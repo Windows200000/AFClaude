@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache parsing, scrubbed env)
+import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -408,6 +409,9 @@ def main():
         start = w["resets_at"] - ka.WEEK
         row["week_elapsed_frac"] = round((t - start) / ka.WEEK, 4)
         row["projected_linear"] = round(ka.project_weekly(w["percent"], w["resets_at"], t), 1)
+    # Cheap: reuse the samples already on disk plus this row, so the ratio
+    # snapshot's own history is kept alongside every sample (limit_ratio.py).
+    row["limit_ratio"] = limit_ratio.compute(limit_ratio.load_samples(SAMPLES) + [row], now=t)
     st["last_sample_at"] = t.isoformat()
     append(SAMPLES, row)
     track_cycle(usage, t, args.tag)

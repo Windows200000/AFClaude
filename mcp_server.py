@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+AFClaude MCP server (stdio): the task store for any Claude Code session on
+this host. Sessions add, query, prioritize and answer tasks, and decide
+stalled sessions, by calling these tools when the user asks ("add a task to
+do X", "what's waiting for me?").
+
+    .venv/bin/python mcp_server.py        (Claude Code starts it; see mcp_register.md)
+
+Uses store.py (schema v3, same DB as tasks.py: $AFCLAUDE_DB or data/afclaude.db)
+and the official MCP Python SDK (mcp 2.x, MCPServer), installed in .venv/
+(Python 3.12; the system python3 is 3.9, too old for the SDK).
+
+The calling session's directory ("project" default, and "." in arguments):
+  1. the client's MCP roots (first file:// root), if it declares roots
+  2. $CLAUDE_PROJECT_DIR, if set in the server's environment
+  3. the server's cwd: Claude Code starts a stdio server per session, in
+     that session's working directory
+"/" and $HOME count as "no project". Results name the source (roots/env/cwd).
+created_by_session is $CLAUDE_CODE_SESSION_ID, when the client passes it on.
+
+Env: AFCLAUDE_DB (database), AFCLAUDE_PROJECTS_DIR (transcripts root for the
+stalled-session scan, default ~/.claude/projects). Results are compact JSON;
+times are Europe/Berlin. Expected failures (unknown id, wrong state, bad
+value) come back as tool errors with a one-line message.
+"""
+import functools
+import json
+import os
+import sqlite3
+import sys
+from typing import Literal, Optional
+from urllib.parse import unquote, urlparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import store  # noqa: E402
+import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
+
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
+
+Priority = Literal["high", "medium", "low"]
+READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False)
+
+server = MCPServer(
+    name="afclaude",
+    instructions=("AFClaude task store on this host. Tasks are stages of ranked projects; execution order is all "
+                  "high stages (by project rank, then stage), then medium, then low. Use these tools when the user "
+                  "asks to add, list, reprioritize or answer AFClaude tasks, or what is waiting for them. "
+                  "Times are Europe/Berlin."),
+    log_level="WARNING",
+)
+
+
+# ---------------------------------------------------------------- helpers
+
+def db():
+    return store.connect(os.environ.get("AFCLAUDE_DB") or store.DB_PATH)
+
+
+def out(obj):
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def bt(s):
+    """UTC ISO -> '2026-09-29 12:00 CEST' (None stays None)."""
+    return cli.berlin(s, "%Y-%m-%d %H:%M %Z") if s else None
+
+
+def compact(d):
+    return {k: v for k, v in d.items() if v is not None and v != ""}
+
+
+def task_brief(t):
+    return compact({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
+                    "project": t["project"], "stage": t["stage_seq"],
+                    "kind": t["kind"] if t["kind"] != "task" else None,
+                    "question": t["blocked_question"] if t["status"] == "blocked" else None,
+                    "updated": bt(t["updated_at"])})
+
+
+def task_full(t, events):
+    d = task_brief(t)
+    d.update(compact({
+        "description": t["description"], "project_rank": t["project_rank"], "created": bt(t["created_at"]),
+        "created_by_session": t["created_by_session"], "assigned_session": t["assigned_session"],
+        "question": t["blocked_question"], "asked": bt(t["blocked_at"]),
+        "answer": t["answer"], "answered": bt(t["answered_at"]),
+        "result": t["result_summary"], "done": bt(t["done_at"])}))
+    d["history"] = [compact({"at": bt(e["ts"]), "event": e["event"], "detail": e["detail"]}) for e in events]
+    return d
+
+
+def project_brief(p):
+    return compact({"rank": p["rank"], "name": p["name"], "open": p.get("open"), "ready": p.get("ready"),
+                    "path": p["path"], "description": p["description"]})
+
+
+def session_brief(s):
+    d = cli.session_json(s)
+    return compact({"session_id": d["session_id"], "title": d["title"], "cwd": d["cwd"],
+                    "limit": d["stall_kind"], "stalled_since": bt(d["stalled_since"]),
+                    "resets": bt(d["stall_reset_at"]), "hits": d["hits"],
+                    "decision": d["decision"], "decision_source": d["decision_source"]})
+
+
+def session_id_env():
+    return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def _no_project_dir(path):
+    home = os.path.expanduser("~")
+    return path in ("/", os.path.normpath(home)) if home else path == "/"
+
+
+async def caller_dir(ctx):
+    """(directory, source) of the calling session; directory None if unknown."""
+    try:
+        caps = ctx.client_capabilities if ctx is not None else None
+        if caps is not None and caps.roots is not None:
+            import anyio
+            import warnings
+            with warnings.catch_warnings(), anyio.fail_after(3):
+                warnings.simplefilter("ignore")
+                res = await ctx.session.list_roots()
+            for r in res.roots:
+                u = urlparse(str(r.uri))
+                if u.scheme == "file" and u.path:
+                    p = os.path.normpath(unquote(u.path))
+                    return (None if _no_project_dir(p) else p), "roots"
+    except Exception:           # no request context, no back-channel, timeout, bad reply: fall through
+        pass
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env and os.path.isabs(env):
+        p = os.path.normpath(env)
+        return (None if _no_project_dir(p) else p), "env"
+    p = os.getcwd()
+    return (None if _no_project_dir(p) else p), "cwd"
+
+
+async def resolve_dir_arg(ctx, value):
+    """'.' -> the caller's directory; './x', '../x' relative to it; '~/x' expanded; else unchanged."""
+    if value is None:
+        return None
+    v = value.strip()
+    if v == "." or v == ".." or v.startswith(("./", "../")):
+        base, _ = await caller_dir(ctx)
+        if base is None:
+            raise ValueError("'.' needs the calling session's directory, which is unknown here "
+                             "(pass a project name or absolute path)")
+        return os.path.normpath(os.path.join(base, v))
+    if v.startswith("~"):
+        return os.path.expanduser(v)
+    return v
+
+
+def tool_errors(fn):
+    """Store errors -> ToolError with a one-line message (no traceback)."""
+    @functools.wraps(fn)
+    async def wrapper(*a, **kw):
+        try:
+            return await fn(*a, **kw)
+        except ToolError:
+            raise
+        except LookupError as e:                         # store.NotFound
+            raise ToolError(e.args[0] if e.args else str(e)) from None
+        except store.InvalidTransition as e:
+            raise ToolError(f"invalid transition: {e}") from None
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+        except sqlite3.OperationalError as e:
+            raise ToolError(f"database error (try again): {e}") from None
+    return wrapper
+
+
+def tool(description, read_only=False):
+    def deco(fn):
+        wrapped = tool_errors(fn)
+        server.add_tool(wrapped, name=fn.__name__, description=description, structured_output=False,
+                        annotations=READ_ONLY if read_only else None)
+        return wrapped
+    return deco
+
+
+# ---------------------------------------------------------------- tools
+
+@tool("Add an AFClaude task (a stage appended to a project). project: name or directory; default = the calling "
+      "session's directory (its project, created if new). priority default high. Returns the task.")
+async def afclaude_add_task(title: str, description: str = "", priority: Priority = "high",
+                            project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+    source = "explicit"
+    if project is None or not project.strip():
+        project, source = await caller_dir(ctx)
+        if project is None:
+            source = "none"
+    else:
+        project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        t = store.add_task(conn, title, description or None, project, priority,
+                           created_by_session=session_id_env())
+    finally:
+        conn.close()
+    return out(dict(task_brief(t), project_source=source))
+
+
+@tool("List AFClaude tasks in execution order. status: open (default: pending/in_progress/blocked), ready (the "
+      "run queue), all, or one status. project: name, directory, or '.' (caller's project).", read_only=True)
+async def afclaude_list_tasks(status: str = "open", project: Optional[str] = None, limit: int = 20,
+                              ctx: Optional[Context] = None) -> str:
+    st = {"open": list(store.OPEN_STATUSES), "ready": "pending", "all": None}.get(status, status)
+    project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        rows = store.list_tasks(conn, status=st, project=project)
+    finally:
+        conn.close()
+    limit = max(1, min(int(limit), 200))
+    return out({"total": len(rows), "tasks": [task_brief(t) for t in rows[:limit]]})
+
+
+@tool("Get one AFClaude task with description, Q&A and full event history.", read_only=True)
+async def afclaude_get_task(id: int) -> str:
+    conn = db()
+    try:
+        t = store.get_task(conn, id)
+        if t is None:
+            raise store.NotFound(f"no task #{id}")
+        return out(task_full(t, store.task_events(conn, id)))
+    finally:
+        conn.close()
+
+
+@tool("Change an AFClaude task. Fields: title, description, priority, project (moves it to the end of that "
+      "project), stage (position in its project, 1 = first). status: done (note = summary), cancelled (note = "
+      "reason), pending (reopen), in_progress, blocked (note = the question for the user). One call is atomic.")
+async def afclaude_update_task(id: int, title: Optional[str] = None, description: Optional[str] = None,
+                               priority: Optional[Priority] = None, project: Optional[str] = None,
+                               stage: Optional[int] = None,
+                               status: Optional[Literal["pending", "in_progress", "blocked", "done",
+                                                        "cancelled"]] = None,
+                               note: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+    fields = {k: v for k, v in (("title", title), ("description", description), ("priority", priority))
+              if v is not None}
+    if project is not None:
+        fields["project"] = await resolve_dir_arg(ctx, project) if project.strip() else None
+    if not fields and stage is None and status is None:
+        raise ValueError("nothing to change (give title/description/priority/project/stage/status)")
+    conn = db()
+    try:
+        with store.transaction(conn):
+            if fields:
+                store.update_task(conn, id, **fields)
+            if stage is not None:
+                store.move_stage(conn, id, stage)
+            if status is not None:
+                cur = store.get_task(conn, id)
+                if cur is None:
+                    raise store.NotFound(f"no task #{id}")
+                if status == "done":
+                    store.finish_task(conn, id, note)
+                elif status == "cancelled":
+                    store.cancel_task(conn, id, note)
+                elif status == "blocked":
+                    store.block_task(conn, id, note)
+                elif status == "in_progress":
+                    store.start_task(conn, id, session_id_env())
+                elif cur["status"] == "blocked":
+                    raise store.InvalidTransition(f"task #{id} is blocked; answer it with afclaude_answer_task")
+                else:
+                    store.reopen_task(conn, id, note)
+        return out(task_brief(store.get_task(conn, id)))
+    finally:
+        conn.close()
+
+
+@tool("Answer a blocked AFClaude task's question; it becomes pending (ready for the next run) again.")
+async def afclaude_answer_task(id: int, answer: str) -> str:
+    conn = db()
+    try:
+        t = store.answer_task(conn, id, answer)
+    finally:
+        conn.close()
+    return out(dict(task_brief(t), question=t["blocked_question"], answer=t["answer"]))
+
+
+@tool("AFClaude projects, a ranked list (1 = top). action: list; add (name, optional rank, path, description); "
+      "move (name, rank); prio (name, priority: sets every open stage of the project); edit (name, new_name/"
+      "description/path). name may be '.' = the caller's project; path '.' = the caller's directory.")
+async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"], name: Optional[str] = None,
+                           rank: Optional[int] = None, priority: Optional[Priority] = None,
+                           description: Optional[str] = None, new_name: Optional[str] = None,
+                           path: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+    conn = db()
+    try:
+        if action == "list":
+            return out({"projects": [project_brief(p) for p in store.list_projects(conn)]})
+        if not name or not name.strip():
+            raise ValueError(f"{action} needs name")
+        path = await resolve_dir_arg(ctx, path)
+        if action == "add":
+            p = store.add_project(conn, name, description, path, rank)
+            return out(project_brief(p))
+        ref = await resolve_dir_arg(ctx, name)
+        if action == "move":
+            if rank is None:
+                raise ValueError("move needs rank")
+            p = store.move_project(conn, ref, rank)
+        elif action == "prio":
+            if priority is None:
+                raise ValueError("prio needs priority")
+            r = store.set_project_priority(conn, ref, priority)
+            return out({"project": r["project"], "priority": r["priority"], "changed_tasks": r["changed"]})
+        else:
+            f = {k: v for k, v in (("name", new_name), ("description", description), ("path", path))
+                 if v is not None}
+            if not f:
+                raise ValueError("edit needs new_name, description or path")
+            p = store.update_project(conn, ref, **f)
+        return out(project_brief(p))
+    finally:
+        conn.close()
+
+
+def _scan():
+    """Incremental stalled-session scan (stalled.py) in its own connection; error text or None."""
+    try:
+        import stalled
+        conn = db()
+        try:
+            stalled.scan(conn, os.environ.get("AFCLAUDE_PROJECTS_DIR") or None)
+        finally:
+            conn.close()
+        return None
+    except Exception as e:      # a broken transcript must not hide the blocked tasks
+        return f"{type(e).__name__}: {e}"
+
+
+async def _scan_async():
+    import anyio
+    return await anyio.to_thread.run_sync(_scan)
+
+
+@tool("What is waiting for the user: blocked AFClaude tasks (answer with afclaude_answer_task) and stalled "
+      "Claude Code sessions with no continue/ignore decision (afclaude_decide_session). Scans transcripts first.",
+      read_only=True)
+async def afclaude_inbox() -> str:
+    err = await _scan_async()
+    conn = db()
+    try:
+        box = store.pending_user_input(conn)
+    finally:
+        conn.close()
+    res = {"blocked_tasks": [dict(task_brief(t), asked=bt(t["blocked_at"])) for t in box["blocked_tasks"]],
+           "undecided_sessions": [session_brief(s) for s in box["undecided_sessions"]]}
+    if err:
+        res["scan_error"] = err
+    return out(res)
+
+
+@tool("Decide a stalled Claude Code session (id or unique prefix): continue (resume it in the nightly window), "
+      "ignore, or clear the decision. Applies to its current stall only; use afclaude_rule for standing rules.")
+async def afclaude_decide_session(session: str, decision: Literal["continue", "ignore", "clear"],
+                                  note: Optional[str] = None) -> str:
+    err = await _scan_async()
+    conn = db()
+    try:
+        sid = cli.resolve_session(conn, session.strip())
+        if decision == "clear":
+            store.clear_decision(conn, sid)
+        else:
+            store.decide_session(conn, sid, decision, note)
+        dec, src = store.effective_decision(conn, sid)
+    finally:
+        conn.close()
+    return out(compact({"session_id": sid, "decision": dec or "undecided", "source": src, "scan_error": err}))
+
+
+@tool("Standing continue/ignore rules for stalled sessions. action: list; add (scope session|project, match, "
+      "decision); rm (id). match: session id/prefix, or for project a directory ('.' = caller's; covers "
+      "subdirs) or a ~/.claude/projects dir name.")
+async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Literal["session", "project"]] = None,
+                        match: Optional[str] = None, decision: Optional[Literal["continue", "ignore"]] = None,
+                        id: Optional[int] = None, note: Optional[str] = None,
+                        ctx: Optional[Context] = None) -> str:
+    conn = db()
+    try:
+        if action == "list":
+            return out({"rules": [compact(dict(r, created_at=bt(r["created_at"]))) for r in store.list_rules(conn)]})
+        if action == "rm":
+            if id is None:
+                raise ValueError("rm needs id")
+            store.remove_rule(conn, id)
+            return out({"removed": id})
+        if scope is None or not match or decision is None:
+            raise ValueError("add needs scope, match and decision")
+        m = match.strip()
+        if scope == "session":
+            m = cli.resolve_session(conn, m)
+        else:
+            m = await resolve_dir_arg(ctx, m)
+        r = store.add_rule(conn, scope, m, decision, note)
+        return out(compact(dict(r, created_at=bt(r["created_at"]))))
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    server.run("stdio")

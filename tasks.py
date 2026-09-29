@@ -3,11 +3,18 @@
 Task store CLI: tasks, blocked questions, and continue/ignore decisions for
 stalled sessions, on store.py's SQLite DB (data/afclaude.db).
 
-    tasks.py add "title" [-d TEXT] [-p N] [--project P] [--kind K] [--by SESSION]
+    tasks.py add "title" [-d TEXT] [-p high|medium|low] [--project P] [--kind K] [--by SESSION]
     tasks.py list [--all | --status S ...] [--project P] [--kind K]   (default: open tasks)
+    tasks.py order [--project P] [--kind K]   the ready queue, in execution order
     tasks.py show ID                       task + its event history
     tasks.py edit ID [--title T] [-d TEXT] [--project P] [--kind K]
-    tasks.py prio ID N                     manual priority, higher runs first
+    tasks.py prio ID high|medium|low       one stage's priority
+    tasks.py move ID N                     stage N (1 = first) within its project
+    tasks.py project add NAME [-d TEXT] [--path DIR] [--rank N]
+    tasks.py project list                  projects by rank (1 = top)
+    tasks.py project move P RANK
+    tasks.py project prio P high|medium|low   every open stage of the project at once
+    tasks.py project edit P [--name N] [-d TEXT] [--path DIR]
     tasks.py block ID "question"           -> blocked, waits for the user
     tasks.py answer ID "answer"            -> pending again, for the next pass
     tasks.py start ID [--session S]        -> in_progress
@@ -18,6 +25,12 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py rule add session|project MATCH continue|ignore [--note N]
     tasks.py rule list | rule rm ID
     tasks.py inbox                         everything that needs the user's input
+
+Tasks are the stages of a project; projects form a ranked list. Execution
+order: every high stage (by project rank, then stage), then every medium one,
+then every low one; only pending tasks are ready. A project P is a name or a
+directory ("." = here; a directory maps to the project whose path is it or its
+closest parent). add/edit with an unknown P create that project at the bottom.
 
 SESSION is a session id or unique prefix. A project MATCH is a path (the
 session's cwd or a parent dir; "." = here) or a ~/.claude/projects dir name
@@ -58,27 +71,45 @@ def dump(obj):
 
 # ---------------------------------------------------------------- output
 
-def print_tasks(rows):
+def stage_label(t):
+    return f"{t['project_rank']}.{t['stage_seq']}" if t.get("project_id") else "-"
+
+
+def print_tasks(rows, numbered=False):
     if not rows:
         print("no tasks")
         return
-    print(f"{'id':>4}  {'prio':>4}  {'status':11}  {'project':16}  {'updated':16}  title")
-    for t in rows:
+    num = f"{'#':>3}  " if numbered else ""
+    print(f"{num}{'id':>4}  {'prio':6}  {'status':11}  {'project':16}  {'stage':5}  {'updated':16}  title")
+    for i, t in enumerate(rows, 1):
         title = ("[backlog] " if t["kind"] == "backlog_project" else "") + t["title"]
-        print(f"{t['id']:>4}  {t['priority']:>4}  {t['status']:11}  {cut(short_project(t['project']), 16):16}  "
-              f"{berlin(t['updated_at']):16}  {cut(title, 70)}")
+        num = f"{i:>3}  " if numbered else ""
+        print(f"{num}{t['id']:>4}  {t['priority']:6}  {t['status']:11}  {cut(short_project(t['project']), 16):16}  "
+              f"{stage_label(t):5}  {berlin(t['updated_at']):16}  {cut(title, 70)}")
+
+
+def print_projects(rows):
+    if not rows:
+        print("no projects")
+        return
+    print(f"{'rank':>4}  {'open':>4}  {'ready h/m/l':11}  {'name':20}  path")
+    for p in rows:
+        r = p["ready"]
+        print(f"{p['rank']:>4}  {p['open']:>4}  {r['high']:>3}/{r['medium']}/{r['low']:<5}  "
+              f"{cut(p['name'], 20):20}  {p['path'] or '-'}")
 
 
 def event_text(e):
     d = e["detail"] or {}
     ev = e["event"]
-    if ev == "priority":
-        return f"{d.get('from')} -> {d.get('to')}"
-    if ev == "updated":
-        return ", ".join(f"{k}: {cut(str(o), 25)} -> {cut(str(n), 25)}" for k, (o, n) in d.items())
+    if ev in ("priority", "moved"):
+        return f"{d.get('from')} -> {d.get('to')}" + (f" (whole {d['via']})" if d.get("via") else "")
+    if ev in ("updated", "migrated"):
+        return ", ".join(f"{k}: {cut(str(v[0]), 25)} -> {cut(str(v[1]), 25)}" if isinstance(v, list)
+                         else f"{k}: {cut(str(v), 25)}" for k, v in d.items())
     if ev == "created":
-        return f"prio {d.get('priority')}, {d.get('kind')}" + (f", by {d['created_by_session'][:8]}"
-                                                             if d.get("created_by_session") else "")
+        return (f"prio {d.get('priority')}, {d.get('kind')}" + (f", project {d['project']}" if d.get("project") else "")
+                + (f", by {d['created_by_session'][:8]}" if d.get("created_by_session") else ""))
     parts = [f"from {d['from']}"] if d.get("from") else []
     for k in ("question", "answer", "session", "summary", "reason"):
         if d.get(k):
@@ -89,7 +120,9 @@ def event_text(e):
 def print_task(t, events):
     kind = " [backlog project]" if t["kind"] == "backlog_project" else ""
     print(f"#{t['id']}  {t['title']}{kind}")
-    print(f"  status {t['status']}, priority {t['priority']}, project {t['project'] or '-'}")
+    stage = (f", stage {t['stage_seq']} of project #{t['project_rank']} {t['project']}" if t["project_id"]
+             else ", no project")
+    print(f"  status {t['status']}, priority {t['priority']}{stage}")
     by = f" by {t['created_by_session']}" if t["created_by_session"] else ""
     print(f"  created {berlin(t['created_at'])}{by}, updated {berlin(t['updated_at'])}")
     if t["assigned_session"]:
@@ -136,7 +169,7 @@ def print_inbox(box):
     if bt:
         print(f"{len(bt)} blocked task(s), answer with: tasks.py answer ID \"...\"")
         for t in bt:
-            print(f"  #{t['id']}  p{t['priority']}  {cut(short_project(t['project']), 16)}  {cut(t['title'], 60)}")
+            print(f"  #{t['id']}  {t['priority']}  {cut(short_project(t['project']), 16)}  {cut(t['title'], 60)}")
             print(f"      Q ({berlin(t['blocked_at'])}): {t['blocked_question']}")
     if us:
         print(f"{len(us)} undecided stalled session(s), decide with: tasks.py decide ID continue|ignore")
@@ -178,18 +211,59 @@ def task_out(args, t):
     if args.json:
         dump(t)
     else:
-        print(f"#{t['id']}  {t['status']}  p{t['priority']}  {t['title']}")
+        where = f"  {t['project']} stage {t['stage_seq']}" if t["project_id"] else ""
+        print(f"#{t['id']}  {t['status']}  {t['priority']}{where}  {t['title']}")
+
+
+def project_ref(p):
+    """CLI project argument: '.', './x', '../x', '~/x' are directories (made absolute)."""
+    if p is not None and (p == "." or p == ".." or p.startswith(("./", "../", "~"))):
+        return os.path.abspath(os.path.expanduser(p))
+    return p
+
+
+def run_project(conn, args):
+    pc = args.project_cmd
+    if pc == "list":
+        rows = store.list_projects(conn)
+        return dump(rows) if args.json else print_projects(rows)
+    if pc == "add":
+        p = store.add_project(conn, args.name, args.description, project_ref(args.path), args.rank)
+    elif pc == "move":
+        p = store.move_project(conn, project_ref(args.project), args.rank)
+    elif pc == "edit":
+        f = {k: v for k, v in (("name", args.name), ("description", args.description),
+                               ("path", project_ref(args.path))) if v is not None}
+        if not f:
+            raise ValueError("nothing to change (use --name/-d/--path)")
+        p = store.update_project(conn, project_ref(args.project), **f)
+    else:  # prio
+        r = store.set_project_priority(conn, project_ref(args.project), args.priority)
+        if args.json:
+            return dump(r)
+        return print(f"{r['project']}: {len(r['changed'])} open stage(s) set to {r['priority']}")
+    if args.json:
+        dump(p)
+    else:
+        print(f"project {p['name']}  rank {p['rank']}" + (f"  {p['path']}" if p["path"] else ""))
 
 
 def run(conn, args):
     c = args.cmd
     if c == "add":
-        task_out(args, store.add_task(conn, args.title, args.description, args.project, args.priority,
-                                      args.kind, args.by))
+        task_out(args, store.add_task(conn, args.title, args.description, project_ref(args.project),
+                                      args.priority, args.kind, args.by))
     elif c == "list":
         status = None if args.all else (args.status or list(store.OPEN_STATUSES))
-        rows = store.list_tasks(conn, status=status, project=args.project, kind=args.kind)
+        rows = store.list_tasks(conn, status=status, project=project_ref(args.project), kind=args.kind)
         dump(rows) if args.json else print_tasks(rows)
+    elif c == "order":
+        rows = store.execution_order(conn, project=project_ref(args.project), kind=args.kind)
+        dump(rows) if args.json else print_tasks(rows, numbered=True)
+    elif c == "project":
+        run_project(conn, args)
+    elif c == "move":
+        task_out(args, store.move_stage(conn, args.id, args.stage))
     elif c == "show":
         t = store.get_task(conn, args.id)
         if t is None:
@@ -198,7 +272,7 @@ def run(conn, args):
         dump(dict(t, events=ev)) if args.json else print_task(t, ev)
     elif c == "edit":
         f = {k: v for k, v in (("title", args.title), ("description", args.description),
-                               ("project", args.project), ("kind", args.kind)) if v is not None}
+                               ("project", project_ref(args.project)), ("kind", args.kind)) if v is not None}
         if not f:
             raise ValueError("nothing to change (use --title/-d/--project/--kind)")
         task_out(args, store.update_task(conn, args.id, **f))
@@ -268,15 +342,40 @@ def parser():
     p = sub.add_parser("add", parents=[js], help="new task (pending)")
     p.add_argument("title")
     p.add_argument("-d", "--description")
-    p.add_argument("-p", "--priority", type=int, default=0)
-    p.add_argument("--project")
+    p.add_argument("-p", "--priority", choices=store.PRIORITIES, default=store.DEFAULT_PRIORITY)
+    p.add_argument("--project", help="name or directory; unknown ones are created")
     p.add_argument("--kind", choices=store.TASK_KINDS, default="task")
     p.add_argument("--by", help="session that created it")
-    p = sub.add_parser("list", parents=[js], help="tasks by priority (default: open ones)")
+    p = sub.add_parser("list", parents=[js], help="tasks in execution order (default: open ones)")
     p.add_argument("--status", nargs="+", choices=store.TASK_STATUSES)
     p.add_argument("--all", action="store_true", help="include done and cancelled")
     p.add_argument("--project")
     p.add_argument("--kind", choices=store.TASK_KINDS)
+    p = sub.add_parser("order", parents=[js], help="the ready queue in execution order")
+    p.add_argument("--project")
+    p.add_argument("--kind", choices=store.TASK_KINDS)
+    p = sub.add_parser("move", parents=[js], help="move a task to stage N of its project")
+    p.add_argument("id", type=int)
+    p.add_argument("stage", type=int)
+    p = sub.add_parser("project", help="the ranked project list")
+    ps = p.add_subparsers(dest="project_cmd", required=True)
+    q = ps.add_parser("add", parents=[js], help="new project (bottom of the list unless --rank)")
+    q.add_argument("name")
+    q.add_argument("-d", "--description")
+    q.add_argument("--path", help="its directory, so sessions there map to it")
+    q.add_argument("--rank", type=int)
+    ps.add_parser("list", parents=[js], help="projects by rank")
+    q = ps.add_parser("move", parents=[js], help="set a project's rank (1 = top)")
+    q.add_argument("project")
+    q.add_argument("rank", type=int)
+    q = ps.add_parser("prio", parents=[js], help="set every open stage of a project")
+    q.add_argument("project")
+    q.add_argument("priority", choices=store.PRIORITIES)
+    q = ps.add_parser("edit", parents=[js], help="rename / describe / set the path")
+    q.add_argument("project")
+    q.add_argument("--name")
+    q.add_argument("-d", "--description")
+    q.add_argument("--path")
     p = sub.add_parser("show", parents=[js], help="task + history")
     p.add_argument("id", type=int)
     p = sub.add_parser("edit", parents=[js], help="change title/description/project/kind")
@@ -285,9 +384,9 @@ def parser():
     p.add_argument("-d", "--description")
     p.add_argument("--project")
     p.add_argument("--kind", choices=store.TASK_KINDS)
-    p = sub.add_parser("prio", parents=[js], help="set priority")
+    p = sub.add_parser("prio", parents=[js], help="set one stage's priority")
     p.add_argument("id", type=int)
-    p.add_argument("priority", type=int)
+    p.add_argument("priority", choices=store.PRIORITIES)
     p = sub.add_parser("block", parents=[js], help="blocked on a question for the user")
     p.add_argument("id", type=int)
     p.add_argument("question")

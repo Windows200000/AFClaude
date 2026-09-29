@@ -28,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget rule, window)
 import store  # noqa: E402  (read-only: pending_user_input)
+import limit_ratio  # noqa: E402  (reads the per-sample ratio snapshot; never recomputes here)
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
@@ -153,6 +154,68 @@ def watcher_running():
         return {"running": None, "pids": []}
 
 
+def tail_last_json(path, chunk=65536):
+    """Last complete JSON object in a JSONL file, without reading the whole
+    (potentially large, never-exported) file: grows the read window from the
+    end until a full line is found or the file start is reached."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    with open(path, "rb") as fh:
+        read = min(chunk, size)
+        while True:
+            fh.seek(size - read)
+            data = fh.read(read)
+            lines = data.split(b"\n")
+            usable = lines[1:] if read < size else lines  # first entry may be a partial line
+            for line in reversed(usable):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+            if read >= size:
+                return None
+            read = min(read * 4, size)
+
+
+def limits_block():
+    """Compact version of the limit_ratio.py snapshot usage_sampler.py already
+    stored on the latest data/samples.jsonl row (no recompute, no raw rows
+    exported -- consistent with samples.jsonl never being exported directly)."""
+    row = tail_last_json(os.path.join(HERE, "data", "samples.jsonl"))
+    snap = (row or {}).get("limit_ratio")
+    if not snap:
+        return None
+    r = snap.get("ratio") or {}
+    share = (snap.get("attribution") or {}).get("week_share") or {}
+
+    def r4(x):
+        return round(x, 4) if x is not None else None
+
+    def r1(x):
+        return round(x, 1) if x is not None else None
+
+    def r3(x):
+        return round(x, 3) if x is not None else None
+
+    return {
+        "ratio_status": r.get("status"),
+        "ratio_median": r4(r.get("median")),
+        "ratio_trimmed_mean": r4(r.get("trimmed_mean")),
+        "ratio_n": r.get("n"),
+        "windows_per_week": r1(snap.get("windows_per_week")),
+        "windows_left_this_week": r1(snap.get("windows_left_this_week")),
+        "share_status": share.get("status"),
+        "own_share_week": r3(share.get("own_share")),
+        "user_share_week": r3(share.get("other_share")),
+        "as_of": snap.get("generated_at"),
+    }
+
+
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
     out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
@@ -169,6 +232,7 @@ def keepalive_and_usage(now):
             out[k] = {"percent": u[k]["percent"], "resets_at_berlin": bstr(u[k]["resets_at"])}
     go, reason = ka.budget_decision(u, now)
     out["budget_rule_now"] = {"continue": go, "reason": reason}
+    out["limits"] = limits_block()
     return out
 
 

@@ -171,6 +171,21 @@ details > .md { padding: 8px 0 4px; }
       out.push(tile("Budget rule", b["continue"] ? '<span class="ok">CONTINUE</span>' : '<span class="warn">HOLD</span>',
         '<div class="mut">' + esc(b.reason || "") + "</div>"));
     }
+    var lim = k.limits || {};
+    if (lim.ratio_status === "ok") {
+      out.push(tile("Session→week ratio", lim.ratio_median,
+        '<div class="mut">~' + (lim.windows_per_week != null ? lim.windows_per_week : "?") + ' windows/week · ' +
+        (lim.windows_left_this_week != null ? lim.windows_left_this_week : "?") + ' left this week</div>'));
+    } else {
+      out.push(tile("Session→week ratio", "–", '<div class="mut">insufficient data</div>'));
+    }
+    if (lim.share_status === "ok") {
+      out.push(tile("AFClaude vs user (week)",
+        Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",
+        '<div class="mut">AFClaude / user share of this week’s weekly % so far</div>'));
+    } else {
+      out.push(tile("AFClaude vs user (week)", "–", '<div class="mut">insufficient data</div>'));
+    }
     var w = k.watcher || {};
     out.push(tile("Watcher", w.running ? '<span class="ok">running</span>' : (w.running === false ? '<span class="bad">not running</span>' : "?"),
       w.pids && w.pids.length ? '<div class="mut">pid ' + esc(w.pids.join(", ")) + "</div>" : ""));
