@@ -8,7 +8,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 4. [x] Local MCP server (`mcp_server.py`, 9 tools), 29.09. The user still has to register it (OPEN_QUESTIONS)
 5. [x] Dispatcher (`dispatcher.py`), 29.09.: armed via cron every 10 min; approved stalled sessions + queued tasks, never takes over RC-server threads
 6. [ ] Usage model: first review Thu 01.10. 17:00 (`usage_review.py`), after that from the collected data
-7. [~] Dashboard (design doc in progress) (built from scratch), then seed BACKLOG.md into the DB so backlog projects run
+7. [~] Dashboard: design done (docs/dashboard_design.md, 0d4b076); 9 build phases in the task store (1: config + schema v4 + actions.py … 9: retire the quickview + seed the backlog)
 8. [x] Pre-public scrub: history squashed into one commit after an audit, with a pre-commit/pre-push guard (`tools/check_public.py`), 29.09.; host-specific values into config still to do
 9. [ ] Usage optimisation (after everything else): use the full limits using the measured session/weekly ratios, AFClaude vs user share
 10. [ ] Shared review + experience store across AFClaude users (usage-limit experience, prediction functions); consider the design
