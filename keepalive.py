@@ -342,6 +342,24 @@ def pid_alive(pid):
     return bool(pid) and os.path.exists(f"/proc/{pid}")
 
 
+ARCHIVED_MARK = "this session was ended or archived from another device"
+
+
+def archived_since_last_message(path):
+    """True if an RC 'ended or archived from another device' notice is newer than
+    the session's last user/assistant entry."""
+    if not path:
+        return False
+    archived = False
+    for e in iter_entries(path):
+        t = e.get("type")
+        if t in ("user", "assistant") and not e.get("isSidechain"):
+            archived = False
+        elif t == "system" and ARCHIVED_MARK in str(e.get("content", "")):
+            archived = True
+    return archived
+
+
 def preflight(session_id):
     """-> (ok, problems[], plan). No --bg anymore: the session is continued in
     its tmux session (send-keys) or resumed into a new one. A live process
@@ -356,6 +374,10 @@ def preflight(session_id):
     if any(a.get("state") == "working" or a.get("status") == "busy" for a in rows):
         return False, ["session is busy in another process (someone is using it)"], None
     inter = [a for a in rows if a.get("kind") == "interactive"]
+    if inter and archived_since_last_message(transcript_path(session_id)):
+        # The user archived it in the RC/web UI: that ends Remote Control but leaves the
+        # local process idle. Archiving counts as closing (user rule, 29.09.), so take it over.
+        return True, [], "take-over:" + ",".join(str(a["pid"]) for a in inter)
     if inter and not TAKE_OVER_IDLE:
         return False, [f"held by an idle interactive process {[a['pid'] for a in inter]} outside tmux; "
                        "a resume would FORK a copy (pass --take-over-idle to SIGTERM it first)"], None

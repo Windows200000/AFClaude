@@ -225,6 +225,19 @@ class Files(unittest.TestCase):
             self.assertTrue(os.access(os.path.join(d, f), os.X_OK), f)
 
 
+class Archived(unittest.TestCase):
+    def test_archived_notice_after_last_message(self):
+        with tempfile.TemporaryDirectory() as d:
+            sysmsg = {"type": "system", "subtype": "informational",
+                      "content": "Remote Control disconnected — this session was ended or archived from another device or app (code 4090)"}
+            write_transcript(d, SID, [USER, REPLY, sysmsg])
+            p = os.path.join(d, "-proj", SID + ".jsonl")
+            self.assertTrue(ka.archived_since_last_message(p))
+            write_transcript(d, SID, [USER, sysmsg, REPLY])
+            self.assertFalse(ka.archived_since_last_message(p))
+            self.assertFalse(ka.archived_since_last_message(None))
+
+
 class RealTranscripts(unittest.TestCase):
     """Read-only checks against real stalls on this host."""
     def setUp(self):
