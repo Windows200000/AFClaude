@@ -209,3 +209,9 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 1. **Default window after the switch.** Today's 00:00–08:00 is 8 h, which is not a multiple of the 5 h session limit. Which should the default be: 22:00–08:00 (2 windows, same end), 00:00–10:00 (2 windows, same start), or 00:00–05:00 (1 window)? And does the "grid anchored at the start you pick" rule still hold, or should the start snap to your observed session resets (the planner can offer both)?
 2. **Access path.** Reuse the `/private` login on the web host with a server-side key proxy (recommended; needs one nginx location change there, done by you), or put the dashboard directly behind the login on the manager host's Traefik (forward-auth), so the web host isn't involved?
 3. **Tasks written by autonomous sessions.** Should tasks that AFClaude's own sessions add through MCP wait for your approval in the inbox (recommended; stages inside a session's own managed project excepted), or run like the tasks you add?
+
+## Decisions by the owner (29.09.2026)
+
+- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff of the budget rule stays "no later than 11:00 after the window".
+- **Q2 login:** the dashboard implements **both** a general SSO (standard OpenID Connect, any provider, e.g. the existing Authelia) **and** a simple local username/password login (hashed passwords, rate limiting, secure session cookies). Either can be enabled via config. The reverse-proxy pattern stays as defence in depth.
+- **Q3 MCP tasks:** tasks added through MCP are treated exactly like tasks created in the UI; **no approval step**. The MCP server's instructions and tool descriptions must say that the tools are only to be used when the user explicitly asks for AFClaude.
