@@ -13,6 +13,8 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 9. [ ] Usage optimisation (after everything else): use the full limits using the measured session/weekly ratios, AFClaude vs user share
 10. [ ] Shared review + experience store across AFClaude users (usage-limit experience, prediction functions); consider the design
 
+11. [ ] Investigate hooking into `claude rc` server mode (more convenient for the user; server sessions don't expire, unlike per-session Remote Control)
+
 Side work:
 - [x] Quickview status page (`export_quickview.py`, `quickview/`), 29.09. Follow-up: the export should read GOALS.md + OPEN_QUESTIONS.md + the task inbox instead of parsing PROGRESS.md
 - [x] Limit-ratio monitoring (`limit_ratio.py`), 29.09.:: how fast session % vs weekly % rise, per user, split AFClaude vs user; surfaced on the quickview for window planning
