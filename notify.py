@@ -17,6 +17,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 ALERTS = os.path.join(HERE, "ALERTS.md")
 PROGRESS = os.path.join(HERE, "PROGRESS.md")
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -27,11 +29,11 @@ ENV = {"HOME": os.path.expanduser("~"), "USER": "opc", "PATH": "/home/opc/.local
 def push(text):
     prompt = f'Use the PushNotification tool (status "proactive") to send exactly this text, then reply DONE: "{text}"'
     try:
-        r = subprocess.run(["claude", "-p", "--model", "haiku", "--no-session-persistence",
-                            "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
-                            "--tools=PushNotification", "--allowedTools=PushNotification",
-                            "--strict-mcp-config"], input=prompt, cwd=os.path.join(HERE, "data"),
-                           env=ENV, capture_output=True, text=True, timeout=180)
+        r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",
+                              "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
+                              "--tools=PushNotification", "--allowedTools=PushNotification",
+                              "--strict-mcp-config"], input=prompt, cwd=os.path.join(HERE, "data"),
+                             env=ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"push failed: {e}"
     for line in r.stdout.splitlines():
@@ -49,10 +51,8 @@ def notify(subject, body="", do_push=True):
     now = datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
     os.makedirs(os.path.join(HERE, "data"), exist_ok=True)
     result = push(f"AFClaude: {subject}"[:180]) if do_push else "push skipped"
-    with open(ALERTS, "a") as fh:
-        fh.write(f"- **{now}** {subject}\n  {body.strip()[:1500]}\n  _(push: {result})_\n")
-    with open(PROGRESS, "a") as fh:
-        fh.write(f"- {now[11:]} [ALERT] {subject} (details in ALERTS.md)\n")
+    host.append_note(ALERTS, f"- **{now}** {subject}\n  {body.strip()[:1500]}\n  _(push: {result})_\n")
+    host.append_note(PROGRESS, f"- {now[11:]} [ALERT] {subject} (details in ALERTS.md)\n")
     return result
 
 

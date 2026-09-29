@@ -60,6 +60,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fire, alert)
+import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
 
@@ -149,14 +150,22 @@ def alert_once(st, key, subject, body=""):
 # ---------------------------------------------------------------- who not to touch
 
 def keepalive_targets():
-    """Session ids that a running keepalive.py watcher targets (its --session)."""
+    """Session ids that a running keepalive.py watcher targets (its --session): local
+    ones, plus, inside the container, the host's (a watcher left running there)."""
     out = set()
+    argvs = []
     for cmdline in glob.glob("/proc/[0-9]*/cmdline"):
         try:
             with open(cmdline, "rb") as fh:
-                argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+                argvs.append([a.decode(errors="replace") for a in fh.read().split(b"\0") if a])
         except OSError:
             continue
+    if host.in_container():
+        try:
+            argvs += [p["argv"] for p in host.proc_snapshot().values() if p.get("argv")]
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            log(f"host process list unavailable ({e}); only local keepalive watchers are known")
+    for argv in argvs:
         if not any(os.path.basename(a) == "keepalive.py" for a in argv):
             continue
         for i, a in enumerate(argv):
@@ -247,11 +256,11 @@ def family_winner(conn, members):
 # ---------------------------------------------------------------- helpers
 
 def tmux_alive(name):
-    return subprocess.run(["tmux", "has-session", "-t", "=" + name], capture_output=True).returncode == 0
+    return host.run_on_host(["tmux", "has-session", "-t", "=" + name], timeout=30).returncode == 0
 
 
 def kill_tmux(name):
-    r = subprocess.run(["tmux", "kill-session", "-t", "=" + name], capture_output=True, text=True)
+    r = host.run_on_host(["tmux", "kill-session", "-t", "=" + name], timeout=30)
     return r.returncode, (r.stderr or "").strip()
 
 

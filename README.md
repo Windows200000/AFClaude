@@ -35,8 +35,25 @@ AFClaude keeps long-running Claude Code sessions going while nobody is at the ke
 | `test_dispatcher.py` | Offline tests for the dispatcher (temp DB, fixture transcripts, stub `ka_resume.sh`/`claude`/`tmux` on PATH): approved vs undecided vs ignored, window/reset waits, keepalive targets, fork families, task order + start marking, skip list, managed projects, answered-task resume, launch failures, concurrency cap, budget/usage gate before each start, cleanup of only its own finished sessions, verification alerts, dry-run changing nothing, the `manager_session` column upgrade. |
 | `test_mcp_server.py` | The MCP tools called directly on temp DBs, plus real stdio round trips through the SDK client (spawn, initialize, list_tools, add → list → inbox, errors, roots vs cwd). Run with `.venv/bin/python -m unittest test_mcp_server`. |
 | `lastmsg.py` | Debug helper that prints a session's last messages. |
+| `host.py` | Every host-side call (claude, `ka_resume.sh`, tmux, kill, `/proc`, the usage cache, PROGRESS/ALERTS appends) goes through `run_on_host()` and a few helpers: a plain local call on the host, the SSH bridge in the manager container (`AFCLAUDE_IN_CONTAINER`). |
+| `docker/` | The manager container (see below): `Dockerfile`, `compose.yml` (+ `compose.dev.yml`), `crontab`, `entrypoint.sh`, `start_watcher.sh`, `at_shim.py`, `env.example`; `host_exec.py` + `install_host_bridge.sh` are the host side of the bridge. |
+| `test_host.py` | Offline tests for `host.py`: host path, ssh argv, the mapping onto `host_exec.py`'s whitelist, denied shapes, and keepalive's `/proc` readers in container mode. |
 | `PROGRESS.md`, `EXCEPTIONS.md` | The build log (findings, dead ends) and the log of rule exceptions. |
 | `launch_nightly.sh`, `nightly_prompt.md` | Legacy: the `at` launcher of the first AFK build session (still `--bg`). |
+
+## Manager container (docker/)
+
+The container is the manager: it runs AFClaude's schedule and code, while everything that touches Claude sessions still runs on the host, through a strict SSH bridge.
+
+- **Image** (`docker/Dockerfile`, `python:3.12-slim`): python3, supercronic (non-root cron), openssh-client, tini, procps, the MCP SDK, plus git/tmux for the unit tests only. It runs as UID/GID 1000 with `HOME=/home/opc`. The code is baked in at the host repo's own path, owned by root, so host-facing paths (cwd, PROGRESS.md in messages) stay the same.
+- **Schedule**: `docker/crontab` mirrors the host's AFClaude crontab lines (sampler, window-start, watcher watchdog, usage review, quickview export, dispatcher). The entrypoint starts the watcher (`docker/start_watcher.sh`, the counterpart of `start_keepalive.sh`), which replaces the `@reboot` line. `at` is a shim (`docker/at_shim.py`) that spools the sampler's pre/post-reset jobs in `data/at_spool/`, run by a per-minute cron line. `AFCLAUDE_SCHEDULER=on|off` (default off: the container only idles).
+- **Mounts** (no docker socket, no privileges, no ports, read-only root fs): the host repo read-only at `/host/repo`. PROGRESS/ALERTS/OPEN_QUESTIONS/BACKLOG/GOALS/EXCEPTIONS/README and PAUSED are symlinks to it, so reads are always fresh. `data/` is read-write. `~/.claude/projects` and `~/.claude/sessions` are read-only, plus the bridge key and the host's public ed25519 host key (for strict checking). `~/.claude.json` is **not** mounted: claude replaces that file, so a file bind mount would go stale. The usage cache comes via the bridge. Watcher state (`keepalive_state.json`, lock, log, STOP) is in `data/keepalive/`.
+- **Bridge**: `host.py` runs `ssh opc@host.docker.internal` (host-gateway, `extra_hosts`) with the key from `install_host_bridge.sh`. The compose network is pinned inside `172.16.0.0/12`, which the key's `from=` requires. sshd runs `docker/host_exec.py` as a forced command, which accepts only its whitelist. Host behaviour without `AFCLAUDE_IN_CONTAINER` is unchanged.
+- **Machine-specific values**: `docker/.env` (gitignored; template `docker/env.example`).
+- **Run**: `docker compose -f docker/compose.yml up -d --build`. Unit tests inside: `docker exec -e AFCLAUDE_IN_CONTAINER= afclaude python3 -m unittest test_keepalive` (the tests use local stubs, so the bridge is switched off for them).
+- **Dev override** (code from a checkout, read-only, no rebuild): `AFCLAUDE_DEV_SRC=/path/to/checkout docker compose -f docker/compose.yml -f docker/compose.dev.yml up -d`.
+- **MCP server from the container**: `docker exec -i afclaude python3 /mnt/BlockVolume/Claude/work/AFClaude/mcp_server.py` is a drop-in stdio command (e.g. `claude mcp add --scope user afclaude -- docker exec -i afclaude python3 …/mcp_server.py`). The existing registration (host `.venv`) keeps working. Both use the same `data/afclaude.db`.
+- **Stop / pause the container watcher**: `touch data/keepalive/STOP` (the next start removes it); `touch PAUSED` in the host repo keeps it stopped. `start_watcher.sh` never starts a second watcher while one runs on the host.
 
 ## Dispatcher cron (suggested, not installed)
 

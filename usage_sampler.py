@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache parsing, scrubbed env)
+import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
 
 UTC = timezone.utc
@@ -100,10 +101,11 @@ def usage_now():
             row[k] = u[k]
     row["text"] = out.strip()[:3000]
     try:
-        raw = json.load(open(ka.CLAUDE_JSON)).get("cachedUsageUtilization", {}).get("utilization", {})
+        cache = host.usage_cache() if host.in_container() else json.load(open(ka.CLAUDE_JSON)).get("cachedUsageUtilization", {})
+        raw = cache.get("utilization", {})
         row["limits_raw"] = raw.get("limits")
         row["extra_usage_enabled"] = (raw.get("extra_usage") or {}).get("is_enabled")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
         pass
     return row
 
@@ -269,8 +271,7 @@ def summarize(agg, sessions):
 
 def agents_snapshot():
     try:
-        r = subprocess.run(["claude", "agents", "--json"], capture_output=True, text=True,
-                           timeout=60, env=ka.SCRUBBED_ENV)
+        r = host.run_on_host(["claude", "agents", "--json"], timeout=60, env=ka.SCRUBBED_ENV)
         rows = json.loads(r.stdout or "[]")
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None
@@ -362,10 +363,10 @@ def haiku_judgement(st, t):
                                      gaps=gaps_txt, totals=fmt_tokens(since))
         try:
             # prompt via stdin: --tools is variadic and would swallow a positional prompt
-            r = subprocess.run(["claude", "-p", "--model", "haiku", "--no-session-persistence",
-                                "--output-format", "json", "--tools=", "--strict-mcp-config", "--permission-mode", "dontAsk",
-                                "--disable-slash-commands"], input=prompt,
-                               cwd=DATA, env=ka.SCRUBBED_ENV, capture_output=True, text=True, timeout=180)
+            r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",
+                                  "--output-format", "json", "--tools=", "--strict-mcp-config", "--permission-mode", "dontAsk",
+                                  "--disable-slash-commands"], input=prompt,
+                                 cwd=DATA, env=ka.SCRUBBED_ENV, timeout=180)
             out = json.loads(r.stdout)
             row["cost_usd"] = out.get("total_cost_usd")
             row["usage"] = out.get("usage")
