@@ -259,6 +259,132 @@ class RealTranscripts(unittest.TestCase):
         self.assertIsNone(ka.stall_info(ka.last_message(p)))
 
 
+class FakeProcHolders(unittest.TestCase):
+    """preflight against a fake /proc + ~/.claude/sessions (paths injected): rc-server
+    children are detected by --sdk-url or entrypoint sdk-cli, and any live registry
+    holder of the uuid that is not our tmux ka-<id8> process blocks a send/resume."""
+    SID = "9da84efe-c1ec-516d-9a86-4ecca2aec1f3"
+    CHILD = ["/h/.local/share/claude/versions/2.1.283", "--print", "--sdk-url",
+             "https://api.anthropic.com/v1/code/sessions/cse_01X", "--session-id", "cse_01X"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proc = os.path.join(self.tmp.name, "proc")
+        self.sess = os.path.join(self.tmp.name, "sessions")
+        os.makedirs(self.proc)
+        os.makedirs(self.sess)
+        self.orig = (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE)
+        ka.PROC_DIR, ka.SESSIONS_DIR = self.proc, self.sess
+        self.tmux, self.panes, self.rows = False, set(), []
+        ka.tmux_alive = lambda s: self.tmux
+        ka.tmux_pids = lambda s: set(self.panes)
+        ka.agent_entries = lambda s: list(self.rows)
+        ka.TAKE_OVER_IDLE = False
+
+    def tearDown(self):
+        (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE) = self.orig
+        self.tmp.cleanup()
+
+    def process(self, pid, argv, ppid=1, start=1000):
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        fields = ["S", str(ppid)] + ["0"] * 17 + [str(start)] + ["0"] * 10
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write(f"{pid} (x y) " + " ".join(fields) + "\n")
+
+    def registry(self, pid, sid=None, entrypoint="cli", start=1000, **kw):
+        d = {"pid": pid, "sessionId": sid or self.SID, "procStart": str(start), "kind": "interactive",
+             "entrypoint": entrypoint, **kw}
+        with open(os.path.join(self.sess, f"{pid}.json"), "w") as fh:
+            json.dump(d, fh)
+
+    def test_proc_parsing(self):
+        self.process(7, ["claude", "rc"], ppid=3, start=4242)
+        self.assertEqual(ka.proc_argv(7), ["claude", "rc"])
+        self.assertEqual((ka.proc_ppid(7), ka.proc_starttime(7)), (3, "4242"))
+        self.assertTrue(ka.pid_alive(7))
+        self.assertFalse(ka.pid_alive(8))
+        self.assertEqual((ka.proc_argv(8), ka.proc_ppid(8)), ([], None))
+
+    def test_sdk_url_child_is_rc_held_even_without_rc_parent(self):
+        self.process(100, self.CHILD, ppid=1)                        # reparented: no rc server above it
+        self.assertTrue(ka.is_sdk_child(self.CHILD))
+        self.assertTrue(ka.is_sdk_child(["x", "--print", "--sdk-url=https://x"]))
+        self.assertFalse(ka.is_sdk_child(["claude", "--resume", self.SID, "--remote-control"]))
+        self.assertTrue(ka.rc_held(100))
+        self.rows = [{"sessionId": self.SID, "pid": 100, "kind": "interactive", "status": "idle"}]
+        ok, problems, plan = ka.preflight(self.SID)
+        self.assertEqual((ok, plan), (False, None))
+        self.assertTrue(problems[0].startswith(ka.RC_HELD))
+
+    def test_sdk_cli_entrypoint_is_rc_held(self):
+        self.process(101, ["claude"], ppid=1)                         # argv tells nothing
+        self.registry(101, entrypoint="sdk-cli")
+        self.assertTrue(ka.rc_held(101))
+        ka.TAKE_OVER_IDLE = True
+        self.rows = [{"sessionId": self.SID, "pid": 101, "kind": "interactive", "status": "idle"}]
+        self.assertTrue(ka.preflight(self.SID)[1][0].startswith(ka.RC_HELD))   # never taken over
+
+    def test_registry_rc_child_not_listed_by_agents(self):
+        self.process(50, ["claude", "rc"])
+        self.process(102, self.CHILD, ppid=50)
+        self.registry(102, entrypoint="sdk-cli")
+        self.rows = []                                                # `claude agents` does not list it
+        ok, problems, _ = ka.preflight(self.SID)
+        self.assertFalse(ok)
+        self.assertTrue(problems[0].startswith(ka.RC_HELD))
+        self.assertIn("102", problems[0])
+
+    def test_registry_other_holder_not_listed_by_agents(self):
+        self.process(103, ["claude", "--resume", self.SID])
+        self.registry(103)
+        ok, problems, plan = ka.preflight(self.SID)
+        self.assertEqual((ok, plan), (False, None))
+        self.assertTrue(problems[0].startswith(ka.OTHER_HELD))
+        self.registry(103, sid="00000000-0000-4000-8000-000000000000")   # a different session: free
+        self.assertEqual(ka.preflight(self.SID), (True, [], "resume"))
+
+    def test_registry_stale_entries_are_ignored(self):
+        self.registry(104)                                            # dead pid
+        self.process(105, ["claude"], start=2000)
+        self.registry(105, start=1000)                                # pid reused by another process
+        self.assertEqual(ka.registry_holders(self.SID), set())
+        self.assertEqual(ka.preflight(self.SID), (True, [], "resume"))
+
+    def test_our_tmux_process_is_not_a_foreign_holder(self):
+        self.tmux, self.panes = True, {300}
+        self.process(300, ["bash", "run.sh"])
+        self.process(301, ["claude", "--resume", self.SID, "--remote-control"], ppid=300)
+        self.registry(301)
+        self.assertEqual(ka.preflight(self.SID), (True, [], "send-keys"))
+        self.panes = {301}                                           # claude is the pane itself
+        self.assertEqual(ka.preflight(self.SID), (True, [], "send-keys"))
+
+    def test_tmux_alive_but_foreign_holder_refuses(self):
+        self.tmux, self.panes = True, {300}
+        self.process(300, ["claude", "--resume", self.SID])
+        self.registry(300)
+        self.process(50, ["claude", "rc"])
+        self.process(102, self.CHILD, ppid=50)
+        self.registry(102, entrypoint="sdk-cli")
+        self.assertTrue(ka.preflight(self.SID)[1][0].startswith(ka.RC_HELD))
+        os.remove(os.path.join(self.sess, "102.json"))
+        self.process(106, ["claude", "--resume", self.SID])          # someone's terminal
+        self.registry(106)
+        self.assertTrue(ka.preflight(self.SID)[1][0].startswith(ka.OTHER_HELD))
+
+    def test_listed_plain_idle_holder_still_taken_over(self):
+        self.process(200, ["claude", "--resume", self.SID, "--remote-control"], ppid=10)
+        self.process(10, ["-bash"])
+        self.registry(200)                                            # listed AND in the registry
+        self.rows = [{"sessionId": self.SID, "pid": 200, "kind": "interactive", "status": "idle"}]
+        self.assertFalse(ka.preflight(self.SID)[0])                  # opt-in only
+        ka.TAKE_OVER_IDLE = True
+        self.assertEqual(ka.preflight(self.SID), (True, [], "take-over:200"))
+
+
 class DryRunLoop(unittest.TestCase):
     """Full CLI pass in a sandbox: detection -> decision -> handle_fire in
     dry-run. `claude` is shadowed by a stub on PATH that records calls and

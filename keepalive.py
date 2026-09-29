@@ -45,6 +45,10 @@ UTC = timezone.utc
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.environ.get("KEEPALIVE_PROJECTS_DIR", os.path.expanduser("~/.claude/projects"))
 JOBS_DIR = os.path.expanduser("~/.claude/jobs")
+# Per-process registry every live claude writes (<pid>.json: pid, sessionId, procStart,
+# kind, entrypoint, ...). Both paths are injectable so tests can use a fake /proc.
+SESSIONS_DIR = os.environ.get("KEEPALIVE_SESSIONS_DIR", os.path.expanduser("~/.claude/sessions"))
+PROC_DIR = os.environ.get("KEEPALIVE_PROC_DIR", "/proc")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR", HERE)
 STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")
@@ -346,28 +350,94 @@ def tmux_alive(session_id):
                           capture_output=True).returncode == 0
 
 
+def tmux_pids(session_id):
+    """Pane pids of our own tmux session ka-<id8> (empty if none)."""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return {int(x) for x in r.stdout.split() if x.isdigit()} if r.returncode == 0 else set()
+
+
 def pid_alive(pid):
-    return bool(pid) and os.path.exists(f"/proc/{pid}")
+    return bool(pid) and os.path.exists(os.path.join(PROC_DIR, str(pid)))
 
 
 ARCHIVED_MARK = "this session was ended or archived from another device"
 RC_HELD = "held by a `claude rc` server"
+OTHER_HELD = "held by another live process"
 
 
 def proc_argv(pid):
     try:
-        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+        with open(os.path.join(PROC_DIR, str(int(pid)), "cmdline"), "rb") as fh:
             return [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
     except (OSError, ValueError):
         return []
 
 
+def _proc_stat(pid):
+    """Fields after the `(comm)` of /proc/<pid>/stat: [0]=state, [1]=ppid, [19]=starttime."""
+    try:
+        with open(os.path.join(PROC_DIR, str(int(pid)), "stat")) as fh:
+            return fh.read().rsplit(")", 1)[1].split()
+    except (OSError, ValueError, IndexError):
+        return []
+
+
 def proc_ppid(pid):
     try:
-        with open(f"/proc/{int(pid)}/stat") as fh:
-            return int(fh.read().rsplit(")", 1)[1].split()[1])
-    except (OSError, ValueError, IndexError):
+        return int(_proc_stat(pid)[1])
+    except (ValueError, IndexError):
         return None
+
+
+def proc_starttime(pid):
+    try:
+        return _proc_stat(pid)[19]
+    except IndexError:
+        return None
+
+
+def session_entry(pid):
+    """The ~/.claude/sessions/<pid>.json registry entry of a process, or {}."""
+    try:
+        with open(os.path.join(SESSIONS_DIR, f"{int(pid)}.json")) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def registry_holders(session_id):
+    """Live pids whose ~/.claude/sessions/<pid>.json holds `session_id`. This sees
+    holders `claude agents --json` may not list. An entry whose procStart does
+    not match the live process's start time is a stale file of a reused pid."""
+    out = set()
+    for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            pid = int(d.get("pid") or os.path.basename(path)[:-5])
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if d.get("sessionId") != session_id or not pid_alive(pid):
+            continue
+        start = d.get("procStart")
+        if start is not None and proc_starttime(pid) not in (None, str(start)):
+            continue
+        out.add(pid)
+    return out
+
+
+def is_ours(pid, ours, depth=32):
+    """True if `pid` is one of the pane pids `ours` (our tmux ka-<id8>) or runs under one."""
+    while pid and depth > 0:
+        if pid in ours:
+            return True
+        pid, depth = proc_ppid(pid), depth - 1
+    return False
 
 
 def is_rc_server(argv):
@@ -377,13 +447,25 @@ def is_rc_server(argv):
     return bool(args) and args[0] in ("rc", "remote-control") and "--print" not in args
 
 
+def is_sdk_child(argv):
+    """An rc-server thread child: `.../versions/<v> --print --sdk-url https://.../code/sessions/cse_...`."""
+    return any(a == "--sdk-url" or a.startswith("--sdk-url=") for a in argv[1:])
+
+
 def rc_held(pid):
-    """True if `pid` is a `claude rc` server or one of its per-thread children.
-    Taking such a holder over + resuming does NOT move the thread: the rc thread
-    stays alive in the app and a second RC thread with the same uuid appears
-    (two writers on one transcript; live test 29.09.). So never take it over."""
+    """True if `pid` is a `claude rc` server or one of its per-thread children:
+    the server itself, anything with `--sdk-url` in its argv, anything whose
+    registry entry says entrypoint "sdk-cli", or a child of an rc server.
+    Taking such a holder over + resuming does NOT move the thread: killing the
+    child does not free it either (the rc server re-serves the thread on the next
+    app message and rebuilds the local transcript), so any take-over + resume
+    makes a second RC thread with the same uuid (two writers on one transcript;
+    live tests 29.09.). So never take it over."""
+    argv = proc_argv(pid)
+    if is_rc_server(argv) or is_sdk_child(argv) or session_entry(pid).get("entrypoint") == "sdk-cli":
+        return True
     ppid = proc_ppid(pid)
-    return is_rc_server(proc_argv(pid)) or bool(ppid and is_rc_server(proc_argv(ppid)))
+    return bool(ppid and is_rc_server(proc_argv(ppid)))
 
 
 def archived_since_last_message(path):
@@ -404,21 +486,36 @@ def archived_since_last_message(path):
 def preflight(session_id):
     """-> (ok, problems[], plan). No --bg anymore: the session is continued in
     its tmux session (send-keys) or resumed into a new one. A live process
-    elsewhere would make a fresh resume FORK a copy, so:
+    elsewhere would make a fresh resume FORK a copy, so (rc / registry checks first):
       - live in our tmux            -> plan 'send-keys'
       - live interactive elsewhere  -> refuse (someone's terminal), unless archived
                                        or --take-over-idle: SIGTERM it, then resume
       - held by a `claude rc` server -> always refuse (a take-over would fork the
-                                       user's RC thread)
+                                       user's RC thread): the server, a child of it,
+                                       argv with --sdk-url, or registry entrypoint sdk-cli
+      - any other live pid in ~/.claude/sessions/*.json on this uuid that is not our
+        tmux ka-<id8> process and not a `claude agents` row -> refuse (OTHER_HELD)
       - live bg worker              -> plan 'stop-bg-then-resume'
       - nothing alive               -> plan 'resume'"""
-    if tmux_alive(session_id):
-        return True, [], "send-keys"
-    rows = [a for a in agent_entries(session_id) if pid_alive(a.get("pid"))]
-    held = [a["pid"] for a in rows if rc_held(a.get("pid"))]
+    in_tmux = tmux_alive(session_id)
+    ours = tmux_pids(session_id) if in_tmux else set()
+    # Every live process the session registry says holds this uuid, except our own
+    # tmux ka-<id8> process (and its children).
+    reg = sorted(p for p in registry_holders(session_id) if not is_ours(p, ours))
+    rows = [] if in_tmux else [a for a in agent_entries(session_id)
+                               if pid_alive(a.get("pid")) and not is_ours(a.get("pid"), ours)]
+    row_pids = [a["pid"] for a in rows]
+    held = sorted({p for p in row_pids + reg if rc_held(p)})
     if held:
         return False, [f"{RC_HELD} thread (pid {held}); a take-over would fork the user's Remote Control "
                        "thread, so it is left alone"], None
+    extra = [p for p in reg if p not in row_pids]
+    if extra:
+        return False, [f"{OTHER_HELD} {extra} (~/.claude/sessions" + (", outside our tmux" if in_tmux else
+                       ", not listed by `claude agents`") + "); a send or resume would make two writers "
+                       "on one transcript, so it is left alone"], None
+    if in_tmux:
+        return True, [], "send-keys"
     if any(a.get("state") == "working" or a.get("status") == "busy" for a in rows):
         return False, ["session is busy in another process (someone is using it)"], None
     inter = [a for a in rows if a.get("kind") == "interactive"]
