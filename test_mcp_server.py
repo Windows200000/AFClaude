@@ -172,6 +172,15 @@ class Projects(Env):
         self.assertEqual((r["name"], r["path"]), ("Bee", self.work))
         r = run(ms.afclaude_project("edit", name=".", description="the caller's"))   # '.' = caller's project
         self.assertEqual((r["name"], r["description"]), ("Bee", "the caller's"))
+        mgr = "f0000000-0000-4000-8000-000000000001"
+        r = run(ms.afclaude_project("edit", name="A", manager_session=mgr))       # full uuid, not scanned yet
+        self.assertEqual(r["manager_session"], mgr)
+        lst = run(ms.afclaude_project("list"))["projects"]
+        self.assertEqual([p.get("manager_session") for p in lst if p["name"] == "A"], [mgr])
+        r = run(ms.afclaude_project("edit", name="A", manager_session=""))        # '' = unmanaged
+        self.assertNotIn("manager_session", r)
+        with self.assertRaisesRegex(ToolError, "no session matches"):
+            asyncio.run(ms.afclaude_project("edit", name="A", manager_session="zzzz"))
         for coro, msg in ((ms.afclaude_project("move", name="A"), "move needs rank"),
                           (ms.afclaude_project("prio", name="A"), "prio needs priority"),
                           (ms.afclaude_project("add"), "add needs name"),

@@ -31,7 +31,7 @@ Remove it: `claude mcp remove --scope user afclaude`.
 | `afclaude_get_task` | one task with description, Q&A and event history |
 | `afclaude_update_task` | title, description, priority, project, stage position, and status (done, cancelled, pending = reopen, in_progress, blocked + question), all in one atomic call |
 | `afclaude_answer_task` | answer a blocked task, which makes it pending again |
-| `afclaude_project` | the ranked project list: `list`, `add`, `move`, `prio` (every open stage at once), `edit` |
+| `afclaude_project` | the ranked project list: `list`, `add`, `move`, `prio` (every open stage at once), `edit` (incl. `manager_session`: a managed project is worked by that session, the dispatcher starts no task sessions for it) |
 | `afclaude_inbox` | everything waiting for you: blocked tasks and undecided stalled sessions (runs the stalled scan first) |
 | `afclaude_decide_session` | continue, ignore or clear for one stalled session (id or prefix) |
 | `afclaude_rule` | standing continue/ignore rules: `list`, `add`, `rm` |

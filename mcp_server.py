@@ -95,7 +95,8 @@ def task_full(t, events):
 
 def project_brief(p):
     return compact({"rank": p["rank"], "name": p["name"], "open": p.get("open"), "ready": p.get("ready"),
-                    "path": p["path"], "description": p["description"]})
+                    "path": p["path"], "description": p["description"],
+                    "manager_session": p.get("manager_session")})
 
 
 def session_brief(s):
@@ -288,11 +289,14 @@ async def afclaude_answer_task(id: int, answer: str) -> str:
 
 @tool("AFClaude projects, a ranked list (1 = top). action: list; add (name, optional rank, path, description); "
       "move (name, rank); prio (name, priority: sets every open stage of the project); edit (name, new_name/"
-      "description/path). name may be '.' = the caller's project; path '.' = the caller's directory.")
+      "description/path/manager_session). name may be '.' = the caller's project; path '.' = the caller's "
+      "directory. manager_session (session id or unique prefix; '' = none) makes the project managed: that "
+      "session works its stages itself and the dispatcher starts no task sessions for it.")
 async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"], name: Optional[str] = None,
                            rank: Optional[int] = None, priority: Optional[Priority] = None,
                            description: Optional[str] = None, new_name: Optional[str] = None,
-                           path: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+                           path: Optional[str] = None, manager_session: Optional[str] = None,
+                           ctx: Optional[Context] = None) -> str:
     conn = db()
     try:
         if action == "list":
@@ -316,8 +320,11 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
         else:
             f = {k: v for k, v in (("name", new_name), ("description", description), ("path", path))
                  if v is not None}
+            if manager_session is not None:
+                f["manager_session"] = (cli.resolve_session(conn, manager_session.strip())
+                                        if manager_session.strip() else None)
             if not f:
-                raise ValueError("edit needs new_name, description or path")
+                raise ValueError("edit needs new_name, description, path or manager_session")
             p = store.update_project(conn, ref, **f)
         return out(project_brief(p))
     finally:

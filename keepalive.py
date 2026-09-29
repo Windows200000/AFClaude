@@ -351,6 +351,39 @@ def pid_alive(pid):
 
 
 ARCHIVED_MARK = "this session was ended or archived from another device"
+RC_HELD = "held by a `claude rc` server"
+
+
+def proc_argv(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            return [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+    except (OSError, ValueError):
+        return []
+
+
+def proc_ppid(pid):
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def is_rc_server(argv):
+    """`claude rc` / `claude remote-control`: the server whose per-thread children
+    (`--print --sdk-url ...`) hold the user's Remote Control threads."""
+    args = argv[1:]
+    return bool(args) and args[0] in ("rc", "remote-control") and "--print" not in args
+
+
+def rc_held(pid):
+    """True if `pid` is a `claude rc` server or one of its per-thread children.
+    Taking such a holder over + resuming does NOT move the thread: the rc thread
+    stays alive in the app and a second RC thread with the same uuid appears
+    (two writers on one transcript; live test 29.09.). So never take it over."""
+    ppid = proc_ppid(pid)
+    return is_rc_server(proc_argv(pid)) or bool(ppid and is_rc_server(proc_argv(ppid)))
 
 
 def archived_since_last_message(path):
@@ -373,12 +406,19 @@ def preflight(session_id):
     its tmux session (send-keys) or resumed into a new one. A live process
     elsewhere would make a fresh resume FORK a copy, so:
       - live in our tmux            -> plan 'send-keys'
-      - live interactive elsewhere  -> refuse (someone's terminal)
+      - live interactive elsewhere  -> refuse (someone's terminal), unless archived
+                                       or --take-over-idle: SIGTERM it, then resume
+      - held by a `claude rc` server -> always refuse (a take-over would fork the
+                                       user's RC thread)
       - live bg worker              -> plan 'stop-bg-then-resume'
       - nothing alive               -> plan 'resume'"""
     if tmux_alive(session_id):
         return True, [], "send-keys"
     rows = [a for a in agent_entries(session_id) if pid_alive(a.get("pid"))]
+    held = [a["pid"] for a in rows if rc_held(a.get("pid"))]
+    if held:
+        return False, [f"{RC_HELD} thread (pid {held}); a take-over would fork the user's Remote Control "
+                       "thread, so it is left alone"], None
     if any(a.get("state") == "working" or a.get("status") == "busy" for a in rows):
         return False, ["session is busy in another process (someone is using it)"], None
     inter = [a for a in rows if a.get("kind") == "interactive"]

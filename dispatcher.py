@@ -126,7 +126,7 @@ def load_state():
             st = json.load(fh)
     except (OSError, json.JSONDecodeError):
         st = {}
-    for k in ("sessions", "handled", "starts", "launch_failures", "alerted"):
+    for k in ("sessions", "handled", "starts", "launch_failures", "alerted", "rc_held"):
         st.setdefault(k, {})
     return st
 
@@ -285,27 +285,6 @@ def session_model(sid):
         if e.get("type") == "assistant" and not e.get("isSidechain") and m and m != "<synthetic>":
             model = m
     return model
-
-
-def rc_server_pids(pids):
-    """The pids among `pids` that are a `claude rc` / remote-control SERVER (the
-    parent of the per-session `--print --sdk-url` children). Taking over the idle
-    child is fine; the server itself must never be signalled."""
-    bad = []
-    for pid in pids:
-        try:
-            with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
-                argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
-        except (OSError, ValueError):
-            continue
-        if is_rc_server(argv):
-            bad.append(int(pid))
-    return bad
-
-
-def is_rc_server(argv):
-    args = argv[1:]
-    return bool(args) and args[0] in ("rc", "remote-control") and "--print" not in args
 
 
 def reply_after(sid, since):
@@ -475,6 +454,14 @@ class Pass:
         if not cwd:
             return self.skip(label, "no existing working directory recorded; not resumable")
         ok, problems, plan = ka.preflight(sid)
+        if not ok and problems and problems[0].startswith(ka.RC_HELD):
+            # the user has it open in the Remote Control app: skip, retry next pass, log once per stall
+            self.skip(label, "skipped, " + problems[0])
+            if key not in self.st.setdefault("rc_held", {}):
+                log(f"not continuing {sid[:8]}: {problems[0]}")
+                if self.arm:
+                    self.st["rc_held"][key] = store.iso(self.now)
+            return
         if not ok:
             self.skip(label, "preflight refused: " + "; ".join(problems))
             if self.arm:
@@ -487,11 +474,6 @@ class Pass:
         if not ctx and managed_project:
             ctx = (f"This session manages the AFClaude project {managed_project['name']!r}: keep working through "
                    f"its open stages (afclaude_list_tasks) and keep their status current (afclaude_update_task).")
-        if plan.startswith("take-over:"):
-            bad = rc_server_pids(plan.split(":", 1)[1].split(","))
-            if bad:
-                return self.skip(label, f"preflight wants to take over pid(s) {bad}, which are a `claude rc` "
-                                        "server itself (only its per-session child may be taken over)")
         reason_txt = "dispatcher, " + detail
         af = is_afclaude_cwd(cwd)
         model = None                                  # AFClaude sessions: LAUNCH (Opus 5.5, high)
@@ -697,6 +679,7 @@ def prune_state(st, now, days=7):
                       if v.get("status") == "running"
                       or (v.get("cleaned_at") or v.get("ended_at") or v.get("released_at") or "9") > cut}
     st["handled"] = {k: v for k, v in st["handled"].items() if (v.get("at") or "9") > cut}
+    st["rc_held"] = {k: v for k, v in st["rc_held"].items() if v > cut}
     st["starts"] = dict(sorted(st["starts"].items())[-14:])
 
 

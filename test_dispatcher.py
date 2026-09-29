@@ -609,19 +609,83 @@ class Prompts(Base):
         self.assertEqual(call[call.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(call.count("--new"), 0)
 
-    def test_rc_server_is_never_taken_over(self):
+    def test_rc_server_argv(self):
         server = ["claude", "rc"]
         child = ["/home/u/.local/share/claude/versions/2.1.283", "--print", "--sdk-url", "https://x/y",
                  "--session-id", "cse_1", "--input-format", "stream"]
-        self.assertTrue(dp.is_rc_server(server))
-        self.assertFalse(dp.is_rc_server(child))
-        self.assertFalse(dp.is_rc_server(["claude", "--resume", sid(1), "--remote-control"]))
-        self.assertEqual(dp.rc_server_pids([os.getpid()]), [])
+        self.assertTrue(ka.is_rc_server(server))
+        self.assertTrue(ka.is_rc_server(["claude", "remote-control"]))
+        self.assertFalse(ka.is_rc_server(child))
+        self.assertFalse(ka.is_rc_server(["claude", "--resume", sid(1), "--remote-control"]))
+        self.assertFalse(ka.rc_held(os.getpid()))                   # this test process: no rc server
 
     def test_keepalive_message_keeps_all_manager_rules(self):
         m = ka.session_message("continue", reason="r", progress="P.md")
         for part in ("PROJECT MANAGER", "usage_report.py", "OPEN_QUESTIONS.md", "PUBLIC", "worktree"):
             self.assertIn(part, m)
+
+
+class Holders(Base):
+    """preflight with fake holder processes: an rc-server thread is never taken over,
+    an idle plain interactive holder (terminal, `claude --resume` in a tty) is."""
+    PROCS = {100: (50, ["/x/versions/2.1.283", "--print", "--sdk-url", "https://x", "--session-id", "cse_1"]),
+             50: (1, ["claude", "rc"]),
+             200: (10, ["claude", "--resume", sid(1), "--remote-control"]),
+             10: (1, ["-bash"])}
+
+    def setUp(self):
+        super().setUp()
+        self.orig = (ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid)
+        self.rows = []
+        ka.agent_entries = lambda s: list(self.rows)
+        ka.pid_alive = lambda pid: pid in self.PROCS
+        ka.proc_argv = lambda pid: self.PROCS.get(pid, (None, []))[1]
+        ka.proc_ppid = lambda pid: self.PROCS.get(pid, (None, []))[0]
+
+    def tearDown(self):
+        ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid = self.orig
+        super().tearDown()
+
+    def test_preflight(self):
+        ka.TAKE_OVER_IDLE = True
+        self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
+        ok, problems, plan = ka.preflight(sid(1))
+        self.assertFalse(ok)
+        self.assertTrue(problems[0].startswith(ka.RC_HELD))
+        self.rows = [{"sessionId": sid(1), "pid": 50, "kind": "interactive", "status": "idle"}]   # the server
+        self.assertFalse(ka.preflight(sid(1))[0])
+        self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "busy"}]
+        self.assertTrue(ka.preflight(sid(1))[1][0].startswith(ka.RC_HELD))
+        self.rows = [{"sessionId": sid(1), "pid": 200, "kind": "interactive", "status": "idle"}]
+        self.assertEqual(ka.preflight(sid(1)), (True, [], "take-over:200"))
+        ka.TAKE_OVER_IDLE = False
+        self.assertFalse(ka.preflight(sid(1))[0])
+
+    def approved_stall(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+
+    def test_dispatcher_skips_rc_held_quietly(self):
+        self.approved_stall()
+        self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
+        for _ in range(3):
+            rep = self.run_pass(take_over_idle=True)                 # the default, and still refused
+            self.assertTrue(any("held by a `claude rc` server" in s for s in rep["skip"]))
+        self.assertEqual(self.resume_calls(), [])
+        self.assertEqual(self.alerts, [])
+        self.assertEqual(self.st["handled"], {})                     # retried once the rc thread is gone
+        self.assertEqual(sum("not continuing" in ln for ln in self.logs), 1)   # logged once per stall
+        self.rows = []
+        rep = self.run_pass()
+        self.assertEqual(self.resumed_sessions(), [sid(1)])
+
+    def test_dispatcher_takes_over_plain_idle_holder(self):
+        self.approved_stall()
+        self.rows = [{"sessionId": sid(1), "pid": 200, "kind": "interactive", "status": "idle"}]
+        rep = self.run_pass(arm=False, take_over_idle=True)          # dry-run: no SIGTERM to a fake pid
+        self.assertEqual([(c["sid"], c["plan"]) for c in rep["continue"]], [(sid(1), "take-over:200")])
+        self.assertEqual(self.resume_calls(), [])
 
 
 class Store(unittest.TestCase):
