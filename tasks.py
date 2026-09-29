@@ -14,7 +14,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py project list                  projects by rank (1 = top)
     tasks.py project move P RANK
     tasks.py project prio P high|medium|low   every open stage of the project at once
-    tasks.py project edit P [--name N] [-d TEXT] [--path DIR]
+    tasks.py project edit P [--name N] [-d TEXT] [--path DIR] [--manager SESSION|""]
     tasks.py block ID "question"           -> blocked, waits for the user
     tasks.py answer ID "answer"            -> pending again, for the next pass
     tasks.py start ID [--session S]        -> in_progress
@@ -96,7 +96,8 @@ def print_projects(rows):
     for p in rows:
         r = p["ready"]
         print(f"{p['rank']:>4}  {p['open']:>4}  {r['high']:>3}/{r['medium']}/{r['low']:<5}  "
-              f"{cut(p['name'], 20):20}  {p['path'] or '-'}")
+              f"{cut(p['name'], 20):20}  {p['path'] or '-'}"
+              + (f"  (managed by {p['manager_session'][:8]})" if p.get("manager_session") else ""))
 
 
 def event_text(e):
@@ -234,8 +235,10 @@ def run_project(conn, args):
     elif pc == "edit":
         f = {k: v for k, v in (("name", args.name), ("description", args.description),
                                ("path", project_ref(args.path))) if v is not None}
+        if args.manager is not None:   # "" clears it
+            f["manager_session"] = resolve_session(conn, args.manager) if args.manager.strip() else None
         if not f:
-            raise ValueError("nothing to change (use --name/-d/--path)")
+            raise ValueError("nothing to change (use --name/-d/--path/--manager)")
         p = store.update_project(conn, project_ref(args.project), **f)
     else:  # prio
         r = store.set_project_priority(conn, project_ref(args.project), args.priority)
@@ -376,6 +379,9 @@ def parser():
     q.add_argument("--name")
     q.add_argument("-d", "--description")
     q.add_argument("--path")
+    q.add_argument("--manager", metavar="SESSION",
+                   help="managed project: this session works its stages, the dispatcher starts no "
+                        "task sessions for it (\"\" = unmanaged)")
     p = sub.add_parser("show", parents=[js], help="task + history")
     p.add_argument("id", type=int)
     p = sub.add_parser("edit", parents=[js], help="change title/description/project/kind")

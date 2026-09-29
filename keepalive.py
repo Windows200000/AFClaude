@@ -51,6 +51,7 @@ STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")
 LOCK_FILE = os.path.join(STATE_DIR, "keepalive.lock")
 STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
+KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
 WINDOW_START = dtime(0, 0)          # Europe/Berlin
 WINDOW_END = dtime(8, 0)            # Europe/Berlin, exclusive
@@ -90,10 +91,17 @@ def load_prompt(name):
         return fh.read()
 
 
-def session_message(name, **fields):
-    """One-line message for a session: <name>.md + guard_respect.md + manager.md.
-    One line because tmux send-keys would submit at the first newline."""
-    parts = [load_prompt(name).format(**fields), load_prompt("guard_respect"), load_prompt("manager")]
+def session_message(name, afclaude=True, manager=True, **fields):
+    """One-line message for a session: <name>.md + guard_respect.md + manager.md
+    + manager_afclaude.md (the AFClaude-repo rules). afclaude=False leaves those
+    rules out for sessions working elsewhere; manager=False leaves out both
+    manager files (the user's own sessions get a neutral message). One line
+    because tmux send-keys would submit at the first newline."""
+    parts = [load_prompt(name).format(**fields), load_prompt("guard_respect")]
+    if manager:
+        parts.append(load_prompt("manager"))
+        if afclaude:
+            parts.append(load_prompt("manager_afclaude"))
     return " ".join(" ".join(parts).split())
 
 
@@ -390,8 +398,9 @@ def preflight(session_id):
     return True, [], "resume"
 
 
-def fire(session_id, cwd, message, plan, new=False, name=None):
-    """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg)."""
+def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
+    """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg).
+    name/model override LAUNCH's for this launch."""
     if plan.startswith("take-over:"):
         import signal
         pids = [int(x) for x in plan.split(":", 1)[1].split(",")]
@@ -408,9 +417,9 @@ def fire(session_id, cwd, message, plan, new=False, name=None):
         subprocess.run(["claude", "stop", session_id[:8]], env=SCRUBBED_ENV,
                        capture_output=True, timeout=60)
         time.sleep(5)
-    cmd = [os.path.join(HERE, "ka_resume.sh"), "--session", session_id, "--message", message,
+    cmd = [KA_RESUME, "--session", session_id, "--message", message,
            "--cwd", cwd]
-    for k, v in {**LAUNCH, **({"name": name} if name else {})}.items():
+    for k, v in {**LAUNCH, **({"name": name} if name else {}), **({"model": model} if model else {})}.items():
         if v:
             cmd += [f"--{k}", v]
     if new:
