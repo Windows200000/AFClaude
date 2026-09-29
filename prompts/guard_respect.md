@@ -1,0 +1,1 @@
+Guard hooks may be disabled in automated runs; respect them anyway: before any state-changing or destructive command or any edit outside your work dir, read /mnt/BlockVolume/Claude/.claude/hooks/guard-destructive-bash.sh and guard-sensitive-edit.sh and treat anything they would 'ask' about as needing the user's approval (log it in PROGRESS.md as a morning question instead).

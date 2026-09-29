@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>AFClaude status</title>
+<link rel="icon" href="/favicon.png">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: #121212; color: #e8eaed; padding: 20px 16px 110px; min-height: 100vh;
+    font-size: 15px; line-height: 1.5;
+}
+h1, h2, h3 { color: #7e22ce; }
+a { color: #a855f7; }
+.wrap { max-width: 800px; margin: 0 auto; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; margin-bottom: 18px; }
+header h1 { font-size: 28px; }
+.meta { color: #9ca3af; font-size: 13px; }
+.meta.stale { color: #f59e0b; }
+button { background: #1e1e1e; color: #e8eaed; border: 1px solid rgba(255,255,255,.15); border-radius: 8px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+button:hover { border-color: #7e22ce; }
+section { background: #1e1e1e; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; padding: 18px 20px; margin-bottom: 18px; }
+section h2 { font-size: 19px; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+.count { font-size: 12px; font-weight: 600; background: #7e22ce; color: #fff; border-radius: 99px; padding: 1px 9px; }
+.count.zero { background: #2a2a2a; color: #9ca3af; }
+.mut { color: #9ca3af; font-size: 13px; }
+.item { border-left: 3px solid #7e22ce; padding: 6px 0 6px 12px; margin: 8px 0; }
+.item .src { color: #9ca3af; font-size: 12px; margin-bottom: 2px; }
+.goals { list-style: none; }
+.goals li { padding: 5px 0; display: flex; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.06); }
+.goals li:last-child { border-bottom: none; }
+.goals li.side:first-of-type { border-top: 1px dashed rgba(255,255,255,.15); margin-top: 4px; padding-top: 9px; }
+.goals .n { color: #9ca3af; min-width: 1.6em; text-align: right; }
+.goals .done .t { color: #9ca3af; text-decoration: line-through; }
+.goals .cur .t { color: #fff; font-weight: 600; }
+.goals .blocked .t { color: #f59e0b; }
+.tick { width: 1.2em; }
+.tag { font-size: 11px; background: #7e22ce; color: #fff; border-radius: 4px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.tile { background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; padding: 10px 12px; }
+.tile .k { color: #9ca3af; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.tile .v { font-size: 21px; font-weight: 600; }
+.bar { height: 6px; background: #2a2a2a; border-radius: 3px; margin: 6px 0 4px; overflow: hidden; }
+.bar > div { height: 100%; background: #7e22ce; }
+.bar > div.hi { background: #ef4444; }
+.ok { color: #22c55e; } .warn { color: #f59e0b; } .bad { color: #ef4444; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+pre { background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+code { background: #2a2a2a; border-radius: 4px; padding: 0 4px; word-break: break-word; }
+pre code { background: none; padding: 0; }
+.md p, .md ul, .md ol, .md pre, .md table { margin: 6px 0; }
+.md ul, .md ol { padding-left: 1.4em; }
+.md h1 { font-size: 22px; margin: 14px 0 8px; } .md h2 { font-size: 18px; margin: 14px 0 6px; } .md h3 { font-size: 16px; margin: 12px 0 6px; }
+.md table { border-collapse: collapse; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid rgba(255,255,255,.1); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md blockquote { border-left: 3px solid #444; padding-left: 10px; color: #9ca3af; }
+.sess { border-bottom: 1px solid rgba(255,255,255,.06); padding: 8px 0; }
+.sess:last-child { border-bottom: none; }
+.sess .id { font-family: ui-monospace, monospace; font-size: 13px; }
+details { border-top: 1px solid rgba(255,255,255,.08); padding: 8px 0; }
+details:first-of-type { border-top: none; }
+summary { cursor: pointer; font-weight: 500; }
+summary .mut { font-weight: 400; margin-left: 6px; }
+details > .md { padding: 8px 0 4px; }
+.err { background: #3b0d0d; border: 1px solid #7f1d1d; color: #fecaca; border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; }
+.sub { font-size: 15px; color: #e8eaed; margin: 16px 0 6px; }
+.decision { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 8px 10px; word-break: break-word; }
+@media (max-width: 520px) {
+    body { padding: 14px 12px 110px; }
+    section { padding: 14px; }
+    header h1 { font-size: 23px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>AFClaude status</h1>
+    <div><span id="updated" class="meta">loading…</span> <button id="reload" type="button">Refresh</button></div>
+  </header>
+  <div id="error" class="err" hidden></div>
+
+  <section id="s-input">
+    <h2>Needs your input <span id="c-input" class="count zero">0</span></h2>
+    <div id="input"></div>
+  </section>
+
+  <section>
+    <h2>Keep-alive &amp; usage</h2>
+    <div id="usage" class="grid"></div>
+  </section>
+
+  <section>
+    <h2>Progress</h2>
+    <ol id="goals" class="goals"></ol>
+  </section>
+
+  <section>
+    <h2>Latest keep-alive decision</h2>
+    <div id="decision" class="decision mut">–</div>
+  </section>
+
+  <section>
+    <h2>Scheduled (cron, tagged AFClaude)</h2>
+    <div id="cron"></div>
+  </section>
+
+  <section>
+    <h2>Files</h2>
+    <div id="docs"></div>
+    <h3 class="sub">Prompts</h3>
+    <div id="prompts"></div>
+  </section>
+  <p class="mut">Read-only quickview. Data comes from ovm1 on every page load (export every 3 min). All times Europe/Berlin.</p>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+(function () {
+  "use strict";
+  var BASE = "/private/AFClaude-data/";
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function md(text) {
+    if (window.marked && window.DOMPurify) {
+      return '<div class="md">' + DOMPurify.sanitize(marked.parse(String(text || ""))) + "</div>";
+    }
+    return "<pre>" + esc(text) + "</pre>";   // CDN blocked: plain text fallback
+  }
+  function berlin(iso) {
+    try {
+      return new Intl.DateTimeFormat("de-DE", { timeZone: "Europe/Berlin", weekday: "short", day: "2-digit",
+        month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
+    } catch (e) { return iso; }
+  }
+
+  function get(path, asText) {
+    return fetch(BASE + path, { cache: "no-store", credentials: "same-origin", redirect: "manual" })
+      .then(function (r) {
+        if (r.type === "opaqueredirect" || r.status === 0) throw new Error("Login expired. Reload the page to sign in again.");
+        if (!r.ok) throw new Error("Could not load " + path + " (HTTP " + r.status + ").");
+        return asText ? r.text() : r.json();
+      });
+  }
+
+  function tile(k, v, extra) {
+    return '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v">' + v + "</div>" + (extra || "") + "</div>";
+  }
+  function pctTile(k, u) {
+    if (!u) return tile(k, "–");
+    var pc = Math.round(u.percent);
+    return tile(k, pc + "%", '<div class="bar"><div class="' + (pc >= 80 ? "hi" : "") + '" style="width:' +
+      Math.min(100, pc) + '%"></div></div><div class="mut">resets ' + esc(u.resets_at_berlin || "?") + "</div>");
+  }
+  function renderUsage(s) {
+    var k = s.keepalive || {}, out = [];
+    if (k.usage_error) out.push(tile("Usage", "–", '<div class="mut">' + esc(k.usage_error) + "</div>"));
+    else {
+      out.push(pctTile("Session", k.session));
+      out.push(pctTile("Week", k.weekly));
+      var b = k.budget_rule_now || {};
+      out.push(tile("Budget rule", b["continue"] ? '<span class="ok">CONTINUE</span>' : '<span class="warn">HOLD</span>',
+        '<div class="mut">' + esc(b.reason || "") + "</div>"));
+    }
+    var w = k.watcher || {};
+    out.push(tile("Watcher", w.running ? '<span class="ok">running</span>' : (w.running === false ? '<span class="bad">not running</span>' : "?"),
+      w.pids && w.pids.length ? '<div class="mut">pid ' + esc(w.pids.join(", ")) + "</div>" : ""));
+    out.push(tile("tmux ka-f2897285", k.tmux_ka_exists ? '<span class="ok">up</span>' : '<span class="bad">down</span>'));
+    out.push(tile("Next window", esc(k.next_window_berlin || "?")));
+    out.push(tile("Next usage review", esc(k.next_usage_review_berlin || "–")));
+    $("usage").innerHTML = out.join("");
+  }
+
+  function renderGoals(s) {
+    var goals = s.goals || [];
+    var markText = { "x": "done", "~": "in progress", " ": "open", "!": "blocked" };
+    var markIcon = { "x": '<span class="ok">✓</span>', "~": '<span class="warn">◐</span>', " ": "○", "!": '<span class="bad">✗</span>' };
+    $("goals").innerHTML = goals.map(function (g, i) {
+      var cls = (g.marker === "x" ? "done" : g.marker === "!" ? "blocked" : g.marker === "~" ? "cur" : "");
+      var sideStart = g.side && (i === 0 || !goals[i - 1].side);
+      return '<li class="' + cls + (g.side ? " side" : "") + '"' + (sideStart ? ' style="margin-top:6px"' : "") + '>' +
+        '<span class="tick">' + (markIcon[g.marker] || "○") + '</span>' +
+        '<span class="t">' + esc(g.text) + '<span class="tag" title="' + esc(markText[g.marker] || "") + '">' +
+        (g.side ? "side" : "") + '</span></span></li>';
+    }).join("") || '<li class="mut">No goals found in GOALS.md.</li>';
+  }
+
+  function renderDecision(s) {
+    $("decision").textContent = s.latest_decision || "(no keep-alive log entries yet)";
+  }
+
+  function renderInput(s) {
+    var n = s.needs_input || {}, out = [];
+    (n.open_questions || []).forEach(function (q) {
+      out.push('<div class="item"><div class="src">OPEN_QUESTIONS.md</div>' + md(q) + "</div>");
+    });
+    (n.blocked_tasks || []).forEach(function (t) {
+      out.push('<div class="item"><div class="src">blocked task' + (t.project ? " · " + esc(t.project) : "") +
+        '</div><strong>' + esc(t.title || "(untitled)") + "</strong>" +
+        (t.question ? "<br>" + esc(t.question) : "") + "</div>");
+    });
+    if (n.error) out.push('<div class="item alert"><div class="src">task store</div>' + esc(n.error) + "</div>");
+    $("input").innerHTML = out.join("") || '<p class="mut">Nothing open.</p>';
+    var count = n.count || 0;
+    $("c-input").textContent = count;
+    $("c-input").className = "count" + (count ? "" : " zero");
+  }
+
+  function renderCron(s) {
+    $("cron").innerHTML = (s.cron || []).map(function (c) {
+      return '<div class="sess"><code>' + esc(c.schedule_berlin || c.schedule_utc) + "</code> " + esc(c.what) + "</div>";
+    }).join("") || '<p class="mut">No AFClaude cron entries.</p>';
+  }
+
+  function docList(el, list, titleKey) {
+    el.innerHTML = "";
+    (list || []).forEach(function (d) {
+      var det = document.createElement("details");
+      det.innerHTML = "<summary>" + esc(d[titleKey] || d.name) + '<span class="mut">' + esc(d.name) +
+        (d.modified_berlin ? " · " + esc(d.modified_berlin) : "") + '</span></summary><div class="md mut">loading…</div>';
+      det.addEventListener("toggle", function () {
+        if (!det.open || det.dataset.loaded) return;
+        det.dataset.loaded = "1";
+        get(d.path, true).then(function (t) { det.lastChild.outerHTML = md(t); })
+          .catch(function (e) { det.dataset.loaded = ""; det.lastChild.textContent = e.message; });
+      });
+      el.appendChild(det);
+    });
+  }
+
+  function load() {
+    $("error").hidden = true;
+    $("updated").textContent = "loading…";
+    get("status.json").then(function (s) {
+      var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
+      $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
+      $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
+      renderUsage(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
+      docList($("docs"), s.docs, "title");
+      docList($("prompts"), s.prompts, "name");
+    }).catch(function (e) {
+      $("updated").textContent = "";
+      $("error").textContent = e.message;
+      $("error").hidden = false;
+    });
+  }
+  $("reload").addEventListener("click", load);
+  load();
+})();
+</script>
+</body>
+</html>

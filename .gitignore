@@ -1,0 +1,38 @@
+# This repo is (or will be) PUBLIC. tools/check_public.py (pre-commit + pre-push,
+# enable with: git config core.hooksPath .githooks) enforces the same rules.
+
+# runtime state and data (local only)
+data/
+run/
+probe/
+keepalive_state.json
+keepalive.lock
+*.log
+STOP
+PAUSED
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# the owner's personal / host-specific notes (read from disk, never committed)
+BACKLOG.md
+ALERTS.md
+OPEN_QUESTIONS.md
+
+# secrets
+docker/secrets/
+.env
+*.env
+*.key
+*.pem
+*.p12
+id_rsa*
+id_ed25519*
+id_ecdsa*
+.public-denylist
+
+# tooling
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Public-repo guard: scans every pushed commit's full tree plus the author,
+# committer and message of commits the remote doesn't have yet.
+exec python3 "$(git rev-parse --show-toplevel)/tools/check_public.py" --pre-push

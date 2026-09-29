@@ -1,0 +1,1 @@
+[keep-alive] Your usage limit has reset and the keep-alive watcher sent this continue ({reason}). Re-read {progress} and pick up from its latest Status line. The AFK rules from your first message still apply.
