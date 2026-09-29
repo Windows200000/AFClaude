@@ -13,6 +13,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                of a project (project_id, stage_seq) with priority high|medium|low.
                A v2 tasks table is rebuilt in place by _migrate_v3 (after a backup
                copy): integer priorities -> 'high', free-text project -> projects.
+               Later column (COLUMNS, no version bump): projects.manager_session
+               (goal 5: a managed project's stages are worked by that session,
+               not by per-task dispatcher sessions).
 
 Times are stored as ISO-8601 UTC strings (transcript timestamps as written,
 e.g. 2026-09-25T15:40:19.679Z; computed ones as 2026-09-25T17:00:00Z; task and
@@ -64,6 +67,7 @@ CREATE TABLE IF NOT EXISTS projects (
     rank        INTEGER NOT NULL,        -- 1 = top; kept contiguous by the store, reordered by hand
     description TEXT,
     path        TEXT,                    -- directory it lives in (cwd of the creating session)
+    manager_session TEXT,                -- managed project: this session works its stages (goal 5)
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 )"""
@@ -159,7 +163,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS standing_rules_scope_match ON standing_rules(s
 # Columns added after a table first shipped: {table: [(name, decl), ...]}.
 # connect() adds any that an existing database lacks.
 COLUMNS = {
-    "projects": [],
+    "projects": [("manager_session", "TEXT")],
     "sessions": [],
     "limit_hits": [],
     "tasks": [],
@@ -385,7 +389,7 @@ DEFAULT_PRIORITY = "high"
 DECISIONS = ("continue", "ignore")
 RULE_SCOPES = ("session", "project")
 TASK_EDITABLE = ("title", "description", "project", "priority", "kind")
-PROJECT_EDITABLE = ("name", "description", "path")
+PROJECT_EDITABLE = ("name", "description", "path", "manager_session")
 
 _PRIO_SQL = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END"
 TASK_ORDER_SQL = f"{_PRIO_SQL}, p.rank IS NULL, p.rank, t.stage_seq, t.created_at, t.id"
@@ -610,7 +614,9 @@ def list_projects(conn):
 
 
 def update_project(conn, ref, **fields):
-    """Rename a project or change its description/path."""
+    """Rename a project or change its description/path/manager_session. A
+    manager_session (full session id; empty = none) makes the project managed:
+    the dispatcher keeps that session alive and starts no task sessions for it."""
     bad = set(fields) - set(PROJECT_EDITABLE)
     if bad:
         raise ValueError(f"not editable: {sorted(bad)} (editable: {', '.join(PROJECT_EDITABLE)}; "
@@ -632,6 +638,8 @@ def update_project(conn, ref, **fields):
             other = clean["path"] and _project_by_path(conn, clean["path"], nearest=False)
             if other and other["id"] != p["id"]:
                 raise ValueError(f"project {other['name']!r} already has path {clean['path']}")
+        if "manager_session" in fields:
+            clean["manager_session"] = _text(fields["manager_session"], "manager_session")
         clean = {k: v for k, v in clean.items() if p[k] != v}
         if clean:
             conn.execute(f"UPDATE projects SET {', '.join(f'{k}=?' for k in clean)}, updated_at=? WHERE id=?",
