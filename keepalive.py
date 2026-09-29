@@ -4,7 +4,8 @@ Keep-alive prototype for the task-manager project (no dashboard).
 
 Watches ONE Claude Code session's transcript. When the session's last message
 is the synthetic "You've hit your ... limit" notice, it waits for the limit to
-reset and then, only inside the daily window 00:00-08:00 Europe/Berlin and only
+reset and then, only inside the nightly window 23:00-09:00 Europe/Berlin (it
+spans midnight) and only
 if the weekly budget rule allows it, resumes that session in place with
 
     ka_resume.sh --session <full-uuid> --message "<continue msg>"   (tmux, no --bg)
@@ -57,9 +58,9 @@ STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
-WINDOW_START = dtime(0, 0)          # Europe/Berlin
-WINDOW_END = dtime(8, 0)            # Europe/Berlin, exclusive
-WEEKLY_CUTOFF = dtime(11, 0)        # "reset no later than 11:00 after the window"
+WINDOW_START = dtime(23, 0)         # Europe/Berlin, the evening before WINDOW_END
+WINDOW_END = dtime(9, 0)            # Europe/Berlin, exclusive
+WEEKLY_CUTOFF = dtime(11, 0)        # "reset no later than 11:00 after the window" (on the window-end day)
 PROJECTION_THRESHOLD = 90.0         # percent
 WEEK = timedelta(days=7)
 MIN_ELAPSED = timedelta(hours=24)   # forecast floor
@@ -71,7 +72,7 @@ HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this oft
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
 VERIFY_TIMEOUT = timedelta(minutes=10)
 
-IGNORE_WINDOW = False  # --now: skip the 00:00-08:00 window / midnight-hour gate (budget rule still applies)
+IGNORE_WINDOW = False  # --now: skip the window / window-start-hour gate (budget rule still applies)
 BACKLOG_FILE = os.path.join(HERE, "BACKLOG.md")
 TAKE_OVER_IDLE = False  # opt-in: SIGTERM an idle interactive holder (e.g. an open terminal)
 # Core AFClaude sessions always run on Opus 5.5 with high effort (user rule, 2026-09-26);
@@ -227,22 +228,39 @@ def parse_reset_text(text, ref):
 
 def in_window(now):
     t = now.astimezone(BERLIN).time()
-    return WINDOW_START <= t < WINDOW_END
+    if WINDOW_START <= WINDOW_END:            # window within one calendar day
+        return WINDOW_START <= t < WINDOW_END
+    return t >= WINDOW_START or t < WINDOW_END   # window spans midnight
 
 
 def current_window_end(now):
-    """08:00 Berlin of the window `now` is in (or of the next window)."""
+    """WINDOW_END (Berlin) of the window `now` is in, or of the next window.
+    Its date names the window ("night"): fire caps and window-start dedup keys use it."""
     local = now.astimezone(BERLIN)
     d = local.date() if local.time() < WINDOW_END else local.date() + timedelta(days=1)
     return datetime.combine(d, WINDOW_END, tzinfo=BERLIN)
 
 
 def next_window_start(now):
-    local = now.astimezone(BERLIN)
+    """`now` if inside the window, else the next WINDOW_START (Berlin)."""
     if in_window(now):
         return now
-    d = local.date() + timedelta(days=1)   # window starts at 00:00, so it's always tomorrow
-    return datetime.combine(d, WINDOW_START, tzinfo=BERLIN)
+    local = now.astimezone(BERLIN)
+    start = datetime.combine(local.date(), WINDOW_START, tzinfo=BERLIN)
+    return start if start > local else start + timedelta(days=1)
+
+
+def is_window_start_hour(now):
+    """--window-start acts only in WINDOW_START's Berlin hour. Cron fires it at 21:00 and
+    22:00 UTC; exactly one of them is 23:xx Berlin (21:00 in CEST, 22:00 in CET)."""
+    return now.astimezone(BERLIN).hour == WINDOW_START.hour
+
+
+def window_start_key(now):
+    """Dedup key of the window-start continue: the window's END date (its "night", as the
+    fire cap uses), so a 23:00 start on 29.09. is window-start-2026-09-30. On the switch
+    night that equals the old 00:00 start's key of 30.09., which is right: one per night."""
+    return f"window-start-{current_window_end(now).date()}"
 
 
 # ---------------------------------------------------------------- usage
@@ -793,7 +811,7 @@ def main():
     ap.add_argument("--window-start", action="store_true",
                     help="one-shot: at window start, continue the session if the budget rule allows")
     ap.add_argument("--now", action="store_true",
-                    help="ignore the 00:00-08:00 window (and, with --window-start, the midnight-hour gate); budget rule still applies")
+                    help="ignore the 23:00-09:00 window (and, with --window-start, the start-hour gate); budget rule still applies")
     ap.add_argument("--work-on", metavar="PROJECT",
                     help="start a BACKLOG.md project right now in a new tmux session (list number or title substring); "
                          "needs --arm to actually start")
@@ -814,13 +832,12 @@ def main():
     if args.window_start:
         # Start-of-window continue (no stall needed): budget rule + window, then fire.
         now = datetime.now(UTC)
-        if not args.now and now.astimezone(BERLIN).hour != WINDOW_START.hour:
-            # cron runs this at 22:00 and 23:00 UTC; only the one that is 00:xx Berlin acts
+        if not args.now and not is_window_start_hour(now):
             return
         go, reason = budget_decision(fresh_usage(now, force=True), now)
         log(f"window-start: {reason}")
         if go:
-            key = f"manual-now-{now.isoformat()}" if args.now else f"window-start-{current_window_end(now).date()}"
+            key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
             stall = {"uuid": key, "timestamp": now}
             handle_fire(args.session, stall, "window start, " + reason, load_state(), args)
         else:

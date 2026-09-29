@@ -207,7 +207,7 @@ class Stalled(Base):
         self.stalled_session(sid(1))
         self.scan()
         store.decide_session(self.conn, sid(1), "continue")
-        rep = self.run_pass(now=datetime(2026, 9, 29, 21, 30, tzinfo=UTC))   # reset passed, 23:30 Berlin
+        rep = self.run_pass(now=datetime(2026, 9, 30, 7, 30, tzinfo=UTC))    # reset passed, 09:30 Berlin
         self.assertEqual(self.resume_calls(), [])
         self.assertTrue(any("WAIT_WINDOW" in s for s in rep["skip"]))
         rep = self.run_pass(now=datetime(2026, 9, 29, 20, 0, tzinfo=UTC))   # before the 21:00 UTC reset

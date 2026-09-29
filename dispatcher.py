@@ -2,7 +2,7 @@
 """
 AFClaude dispatcher (goal 5): keepalive.py keeps ONE session alive; the
 dispatcher runs everything else AFClaude should run, in the same nightly
-window (00:00-08:00 Europe/Berlin) and under the same budget rule
+window (23:00-09:00 Europe/Berlin) and under the same budget rule
 (keepalive.budget_decision). One pass per invocation (cron-friendly):
 
   1. Approved stalled sessions: store.stalled_decisions() rows whose effective
@@ -705,7 +705,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", action="store_true", help="act (default: dry-run, changes nothing)")
     ap.add_argument("--once", action="store_true", help="one pass (always the case; for cron symmetry)")
-    ap.add_argument("--now", action="store_true", help="ignore the 00:00-08:00 window (budget rule still applies)")
+    ap.add_argument("--now", action="store_true", help="ignore the 23:00-09:00 window (budget rule still applies)")
     ap.add_argument("--skip-task", action="append", default=[], metavar="ID|TITLE",
                     help="never start this task (id or exact title, case-insensitive); repeatable, "
                          "adds to the config's skip_tasks")

@@ -16,7 +16,7 @@ Your first deliverable is not the dashboard. Build a small, dashboard-less proto
 - projected end-of-week usage below 90% → continue
 - otherwise, continue only if the weekly reset is no later than 11:00 after the current window
 - otherwise, hold back
-- only inside the daily window 00:00–08:00 **Europe/Berlin** (confirmed, so hardcode it with a tz-aware implementation, not a fixed UTC offset).
+- only inside the nightly window 23:00–09:00 **Europe/Berlin** (was 00:00–08:00 until 29.09.2026) (confirmed, so hardcode it with a tz-aware implementation, not a fixed UTC offset).
 
 **The session to keep alive is THIS session — resume yourself.** Your own full session UUID is in `$CLAUDE_CODE_SESSION_ID`. Wire the prototype to watch your own transcript. When you hit a session limit, it should resume you (budget rule and window permitting) with a continue message that tells you to pick up from PROGRESS.md.
 
