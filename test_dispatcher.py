@@ -635,7 +635,9 @@ class Holders(Base):
 
     def setUp(self):
         super().setUp()
-        self.orig = (ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid)
+        self.orig = (ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid, ka.SESSIONS_DIR)
+        self.sessdir = tempfile.TemporaryDirectory()
+        ka.SESSIONS_DIR = self.sessdir.name                         # empty registry: never the real one
         self.rows = []
         ka.agent_entries = lambda s: list(self.rows)
         ka.pid_alive = lambda pid: pid in self.PROCS
@@ -643,7 +645,8 @@ class Holders(Base):
         ka.proc_ppid = lambda pid: self.PROCS.get(pid, (None, []))[0]
 
     def tearDown(self):
-        ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid = self.orig
+        ka.agent_entries, ka.pid_alive, ka.proc_argv, ka.proc_ppid, ka.SESSIONS_DIR = self.orig
+        self.sessdir.cleanup()
         super().tearDown()
 
     def test_preflight(self):
