@@ -47,6 +47,23 @@ DOCS = [  # (published name, source, title)
     ("README.md", os.path.join(HERE, "README.md"), "README"),
     ("design-task-manager.md", DESIGN_DOC, "Design doc: task manager / MCP plan"),
 ]
+EXCLUDE_DIRS = ("data", "run", "probe", ".git", ".venv", "prompts", "node_modules", "__pycache__")
+
+
+def all_docs():
+    """The fixed list plus EVERY other Markdown file in the repo (root, docs/, any
+    subdir except runtime/vendored ones; prompts/ is published separately), so new
+    documents surface automatically (owner's rule, 30.09.)."""
+    out = list(DOCS)
+    known = {os.path.realpath(src) for _, src, _ in DOCS}
+    for src in sorted(glob.glob(os.path.join(HERE, "**", "*.md"), recursive=True)):
+        rel = os.path.relpath(src, HERE)
+        if rel.split(os.sep)[0] in EXCLUDE_DIRS or os.path.realpath(src) in known:
+            continue
+        name = rel.replace(os.sep, "__")
+        title = rel[:-3].replace("_", " ").replace("/", ": ")
+        out.append((name, src, title))
+    return out
 
 
 def bstr(dt):
@@ -282,7 +299,7 @@ def main():
     os.chmod(OUT, 0o755)
 
     docs = []
-    for name, src, title in DOCS:
+    for name, src, title in all_docs():
         text = strip_frontmatter(read(src))
         if text is None:
             continue
