@@ -68,6 +68,26 @@ details > .md { padding: 8px 0 4px; }
 .err { background: #3b0d0d; border: 1px solid #7f1d1d; color: #fecaca; border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; }
 .sub { font-size: 15px; color: #e8eaed; margin: 16px 0 6px; }
 .decision { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 8px 10px; word-break: break-word; }
+.phases { margin-bottom: 14px; }
+.ph-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.strip { display: flex; gap: 4px; }
+button.chip { flex: 1 1 0; min-width: 0; padding: 4px 0 3px; border-radius: 6px; border: 1px solid rgba(255,255,255,.12);
+    background: #2a2a2a; color: #9ca3af; text-align: center; line-height: 1.2; font-size: 14px; font-weight: 600; }
+button.chip small { display: block; font-size: 10px; font-weight: 400; opacity: .85; }
+button.chip.done { background: rgba(34,197,94,.18); border-color: rgba(34,197,94,.45); color: #22c55e; }
+button.chip.in_progress { background: rgba(245,158,11,.18); border-color: rgba(245,158,11,.5); color: #f59e0b; }
+button.chip.blocked { background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.5); color: #ef4444; }
+button.chip.cur { box-shadow: 0 0 0 2px #a855f7; color: #fff; }
+button.chip.sel { border-color: #a855f7; }
+.ph-detail { font-size: 13px; margin-top: 8px; }
+.ph-detail .steps, .stages { list-style: none; }
+.stages { font-size: 13px; margin-top: 6px; border-top: 1px dashed rgba(255,255,255,.15); padding-top: 6px; }
+.stages li, .ph-detail .steps li { display: flex; gap: 8px; padding: 1px 0; }
+.stages .t, .ph-detail .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.stages .done .t, .ph-detail .done .t { color: #9ca3af; text-decoration: line-through; }
+.stages .cancelled { color: #6b7280; }
+.stages .cancelled .t { text-decoration: line-through; }
+.stages .in_progress .t { color: #fff; font-weight: 600; }
 @media (max-width: 520px) {
     body { padding: 14px 12px 110px; }
     section { padding: 14px; }
@@ -95,6 +115,7 @@ details > .md { padding: 8px 0 4px; }
 
   <section>
     <h2>Progress</h2>
+    <div id="phases" class="phases"></div>
     <ol id="goals" class="goals"></ol>
   </section>
 
@@ -209,6 +230,52 @@ details > .md { padding: 8px 0 4px; }
     }).join("") || '<li class="mut">No goals found in GOALS.md.</li>';
   }
 
+  var ST_ICON = { "done": '<span class="ok">✓</span>', "in_progress": '<span class="warn">◐</span>',
+    "pending": "○", "blocked": '<span class="bad">✗</span>', "cancelled": "–" };
+  var ST_TEXT = { "done": "done", "in_progress": "in progress", "pending": "pending", "blocked": "blocked", "cancelled": "cancelled" };
+  var phaseSel = null;   // phase number the viewer tapped (default: the current one)
+
+  function stageLi(t, label) {
+    return '<li class="' + esc(t.status) + '" title="' + esc(ST_TEXT[t.status] || t.status) + '">' +
+      '<span class="tick">' + (ST_ICON[t.status] || "○") + '</span><span class="t">' + label + "</span></li>";
+  }
+  function renderPhases(s) {
+    var st = s.stages || {}, ph = st.phases || [], others = st.others || [], el = $("phases");
+    if (st.error) { el.innerHTML = '<div class="item alert"><div class="src">task store</div>' + esc(st.error) + "</div>"; return; }
+    if (!ph.length && !others.length) { el.innerHTML = ""; return; }
+    var cur = null, done = 0;
+    ph.forEach(function (p) { if (p.current) cur = p; if (p.status === "done") done++; });
+    var sel = null;
+    ph.forEach(function (p) { if (p.n === phaseSel) sel = p; });
+    sel = sel || cur || ph[ph.length - 1];
+    var out = [];
+    if (ph.length) {
+      out.push('<div class="ph-head"><span class="mut">Dashboard phases</span><span class="mut">' + done + "/" + ph.length + " done</span></div>");
+      out.push('<div class="strip">' + ph.map(function (p) {
+        var tip = "Phase " + p.n + " · " + (ST_TEXT[p.status] || p.status) + " · " +
+          p.steps.map(function (x) { return x.key + ": " + x.title; }).join(" | ");
+        return '<button type="button" class="chip ' + esc(p.status) + (p.current ? " cur" : "") + (p === sel ? " sel" : "") +
+          '" data-n="' + p.n + '" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">' + p.n +
+          (p.total > 1 ? "<small>" + p.done + "/" + p.total + "</small>" : "") + "</button>";
+      }).join("") + "</div>");
+      if (sel) {
+        out.push('<div class="ph-detail"><strong>Phase ' + sel.n + "</strong> " +
+          '<span class="mut">' + esc(ST_TEXT[sel.status] || sel.status) + (sel.current ? " · current" : "") +
+          (sel.total > 1 ? " · " + sel.done + "/" + sel.total + " done" : "") + '</span><ul class="steps">' +
+          sel.steps.map(function (x) { return stageLi(x, (sel.total > 1 ? "<b>" + esc(x.key) + "</b> " : "") + esc(x.title)); }).join("") +
+          "</ul></div>");
+      }
+    }
+    if (others.length) {
+      out.push('<ul class="stages" aria-label="Other ' + esc(st.project || "") + ' stages">' +
+        others.map(function (t) { return stageLi(t, esc(t.title)); }).join("") + "</ul>");
+    }
+    el.innerHTML = out.join("");
+    Array.prototype.forEach.call(el.querySelectorAll("button.chip"), function (b) {
+      b.addEventListener("click", function () { phaseSel = Number(b.getAttribute("data-n")); renderPhases(s); });
+    });
+  }
+
   function renderDecision(s) {
     $("decision").textContent = s.latest_decision || "(no keep-alive log entries yet)";
   }
@@ -259,7 +326,7 @@ details > .md { padding: 8px 0 4px; }
       var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
       $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
       $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
-      renderUsage(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
+      renderUsage(s); renderPhases(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
       docList($("docs"), s.docs, "title");
       docList($("prompts"), s.prompts, "name");
     }).catch(function (e) {
