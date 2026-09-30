@@ -375,7 +375,7 @@ class Pass:
         """Window + budget + session headroom, checked before EACH start."""
         if self.report["stop"]:
             return False, self.report["stop"]
-        if not self.ignore_window and not ka.in_window(self.now):
+        if not self.ignore_window and not ka.in_window(self.now) and not ka.in_last_mile(self.now):
             return False, f"outside the window, next {ka.berlin(ka.next_window_start(self.now))}"
         go, reason = budget_gate(self.usage_getter(datetime.now(UTC) if self.arm else self.now), self.now, self.cfg)
         if not go:

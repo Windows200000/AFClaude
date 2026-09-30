@@ -1,0 +1,1 @@
+[keep-alive] Last mile: {reason}. The weekly usage limit resets soon and the remaining quota would expire unused, so the keep-alive watcher sent this continue. Re-read {progress} and pick up from its latest Status line. The AFK rules from your first message still apply.

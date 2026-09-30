@@ -225,6 +225,116 @@ class Files(unittest.TestCase):
             self.assertTrue(os.access(os.path.join(d, f), os.X_OK), f)
 
 
+class LastMile(unittest.TestCase):
+    R = Z("2026-10-01T16:59:59Z")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = os.path.join(self.tmp.name, "afclaude.json")
+        import afclaude_config
+        self.ac = afclaude_config
+        self._old = afclaude_config.CONFIG_FILE
+        afclaude_config.CONFIG_FILE = self.cfg
+
+    def tearDown(self):
+        self.ac.CONFIG_FILE = self._old
+        self.tmp.cleanup()
+
+    def setcfg(self, **kw):
+        with open(self.cfg, "w") as fh:
+            json.dump(kw, fh)
+
+    def test_default_is_one_session_length(self):
+        self.assertEqual(self.ac.last_mile(), timedelta(hours=5))
+        self.setcfg(last_mile_hours=3)
+        self.assertEqual(self.ac.last_mile(), timedelta(hours=3))
+        self.setcfg(last_mile_hours=0)
+        self.assertEqual(self.ac.last_mile(), timedelta(0))
+
+    def test_budget_edges(self):
+        u = usage(99, self.R)
+        # before the last mile the old rules decide (here the reset-before-cutoff rule)
+        self.assertNotIn("last mile", ka.budget_decision(u, self.R - timedelta(hours=5, minutes=1))[1])
+        # early in the week at 99%: HOLD without the last mile
+        self.assertFalse(ka.budget_decision(usage(99, Z("2026-10-05T16:59:59Z")), Z("2026-10-01T18:00:00Z"))[0])
+        go, why = ka.budget_decision(u, self.R - timedelta(hours=4, minutes=59))
+        self.assertTrue(go, why)
+        self.assertIn("last mile", why)
+        self.assertFalse(ka.budget_decision(usage(100, self.R), self.R - timedelta(hours=1))[0])
+        self.assertFalse(ka.budget_decision(None, self.R - timedelta(hours=1))[0])
+        self.setcfg(last_mile_hours=0)
+        self.assertNotIn("last mile", ka.budget_decision(u, self.R - timedelta(hours=1))[1])
+
+    def test_dst_day(self):
+        r = Z("2026-10-25T16:59:59Z")          # reset on the CEST->CET day
+        self.assertIsNotNone(ka.last_mile_left(r, r - timedelta(hours=4, minutes=59)))
+        self.assertIsNone(ka.last_mile_left(r, r - timedelta(hours=5, minutes=1)))
+
+    def test_evaluate_window_exempt_in_last_mile(self):
+        with tempfile.TemporaryDirectory() as d:
+            ka.PROJECTS_DIR, old = d, ka.PROJECTS_DIR
+            try:
+                stall = dict(STALL, timestamp="2026-10-01T11:00:00.000Z",
+                             message=dict(STALL["message"], content=[{"type": "text",
+                                          "text": "You've hit your session limit · resets 12pm (UTC)"}]))
+                write_transcript(d, SID, [USER, stall])
+                cache = {"fetched_at": self.R, "weekly": {"percent": 95.0, "resets_at": self.R},
+                         "session": {"percent": 0.0, "resets_at": None}}
+                ka.read_usage_cache, oldc = (lambda: cache), ka.read_usage_cache
+                try:
+                    now = Z("2026-10-01T12:05:00Z")        # 14:05 Berlin, outside the night window
+                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "FIRE")
+                    self.setcfg(last_mile_hours=0)
+                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "WAIT_WINDOW")
+                finally:
+                    ka.read_usage_cache = oldc
+            finally:
+                ka.PROJECTS_DIR = old
+
+    def test_last_mile_pass_once_per_cycle(self):
+        fired = []
+        cache = {"fetched_at": self.R, "weekly": {"percent": 95.0, "resets_at": self.R},
+                 "session": {"percent": 0.0, "resets_at": None}}
+        olds = (ka.read_usage_cache, ka.fresh_usage, ka.handle_fire)
+        ka.read_usage_cache = lambda: cache
+        ka.fresh_usage = lambda n, force=False: cache
+        def hf(sid, stall, reason, st, args):
+            fired.append(stall)
+            st["handled"][stall["uuid"]] = {"result": "test"}
+        ka.handle_fire = hf
+        try:
+            st = {"handled": {}, "fires": {}}
+            self.assertIsNone(ka.last_mile_pass(SID, self.R - timedelta(hours=6), st, None))
+            self.assertEqual(fired, [])
+            ka.last_mile_pass(SID, self.R - timedelta(hours=4), st, None)
+            ka.last_mile_pass(SID, self.R - timedelta(hours=3), st, None)
+            self.assertEqual(len(fired), 1)
+            self.assertEqual(fired[0]["prompt"], "last_mile")
+            self.assertTrue(fired[0]["uuid"].startswith("last-mile-"))
+            cache["weekly"]["percent"] = 100.0        # exhausted -> HOLD, re-check later
+            st2 = {"handled": {}, "fires": {}}
+            nxt = ka.last_mile_pass(SID, self.R - timedelta(hours=2), st2, None)
+            self.assertEqual(nxt, self.R - timedelta(hours=2) + ka.LAST_MILE_RECHECK)
+        finally:
+            ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = olds
+
+    def test_budget_headroom(self):
+        now = Z("2026-09-30T22:00:00Z")                       # 149 h into the week
+        extra, text = ka.budget_headroom(usage(77, self.R), now)
+        self.assertAlmostEqual(extra, 90 * 149 / 168 - 77, places=1)   # ~2.8 %
+        self.assertAlmostEqual(ka.project_weekly(77 + extra, self.R, now), 90, places=1)
+        self.assertEqual(ka.budget_headroom(usage(95, self.R), now)[0], 0.0)
+        extra, text = ka.budget_headroom(usage(80, self.R), self.R - timedelta(hours=2))
+        self.assertEqual(extra, 20.0)
+        self.assertIn("last mile", text)
+        self.assertIsNone(ka.budget_headroom(None, now)[0])
+
+    def test_prompt_file(self):
+        m = ka.session_message("last_mile", reason="r", progress=ka.PROGRESS_FILE)
+        self.assertIn("Last mile", m)
+        self.assertNotIn("\n", m)
+
+
 class Archived(unittest.TestCase):
     def test_archived_notice_after_last_message(self):
         with tempfile.TemporaryDirectory() as d:
