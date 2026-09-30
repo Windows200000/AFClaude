@@ -4,7 +4,8 @@
 Writes into data/quickview/ (gitignored), which the key-gated nginx in quickview/
 serves at /afclaude/:
 
-  status.json   keepalive+usage, progress (from GOALS.md), latest keep-alive
+  status.json   keepalive+usage, progress (from GOALS.md, plus the project's
+                stages from the task store as a phase strip), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
@@ -35,6 +36,8 @@ DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
 # This manager's own session/tmux (matches usage_report.py's DEFAULT_SESSION).
 SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION", "f2897285-dd97-49d9-b29a-2334b4753dee")
+# The task-store project whose stages the Progress section shows as a phase strip.
+STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 UTC = timezone.utc
 
 DOCS = [  # (published name, source, title)
@@ -121,6 +124,77 @@ def parse_goals(md):
         if len(short) > 140:
             short = short[:137].rstrip() + "..."
         out.append({"marker": marker if marker in "x~!" else " ", "text": short, "side": in_side})
+    return out
+
+
+# ------------------------------------------------------------ task-store stages
+
+PHASE_RE = re.compile(r"^Dashboard\s+(\d+)([a-z]?)\s*:?\s*(.*)$", re.I)
+
+
+def _stage(t):
+    return {"id": t.get("id"), "seq": t.get("stage_seq"), "status": t.get("status"),
+            "priority": t.get("priority"), "title": (t.get("title") or "")[:140]}
+
+
+def _phase_status(steps):
+    """Aggregate status of one phase's (non-cancelled) steps."""
+    sts = [s["status"] for s in steps]
+    if all(s == "done" for s in sts):
+        return "done"
+    if "blocked" in sts:
+        return "blocked"
+    if "in_progress" in sts or "done" in sts:
+        return "in_progress"
+    return "pending"
+
+
+def build_stages(tasks):
+    """Split a project's stages (every status, in execution order) into the
+    'Dashboard N[x]: ...' phases and the other stages.
+
+    phases: one entry per phase number N, ordered by N, with its steps (8a..8d
+    are steps of phase 8). Cancelled steps are dropped from phases (they were
+    superseded); a phase with only cancelled steps disappears. Exactly one
+    phase (the first one not done) is marked current. others: everything else,
+    in stage order, cancelled ones included (the page greys them)."""
+    groups, others = {}, []
+    for t in tasks:
+        m = PHASE_RE.match(t.get("title") or "")
+        if not m:
+            others.append(_stage(t))
+            continue
+        if t.get("status") == "cancelled":
+            continue
+        n = int(m.group(1))
+        st = _stage(t)
+        st["key"] = f"{n}{m.group(2).lower()}"
+        st["title"] = (m.group(3) or t.get("title") or "")[:140]
+        groups.setdefault(n, []).append(st)
+    phases = []
+    for n in sorted(groups):
+        steps = sorted(groups[n], key=lambda s: (s["key"], s["seq"] or 0))
+        phases.append({"n": n, "status": _phase_status(steps), "current": False,
+                       "done": sum(s["status"] == "done" for s in steps), "total": len(steps),
+                       "steps": steps})
+    cur = next((p for p in phases if p["status"] != "done"), None)
+    if cur:
+        cur["current"] = True
+    return {"phases": phases, "others": others}
+
+
+def stages():
+    conn = None
+    try:
+        conn = store.connect()
+        out = build_stages(store.list_tasks(conn, project=STAGES_PROJECT))
+        out["error"] = None
+    except Exception as e:  # noqa: BLE001 - never let a DB hiccup break the export
+        out = {"phases": [], "others": [], "error": str(e)[:300]}
+    finally:
+        if conn is not None:
+            conn.close()
+    out["project"] = STAGES_PROJECT
     return out
 
 
@@ -317,6 +391,7 @@ def main():
         "generated_berlin": bstr(now),
         "keepalive": keepalive_and_usage(now),
         "goals": parse_goals(read(os.path.join(HERE, "GOALS.md"))),
+        "stages": stages(),
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),
         "cron": cron_entries(),
