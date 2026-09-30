@@ -239,3 +239,10 @@ Preliminary status page: until phase 9, the quickview gets a small **phase visua
 - **Architecture option A** (a small Python web app) is confirmed; auth = generic OIDC SSO with any provider alongside local username/password (as in Q2).
 - **Deploy gates:** 8a thorough review (Opus 5.5, ultracode effort) → 8b deploy without the Claude connection → 8c live pentest with full code access → 8d attach the Claude connection + seed the backlog (§9).
 - **Quickview phase visualiser** on the preliminary status page (§9).
+
+## Visual design (owner, 30.09.2026)
+
+The owner likes the preliminary quickview's look and wants it kept for the main app:
+- **Purple as the main accent**, and **vibrant colours that directly represent status** (done / in progress / pending / blocked / alert), used consistently everywhere a status appears.
+- The feel: **rigid but sleek**. A strict grid, clear boxes and chips, compact and dense, no decorative fluff.
+- Baseline: take the colour tokens, dark/light theming, typography and spacing from `quickview/AFClaude.html` as the starting design system; phone first.
