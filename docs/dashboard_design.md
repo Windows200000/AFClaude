@@ -183,7 +183,7 @@ Local only (gitignored, and blocked by `tools/check_public.py`):
 - `data/`: the DB with prompt overrides, settings, the backlog projects, reviews and `user_model.json`
 - `BACKLOG.md`
 
-The backlog is seeded into the DB by a generic `tools/seed_backlog.py` that reads the local `BACKLOG.md`: backlog projects ranked after AFClaude, their stages low priority and kind `backlog_project`. It runs once, after the dashboard is live (phase 9).
+The backlog is seeded into the DB by a generic `tools/seed_backlog.py` that reads the local `BACKLOG.md`: backlog projects ranked after AFClaude, their stages low priority and kind `backlog_project`. It runs once, in phase 8d, after the 8c pentest is clean.
 
 ### 7.4 Remote Control visibility
 Sessions AFClaude drives already run as individual RC sessions (`ka_resume.sh` launches with `--remote-control --name`, and a resume keeps the RC link). The dashboard lists them in F6 with their RC link when one can be found (`claude agents --json` or the session registry, read by the sampler and stored in `driven_sessions.rc_url`; to verify in phase 5), and the tmux name otherwise.
