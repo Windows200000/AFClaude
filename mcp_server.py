@@ -7,7 +7,10 @@ do X", "what's waiting for me?").
 
     .venv/bin/python mcp_server.py        (Claude Code starts it; see mcp_register.md)
 
-Uses store.py (schema v3, same DB as tasks.py: $AFCLAUDE_DB or data/afclaude.db)
+Reads through store.py (schema v4, same DB as tasks.py: $AFCLAUDE_DB or data/afclaude.db);
+every write goes through actions.py (validation, one transaction, an audit row as
+actor mcp:<session>; an autonomous AFClaude session, CLAUDE_GUARD_DISABLE=1 or a
+session AFClaude drives, may not decide sessions or change rules)
 and the official MCP Python SDK (mcp 2.x, MCPServer), installed in .venv/
 (Python 3.12; the system python3 is 3.9, too old for the SDK).
 
@@ -34,7 +37,8 @@ from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import store  # noqa: E402
+import store  # noqa: E402  (reads)
+import actions  # noqa: E402  (every write)
 import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
 
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
@@ -109,6 +113,19 @@ def session_brief(s):
 
 def session_id_env():
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def actor():
+    """mcp:<calling session> for the audit log (plain mcp if the client didn't pass its id)."""
+    sid = session_id_env()
+    return f"mcp:{sid}" if sid and actions.ACTOR_RE.match(f"mcp:{sid}") else "mcp"
+
+
+def act(conn, action, /, **params):
+    """One write through the shared write path. The guard-hook bypass marks a session
+    AFClaude launched (autonomous), whatever its id."""
+    return actions.perform(conn, action, params, actor=actor(), via="mcp",
+                           autonomous=os.environ.get("CLAUDE_GUARD_DISABLE") == "1")
 
 
 def _no_project_dir(path):
@@ -200,8 +217,8 @@ async def afclaude_add_task(title: str, description: str = "", priority: Priorit
         project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
-        t = store.add_task(conn, title, description or None, project, priority,
-                           created_by_session=session_id_env())
+        t = act(conn, "task.add", title=title, description=description or None, project=project,
+                priority=priority, created_by_session=session_id_env())
     finally:
         conn.close()
     return out(dict(task_brief(t), project_source=source))
@@ -251,28 +268,9 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
         raise ValueError("nothing to change (give title/description/priority/project/stage/status)")
     conn = db()
     try:
-        with store.transaction(conn):
-            if fields:
-                store.update_task(conn, id, **fields)
-            if stage is not None:
-                store.move_stage(conn, id, stage)
-            if status is not None:
-                cur = store.get_task(conn, id)
-                if cur is None:
-                    raise store.NotFound(f"no task #{id}")
-                if status == "done":
-                    store.finish_task(conn, id, note)
-                elif status == "cancelled":
-                    store.cancel_task(conn, id, note)
-                elif status == "blocked":
-                    store.block_task(conn, id, note)
-                elif status == "in_progress":
-                    store.start_task(conn, id, session_id_env())
-                elif cur["status"] == "blocked":
-                    raise store.InvalidTransition(f"task #{id} is blocked; answer it with afclaude_answer_task")
-                else:
-                    store.reopen_task(conn, id, note)
-        return out(task_brief(store.get_task(conn, id)))
+        t = act(conn, "task.update", task_id=id, fields=fields or None, stage=stage, status=status, note=note,
+                session=session_id_env())
+        return out(task_brief(t))
     finally:
         conn.close()
 
@@ -281,10 +279,26 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
 async def afclaude_answer_task(id: int, answer: str) -> str:
     conn = db()
     try:
-        t = store.answer_task(conn, id, answer)
+        t = act(conn, "task.answer", task_id=id, answer=answer)
     finally:
         conn.close()
     return out(dict(task_brief(t), question=t["blocked_question"], answer=t["answer"]))
+
+
+@tool("Ask the user a question you can't decide yourself: it becomes a blocked AFClaude task (kind question) in "
+      "their inbox; their answer closes it (read it with afclaude_get_task). project: name or directory; default = "
+      "the calling session's directory. Returns the task.")
+async def afclaude_ask(question: str, project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+    if project is None or not project.strip():
+        project, _ = await caller_dir(ctx)
+    else:
+        project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        t = act(conn, "task.ask", question=question, project=project, created_by_session=session_id_env())
+    finally:
+        conn.close()
+    return out(task_brief(t))
 
 
 @tool("AFClaude projects, a ranked list (1 = top). action: list; add (name, optional rank, path, description); "
@@ -305,17 +319,17 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
             raise ValueError(f"{action} needs name")
         path = await resolve_dir_arg(ctx, path)
         if action == "add":
-            p = store.add_project(conn, name, description, path, rank)
+            p = act(conn, "project.add", name=name, description=description, path=path, rank=rank)
             return out(project_brief(p))
         ref = await resolve_dir_arg(ctx, name)
         if action == "move":
             if rank is None:
                 raise ValueError("move needs rank")
-            p = store.move_project(conn, ref, rank)
+            p = act(conn, "project.move", project=ref, rank=rank)
         elif action == "prio":
             if priority is None:
                 raise ValueError("prio needs priority")
-            r = store.set_project_priority(conn, ref, priority)
+            r = act(conn, "project.priority", project=ref, priority=priority)
             return out({"project": r["project"], "priority": r["priority"], "changed_tasks": r["changed"]})
         else:
             f = {k: v for k, v in (("name", new_name), ("description", description), ("path", path))
@@ -325,7 +339,7 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
                                         if manager_session.strip() else None)
             if not f:
                 raise ValueError("edit needs new_name, description, path or manager_session")
-            p = store.update_project(conn, ref, **f)
+            p = act(conn, "project.edit", project=ref, **f)
         return out(project_brief(p))
     finally:
         conn.close()
@@ -376,9 +390,9 @@ async def afclaude_decide_session(session: str, decision: Literal["continue", "i
     try:
         sid = cli.resolve_session(conn, session.strip())
         if decision == "clear":
-            store.clear_decision(conn, sid)
+            act(conn, "session.clear", session_id=sid)
         else:
-            store.decide_session(conn, sid, decision, note)
+            act(conn, "session.decide", session_id=sid, decision=decision, note=note)
         dec, src = store.effective_decision(conn, sid)
     finally:
         conn.close()
@@ -399,7 +413,7 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
         if action == "rm":
             if id is None:
                 raise ValueError("rm needs id")
-            store.remove_rule(conn, id)
+            act(conn, "rule.remove", rule_id=id)
             return out({"removed": id})
         if scope is None or not match or decision is None:
             raise ValueError("add needs scope, match and decision")
@@ -408,7 +422,7 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
             m = cli.resolve_session(conn, m)
         else:
             m = await resolve_dir_arg(ctx, m)
-        r = store.add_rule(conn, scope, m, decision, note)
+        r = act(conn, "rule.add", scope=scope, match=m, decision=decision, note=note)
         return out(compact(dict(r, created_at=bt(r["created_at"]))))
     finally:
         conn.close()

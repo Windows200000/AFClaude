@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the task store (store.py v3) and tasks.py (temp DBs only)."""
+"""Offline tests for the task store (store.py v3/v4) and tasks.py (temp DBs only)."""
 import contextlib
 import io
 import json
@@ -533,7 +533,7 @@ class Migration(unittest.TestCase):
                 tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertTrue({"tasks", "task_events", "session_decisions", "standing_rules"} <= tables)
                 self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))
-                self.assertEqual(store.SCHEMA_VERSION, 3)
+                self.assertEqual(store.SCHEMA_VERSION, 4)
                 self.assertIn("projects", tables)
                 self.assertEqual(store.counts(conn)["hits"], 1)                 # old data intact
                 self.assertEqual(store.get_session(conn, SID)["cwd"], "/home/x/proj")
@@ -583,7 +583,7 @@ class Migration(unittest.TestCase):
 
             conn = store.connect(path)
             try:
-                self.assertEqual(store.get_meta(conn, "schema_version"), "3")
+                self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))
                 baks = [f for f in os.listdir(d) if f.startswith("v2.db.v2-") and f.endswith(".bak")]
                 self.assertEqual(len(baks), 1)                                   # copy taken first
                 b = sqlite3.connect(os.path.join(d, baks[0]))

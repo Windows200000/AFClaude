@@ -16,6 +16,16 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Later column (COLUMNS, no version bump): projects.manager_session
                (goal 5: a managed project's stages are worked by that session,
                not by per-task dispatcher sessions).
+  v4 (dashboard phase 1, docs/dashboard_design.md §4): settings, prompt_overrides,
+               audit_log (append-only), idempotency_keys, run_log, driven_sessions,
+               action_requests; a `version` column on projects, tasks,
+               standing_rules and session_decisions, bumped by a trigger on every
+               UPDATE (optimistic concurrency, whoever writes); task kind 'question'
+               (a manager question, born blocked; answering it closes it). Purely
+               additive: a v3 database is first copied to <db>.v3-<utc>.bak, then
+               gains the tables/columns/triggers in place (_backup_v3, init).
+               Writes from the CLI, the MCP server and the dashboard go through
+               actions.py (validation, audit row, idempotency, version checks).
 
 Times are stored as ISO-8601 UTC strings (transcript timestamps as written,
 e.g. 2026-09-25T15:40:19.679Z; computed ones as 2026-09-25T17:00:00Z; task and
@@ -34,7 +44,7 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("AFCLAUDE_DB", os.path.join(HERE, "data", "afclaude.db"))
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # The tasks table, v3. {name} so _migrate_v3 can build it as tasks_v3 and rename it.
 TASKS_DDL = """
@@ -47,7 +57,7 @@ CREATE TABLE IF NOT EXISTS {name} (
     project            TEXT,            -- legacy v2 free text, kept only as the migration's source
     priority           TEXT NOT NULL DEFAULT 'high',     -- high|medium|low
     status             TEXT NOT NULL DEFAULT 'pending',  -- pending|in_progress|blocked|done|cancelled
-    kind               TEXT NOT NULL DEFAULT 'task',     -- task|backlog_project
+    kind               TEXT NOT NULL DEFAULT 'task',     -- task|backlog_project|question
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL,
     created_by_session TEXT,
@@ -57,7 +67,8 @@ CREATE TABLE IF NOT EXISTS {name} (
     answer             TEXT,
     answered_at        TEXT,
     result_summary     TEXT,
-    done_at            TEXT
+    done_at            TEXT,
+    version            INTEGER NOT NULL DEFAULT 0       -- v4: bumped by tasks_version on every UPDATE
 )"""
 
 PROJECTS_DDL = """
@@ -69,7 +80,8 @@ CREATE TABLE IF NOT EXISTS projects (
     path        TEXT,                    -- directory it lives in (cwd of the creating session)
     manager_session TEXT,                -- managed project: this session works its stages (goal 5)
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 0   -- v4: bumped by projects_version on every UPDATE
 )"""
 
 SCHEMA = """
@@ -145,7 +157,8 @@ CREATE TABLE IF NOT EXISTS session_decisions (
     decision   TEXT NOT NULL,           -- continue|ignore
     decided_at TEXT NOT NULL,
     note       TEXT,
-    stall_ref  TEXT                     -- sessions.stall_uuid (or stalled_since) at decision time
+    stall_ref  TEXT,                    -- sessions.stall_uuid (or stalled_since) at decision time
+    version    INTEGER NOT NULL DEFAULT 0
 );
 
 -- standing "always continue" / "always ignore"
@@ -155,21 +168,128 @@ CREATE TABLE IF NOT EXISTS standing_rules (
     match      TEXT NOT NULL,           -- session id | absolute path (cwd, incl. subdirs) | project_dir name
     decision   TEXT NOT NULL,           -- continue|ignore
     created_at TEXT NOT NULL,
-    note       TEXT
+    note       TEXT,
+    version    INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS standing_rules_scope_match ON standing_rules(scope, match);
+
+-- v4 (dashboard phase 1). Values are validated in actions.py, not with CHECKs.
+-- settings: key -> JSON value; no row or a JSON null = the code default (actions.SETTINGS).
+-- A reset stores null instead of deleting, so a key's version never repeats (no row = 0,
+-- the first save = 1).
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,           -- JSON
+    version    INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT
+);
+
+-- an edited prompt; the file prompts/<name> stays the default. A reset sets body NULL
+-- (the row stays, so its version never repeats; no row = version 0).
+CREATE TABLE IF NOT EXISTS prompt_overrides (
+    name        TEXT PRIMARY KEY,       -- file name under prompts/, e.g. continue.md
+    body        TEXT,                   -- NULL = reset to the default
+    base_sha256 TEXT,                   -- sha256 of the default file when the edit was made
+    version     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
+
+-- every write through actions.py, oldest first (task_events stays the per-task history)
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    actor       TEXT NOT NULL,          -- owner | cli | mcp[:<session>] | dispatcher | keepalive
+    via         TEXT NOT NULL,          -- dashboard | mcp | cli | runner
+    action      TEXT NOT NULL,          -- actions.ACTIONS name, e.g. task.answer
+    target_type TEXT,
+    target_id   TEXT,
+    before      TEXT,                   -- JSON: the changed fields before (NULL = created)
+    after       TEXT,                   -- JSON: the changed fields after (NULL = deleted)
+    request_id  TEXT                    -- the idempotency key, if any
+);
+CREATE INDEX IF NOT EXISTS audit_log_target ON audit_log(target_type, target_id, id);
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+
+-- a replayed key returns the stored response without acting again (pruned after 7 days)
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key            TEXT PRIMARY KEY,
+    actor          TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,       -- the action + parameters it was first used for
+    response       TEXT,                -- JSON
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idempotency_keys_created ON idempotency_keys(created_at);
+
+-- one row per keep-alive / dispatcher decision (FIRE, HOLD, WAIT_WINDOW, skip, start, cleanup)
+CREATE TABLE IF NOT EXISTS run_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    component  TEXT NOT NULL,           -- keepalive | dispatcher | ...
+    session_id TEXT,
+    task_id    INTEGER,
+    decision   TEXT NOT NULL,
+    reason     TEXT
+);
+CREATE INDEX IF NOT EXISTS run_log_component ON run_log(component, id);
+
+-- every session AFClaude started or continued (replaces dispatcher_state.json's list
+-- and data/own_sessions.txt once the runners fill it, phase 3)
+CREATE TABLE IF NOT EXISTS driven_sessions (
+    session_id  TEXT PRIMARY KEY,
+    tmux        TEXT,
+    kind        TEXT NOT NULL,          -- keepalive | task | stall | review
+    task_id     INTEGER,
+    started_at  TEXT NOT NULL,
+    last_seen   TEXT,
+    ended_at    TEXT,
+    holder_kind TEXT,
+    rc_url      TEXT
+);
+
+-- the dashboard's only way to ask for execution; the dispatcher consumes them (phase 2)
+CREATE TABLE IF NOT EXISTS action_requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    kind       TEXT NOT NULL,           -- continue_now | review_now
+    target     TEXT,                    -- session id (continue_now), NULL (review_now)
+    status     TEXT NOT NULL DEFAULT 'open',   -- open | done | failed | cancelled
+    result     TEXT,
+    handled_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS action_requests_one_open ON action_requests(kind, COALESCE(target, ''))
+    WHERE status = 'open';
 """
+
+# v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
+# read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
+# Created after COLUMNS (the column must exist). recursive_triggers is off, so the
+# trigger's own UPDATE doesn't fire it again.
+VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
+             "settings": "key", "prompt_overrides": "name"}
+VERSION_TRIGGERS = [
+    f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
+    f"WHEN NEW.version IS OLD.version BEGIN "
+    f"UPDATE {t} SET version = OLD.version + 1 WHERE {pk} = NEW.{pk}; END"
+    for t, pk in VERSIONED.items()]
 
 # Columns added after a table first shipped: {table: [(name, decl), ...]}.
 # connect() adds any that an existing database lacks.
+VERSION_COL = ("version", "INTEGER NOT NULL DEFAULT 0")
 COLUMNS = {
-    "projects": [("manager_session", "TEXT")],
+    "projects": [("manager_session", "TEXT"), VERSION_COL],
     "sessions": [],
     "limit_hits": [],
-    "tasks": [],
+    "tasks": [VERSION_COL],
     "task_events": [],
-    "session_decisions": [],
-    "standing_rules": [],
+    "session_decisions": [VERSION_COL],
+    "standing_rules": [VERSION_COL],
 }
 
 SESSION_FIELDS = (
@@ -209,19 +329,58 @@ def connect(path=None):
 
 
 def init(conn):
-    _migrate_v3(conn)          # before SCHEMA: its tasks_order index needs the v3 columns
+    if not _migrate_v3(conn):  # before SCHEMA: its tasks_order index needs the v3 columns
+        _backup_v3(conn)       # (a v2 database was just backed up by _migrate_v3)
+    before = _stored_version(conn)
     conn.executescript(SCHEMA)
-    for table, cols in COLUMNS.items():
-        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        for name, decl in cols:
-            if name not in have:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-    # raise the stored version, never lower it (an older checkout must not downgrade the mark)
-    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
-                 "WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
-                 (str(SCHEMA_VERSION),))
+    with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
+        for table, cols in COLUMNS.items():
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        for ddl in VERSION_TRIGGERS:
+            conn.execute(ddl)
+        if before is not None and before < 4 and get_meta(conn, "migrated_v4_at") is None:
+            set_meta(conn, "migrated_v4_at", now_iso())
+        # raise the stored version, never lower it (an older checkout must not downgrade the mark)
+        conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
+                     "WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+                     (str(SCHEMA_VERSION),))
+
+
+def _stored_version(conn):
+    """meta.schema_version as an int; None for a fresh database (no meta table yet)."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+        return None
+    try:
+        return int(get_meta(conn, "schema_version", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _backup_v3(conn):
+    """v3 -> v4 is additive (new tables, a version column, triggers; init does it in
+    place), but like the v3 rebuild it first copies a non-empty database to
+    <db>.v3-<utc>.bak. Only for a stored schema_version of 3: v4+ needs nothing, a
+    v2 one was backed up by _migrate_v3. -> the backup path or None."""
+    if _stored_version(conn) != 3:
+        return None
+    path = _db_file(conn)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    rows = sum(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+               for t in ("sessions", "tasks", "projects", "standing_rules", "session_decisions") if t in tables)
+    if not path or not rows:
+        return None
     conn.commit()
+    dst_path = f"{path}.v3-{_utcnow():%Y%m%dT%H%M%SZ}.bak"
+    dst = sqlite3.connect(dst_path)
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+    return dst_path
 
 
 V2_TASK_COLUMNS = ("id", "title", "description", "project", "status", "kind", "created_at", "updated_at",
@@ -383,7 +542,9 @@ def counts(conn):
 
 TASK_STATUSES = ("pending", "in_progress", "blocked", "done", "cancelled")
 OPEN_STATUSES = ("pending", "in_progress", "blocked")
-TASK_KINDS = ("task", "backlog_project")
+TASK_KINDS = ("task", "backlog_project")       # what add_task / update_task accept
+QUESTION_KIND = "question"   # v4: a manager question (ask_question), born blocked, closed by its answer
+ALL_TASK_KINDS = TASK_KINDS + (QUESTION_KIND,)
 PRIORITIES = ("high", "medium", "low")          # order = execution order
 DEFAULT_PRIORITY = "high"
 DECISIONS = ("continue", "ignore")
@@ -468,6 +629,8 @@ def _clean_task_field(name, value):
     if name == "priority":
         return _priority(value)
     if name == "kind":
+        if value == QUESTION_KIND:
+            raise ValueError("kind 'question' is only for questions (ask_question), not an edit")
         return _enum(value, TASK_KINDS, "kind")
     return _text(value, name)
 
@@ -719,10 +882,16 @@ def add_task(conn, title, description=None, project=None, priority=DEFAULT_PRIOR
     """New pending task, appended as the last stage of `project` (a name or a
     directory, see get_project; an unknown one is created at the bottom of the
     project list). project=None: no project."""
+    if kind == QUESTION_KIND:
+        raise ValueError("kind 'question' is created with ask_question (born blocked)")
+    return _add_task(conn, title, description, project, priority, kind, created_by_session)
+
+
+def _add_task(conn, title, description, project, priority, kind, created_by_session):
     fields = {"title": _clean_task_field("title", title),
               "description": _clean_task_field("description", description),
               "priority": _priority(priority),
-              "kind": _enum(kind, TASK_KINDS, "kind"),
+              "kind": _enum(kind, ALL_TASK_KINDS, "kind"),
               "created_by_session": _text(created_by_session, "created_by_session")}
     ref = _text(project, "project")
     with transaction(conn):
@@ -756,7 +925,7 @@ def list_tasks(conn, status=None, project=None, kind=None, limit=None):
         args.append(_project_row(conn, project)["id"])
     if kind is not None:
         where.append("t.kind = ?")
-        args.append(_enum(kind, TASK_KINDS, "kind"))
+        args.append(_enum(kind, ALL_TASK_KINDS, "kind"))
     sql = TASK_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -879,10 +1048,30 @@ def block_task(conn, task_id, question):
 def answer_task(conn, task_id, answer):
     """The user's answer; the task is pending again (ready for the next pass).
     blocked_question and assigned_session stay, so the next run sees the Q&A
-    and the dispatcher can resume the same session."""
+    and the dispatcher can resume the same session. A question (kind
+    'question') is done once answered: there is nothing to run, the asking
+    session reads the answer."""
     a = _text(answer, "answer", required=True)
-    return _transition(conn, task_id, ("blocked",), "pending", "answered", {"answer": a},
-                       answer=a, answered_at=NOW)
+    with transaction(conn):
+        if _task_row(conn, task_id)["kind"] == QUESTION_KIND:
+            return _transition(conn, task_id, ("blocked",), "done", "answered", {"answer": a},
+                               answer=a, answered_at=NOW, done_at=NOW)
+        return _transition(conn, task_id, ("blocked",), "pending", "answered", {"answer": a},
+                           answer=a, answered_at=NOW)
+
+
+def ask_question(conn, question, project=None, created_by_session=None, title=None):
+    """v4: a question for the user from a (manager) session, as a task of kind
+    'question' that is born blocked, so it is in the inbox like any blocked task.
+    Its answer closes it (done); the dispatcher never starts it (it only takes
+    kind 'task'). title defaults to the question's first line, cut at 120 chars."""
+    q = _text(question, "question", required=True)
+    if title is None:
+        first = q.splitlines()[0].strip()
+        title = first if len(first) <= 120 else first[:119] + "…"
+    with transaction(conn):
+        t = _add_task(conn, title, None, project, DEFAULT_PRIORITY, QUESTION_KIND, created_by_session)
+        return block_task(conn, t["id"], q)
 
 
 def start_task(conn, task_id, session):
@@ -891,6 +1080,8 @@ def start_task(conn, task_id, session):
     session = _text(session, "session")
     with transaction(conn):
         t = _task_row(conn, task_id)
+        if t["kind"] == QUESTION_KIND:
+            raise InvalidTransition(f"task #{task_id} is a question: answer it, it doesn't run")
         if t["status"] == "in_progress" and t["assigned_session"] == session:
             return t
         return _transition(conn, task_id, ("pending",), "in_progress", "started", {"session": session},
@@ -910,10 +1101,16 @@ def cancel_task(conn, task_id, reason=None):
 
 
 def reopen_task(conn, task_id, reason=None):
-    """Back to pending from done/cancelled, or from in_progress (a run died)."""
+    """Back to pending from done/cancelled, or from in_progress (a run died). A
+    question goes back to blocked (asked again, the old answer cleared)."""
     r = _text(reason, "reason")
-    return _transition(conn, task_id, ("in_progress", "done", "cancelled"), "pending", "reopened",
-                       {"reason": r} if r else None, done_at=None)
+    with transaction(conn):
+        if _task_row(conn, task_id)["kind"] == QUESTION_KIND:
+            return _transition(conn, task_id, ("done", "cancelled"), "blocked", "reopened",
+                               {"reason": r} if r else None, done_at=None, answer=None, answered_at=None,
+                               blocked_at=NOW)
+        return _transition(conn, task_id, ("in_progress", "done", "cancelled"), "pending", "reopened",
+                           {"reason": r} if r else None, done_at=None)
 
 
 # ---- stalled-session decisions
@@ -1038,3 +1235,178 @@ def pending_user_input(conn, include_own=False):
     return {"blocked_tasks": list_tasks(conn, status="blocked"),
             "undecided_sessions": [s for s in stalled_decisions(conn) if s["decision"] is None
                                    and (include_own or not s.get("own"))]}
+
+
+# ---------------------------------------------------------------- v4: settings, prompts, audit, runner tables
+#
+# Low-level rows only. Validation, defaults, version checks, the audit row and
+# idempotency are actions.py's job: every write from the CLI, the MCP server and
+# the dashboard goes through actions.perform().
+
+def _json_or_none(v):
+    return None if v is None else json.dumps(v, ensure_ascii=False, sort_keys=True)
+
+
+def _loads(s):
+    return None if s is None else json.loads(s)
+
+
+def get_setting_row(conn, key):
+    """{key, value (decoded; None = the code default), version, updated_at, updated_by},
+    or None if the key was never saved (version 0)."""
+    r = conn.execute("SELECT * FROM settings WHERE key=?", (key,)).fetchone()
+    return dict(r, value=json.loads(r["value"])) if r else None
+
+
+def setting_rows(conn):
+    return {r["key"]: dict(r, value=json.loads(r["value"]))
+            for r in conn.execute("SELECT * FROM settings ORDER BY key")}
+
+
+def put_setting(conn, key, value, updated_by=None):
+    conn.execute("INSERT INTO settings(key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, "
+                 "updated_by=excluded.updated_by", (key, json.dumps(value, ensure_ascii=False), now_iso(),
+                                                    updated_by))
+    return get_setting_row(conn, key)
+
+
+def reset_setting(conn, key, updated_by=None):
+    """Back to the code default: the value becomes JSON null (the row and its version stay)."""
+    return put_setting(conn, key, None, updated_by)
+
+
+def get_prompt_override(conn, name):
+    r = conn.execute("SELECT * FROM prompt_overrides WHERE name=?", (name,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_prompt_overrides(conn):
+    """The prompts that currently have an override (body not NULL)."""
+    return [dict(r) for r in conn.execute("SELECT * FROM prompt_overrides WHERE body IS NOT NULL ORDER BY name")]
+
+
+def put_prompt_override(conn, name, body, base_sha256, updated_by=None):
+    conn.execute("INSERT INTO prompt_overrides(name, body, base_sha256, updated_at, updated_by) "
+                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body, "
+                 "base_sha256=excluded.base_sha256, updated_at=excluded.updated_at, "
+                 "updated_by=excluded.updated_by", (name, body, base_sha256, now_iso(), updated_by))
+    return get_prompt_override(conn, name)
+
+
+def reset_prompt_override(conn, name, updated_by=None):
+    """Back to the default file: body and base_sha256 NULL (the row and its version stay)."""
+    conn.execute("UPDATE prompt_overrides SET body=NULL, base_sha256=NULL, updated_at=?, updated_by=? "
+                 "WHERE name=?", (now_iso(), updated_by, name))
+    return get_prompt_override(conn, name)
+
+
+def add_audit(conn, actor, via, action, target_type=None, target_id=None, before=None, after=None,
+              request_id=None, ts=None):
+    cur = conn.execute(
+        "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (ts or now_iso(), actor, via, action, target_type, None if target_id is None else str(target_id),
+         _json_or_none(before), _json_or_none(after), request_id))
+    return cur.lastrowid
+
+
+def audit_log(conn, limit=50, target_type=None, target_id=None):
+    """Newest first; before/after decoded."""
+    where, args = [], []
+    if target_type is not None:
+        where.append("target_type=?")
+        args.append(target_type)
+    if target_id is not None:
+        where.append("target_id=?")
+        args.append(str(target_id))
+    sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
+    sql += f" ORDER BY id DESC LIMIT {int(limit)}"
+    return [dict(r, before=_loads(r["before"]), after=_loads(r["after"])) for r in conn.execute(sql, args)]
+
+
+def get_idempotency(conn, key):
+    r = conn.execute("SELECT * FROM idempotency_keys WHERE key=?", (key,)).fetchone()
+    return dict(r) if r else None
+
+
+def put_idempotency(conn, key, actor, action, request_sha256, response):
+    conn.execute("INSERT INTO idempotency_keys(key, actor, action, request_sha256, response, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?)",
+                 (key, actor, action, request_sha256, json.dumps(response, ensure_ascii=False), now_iso()))
+
+
+def prune_idempotency(conn, older_than):
+    """Delete keys created before `older_than` (a datetime). -> number deleted."""
+    return conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (iso(older_than),)).rowcount
+
+
+def add_run_log(conn, component, decision, reason=None, session_id=None, task_id=None, ts=None):
+    """One keep-alive/dispatcher decision (written by the runners from phase 2 on)."""
+    cur = conn.execute("INSERT INTO run_log(ts, component, session_id, task_id, decision, reason) "
+                       "VALUES (?, ?, ?, ?, ?, ?)",
+                       (iso(ts) if ts else now_iso(), _text(component, "component", required=True), session_id,
+                        task_id, _text(decision, "decision", required=True), reason))
+    return cur.lastrowid
+
+
+def run_log(conn, component=None, limit=50):
+    if component is None:
+        rows = conn.execute(f"SELECT * FROM run_log ORDER BY id DESC LIMIT {int(limit)}")
+    else:
+        rows = conn.execute(f"SELECT * FROM run_log WHERE component=? ORDER BY id DESC LIMIT {int(limit)}",
+                            (component,))
+    return [dict(r) for r in rows]
+
+
+DRIVEN_FIELDS = ("tmux", "kind", "task_id", "started_at", "last_seen", "ended_at", "holder_kind", "rc_url")
+
+
+def upsert_driven_session(conn, session_id, **fields):
+    """Insert (kind and started_at needed then) or update the given fields."""
+    bad = set(fields) - set(DRIVEN_FIELDS)
+    if bad:
+        raise ValueError(f"unknown driven_sessions fields: {sorted(bad)}")
+    fields = {k: iso(v) if isinstance(v, datetime) else v for k, v in fields.items()}
+    if get_driven_session(conn, session_id) is None:
+        fields.setdefault("started_at", now_iso())
+        if not fields.get("kind"):
+            raise ValueError("a new driven session needs kind")
+        cols = ["session_id"] + list(fields)
+        conn.execute(f"INSERT INTO driven_sessions ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                     [session_id] + list(fields.values()))
+    elif fields:
+        conn.execute(f"UPDATE driven_sessions SET {', '.join(f'{k}=?' for k in fields)} WHERE session_id=?",
+                     list(fields.values()) + [session_id])
+    return get_driven_session(conn, session_id)
+
+
+def get_driven_session(conn, session_id):
+    r = conn.execute("SELECT * FROM driven_sessions WHERE session_id=?", (session_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def driven_sessions(conn, include_ended=True):
+    sql = "SELECT * FROM driven_sessions" + ("" if include_ended else " WHERE ended_at IS NULL")
+    return [dict(r) for r in conn.execute(sql + " ORDER BY started_at DESC, session_id")]
+
+
+def open_request(conn, kind, target=None):
+    r = conn.execute("SELECT * FROM action_requests WHERE status='open' AND kind=? AND COALESCE(target, '')=?",
+                     (kind, target or "")).fetchone()
+    return dict(r) if r else None
+
+
+def add_request(conn, actor, kind, target=None):
+    cur = conn.execute("INSERT INTO action_requests(ts, actor, kind, target) VALUES (?, ?, ?, ?)",
+                       (now_iso(), actor, kind, target))
+    return dict(conn.execute("SELECT * FROM action_requests WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+def list_requests(conn, status=None, limit=50):
+    if status is None:
+        rows = conn.execute(f"SELECT * FROM action_requests ORDER BY id DESC LIMIT {int(limit)}")
+    else:
+        rows = conn.execute(f"SELECT * FROM action_requests WHERE status=? ORDER BY id DESC LIMIT {int(limit)}",
+                            (status,))
+    return [dict(r) for r in rows]

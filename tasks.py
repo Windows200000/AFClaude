@@ -46,7 +46,8 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import store  # noqa: E402
+import store  # noqa: E402  (reads)
+import actions  # noqa: E402  (every write: validation, one transaction, audit row)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -202,6 +203,11 @@ def resolve_session(conn, prefix):
     raise store.NotFound(f"no session matches {prefix!r}")
 
 
+def act(conn, action, /, **params):
+    """One write through the shared write path (actions.py), as the CLI."""
+    return actions.perform(conn, action, params, actor="cli", via="cli")
+
+
 def maybe_scan(conn, args):
     if not args.no_scan:
         import stalled      # imports keepalive/usage_sampler; only needed here
@@ -229,9 +235,10 @@ def run_project(conn, args):
         rows = store.list_projects(conn)
         return dump(rows) if args.json else print_projects(rows)
     if pc == "add":
-        p = store.add_project(conn, args.name, args.description, project_ref(args.path), args.rank)
+        p = act(conn, "project.add", name=args.name, description=args.description, path=project_ref(args.path),
+                rank=args.rank)
     elif pc == "move":
-        p = store.move_project(conn, project_ref(args.project), args.rank)
+        p = act(conn, "project.move", project=project_ref(args.project), rank=args.rank)
     elif pc == "edit":
         f = {k: v for k, v in (("name", args.name), ("description", args.description),
                                ("path", project_ref(args.path))) if v is not None}
@@ -239,9 +246,9 @@ def run_project(conn, args):
             f["manager_session"] = resolve_session(conn, args.manager) if args.manager.strip() else None
         if not f:
             raise ValueError("nothing to change (use --name/-d/--path/--manager)")
-        p = store.update_project(conn, project_ref(args.project), **f)
+        p = act(conn, "project.edit", project=project_ref(args.project), **f)
     else:  # prio
-        r = store.set_project_priority(conn, project_ref(args.project), args.priority)
+        r = act(conn, "project.priority", project=project_ref(args.project), priority=args.priority)
         if args.json:
             return dump(r)
         return print(f"{r['project']}: {len(r['changed'])} open stage(s) set to {r['priority']}")
@@ -254,8 +261,9 @@ def run_project(conn, args):
 def run(conn, args):
     c = args.cmd
     if c == "add":
-        task_out(args, store.add_task(conn, args.title, args.description, project_ref(args.project),
-                                      args.priority, args.kind, args.by))
+        task_out(args, act(conn, "task.add", title=args.title, description=args.description,
+                           project=project_ref(args.project), priority=args.priority, kind=args.kind,
+                           created_by_session=args.by))
     elif c == "list":
         status = None if args.all else (args.status or list(store.OPEN_STATUSES))
         rows = store.list_tasks(conn, status=status, project=project_ref(args.project), kind=args.kind)
@@ -266,7 +274,7 @@ def run(conn, args):
     elif c == "project":
         run_project(conn, args)
     elif c == "move":
-        task_out(args, store.move_stage(conn, args.id, args.stage))
+        task_out(args, act(conn, "task.move", task_id=args.id, stage=args.stage))
     elif c == "show":
         t = store.get_task(conn, args.id)
         if t is None:
@@ -278,28 +286,28 @@ def run(conn, args):
                                ("project", project_ref(args.project)), ("kind", args.kind)) if v is not None}
         if not f:
             raise ValueError("nothing to change (use --title/-d/--project/--kind)")
-        task_out(args, store.update_task(conn, args.id, **f))
+        task_out(args, act(conn, "task.edit", task_id=args.id, **f))
     elif c == "prio":
-        task_out(args, store.set_priority(conn, args.id, args.priority))
+        task_out(args, act(conn, "task.priority", task_id=args.id, priority=args.priority))
     elif c == "block":
-        task_out(args, store.block_task(conn, args.id, args.question))
+        task_out(args, act(conn, "task.block", task_id=args.id, question=args.question))
     elif c == "answer":
-        task_out(args, store.answer_task(conn, args.id, args.answer))
+        task_out(args, act(conn, "task.answer", task_id=args.id, answer=args.answer))
     elif c == "start":
-        task_out(args, store.start_task(conn, args.id, args.session))
+        task_out(args, act(conn, "task.start", task_id=args.id, session=args.session))
     elif c == "done":
-        task_out(args, store.finish_task(conn, args.id, args.summary))
+        task_out(args, act(conn, "task.finish", task_id=args.id, summary=args.summary))
     elif c == "cancel":
-        task_out(args, store.cancel_task(conn, args.id, args.reason))
+        task_out(args, act(conn, "task.cancel", task_id=args.id, reason=args.reason))
     elif c == "reopen":
-        task_out(args, store.reopen_task(conn, args.id, args.reason))
+        task_out(args, act(conn, "task.reopen", task_id=args.id, reason=args.reason))
     elif c == "decide":
         maybe_scan(conn, args)
         sid = resolve_session(conn, args.session)
         if args.decision == "clear":
-            store.clear_decision(conn, sid)
+            act(conn, "session.clear", session_id=sid)
         else:
-            store.decide_session(conn, sid, args.decision, args.note)
+            act(conn, "session.decide", session_id=sid, decision=args.decision, note=args.note)
         dec, src = store.effective_decision(conn, sid)
         if args.json:
             dump({"session_id": sid, "decision": dec, "source": src})
@@ -310,7 +318,7 @@ def run(conn, args):
             rules = store.list_rules(conn)
             dump(rules) if args.json else print_rules(rules)
         elif args.rule_cmd == "rm":
-            store.remove_rule(conn, args.id)
+            act(conn, "rule.remove", rule_id=args.id)
             dump({"removed": args.id}) if args.json else print(f"rule #{args.id} removed")
         else:
             match = args.match
@@ -318,7 +326,7 @@ def run(conn, args):
                 match = resolve_session(conn, match)
             elif match == "." or match.startswith(("./", "../", "~")):
                 match = os.path.abspath(os.path.expanduser(match))
-            r = store.add_rule(conn, args.scope, match, args.decision, args.note)
+            r = act(conn, "rule.add", scope=args.scope, match=match, decision=args.decision, note=args.note)
             dump(r) if args.json else print_rules([r])
     elif c == "inbox":
         maybe_scan(conn, args)
@@ -353,7 +361,7 @@ def parser():
     p.add_argument("--status", nargs="+", choices=store.TASK_STATUSES)
     p.add_argument("--all", action="store_true", help="include done and cancelled")
     p.add_argument("--project")
-    p.add_argument("--kind", choices=store.TASK_KINDS)
+    p.add_argument("--kind", choices=store.ALL_TASK_KINDS)
     p = sub.add_parser("order", parents=[js], help="the ready queue in execution order")
     p.add_argument("--project")
     p.add_argument("--kind", choices=store.TASK_KINDS)
