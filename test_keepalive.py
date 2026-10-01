@@ -10,6 +10,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the code defaults, not a local data/afclaude.json
 import keepalive as ka  # noqa: E402
 
 UTC = timezone.utc
@@ -148,6 +149,83 @@ class Window(unittest.TestCase):
         self.assertEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")), "window-start-2026-09-30")
         self.assertEqual(ka.window_start_key(Z("2026-10-26T22:00:05Z")), "window-start-2026-10-27")
         self.assertEqual(ka.window_start_key(Z("2027-03-27T22:00:05Z")), "window-start-2027-03-28")
+
+    def test_window_start_dedup_across_midnight(self):
+        """One window-start continue per night: every moment of one window (before and
+        after midnight, incl. the DST nights) has the same key; the next night a new one."""
+        for night, moments in [
+            ("2026-09-30", ["2026-09-29T21:00:05Z", "2026-09-29T21:59:59Z", "2026-09-29T22:30:00Z",
+                            "2026-09-30T06:59:59Z"]),                  # CEST: 23:00, 23:59, 00:30, 08:59
+            ("2026-10-27", ["2026-10-26T22:00:05Z", "2026-10-26T23:30:00Z", "2026-10-27T07:59:59Z"]),  # CET
+            ("2026-10-25", ["2026-10-24T21:00:05Z", "2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z",
+                            "2026-10-25T07:59:59Z"]),                  # DST end (02:30 twice)
+            ("2027-03-28", ["2027-03-27T22:00:05Z", "2027-03-28T00:59:59Z", "2027-03-28T01:00:00Z",
+                            "2027-03-28T06:59:59Z"]),                  # DST start
+        ]:
+            for m in moments:
+                with self.subTest(m=m):
+                    self.assertEqual(ka.window_start_key(Z(m)), f"window-start-{night}")
+        self.assertNotEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")),
+                            ka.window_start_key(Z("2026-09-30T21:00:05Z")))
+
+    def test_window_start_handled_key_not_fired_again_after_midnight(self):
+        """handle_fire skips a key already handled (before preflight): a 23:00 window-start
+        and a second --window-start run at 00:30 the same night fire once."""
+        st = {"handled": {ka.window_start_key(Z("2026-09-29T21:00:05Z")): {"result": "continued"}},
+              "fires": {}}
+        old = ka.preflight
+        ka.preflight = lambda *a, **k: self.fail("preflight must not run for a handled key")
+        try:
+            stall = {"uuid": ka.window_start_key(Z("2026-09-29T22:30:00Z")), "timestamp": Z("2026-09-29T22:30:00Z")}
+            ka.handle_fire(SID, stall, "window start", st, None)
+        finally:
+            ka.preflight = old
+
+
+class WindowConfig(unittest.TestCase):
+    """The window comes from data/afclaude.json (window_start, window_hours); the default
+    is the owner's weekly window 23:00-09:00 (dashboard design §4.2.1)."""
+
+    def setUp(self):
+        import afclaude_config
+        self.ac = afclaude_config
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old = afclaude_config.CONFIG_FILE
+        afclaude_config.CONFIG_FILE = os.path.join(self.tmp.name, "afclaude.json")
+
+    def tearDown(self):
+        self.ac.CONFIG_FILE = self._old
+        ka.reload_window()
+        self.tmp.cleanup()
+
+    def setcfg(self, **kw):
+        with open(self.ac.CONFIG_FILE, "w") as fh:
+            json.dump(kw, fh)
+
+    def test_default(self):
+        from datetime import time
+        self.assertEqual(self.ac.DEFAULTS["window_start"], "23:00")
+        self.assertEqual(self.ac.DEFAULTS["window_hours"], 10)
+        self.assertEqual(self.ac.window(), (time(23, 0), time(9, 0)))
+        ka.reload_window()
+        self.assertEqual((ka.WINDOW_START, ka.WINDOW_END), (time(23, 0), time(9, 0)))
+
+    def test_override_and_invalid(self):
+        from datetime import time
+        self.setcfg(window_start="00:00", window_hours=8)       # the old window, same-day
+        self.assertEqual(self.ac.window(), (time(0, 0), time(8, 0)))
+        ka.reload_window()
+        self.assertTrue(ka.in_window(Z("2026-09-25T22:00:00Z")))    # 00:00 CEST
+        self.assertFalse(ka.in_window(Z("2026-09-25T21:00:00Z")))   # 23:00 CEST
+        self.assertFalse(ka.in_window(Z("2026-09-26T06:00:00Z")))   # 08:00 CEST
+        self.assertEqual(ka.next_window_start(Z("2026-09-26T10:00:00Z")), Z("2026-09-26T22:00:00Z"))
+        self.setcfg(window_start="22:30", window_hours=5)
+        self.assertEqual(self.ac.window(), (time(22, 30), time(3, 30)))
+        for bad in ({"window_start": "25:00"}, {"window_start": "x"}, {"window_hours": 0},
+                    {"window_hours": 24}, {"window_hours": "ten"}):
+            with self.subTest(bad=bad):
+                self.setcfg(**bad)
+                self.assertEqual(self.ac.window(), (time(23, 0), time(9, 0)))
 
 
 class Budget(unittest.TestCase):

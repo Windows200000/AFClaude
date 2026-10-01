@@ -94,15 +94,30 @@ FINISHED_TASK = ("done", "blocked", "cancelled")
 
 # ---------------------------------------------------------------- log, state, config
 
+def is_log_file(stream):
+    """True if `stream` already writes into LOG_FILE (cron's `>> data/dispatcher.log 2>&1`)."""
+    try:
+        a, b = os.fstat(stream.fileno()), os.stat(LOG_FILE)
+    except (AttributeError, OSError, ValueError):   # no fd (StringIO), closed, no log yet
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
 def log(msg):
+    """Append one line to LOG_FILE and echo it to stdout, unless stdout IS the log file
+    (cron redirects it there; every line used to land twice). -> True if written."""
     line = f"[{datetime.now(ka.BERLIN).strftime('%Y-%m-%d %H:%M:%S %Z')}] {msg}"
-    print(line, flush=True)
+    written = False
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(LOG_FILE, "a") as fh:
             fh.write(line + "\n")
+        written = True
     except OSError:
         pass
+    if not (written and is_log_file(sys.stdout)):
+        print(line, flush=True)
+    return written
 
 
 def load_config(path=None, overrides=None):
@@ -753,9 +768,12 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
+        tb = traceback.format_exc()
+        written = False
         try:
-            log(f"CRASH: {type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}")
+            written = log(f"CRASH: {type(e).__name__}: {e}\n{tb.rstrip()}")
         finally:
+            if not (written and is_log_file(sys.stderr)):   # cron: stderr is the log file too
+                sys.stderr.write(tb)
             ka.alert(f"dispatcher.py crashed: {type(e).__name__}: {e}"[:200], traceback.format_exc()[-1500:])
         sys.exit(1)

@@ -4,8 +4,10 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the default window
 import export_quickview as qv  # noqa: E402
 import store  # noqa: E402
 
@@ -64,6 +66,30 @@ class BuildStages(unittest.TestCase):
                 self.assertTrue(qv.stages()["error"])      # reported, not raised
             finally:
                 store.DB_PATH, qv.STAGES_PROJECT = old_path, old_proj
+
+
+class WindowInfo(unittest.TestCase):
+    """The 23:00-09:00 window spans midnight: inside it, the next window is the following
+    evening's; outside, this evening's."""
+
+    def Z(self, s):
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+    def test_window_info(self):
+        out = qv.window_info(self.Z("2026-09-29T22:30:00Z"))        # Wed 00:30 CEST: inside
+        self.assertEqual(out["window_berlin"], "23:00–09:00")
+        self.assertTrue(out["in_window"])
+        self.assertEqual(out["window_end_berlin"], "Wed 30.09. 09:00 CEST")
+        self.assertEqual(out["next_window_berlin"], "Wed 30.09. 23:00 CEST")
+        out = qv.window_info(self.Z("2026-09-29T21:30:00Z"))        # Tue 23:30 CEST: inside
+        self.assertEqual(out["window_end_berlin"], "Wed 30.09. 09:00 CEST")
+        self.assertEqual(out["next_window_berlin"], "Wed 30.09. 23:00 CEST")
+        out = qv.window_info(self.Z("2026-09-30T10:00:00Z"))        # Wed 12:00 CEST: outside
+        self.assertFalse(out["in_window"])
+        self.assertIsNone(out["window_end_berlin"])
+        self.assertEqual(out["next_window_berlin"], "Wed 30.09. 23:00 CEST")
+        out = qv.window_info(self.Z("2026-10-25T12:00:00Z"))        # first CET evening
+        self.assertEqual(out["next_window_berlin"], "Sun 25.10. 23:00 CET")
 
 
 if __name__ == "__main__":

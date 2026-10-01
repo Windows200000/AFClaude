@@ -60,8 +60,10 @@ STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
-WINDOW_START = dtime(23, 0)         # Europe/Berlin, the evening before WINDOW_END
-WINDOW_END = dtime(9, 0)            # Europe/Berlin, exclusive
+# Automation window, Europe/Berlin wall clock: default 23:00-09:00 (spans midnight), from
+# data/afclaude.json window_start / window_hours (afclaude_config.window()). The watcher
+# re-reads it every loop iteration (reload_window), cron runs read it at start.
+WINDOW_START, WINDOW_END = afclaude_config.window()   # END exclusive; END < START = spans midnight
 WEEKLY_CUTOFF = dtime(11, 0)        # "reset no later than 11:00 after the window" (on the window-end day)
 PROJECTION_THRESHOLD = 90.0         # percent
 WEEK = timedelta(days=7)
@@ -228,6 +230,12 @@ def parse_reset_text(text, ref):
 
 # ---------------------------------------------------------------- window
 
+def reload_window():
+    """Re-read the window from data/afclaude.json (the dashboard will edit it later)."""
+    global WINDOW_START, WINDOW_END
+    WINDOW_START, WINDOW_END = afclaude_config.window()
+
+
 def in_window(now):
     t = now.astimezone(BERLIN).time()
     if WINDOW_START <= WINDOW_END:            # window within one calendar day
@@ -254,7 +262,8 @@ def next_window_start(now):
 
 def is_window_start_hour(now):
     """--window-start acts only in WINDOW_START's Berlin hour. Cron fires it at 21:00 and
-    22:00 UTC; exactly one of them is 23:xx Berlin (21:00 in CEST, 22:00 in CET)."""
+    22:00 UTC (`0 21,22 * * *`); exactly one of them is 23:xx Berlin (21:00 in CEST,
+    22:00 in CET). A different window_start needs a different cron line."""
     return now.astimezone(BERLIN).hour == WINDOW_START.hour
 
 
@@ -731,6 +740,7 @@ def run(args):
             return
         now = datetime.now(UTC)
         if now >= next_eval:
+            reload_window()
             action, detail, stall = evaluate(sid, now)
             line = f"{action}: {detail}"
             if line != last_line:

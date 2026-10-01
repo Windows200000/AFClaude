@@ -307,10 +307,23 @@ def limits_block():
     }
 
 
+def window_info(now):
+    """The nightly window for the page: its wall-clock span, whether `now` is inside, the
+    current window's end, and the NEXT window's start (after the current one if inside;
+    the window spans midnight, so that is this evening or tomorrow evening)."""
+    inside = ka.in_window(now)
+    end = ka.current_window_end(now)
+    nxt = ka.next_window_start(end if inside else now)
+    return {"window_berlin": f"{ka.WINDOW_START:%H:%M}–{ka.WINDOW_END:%H:%M}",
+            "in_window": inside,
+            "window_end_berlin": bstr(end) if inside else None,
+            "next_window_berlin": bstr(nxt)}
+
+
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
     out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
-           "next_window_berlin": bstr(ka.next_window_start(now))}
+           **window_info(now)}
     rev = usage_review()
     out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
     if not u:
