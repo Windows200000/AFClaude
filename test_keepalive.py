@@ -411,9 +411,13 @@ class ReserveWiring(unittest.TestCase):
                 cache = {"fetched_at": now, "weekly": {"percent": 60.0, "resets_at": self.R},
                          "session": {"percent": 0.0, "resets_at": None}}
                 self.samples(now)
-                self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "FIRE")
-                self.samples(now, prompt_minutes_ago=0)
-                self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "HOLD")
+                ka.read_usage_cache, oldc = (lambda: cache), ka.read_usage_cache   # the window check reads the cache
+                try:
+                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "FIRE")
+                    self.samples(now, prompt_minutes_ago=0)
+                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "HOLD")
+                finally:
+                    ka.read_usage_cache = oldc
                 self.samples(now)
                 self.setcfg(last_mile_hours=0)                           # no last mile: the window gate holds
                 self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "WAIT_WINDOW")
