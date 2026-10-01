@@ -64,6 +64,22 @@ class Env(unittest.TestCase):
 
 
 class Tasks(Env):
+    def test_mcp_task_is_like_a_ui_task(self):
+        """No approval step: an MCP-added task is pending and in the run queue exactly like
+        one added through the CLI (tasks.py, the UI until the dashboard exists)."""
+        m = run(ms.afclaude_add_task("via mcp", project="P"))
+        conn = self.conn()
+        try:
+            c = store.add_task(conn, "via cli", None, "P", "high")
+            rows = {t["id"]: t for t in store.list_tasks(conn, status="pending")}
+        finally:
+            conn.close()
+        self.assertEqual(m["status"], "pending")
+        self.assertEqual(set(rows), {m["id"], c["id"]})           # both in the run queue
+        for k in ("status", "kind", "priority"):
+            self.assertEqual(rows[m["id"]][k], rows[c["id"]][k], k)
+        self.assertFalse(any("approv" in k for k in rows[m["id"]]))
+
     def test_add_defaults_to_callers_cwd(self):
         t = run(ms.afclaude_add_task("Write the dispatcher"))
         self.assertEqual((t["project"], t["project_source"], t["priority"], t["stage"], t["status"]),
@@ -292,6 +308,7 @@ class Stdio(unittest.TestCase):
             t0 = time.monotonic()
             async with Client(self.params, mode="legacy", read_timeout_seconds=30) as client:
                 started = time.monotonic() - t0
+                self.instructions = client.instructions
                 tools = (await client.list_tools()).tools
                 call = lambda n, a=None: client.call_tool(n, a or {})  # noqa: E731
                 added = await call("afclaude_add_task", {"title": "via stdio", "description": "rt"})
@@ -303,8 +320,14 @@ class Stdio(unittest.TestCase):
         started, tools, added, listed, inbox, bad, badarg = asyncio.run(go())
         self.assertLess(started, 15)
         self.assertEqual({t.name for t in tools}, EXPECTED_TOOLS)
+        # owner decision Q3: only on the user's explicit request (no approval step behind it)
+        self.assertEqual(self.instructions, ms.INSTRUCTIONS)
+        self.assertIn("ONLY when the user explicitly asks for AFClaude", self.instructions)
+        self.assertIn("no approval step", self.instructions)
+        self.assertLess(len(ms.USE_ONLY), 100)                      # the per-tool prefix stays short
         for t in tools:
             self.assertTrue(t.description)
+            self.assertTrue(t.description.startswith(ms.USE_ONLY), t.name)
             self.assertIsNone(t.output_schema)                       # plain text results, no schema cost
             self.assertNotIn("ctx", t.input_schema.get("properties", {}))
         schema = {t.name: t.input_schema for t in tools}

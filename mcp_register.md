@@ -22,6 +22,15 @@ Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp`
 
 Remove it: `claude mcp remove --scope user afclaude`.
 
+## Only on explicit request, no approval step
+
+A task added through MCP counts exactly like one you add in the UI (today `tasks.py`, later the dashboard): it is `pending` right away, and the dispatcher starts it on its own in the nightly window. There is no approval step (owner decision, 29.09.2026). So the server tells every session to use these tools **only when you explicitly ask for AFClaude**, or when the AFClaude task prompt a session was started with tells it to report through them (`prompts/task_start.md`: done / blocked). It says this in two places, because some clients drop server instructions:
+
+- the server's MCP `instructions` (sent at initialize: when to use the tools, never on the session's own initiative, no approval step, execution order);
+- a short prefix on every tool description: "Only when the user explicitly asks for AFClaude (or an AFClaude task prompt says so)."
+
+`test_mcp_server.py` checks both over a real stdio round trip. Sessions that already run pick up the new texts only after a restart or `/mcp` reconnect.
+
 ## Tools
 
 | tool | what |

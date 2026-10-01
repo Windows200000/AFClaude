@@ -2,7 +2,7 @@
 """
 AFClaude dispatcher (goal 5): keepalive.py keeps ONE session alive; the
 dispatcher runs everything else AFClaude should run, in the same nightly
-window (00:00-08:00 Europe/Berlin) and under the same budget rule
+window (23:00-09:00 Europe/Berlin) and under the same budget rule
 (keepalive.budget_decision). One pass per invocation (cron-friendly):
 
   1. Approved stalled sessions: store.stalled_decisions() rows whose effective
@@ -95,15 +95,30 @@ FINISHED_TASK = ("done", "blocked", "cancelled")
 
 # ---------------------------------------------------------------- log, state, config
 
+def is_log_file(stream):
+    """True if `stream` already writes into LOG_FILE (cron's `>> data/dispatcher.log 2>&1`)."""
+    try:
+        a, b = os.fstat(stream.fileno()), os.stat(LOG_FILE)
+    except (AttributeError, OSError, ValueError):   # no fd (StringIO), closed, no log yet
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
 def log(msg):
+    """Append one line to LOG_FILE and echo it to stdout, unless stdout IS the log file
+    (cron redirects it there; every line used to land twice). -> True if written."""
     line = f"[{datetime.now(ka.BERLIN).strftime('%Y-%m-%d %H:%M:%S %Z')}] {msg}"
-    print(line, flush=True)
+    written = False
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(LOG_FILE, "a") as fh:
             fh.write(line + "\n")
+        written = True
     except OSError:
         pass
+    if not (written and is_log_file(sys.stdout)):
+        print(line, flush=True)
+    return written
 
 
 def load_config(path=None, overrides=None):
@@ -714,7 +729,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", action="store_true", help="act (default: dry-run, changes nothing)")
     ap.add_argument("--once", action="store_true", help="one pass (always the case; for cron symmetry)")
-    ap.add_argument("--now", action="store_true", help="ignore the 00:00-08:00 window (budget rule still applies)")
+    ap.add_argument("--now", action="store_true", help="ignore the 23:00-09:00 window (budget rule still applies)")
     ap.add_argument("--skip-task", action="append", default=[], metavar="ID|TITLE",
                     help="never start this task (id or exact title, case-insensitive); repeatable, "
                          "adds to the config's skip_tasks")
@@ -762,9 +777,12 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
+        tb = traceback.format_exc()
+        written = False
         try:
-            log(f"CRASH: {type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}")
+            written = log(f"CRASH: {type(e).__name__}: {e}\n{tb.rstrip()}")
         finally:
+            if not (written and is_log_file(sys.stderr)):   # cron: stderr is the log file too
+                sys.stderr.write(tb)
             ka.alert(f"dispatcher.py crashed: {type(e).__name__}: {e}"[:200], traceback.format_exc()[-1500:])
         sys.exit(1)

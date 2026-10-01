@@ -23,7 +23,7 @@ Non-goals (v1)
 
 There is one user, the owner. They mostly open the dashboard on a phone, often right after a push or in the morning. So: one column, large tap targets, no hover-only controls, no drag-and-drop as the only way to reorder, every page useful without scrolling past the first screen.
 
-Top bar on every page: automation state (running / paused, with a toggle), tonight's window ("22:00–08:00, 2 × 5 h"), weekly usage and the projected end-of-week value, and a badge with the inbox count.
+Top bar on every page: automation state (running / paused, with a toggle), tonight's window ("23:00–09:00, 2 × 5 h"), weekly usage and the projected end-of-week value, and a badge with the inbox count.
 
 - **F1 Inbox (home).** Shows ONLY real questions: blocked tasks (question plus a text box) and open manager questions (§4.6). Never stalls, never untitled sessions. Answering moves the task from blocked to pending, and the card disappears immediately (the server returns the new inbox). An empty inbox says so in one line.
 - **F2 Stalled sessions.** Only sessions whose last entry is a limit notice (`sessions.stalled = 1`), newest first, own AFClaude sessions hidden by default. Each card shows the title (or the cwd plus the first prompt when the session has no title), project, stall kind, reset time and the effective decision with its source. Buttons: Continue, Ignore, and "Always…" (a session rule or a project rule; the project rule preselects the most specific cwd). An undecided stall stays until the user decides it; it never expires. Decided or resumed stalls leave the undecided list right away. A "decided" filter shows the rest.
@@ -71,15 +71,15 @@ The usual approach applies: `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict
 
 ### 4.1 `settings`
 `key TEXT PK, value TEXT (JSON), updated_at, updated_by`. Typed accessors live in `schedule.py` and `actions.py`, and code defaults apply when a key is missing, so an empty table reproduces today's behaviour exactly.
-- `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 08:00, used only until the first GUI save, see §10 Q1)
-- `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (3: today's "11:00 after an 08:00 window end"), `budget.session_usage_stop` (85, from `dispatcher.json`)
+- `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
+- `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: today's "11:00 after a 09:00 window end"), `budget.session_usage_stop` (85, from `dispatcher.json`)
 - `automation.paused` (bool, checked by every runner in addition to the `PAUSED` file)
 
 ### 4.2 Window semantics (`schedule.py`)
 - Window = [start, start + N × session_hours), per weekday (§4.2.1). The start is a wall-clock time in `window.tz`, and the length is in absolute hours, so a DST night still holds exactly N full session windows (it may end an hour earlier or later on the wall clock; the preview shows this).
 - The grid is anchored at the chosen start, as decided earlier: session k runs from start + k × session_hours, so every session window inside the automation window is a full one, and the window ends on a session-limit boundary. The start picker moves in 30-min steps. It also offers "snap to the usual reset": from `data/samples.jsonl` it shows when a user-started session window was typically still running at the chosen start and when it reset (the automation window's first session can only begin after that). Picking that time aligns the grid with real limits.
 - `in_window`, `current_window_end`, `next_window_start` and the budget cutoff (window end + cutoff hours) move from constants in `keepalive.py` to `schedule.py`. `keepalive.py`, `dispatcher.py`, `export_quickview.py` and `usage_review.py` read the settings once per pass or loop iteration.
-- The fixed window-start cron (`0 22,23 * * *` UTC) is replaced by a window-start tick in the dispatcher pass: the first pass at or after the window start fires the keep-alive's window-start continue once per window (dedup key = window start date).
+- The fixed window-start cron (`0 21,22 * * *` UTC for the 23:00 Berlin start) is replaced by a window-start tick in the dispatcher pass: the first pass at or after the window start fires the keep-alive's window-start continue once per window (dedup key = the window's end date, as `keepalive.window_start_key()`, since the window spans midnight).
 
 ### 4.2.1 Per-weekday windows and link groups
 - `window.days` = `{"mon": {"start": "23:00", "n": 2, "group": "g1"} | null, …, "sun": …}`. A window belongs to the weekday on which it **starts** (Mon 23:00–09:00 runs into Tuesday). `null` = no automation window that night.

@@ -224,7 +224,7 @@ class Stalled(Base):
         self.stalled_session(sid(1))
         self.scan()
         store.decide_session(self.conn, sid(1), "continue")
-        rep = self.run_pass(now=datetime(2026, 9, 29, 21, 30, tzinfo=UTC))   # reset passed, 23:30 Berlin
+        rep = self.run_pass(now=datetime(2026, 9, 30, 7, 30, tzinfo=UTC))    # reset passed, 09:30 Berlin
         self.assertEqual(self.resume_calls(), [])
         self.assertTrue(any("WAIT_WINDOW" in s for s in rep["skip"]))
         rep = self.run_pass(now=datetime(2026, 9, 29, 20, 0, tzinfo=UTC))   # before the 21:00 UTC reset
@@ -620,6 +620,52 @@ class DryRun(Base):
         self.assertEqual(self.resume_calls(), [])
         self.assertFalse(os.path.exists(os.path.join(data, "dispatcher_state.json")))
         self.assertTrue(os.path.exists(os.path.join(data, "dispatcher.log")))
+
+    def run_cli_into(self, data, out_path):
+        """The CLI like cron runs it: `>> out_path 2>&1`."""
+        env = dict(os.environ, AFCLAUDE_DB=os.path.join(self.d, "t.db"), DISPATCHER_DATA_DIR=data,
+                   KEEPALIVE_PROJECTS_DIR=self.proj, KEEPALIVE_KA_RESUME=ka.KA_RESUME,
+                   AFCLAUDE_OWN_LIST=self.own, KA_TRUST_ROOT=self.d)
+        code = ("import sys, keepalive as ka, dispatcher as dp;"
+                f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
+                f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
+                "ka.alert=lambda s, b='': None;"
+                "sys.exit(dp.main(['--once', '--now']))")
+        with open(out_path, "a") as out:
+            r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, stdout=out,
+                               stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(r.returncode, 0)
+
+    def test_cron_redirect_logs_each_line_once(self):
+        """Cron appends stdout+stderr to data/dispatcher.log, which log() also writes:
+        every line must land there exactly once (it used to be twice)."""
+        data = os.path.join(self.d, "clidata")
+        os.makedirs(data)
+        logf = os.path.join(data, "dispatcher.log")
+        self.run_cli_into(data, logf)
+        with open(logf) as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(sum("pass (DRY-RUN" in ln for ln in lines), 1, lines)
+        self.assertTrue(lines)
+        self.assertEqual(len(lines), len(set(lines)), lines)     # no line twice
+        self.run_cli_into(data, logf)
+        with open(logf) as fh:
+            self.assertEqual(sum("pass (DRY-RUN" in ln for ln in fh), 2)
+        # stdout elsewhere (a terminal, another file): still a full copy there
+        other = os.path.join(self.d, "other.out")
+        self.run_cli_into(data, other)
+        with open(other) as a, open(logf) as b:
+            self.assertEqual(sum("pass (DRY-RUN" in ln for ln in a), 1)
+            self.assertEqual(sum("pass (DRY-RUN" in ln for ln in b), 3)
+
+    def test_is_log_file(self):
+        import io
+        os.makedirs(dp.DATA_DIR, exist_ok=True)
+        self.assertFalse(dp.is_log_file(io.StringIO()))
+        with open(dp.LOG_FILE, "a") as fh:
+            self.assertTrue(dp.is_log_file(fh))
+        with open(os.path.join(dp.DATA_DIR, "x.log"), "a") as fh:
+            self.assertFalse(dp.is_log_file(fh))
 
 
 class Prompts(Base):
