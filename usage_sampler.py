@@ -388,6 +388,133 @@ def haiku_judgement(st, t):
     return rows
 
 
+# ------------------------------------------------------------------ derived (additive) fields
+
+SESSION_LEN = timedelta(hours=5)
+SERIES = os.path.join(DATA, "weekly_series.jsonl")   # compact long-term history, never pruned
+RESET_JUMP = timedelta(minutes=30)                   # resets_at jitters by ms; a real reset moves it by hours
+
+
+def limits_kinds(usage):
+    """Sorted limit kinds present in this row's /usage data (spots new meters)."""
+    return sorted({l["kind"] for l in (usage.get("limits_raw") or []) if isinstance(l, dict) and l.get("kind")})
+
+
+def token_totals(activity):
+    """Scalar token totals for the interval, split own / other (0 when idle)."""
+    out = {}
+    for who in ("own", "other"):
+        toks = ((activity or {}).get(who) or {}).get("tokens") or {}
+        out[f"{who}_w_tokens"] = weighted_tokens(toks)
+        out[f"{who}_cache_read"] = sum(tk.get("cache_r") or 0 for tk in toks.values())
+        out[f"{who}_cache_write"] = sum(tk.get("cache_w") or 0 for tk in toks.values())
+    return out
+
+
+def _dt(x):
+    if isinstance(x, datetime):
+        return x
+    try:
+        return datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def pct_state(usage):
+    """Minimal JSON-serialisable snapshot of the meters, kept in sampler state."""
+    snap = {}
+    for k in ("session", "weekly"):
+        m = usage.get(k) or {}
+        r = _dt(m.get("resets_at"))
+        snap[k] = {"percent": m.get("percent"), "resets_at": r.isoformat() if r else None}
+    return snap
+
+
+def pct_deltas(usage, prev):
+    """weekly/session % delta vs the previous sample; None if there is no previous
+    or a reset happened in between (resets_at moved, or the percentage went down).
+    pct_step: the integer weekly % changed."""
+    res = {"weekly_pct_delta": None, "session_pct_delta": None, "pct_step": False}
+    cur = pct_state(usage)
+    for k in ("weekly", "session"):
+        p = (prev or {}).get(k) or {}
+        c = cur[k]
+        if p.get("percent") is None or c["percent"] is None:
+            continue
+        pr, cr = _dt(p.get("resets_at")), _dt(c["resets_at"])
+        if pr and cr and abs(cr - pr) > RESET_JUMP:
+            continue
+        if c["percent"] < p["percent"]:
+            continue
+        res[f"{k}_pct_delta"] = round(c["percent"] - p["percent"], 2)
+    if res["weekly_pct_delta"] is not None:
+        res["pct_step"] = int(cur["weekly"]["percent"]) != int(prev["weekly"]["percent"])
+    return res
+
+
+def session_start(usage):
+    r = _dt((usage.get("session") or {}).get("resets_at"))
+    return (r - SESSION_LEN).isoformat() if r else None
+
+
+def parse_breakdown(text):
+    """Numbers out of the /usage 'what is contributing' text; missing -> absent keys."""
+    bd = {}
+    try:
+        num = r"(\d+(?:\.\d+)?)"
+        for label, key in (("Last 24h", "24h"), ("Last 7d", "7d")):
+            m = re.search(label + r"[^\d\n]*(\d+) requests?[^\d\n]*(\d+) sessions?", text or "")
+            if m:
+                bd[f"requests_{key}"], bd[f"sessions_{key}"] = int(m.group(1)), int(m.group(2))
+            m = re.search(label + r"(.*?)(?=\n\s*\n|\n\s*Last \d|\Z)", text or "", re.S)
+            sec = m.group(1) if m else ""
+            m = re.search(num + r"% of your usage came from subagent-heavy", sec)
+            if m:
+                bd[f"subagent_heavy_pct_{key}"] = float(m.group(1))
+            m = re.search(num + r"% of your usage was at >(\d+)k context", sec)
+            if m:
+                bd[f"over_ctx_pct_{key}"] = float(m.group(1))
+                bd["over_ctx_threshold_k"] = int(m.group(2))
+            m = re.search(num + r"% of your usage came from sessions active for (\d+)\+ hours", sec)
+            if m:
+                bd[f"long_session_pct_{key}"] = float(m.group(1))
+                bd["long_session_hours"] = int(m.group(2))
+            m = re.search(r"Top subagents:\s*(.+)", sec)
+            if m:
+                bd[f"top_subagents_{key}"] = {n.strip(): float(p) for n, p in
+                                              re.findall(r"([^,%]+?)\s+(\d+(?:\.\d+)?)%", m.group(1))}
+    except Exception:  # never fail a sample over text parsing
+        pass
+    return bd
+
+
+def derived_fields(usage, activity, prev):
+    """All additive per-sample fields; each guarded so one failure can't sink the row."""
+    out = {}
+    for name, fn in (("limits_kinds", lambda: {"limits_kinds": limits_kinds(usage)}),
+                     ("tokens", lambda: token_totals(activity)),
+                     ("deltas", lambda: pct_deltas(usage, prev)),
+                     ("session_start", lambda: {"session_start": session_start(usage)}),
+                     ("breakdown", lambda: {"breakdown": parse_breakdown(usage.get("text"))})):
+        try:
+            out.update(fn())
+        except Exception:
+            pass
+    return out
+
+
+def series_line(row):
+    u = row.get("usage") or {}
+    w, s = u.get("weekly") or {}, u.get("session") or {}
+    line = {"at": row.get("at"), "weekly_pct": w.get("percent"), "weekly_resets_at": w.get("resets_at"),
+            "session_pct": s.get("percent"), "session_resets_at": s.get("resets_at"),
+            "own_w_tokens": row.get("own_w_tokens"), "other_w_tokens": row.get("other_w_tokens")}
+    if row.get("activity"):
+        line["human_prompts"] = sum((row["activity"].get(x) or {}).get("human_prompts", 0)
+                                    for x in ("own", "other"))
+    return line
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -413,8 +540,17 @@ def main():
     # Cheap: reuse the samples already on disk plus this row, so the ratio
     # snapshot's own history is kept alongside every sample (limit_ratio.py).
     row["limit_ratio"] = limit_ratio.compute(limit_ratio.load_samples(SAMPLES) + [row], now=t)
+    row.update(derived_fields(usage, row["activity"], st.get("prev_pct")))
+    try:
+        st["prev_pct"] = pct_state(usage)
+    except Exception:
+        st.pop("prev_pct", None)
     st["last_sample_at"] = t.isoformat()
     append(SAMPLES, row)
+    try:
+        append(SERIES, series_line(row))
+    except Exception:
+        pass
     track_cycle(usage, t, args.tag)
     if not args.no_haiku and args.tag == "cron":
         haiku_judgement(st, t)

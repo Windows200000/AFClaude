@@ -29,7 +29,9 @@ AFClaude keeps long-running Claude Code sessions going while nobody is at the ke
 | `usage_report.py` | Per-session usage table for the manager: one row per subagent (from `<session>/subagents/agent-*.jsonl` + its `.meta.json`) plus the main session, combining transcripts across project dirs if the cwd changed. Turns, output(+thinking)/input+cache-write/cache-read tokens, running/done, first/last activity in Berlin, each subagent's share of session output, then session/weekly % and reset times (`keepalive.read_usage_cache()`, or fresh via `--fresh`). `--since ISO`/`--last` for deltas, `--record` appends to `data/usage_reports.jsonl` (not committed), `--json`. |
 | `notify.py` | Failure alerts: always `ALERTS.md` + `PROGRESS.md`, plus a best-effort first-party Claude push via a tiny Haiku run. Claude suppresses the push while you're at a terminal. |
 | `test_e2e_tmux.sh` | Real end-to-end test of the tmux path on a Haiku session (new → send-keys → kill → resume, one transcript, bypass env). About 15 s. |
-| `test_keepalive.py` | Offline tests: reset parsing, the DST-aware window, budget thresholds, transcript detection, and a sandboxed dry-run. |
+| `usage_model.py` | The reserve budget model (see Budget rule): envelope, blending, yield, session guard, `data/user_model.json` loading. Stdlib only. |
+| `test_keepalive.py` | Offline tests: reset parsing, the DST-aware window, budget thresholds (linear rule and the reserve-model wiring + fallback), transcript detection, and a sandboxed dry-run. |
+| `test_usage_model.py` | Offline tests for `usage_model.py` (temp files): envelope interpolation, blending, yield, session guard, fallbacks, user model loading. |
 | `test_stalled.py` | Offline tests for `stalled.py` and `store.py` (temp dirs and DBs), plus read-only checks against this host's transcripts. |
 | `test_tasks.py` | Offline tests for the task store and `tasks.py` (temp DBs): lifecycle, execution order across projects and priorities, bulk project priority, project and stage moves, event log, validation, decision precedence, inbox, and the in-place upgrades of goal-2 (v1) and goal-3 (v2, integer priorities) databases. |
 | `test_dispatcher.py` | Offline tests for the dispatcher (temp DB, fixture transcripts, stub `ka_resume.sh`/`claude`/`tmux` on PATH): approved vs undecided vs ignored, window/reset waits, keepalive targets, fork families, task order + start marking, skip list, managed projects, answered-task resume, launch failures, concurrency cap, budget/usage gate before each start, cleanup of only its own finished sessions, verification alerts, dry-run changing nothing, the `manager_session` column upgrade. |
@@ -67,12 +69,47 @@ The dispatcher logs to `data/dispatcher.log` itself (stdout is a copy); only std
 
 ## Budget rule
 
-At each point where a continue could fire:
-1. projected end-of-week usage < 90% → continue
-2. otherwise, continue only if the weekly reset is ≤ 11:00 Berlin after the current window
-3. otherwise, hold
+Every point where a continue or a start could fire asks `keepalive.budget_decision()` (the watcher, the window-start and last-mile passes, `--work-on`, the dispatcher's gate, the quickview). `data/afclaude.json` `"usage_model"` selects the model: `"reserve"` (default, `usage_model.py`) or `"linear"`. If the reserve model raises, the linear rule decides (the reason says so), except inside the last mile, which then holds: the linear rule cannot see the user. Bad local data does not raise: an invalid `user_model.json` means the generic defaults, unreadable or malformed sampler data means "user active". The window gates (00:00–08:00, the last-mile exemption, once-per-cycle keys) are the same for both.
 
-The current forecast is a linear extrapolation over the elapsed week (elapsed floored at 24 h). `usage_sampler.py` collects data for a better model.
+### Reserve model (`usage_model.py`, default)
+
+Idea: a mean forecast cannot protect a user whose demand comes in bursts. So AFClaude keeps a **reserve** that bounds what the user could still need before the weekly reset, spends only above it, and **yields** while the user is active.
+
+```
+T          = hours until the weekly reset
+env(h)     = demand envelope: the max weekly-% rise within any h hours
+             (piecewise-linear through (0,0) and the table points, flat after the last)
+reserve(T) = min(100, safety × env(T − grace))
+target     = 100 − reserve(T)
+CONTINUE  iff  usage known, weekly < 100, user idle, session guard ok, target − weekly > min_gap
+budget for this run = target − weekly   (passed to the session in its message)
+```
+
+- **Yield**: the user counts as active for `idle_min` after their last activity in the sampler data (`data/samples.jsonl`): a human prompt (minus the prompts AFClaude itself typed in at a recorded keepalive/dispatcher fire), turns in a non-AFClaude session, or a weekly rise with no local turns (another device). Missing or stale (> 30 min) sampler data counts as active.
+- **Session guard**: AFClaude fills a session window to at most 85%; a window that ends at/before the weekly reset, in the last 5 h, may go to 100% (it cannot leak into the next week).
+- The target rises as the reset approaches, so a HOLD is re-checked: the last-mile pass every 15 min until it fires, a stalled session every 15 min. Under `"reserve"` the model governs inside the last mile too (no unconditional 100%), and the 11:00 rule does not apply.
+
+Defaults (generic, used without a user model): envelope `{1h: 12, 3h: 16, 5h: 16, 10h: 32, 24h: 50, 48h: 70, 96h: 90, 168h: 100}` (about one session window per 5 h for the first day, then conservative), `safety` 1.25, `grace_min` 0, `idle_min` 60, `min_gap` 1%, `session_cap` 85%.
+
+**Per-user parameters**: `data/user_model.json` (local, not committed). An invalid file means the generic defaults.
+
+```json
+{"schema": "afclaude.user_model/1",
+ "weeks_of_data": 2,
+ "envelope_weekly_pct_by_hours": {"1": 8, "5": 15, "24": 35, "96": 55},
+ "safety": 1.25, "grace_min": 0, "idle_min": 60, "min_gap": 1.0, "session_cap": 85}
+```
+
+Only `envelope_weekly_pct_by_hours` (non-decreasing, 0–100) and `weeks_of_data` are required. Fitting: for each closed week, take the user-only weekly series (without intervals inside an AFClaude-autonomous run) and compute `env(h)` = the max rise within any h hours; store the pointwise max over the trailing 4 weeks and refit after each reset. Blending by `weeks_of_data`: < 1 → the generic envelope; 1 to < 4 → pointwise max(user, 0.5 × generic); ≥ 4 → the user's envelope, still floored at 0.5 × generic. A stale weekly reset time (already passed) holds.
+
+`python3 usage_model.py` prints the current decision.
+
+### Linear rule (`"usage_model": "linear"`, and the fallback)
+
+1. in the last mile (`last_mile_hours`, default 5 h before the weekly reset) → continue up to 100%
+2. projected end-of-week usage < 90% → continue (linear extrapolation over the elapsed week, elapsed floored at 24 h)
+3. otherwise, continue only if the weekly reset is ≤ 11:00 Berlin after the current window
+4. otherwise, hold
 
 ## Project-manager mode
 

@@ -16,6 +16,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import host  # noqa: E402
 import keepalive as ka  # noqa: E402
+import afclaude_config  # noqa: E402
+
+_CFG_DIR = tempfile.TemporaryDirectory()
+_OLD_CFG = afclaude_config.CONFIG_FILE
+
+
+def setUpModule():
+    # the last-mile test below is about the bridge; pin the linear budget rule so it does
+    # not depend on this host's sampler data (the reserve model is tested elsewhere)
+    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
+    with open(afclaude_config.CONFIG_FILE, "w") as fh:
+        json.dump({"usage_model": "linear"}, fh)
+
+
+def tearDownModule():
+    afclaude_config.CONFIG_FILE = _OLD_CFG
+    _CFG_DIR.cleanup()
 
 HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")
 

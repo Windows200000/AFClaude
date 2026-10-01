@@ -17,6 +17,23 @@ import dispatcher as dp  # noqa: E402
 import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
+import afclaude_config  # noqa: E402
+import usage_model  # noqa: E402
+
+_CFG_DIR = tempfile.TemporaryDirectory()
+_OLD_CFG = afclaude_config.CONFIG_FILE
+
+
+def setUpModule():
+    # these tests use linear-rule usage numbers; ReserveModel below checks the reserve model
+    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
+    with open(afclaude_config.CONFIG_FILE, "w") as fh:
+        json.dump({"usage_model": "linear"}, fh)
+
+
+def tearDownModule():
+    afclaude_config.CONFIG_FILE = _OLD_CFG
+    _CFG_DIR.cleanup()
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 29, 23, 0, tzinfo=UTC)          # 01:00 Berlin, inside the window
@@ -420,6 +437,36 @@ class Limits(Base):
         rep = self.run_pass(now=DAY)
         self.assertEqual(rep["start"], [])
         self.assertTrue(any("outside the window" in s for s in rep["skip"]))
+
+
+class ReserveModel(Base):
+    """The dispatcher's budget gate is keepalive.budget_decision, so it follows the reserve model."""
+    def setUp(self):
+        super().setUp()
+        with open(afclaude_config.CONFIG_FILE, "w") as fh:
+            json.dump({"usage_model": "reserve"}, fh)
+        self._um = (usage_model.USER_MODEL_FILE, usage_model.minutes_since_user)
+        usage_model.USER_MODEL_FILE = os.path.join(self.d, "no_user_model.json")
+
+    def tearDown(self):
+        usage_model.USER_MODEL_FILE, usage_model.minutes_since_user = self._um
+        with open(afclaude_config.CONFIG_FILE, "w") as fh:
+            json.dump({"usage_model": "linear"}, fh)
+        super().tearDown()
+
+    def test_yields_to_active_user(self):
+        self.project("p1")
+        store.add_task(self.conn, "t0", project="p1")
+        usage_model.minutes_since_user = lambda now: 10.0
+        rep = self.run_pass(u=usage(weekly=20))
+        self.assertEqual(rep["start"], [])
+        self.assertIn("yield", rep["stop"])
+        usage_model.minutes_since_user = lambda now: 300.0
+        rep = self.run_pass(u=usage(weekly=20))        # idle, but 42 h left: generic reserve 79%
+        self.assertEqual(rep["start"], [])
+        self.assertIn("target 18.8%", rep["stop"])
+        rep = self.run_pass(u=usage(weekly=10))        # idle, 10% used: may spend to the target
+        self.assertEqual(len(rep["start"]), 1)
 
 
 class Cleanup(Base):

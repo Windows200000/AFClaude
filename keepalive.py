@@ -12,7 +12,10 @@ if the weekly budget rule allows it, resumes that session in place with
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
 
-Budget rule (user-specified, see memory task_manager_mcp_plan.md):
+Budget rule: by default the reserve envelope model of usage_model.py (keeps a reserve
+for the user's possible demand until the weekly reset, yields while the user is active);
+data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
+the fallback if the reserve model fails:
   projected end-of-week usage < 90%                          -> continue
   else weekly reset <= 11:00 Berlin after the current window -> continue
   else                                                       -> hold back
@@ -308,9 +311,17 @@ def project_weekly(pct, resets_at, now):
     return pct + pct * (remaining / elapsed)
 
 
-def budget_headroom(usage, now):
-    """How much more weekly % can be used now before the linear projection reaches
-    PROJECTION_THRESHOLD (in the last mile: up to 100%). -> (extra_weekly_pct | None, text)."""
+def _reserve_model():
+    """usage_model (the reserve envelope model) if data/afclaude.json selects it, else None."""
+    if afclaude_config.usage_model() != "reserve":
+        return None
+    import usage_model
+    return usage_model
+
+
+def linear_budget_headroom(usage, now):
+    """Linear rule: how much more weekly % can be used before the projection reaches
+    PROJECTION_THRESHOLD (in the last mile: up to 100%). -> (extra | None, text)."""
     w = (usage or {}).get("weekly") or {}
     if w.get("percent") is None or not w.get("resets_at"):
         return None, "budget unknown"
@@ -322,7 +333,23 @@ def budget_headroom(usage, now):
         remaining = max(reset - now, timedelta(0))
         extra = max(PROJECTION_THRESHOLD * elapsed / (elapsed + remaining) - pct, 0.0)
         target = f"a projected {PROJECTION_THRESHOLD:.0f}%"
-    text = f"budget for this run: about +{extra:.1f} weekly % (now {pct:.0f}%) before reaching {target}"
+    return extra, f"budget for this run: about +{extra:.1f} weekly % (now {pct:.0f}%) before reaching {target}"
+
+
+def budget_headroom(usage, now):
+    """How much more weekly % this run may use -> (extra_weekly_pct | None, text). The
+    configured model (afclaude_config.usage_model(); reserve model: up to its target),
+    the linear rule if that is selected or the reserve model fails."""
+    try:
+        m = _reserve_model()
+        extra, text = m.budget_headroom(usage, now) if m else linear_budget_headroom(usage, now)
+    except Exception as e:   # noqa: BLE001 - any model failure falls back to the linear rule
+        log(f"usage model failed in budget_headroom ({type(e).__name__}: {e}); linear rule used")
+        if _fallback_last_mile(usage, now):
+            return 0.0, "budget for this run: none (reserve model failed; the last mile is not spent)"
+        extra, text = linear_budget_headroom(usage, now)
+    if extra is None:
+        return None, text
     try:
         import limit_ratio
         r = limit_ratio.compute(limit_ratio.load_samples(limit_ratio.SAMPLES), now=now)
@@ -351,7 +378,38 @@ def in_last_mile(now, usage=None):
 
 
 def budget_decision(usage, now):
-    """-> (go: bool, reason: str). Assumes `now` is inside the window (or the last mile)."""
+    """-> (go: bool, reason: str). Assumes `now` is inside the window (or the last mile).
+    afclaude_config.usage_model() picks the model: "reserve" (default, usage_model.py: its
+    decision governs, also inside the last mile, where it still yields to an active user)
+    or "linear" (linear_budget_decision). Any failure of the reserve model -> linear rule."""
+    try:
+        m = _reserve_model()
+        if m:
+            return m.budget_decision(usage, now)
+    except Exception as e:   # noqa: BLE001
+        log(f"usage model failed ({type(e).__name__}: {e}); falling back to the linear rule")
+        return fallback_budget_decision(usage, now)
+    return linear_budget_decision(usage, now)
+
+
+def _fallback_last_mile(usage, now):
+    try:
+        return last_mile_left(((usage or {}).get("weekly") or {}).get("resets_at"), now) is not None
+    except Exception:   # noqa: BLE001 - unknown: assume the last mile (the safe side)
+        return True
+
+
+def fallback_budget_decision(usage, now):
+    """Linear rule after a reserve-model failure. The linear rule cannot see the user, so the
+    last mile (where it would spend up to 100%) holds instead of continuing."""
+    if _fallback_last_mile(usage, now):
+        return False, "HOLD: reserve model failed and the linear fallback does not spend the last mile"
+    go, reason = linear_budget_decision(usage, now)
+    return go, f"{reason} [linear fallback: reserve model failed]"
+
+
+def linear_budget_decision(usage, now):
+    """The linear rule (projection < 90%, 11:00 reset cutoff, last mile) -> (go, reason)."""
     if not usage or "weekly" not in usage or not usage["weekly"]["resets_at"]:
         return False, "HOLD: weekly usage unknown (fail-safe)"
     w = usage["weekly"]

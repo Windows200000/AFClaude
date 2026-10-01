@@ -21,6 +21,23 @@ def Z(s):
 
 WEEK_RESET = Z("2026-10-01T16:59:59Z")   # real value from /usage at 00:01 Berlin
 
+import afclaude_config  # noqa: E402
+
+_CFG_DIR = tempfile.TemporaryDirectory()
+_OLD_CFG = afclaude_config.CONFIG_FILE
+
+
+def setUpModule():
+    # the budget tests below pin the linear rule; ReserveWiring tests the reserve model
+    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
+    with open(afclaude_config.CONFIG_FILE, "w") as fh:
+        json.dump({"usage_model": "linear"}, fh)
+
+
+def tearDownModule():
+    afclaude_config.CONFIG_FILE = _OLD_CFG
+    _CFG_DIR.cleanup()
+
 
 def usage(week_pct, week_reset=WEEK_RESET, sess_pct=0, sess_reset=None, fetched=None):
     return {"fetched_at": fetched or Z("2026-09-26T00:00:00Z"),
@@ -225,6 +242,185 @@ class Files(unittest.TestCase):
             self.assertTrue(os.access(os.path.join(d, f), os.X_OK), f)
 
 
+class ReserveWiring(unittest.TestCase):
+    """budget_decision / budget_headroom with "usage_model": "reserve" (the default)."""
+    R = Z("2026-10-01T16:59:59Z")
+
+    def setUp(self):
+        import usage_model
+        self.um = usage_model
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = os.path.join(self.tmp.name, "afclaude.json")
+        self._old = (afclaude_config.CONFIG_FILE, usage_model.USER_MODEL_FILE, usage_model.SAMPLES_FILE,
+                     usage_model.FIRE_STATE_FILES, usage_model.decide)
+        afclaude_config.CONFIG_FILE = self.cfg
+        usage_model.USER_MODEL_FILE = os.path.join(self.tmp.name, "user_model.json")
+        usage_model.SAMPLES_FILE = os.path.join(self.tmp.name, "samples.jsonl")
+        usage_model.FIRE_STATE_FILES = []
+        self.setcfg()
+
+    def tearDown(self):
+        (afclaude_config.CONFIG_FILE, self.um.USER_MODEL_FILE, self.um.SAMPLES_FILE,
+         self.um.FIRE_STATE_FILES, self.um.decide) = self._old
+        self.tmp.cleanup()
+
+    def setcfg(self, **kw):
+        with open(self.cfg, "w") as fh:
+            json.dump(kw, fh)
+
+    def samples(self, now, prompt_minutes_ago=None):
+        """Sampler rows every 15 min up to `now`; one user prompt `prompt_minutes_ago` ago."""
+        with open(self.um.SAMPLES_FILE, "w") as fh:
+            for m in range(300, -1, -15):
+                other = {"human_prompts": 1} if m == prompt_minutes_ago else {}
+                fh.write(json.dumps({"at": (now - timedelta(minutes=m)).isoformat(),
+                                     "activity": {"own": {}, "other": other}}) + "\n")
+
+    def test_config_switch(self):
+        self.assertEqual(afclaude_config.usage_model(), "reserve")      # default
+        self.setcfg(usage_model="linear")
+        self.assertEqual(afclaude_config.usage_model(), "linear")
+        self.setcfg(usage_model="nonsense")
+        self.assertEqual(afclaude_config.usage_model(), "reserve")
+
+    def test_reserve_decides(self):
+        now = self.R - timedelta(hours=30)
+        self.samples(now)
+        go, why = ka.budget_decision(usage(20, self.R), now)            # reserve 1.25*55 -> target 31
+        self.assertTrue(go, why)
+        self.assertIn("reserve model", why)
+        self.assertIn("target 31.2%", why)
+        extra, text = ka.budget_headroom(usage(20, self.R), now)
+        self.assertAlmostEqual(extra, 100 - 1.25 * 55 - 20, places=3)
+        self.assertIn("reserve", text)
+        self.assertIn("stop before exceeding it", text)
+        self.setcfg(usage_model="linear")                               # same numbers, linear rule
+        go, why = ka.budget_decision(usage(20, self.R), now)
+        self.assertIn("projected", why)
+        self.assertNotIn("reserve", ka.budget_headroom(usage(20, self.R), now)[1])
+
+    def test_no_eleven_oclock_rule_under_reserve(self):
+        now = Z("2026-09-26T03:00:00Z")                                 # 05:00 Berlin
+        reset = Z("2026-09-26T08:30:00Z")                               # 10:30 Berlin, before the cutoff
+        self.samples(now)
+        go, why = ka.budget_decision(usage(95, reset), now)
+        self.assertFalse(go, why)                                       # reserve ~22% for 5.5 h
+        self.setcfg(usage_model="linear")
+        self.assertTrue(ka.budget_decision(usage(95, reset), now)[0])
+
+    def test_fallback_to_linear_on_error(self):
+        now = self.R - timedelta(hours=30)
+        def boom(*a, **k):
+            raise RuntimeError("broken model")
+        self.um.decide = boom
+        go, why = ka.budget_decision(usage(20, self.R), now)
+        self.assertEqual(go, ka.linear_budget_decision(usage(20, self.R), now)[0])
+        self.assertIn("linear fallback", why)
+        extra, text = ka.budget_headroom(usage(20, self.R), now)
+        self.assertEqual(extra, ka.linear_budget_headroom(usage(20, self.R), now)[0])
+        self.assertFalse(ka.budget_decision(None, now)[0])
+
+    def test_fallback_holds_in_last_mile(self):
+        now = self.R - timedelta(hours=2)                               # linear would CONTINUE to 100%
+        self.assertTrue(ka.linear_budget_decision(usage(50, self.R), now)[0])
+        def boom(*a, **k):
+            raise RuntimeError("broken model")
+        self.um.decide = boom
+        go, why = ka.budget_decision(usage(50, self.R), now)
+        self.assertFalse(go, why)
+        self.assertIn("reserve model failed", why)
+        self.assertEqual(ka.budget_headroom(usage(50, self.R), now)[0], 0.0)
+
+    def test_regression_bad_local_data_still_yields(self):
+        """Bad local files must not switch off the yield (review 2026-10-01 repros)."""
+        now = self.R - timedelta(hours=2)
+        u = usage(50, self.R)
+        # 1. user_model.json with non-object sections -> generic params, still the reserve model
+        with open(self.um.USER_MODEL_FILE, "w") as fh:
+            json.dump({"weeks_of_data": 5, "envelope_weekly_pct_by_hours": {"1": 1, "168": 2},
+                       "recommended": "x", "decider": [1]}, fh)
+        self.samples(now, prompt_minutes_ago=15)
+        go, why = ka.budget_decision(u, now)
+        self.assertFalse(go, why)
+        self.assertIn("yield", why)
+        self.assertIn("generic envelope", why)
+        # 2. a sample with a non-int human_prompts counts as the user
+        with open(self.um.SAMPLES_FILE, "w") as fh:
+            for m in range(60, -1, -15):
+                fh.write(json.dumps({"at": (now - timedelta(minutes=m)).isoformat(),
+                                     "activity": {"own": {}, "other": {"human_prompts": "1"} if m == 0 else {}}})
+                         + "\n")
+        go, why = ka.budget_decision(u, now)
+        self.assertFalse(go, why)
+        self.assertNotIn("linear fallback", why)
+        # 3. malformed fire-state files are ignored
+        fs = os.path.join(self.tmp.name, "fires.json")
+        with open(fs, "w") as fh:
+            json.dump({"handled": [1], "sessions": "x"}, fh)
+        self.um.FIRE_STATE_FILES = [fs]
+        self.samples(now, prompt_minutes_ago=15)
+        go, why = ka.budget_decision(u, now)
+        self.assertFalse(go, why)
+        self.assertIn("yield", why)
+
+    def test_unknown_usage_and_stale_sampler(self):
+        now = self.R - timedelta(hours=2)
+        self.assertFalse(ka.budget_decision(None, now)[0])
+        go, why = ka.budget_decision(usage(50, self.R), now)            # no samples file
+        self.assertFalse(go)
+        self.assertIn("unknown", why)
+        self.samples(now - timedelta(minutes=45))                        # sampler stopped 45 min ago
+        self.assertFalse(ka.budget_decision(usage(50, self.R), now)[0])
+
+    def test_last_mile_yields_then_fires(self):
+        fired = []
+        now = self.R - timedelta(hours=3)
+        cache = {"fetched_at": now, "weekly": {"percent": 70.0, "resets_at": self.R},
+                 "session": {"percent": 0.0, "resets_at": None}}
+        olds = (ka.read_usage_cache, ka.fresh_usage, ka.handle_fire)
+        ka.read_usage_cache = lambda: cache
+        ka.fresh_usage = lambda n, force=False: cache
+        def hf(sid, stall, reason, st, args):
+            fired.append(reason)
+            st["handled"][stall["uuid"]] = {"result": "test"}
+        ka.handle_fire = hf
+        try:
+            st = {"handled": {}, "fires": {}}
+            self.samples(now, prompt_minutes_ago=15)                     # user active: yield
+            self.assertEqual(ka.last_mile_pass(SID, now, st, None), now + ka.LAST_MILE_RECHECK)
+            self.assertEqual(fired, [])
+            cache["weekly"]["percent"] = 85.0                            # idle, but above the target 80
+            self.samples(now, prompt_minutes_ago=120)
+            self.assertIsNotNone(ka.last_mile_pass(SID, now, st, None))
+            cache["weekly"]["percent"] = 70.0                            # idle, below the target: fire
+            self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
+            self.assertEqual(len(fired), 1)
+            self.assertIn("reserve model", fired[0])
+        finally:
+            ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = olds
+
+    def test_window_gate_unchanged_in_last_mile(self):
+        with tempfile.TemporaryDirectory() as d:
+            ka.PROJECTS_DIR, old = d, ka.PROJECTS_DIR
+            try:
+                stall = dict(STALL, timestamp="2026-10-01T11:00:00.000Z",
+                             message=dict(STALL["message"], content=[{"type": "text",
+                                          "text": "You've hit your session limit · resets 12pm (UTC)"}]))
+                write_transcript(d, SID, [USER, stall])
+                now = Z("2026-10-01T12:05:00Z")                          # 14:05 Berlin, outside the window
+                cache = {"fetched_at": now, "weekly": {"percent": 60.0, "resets_at": self.R},
+                         "session": {"percent": 0.0, "resets_at": None}}
+                self.samples(now)
+                self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "FIRE")
+                self.samples(now, prompt_minutes_ago=0)
+                self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "HOLD")
+                self.samples(now)
+                self.setcfg(last_mile_hours=0)                           # no last mile: the window gate holds
+                self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "WAIT_WINDOW")
+            finally:
+                ka.PROJECTS_DIR = old
+
+
 class LastMile(unittest.TestCase):
     R = Z("2026-10-01T16:59:59Z")
 
@@ -235,6 +431,7 @@ class LastMile(unittest.TestCase):
         self.ac = afclaude_config
         self._old = afclaude_config.CONFIG_FILE
         afclaude_config.CONFIG_FILE = self.cfg
+        self.setcfg()
 
     def tearDown(self):
         self.ac.CONFIG_FILE = self._old
@@ -242,7 +439,7 @@ class LastMile(unittest.TestCase):
 
     def setcfg(self, **kw):
         with open(self.cfg, "w") as fh:
-            json.dump(kw, fh)
+            json.dump({"usage_model": "linear", **kw}, fh)
 
     def test_default_is_one_session_length(self):
         self.assertEqual(self.ac.last_mile(), timedelta(hours=5))
