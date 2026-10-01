@@ -18,7 +18,7 @@ This changes your Claude Code config (`~/.claude.json`, user scope), so run it y
 claude mcp add --scope user afclaude -- /mnt/BlockVolume/Claude/work/AFClaude/.venv/bin/python /mnt/BlockVolume/Claude/work/AFClaude/mcp_server.py
 ```
 
-Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its 9 tools. Sessions that are already running only pick it up after a restart or `/mcp` reconnect.
+Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its 10 tools. Sessions that are already running only pick it up after a restart or `/mcp` reconnect.
 
 Remove it: `claude mcp remove --scope user afclaude`.
 
@@ -35,6 +35,9 @@ Remove it: `claude mcp remove --scope user afclaude`.
 | `afclaude_inbox` | everything waiting for you: blocked tasks and undecided stalled sessions (runs the stalled scan first) |
 | `afclaude_decide_session` | continue, ignore or clear for one stalled session (id or prefix) |
 | `afclaude_rule` | standing continue/ignore rules: `list`, `add`, `rm` |
+| `afclaude_ask` | a question for you from a (manager) session: a blocked task of kind `question` in your inbox; your answer closes it |
+
+Every write goes through `actions.py` (one transaction, an `audit_log` row with actor `mcp:<session>`). A session AFClaude itself runs (`CLAUDE_GUARD_DISABLE=1`, `data/own_sessions.txt`, `driven_sessions`, a manager session) may add tasks and projects, but `afclaude_decide_session` and `afclaude_rule add/rm` refuse it: deciding sessions and rules stays with you.
 
 ## How "project" defaults
 
