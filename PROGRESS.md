@@ -158,3 +158,5 @@ Session 73% (resets 01:00 Berlin). Running: the container subagent (worktree ../
 - Sampler: additive fields (limits_kinds, weighted own/other tokens + cache, pct deltas/steps, session_start, parsed /usage breakdown) + never-pruned data/weekly_series.jsonl.
 - Follow-ups (not built yet): pause a running AFClaude session when the user becomes active; anchor a session window at T−5 h so it ends at the reset; allow more than one last-mile fire while budget remains; an "autonomous since fire" flag per interval; measure AFClaude's real cost per night; refit data/user_model.json after 3–4 closed weeks (safety 1.25 → ~1.1).
 - Open question: ship the reserve model with the pending rebuild (OPEN_QUESTIONS.md, deploy item).
+- 17:32 [ALERT] usage review 2026-10-01 done (details in ALERTS.md)
+- 18:05 Review wrapped up: b02a13e pushed, GOALS 6 updated, memory note afclaude_unread_review.md written, notify.py ran (not sent: the terminal was active).
