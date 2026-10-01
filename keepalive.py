@@ -527,6 +527,16 @@ def rc_held(pid):
     return bool(ppid and is_rc_server(proc_argv(ppid)))
 
 
+def latest_entrypoint(path):
+    """`entrypoint` of the session's latest user/assistant entry: "sdk-cli" for
+    turns written by an rc-server thread child (or another SDK host), "cli" for
+    terminal / tmux turns. Only the LATEST counts: a session can carry old
+    "sdk-cli" entries (e.g. from a former --bg start) and be a terminal one now."""
+    if not path:
+        return None
+    return (last_message(path) or {}).get("entrypoint")
+
+
 def archived_since_last_message(path):
     """True if an RC 'ended or archived from another device' notice is newer than
     the session's last user/assistant entry."""
@@ -564,6 +574,8 @@ def _preflight(session_id):
       - any other live pid in ~/.claude/sessions/*.json on this uuid that is not our
         tmux ka-<id8> process and not a `claude agents` row -> refuse (OTHER_HELD)
       - live bg worker              -> plan 'stop-bg-then-resume'
+      - nothing alive, latest user/assistant entry has entrypoint "sdk-cli"
+                                    -> refuse (RC_HELD: an idle rc-server/SDK thread)
       - nothing alive               -> plan 'resume'"""
     in_tmux = tmux_alive(session_id)
     ours = tmux_pids(session_id) if in_tmux else set()
@@ -600,6 +612,13 @@ def _preflight(session_id):
         return True, [], "take-over:" + ",".join(str(a["pid"]) for a in inter)
     if any(a.get("kind") == "background" for a in rows):
         return True, [], "stop-bg-then-resume"
+    if latest_entrypoint(transcript_path(session_id)) == "sdk-cli":
+        # Nothing alive, but the last turn came from an rc-server/SDK host: the rc
+        # server re-serves the thread on the next app message, so a resume now would
+        # FORK the user's Remote Control thread once it's used again.
+        return False, [f"{RC_HELD}: rc-server/SDK-hosted thread (idle; latest transcript entry has "
+                       "entrypoint sdk-cli); a resume would fork the user's Remote Control thread, "
+                       "so it is left alone"], None
     return True, [], "resume"
 
 

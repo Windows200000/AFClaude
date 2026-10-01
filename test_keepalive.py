@@ -397,6 +397,15 @@ class RealTranscripts(unittest.TestCase):
         self.assertEqual(s["kind"], "session")
         self.assertEqual(s["reset_from_text"], Z("2026-09-25T17:00:00Z"))
 
+    def test_latest_entrypoint_real(self):
+        # the manager (tmux, old sdk-cli entries from a former --bg start) vs an rc thread
+        for sid, want in (("f2897285-dd97-49d9-b29a-2334b4753dee", "cli"),
+                          ("9da84efe-c1ec-516d-9a86-4ecca2aec1f3", "sdk-cli")):
+            p = ka.transcript_path(sid)
+            if not p:
+                continue
+            self.assertEqual(ka.latest_entrypoint(p), want, sid)
+
     def test_planning_session_not_stalled(self):
         p = ka.transcript_path("37c51d64-4516-578d-af3f-b34feea826ee")
         if not p:
@@ -418,8 +427,12 @@ class FakeProcHolders(unittest.TestCase):
         self.sess = os.path.join(self.tmp.name, "sessions")
         os.makedirs(self.proc)
         os.makedirs(self.sess)
-        self.orig = (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE)
+        self.proj = os.path.join(self.tmp.name, "projects", "-x")
+        os.makedirs(self.proj)
+        self.orig = (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE,
+                     ka.PROJECTS_DIR)
         ka.PROC_DIR, ka.SESSIONS_DIR = self.proc, self.sess
+        ka.PROJECTS_DIR = os.path.dirname(self.proj)
         self.tmux, self.panes, self.rows = False, set(), []
         ka.tmux_alive = lambda s: self.tmux
         ka.tmux_pids = lambda s: set(self.panes)
@@ -427,7 +440,8 @@ class FakeProcHolders(unittest.TestCase):
         ka.TAKE_OVER_IDLE = False
 
     def tearDown(self):
-        (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE) = self.orig
+        (ka.PROC_DIR, ka.SESSIONS_DIR, ka.tmux_alive, ka.tmux_pids, ka.agent_entries, ka.TAKE_OVER_IDLE,
+         ka.PROJECTS_DIR) = self.orig
         self.tmp.cleanup()
 
     def process(self, pid, argv, ppid=1, start=1000):
@@ -444,6 +458,36 @@ class FakeProcHolders(unittest.TestCase):
              "entrypoint": entrypoint, **kw}
         with open(os.path.join(self.sess, f"{pid}.json"), "w") as fh:
             json.dump(d, fh)
+
+    def transcript(self, *entrypoints):
+        with open(os.path.join(self.proj, self.SID + ".jsonl"), "w") as fh:
+            for i, ep in enumerate(entrypoints):
+                fh.write(json.dumps({"type": "user" if i % 2 == 0 else "assistant", "entrypoint": ep,
+                                     "uuid": f"u{i}", "message": {"content": "x"}}) + "\n")
+            fh.write(json.dumps({"type": "system", "content": "meta"}) + "\n")
+
+    def test_idle_rc_thread_refused(self):
+        # nothing alive, but the latest turn came from an rc-server/SDK host -> refuse
+        self.transcript("cli", "cli", "sdk-cli", "sdk-cli")
+        ok, problems, plan = ka.preflight(self.SID)
+        self.assertEqual((ok, plan), (False, None))
+        self.assertTrue(problems[0].startswith(ka.RC_HELD))
+        self.assertIn("rc-server/SDK-hosted thread (idle", problems[0])
+
+    def test_old_sdk_cli_entries_do_not_count(self):
+        # e.g. the manager's own transcript: old sdk-cli turns from a former --bg start
+        self.transcript("sdk-cli", "sdk-cli", "cli", "cli")
+        self.assertEqual(ka.preflight(self.SID), (True, [], "resume"))
+
+    def test_sdk_cli_latest_with_plain_interactive_holder(self):
+        # a plain interactive holder is alive: the normal holder rules apply
+        self.transcript("sdk-cli", "sdk-cli")
+        self.process(107, ["claude", "--resume", self.SID])
+        self.registry(107)
+        self.rows = [{"sessionId": self.SID, "pid": 107, "kind": "interactive", "status": "idle"}]
+        self.assertFalse(ka.preflight(self.SID)[0])
+        ka.TAKE_OVER_IDLE = True
+        self.assertEqual(ka.preflight(self.SID), (True, [], "take-over:107"))
 
     def test_proc_parsing(self):
         self.process(7, ["claude", "rc"], ppid=3, start=4242)
