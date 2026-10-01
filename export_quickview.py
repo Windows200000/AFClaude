@@ -225,7 +225,7 @@ def needs_input():
 
 
 def latest_decision():
-    log = read(os.path.join(HERE, "keepalive.log")) or ""
+    log = read(os.path.join(ka.STATE_DIR, "keepalive.log")) or ""
     lines = [l for l in log.splitlines() if l.startswith("[")]
     if not lines:
         return None
@@ -352,12 +352,17 @@ def usage_review():
 
 
 def cron_entries():
-    try:
-        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
-    except OSError:
-        return []
+    # In the manager container supercronic runs a crontab FILE (AFCLAUDE_CRONTAB);
+    # there is no `crontab -l` there.
+    if os.environ.get("AFCLAUDE_CRONTAB"):
+        text = read(os.environ["AFCLAUDE_CRONTAB"]) or ""
+    else:
+        try:
+            text = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10).stdout
+        except OSError:
+            return []
     out = []
-    for line in r.stdout.splitlines():
+    for line in text.splitlines():
         if "AFClaude" not in line or line.lstrip().startswith("#"):
             continue
         comment = line.split(" # ", 1)[1].strip() if " # " in line else ""

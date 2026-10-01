@@ -1,0 +1,22 @@
+# Only committed code goes into the image: no local-only, runtime or secret files.
+.git
+.venv
+__pycache__
+*.pyc
+data
+run
+probe
+docker/secrets
+docker/.env
+quickview/.env
+*.env
+*.log
+*.key
+*.pem
+keepalive_state.json
+keepalive.lock
+STOP
+PAUSED
+BACKLOG.md
+ALERTS.md
+OPEN_QUESTIONS.md
