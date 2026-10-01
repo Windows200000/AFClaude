@@ -29,7 +29,7 @@ SID2 = "00000000-0000-4000-8000-000000000002"
 CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
-                  "afclaude_rule"}
+                  "afclaude_rule", "afclaude_ask"}
 
 
 def run(coro):
@@ -51,6 +51,7 @@ class Env(unittest.TestCase):
         os.environ.update(AFCLAUDE_DB=self.db, AFCLAUDE_PROJECTS_DIR=self.projects_dir,
                           CLAUDE_CODE_SESSION_ID=CALLER)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # the tests act as the owner's session
         os.chdir(self.work)
 
     def tearDown(self):

@@ -1,0 +1,25 @@
+{
+  "_comment": "Template for data/afclaude.json (local, gitignored; or $AFCLAUDE_CONFIG). Copy it, fill in the values, delete what you don't need: every key is optional and falls back to the code default (afclaude_config.py). Keys starting with _ are ignored.",
+
+  "manager_session": "<manager-session-uuid>",
+  "trust_root": "/path/to/your/workspace",
+
+  "last_mile_hours": 5,
+  "window_start": "23:00",
+  "window_hours": 10,
+
+  "_settings_comment": "Window, budget and pause are tunables in the DB settings table (actions.SETTINGS, edited through actions.py / the dashboard). last_mile_hours above is only their local default.",
+
+  "dashboard": {
+    "_comment": "Read from dashboard phase 4 on (docs/dashboard_design.md §6, §7.3).",
+    "owner_user": "<owner-login>",
+    "base_path": "/private/afclaude/",
+    "public_host": "<private-host>",
+    "manager_host": "<manager-host>",
+    "proxy_allow_ip": "<web-host-ip>",
+    "key_file": "~/.config/afclaude/dashboard.key",
+    "oidc": {"enabled": false, "issuer": "https://<sso-host>", "client_id": "<client-id>",
+             "client_secret_file": "~/.config/afclaude/oidc_client_secret"},
+    "local_login": {"enabled": false, "users_file": "~/.config/afclaude/dashboard_users.json"}
+  }
+}

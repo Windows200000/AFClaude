@@ -178,7 +178,7 @@ The container runs as the same UID with only these mounts: code read-only, `data
 In the repo: all code, templates, the vendored static assets, `config.example.toml`, the compose file with `${VARS}`, the default prompts, and this doc.
 
 Local only (gitignored, and blocked by `tools/check_public.py`):
-- `~/.config/afclaude/config.toml`: host names, the owner identity, repo root, manager session id, allowlisted proxy IP. This also absorbs today's hardcoded paths and the session UUID in `export_quickview.py`/`usage_report.py`.
+- `~/.config/afclaude/config.toml`: host names, the owner identity, repo root, manager session id, allowlisted proxy IP. This also absorbs today's hardcoded paths and the session UUID in `export_quickview.py`/`usage_report.py`. (Built in phase 1 as `data/afclaude.json`, read by `afclaude_config.py`, template `afclaude.example.json`: JSON because the host's `python3` is 3.9 without `tomllib`, and `data/` is already mounted in the manager container.)
 - the key files and `dashboard/.env`
 - `data/`: the DB with prompt overrides, settings, the backlog projects, reviews and `user_model.json`
 - `BACKLOG.md`

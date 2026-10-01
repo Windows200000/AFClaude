@@ -63,6 +63,7 @@ import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fir
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
+import afclaude_config  # noqa: E402  (local machine-specific values: manager session, trust root)
 
 UTC = timezone.utc
 DATA_DIR = os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data"))
@@ -71,9 +72,9 @@ LOG_FILE = os.path.join(DATA_DIR, "dispatcher.log")
 LOCK_FILE = os.path.join(DATA_DIR, ".dispatcher.lock")
 CONFIG_FILE = os.path.join(DATA_DIR, "dispatcher.json")
 # The AFClaude manager session (kept alive by keepalive.py's watcher + window-start cron);
-# same default as export_quickview.py's SELF_SESSION.
-MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION", "f2897285-dd97-49d9-b29a-2334b4753dee")
-TRUST_ROOT = os.environ.get("KA_TRUST_ROOT", "/mnt/BlockVolume/Claude")   # as in ka_resume.sh
+# same source as export_quickview.py's SELF_SESSION (data/afclaude.json manager_session).
+MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
+TRUST_ROOT = os.environ.get("KA_TRUST_ROOT") or afclaude_config.trust_root()   # as in ka_resume.sh
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TMUX_RE = re.compile(r"ka-[0-9a-f]{8}")
 

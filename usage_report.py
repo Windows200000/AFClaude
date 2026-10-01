@@ -5,8 +5,8 @@ main session itself) has consumed, so the manager can watch the session cap.
 
     usage_report.py [--session UUID] [--since ISO|--last] [--json] [--fresh] [--record]
 
---session      defaults to $CLAUDE_CODE_SESSION_ID, else the AFClaude build
-               session (f2897285-dd97-49d9-b29a-2334b4753dee).
+--session      defaults to $CLAUDE_CODE_SESSION_ID, else the AFClaude manager
+               session (manager_session in data/afclaude.json).
 --since ISO    only count assistant turns whose timestamp is after ISO.
 --last         only count usage since the previous --record'ed report for
                this session (a delta). Ignored if --since is also given.
@@ -48,12 +48,13 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache, PROJECTS_DIR, berlin/parse_ts helpers)
+import afclaude_config  # noqa: E402  (local machine-specific values: the manager session)
 
 UTC = timezone.utc
 BERLIN = ka.BERLIN
 DATA = os.path.join(HERE, "data")
 REPORTS_FILE = os.path.join(DATA, "usage_reports.jsonl")
-DEFAULT_SESSION = "f2897285-dd97-49d9-b29a-2334b4753dee"
+DEFAULT_SESSION = afclaude_config.manager_session()   # data/afclaude.json manager_session
 RUNNING_MAX_AGE = 300  # seconds since last transcript entry -> still "running"
 
 
