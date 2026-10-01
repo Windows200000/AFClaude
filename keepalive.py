@@ -40,6 +40,7 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import host  # host calls: local subprocess on the host, the SSH bridge inside the container
 
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
@@ -252,9 +253,12 @@ def next_window_start(now):
 def read_usage_cache():
     """Parse ~/.claude.json cachedUsageUtilization -> dict or None."""
     try:
-        with open(CLAUDE_JSON) as fh:
-            c = json.load(fh).get("cachedUsageUtilization") or {}
-    except (OSError, json.JSONDecodeError):
+        if host.in_container():
+            c = host.usage_cache()
+        else:
+            with open(CLAUDE_JSON) as fh:
+                c = json.load(fh).get("cachedUsageUtilization") or {}
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
         return None
     if not c.get("fetchedAtMs"):
         return None
@@ -277,9 +281,8 @@ def refresh_usage(cwd=HERE):
     fresh numbers and rewrites the ~/.claude.json cache. Run it scrubbed, with
     no session persistence so it leaves no transcript behind."""
     try:
-        r = subprocess.run(["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
-                           cwd=cwd, env=SCRUBBED_ENV, capture_output=True,
-                           text=True, timeout=120)
+        r = host.run_on_host(["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
+                             cwd=cwd, env=SCRUBBED_ENV, timeout=120)
         return r.returncode, r.stdout
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, str(e)
@@ -375,8 +378,7 @@ def agent_entries(session_id):
     """All `claude agents` rows for this session (a session can show up twice,
     e.g. a dead bg row plus a live interactive one)."""
     try:
-        r = subprocess.run(["claude", "agents", "--json", "--all"], capture_output=True,
-                           text=True, timeout=60, env=SCRUBBED_ENV)
+        r = host.run_on_host(["claude", "agents", "--json", "--all"], timeout=60, env=SCRUBBED_ENV)
         return [a for a in json.loads(r.stdout or "[]") if a.get("sessionId") == session_id]
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return []
@@ -395,21 +397,23 @@ def tmux_name(session_id):
 
 
 def tmux_alive(session_id):
-    return subprocess.run(["tmux", "has-session", "-t", "=" + tmux_name(session_id)],
-                          capture_output=True).returncode == 0
+    return host.run_on_host(["tmux", "has-session", "-t", "=" + tmux_name(session_id)],
+                            timeout=30).returncode == 0
 
 
 def tmux_pids(session_id):
     """Pane pids of our own tmux session ka-<id8> (empty if none)."""
     try:
-        r = subprocess.run(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
-                           capture_output=True, text=True, timeout=10)
+        r = host.run_on_host(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
+                             timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return set()
     return {int(x) for x in r.stdout.split() if x.isdigit()} if r.returncode == 0 else set()
 
 
 def pid_alive(pid):
+    if host.in_container():   # the container's /proc is not the host's
+        return bool(pid) and host.proc_info(pid) is not None
     return bool(pid) and os.path.exists(os.path.join(PROC_DIR, str(pid)))
 
 
@@ -419,6 +423,8 @@ OTHER_HELD = "held by another live process"
 
 
 def proc_argv(pid):
+    if host.in_container():   # argv of claude / keepalive.py processes only
+        return list((host.proc_info(pid) or {}).get("argv") or [])
     try:
         with open(os.path.join(PROC_DIR, str(int(pid)), "cmdline"), "rb") as fh:
             return [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
@@ -436,6 +442,8 @@ def _proc_stat(pid):
 
 
 def proc_ppid(pid):
+    if host.in_container():
+        return (host.proc_info(pid) or {}).get("ppid")
     try:
         return int(_proc_stat(pid)[1])
     except (ValueError, IndexError):
@@ -443,6 +451,8 @@ def proc_ppid(pid):
 
 
 def proc_starttime(pid):
+    if host.in_container():
+        return (host.proc_info(pid) or {}).get("start")
     try:
         return _proc_stat(pid)[19]
     except IndexError:
@@ -533,6 +543,15 @@ def archived_since_last_message(path):
 
 
 def preflight(session_id):
+    """_preflight(), failing safe (refuse) if the host's process info is unavailable
+    (inside the container it comes over the SSH bridge)."""
+    try:
+        return _preflight(session_id)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return False, [f"host process info unavailable ({type(e).__name__}: {str(e)[:200]}); not touching the session"], None
+
+
+def _preflight(session_id):
     """-> (ok, problems[], plan). No --bg anymore: the session is continued in
     its tmux session (send-keys) or resumed into a new one. A live process
     elsewhere would make a fresh resume FORK a copy, so (rc / registry checks first):
@@ -588,11 +607,10 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
     """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg).
     name/model override LAUNCH's for this launch."""
     if plan.startswith("take-over:"):
-        import signal
         pids = [int(x) for x in plan.split(":", 1)[1].split(",")]
         for pid in pids:
             try:
-                os.kill(pid, signal.SIGTERM)
+                host.kill_claude(pid)
             except ProcessLookupError:
                 pass
         for _ in range(30):
@@ -600,8 +618,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
                 break
             time.sleep(1)
     if plan == "stop-bg-then-resume":
-        subprocess.run(["claude", "stop", session_id[:8]], env=SCRUBBED_ENV,
-                       capture_output=True, timeout=60)
+        host.run_on_host(["claude", "stop", session_id[:8]], env=SCRUBBED_ENV, timeout=60)
         time.sleep(5)
     cmd = [KA_RESUME, "--session", session_id, "--message", message,
            "--cwd", cwd]
@@ -610,7 +627,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
             cmd += [f"--{k}", v]
     if new:
         cmd.append("--new")
-    r = subprocess.run(cmd, env=SCRUBBED_ENV, capture_output=True, text=True, timeout=120)
+    r = host.run_on_host(cmd, env=SCRUBBED_ENV, timeout=120)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -629,13 +646,12 @@ def verify_reply(path, since, timeout=VERIFY_TIMEOUT):
 
 
 def process_env_flags(pid):
-    try:
-        env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
-    except OSError:
+    env = host.claude_env(pid)
+    if env is None:
         return None
-    wanted = (b"CLAUDE_GUARD_DISABLE=", b"CLAUDE_EFFORT=", b"CLAUDECODE=", b"CLAUDE_CODE_CHILD_SESSION=",
-              b"CLAUDE_CODE_MESSAGING_SOCKET=")
-    return [x.decode() for x in env if x.startswith(wanted)]
+    wanted = ("CLAUDE_GUARD_DISABLE=", "CLAUDE_EFFORT=", "CLAUDECODE=", "CLAUDE_CODE_CHILD_SESSION=",
+              "CLAUDE_CODE_MESSAGING_SOCKET=")
+    return [x for x in env if x.startswith(wanted)]
 
 
 # ---------------------------------------------------------------- state
@@ -656,8 +672,7 @@ def save_state(st):
 
 
 def progress_note(line):
-    with open(PROGRESS_FILE, "a") as fh:
-        fh.write(f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n")
+    host.append_note(PROGRESS_FILE, f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n")
 
 
 # ---------------------------------------------------------------- main loop
@@ -734,6 +749,33 @@ def run(args):
 LAST_MILE_RECHECK = timedelta(minutes=15)
 
 
+def _round_reset(resets_at):
+    """resets_at jitters by milliseconds between usage fetches (16:59:59.557 vs
+    17:00:00.320): round to the nearest minute, like usage_sampler.track_cycle."""
+    r = resets_at.astimezone(UTC) + timedelta(seconds=30)
+    return r.replace(second=0, microsecond=0)
+
+
+def last_mile_key(resets_at):
+    return f"last-mile-{_round_reset(resets_at).isoformat()}"
+
+
+def last_mile_handled(key, handled):
+    """True if this weekly cycle's last mile was already handled, also under an
+    older raw (un-rounded) key such as last-mile-2026-10-01T16:59:59.557562+00:00."""
+    if key in handled:
+        return True
+    for k in handled:
+        if k.startswith("last-mile-"):
+            try:
+                t = parse_ts(k[len("last-mile-"):])
+            except ValueError:
+                continue
+            if t and t.tzinfo and last_mile_key(t) == key:
+                return True
+    return False
+
+
 def last_mile_pass(sid, now, st, args):
     """Once per weekly cycle: continue the (not stalled) session as soon as the
     last mile opens, even outside the night window. Returns the next re-check
@@ -741,8 +783,8 @@ def last_mile_pass(sid, now, st, args):
     w = (read_usage_cache() or {}).get("weekly") or {}
     if last_mile_left(w.get("resets_at"), now) is None:
         return None
-    key = f"last-mile-{w['resets_at'].astimezone(UTC).isoformat()}"
-    if key in st["handled"]:
+    key = last_mile_key(w["resets_at"])
+    if last_mile_handled(key, st["handled"]):
         return None
     go, reason = budget_decision(fresh_usage(now, force=True), now)
     log(f"last-mile: {reason}")

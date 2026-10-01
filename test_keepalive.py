@@ -318,6 +318,41 @@ class LastMile(unittest.TestCase):
         finally:
             ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = olds
 
+    def test_last_mile_jittered_reset_fires_once(self):
+        # regression 01.10.: resets_at jittered between fetches (16:59:59.557 vs
+        # 17:00:00.320) and the raw ISO key let the watcher fire twice
+        fired = []
+        r1 = Z("2026-10-01T16:59:59.557562Z")
+        r2 = Z("2026-10-01T17:00:00.320910Z")
+        cache = {"fetched_at": r1, "weekly": {"percent": 85.0, "resets_at": r1},
+                 "session": {"percent": 0.0, "resets_at": None}}
+        olds = (ka.read_usage_cache, ka.fresh_usage, ka.handle_fire)
+        ka.read_usage_cache = lambda: cache
+        ka.fresh_usage = lambda n, force=False: cache
+        def hf(sid, stall, reason, st, args):
+            fired.append(stall)
+            st["handled"][stall["uuid"]] = {"result": "test"}
+        ka.handle_fire = hf
+        try:
+            st = {"handled": {}, "fires": {}}
+            ka.last_mile_pass(SID, r1 - timedelta(hours=4), st, None)
+            cache["weekly"]["resets_at"] = r2
+            ka.last_mile_pass(SID, r1 - timedelta(hours=3), st, None)
+            self.assertEqual(len(fired), 1)
+            self.assertEqual(fired[0]["uuid"], "last-mile-2026-10-01T17:00:00+00:00")
+            # the raw keys already in today's state count as handled
+            fired.clear()
+            st = {"handled": {"last-mile-2026-10-01T17:00:00.320910+00:00": {},
+                              "last-mile-2026-10-01T16:59:59.557562+00:00": {}}, "fires": {}}
+            for r in (r1, r2):
+                cache["weekly"]["resets_at"] = r
+                ka.last_mile_pass(SID, r1 - timedelta(hours=2), st, None)
+            self.assertEqual(fired, [])
+            # a different weekly cycle is not handled by them
+            self.assertFalse(ka.last_mile_handled(ka.last_mile_key(r1 + timedelta(days=7)), st["handled"]))
+        finally:
+            ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = olds
+
     def test_budget_headroom(self):
         now = Z("2026-09-30T22:00:00Z")                       # 149 h into the week
         extra, text = ka.budget_headroom(usage(77, self.R), now)

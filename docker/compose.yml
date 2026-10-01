@@ -1,0 +1,42 @@
+# AFClaude manager container. Machine-specific values: docker/.env (gitignored),
+# see docker/env.example. Start: `docker compose -f docker/compose.yml up -d --build`.
+# No docker socket, no privileges, no published ports.
+name: afclaude
+services:
+  afclaude:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        AFCLAUDE_DIR: ${AFCLAUDE_DIR:?set in docker/.env}
+    image: afclaude-manager:latest
+    container_name: afclaude
+    restart: unless-stopped
+    environment:
+      AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
+      AFCLAUDE_MANAGER_SESSION: ${AFCLAUDE_MANAGER_SESSION:?set in docker/.env}
+      DISPATCHER_MANAGER_SESSION: ${AFCLAUDE_MANAGER_SESSION}
+      QUICKVIEW_SELF_SESSION: ${AFCLAUDE_MANAGER_SESSION}
+      AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
+      AFCLAUDE_BRIDGE_USER: ${AFCLAUDE_BRIDGE_USER:?set in docker/.env}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${AFCLAUDE_HOST_REPO:?}:/host/repo:ro                       # local-only files, read fresh
+      - ${AFCLAUDE_HOST_REPO}/data:${AFCLAUDE_DIR}/data             # DB, samples, state, logs (rw)
+      - ${HOST_HOME:?}/.claude/projects:/home/opc/.claude/projects:ro
+      - ${HOST_HOME}/.claude/sessions:/home/opc/.claude/sessions:ro
+      - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro
+      - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777          # exec: the unit tests put stub binaries in temp dirs
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [afclaude]
+networks:
+  afclaude:
+    # host_exec.py's authorized_keys line only accepts from="172.16.0.0/12"
+    ipam:
+      config:
+        - subnet: ${AFCLAUDE_SUBNET:-172.28.0.0/24}

@@ -1,0 +1,8 @@
+# Dev override: run the code from a checkout instead of the baked copy (read-only),
+# no rebuild needed after edits:
+#   AFCLAUDE_DEV_SRC=/path/to/checkout docker compose -f docker/compose.yml -f docker/compose.dev.yml up -d
+services:
+  afclaude:
+    volumes:
+      - ${AFCLAUDE_DEV_SRC:-..}:${AFCLAUDE_DIR}:ro
+      - ${AFCLAUDE_HOST_REPO}/data:${AFCLAUDE_DIR}/data
