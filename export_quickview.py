@@ -30,12 +30,13 @@ sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget rule, window)
 import store  # noqa: E402  (read-only: pending_user_input)
 import limit_ratio  # noqa: E402  (reads the per-sample ratio snapshot; never recomputes here)
+import afclaude_config  # noqa: E402  (local machine-specific values)
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
-# This manager's own session/tmux (matches usage_report.py's DEFAULT_SESSION).
-SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION", "f2897285-dd97-49d9-b29a-2334b4753dee")
+# This manager's own session/tmux (data/afclaude.json manager_session, as usage_report.py).
+SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manager_session()
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 UTC = timezone.utc
