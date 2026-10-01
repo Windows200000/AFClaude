@@ -28,7 +28,8 @@ Top bar on every page: automation state (running / paused, with a toggle), tonig
 - **F1 Inbox (home).** Shows ONLY real questions: blocked tasks (question plus a text box) and open manager questions (§4.6). Never stalls, never untitled sessions. Answering moves the task from blocked to pending, and the card disappears immediately (the server returns the new inbox). An empty inbox says so in one line.
 - **F2 Stalled sessions.** Only sessions whose last entry is a limit notice (`sessions.stalled = 1`), newest first, own AFClaude sessions hidden by default. Each card shows the title (or the cwd plus the first prompt when the session has no title), project, stall kind, reset time and the effective decision with its source. Buttons: Continue, Ignore, and "Always…" (a session rule or a project rule; the project rule preselects the most specific cwd). An undecided stall stays until the user decides it; it never expires. Decided or resumed stalls leave the undecided list right away. A "decided" filter shows the rest.
 - **F3 Queue and projects.** Ranked projects, each expanded to its stages with a priority chip (tap cycles high → medium → low). Up/down buttons move projects and stages, plus a "move to position…" field (optional drag on desktop). A per-project menu has "Set whole project to medium/low", edit, and manage/unmanage. A second tab shows the flat execution order (`store.execution_order`: high by project rank then stage, then medium, then low), marks what runs next, and says why an item is skipped (managed project, skip list).
-- **F4 Window planner.** Pick a start time and a number of session windows (§4.2). The page shows the session-limit length, the resulting window as a timeline over the next 7 nights, and the weekly-reset marker. It also shows the measured ratios from `limit_ratio.py`: weekly % per full session window, windows per week, windows left this week, and the AFClaude vs user share (each with "insufficient data" when that is the honest answer). A hint compares planned windows with the windows needed to use the full weekly limit. Save applies from the next dispatcher pass.
+- **F4 Window planner.** Pick a start time and a number of session windows (§4.2), once for the whole week or per weekday (§4.2.1). The page shows the session-limit length, the resulting window as a timeline over the next 7 nights, and the weekly-reset marker. It also shows the measured ratios from `limit_ratio.py`: weekly % per full session window, windows per week, windows left this week, and the AFClaude vs user share (each with "insufficient data" when that is the honest answer). A hint compares planned windows with the windows needed to use the full weekly limit. Save applies from the next dispatcher pass.
+  - Editing flow: the week is shown as seven rows (Mon..Sun), each with its window or "off"; identical windows carry the same link colour. "Set for the whole week" writes one window to all seven days as one link group. Tapping a day's window opens the editor with a choice: **change all linked** (every day in that link group moves together) or **only this day** (the day leaves the group and becomes individual; a day edited to match another group's window can be re-linked with one tap). The preview shows which days change before saving.
 - **F5 Status.** Keep-alive state, the latest budget decisions (one line each, with the reason text from `budget_decision`), dispatcher activity, the cron entries, the next usage review, and the review results split into universal and user-specific findings.
 - **F6 Driven sessions.** Every session AFClaude started or continued: tmux name, kind (keep-alive / task / stall / review), state, a link that opens it in the Claude app when an RC URL is known, and the RC caveat (§7.4).
 - **F7 Prompts.** Every `prompts/*.md` file with its placeholders and where it is used. Shows the default, any override, and a diff. Edit, validate, save, reset to default.
@@ -70,15 +71,22 @@ The usual approach applies: `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict
 
 ### 4.1 `settings`
 `key TEXT PK, value TEXT (JSON), updated_at, updated_by`. Typed accessors live in `schedule.py` and `actions.py`, and code defaults apply when a key is missing, so an empty table reproduces today's behaviour exactly.
-- `window.start_local` ("HH:MM"), `window.tz` ("Europe/Berlin"), `window.session_windows` (int ≥ 1), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
+- `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
 - `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: today's "11:00 after a 09:00 window end"), `budget.session_usage_stop` (85, from `dispatcher.json`)
 - `automation.paused` (bool, checked by every runner in addition to the `PAUSED` file)
 
 ### 4.2 Window semantics (`schedule.py`)
-- Window = [start, start + N × session_hours). The start is a wall-clock time in `window.tz`, and the length is in absolute hours, so a DST night still holds exactly N full session windows (it may end an hour earlier or later on the wall clock; the preview shows this).
+- Window = [start, start + N × session_hours), per weekday (§4.2.1). The start is a wall-clock time in `window.tz`, and the length is in absolute hours, so a DST night still holds exactly N full session windows (it may end an hour earlier or later on the wall clock; the preview shows this).
 - The grid is anchored at the chosen start, as decided earlier: session k runs from start + k × session_hours, so every session window inside the automation window is a full one, and the window ends on a session-limit boundary. The start picker moves in 30-min steps. It also offers "snap to the usual reset": from `data/samples.jsonl` it shows when a user-started session window was typically still running at the chosen start and when it reset (the automation window's first session can only begin after that). Picking that time aligns the grid with real limits.
 - `in_window`, `current_window_end`, `next_window_start` and the budget cutoff (window end + cutoff hours) move from constants in `keepalive.py` to `schedule.py`. `keepalive.py`, `dispatcher.py`, `export_quickview.py` and `usage_review.py` read the settings once per pass or loop iteration.
 - The fixed window-start cron (`0 21,22 * * *` UTC for the 23:00 Berlin start) is replaced by a window-start tick in the dispatcher pass: the first pass at or after the window start fires the keep-alive's window-start continue once per window (dedup key = the window's end date, as `keepalive.window_start_key()`, since the window spans midnight).
+
+### 4.2.1 Per-weekday windows and link groups
+- `window.days` = `{"mon": {"start": "23:00", "n": 2, "group": "g1"} | null, …, "sun": …}`. A window belongs to the weekday on which it **starts** (Mon 23:00–09:00 runs into Tuesday). `null` = no automation window that night.
+- `group` is a link-group id. Days in one group have identical windows by construction: a "change all linked" edit rewrites every day in the group in one transaction; an "only this day" edit gives that day a fresh group id. Setting "the whole week" writes all seven days with one new group. Two days with identical windows but different groups stay separate until the user re-links them.
+- Validation: start on the 30-min grid, n ≥ 1, and no overlap between consecutive days' windows (e.g. Mon 23:00 × 2 ends Tue 09:00, so Tue can't start before 09:00); a rejected edit names the conflicting day.
+- Default (empty table): all seven days `{"start": "23:00", "n": 2, "group": "weekly"}` in Europe/Berlin (owner decision, 29.09.2026).
+- The `settings/window` write (§5) takes `{day, start, n, mode: linked | individual | week}` and the settings version.
 
 ### 4.3 Prompt overrides
 - `prompt_overrides(name PK, body, base_sha256, updated_at, updated_by)`. `name` is the file name under `prompts/`, and `base_sha256` is the hash of the default file when the edit was made. If the default changes later (a repo update), the dashboard flags "default changed since your edit" and shows a three-way view.
@@ -117,7 +125,7 @@ Writes, each a single `actions.py` call and a single transaction:
 | `tasks/{id}/cancel`, `/reopen` | lifecycle | 409 on a wrong state |
 | `stalls/{session}/decision` | continue / ignore / clear, with the `stall_ref` shown | 409 if the session has stalled again since (the user decided an older stall) |
 | `rules` POST, `rules/{id}` DELETE | standing rule per session / project | unique (scope, match) → returns the existing rule |
-| `settings/window` | start, N (validated and snapped) | version = settings.updated_at |
+| `settings/window` | day, start, N, mode (linked / individual / week; validated, snapped, overlap-checked) | version = settings.updated_at |
 | `settings/automation` | pause / resume | idempotent |
 | `prompts/{name}` PUT, DELETE | save override / reset to default | base_sha256 + updated_at |
 | `requests` POST | queue `continue_now` / `review_now` | one open request per (kind, target) |
@@ -175,7 +183,7 @@ Local only (gitignored, and blocked by `tools/check_public.py`):
 - `data/`: the DB with prompt overrides, settings, the backlog projects, reviews and `user_model.json`
 - `BACKLOG.md`
 
-The backlog is seeded into the DB by a generic `tools/seed_backlog.py` that reads the local `BACKLOG.md`: backlog projects ranked after AFClaude, their stages low priority and kind `backlog_project`. It runs once, after the dashboard is live (phase 9).
+The backlog is seeded into the DB by a generic `tools/seed_backlog.py` that reads the local `BACKLOG.md`: backlog projects ranked after AFClaude, their stages low priority and kind `backlog_project`. It runs once, in phase 8d, after the 8c pentest is clean.
 
 ### 7.4 Remote Control visibility
 Sessions AFClaude drives already run as individual RC sessions (`ka_resume.sh` launches with `--remote-control --name`, and a resume keeps the RC link). The dashboard lists them in F6 with their RC link when one can be found (`claude agents --json` or the session registry, read by the sampler and stored in `driven_sessions.rc_url`; to verify in phase 5), and the tmux name otherwise.
@@ -193,7 +201,7 @@ Threads hosted by the user's `claude rc` server are never taken over: that forks
 
 ## 9. Phased build plan
 
-Each phase is one subagent in a worktree with a clear definition of done (tests green, `check_public` clean). Phases 1–3 change runner code and must keep every existing suite green. Nothing is deployed before phase 8.
+Each phase is one subagent in a worktree with a clear definition of done (tests green, `check_public` clean). Phases 1–3 change runner code and must keep every existing suite green. Nothing is deployed before phase 8b, and nothing deployed can reach Claude before phase 8d.
 
 1. **Config + v4 schema + `actions.py`.** `config.py` + `config.example.toml`; move hardcoded paths and session ids; v4 tables and columns (§4); `actions.py` with audit and idempotency; `tasks.py` and `mcp_server.py` routed through it; the autonomous-writer rules; `afclaude_ask` + `kind='question'`. Tests.
 2. **`schedule.py` + settings in the runners.** Window and budget cutoff from settings; keepalive re-reads settings per loop; the dispatcher window-start tick replaces the fixed cron line; `automation.paused`; `run_log` writes; `action_requests` consumption (`continue_now`, `review_now`). DST and legacy-window tests.
@@ -202,8 +210,16 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 5. **Read views.** Inbox, stalls (with filters and the RC caveat), projects and queue, status (keep-alive, budget decisions, cron, reviews), window planner (read-only preview + ratios), driven sessions (verify the RC URL source), prompts (read + diff), audit.
 6. **Task and project writes.** Answer (the card disappears), add/edit/cancel/reopen, stage priority chip, project bulk priority, move up/down/position, manage/unmanage; 409 handling in the UI. Parity with the quickview is reached here.
 7. **Stall, rule, window, prompt and automation writes.** Decide with `stall_ref`, session and project rules, window editor with snapping and a live preview, prompt editor (validate, save, reset, default-changed view), pause/resume, the `continue_now` button, confirm steps and the ALERTS lines for high-impact writes.
-8. **Deploy (with the user's approval).** Sidecar on `<manager-host>` behind Traefik with the IP allowlist; the user adds the `/private/afclaude/` location on `<web-host>`; curl checks from §8; the manager container must already be cut over.
-9. **Retire the quickview, seed the backlog.** About a week of overlap, then retire the quickview (§7.2); `OPEN_QUESTIONS.md` becomes an export; `tools/seed_backlog.py` run locally; the README and PROGRESS updated.
+8. **Deploy gates, strictly in this order:**
+   - **8a. Thorough review (Opus 5.5, ultracode/max effort).** The whole dashboard plus its integration (actions.py, schedule.py, prompts.py, the runner changes, auth incl. OIDC and local login, deploy files). Findings fixed and re-reviewed before 8b.
+   - **8b. Deploy without the Claude connection (with the user's approval).** Sidecar on `<manager-host>` behind Traefik with the IP allowlist; the user adds the `/private/afclaude/` location on `<web-host>`; curl checks from §8. The app runs against a separate staging DB that no runner reads, so no write can trigger, continue or decide a session; the container has no route to `claude`, tmux or the host bridge anyway (§6.3).
+   - **8c. Live pentest with full code access.** An agent with the source tests the running 8b deployment (auth bypass, OIDC flow and local-login brute force, CSRF, session handling, injection, IDOR, header/CSP checks, the proxy path). Findings fixed, re-tested, and 8a re-run on the fixes if they are non-trivial.
+   - **8d. Attach the Claude connection + seed the backlog (with the user's approval).** Point the app at the live DB, so its writes (decisions, `continue_now`, windows) reach the runners; the manager container must already be cut over. Then run `tools/seed_backlog.py` locally with the owner's backlog.
+9. **Retire the quickview.** About a week of overlap, then retire the quickview (§7.2); `OPEN_QUESTIONS.md` becomes an export; the README and PROGRESS updated.
+
+Future (not a phase): **window recommendations.** The usage monitor recommends shifting windows when the user is usually active during an automation window, or usually inactive at some other time of the week. It aggregates activity only by **weekday + hour of day** (never the date or the day of the month), shows the evidence (weeks observed per slot), and proposes a concrete edit in the F4 terms (which day or link group, new start/N); applying it is a normal window write.
+
+Preliminary status page: until phase 9, the quickview gets a small **phase visualiser** (phases 1–9 incl. 8a–8d as a strip, each coloured by its task-store state).
 
 ## 10. Open questions for the user
 1. **Default window after the switch.** Today's 00:00–08:00 is 8 h, which is not a multiple of the 5 h session limit. Which should the default be: 22:00–08:00 (2 windows, same end), 00:00–10:00 (2 windows, same start), or 00:00–05:00 (1 window)? And does the "grid anchored at the start you pick" rule still hold, or should the start snap to your observed session resets (the planner can offer both)?
@@ -215,3 +231,18 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 - **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff of the budget rule stays "no later than 11:00 after the window".
 - **Q2 login:** the dashboard implements **both** a general SSO (standard OpenID Connect, any provider, e.g. the existing Authelia) **and** a simple local username/password login (hashed passwords, rate limiting, secure session cookies). Either can be enabled via config. The reverse-proxy pattern stays as defence in depth.
 - **Q3 MCP tasks:** tasks added through MCP are treated exactly like tasks created in the UI; **no approval step**. The MCP server's instructions and tool descriptions must say that the tools are only to be used when the user explicitly asks for AFClaude.
+
+## Decisions by the owner (30.09.2026)
+
+- **Windows:** settable once for the whole week **and** individually per weekday. When editing, the user chooses to change all identical (linked) windows together or only one day (§4.2.1, F4). Default stays one weekly window 23:00–09:00 Europe/Berlin.
+- **Future: window recommendations** by the usage monitor, from weekday + hour only (§9, "Future").
+- **Architecture option A** (a small Python web app) is confirmed; auth = generic OIDC SSO with any provider alongside local username/password (as in Q2).
+- **Deploy gates:** 8a thorough review (Opus 5.5, ultracode effort) → 8b deploy without the Claude connection → 8c live pentest with full code access → 8d attach the Claude connection + seed the backlog (§9).
+- **Quickview phase visualiser** on the preliminary status page (§9).
+
+## Visual design (owner, 30.09.2026)
+
+The owner likes the preliminary quickview's look and wants it kept for the main app:
+- **Purple as the main accent**, and **vibrant colours that directly represent status** (done / in progress / pending / blocked / alert), used consistently everywhere a status appears.
+- The feel: **rigid but sleek**. A strict grid, clear boxes and chips, compact and dense, no decorative fluff.
+- Baseline: take the colour tokens, dark/light theming, typography and spacing from `quickview/AFClaude.html` as the starting design system; phone first.
