@@ -2,8 +2,10 @@
 """
 AFClaude MCP server (stdio): the task store for any Claude Code session on
 this host. Sessions add, query, prioritize and answer tasks, and decide
-stalled sessions, by calling these tools when the user asks ("add a task to
-do X", "what's waiting for me?").
+stalled sessions, by calling these tools only when the user explicitly asks
+for AFClaude ("add an AFClaude task to do X", "what's waiting for me in
+AFClaude?"), or when an AFClaude task prompt tells them to report. A task
+added here is the same as one added in the UI/CLI: no approval step.
 
     .venv/bin/python mcp_server.py        (Claude Code starts it; see mcp_register.md)
 
@@ -44,12 +46,23 @@ from mcp.types import ToolAnnotations  # noqa: E402
 Priority = Literal["high", "medium", "low"]
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False)
 
+# Owner decision (29.09.2026, dashboard design Q3): tasks added through MCP are treated
+# exactly like tasks created in the UI (no approval step), so the tools may only be used
+# when the user explicitly asks for AFClaude. Said in the server instructions and, short,
+# at the start of every tool description (clients may drop the instructions).
+USE_ONLY = "Only when the user explicitly asks for AFClaude (or an AFClaude task prompt says so). "
+INSTRUCTIONS = (
+    "AFClaude task store on this host. Use these tools ONLY when the user explicitly asks for AFClaude "
+    "(adding, listing, reprioritizing or answering AFClaude tasks, its projects, what is waiting for them, "
+    "stalled-session decisions or rules), or when the AFClaude task prompt this session was started with tells "
+    "you to report through them. Never on your own initiative, e.g. not as your own todo list. A task added here "
+    "counts exactly like one the user added in the UI: there is no approval step, and the dispatcher starts "
+    "pending tasks on its own in the nightly window. Tasks are stages of ranked projects; execution order is all "
+    "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin.")
+
 server = MCPServer(
     name="afclaude",
-    instructions=("AFClaude task store on this host. Tasks are stages of ranked projects; execution order is all "
-                  "high stages (by project rank, then stage), then medium, then low. Use these tools when the user "
-                  "asks to add, list, reprioritize or answer AFClaude tasks, or what is waiting for them. "
-                  "Times are Europe/Berlin."),
+    instructions=INSTRUCTIONS,
     log_level="WARNING",
 )
 
@@ -179,7 +192,7 @@ def tool_errors(fn):
 def tool(description, read_only=False):
     def deco(fn):
         wrapped = tool_errors(fn)
-        server.add_tool(wrapped, name=fn.__name__, description=description, structured_output=False,
+        server.add_tool(wrapped, name=fn.__name__, description=USE_ONLY + description, structured_output=False,
                         annotations=READ_ONLY if read_only else None)
         return wrapped
     return deco
