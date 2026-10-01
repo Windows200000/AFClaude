@@ -160,3 +160,4 @@ Session 73% (resets 01:00 Berlin). Running: the container subagent (worktree ../
 - Open question: ship the reserve model with the pending rebuild (OPEN_QUESTIONS.md, deploy item).
 - 17:32 [ALERT] usage review 2026-10-01 done (details in ALERTS.md)
 - 18:05 Review wrapped up: b02a13e pushed, GOALS 6 updated, memory note afclaude_unread_review.md written, notify.py ran (not sent: the terminal was active).
+- 21:01 DEPLOYED (owner-approved): main = usage review model (reserve default, linear fallback) + window 23:00-09:00 + dash1 (schema v4, actions.py); container rebuilt, watcher on 'window 23:00-09:00', cron window-start 21/22 UTC. Review prompt fixed (proposals only as a branch in a worktree; defaults = owner's decision). Note: right after the weekly reset the reserve model keeps 100% for the user → HOLD early in the week, including tonight. Next: dashboard phase 2 in the next window that has budget.
