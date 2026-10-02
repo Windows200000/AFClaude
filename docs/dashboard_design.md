@@ -258,5 +258,5 @@ The owner likes the preliminary quickview's look and wants it kept for the main 
 ## Owner decision store (owner, 02.10.2026)
 
 - Every AFClaude project has a separate store of the OWNER's decisions (for AFClaude itself: DECISIONS.md, local only, later a `decisions` table): verbatim owner words, date, scope, status (active / superseded), and the manager's interpretation clearly marked as non-binding.
-- Only the owner creates, changes or supersedes a decision. Managers and agents can only PROPOSE a change (as an open question). The dashboard shows the store per project, with history and a "propose change → owner confirms" flow; a change takes effect only after the owner's confirmation.
+- Owner decisions can only be changed or superseded by the owner. Managers may record their own decisions (marked as such) and propose changes to owner decisions (as an open question); they must never contradict an owner decision silently. The dashboard shows the store per project, with history and a "propose change → owner confirms" flow; a change takes effect only after the owner's confirmation.
 - Agents check the store before acting on anything it covers, and ask on ambiguity instead of deciding.
