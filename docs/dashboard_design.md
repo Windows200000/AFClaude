@@ -254,3 +254,9 @@ The owner likes the preliminary quickview's look and wants it kept for the main 
 - "Reset this page/section" and "Reset all settings", each with a warning dialog that lists what will change, plus an UNDO (the previous values are kept in the audit log / settings versions, so one tap restores them).
 - Every setting has a short explanation: what it does, what it can affect (e.g. "can make AFClaude run during your daytime"), and its default.
 - The settings registry (actions.SETTINGS) is the single source for defaults, types, validation, the explanation texts and the "important" flag; the UI renders from it.
+
+## Owner decision store (owner, 02.10.2026)
+
+- Every AFClaude project has a separate store of the OWNER's decisions (for AFClaude itself: DECISIONS.md, local only, later a `decisions` table): verbatim owner words, date, scope, status (active / superseded), and the manager's interpretation clearly marked as non-binding.
+- Only the owner creates, changes or supersedes a decision. Managers and agents can only PROPOSE a change (as an open question). The dashboard shows the store per project, with history and a "propose change → owner confirms" flow; a change takes effect only after the owner's confirmation.
+- Agents check the store before acting on anything it covers, and ask on ambiguity instead of deciding.
