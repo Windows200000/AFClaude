@@ -18,13 +18,13 @@ import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
-import budget  # noqa: E402
+import pacing as budget  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
 _OLD_CFG = afclaude_config.CONFIG_FILE
 
 
-_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE)
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES)
 
 
 def setUpModule():
@@ -35,11 +35,12 @@ def setUpModule():
         json.dump({"usage_model": "linear"}, fh)
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
     budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
+    budget.FIRE_FILES = []
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE = _OLD_BUDGET
+    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 UTC = timezone.utc
@@ -451,7 +452,7 @@ class BudgetModel(Base):
     def setUp(self):
         super().setUp()
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump({"usage_model": "budget"}, fh)
+            json.dump({"usage_model": "pacing"}, fh)
         self._bm = (budget.minutes_since_user, budget.weekly_at)
         budget.weekly_at = lambda rows, t0, r, now: None          # anchor: the current weekly %
 
@@ -478,7 +479,7 @@ class BudgetModel(Base):
         self.project("p1")
         for i in range(3):
             store.add_task(self.conn, f"t{i}", project="p1")
-        budget.minutes_since_user = lambda now, rows=None: 0.0         # no yield in the last mile
+        budget.minutes_since_user = lambda now, rows=None: 300.0       # idle user
         lm_now = WEEK_RESET - timedelta(hours=3)                       # 92%: one window, 5 h
         u = {"fetched_at": lm_now, "session": {"percent": 90.0, "resets_at": lm_now + timedelta(hours=2)},
              "weekly": {"percent": 92.0, "resets_at": WEEK_RESET}}
@@ -489,7 +490,7 @@ class BudgetModel(Base):
         finally:
             ka.read_usage_cache = olds
         self.assertEqual(len(rep["start"]), 2, rep)                    # 90% session < 100% cap
-        self.assertIn("last mile", rep["start"][0]["reason"])
+        self.assertIn("last stretch", rep["start"][0]["reason"])
 
 
 class Cleanup(Base):

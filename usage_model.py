@@ -1,6 +1,6 @@
 """Weekly budget model "reserve envelope + yield + session guard" (stdlib only).
 
-RETIRED (02.10.2026): keepalive.py uses budget.py by default (linear as the fallback); this
+RETIRED (02.10.2026): keepalive.py uses pacing.py by default (linear as the fallback); this
 module is no longer selectable and stays only as the comparison baseline of
 tools/budget_backtest.py.
 

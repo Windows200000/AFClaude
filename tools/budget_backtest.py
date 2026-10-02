@@ -12,7 +12,7 @@ Simulation (the 15-min sample grid of one weekly cycle):
     --user-scale scales it; --late-burst H copies the user's worst H-hour burst into the last
     H hours before the reset (stress test for the last mile).
   * User ACTIVITY (for the yield) comes from the same rows: each model's own rule
-    (reserve: usage_model.user_signal; budget: budget.user_signal); linear does not yield.
+    (reserve: usage_model.user_signal; pacing: pacing.user_signal); linear does not yield.
   * AFClaude, while allowed, burns RAF weekly-%/h and RAF/K session-%/h (unlimited work). It
     stops at its target (the run budget), at its session cap, at 100% weekly, or outside its
     allowed period (the nightly window, or the last mile).
@@ -21,10 +21,11 @@ Simulation (the 15-min sample grid of one weekly cycle):
   * user headroom = 100 - weekly at each step with user demand or activity (min and p10).
   * session hits by AF = user session demand that hit 100% in a window AFClaude spent in.
   * nights with work = nightly windows in which AFClaude spent > 0.1%.
-Models: linear (keepalive's linear rule: projection < 90%, 11:00 cutoff, 5 h last mile, decided
-at the window start / after a session reset in the window / every 15 min in the last mile),
-reserve (usage_model.py, continuous), budget (budget.py, continuous; envelope variants
-generic / blended / user from data/user_model.json).
+Models: linear (the original rule: projection < 90%, 11:00 cutoff, 5 h last mile, decided at
+the window start / after a session reset in the window / every 15 min in the last mile),
+reserve (the retired usage_model.py, continuous), pacing (pacing.py, continuous: the straight
+line, and with the forecast fitted on the replayed cycle itself, i.e. IN-SAMPLE).
+fcErr = mean / mean absolute error of the night-start forecasts of the user's remaining use.
 """
 import argparse
 import json
@@ -37,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import afclaude_config  # noqa: E402
-import budget  # noqa: E402
+import pacing  # noqa: E402
 import usage_model  # noqa: E402
 
 UTC = timezone.utc
@@ -47,7 +48,7 @@ WEEK = timedelta(days=7)
 
 
 def ts(s):
-    return budget._ts(s)
+    return pacing._ts(s)
 
 
 def load_rows(path):
@@ -65,19 +66,19 @@ def load_rows(path):
 
 
 def wk(r):
-    w = budget._weekly(r)
+    w = pacing._weekly(r)
     return w.get("percent"), ts(w.get("resets_at"))
 
 
 def sess(r):
-    s = budget._dict(budget._dict(r.get("usage")).get("session"))
+    s = pacing._dict(pacing._dict(r.get("usage")).get("session"))
     return s.get("percent")
 
 
 def build_steps(rows, reset, user_until, user_scale=1.0, late_burst_h=0.0):
     """-> (w0, t0, steps). Each step: t, dt (h), dw, ds (user demand), act_new, act_old."""
-    cyc = budget._round_reset(reset)
-    rs = [r for r in rows if wk(r)[0] is not None and budget._round_reset(wk(r)[1]) == cyc]
+    cyc = pacing._round_reset(reset)
+    rs = [r for r in rows if wk(r)[0] is not None and pacing._round_reset(wk(r)[1]) == cyc]
     steps = []
     for p, c in zip(rs, rs[1:]):
         t = ts(c["at"])
@@ -87,7 +88,7 @@ def build_steps(rows, reset, user_until, user_scale=1.0, late_burst_h=0.0):
         dw = max(wk(c)[0] - wk(p)[0], 0.0) if user else 0.0
         ds = max((sess(c) or 0) - (sess(p) or 0), 0.0) if user else 0.0
         steps.append(dict(t=t, dt=(t - ts(p["at"])).total_seconds() / 3600, dw=dw * user_scale, ds=ds * user_scale,
-                          act_new=user and budget.user_signal(c, p),
+                          act_new=user and pacing.user_signal(c, p),
                           act_old=user and usage_model.user_signal(c, p, [])))
     t = steps[-1]["t"]
     while t + STEP <= reset - timedelta(minutes=4):
@@ -107,9 +108,7 @@ def build_steps(rows, reset, user_until, user_scale=1.0, late_burst_h=0.0):
 # ------------------------------------------------------------------ models
 
 def window_end(t, win):
-    s = budget.latest_window_start(t, win)
-    end_d = s.astimezone(budget.BERLIN).date() + (timedelta(days=1) if win[1] <= win[0] else timedelta(0))
-    return datetime.combine(end_d, win[1], tzinfo=budget.BERLIN)
+    return pacing.window_end(pacing.latest_window_start(t, win), win)
 
 
 def linear(ctx, t, w):
@@ -123,8 +122,8 @@ def linear(ctx, t, w):
     proj = w + w * (T / el)
     if proj < 90:
         return True, 90 * el / (el + T), 95.0
-    cutoff = datetime.combine(window_end(t, ctx["win"]).astimezone(budget.BERLIN).date(),
-                              datetime.min.time().replace(hour=11), tzinfo=budget.BERLIN)
+    cutoff = datetime.combine(window_end(t, ctx["win"]).astimezone(pacing.BERLIN).date(),
+                              datetime.min.time().replace(hour=11), tzinfo=pacing.BERLIN)
     return (reset <= cutoff), (100.0 if reset <= cutoff else w), 95.0
 
 
@@ -139,19 +138,23 @@ def reserve(ctx, t, w, s_pct, s_open):
     return d["go"], (d["target"] if d["target"] is not None else w), cap
 
 
-def new_budget(ctx, t, w, s_pct, s_open):
-    P, env = ctx["P"], ctx["env"]
+def new_pacing(ctx, t, w, s_pct, s_open):
     msu = None if ctx["last_act"] is None else (t - ctx["last_act"]).total_seconds() / 60
     if msu is None:
         msu = 10 ** 6
-    d = budget.decide_core(w, ctx["reset"], t, msu, env, P, s_pct, (s_open + SESSION) if s_open else None,
-                           True, ctx["ratio"], ctx.get("lm", "auto"), ctx["win"], anchor=ctx["anchor"])
+    d = pacing.decide_core(w, ctx["reset"], t, msu, ctx["P"], s_pct, (s_open + SESSION) if s_open else None,
+                           True, ctx["ratio"], ctx.get("lm", "auto"), ctx["win"], ctx["week_target"],
+                           ctx["forecast"], anchor=ctx["anchor"])
     ctx["last_d"] = d
+    if d.get("forecast") is not None and d.get("t0") is not None:
+        ctx["forecasts"].setdefault(d["t0"], d["forecast"])
     return d["go"], (d["target"] if d["target"] is not None else w), d["session_cap"]
 
 
-def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="auto", trace=False):
-    ctx = dict(reset=reset, win=win, P=P, env=env, ratio=ratio, lm=lm, last_act=None)
+def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="auto", trace=False,
+        forecast=None, week_target=90.0):
+    ctx = dict(reset=reset, win=win, P=P, env=env, ratio=ratio, lm=lm, last_act=None, forecast=forecast,
+               week_target=week_target, forecasts={})
     w = w0
     hist = []                       # (t, w) of the simulated weekly %, for the night anchor
 
@@ -173,10 +176,10 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
         if s_open is not None and t >= s_open + SESSION:
             s_open, s_val, af_in_win = None, 0.0, False
         hist.append((t, w))
-        allowed_win = budget.in_window(t, win)
+        allowed_win = pacing.in_window(t, win)
         if model == "linear":
             in_lm = timedelta(0) < reset - t <= timedelta(hours=5)
-            lt = t.astimezone(budget.BERLIN)
+            lt = t.astimezone(pacing.BERLIN)
             start_tick = allowed_win and lt.hour == win[0].hour and lt.minute < 15
             decide_now = start_tick or (allowed_win and s_open is None and not running) or in_lm
             ok = allowed_win or in_lm
@@ -188,7 +191,7 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
                 go, target, cap = reserve(ctx, t, w, s_val, s_open)
                 ctx["last_act_kind"] = "act_old"
             else:
-                go, target, cap = new_budget(ctx, t, w, s_val, s_open)
+                go, target, cap = new_pacing(ctx, t, w, s_val, s_open)
                 ok = allowed_win or ctx["last_d"]["mode"] == "last_mile"
             running = go and ok
         if not ok:
@@ -204,10 +207,10 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
                 af_in_win = True
                 w += af
                 out["af"] += af
-                night = budget.latest_window_start(t, win).date().isoformat()
+                night = pacing.latest_window_start(t, win).date().isoformat()
                 out["night_spend"][night] = out["night_spend"].get(night, 0.0) + af
                 if trace:
-                    print("   ", t.astimezone(budget.BERLIN).strftime("%a %H:%M"),
+                    print("   ", t.astimezone(pacing.BERLIN).strftime("%a %H:%M"),
                           f"AF +{af:.2f} w={w:.1f} s={s_val:.0f} target={target:.1f} cap={cap:.0f}")
         if st["dw"] > 0 or st["ds"] > 0:
             if s_open is None:
@@ -225,19 +228,21 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
                 out["blocked"] += st["dw"] - fit
                 out["blocked_steps"] += 1
             w += fit
-        if st["act_new"] if model == "budget" else st["act_old"]:
+        if st["act_new"] if model == "pacing" else st["act_old"]:
             ctx["last_act"] = t
         if st["act_new"] or st["act_old"] or st["dw"] > 0 or st["ds"] > 0:
             out["heads"].append(100 - w)        # the same user moments for every model
     out["final"] = w
     out["nights"] = {n for n, v in out["night_spend"].items() if v > 0.1}
+    errs = [fc - sum(x["dw"] for x in steps if x["t"] > t0) for t0, fc in ctx["forecasts"].items()]
+    out["fc_err"] = (sum(errs) / len(errs), sum(abs(e) for e in errs) / len(errs)) if errs else None
     return out
 
 
 def nights_in(steps, win, reset):
     first = steps[0]["t"]
-    return sorted({budget.latest_window_start(s["t"], win).date().isoformat() for s in steps
-                   if budget.in_window(s["t"], win) and s["t"] >= first})
+    return sorted({pacing.latest_window_start(s["t"], win).date().isoformat() for s in steps
+                   if pacing.in_window(s["t"], win) and s["t"] >= first})
 
 
 def p10(xs):
@@ -250,61 +255,69 @@ def p10(xs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--samples", default=os.path.join(HERE, "data", "samples.jsonl"))
-    ap.add_argument("--user-model", default=os.path.join(HERE, "data", "user_model.json"))
+    ap.add_argument("--data", default=os.path.join(HERE, "data"), help="for the recorded fires")
+    ap.add_argument("--user-model", default=os.path.join(HERE, "data", "user_model.json"),
+                    help="the reserve model's envelope (comparison only)")
     ap.add_argument("--reset", required=True, help="the weekly reset (ISO) of the cycle to replay")
     ap.add_argument("--user-until", required=True, help="observed demand counts as the user's up to here (ISO)")
     ap.add_argument("--raf", type=float, default=8.0, help="AFClaude burn rate, weekly %%/h")
     ap.add_argument("--k", type=float, default=0.16, help="simulated weekly %% per session %%")
-    ap.add_argument("--ratio", type=float, default=None, help="ratio the budget model uses (default: limit_ratio)")
+    ap.add_argument("--ratio", type=float, default=None, help="ratio pacing uses (default: per session window)")
     ap.add_argument("--user-scale", type=float, default=1.0)
     ap.add_argument("--late-burst", type=float, default=0.0)
-    ap.add_argument("--floor", type=float, default=None, help="night_floor for the budget model")
-    ap.add_argument("--safety", type=float, default=None)
-    ap.add_argument("--floor-min", type=float, default=None)
-    ap.add_argument("--lm-yield", action="store_true")
+    ap.add_argument("--week-target", type=float, default=90.0)
+    ap.add_argument("--margin", type=float, default=None, help="forecast_margin")
+    ap.add_argument("--no-lm-yield", action="store_true")
     ap.add_argument("--trace", default=None)
     a = ap.parse_args()
     reset, until = ts(a.reset), ts(a.user_until)
     rows = load_rows(a.samples)
     w0, t0, steps = build_steps(rows, reset, until, a.user_scale, a.late_burst)
     win = afclaude_config.window()
-    ratio = a.ratio if a.ratio is not None else budget.ratio_info([r for r in rows if ts(r["at"]) <= reset])[0]
+    upto = [r for r in rows if ts(r["at"]) <= reset + timedelta(minutes=10)]
+    ratio = a.ratio if a.ratio is not None else pacing.ratio_info(upto)[0]
+    P = dict(pacing.DEFAULTS)
+    if a.margin is not None:
+        P["forecast_margin"] = a.margin
+    if a.no_lm_yield:
+        P["last_mile_yield"] = False
+    pacing.FIRE_FILES = [(os.path.join(a.data, "keepalive", "keepalive_state.json"), "handled", "at"),
+                         (os.path.join(a.data, "dispatcher_state.json"), "sessions", "sent_at"),
+                         (os.path.join(a.data, "usage_review_state.json"), "runs", "at")]
+    rates, fsrc = pacing.fit_profile(upto, pacing.fire_times(), reset + timedelta(minutes=10))   # in-sample
+    if rates:
+        rates = [x * a.user_scale for x in rates]
+    fc = (lambda x, y: pacing.forecast_user(rates, x, y, P["forecast_margin"])) if rates else None
     try:
         with open(a.user_model) as fh:
-            user_env, weeks, _ = budget.parse_user_model(json.load(fh))
+            user_env, weeks, _ = usage_model.parse_user_model(json.load(fh))
+        user_env = {h: v * a.user_scale for h, v in user_env.items()}
     except (OSError, ValueError):
-        user_env, weeks = None, 0
-    P = dict(budget.DEFAULTS)
-    if a.floor is not None:
-        P["night_floor"] = a.floor
-    if a.safety is not None:
-        P["safety"] = a.safety
-    if a.floor_min is not None:
-        P["night_floor_min"] = a.floor_min
-    if a.lm_yield:
-        P["last_mile_yield"] = True
-    envs = [("generic", dict(budget.GENERIC_ENVELOPE))]
-    if user_env:
-        envs += [("blended", budget.floored(budget.effective_envelope(user_env, 2)[0])),
-                 ("user", budget.floored(budget.effective_envelope(user_env, 4)[0]))]
+        user_env = None
     nights = nights_in(steps, win, reset)
     print(f"cycle reset {reset:%Y-%m-%d %H:%M}Z, replay from {t0:%a %d.%m. %H:%M}Z at {w0:.0f}%, "
           f"user demand {sum(s['dw'] for s in steps):.1f}%, {len(nights)} observed nights; "
-          f"RAF {a.raf:g} %/h, k {a.k:g}, budget ratio {ratio:.3g}, floor {P['night_floor']:g}, "
-          f"safety {P['safety']:g}, user x{a.user_scale:g}, late burst {a.late_burst:g} h")
+          f"RAF {a.raf:g} %/h, k {a.k:g}, ratio {ratio:.3g}, week_target {a.week_target:g}, "
+          f"margin {P['forecast_margin']:g}, last_mile_yield {P['last_mile_yield']}, user x{a.user_scale:g}, "
+          f"late burst {a.late_burst:g} h; {fsrc}")
     print(f"{'model':28s} {'final':>6s} {'AF+':>6s} {'minH':>5s} {'p10H':>5s} {'blk%':>5s} {'blkN':>4s} "
-          f"{'sessAF':>6s} {'nights':>7s}  per-night AF spend")
-    cases = [("linear", "linear", None, None)]
-    for name, env in envs:
-        cases.append((f"reserve ({name})", "reserve", dict(usage_model.DEFAULTS), env))
-    for name, env in envs:
-        cases.append((f"budget ({name})", "budget", P, env))
-    for label, model, PP, env in cases:
-        o = run(model, steps, w0, reset, win, a.raf, a.k, PP, env, ratio, trace=(a.trace == label))
+          f"{'sessAF':>6s} {'nights':>7s} {'fcErr':>11s}  per-night AF spend")
+    cases = [("linear (original)", "linear", None, None, None)]
+    cases.append(("reserve (generic)", "reserve", dict(usage_model.DEFAULTS), dict(usage_model.GENERIC_ENVELOPE), None))
+    if user_env:
+        cases.append(("reserve (user env)", "reserve", dict(usage_model.DEFAULTS),
+                      usage_model.floored(usage_model.effective_envelope(user_env, 2)[0]), None))
+    cases.append(("pacing, straight line", "pacing", P, None, None))
+    if fc:
+        cases.append(("pacing, forecast", "pacing", P, None, fc))
+    for label, model, PP, env, f in cases:
+        o = run(model, steps, w0, reset, win, a.raf, a.k, PP, env, ratio, trace=(a.trace == label),
+                forecast=f, week_target=a.week_target)
         per = " ".join(f"{o['night_spend'].get(n, 0):.1f}" for n in nights)
+        fe = f"{o['fc_err'][0]:+.1f}/{o['fc_err'][1]:.1f}" if o.get("fc_err") else "-"
         print(f"{label:28s} {o['final']:6.1f} {o['af']:6.1f} {min(o['heads'] or [100]):5.1f} {p10(o['heads']):5.1f} "
               f"{o['blocked']:5.1f} {o['blocked_steps']:4d} {o['sess_hits_af']:6d} "
-              f"{len(o['nights'] & set(nights)):3d}/{len(nights):<3d}  {per}")
+              f"{len(o['nights'] & set(nights)):3d}/{len(nights):<3d} {fe:>11s}  {per}")
 
 
 if __name__ == "__main__":

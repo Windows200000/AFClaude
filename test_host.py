@@ -22,9 +22,9 @@ _CFG_DIR = tempfile.TemporaryDirectory()
 _OLD_CFG = afclaude_config.CONFIG_FILE
 
 
-import budget  # noqa: E402
+import pacing as budget  # noqa: E402
 
-_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE)
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES)
 
 
 def setUpModule():
@@ -36,11 +36,12 @@ def setUpModule():
         json.dump({"usage_model": "linear"}, fh)
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
     budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
+    budget.FIRE_FILES = []
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE = _OLD_BUDGET
+    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")

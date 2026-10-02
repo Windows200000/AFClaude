@@ -5,7 +5,8 @@
   "trust_root": "/path/to/your/workspace",
 
   "last_mile_hours": "auto",
-  "usage_model": "budget",
+  "week_target": 90,
+  "usage_model": "pacing",
   "window_start": "23:00",
   "window_hours": 10,
 

@@ -13,11 +13,12 @@ if the weekly budget rule allows it, resumes that session in place with
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
 
-Budget rule: by default budget.py ("nightly share + last mile": every night gets a share
-of what the user's projected need leaves, the last ceil(session windows of quota left)
-session lengths before the weekly reset spend the rest; AFClaude yields to an active user
-by POSTPONING to last activity + 60 min). data/afclaude.json "usage_model": "linear"
-selects the original linear rule, which is also the fallback if budget.py fails:
+Budget rule: by default pacing.py (the original linear rule evolved: the nights run full
+session windows to fill the week to week_target (90%) minus what the user is forecast to
+use, re-planned every night; the final <= 2 session windows before the weekly reset fill to
+100%; AFClaude yields to an active user by POSTPONING to last activity + 60 min).
+data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
+the fallback if pacing.py fails:
   projected end-of-week usage < 90%                          -> continue
   else weekly reset <= 11:00 Berlin after the current window -> continue
   else                                                       -> hold back
@@ -340,11 +341,11 @@ def project_weekly(pct, resets_at, now):
 
 
 def _budget_model():
-    """budget.py (nightly share + last mile) unless data/afclaude.json selects "linear"."""
+    """pacing.py (forecast-driven pacing) unless data/afclaude.json selects "linear"."""
     if afclaude_config.usage_model() == "linear":
         return None
-    import budget
-    return budget
+    import pacing
+    return pacing
 
 
 def _ratio_text(extra, ratio):
@@ -358,8 +359,8 @@ def budget_eval(usage, now):
     """THE budget evaluation every caller uses (watcher, window-start, last mile, deferred
     window-start, --decide, --work-on, the dispatcher gate, the quickview), so they all show
     the same number. -> dict(go, reason, headroom, text, postpone, recheck_at, last_mile,
-    session_cap). Model: afclaude_config.usage_model(); any failure of budget.py -> the
-    linear rule (which HOLDs inside the last mile: it cannot see the user)."""
+    session_cap). Model: afclaude_config.usage_model(); any failure of pacing.py -> the
+    original linear rule (which HOLDs inside the last mile: it cannot see the user)."""
     try:
         m = _budget_model()
         if m:
@@ -367,7 +368,7 @@ def budget_eval(usage, now):
             pct = ((usage or {}).get("weekly") or {}).get("percent")
             text = m.budget_text(d, pct)
             if d["headroom"] is not None:
-                text += _ratio_text(d["headroom"], d.get("ratio")) + BUDGET_ADVICE
+                text += BUDGET_ADVICE
             return dict(d, text=text, last_mile=d.get("mode") == "last_mile")
     except Exception as e:   # noqa: BLE001 - any model failure falls back to the linear rule
         log(f"budget model failed ({type(e).__name__}: {e}); falling back to the linear rule")
@@ -420,24 +421,24 @@ def fallback_eval(usage, now):
     return linear_eval(usage, now, " [linear fallback: budget model failed]")
 
 
-def last_mile_hours(weekly_pct):
-    """Last-mile length in hours for this weekly %: data/afclaude.json last_mile_hours, by
-    default "auto" = ceil(session windows of quota left) x session length (budget.py)."""
+def last_mile_hours(weekly_pct, resets_at=None, now=None):
+    """Last-stretch length in hours: data/afclaude.json last_mile_hours, by default "auto" =
+    min(ceil(session windows of quota left), 2) x session length (pacing.py)."""
     setting = afclaude_config.last_mile_setting()
     if setting != "auto":
         return setting
-    import budget
+    import pacing
     if weekly_pct is None:
-        return budget.SESSION_H
-    ratio, _ = budget.ratio_info()
-    return budget.last_mile_hours(weekly_pct, ratio)
+        return pacing.SESSION_H
+    ratio, _ = pacing.ratio_info()
+    return pacing.last_mile_hours(weekly_pct, ratio, "auto")
 
 
 def last_mile_left(resets_at, now, weekly_pct=None):
     """Time left until the weekly reset if `now` is inside the last-mile period, else None."""
     if not resets_at:
         return None
-    lm = timedelta(hours=last_mile_hours(weekly_pct))
+    lm = timedelta(hours=last_mile_hours(weekly_pct, resets_at, now))
     if lm <= timedelta(0):
         return None
     left = resets_at.astimezone(UTC) - now.astimezone(UTC)   # UTC: DST-safe
@@ -979,9 +980,16 @@ def window_start_pass(sid, now, args):
     """The start-of-window continue (no stall needed), one decision per night: FIRE, a final
     HOLD, or a POSTPONE (e.g. the user was active) that the watcher re-decides at its recheck
     time within the same window (deferred_window_start_pass). -> the decision dict."""
-    d = budget_eval(fresh_usage(now, force=True), now)
+    u = fresh_usage(now, force=True)
+    d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
     key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
+    if not args.now and getattr(args, "arm", False):
+        try:                                  # score the forecast later (pacing.forecast_errors)
+            import pacing
+            pacing.record_forecast(d, ((u or {}).get("weekly") or {}).get("resets_at"))
+        except Exception as e:   # noqa: BLE001 - the log is advisory
+            log(f"forecast log failed: {type(e).__name__}: {e}")
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
         handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
@@ -1230,13 +1238,24 @@ def main():
         w = (u or {}).get("weekly") or {}
         if w.get("resets_at"):
             setting = afclaude_config.last_mile_setting()
-            lm = timedelta(hours=last_mile_hours(w.get("percent")))
-            how = "auto: ceil(session windows of quota left) x session length" if setting == "auto" \
-                else "last_mile_hours"
+            lm = timedelta(hours=last_mile_hours(w.get("percent"), w["resets_at"], now))
+            how = ("auto: min(ceil(session windows of quota left), 2) x session length"
+                   if setting == "auto" else "last_mile_hours")
             print(f"last mile ({how}): {lm} before the weekly reset → opens {berlin(w['resets_at'] - lm)}"
                   if lm > timedelta(0) else "last mile: off")
         for k, v in load_deferred().items():
             print(f"postponed window start {k}: recheck {v.get('recheck_at')}")
+        if d.get("forecast_source"):
+            print(f"forecast: {d['forecast_source']}")
+        try:
+            import pacing
+            errs = pacing.forecast_errors(pacing.tail_rows(max_bytes=pacing.LONG_BYTES), pacing.fire_times(), now)
+            if errs:
+                e = [x["error"] for x in errs]
+                print(f"forecast quality: {len(e)} scored nights, mean error {sum(e) / len(e):+.1f}%, "
+                      f"mean abs error {sum(abs(x) for x in e) / len(e):.1f}% (forecast - actual user use)")
+        except Exception:   # noqa: BLE001 - advisory
+            pass
         if args.session:
             print(evaluate(args.session, now, lambda n: u)[:2])
         return

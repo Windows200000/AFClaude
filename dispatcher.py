@@ -3,7 +3,7 @@
 AFClaude dispatcher (goal 5): keepalive.py keeps ONE session alive; the
 dispatcher runs everything else AFClaude should run, in the same nightly
 window (23:00-09:00 Europe/Berlin) and under the same budget rule
-(keepalive.budget_eval / budget_decision: budget.py by default). One pass per invocation
+(keepalive.budget_eval / budget_decision: pacing.py by default). One pass per invocation
 (cron-friendly):
 
   1. Approved stalled sessions: store.stalled_decisions() rows whose effective

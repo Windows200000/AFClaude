@@ -72,7 +72,7 @@ The usual approach applies: `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict
 ### 4.1 `settings`
 `key TEXT PK, value TEXT (JSON), updated_at, updated_by`. Typed accessors live in `schedule.py` and `actions.py`, and code defaults apply when a key is missing, so an empty table reproduces today's behaviour exactly.
 - `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
-- `budget.last_mile_hours` (**"auto"** = ceil(session windows of quota left) × `window.session_hours`, the period before the weekly reset with no HOLD; or a number of hours, 0 = off; the only end-of-week setting), `budget.session_usage_stop` (85, from `dispatcher.json`; 100 inside the last mile). Model parameters (envelope, safety, night_floor, …) stay in the local `data/user_model.json` that the usage review fits. Only for the linear fallback: `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: "11:00 after a 09:00 window end")
+- `budget.week_target` (90, 80..95: the weekly % the nights fill to before the last stretch), `budget.last_mile_hours` (**"auto"** = min(ceil(session windows of quota left), 2) × `window.session_hours`, the last stretch before the weekly reset that fills to 100%; or a number of hours, 0 = off; the only end-of-week setting), `budget.session_usage_stop` (85, from `dispatcher.json`; 100 inside the last stretch). Model parameters (forecast_margin, idle_min, …) stay in the local `data/user_model.json`. Only for the linear fallback: `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: "11:00 after a 09:00 window end")
 - `automation.paused` (bool, checked by every runner in addition to the `PAUSED` file)
 
 ### 4.2 Window semantics (`schedule.py`)
@@ -228,7 +228,7 @@ Preliminary status page: until phase 9, the quickview gets a small **phase visua
 
 ## Decisions by the owner (29.09.2026)
 
-- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff "no later than 11:00 after the window" now only applies to the linear fallback; the default budget model (budget.py, 02.10.2026) ends the week with the "auto" last mile instead.
+- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff "no later than 11:00 after the window" now only applies to the linear fallback; the default budget model (pacing.py, 02.10.2026) plans the nights to `week_target` and ends the week with the "auto" last stretch instead.
 - **Q2 login:** the dashboard implements **both** a general SSO (standard OpenID Connect, any provider, e.g. the existing Authelia) **and** a simple local username/password login (hashed passwords, rate limiting, secure session cookies). Either can be enabled via config. The reverse-proxy pattern stays as defence in depth.
 - **Q3 MCP tasks:** tasks added through MCP are treated exactly like tasks created in the UI; **no approval step**. The MCP server's instructions and tool descriptions must say that the tools are only to be used when the user explicitly asks for AFClaude.
 

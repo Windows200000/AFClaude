@@ -493,7 +493,7 @@ def _default_last_mile_hours():
 
 
 def _hours_or_auto(lo, hi):
-    """last_mile_hours: "auto" (the budget.py formula) or a number of hours in lo..hi."""
+    """last_mile_hours: "auto" (the pacing.py formula) or a number of hours in lo..hi."""
     num = _number(lo, hi)
 
     def check(v, conn=None):
@@ -565,9 +565,11 @@ SETTINGS = {
     "window_tz": Setting(lambda: "Europe/Berlin", _tz, "time zone of the window starts"),
     "session_hours": Setting(_default_session_hours, _number(1, 24), "length of one session-limit window"),
     "last_mile_hours": Setting(_default_last_mile_hours, _hours_or_auto(0, 168),
-                               'end-of-week period with no HOLD before the weekly reset: "auto" = '
-                               'ceil(session windows of quota left) x session_hours, or hours (0 = off)'),
-    "projection_threshold": Setting(lambda: 90.0, _number(1, 100), "budget rule: projected weekly %"),
+                               'last stretch before the weekly reset (filled to 100%): "auto" = '
+                               'min(ceil(session windows of quota left), 2) x session_hours, or hours (0 = off)'),
+    "week_target": Setting(afclaude_config.week_target, _number(80, 95),
+                           "pacing: weekly % the nights fill to before the last stretch"),
+    "projection_threshold": Setting(lambda: 90.0, _number(1, 100), "linear rule: projected weekly %"),
     "cutoff_after_window_hours": Setting(lambda: 2.0, _number(0, 24),
                                          "budget rule: a weekly reset this long after the window end still "
                                          "continues (11:00 after a 09:00 end)"),

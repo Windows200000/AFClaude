@@ -28,9 +28,9 @@ _CFG_DIR = tempfile.TemporaryDirectory()
 _OLD_CFG = afclaude_config.CONFIG_FILE
 
 
-import budget  # noqa: E402
+import pacing as budget  # noqa: E402
 
-_OLD_FILES = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE)
+_OLD_FILES = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES)
 
 
 def setUpModule():
@@ -42,11 +42,12 @@ def setUpModule():
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
     budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
     ka.DEFER_FILE = os.path.join(_CFG_DIR.name, "deferred.json")
+    budget.FIRE_FILES = []
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE = _OLD_FILES
+    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES = _OLD_FILES
     _CFG_DIR.cleanup()
 
 
@@ -411,12 +412,12 @@ class Files(unittest.TestCase):
 
 
 class BudgetWiring(unittest.TestCase):
-    """budget_eval / budget_decision / budget_headroom with "usage_model": "budget" (the default)."""
+    """budget_eval / budget_decision / budget_headroom with "usage_model": "pacing" (the default)."""
     R = Z("2026-10-08T17:00:00Z")                       # Thu 19:00 Berlin
     NIGHT = Z("2026-10-04T21:00:00Z")                   # Sun 23:00 Berlin, a window start
 
     def setUp(self):
-        import budget
+        import pacing as budget
         self.bm = budget
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = os.path.join(self.tmp.name, "afclaude.json")
@@ -454,12 +455,12 @@ class BudgetWiring(unittest.TestCase):
         return usage(week, self.R, sess, sess_reset)
 
     def test_config_switch(self):
-        self.assertEqual(afclaude_config.usage_model(), "budget")       # default
+        self.assertEqual(afclaude_config.usage_model(), "pacing")       # default
         self.setcfg(usage_model="linear")
         self.assertEqual(afclaude_config.usage_model(), "linear")
-        for v in ("reserve", "nonsense"):                               # the retired reserve model too
+        for v in ("reserve", "budget", "nonsense"):                     # retired names
             self.setcfg(usage_model=v)
-            self.assertEqual(afclaude_config.usage_model(), "budget")
+            self.assertEqual(afclaude_config.usage_model(), "pacing")
 
     def test_one_headroom_number_everywhere(self):
         """Requirement 6: reason, budget_headroom, --decide, the continue message, the quickview."""
@@ -572,7 +573,7 @@ class BudgetWiring(unittest.TestCase):
         self.samples(now - timedelta(minutes=45))                        # sampler stopped 45 min ago
         self.assertFalse(ka.budget_decision(self.u(), now)[0])
 
-    def test_last_mile_no_yield_and_one_fire_per_slot(self):
+    def test_last_stretch_yields_and_fires_once_per_slot(self):
         fired = []
         cache = {"fetched_at": self.R, "weekly": {"percent": 70.0, "resets_at": self.R},
                  "session": {"percent": 0.0, "resets_at": None}}
@@ -587,22 +588,26 @@ class BudgetWiring(unittest.TestCase):
             st = {"handled": {}, "fires": {}}
             # no ratio data: the conservative default 0.2 -> 30 / 20 = 1.5 -> 2 windows = 10 h
             now = self.R - timedelta(hours=10, minutes=1)
-            self.samples(now, prompt_minutes_ago=0, week=70)
+            self.samples(now, week=70)
             self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
             self.assertEqual(fired, [])
             now = self.R - timedelta(hours=9)
-            self.samples(now, prompt_minutes_ago=0, week=70)              # the user is active: no yield
+            self.samples(now, prompt_minutes_ago=0, week=70)              # the user is active: postpone
+            self.assertEqual(ka.last_mile_pass(SID, now, st, None), now + timedelta(minutes=60))
+            self.assertEqual(fired, [])
+            self.samples(now, week=70)                                    # idle: fires slot 2
             self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
             self.assertEqual(len(fired), 1)
             self.assertTrue(fired[0][0]["uuid"].endswith("-s2"), fired[0][0]["uuid"])
-            self.assertIn("last mile", fired[0][1])
+            self.assertIn("last stretch", fired[0][1])
             self.assertIn("+30.0 weekly %", fired[0][0]["budget"])
             ka.last_mile_pass(SID, self.R - timedelta(hours=6), st, None)      # same slot: no second fire
             self.assertEqual(len(fired), 1)
+            self.samples(self.R - timedelta(hours=4), week=70)
             ka.last_mile_pass(SID, self.R - timedelta(hours=4), st, None)      # the final slot fires again
             self.assertEqual(len(fired), 2)
             self.assertTrue(fired[1][0]["uuid"].endswith("-s1"))
-            cache["weekly"]["percent"] = 100.0                                 # exhausted: not in the LM
+            cache["weekly"]["percent"] = 100.0                                 # exhausted: no last stretch
             self.assertIsNone(ka.last_mile_pass(SID, self.R - timedelta(hours=3), {"handled": {}, "fires": {}},
                                                 None))
         finally:
@@ -628,11 +633,14 @@ class BudgetWiring(unittest.TestCase):
                     action, detail, st = ka.evaluate(SID, now, lambda n: cache)
                     self.assertEqual(action, "FIRE", detail)
                     self.assertIn(f"+{ka.budget_headroom(cache, now)[0]:.1f}", st["budget"])
-                    # outside the window: only inside the last mile (no yield there)
+                    # outside the window: only inside the last stretch (it yields too)
                     day = Z("2026-10-08T13:00:00Z")                         # Thu 15:00, 4 h to the reset
                     cache = self.u(90.0)
-                    self.samples(day, prompt_minutes_ago=0, week=90)
+                    self.samples(day, week=90)
                     self.assertEqual(ka.evaluate(SID, day, lambda n: cache)[0], "FIRE")
+                    self.samples(day, prompt_minutes_ago=0, week=90)
+                    self.assertEqual(ka.evaluate(SID, day, lambda n: cache)[0], "POSTPONE")
+                    self.samples(day, week=90)
                     self.assertEqual(ka.evaluate(SID, Z("2026-10-07T10:00:00Z"), lambda n: cache)[0],
                                      "WAIT_WINDOW")
                     self.setcfg(last_mile_hours=0)                          # no last mile: the window gate holds
