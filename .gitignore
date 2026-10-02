@@ -36,3 +36,4 @@ id_ecdsa*
 .venv/
 __pycache__/
 *.pyc
+DECISIONS.md

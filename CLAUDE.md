@@ -4,3 +4,4 @@
 - The full manager instructions are in `prompts/manager.md`; follow them.
 - The moment an item no longer needs the user, delete it from OPEN_QUESTIONS.md before anything else; then fix GOALS.md.
 - This repo is public: never commit personal or host-secret data, and never bypass the `tools/check_public.py` hooks.
+- The owner's decisions are in DECISIONS.md (local only). Only the owner may add, change or supersede one; never turn your own interpretation into a "decision", and never close an open question by deciding it yourself.
