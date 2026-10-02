@@ -246,3 +246,11 @@ The owner likes the preliminary quickview's look and wants it kept for the main 
 - **Purple as the main accent**, and **vibrant colours that directly represent status** (done / in progress / pending / blocked / alert), used consistently everywhere a status appears.
 - The feel: **rigid but sleek**. A strict grid, clear boxes and chips, compact and dense, no decorative fluff.
 - Baseline: take the colour tokens, dark/light theming, typography and spacing from `quickview/AFClaude.html` as the starting design system; phone first.
+
+## Settings UX (owner, 02.10.2026)
+
+- Surface as much customisation as possible, but keep the main views uncluttered: only the most important settings are directly available (e.g. pause, today's window, last_mile_hours, the budget mode); everything else lives on a separate Settings page, grouped into sections.
+- Every setting has a default and its own "reset to default".
+- "Reset this page/section" and "Reset all settings", each with a warning dialog that lists what will change, plus an UNDO (the previous values are kept in the audit log / settings versions, so one tap restores them).
+- Every setting has a short explanation: what it does, what it can affect (e.g. "can make AFClaude run during your daytime"), and its default.
+- The settings registry (actions.SETTINGS) is the single source for defaults, types, validation, the explanation texts and the "important" flag; the UI renders from it.
