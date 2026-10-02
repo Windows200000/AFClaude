@@ -13,10 +13,12 @@ if the weekly budget rule allows it, resumes that session in place with
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
 
-Budget rule: by default the reserve envelope model of usage_model.py (keeps a reserve
-for the user's possible demand until the weekly reset, yields while the user is active);
+Budget rule: by default pacing.py (the original linear rule evolved: the nights run full
+session windows to fill the week to week_target (90%) minus what the user is forecast to
+use, re-planned every night; the final <= 2 session windows before the weekly reset fill to
+100%; AFClaude yields to an active user by POSTPONING to last activity + 60 min).
 data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
-the fallback if the reserve model fails:
+the fallback if pacing.py fails:
   projected end-of-week usage < 90%                          -> continue
   else weekly reset <= 11:00 Berlin after the current window -> continue
   else                                                       -> hold back
@@ -338,12 +340,127 @@ def project_weekly(pct, resets_at, now):
     return pct + pct * (remaining / elapsed)
 
 
-def _reserve_model():
-    """usage_model (the reserve envelope model) if data/afclaude.json selects it, else None."""
-    if afclaude_config.usage_model() != "reserve":
+def _budget_model():
+    """pacing.py (forecast-driven pacing) unless data/afclaude.json selects "linear"."""
+    if afclaude_config.usage_model() == "linear":
         return None
-    import usage_model
-    return usage_model
+    import pacing
+    return pacing
+
+
+def _ratio_text(extra, ratio):
+    return f" ≈ {extra / ratio:.0f}% of a session window" if ratio and extra is not None else ""
+
+
+BUDGET_ADVICE = "; check usage_report.py / keepalive.py --decide and stop before exceeding it"
+
+
+def budget_eval(usage, now):
+    """THE budget evaluation every caller uses (watcher, window-start, last mile, deferred
+    window-start, --decide, --work-on, the dispatcher gate, the quickview), so they all show
+    the same number. -> dict(go, reason, headroom, text, postpone, recheck_at, last_mile,
+    session_cap). Model: afclaude_config.usage_model(); any failure of pacing.py -> the
+    original linear rule (which HOLDs inside the last mile: it cannot see the user)."""
+    try:
+        m = _budget_model()
+        if m:
+            d = m.decide(usage, now)
+            pct = ((usage or {}).get("weekly") or {}).get("percent")
+            text = m.budget_text(d, pct)
+            if d["headroom"] is not None:
+                text += BUDGET_ADVICE
+            return dict(d, text=text, last_mile=d.get("mode") == "last_mile")
+    except Exception as e:   # noqa: BLE001 - any model failure falls back to the linear rule
+        log(f"budget model failed ({type(e).__name__}: {e}); falling back to the linear rule")
+        return fallback_eval(usage, now)
+    return linear_eval(usage, now)
+
+
+def budget_decision(usage, now):
+    """-> (go: bool, reason: str), from budget_eval()."""
+    d = budget_eval(usage, now)
+    return d["go"], d["reason"]
+
+
+def budget_headroom(usage, now):
+    """How much more weekly % this run may use -> (extra_weekly_pct | None, text), from
+    budget_eval(): the same number as in the decision reason."""
+    d = budget_eval(usage, now)
+    return d["headroom"], d["text"]
+
+
+def _limit_ratio():
+    try:
+        import limit_ratio
+        r = limit_ratio.compute(limit_ratio.load_samples(limit_ratio.SAMPLES), now=datetime.now(UTC))
+        return ((r or {}).get("ratio") or {}).get("median")
+    except Exception:   # noqa: BLE001 - the ratio text is advisory
+        return None
+
+
+def linear_eval(usage, now, reason_suffix=""):
+    go, reason = linear_budget_decision(usage, now)
+    extra, text = linear_budget_headroom(usage, now)
+    if extra is not None:
+        reason += f"; budget for this run +{extra:.1f}%"
+        text += _ratio_text(extra, _limit_ratio()) + BUDGET_ADVICE
+    lm = _fallback_last_mile(usage, now)
+    return {"go": go, "reason": reason + reason_suffix, "headroom": extra, "text": text, "postpone": False,
+            "recheck_at": None, "last_mile": lm, "session_cap": 100.0 if lm else 85.0, "mode": "linear"}
+
+
+def fallback_eval(usage, now):
+    """Linear rule after a budget-model failure. The linear rule cannot see the user, so the
+    last mile (where it would spend up to 100%) holds instead of continuing."""
+    if _fallback_last_mile(usage, now):
+        return {"go": False, "reason": "HOLD: budget model failed and the linear fallback does not spend the "
+                                       "last mile; budget for this run +0.0%",
+                "headroom": 0.0, "text": "budget for this run: none (budget model failed; the last mile is not "
+                                         "spent)", "postpone": False, "recheck_at": None, "last_mile": True,
+                "session_cap": 85.0, "mode": "fallback"}
+    return linear_eval(usage, now, " [linear fallback: budget model failed]")
+
+
+def last_mile_hours(weekly_pct, resets_at=None, now=None):
+    """Last-stretch length in hours: data/afclaude.json last_mile_hours, by default "auto" =
+    min(ceil(session windows of quota left), 2) x session length (pacing.py)."""
+    setting = afclaude_config.last_mile_setting()
+    if setting != "auto":
+        return setting
+    import pacing
+    if weekly_pct is None:
+        return pacing.SESSION_H
+    ratio, _ = pacing.ratio_info()
+    return pacing.last_mile_hours(weekly_pct, ratio, "auto")
+
+
+def last_mile_left(resets_at, now, weekly_pct=None):
+    """Time left until the weekly reset if `now` is inside the last-mile period, else None."""
+    if not resets_at:
+        return None
+    lm = timedelta(hours=last_mile_hours(weekly_pct, resets_at, now))
+    if lm <= timedelta(0):
+        return None
+    left = resets_at.astimezone(UTC) - now.astimezone(UTC)   # UTC: DST-safe
+    return left if timedelta(0) < left <= lm else None
+
+
+def in_last_mile(now, usage=None):
+    """Last-mile check from given usage or the cached usage (no refresh)."""
+    w = (usage or read_usage_cache() or {}).get("weekly") or {}
+    return last_mile_left(w.get("resets_at"), now, w.get("percent")) is not None
+
+
+def _fallback_last_mile(usage, now):
+    try:
+        return in_last_mile(now, usage or {"weekly": {}})
+    except Exception:   # noqa: BLE001 - unknown: assume the last mile (the safe side)
+        return True
+
+
+def fallback_budget_decision(usage, now):
+    d = fallback_eval(usage, now)
+    return d["go"], d["reason"]
 
 
 def linear_budget_headroom(usage, now):
@@ -353,7 +470,7 @@ def linear_budget_headroom(usage, now):
     if w.get("percent") is None or not w.get("resets_at"):
         return None, "budget unknown"
     pct, reset = float(w["percent"]), w["resets_at"]
-    if last_mile_left(reset, now) is not None:
+    if last_mile_left(reset, now, pct) is not None:
         extra, target = max(100.0 - pct, 0.0), "100% (last mile)"
     else:
         elapsed = max(now - (reset - WEEK), MIN_ELAPSED)
@@ -363,78 +480,6 @@ def linear_budget_headroom(usage, now):
     return extra, f"budget for this run: about +{extra:.1f} weekly % (now {pct:.0f}%) before reaching {target}"
 
 
-def budget_headroom(usage, now):
-    """How much more weekly % this run may use -> (extra_weekly_pct | None, text). The
-    configured model (afclaude_config.usage_model(); reserve model: up to its target),
-    the linear rule if that is selected or the reserve model fails."""
-    try:
-        m = _reserve_model()
-        extra, text = m.budget_headroom(usage, now) if m else linear_budget_headroom(usage, now)
-    except Exception as e:   # noqa: BLE001 - any model failure falls back to the linear rule
-        log(f"usage model failed in budget_headroom ({type(e).__name__}: {e}); linear rule used")
-        if _fallback_last_mile(usage, now):
-            return 0.0, "budget for this run: none (reserve model failed; the last mile is not spent)"
-        extra, text = linear_budget_headroom(usage, now)
-    if extra is None:
-        return None, text
-    try:
-        import limit_ratio
-        r = limit_ratio.compute(limit_ratio.load_samples(limit_ratio.SAMPLES), now=now)
-        ratio = ((r or {}).get("ratio") or {}).get("median")
-        if ratio:
-            text += f" ≈ {extra / ratio:.0f}% of a session window"
-    except Exception:   # noqa: BLE001 - the budget text is advisory
-        pass
-    return extra, text + "; check usage_report.py / keepalive.py --decide and stop before exceeding it"
-
-
-def last_mile_left(resets_at, now):
-    """Time left until the weekly reset if `now` is inside the last-mile period
-    (afclaude_config.last_mile(); default one session length), else None."""
-    lm = afclaude_config.last_mile()
-    if not resets_at or lm <= timedelta(0):
-        return None
-    left = resets_at.astimezone(UTC) - now.astimezone(UTC)   # UTC: DST-safe
-    return left if timedelta(0) < left <= lm else None
-
-
-def in_last_mile(now, usage=None):
-    """Last-mile check from given usage or the cached weekly reset (no refresh)."""
-    w = (usage or read_usage_cache() or {}).get("weekly") or {}
-    return last_mile_left(w.get("resets_at"), now) is not None
-
-
-def budget_decision(usage, now):
-    """-> (go: bool, reason: str). Assumes `now` is inside the window (or the last mile).
-    afclaude_config.usage_model() picks the model: "reserve" (default, usage_model.py: its
-    decision governs, also inside the last mile, where it still yields to an active user)
-    or "linear" (linear_budget_decision). Any failure of the reserve model -> linear rule."""
-    try:
-        m = _reserve_model()
-        if m:
-            return m.budget_decision(usage, now)
-    except Exception as e:   # noqa: BLE001
-        log(f"usage model failed ({type(e).__name__}: {e}); falling back to the linear rule")
-        return fallback_budget_decision(usage, now)
-    return linear_budget_decision(usage, now)
-
-
-def _fallback_last_mile(usage, now):
-    try:
-        return last_mile_left(((usage or {}).get("weekly") or {}).get("resets_at"), now) is not None
-    except Exception:   # noqa: BLE001 - unknown: assume the last mile (the safe side)
-        return True
-
-
-def fallback_budget_decision(usage, now):
-    """Linear rule after a reserve-model failure. The linear rule cannot see the user, so the
-    last mile (where it would spend up to 100%) holds instead of continuing."""
-    if _fallback_last_mile(usage, now):
-        return False, "HOLD: reserve model failed and the linear fallback does not spend the last mile"
-    go, reason = linear_budget_decision(usage, now)
-    return go, f"{reason} [linear fallback: reserve model failed]"
-
-
 def linear_budget_decision(usage, now):
     """The linear rule (projection < 90%, 11:00 reset cutoff, last mile) -> (go, reason)."""
     if not usage or "weekly" not in usage or not usage["weekly"]["resets_at"]:
@@ -442,7 +487,7 @@ def linear_budget_decision(usage, now):
     w = usage["weekly"]
     if w["percent"] >= 100 and w["resets_at"] > now:
         return False, f"HOLD: weekly limit exhausted until {berlin(w['resets_at'])}"
-    left = last_mile_left(w["resets_at"], now)
+    left = last_mile_left(w["resets_at"], now, w["percent"])
     if left is not None:
         # last-mile rule (owner, 30.09.): the remaining quota would expire unused
         return True, (f"CONTINUE: last mile, weekly reset in {int(left.total_seconds() // 3600)}h"
@@ -783,7 +828,8 @@ def progress_note(line):
 
 def evaluate(session_id, now, usage_getter=fresh_usage):
     """One decision pass. Returns (action, detail, stall) where action is one
-    of: NO_STALL, WAIT_RESET, WAIT_WINDOW, HOLD, FIRE."""
+    of: NO_STALL, WAIT_RESET, WAIT_WINDOW, HOLD, POSTPONE (a HOLD with
+    stall["recheck_at"], e.g. the user was active), FIRE."""
     path = transcript_path(session_id)
     if not path:
         return "NO_TRANSCRIPT", "transcript not found", None
@@ -810,8 +856,14 @@ def evaluate(session_id, now, usage_getter=fresh_usage):
     s = (usage or {}).get("session") or {}
     if s.get("percent", 0) >= 100 and s.get("resets_at") and s["resets_at"] > now:
         return "WAIT_RESET", f"live usage still shows session limit 100% until {berlin(s['resets_at'])}", stall
-    go, reason = budget_decision(usage, now)
-    return ("FIRE" if go else "HOLD"), reason, stall
+    d = budget_eval(usage, now)
+    stall["budget"] = d["text"]          # the continue message carries this very number
+    if d["go"]:
+        return "FIRE", d["reason"], stall
+    if d.get("postpone"):                # yield/unknown/session guard: recheck, don't drop the run
+        stall["recheck_at"] = d.get("recheck_at")
+        return "POSTPONE", d["reason"], stall
+    return "HOLD", d["reason"], stall
 
 
 def run(args):
@@ -825,6 +877,7 @@ def run(args):
     log(f"keepalive start ({mode}) target={sid} window {WINDOW_START:%H:%M}-{WINDOW_END:%H:%M} Europe/Berlin pid={os.getpid()}")
     st = load_state()
     last_line = None
+    last_action = None
     next_eval = datetime.min.replace(tzinfo=UTC)
     while True:
         if os.path.exists(STOP_FILE):
@@ -834,11 +887,15 @@ def run(args):
         if now >= next_eval:
             reload_window()
             action, detail, stall = evaluate(sid, now)
+            last_action = action
             line = f"{action}: {detail}"
             if line != last_line:
                 log(line)
                 last_line = line
             next_eval = now + (HOLD_RECHECK if action == "HOLD" else timedelta(seconds=POLL_SECONDS))
+            if action == "POSTPONE":
+                next_eval = max((stall or {}).get("recheck_at") or now + HOLD_RECHECK,
+                                now + timedelta(seconds=POLL_SECONDS))
             if action == "FIRE":
                 handle_fire(sid, stall, detail, st, args)
                 last_line = None
@@ -846,6 +903,9 @@ def run(args):
                 next_lm = last_mile_pass(sid, now, st, args)
                 if next_lm:
                     next_eval = max(next_eval, next_lm)
+        if last_action == "NO_STALL":
+            # a postponed window start (stalled sessions are continued by the stall path)
+            deferred_window_start_pass(sid, now, st, args)
         if args.once:
             return
         time.sleep(POLL_SECONDS)
@@ -861,41 +921,156 @@ def _round_reset(resets_at):
     return r.replace(second=0, microsecond=0)
 
 
-def last_mile_key(resets_at):
-    return f"last-mile-{_round_reset(resets_at).isoformat()}"
+def last_mile_slot(left):
+    """Session slot of the last mile, counted back from the weekly reset: 1 = the final
+    session length before it, 2 = the one before, ... (the "auto" last mile is a whole
+    number of slots, so each slot is one session window that ends on a slot boundary)."""
+    return max(1, -int(-left.total_seconds() // afclaude_config.SESSION_LENGTH.total_seconds()))
+
+
+def last_mile_key(resets_at, slot=None):
+    k = f"last-mile-{_round_reset(resets_at).isoformat()}"
+    return k if slot is None else f"{k}-s{slot}"
 
 
 def last_mile_handled(key, handled):
-    """True if this weekly cycle's last mile was already handled, also under an
-    older raw (un-rounded) key such as last-mile-2026-10-01T16:59:59.557562+00:00."""
+    """True if this slot of this weekly cycle's last mile was already handled, also under
+    an older raw (un-rounded) reset time such as last-mile-2026-10-01T16:59:59.557562+00:00-s1."""
     if key in handled:
         return True
+    want = re.fullmatch(r"last-mile-(.+?)(-s\d+)?", key)
     for k in handled:
-        if k.startswith("last-mile-"):
-            try:
-                t = parse_ts(k[len("last-mile-"):])
-            except ValueError:
-                continue
-            if t and t.tzinfo and last_mile_key(t) == key:
-                return True
+        m = re.fullmatch(r"last-mile-(.+?)(-s\d+)?", k)
+        if not (m and want) or m.group(2) != want.group(2):
+            continue
+        try:
+            t = parse_ts(m.group(1))
+        except ValueError:
+            continue
+        if t and t.tzinfo and last_mile_key(t) + (m.group(2) or "") == key:
+            return True
     return False
 
 
 def last_mile_pass(sid, now, st, args):
-    """Once per weekly cycle: continue the (not stalled) session as soon as the
-    last mile opens, even outside the night window. Returns the next re-check
-    time after a HOLD, else None."""
+    """Once per last-mile slot (one session length, counted back from the weekly reset):
+    continue the (not stalled) session when the last mile opens and again at each later
+    slot, even outside the night window, so the remaining quota gets used. Returns the
+    next re-check time after a HOLD, else None."""
     w = (read_usage_cache() or {}).get("weekly") or {}
-    if last_mile_left(w.get("resets_at"), now) is None:
+    left = last_mile_left(w.get("resets_at"), now, w.get("percent"))
+    if left is None:
         return None
-    key = last_mile_key(w["resets_at"])
+    key = last_mile_key(w["resets_at"], last_mile_slot(left))
     if last_mile_handled(key, st["handled"]):
         return None
-    go, reason = budget_decision(fresh_usage(now, force=True), now)
-    log(f"last-mile: {reason}")
-    if not go:
-        return now + LAST_MILE_RECHECK
-    handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile"}, reason, st, args)
+    d = budget_eval(fresh_usage(now, force=True), now)
+    log(f"last-mile: {d['reason']}")
+    if not d["go"]:
+        return max(d.get("recheck_at") or now + LAST_MILE_RECHECK, now + timedelta(seconds=POLL_SECONDS)) \
+            if d.get("postpone") else now + LAST_MILE_RECHECK
+    handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"]},
+                d["reason"], st, args)
+    return None
+
+
+# ---------------------------------------------------------------- window start
+
+def window_start_pass(sid, now, args):
+    """The start-of-window continue (no stall needed), one decision per night: FIRE, a final
+    HOLD, or a POSTPONE (e.g. the user was active) that the watcher re-decides at its recheck
+    time within the same window (deferred_window_start_pass). -> the decision dict."""
+    u = fresh_usage(now, force=True)
+    d = budget_eval(u, now)
+    log(f"window-start: {d['reason']}")
+    key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
+    if not args.now and getattr(args, "arm", False):
+        try:                                  # score the forecast later (pacing.forecast_errors)
+            import pacing
+            pacing.record_forecast(d, ((u or {}).get("weekly") or {}).get("resets_at"))
+        except Exception as e:   # noqa: BLE001 - the log is advisory
+            log(f"forecast log failed: {type(e).__name__}: {e}")
+    if d["go"]:
+        stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
+        handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+    elif d.get("postpone") and d.get("recheck_at") and not args.now:
+        defer_window_start(key, sid, d["recheck_at"], d["reason"])
+        progress_note(f"window-start {berlin(now)}: postponed to {berlin(d['recheck_at'])}, {d['reason']}")
+    else:
+        progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
+    return d
+
+
+# ---------------------------------------------------------------- postponed window start
+
+DEFER_FILE = os.path.join(STATE_DIR, "keepalive_deferred.json")
+
+
+def load_deferred():
+    try:
+        with open(DEFER_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_deferred(d):
+    tmp = DEFER_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(d, fh, indent=1, default=str)
+    os.replace(tmp, DEFER_FILE)
+
+
+def defer_window_start(key, sid, recheck_at, reason):
+    """The window-start decision was a POSTPONE (the user was active, ...): the watcher
+    re-decides at recheck_at, still once per window (same dedup key)."""
+    d = {k: v for k, v in load_deferred().items() if k == key}   # older nights are over
+    d[key] = {"session": sid, "recheck_at": recheck_at.astimezone(UTC).isoformat(), "reason": reason,
+              "deferred_at": datetime.now(UTC).isoformat()}
+    save_deferred(d)
+
+
+def deferred_window_start_pass(sid, now, st, args):
+    """Watcher side of a postponed window start: at its recheck time, decide again and fire
+    under the same window-start key, postpone again, or drop it (a final HOLD, or the window
+    is over). -> the next recheck time or None."""
+    defs = load_deferred()
+    if not defs:
+        return None
+    key = window_start_key(now) if (in_window(now) or in_last_mile(now)) else None
+    ent = defs.get(key) if key else None
+    stale = [k for k in defs if k != key or (ent and ent.get("session") != sid)]
+    if ent and ent.get("session") != sid:
+        ent = None
+    if ent and (key in st["handled"] or key in load_state().get("handled", {})):
+        stale.append(key)
+        ent = None
+    if stale:
+        for k in stale:
+            defs.pop(k, None)
+        save_deferred(defs)
+    if not ent:
+        return None
+    due = parse_ts(ent.get("recheck_at")) or now
+    if now < due:
+        return due
+    d = budget_eval(fresh_usage(now, force=True), now)
+    log(f"window-start (postponed): {d['reason']}")
+    if d["go"]:
+        defs.pop(key, None)
+        save_deferred(defs)
+        handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
+                    "window start (postponed), " + d["reason"], st, args)
+        return None
+    if d.get("postpone") and d.get("recheck_at"):
+        ent["recheck_at"] = d["recheck_at"].astimezone(UTC).isoformat()
+        ent["reason"] = d["reason"]
+        save_deferred(defs)
+        return d["recheck_at"]
+    defs.pop(key, None)
+    save_deferred(defs)
+    progress_note(f"window-start (postponed) {berlin(now)}: not resumed, {d['reason']}")
     return None
 
 
@@ -915,7 +1090,7 @@ def handle_fire(sid, stall, reason, st, args):
         progress_note(f"did NOT fire for stall {key}: preflight failed: {problems}")
         alert(f"keep-alive did NOT continue {sid[:8]}: preflight failed", "; ".join(problems))
         return
-    _, budget = budget_headroom(read_usage_cache(), datetime.now(UTC))
+    budget = stall.get("budget") or budget_headroom(read_usage_cache(), datetime.now(UTC))[1]
     msg = session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE)
     path = transcript_path(sid)
     # the last recorded cwd can be a directory that has since been renamed/deleted
@@ -1048,27 +1223,39 @@ def main():
         now = datetime.now(UTC)
         if not args.now and not is_window_start_hour(now):
             return
-        go, reason = budget_decision(fresh_usage(now, force=True), now)
-        log(f"window-start: {reason}")
-        if go:
-            key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
-            stall = {"uuid": key, "timestamp": now}
-            handle_fire(args.session, stall, "window start, " + reason, load_state(), args)
-        else:
-            progress_note(f"window-start {berlin(now)}: not resumed, {reason}")
+        window_start_pass(args.session, now, args)
         return
     if args.decide:
         now = datetime.now(UTC)
         u = fresh_usage(now, force=True)
         print(f"now {berlin(now)} in_window={in_window(now)} next_window={berlin(next_window_start(now))}")
         print(f"usage: {json.dumps(u, default=str)}")
-        print(budget_decision(u, now))
-        print(budget_headroom(u, now)[1])
+        d = budget_eval(u, now)
+        print((d["go"], d["reason"]))
+        print(d["text"])
+        if d.get("postpone") and d.get("recheck_at"):
+            print(f"postponed: recheck {berlin(d['recheck_at'])}")
         w = (u or {}).get("weekly") or {}
         if w.get("resets_at"):
-            lm = afclaude_config.last_mile()
-            print(f"last mile: {lm} before the weekly reset → opens {berlin(w['resets_at'] - lm)}"
+            setting = afclaude_config.last_mile_setting()
+            lm = timedelta(hours=last_mile_hours(w.get("percent"), w["resets_at"], now))
+            how = ("auto: min(ceil(session windows of quota left), 2) x session length"
+                   if setting == "auto" else "last_mile_hours")
+            print(f"last mile ({how}): {lm} before the weekly reset → opens {berlin(w['resets_at'] - lm)}"
                   if lm > timedelta(0) else "last mile: off")
+        for k, v in load_deferred().items():
+            print(f"postponed window start {k}: recheck {v.get('recheck_at')}")
+        if d.get("forecast_source"):
+            print(f"forecast: {d['forecast_source']}")
+        try:
+            import pacing
+            errs = pacing.forecast_errors(pacing.tail_rows(max_bytes=pacing.LONG_BYTES), pacing.fire_times(), now)
+            if errs:
+                e = [x["error"] for x in errs]
+                print(f"forecast quality: {len(e)} scored nights, mean error {sum(e) / len(e):+.1f}%, "
+                      f"mean abs error {sum(abs(x) for x in e) / len(e):.1f}% (forecast - actual user use)")
+        except Exception:   # noqa: BLE001 - advisory
+            pass
         if args.session:
             print(evaluate(args.session, now, lambda n: u)[:2])
         return

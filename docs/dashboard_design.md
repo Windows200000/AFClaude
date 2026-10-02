@@ -72,14 +72,14 @@ The usual approach applies: `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict
 ### 4.1 `settings`
 `key TEXT PK, value TEXT (JSON), updated_at, updated_by`. Typed accessors live in `schedule.py` and `actions.py`, and code defaults apply when a key is missing, so an empty table reproduces today's behaviour exactly.
 - `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
-- `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: today's "11:00 after a 09:00 window end"), `budget.session_usage_stop` (85, from `dispatcher.json`)
+- `budget.week_target` (90, 80..95: the weekly % the nights fill to before the last stretch), `budget.last_mile_hours` (**"auto"** = min(ceil(session windows of quota left), 2) × `window.session_hours`, the last stretch before the weekly reset that fills to 100%; or a number of hours, 0 = off; the only end-of-week setting), `budget.session_usage_stop` (85, from `dispatcher.json`; 100 inside the last stretch). Model parameters (forecast_margin, idle_min, …) stay in the local `data/user_model.json`. Only for the linear fallback: `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: "11:00 after a 09:00 window end")
 - `automation.paused` (bool, checked by every runner in addition to the `PAUSED` file)
 
 ### 4.2 Window semantics (`schedule.py`)
 - Window = [start, start + N × session_hours), per weekday (§4.2.1). The start is a wall-clock time in `window.tz`, and the length is in absolute hours, so a DST night still holds exactly N full session windows (it may end an hour earlier or later on the wall clock; the preview shows this).
 - The grid is anchored at the chosen start, as decided earlier: session k runs from start + k × session_hours, so every session window inside the automation window is a full one, and the window ends on a session-limit boundary. The start picker moves in 30-min steps. It also offers "snap to the usual reset": from `data/samples.jsonl` it shows when a user-started session window was typically still running at the chosen start and when it reset (the automation window's first session can only begin after that). Picking that time aligns the grid with real limits.
 - `in_window`, `current_window_end`, `next_window_start` and the budget cutoff (window end + cutoff hours) move from constants in `keepalive.py` to `schedule.py`. `keepalive.py`, `dispatcher.py`, `export_quickview.py` and `usage_review.py` read the settings once per pass or loop iteration.
-- The fixed window-start cron (`0 21,22 * * *` UTC for the 23:00 Berlin start) is replaced by a window-start tick in the dispatcher pass: the first pass at or after the window start fires the keep-alive's window-start continue once per window (dedup key = the window's end date, as `keepalive.window_start_key()`, since the window spans midnight).
+- The fixed window-start cron (`0 21,22 * * *` UTC for the 23:00 Berlin start) is replaced by a window-start tick in the dispatcher pass: the first pass at or after the window start fires the keep-alive's window-start continue once per window (dedup key = the window's end date, as `keepalive.window_start_key()`, since the window spans midnight). A budget POSTPONE (the user was active in the last 60 min) defers that one decision within the window to its recheck time (last activity + 60 min) instead of dropping the night.
 
 ### 4.2.1 Per-weekday windows and link groups
 - `window.days` = `{"mon": {"start": "23:00", "n": 2, "group": "g1"} | null, …, "sun": …}`. A window belongs to the weekday on which it **starts** (Mon 23:00–09:00 runs into Tuesday). `null` = no automation window that night.
@@ -228,7 +228,7 @@ Preliminary status page: until phase 9, the quickview gets a small **phase visua
 
 ## Decisions by the owner (29.09.2026)
 
-- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff of the budget rule stays "no later than 11:00 after the window".
+- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff "no later than 11:00 after the window" now only applies to the linear fallback; the default budget model (pacing.py, 02.10.2026) plans the nights to `week_target` and ends the week with the "auto" last stretch instead.
 - **Q2 login:** the dashboard implements **both** a general SSO (standard OpenID Connect, any provider, e.g. the existing Authelia) **and** a simple local username/password login (hashed passwords, rate limiting, secure session cookies). Either can be enabled via config. The reverse-proxy pattern stays as defence in depth.
 - **Q3 MCP tasks:** tasks added through MCP are treated exactly like tasks created in the UI; **no approval step**. The MCP server's instructions and tool descriptions must say that the tools are only to be used when the user explicitly asks for AFClaude.
 

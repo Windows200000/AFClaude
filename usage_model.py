@@ -1,5 +1,9 @@
 """Weekly budget model "reserve envelope + yield + session guard" (stdlib only).
 
+RETIRED (02.10.2026): keepalive.py uses pacing.py by default (linear as the fallback); this
+module is no longer selectable and stays only as the comparison baseline of
+tools/budget_backtest.py.
+
 Idea: instead of forecasting the user's mean usage, keep a reserve that bounds what the
 user could still need before the weekly reset, and let AFClaude spend only above it.
 

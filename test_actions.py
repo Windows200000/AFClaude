@@ -524,7 +524,7 @@ class SettingActions(Base):
         self.assertEqual((s["window_tz"]["value"], s["session_hours"]["value"], s["last_mile_hours"]["value"],
                           s["projection_threshold"]["value"], s["session_usage_stop"]["value"],
                           s["automation_paused"]["value"]),
-                         ("Europe/Berlin", 5.0, 5.0, 90.0, 85.0, False))
+                         ("Europe/Berlin", 5.0, "auto", 90.0, 85.0, False))
 
     def test_local_config_feeds_the_defaults(self):
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
@@ -556,7 +556,8 @@ class SettingActions(Base):
         for key, value, msg in (("nope", 1, "unknown setting"), ("projection_threshold", 0, "1..100"),
                                 ("projection_threshold", "90", "number"), ("automation_paused", 1, "true or false"),
                                 ("window_tz", "Mars/Olympus", "unknown time zone"),
-                                ("last_mile_hours", -1, "0..168"), ("session_hours", None, "not be null")):
+                                ("last_mile_hours", -1, "0..168"), ("last_mile_hours", "soon", "auto"),
+                                ("session_hours", None, "not be null")):
             with self.assertRaisesRegex(ValueError, msg, msg=key):
                 self.do("setting.set", key=key, value=value)
 

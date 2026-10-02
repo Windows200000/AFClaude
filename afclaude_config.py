@@ -1,6 +1,7 @@
 """Shared local settings for AFClaude (data/afclaude.json, optional, gitignored).
 The dashboard will edit these later (schema v4 settings). Defaults live here."""
 import json
+import math
 import os
 from datetime import time as dtime, timedelta
 
@@ -11,11 +12,13 @@ SESSION_LENGTH = timedelta(hours=5)          # one Claude session-limit window
 # windows in docs/dashboard_design.md §4.2.1 (owner decision 29.09.2026: 23:00-09:00,
 # 2 session windows of 5 h). It may span midnight; the end is start + hours on the wall
 # clock, so a DST night still ends at 09:00 (it is then 11 h or 9 h long in real time).
-DEFAULTS = {"last_mile_hours": SESSION_LENGTH.total_seconds() / 3600,
+DEFAULTS = {"last_mile_hours": "auto",   # "auto" = pacing.last_mile_hours(), or a number of hours
             "window_start": "23:00",
             "window_hours": 10,
-            "usage_model": "reserve"}   # weekly budget model: "reserve" (usage_model.py) | "linear"
-USAGE_MODELS = ("reserve", "linear")
+            "week_target": 90,          # weekly % the nights fill to before the last stretch (80..95)
+            "usage_model": "pacing"}    # weekly budget model: "pacing" (pacing.py) | "linear"
+USAGE_MODELS = ("pacing", "linear")
+WEEK_TARGET_RANGE = (80.0, 95.0)
 
 
 def load():
@@ -61,22 +64,37 @@ def trust_root():
     return _text("trust_root", LEGACY_TRUST_ROOT)
 
 
-def last_mile():
-    """Period before the weekly reset in which the 90% projection no longer blocks
-    (the last-mile rule). timedelta(0) = off."""
+def last_mile_setting():
+    """The last stretch before the weekly reset (the only end-of-week setting): "auto"
+    (default: min(ceil(session windows of quota left), 2) x SESSION_LENGTH, see pacing.py)
+    or a number of hours >= 0 (0 = off). Anything invalid means "auto"."""
+    v = load().get("last_mile_hours", DEFAULTS["last_mile_hours"])
+    if v is None or (isinstance(v, str) and v.strip().lower() == "auto"):
+        return "auto"
     try:
-        h = float(load().get("last_mile_hours", DEFAULTS["last_mile_hours"]))
+        h = float(v)
     except (TypeError, ValueError):
-        h = DEFAULTS["last_mile_hours"]
-    return timedelta(hours=max(h, 0.0))
+        return "auto"
+    return max(h, 0.0) if math.isfinite(h) and not isinstance(v, bool) else "auto"
 
 
 def usage_model():
-    """Which weekly budget model keepalive.budget_decision() uses: "reserve" (the reserve
-    envelope model in usage_model.py, default) or "linear" (the old projection rule).
-    An unknown value means the default."""
+    """Which weekly budget model keepalive.budget_eval() uses: "pacing" (pacing.py, default:
+    the original linear rule evolved into a forecast-driven plan) or "linear" (the original
+    rule unchanged, also the error fallback). An unknown value (also the retired "reserve"
+    and "budget") means the default."""
     v = str(load().get("usage_model", DEFAULTS["usage_model"])).strip().lower()
     return v if v in USAGE_MODELS else DEFAULTS["usage_model"]
+
+
+def week_target():
+    """Weekly % the nights fill to before the last stretch (data/afclaude.json week_target,
+    80..95, default 90; invalid -> 90)."""
+    v = load().get("week_target", DEFAULTS["week_target"])
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+            or not WEEK_TARGET_RANGE[0] <= v <= WEEK_TARGET_RANGE[1]:
+        return float(DEFAULTS["week_target"])
+    return float(v)
 
 
 def _hhmm(s):

@@ -189,8 +189,9 @@ button.chip.sel { border-color: #a855f7; }
       out.push(pctTile("Session", k.session));
       out.push(pctTile("Week", k.weekly));
       var b = k.budget_rule_now || {};
-      out.push(tile("Budget rule", b["continue"] ? '<span class="ok">CONTINUE</span>' : '<span class="warn">HOLD</span>',
-        '<div class="mut">' + esc(b.reason || "") + "</div>"));
+      var head = (b.headroom === null || b.headroom === undefined) ? "" : " +" + Number(b.headroom).toFixed(1) + "%";
+      out.push(tile("Budget rule", (b["continue"] ? '<span class="ok">CONTINUE</span>' : '<span class="warn">HOLD</span>') + esc(head),
+        '<div class="mut">' + esc(b.reason || "") + (b.recheck_berlin ? " (recheck " + esc(b.recheck_berlin) + ")" : "") + "</div>"));
     }
     var lim = k.limits || {};
     if (lim.ratio_status === "ok") {
