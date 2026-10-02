@@ -3,7 +3,8 @@
 AFClaude dispatcher (goal 5): keepalive.py keeps ONE session alive; the
 dispatcher runs everything else AFClaude should run, in the same nightly
 window (23:00-09:00 Europe/Berlin) and under the same budget rule
-(keepalive.budget_decision). One pass per invocation (cron-friendly):
+(keepalive.budget_eval / budget_decision: budget.py by default). One pass per invocation
+(cron-friendly):
 
   1. Approved stalled sessions: store.stalled_decisions() rows whose effective
      decision is 'continue', plus the manager sessions of managed projects
@@ -28,7 +29,9 @@ window (23:00-09:00 Europe/Berlin) and under the same budget rule
      is an approved stalled session by itself.
   3. Concurrency + budget: at most max_concurrent (default 2) dispatcher
      sessions alive at once; before EACH start: window, budget rule, and session
-     usage < session_usage_stop (default 85%). Also a per-night start cap.
+     usage < session_usage_stop (default 85%; 100% inside the last mile). Also a
+     per-night start cap. A budget POSTPONE (the user was active) is not final:
+     the next pass (cron, every 10 min) decides again.
   4. Cleanup (any time of day): tmux sessions the dispatcher started (tracked in
      its state) that finished (their task is done/blocked/cancelled and the
      session is idle, or idle for > 2 h after an end_turn), and are not stalled,
@@ -339,12 +342,14 @@ def skip_match(task, skips):
 
 
 def budget_gate(usage, now, cfg):
-    """-> (go, reason). Budget rule plus the session-usage headroom stop."""
+    """-> (go, reason). Budget rule (keepalive.budget_eval) plus the session-usage headroom
+    stop: session_usage_stop (85%) outside the last mile, the model's cap (100%) inside it."""
+    d = ka.budget_eval(usage, now)
     s = (usage or {}).get("session") or {}
-    stop = float(cfg["session_usage_stop"])
+    stop = float(d.get("session_cap") or 100.0) if d.get("last_mile") else float(cfg["session_usage_stop"])
     if s.get("percent") is not None and s["percent"] >= stop and (not s.get("resets_at") or s["resets_at"] > now):
         return False, f"STOP: session usage {s['percent']:.0f}% >= {stop:.0f}% (headroom for the user)"
-    return ka.budget_decision(usage, now)
+    return d["go"], d["reason"]
 
 
 def task_context(conn, sid):
@@ -466,7 +471,7 @@ class Pass:
         action, detail, _ = ka.evaluate(sid, self.now, getter)
         if action != "FIRE":
             self.skip(label, f"{action}: {detail}")
-            if action == "HOLD":
+            if action in ("HOLD", "POSTPONE"):   # POSTPONE: retried by a later pass (every 10 min)
                 self.report["stop"] = self.report["stop"] or detail
             return
         ok, why = self.slots_free(sid)

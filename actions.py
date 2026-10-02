@@ -489,7 +489,21 @@ def _default_session_hours():
 
 
 def _default_last_mile_hours():
-    return afclaude_config.last_mile().total_seconds() / 3600
+    return afclaude_config.last_mile_setting()
+
+
+def _hours_or_auto(lo, hi):
+    """last_mile_hours: "auto" (the budget.py formula) or a number of hours in lo..hi."""
+    num = _number(lo, hi)
+
+    def check(v, conn=None):
+        if isinstance(v, str) and v.strip().lower() == "auto":
+            return "auto"
+        try:
+            return num(v, conn)
+        except ValueError:
+            raise ValueError(f'must be "auto" or a number in {lo}..{hi}, got {v!r}') from None
+    return check
 
 
 def _fmt_min(m):
@@ -550,8 +564,9 @@ SETTINGS = {
                            "per-weekday automation windows {mon..sun: {start, n, group} | null} (§4.2.1)"),
     "window_tz": Setting(lambda: "Europe/Berlin", _tz, "time zone of the window starts"),
     "session_hours": Setting(_default_session_hours, _number(1, 24), "length of one session-limit window"),
-    "last_mile_hours": Setting(_default_last_mile_hours, _number(0, 168),
-                               "before the weekly reset, the projection no longer blocks (0 = off)"),
+    "last_mile_hours": Setting(_default_last_mile_hours, _hours_or_auto(0, 168),
+                               'end-of-week period with no HOLD before the weekly reset: "auto" = '
+                               'ceil(session windows of quota left) x session_hours, or hours (0 = off)'),
     "projection_threshold": Setting(lambda: 90.0, _number(1, 100), "budget rule: projected weekly %"),
     "cutoff_after_window_hours": Setting(lambda: 2.0, _number(0, 24),
                                          "budget rule: a weekly reset this long after the window end still "

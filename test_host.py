@@ -22,16 +22,25 @@ _CFG_DIR = tempfile.TemporaryDirectory()
 _OLD_CFG = afclaude_config.CONFIG_FILE
 
 
+import budget  # noqa: E402
+
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE)
+
+
 def setUpModule():
-    # the last-mile test below is about the bridge; pin the linear budget rule so it does
-    # not depend on this host's sampler data (the reserve model is tested elsewhere)
+    # the last-mile test below is about the bridge; pin the linear budget rule and point the
+    # budget model's files (the "auto" last mile reads the ratio) away from this host's
+    # sampler data (the budget model is tested elsewhere)
     afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
     with open(afclaude_config.CONFIG_FILE, "w") as fh:
         json.dump({"usage_model": "linear"}, fh)
+    budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
+    budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
+    budget.SAMPLES_FILE, budget.USER_MODEL_FILE = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")

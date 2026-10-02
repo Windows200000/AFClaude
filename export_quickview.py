@@ -335,8 +335,11 @@ def keepalive_and_usage(now):
     for k in ("session", "weekly"):
         if u.get(k):
             out[k] = {"percent": u[k]["percent"], "resets_at_berlin": bstr(u[k]["resets_at"])}
-    go, reason = ka.budget_decision(u, now)
-    out["budget_rule_now"] = {"continue": go, "reason": reason}
+    d = ka.budget_eval(u, now)
+    out["budget_rule_now"] = {"continue": d["go"], "reason": d["reason"], "headroom": d.get("headroom"),
+                              "budget": d.get("text"),
+                              "recheck_berlin": bstr(d["recheck_at"]) if d.get("postpone") and d.get("recheck_at")
+                              else None}
     out["limits"] = limits_block()
     return out
 

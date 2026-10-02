@@ -18,21 +18,28 @@ import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
-import usage_model  # noqa: E402
+import budget  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
 _OLD_CFG = afclaude_config.CONFIG_FILE
 
 
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE)
+
+
 def setUpModule():
-    # these tests use linear-rule usage numbers; ReserveModel below checks the reserve model
+    # these tests use linear-rule usage numbers; BudgetModel below checks the budget model.
+    # Hermetic: no real samples / user model (the last mile's ratio is the default).
     afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
     with open(afclaude_config.CONFIG_FILE, "w") as fh:
         json.dump({"usage_model": "linear"}, fh)
+    budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
+    budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
+    budget.SAMPLES_FILE, budget.USER_MODEL_FILE = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 UTC = timezone.utc
@@ -439,34 +446,50 @@ class Limits(Base):
         self.assertTrue(any("outside the window" in s for s in rep["skip"]))
 
 
-class ReserveModel(Base):
-    """The dispatcher's budget gate is keepalive.budget_decision, so it follows the reserve model."""
+class BudgetModel(Base):
+    """The dispatcher's budget gate is keepalive.budget_eval, so it follows the budget model."""
     def setUp(self):
         super().setUp()
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump({"usage_model": "reserve"}, fh)
-        self._um = (usage_model.USER_MODEL_FILE, usage_model.minutes_since_user)
-        usage_model.USER_MODEL_FILE = os.path.join(self.d, "no_user_model.json")
+            json.dump({"usage_model": "budget"}, fh)
+        self._bm = (budget.minutes_since_user, budget.weekly_at)
+        budget.weekly_at = lambda rows, t0, r, now: None          # anchor: the current weekly %
 
     def tearDown(self):
-        usage_model.USER_MODEL_FILE, usage_model.minutes_since_user = self._um
+        budget.minutes_since_user, budget.weekly_at = self._bm
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
             json.dump({"usage_model": "linear"}, fh)
         super().tearDown()
 
-    def test_yields_to_active_user(self):
+    def test_postpones_for_an_active_user(self):
         self.project("p1")
         store.add_task(self.conn, "t0", project="p1")
-        usage_model.minutes_since_user = lambda now: 10.0
+        budget.minutes_since_user = lambda now, rows=None: 10.0
         rep = self.run_pass(u=usage(weekly=20))
         self.assertEqual(rep["start"], [])
         self.assertIn("yield", rep["stop"])
-        usage_model.minutes_since_user = lambda now: 300.0
-        rep = self.run_pass(u=usage(weekly=20))        # idle, but 42 h left: generic reserve 79%
-        self.assertEqual(rep["start"], [])
-        self.assertIn("target 18.8%", rep["stop"])
-        rep = self.run_pass(u=usage(weekly=10))        # idle, 10% used: may spend to the target
-        self.assertEqual(len(rep["start"]), 1)
+        self.assertIn("postponed", rep["stop"])
+        budget.minutes_since_user = lambda now, rows=None: 300.0      # idle: tonight's budget
+        rep = self.run_pass(u=usage(weekly=20))
+        self.assertEqual(len(rep["start"]), 1, rep)
+        self.assertIn("budget for this run +", rep["start"][0]["reason"])
+
+    def test_last_mile_session_cap_is_100(self):
+        self.project("p1")
+        for i in range(3):
+            store.add_task(self.conn, f"t{i}", project="p1")
+        budget.minutes_since_user = lambda now, rows=None: 0.0         # no yield in the last mile
+        lm_now = WEEK_RESET - timedelta(hours=3)                       # 92%: one window, 5 h
+        u = {"fetched_at": lm_now, "session": {"percent": 90.0, "resets_at": lm_now + timedelta(hours=2)},
+             "weekly": {"percent": 92.0, "resets_at": WEEK_RESET}}
+        olds = ka.read_usage_cache
+        ka.read_usage_cache = lambda: u                                # in_last_mile() reads the cache
+        try:
+            rep = self.run_pass(now=lm_now, u=u)
+        finally:
+            ka.read_usage_cache = olds
+        self.assertEqual(len(rep["start"]), 2, rep)                    # 90% session < 100% cap
+        self.assertIn("last mile", rep["start"][0]["reason"])
 
 
 class Cleanup(Base):
