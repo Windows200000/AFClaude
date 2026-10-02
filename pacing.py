@@ -147,11 +147,23 @@ def _num(x):
 _TAIL_CACHE = {}
 
 
+def _file_sig(path, st):
+    """Cache key for a file: mtime + size + its last bytes. mtime alone is too coarse (a
+    same-size rewrite within a few ms keeps mtime_ns), which made tests read stale rows."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(st.st_size - 256, 0))
+            tail = fh.read(256)
+    except OSError:
+        tail = b""
+    return (st.st_mtime_ns, st.st_size, tail)
+
+
 def tail_rows(path=None, max_bytes=TAIL_BYTES):
     """Rows of the end of samples.jsonl, oldest first (cached while the file is unchanged)."""
     path = path or SAMPLES_FILE
     st = os.stat(path)
-    key = (st.st_mtime_ns, st.st_size)
+    key = _file_sig(path, st)
     hit = _TAIL_CACHE.get((path, max_bytes))
     if hit and hit[0] == key:
         return hit[1]
@@ -254,18 +266,28 @@ def ratio_info(rows=None):
             rows = tail_rows(max_bytes=LONG_BYTES)
         except Exception:   # noqa: BLE001
             rows = []
-    snap = None
+    full = None
     for r in reversed(rows):
         if isinstance(_dict(r).get("limit_ratio"), dict):
-            snap = r["limit_ratio"].get("ratio")
+            full = r["limit_ratio"]
             break
-    if snap is None and rows:
+    if full is None and rows:
         try:
             import limit_ratio
-            snap = limit_ratio.compute(rows).get("ratio")
+            full = limit_ratio.compute(rows)
         except Exception:   # noqa: BLE001
-            snap = None
-    snap = _dict(snap)
+            full = None
+    # prefer the per-session-window estimate (unbiased by the integer weekly %) once it has
+    # enough windows; limit_ratio.preferred_ratio() falls back to the old 15-min median
+    try:
+        import limit_ratio
+        pr = limit_ratio.preferred_ratio(full)
+        v = pr.get("value")
+        if pr.get("source") == "windows" and _num(v) and RATIO_RANGE[0] <= v <= RATIO_RANGE[1]:
+            return float(v), f"per-session-window ratio, n={pr.get('n')} windows"
+    except Exception:   # noqa: BLE001
+        pass
+    snap = _dict(_dict(full).get("ratio"))
     med = snap.get("median")
     if snap.get("status") == "ok" and _num(med) and RATIO_RANGE[0] <= med <= RATIO_RANGE[1]:
         return float(med), f"limit_ratio median, n={snap.get('n')}"
@@ -451,7 +473,7 @@ def profile(rows=None, now=None, fires=None):
         st = os.stat(SAMPLES_FILE)
     except OSError:
         return None, "no samples: the straight line"
-    key = (SAMPLES_FILE, st.st_mtime_ns, st.st_size, now.date())
+    key = (SAMPLES_FILE, _file_sig(SAMPLES_FILE, st), now.date())
     if _PROFILE_CACHE.get("key") != key:
         _PROFILE_CACHE.update(key=key, val=fit_profile(tail_rows(max_bytes=LONG_BYTES),
                                                        fire_times() if fires is None else fires, now))

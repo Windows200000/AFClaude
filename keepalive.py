@@ -393,7 +393,7 @@ def _limit_ratio():
     try:
         import limit_ratio
         r = limit_ratio.compute(limit_ratio.load_samples(limit_ratio.SAMPLES), now=datetime.now(UTC))
-        return ((r or {}).get("ratio") or {}).get("median")
+        return limit_ratio.preferred_ratio(r).get("value")   # per-window estimate when available
     except Exception:   # noqa: BLE001 - the ratio text is advisory
         return None
 
