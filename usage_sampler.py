@@ -515,6 +515,24 @@ def series_line(row):
     return line
 
 
+SESSION_WINDOWS = os.path.join(DATA, "session_windows.jsonl")  # one row per completed 5-h window, never pruned
+
+
+def ratio_snapshot(rows, t, windows_path=None):
+    """limit_ratio snapshot for this row. First appends every session window
+    that has completed by `t` and isn't in data/session_windows.jsonl yet (so a
+    window is recorded on the first run after it ends; a missed run catches
+    up), then computes with the stored windows. A failure in the window file
+    never sinks the sample: the snapshot is then built from `rows` alone."""
+    windows_path = windows_path or SESSION_WINDOWS
+    stored = None
+    try:
+        stored, _new = limit_ratio.append_new_windows(rows, path=windows_path, now=t)
+    except Exception:   # noqa: BLE001
+        stored = None
+    return limit_ratio.compute(rows, now=t, windows=stored)
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -539,7 +557,7 @@ def main():
         row["projected_linear"] = round(ka.project_weekly(w["percent"], w["resets_at"], t), 1)
     # Cheap: reuse the samples already on disk plus this row, so the ratio
     # snapshot's own history is kept alongside every sample (limit_ratio.py).
-    row["limit_ratio"] = limit_ratio.compute(limit_ratio.load_samples(SAMPLES) + [row], now=t)
+    row["limit_ratio"] = ratio_snapshot(limit_ratio.load_samples(SAMPLES) + [row], t)
     row.update(derived_fields(usage, row["activity"], st.get("prev_pct")))
     try:
         st["prev_pct"] = pct_state(usage)

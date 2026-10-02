@@ -194,10 +194,18 @@ button.chip.sel { border-color: #a855f7; }
         '<div class="mut">' + esc(b.reason || "") + (b.recheck_berlin ? " (recheck " + esc(b.recheck_berlin) + ")" : "") + "</div>"));
     }
     var lim = k.limits || {};
-    if (lim.ratio_status === "ok") {
+    if (lim.ratio_pref != null && lim.ratio_pref_source === "windows") {
+      out.push(tile("Session→week ratio", lim.ratio_pref + (lim.ratio_spread != null ? " ± " + lim.ratio_spread : ""),
+        '<div class="mut">' + lim.ratio_windows_n + " session windows · IQR " +
+        (lim.ratio_iqr ? lim.ratio_iqr[0] + "–" + lim.ratio_iqr[1] : "?") + " · 15-min median " +
+        (lim.ratio_15min_median != null ? lim.ratio_15min_median : "?") + '</div><div class="mut">~' +
+        (lim.windows_per_week_pref != null ? lim.windows_per_week_pref : "?") + " windows/week · " +
+        (lim.windows_left_pref != null ? lim.windows_left_pref : "?") + " left this week</div>"));
+    } else if (lim.ratio_status === "ok") {
       out.push(tile("Session→week ratio", lim.ratio_median,
         '<div class="mut">~' + (lim.windows_per_week != null ? lim.windows_per_week : "?") + ' windows/week · ' +
-        (lim.windows_left_this_week != null ? lim.windows_left_this_week : "?") + ' left this week</div>'));
+        (lim.windows_left_this_week != null ? lim.windows_left_this_week : "?") + ' left this week' +
+        (lim.ratio_windows_n != null ? " · 15-min median, only " + lim.ratio_windows_n + " session windows" : "") + "</div>"));
     } else {
       out.push(tile("Session→week ratio", "–", '<div class="mut">insufficient data</div>'));
     }

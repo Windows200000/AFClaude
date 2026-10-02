@@ -279,10 +279,16 @@ def limits_block():
     stored on the latest data/samples.jsonl row (no recompute, no raw rows
     exported -- consistent with samples.jsonl never being exported directly)."""
     row = tail_last_json(os.path.join(HERE, "data", "samples.jsonl"))
-    snap = (row or {}).get("limit_ratio")
+    return limits_from_snapshot((row or {}).get("limit_ratio"))
+
+
+def limits_from_snapshot(snap):
+    """The page's limits block from one stored limit_ratio snapshot (pure)."""
     if not snap:
         return None
     r = snap.get("ratio") or {}
+    rw = snap.get("ratio_windows") or {}
+    pref = snap.get("preferred_ratio") or {}
     share = (snap.get("attribution") or {}).get("week_share") or {}
 
     def r4(x):
@@ -305,6 +311,19 @@ def limits_block():
         "own_share_week": r3(share.get("own_share")),
         "user_share_week": r3(share.get("other_share")),
         "as_of": snap.get("generated_at"),
+        # per-session-window estimate (limit_ratio.estimate_window_ratio) and the
+        # ratio consumers should use; absent in snapshots older than this field
+        "ratio_pref": r4(pref.get("value")),
+        "ratio_pref_source": pref.get("source"),
+        "ratio_pref_flagged": pref.get("flagged"),
+        "ratio_spread": r4(rw.get("weighted_stdev")),
+        "ratio_iqr": [r4(rw.get("p25")), r4(rw.get("p75"))] if rw.get("p25") is not None else None,
+        "ratio_se": r4(rw.get("se")),
+        "ratio_windows_n": rw.get("n"),
+        "ratio_windows_total": rw.get("n_total"),
+        "ratio_15min_median": r4(((rw.get("vs_15min") or {}).get("median_15min"))),
+        "windows_per_week_pref": r1(pref.get("windows_per_week")),
+        "windows_left_pref": r1(pref.get("windows_left_this_week")),
     }
 
 
