@@ -92,5 +92,31 @@ class WindowInfo(unittest.TestCase):
         self.assertEqual(out["next_window_berlin"], "Sun 25.10. 23:00 CET")
 
 
+
+class LimitsBlock(unittest.TestCase):
+    OLD = {"generated_at": "x", "ratio": {"status": "ok", "median": 0.13333, "trimmed_mean": 0.1, "n": 55},
+           "windows_per_week": 7.5, "windows_left_this_week": 6.2,
+           "attribution": {"week_share": {"status": "ok", "own_share": 1.0, "other_share": 0.0}}}
+
+    def test_old_snapshot_still_renders(self):
+        b = qv.limits_from_snapshot(self.OLD)
+        self.assertEqual((b["ratio_status"], b["ratio_median"], b["ratio_n"]), ("ok", 0.1333, 55))
+        self.assertIsNone(b["ratio_pref"])
+        self.assertIsNone(qv.limits_from_snapshot(None))
+
+    def test_per_window_fields(self):
+        snap = dict(self.OLD,
+                    ratio_windows={"status": "ok", "n": 11, "n_total": 17, "weighted": 0.15368, "weighted_stdev": 0.01834,
+                                   "p25": 0.1125, "p75": 0.16273, "se": 0.0045, "vs_15min": {"median_15min": 0.1381}},
+                    preferred_ratio={"value": 0.15368, "source": "windows", "flagged": False,
+                                     "windows_per_week": 6.507, "windows_left_this_week": 5.21})
+        b = qv.limits_from_snapshot(snap)
+        self.assertEqual((b["ratio_pref"], b["ratio_spread"], b["ratio_windows_n"]), (0.1537, 0.0183, 11))
+        self.assertEqual(b["ratio_iqr"], [0.1125, 0.1627])
+        self.assertEqual((b["ratio_pref_source"], b["ratio_15min_median"]), ("windows", 0.1381))
+        self.assertEqual((b["windows_per_week_pref"], b["windows_left_pref"]), (6.5, 5.2))
+        self.assertEqual(b["ratio_median"], 0.1333)   # old field unchanged
+
+
 if __name__ == "__main__":
     unittest.main()

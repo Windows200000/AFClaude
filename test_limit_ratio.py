@@ -225,5 +225,269 @@ class HumanSummary(unittest.TestCase):
         self.assertIn("full session windows fit", text2)
 
 
+# ------------------------------------------------------------------ per-session-window
+
+W_END = datetime(2026, 9, 26, 17, 0, 0, tzinfo=UTC)      # window 12:00..17:00
+W_START = W_END - timedelta(hours=5)
+
+
+def srow(t, sp, wp, session_reset=None, week_reset=WEEK_RESET, own=None, other=None):
+    """Like row(), but session_reset=None means idle (no window open, 0%)."""
+    r = row(t, sp, wp, session_reset=session_reset or SESSION_RESET, week_reset=week_reset, own=own, other=other)
+    if session_reset is None:
+        r["usage"]["session"] = {"percent": 0.0, "resets_at": None}
+    return r
+
+
+def window_rows(seq, start=W_START, end=W_END, step=15, week_reset=WEEK_RESET, idle_before=True, own=None):
+    """Samples every `step` min from start+step..end-step, readings from seq(i)."""
+    rows = [srow(start - timedelta(minutes=10), 0, seq(0)[1], week_reset=week_reset)] if idle_before else []
+    i = 1
+    t = start + timedelta(minutes=step)
+    while t < end:
+        sp, wp = seq(i)
+        rows.append(srow(t, sp, wp, session_reset=end.isoformat(), week_reset=week_reset, own=own))
+        i += 1
+        t += timedelta(minutes=step)
+    return rows
+
+
+def linear(ds_total, w0, dw_total, n=19):
+    """session rises to ds_total and weekly from w0 by dw_total, integer readings."""
+    return lambda i: (float(round(ds_total * min(i, n) / n)), float(w0 + round(dw_total * min(i, n) / n)))
+
+
+class PerWindow(unittest.TestCase):
+    def one(self, rows, now=None):
+        ws = lr.build_windows(rows, now=now or W_END + timedelta(minutes=5))
+        self.assertEqual(len(ws), 1)
+        return ws[0]
+
+    def test_whole_window_deltas_idle_baseline(self):
+        w = self.one(window_rows(linear(40, 30, 6), own=own_tok(out=100)))
+        self.assertEqual(w["window_end"], W_END.isoformat())
+        self.assertEqual(w["window_start"], W_START.isoformat())
+        self.assertEqual(w["baseline"], "idle_pre_sample")
+        self.assertEqual((w["d_session"], w["d_weekly"]), (40.0, 6.0))
+        self.assertEqual(w["session_end_pct"], 40.0)
+        self.assertAlmostEqual(w["ratio"], 0.15)
+        # exact 0% session at the idle baseline: only the end reading is rounded
+        self.assertEqual((w["err_session"], w["err_weekly"]), (0.5, 1.0))
+        self.assertTrue(w["usable"])
+        self.assertEqual(w["flags"], [])
+        self.assertEqual(w["own_share"], 1.0)
+        self.assertIsNone(w["exclude_reason"])
+
+    def test_rounding_interval(self):
+        # baseline is the first in-window sample (no idle sample before): +-1 on both deltas
+        w = self.one(window_rows(lambda i: (float(i), 40.0 + (3 if i >= 19 else 0)), idle_before=False))
+        self.assertEqual(w["baseline"], "first_sample")
+        self.assertEqual((w["d_session"], w["d_weekly"]), (18.0, 3.0))
+        self.assertEqual((w["err_session"], w["err_weekly"]), (1.0, 1.0))
+        self.assertAlmostEqual(w["ratio_lo"], 2 / 19)
+        self.assertAlmostEqual(w["ratio_hi"], 4 / 17)
+        self.assertLessEqual(w["ratio_lo"], w["ratio"])
+        self.assertGreaterEqual(w["ratio_hi"], w["ratio"])
+        self.assertEqual(lr._ratio_interval(0, 10, 1, 1), (0.0, 1 / 9))
+        self.assertEqual(lr._ratio_interval(1, 0.5, 1, 1)[1], None)   # ds within its error: unbounded
+
+    def test_idle_baseline_requires_same_cycle_and_recency(self):
+        rows = window_rows(linear(40, 30, 6))
+        rows[0] = srow(W_START - timedelta(hours=6), 0, 30)          # too old: a window could hide in between
+        self.assertEqual(self.one(rows)["baseline"], "first_sample")
+        rows[0] = srow(W_START - timedelta(minutes=10), 0, 30, week_reset=WEEK_RESET2)  # other weekly cycle
+        self.assertEqual(self.one(rows)["baseline"], "first_sample")
+
+    def test_back_to_back_windows_use_first_sample(self):
+        prev_end = W_START
+        rows = [srow(prev_end - timedelta(minutes=15), 50, 30, session_reset=prev_end.isoformat())]
+        rows += window_rows(linear(40, 31, 6), idle_before=False)
+        ws = lr.build_windows(rows, now=W_END + timedelta(minutes=5))
+        w = [x for x in ws if x["window_end"] == W_END.isoformat()][0]
+        self.assertEqual(w["baseline"], "first_sample")
+
+    def test_partial_window_flagged_and_excluded(self):
+        rows = [r for r in window_rows(linear(40, 30, 6)) if lr._parse_ts(r["at"]) >= W_END - timedelta(hours=2)]
+        w = self.one(rows)
+        self.assertIn("partial", w["flags"])
+        self.assertFalse(w["usable"])
+        est = lr.estimate_window_ratio([w])
+        self.assertEqual(est["status"], "insufficient_data")
+        self.assertEqual(est["excluded"], {"partial": 1})
+
+    def test_gap_is_flagged_but_deltas_still_valid(self):
+        rows = window_rows(linear(40, 30, 6))
+        gap0, gap1 = W_START + timedelta(hours=1), W_START + timedelta(hours=2, minutes=30)
+        rows = [r for r in rows if not (gap0 < lr._parse_ts(r["at"]) < gap1)]
+        w = self.one(rows)
+        self.assertIn("gap", w["flags"])
+        self.assertTrue(w["usable"])                 # cumulative meters: endpoints still valid
+        self.assertEqual((w["d_session"], w["d_weekly"]), (40.0, 6.0))
+        self.assertGreaterEqual(w["max_gap_min"], 90)
+
+    def test_low_activity_excluded(self):
+        w = self.one(window_rows(linear(3, 30, 0)))
+        self.assertIn("low_activity", w["flags"])
+        self.assertFalse(w["usable"])
+
+    def test_open_window_left_out(self):
+        rows = window_rows(linear(40, 30, 6))
+        self.assertEqual(lr.build_windows(rows, now=W_END - timedelta(minutes=30)), [])
+        ws = lr.build_windows(rows, now=W_END - timedelta(minutes=30), include_open=True)
+        self.assertIn("open", ws[0]["flags"])
+        self.assertFalse(ws[0]["usable"])
+        # default "now" = the latest sample, which is inside the window
+        self.assertEqual(lr.build_windows(rows), [])
+
+    def test_capped_window_cut_before_saturation(self):
+        # weekly hits 100 at sample 10 and stays there while session keeps rising
+        seq = lambda i: (float(5 * i), float(min(100, 90 + i)))   # noqa: E731
+        w = self.one(window_rows(seq))
+        self.assertIn("capped", w["flags"])
+        self.assertEqual(w["weekly_end_pct"], 99.0)
+        self.assertEqual((w["d_session"], w["d_weekly"]), (45.0, 9.0))
+        self.assertTrue(w["usable"])                 # cut on purpose, not partial
+
+    def test_cross_weekly_reset_split(self):
+        # weekly cycle resets at 14:30 inside the 12:00..17:00 window
+        reset = datetime(2026, 9, 26, 14, 30, tzinfo=UTC)
+        rows = [srow(W_START - timedelta(minutes=10), 0, 90, week_reset=reset.isoformat())]
+        t, i = W_START + timedelta(minutes=15), 1
+        while t < W_END:
+            if t < reset:
+                rows.append(srow(t, 4.0 * i, 90 + (4 * i) // 6, session_reset=W_END.isoformat(), week_reset=reset.isoformat()))
+            else:
+                rows.append(srow(t, 4.0 * i, float((4 * i - 40) // 6), session_reset=W_END.isoformat(),
+                                 week_reset=WEEK_RESET2))
+            t += timedelta(minutes=15)
+            i += 1
+        w = self.one(rows)
+        self.assertIn("weekly_reset_split", w["flags"])
+        self.assertEqual(len(w["segments"]), 2)
+        s1, s2 = w["segments"]
+        # segment 1: idle 0 -> 9 samples*4 = 36% session; segment 2 from 40% to 76%
+        self.assertEqual(s1["d_session"], 36.0)
+        self.assertEqual(s2["d_session"], 36.0)
+        self.assertEqual(w["d_session"], s1["d_session"] + s2["d_session"])
+        self.assertEqual(w["d_weekly"], s1["d_weekly"] + s2["d_weekly"])
+        # the straddling 15 min is dropped, rounding counts both segments' readings
+        self.assertEqual(w["err_weekly"], 2.0)
+        self.assertEqual(w["err_session"], 0.5 + 1.0)
+        self.assertLess(w["covered_min"], 300 - 15 + 1)
+        self.assertTrue(w["usable"])
+
+    def test_samples_without_meters_are_skipped(self):
+        rows = window_rows(linear(40, 30, 6))
+        rows.insert(5, {"at": rows[4]["at"], "usage": {}})
+        self.assertEqual(self.one(rows)["d_session"], 40.0)
+
+
+def wrec(ds, dw, end="2026-09-26T17:00:00+00:00", usable=True):
+    return {"window_end": end, "d_session": float(ds), "d_weekly": float(dw), "ratio": dw / ds if ds else None,
+            "err_session": 1.0, "err_weekly": 1.0, "rounding_var_session": 2 / 12, "rounding_var_weekly": 2 / 12,
+            "usable": usable, "flags": [] if usable else ["low_activity"],
+            "exclude_reason": None if usable else "low activity: x"}
+
+
+class WindowEstimate(unittest.TestCase):
+    NOW = datetime(2026, 9, 30, tzinfo=UTC)
+
+    def test_weighted_by_d_session(self):
+        ws = [wrec(10, 1), wrec(90, 15)]
+        est = lr.estimate_window_ratio(ws, now=self.NOW)
+        self.assertEqual(est["status"], "low_n")          # < MIN_WINDOWS
+        self.assertAlmostEqual(est["weighted"], 16 / 100)   # not the plain mean (0.1333)
+        self.assertAlmostEqual(est["mean"], (0.1 + 15 / 90) / 2)
+        self.assertEqual(est["n"], 2)
+
+    def test_dispersion_and_rounding(self):
+        ws = [wrec(20, 2), wrec(40, 6), wrec(50, 8), wrec(60, 9), wrec(30, 6), wrec(3, 2, usable=False)]
+        est = lr.estimate_window_ratio(ws, now=self.NOW)
+        self.assertEqual(est["status"], "ok")
+        self.assertEqual((est["n"], est["n_total"]), (5, 6))
+        self.assertEqual(est["excluded"], {"low activity": 1})
+        ratios = sorted([0.1, 0.15, 0.16, 0.15, 0.2])
+        self.assertAlmostEqual(est["weighted"], 31 / 200)
+        self.assertAlmostEqual(est["median"], 0.15)
+        self.assertAlmostEqual(est["p25"], 0.15)
+        self.assertAlmostEqual(est["p75"], 0.16)
+        self.assertAlmostEqual(est["iqr"], 0.01)
+        self.assertAlmostEqual(est["stdev"], statistics_stdev(ratios))
+        self.assertEqual((est["min"], est["max"]), (0.1, 0.2))
+        self.assertGreater(est["se"], 0)
+        lo, hi = est["rounding_worst"]
+        self.assertAlmostEqual(lo, 26 / 205)
+        self.assertAlmostEqual(hi, 36 / 195)
+        self.assertGreater(est["rounding_sd"], 0)
+        self.assertLess(est["rounding_sd"], hi - lo)
+        self.assertGreaterEqual(est["intrinsic_stdev"], 0)
+        self.assertEqual(len(est["distribution"]), 5)
+
+    def test_vs_15min_and_preferred(self):
+        rows = make_series(lr.MIN_PAIRS + 5)
+        pairs = lr.build_pairs(rows)
+        ws = [wrec(40, 6)] * 5
+        est = lr.estimate_window_ratio(ws, pairs=pairs, now=self.NOW)
+        self.assertAlmostEqual(est["vs_15min"]["median_15min"], 0.2)
+        self.assertAlmostEqual(est["vs_15min"]["factor_vs_median"], 0.15 / 0.2)
+        old = lr.estimate_ratio(pairs, now=T0 + timedelta(days=1))
+        p = lr.preferred_ratio({"ratio": old, "ratio_windows": est})
+        self.assertEqual((p["source"], p["flagged"]), ("windows", False))
+        self.assertAlmostEqual(p["value"], 0.15)
+        p = lr.preferred_ratio({"ratio": old, "ratio_windows": lr.estimate_window_ratio(ws[:2], now=self.NOW)})
+        self.assertEqual((p["source"], p["flagged"]), ("15min_median", True))
+        self.assertAlmostEqual(p["value"], 0.2)
+        p = lr.preferred_ratio({"ratio": {"status": "insufficient_data"}, "ratio_windows": {}})
+        self.assertIsNone(p["value"])
+
+    def test_compute_snapshot_keeps_old_api_and_adds_windows(self):
+        rows = window_rows(linear(40, 30, 6))
+        snap = lr.compute(rows, now=W_END + timedelta(minutes=5))
+        for k in ("status", "n"):
+            self.assertIn(k, snap["ratio"])
+        for k in ("generated_at", "windows_per_week", "windows_left_this_week", "weekly_pct_now", "attribution"):
+            self.assertIn(k, snap)
+        self.assertEqual(snap["ratio_windows"]["n"], 1)
+        self.assertAlmostEqual(snap["ratio_windows"]["weighted"], 0.15)
+        self.assertIn("preferred_ratio", snap)
+        self.assertIn("Per-session-window ratio", lr.human_summary(snap))
+        # stored windows win over derived ones, unknown stored ones are kept
+        stored = [dict(wrec(50, 10, end=W_END.isoformat())), wrec(50, 5, end="2026-09-20T10:00:00+00:00")]
+        snap = lr.compute(rows, now=W_END + timedelta(minutes=5), windows=stored)
+        self.assertEqual(snap["ratio_windows"]["n"], 2)
+        self.assertAlmostEqual(snap["ratio_windows"]["weighted"], 15 / 100)
+
+
+class WindowFile(unittest.TestCase):
+    def test_append_dedupes_and_backfill_keeps_pruned(self):
+        import json
+        import tempfile
+        rows = window_rows(linear(40, 30, 6))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session_windows.jsonl")
+            now = W_END + timedelta(minutes=5)
+            allw, new = lr.append_new_windows(rows, path=path, now=now)
+            self.assertEqual((len(allw), len(new)), (1, 1))
+            self.assertEqual(new[0]["source"], "sampler")
+            allw, new = lr.append_new_windows(rows, path=path, now=now)
+            self.assertEqual((len(allw), len(new)), (1, 0))
+            # a window from long ago that samples.jsonl no longer has
+            with open(path, "a") as fh:
+                fh.write(json.dumps(wrec(50, 5, end="2026-09-01T10:00:00+00:00")) + "\n")
+            sp = os.path.join(d, "samples.jsonl")
+            with open(sp, "w") as fh:
+                for r in rows + [srow(W_END + timedelta(minutes=5), 0, 36)]:
+                    fh.write(json.dumps(r) + "\n")
+            out = lr.backfill_windows(sp, path)
+            self.assertEqual([w["window_end"][:10] for w in out], ["2026-09-01", "2026-09-26"])
+            self.assertEqual(out[1]["source"], "backfill")
+            self.assertEqual(len(lr.load_windows(path)), 2)
+
+
+def statistics_stdev(xs):
+    import statistics
+    return statistics.stdev(xs)
+
+
 if __name__ == "__main__":
     unittest.main()

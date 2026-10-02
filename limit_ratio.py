@@ -25,6 +25,16 @@ compared after rounding to the minute the same way track_cycle does: add 30s,
 then floor -- a reset that's genuinely NNN:59:5x/NNN+1:00:0x rounds to the
 same minute either way.
 
+Per-session-window ratio (preferred): the 15-min pair median above is
+biased low because both meters are integer percent (weekly mostly moves 0-1
+point per pair). `ratio_windows` instead measures each completed 5-h window
+from its first to its last reading (rounding error of two readings only), see
+window_record() for baseline / weekly-reset split / saturation / partial
+rules; records are kept in the never-pruned data/session_windows.jsonl
+(appended by the sampler, rebuilt with --backfill-windows). `preferred_ratio`
+is that estimate once MIN_WINDOWS usable windows exist, else the old median
+(flagged). The old `ratio` fields are unchanged.
+
 Sparse data is reported honestly: any estimate backed by fewer than
 MIN_PAIRS usable pairs comes back as status "insufficient_data" rather than
 a number.
@@ -192,6 +202,374 @@ def windows_left_this_week(ratio, weekly_pct_now):
     return max(0.0, 100.0 - weekly_pct_now) / (100.0 * ratio)
 
 
+# ------------------------------------------------------------------ per-session-window
+
+# Why per window: both meters are reported as INTEGER percent. Over one 15-min
+# pair the weekly meter mostly moves 0 or 1 point while the session meter moves
+# several, so per-pair ratios (and their median) are biased low and very noisy.
+# Both meters are cumulative within a window, so the deltas between the first
+# and the last reading of a whole 5-h window carry the rounding error of only
+# two readings each (+-0.5 point per reading), however many samples lie between.
+SESSION_LEN = timedelta(hours=5)
+MIN_COVERAGE_FRAC = 0.7     # samples must span >= 70% of the 5 h (3.5 h), else "partial"
+MIN_D_SESSION = 5.0         # windows with fewer session points are "low_activity" (rounding dominates)
+GAP_FLAG = timedelta(minutes=40)  # a gap this long inside a window is flagged (not excluded: meters are cumulative)
+CAP_PCT = 100.0             # a meter at 100% is saturated: the window is cut before it
+READ_ERR = 0.5              # +- rounding error of one integer reading
+MIN_WINDOWS = 5             # usable windows needed before the per-window ratio is preferred
+DIST_MAX = 30               # most recent windows listed in the snapshot's distribution
+WINDOW_RECORD_VERSION = 1
+SESSION_WINDOWS = os.path.join(DATA, "session_windows.jsonl")  # never pruned
+
+
+def _points(rows):
+    """Usable readings, oldest first: t, sp, wp, sr (rounded session reset or
+    None when no window is open), wr, own/other weighted tokens of the interval
+    ending at this sample."""
+    pts = []
+    for r in rows:
+        u = r.get("usage") or {}
+        s = u.get("session") or {}
+        w = u.get("weekly") or {}
+        t = _parse_ts(r.get("at"))
+        if not t or s.get("percent") is None or w.get("percent") is None or not w.get("resets_at"):
+            continue
+        act = r.get("activity") or {}
+        pts.append({"t": t, "sp": float(s["percent"]), "wp": float(w["percent"]),
+                    "sr": _round_reset(s.get("resets_at")), "wr": _round_reset(w["resets_at"]),
+                    "own": weighted_tokens((act.get("own") or {}).get("tokens")),
+                    "other": weighted_tokens((act.get("other") or {}).get("tokens"))})
+    pts.sort(key=lambda p: p["t"])
+    return pts
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def _ratio_interval(dw, ds, ew, es):
+    """Worst-case bounds of dw/ds when dw is off by up to ew and ds by up to es."""
+    lo = max(0.0, dw - ew) / (ds + es) if ds + es > 0 else None
+    hi = (dw + ew) / (ds - es) if ds - es > 0 else None
+    return lo, hi
+
+
+def window_record(key, pts, pre=None):
+    """One completed window (key = rounded session resets_at = window end) from
+    its in-window points (oldest first) and the point just before them.
+
+    Baseline: when the sample just before the window is idle (no session window
+    open, session 0%), in the same weekly cycle, and less than 5 h before the
+    window start (so no other, unseen window fits in between), nothing was used
+    between it and the window start: it is the baseline with an EXACT session
+    reading of 0 (no rounding error on that end). Otherwise the first in-window
+    sample is the baseline.
+
+    Weekly reset inside the window: the window is SPLIT into one segment per
+    weekly cycle; each segment is measured first-to-last on its own and the
+    deltas are summed. Only the interval between the last old-cycle and the
+    first new-cycle sample (one sampling step, its weekly delta unknowable) is
+    dropped, and the rounding error counts the extra readings. Excluding such
+    windows outright would throw away up to 5 h of good data per week.
+
+    Saturation: once a meter reads 100% it stops tracking (the weekly meter sat
+    at 100 while the session meter still rose), so the window is cut at the
+    last sample before any meter reached 100 (flag "capped")."""
+    start = key - SESSION_LEN
+    flags = []
+    pts = list(pts)
+    base_kind = "first_sample"
+    if (pre and pre["sr"] is None and pre["sp"] == 0 and pts and pre["wr"] == pts[0]["wr"]
+            and pre["t"] > start - SESSION_LEN and pre["t"] <= start + timedelta(minutes=1)):
+        pts = [dict(pre, exact_session=True)] + pts
+        base_kind = "idle_pre_sample"
+    # coverage is judged on what was observed, before any saturation cut
+    # (a capped window is cut on purpose, it isn't missing data)
+    observed = (pts[-1]["t"] - pts[0]["t"]) if pts else timedelta(0)
+    if pts and len({p["wr"] for p in pts}) > 1:   # minus the dropped straddling interval(s)
+        observed = sum((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)
+                        if pts[i]["wr"] == pts[i + 1]["wr"]), timedelta(0))
+    # cut at saturation
+    cut = None
+    for i, p in enumerate(pts):
+        if p["sp"] >= CAP_PCT or p["wp"] >= CAP_PCT:
+            cut = i
+            break
+    if cut is not None:
+        flags.append("capped")
+        pts = pts[:cut]
+    # segments by weekly cycle
+    segs = []
+    for p in pts:
+        if segs and segs[-1][-1]["wr"] == p["wr"]:
+            segs[-1].append(p)
+        else:
+            segs.append([p])
+    if len(segs) > 1:
+        flags.append("weekly_reset_split")
+    ds = dw = es = ew = 0.0
+    var_s = var_w = 0.0
+    covered = timedelta(0)
+    own = other = 0.0
+    seg_out = []
+    for seg in segs:
+        a, b = seg[0], seg[-1]
+        if len(seg) < 2:
+            continue
+        d_s, d_w = b["sp"] - a["sp"], b["wp"] - a["wp"]
+        e_s = READ_ERR * (1 if a.get("exact_session") else 2)
+        ds, dw, es, ew = ds + d_s, dw + d_w, es + e_s, ew + 2 * READ_ERR
+        var_s += (1 if a.get("exact_session") else 2) / 12.0   # uniform(+-0.5) has variance 1/12
+        var_w += 2 / 12.0
+        covered += b["t"] - a["t"]
+        own += sum(p["own"] for p in seg[1:])
+        other += sum(p["other"] for p in seg[1:])
+        seg_out.append({"first_at": _iso(a["t"]), "last_at": _iso(b["t"]), "weekly_resets_at": _iso(a["wr"]),
+                        "d_session": d_s, "d_weekly": d_w})
+    max_gap = max((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)), default=timedelta(0))
+    if max_gap > GAP_FLAG:
+        flags.append("gap")
+    cov_frac = observed / SESSION_LEN
+    rec = {
+        "v": WINDOW_RECORD_VERSION,
+        "window_end": _iso(key), "window_start": _iso(start),
+        "weekly_resets_at": _iso(pts[0]["wr"]) if pts else None,
+        "baseline": base_kind,
+        "first_at": _iso(pts[0]["t"]) if pts else None, "last_at": _iso(pts[-1]["t"]) if pts else None,
+        "n_samples": len(pts), "covered_min": round(covered.total_seconds() / 60, 1),
+        "observed_min": round(observed.total_seconds() / 60, 1),
+        "coverage_frac": round(cov_frac, 3), "max_gap_min": round(max_gap.total_seconds() / 60, 1),
+        "session_start_pct": pts[0]["sp"] if pts else None, "session_end_pct": pts[-1]["sp"] if pts else None,
+        "weekly_start_pct": pts[0]["wp"] if pts else None, "weekly_end_pct": pts[-1]["wp"] if pts else None,
+        "d_session": ds, "d_weekly": dw, "err_session": es, "err_weekly": ew,
+        "rounding_var_session": round(var_s, 4), "rounding_var_weekly": round(var_w, 4),
+        "ratio": dw / ds if ds > 0 else None,
+        "ratio_lo": None, "ratio_hi": None,
+        "own_w_tokens": round(own, 1), "other_w_tokens": round(other, 1),
+        "own_share": round(own / (own + other), 4) if own + other > 0 else None,
+        "other_share": round(other / (own + other), 4) if own + other > 0 else None,
+    }
+    if ds > 0:
+        rec["ratio_lo"], rec["ratio_hi"] = _ratio_interval(dw, ds, ew, es)
+    if len(seg_out) > 1:
+        rec["segments"] = seg_out
+    reason = None
+    if ds < 0 or dw < 0:
+        flags.append("inconsistent")
+        reason = "negative delta"
+    elif cov_frac < MIN_COVERAGE_FRAC:
+        flags.append("partial")
+        reason = f"partial: samples cover {cov_frac:.0%} of the window (< {MIN_COVERAGE_FRAC:.0%})"
+    elif ds < MIN_D_SESSION:
+        flags.append("low_activity")
+        reason = f"low activity: d_session {ds:g} < {MIN_D_SESSION:g}"
+    rec["flags"] = flags
+    rec["usable"] = reason is None
+    rec["exclude_reason"] = reason
+    return rec
+
+
+def build_windows(rows, now=None, include_open=False):
+    """Per-session-window records from sample rows (oldest first). A window is
+    completed once `now` (default: the latest sample) has reached its end; the
+    open window is left out unless include_open (then flagged "open")."""
+    pts = _points(rows)
+    if not pts:
+        return []
+    now = now or pts[-1]["t"]
+    groups, order, pre_of = {}, [], {}
+    prev = None
+    for p in pts:
+        k = p["sr"]
+        if k is not None:
+            if k not in groups:
+                groups[k] = []
+                order.append(k)
+                pre_of[k] = prev
+            groups[k].append(p)
+        prev = p
+    out = []
+    for k in order:
+        is_open = now < k
+        if is_open and not include_open:
+            continue
+        rec = window_record(k, groups[k], pre_of[k])
+        if is_open:
+            rec["flags"].append("open")
+            rec["usable"] = False
+            rec["exclude_reason"] = rec["exclude_reason"] or "open: window not finished"
+        out.append(rec)
+    return out
+
+
+def load_windows(path=SESSION_WINDOWS):
+    return load_samples(path)
+
+
+def merge_windows(stored, derived):
+    """Stored records (never pruned) win; derived ones fill in the rest. Sorted by window end."""
+    by = {}
+    for w in derived or []:
+        if w.get("window_end"):
+            by[w["window_end"]] = w
+    for w in stored or []:
+        if w.get("window_end"):
+            by[w["window_end"]] = w
+    return [by[k] for k in sorted(by)]
+
+
+def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
+    """Append every completed window found in `rows` that the file doesn't
+    have yet (called by the sampler on each run, so a window is recorded on
+    the first run after it ends). Returns (all stored records, newly added)."""
+    stored = load_windows(path)
+    have = {w.get("window_end") for w in stored}
+    computed_at = (now or datetime.now(UTC)).isoformat()
+    new = []
+    for w in build_windows(rows, now=now):
+        if w["window_end"] in have:
+            continue
+        w = dict(w, source=source, computed_at=computed_at)
+        new.append(w)
+    if new:
+        with open(path, "a") as fh:
+            for w in new:
+                fh.write(json.dumps(w) + "\n")
+    return stored + new, new
+
+
+def backfill_windows(samples_path=SAMPLES, out_path=SESSION_WINDOWS, now=None):
+    """Rebuild out_path from samples: every window derivable from the samples
+    is recomputed; stored windows the samples no longer cover (pruned) are kept,
+    since the file is never pruned. Atomic replace. Returns the records."""
+    now_dt = now or datetime.now(UTC)
+    derived = [dict(w, source="backfill", computed_at=now_dt.isoformat())
+               for w in build_windows(load_samples(samples_path), now=now)]
+    stored = load_windows(out_path)
+    derived_keys = {w["window_end"] for w in derived}
+    keep = [w for w in stored if w.get("window_end") not in derived_keys]
+    allw = merge_windows(keep, derived)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w") as fh:
+        for w in allw:
+            fh.write(json.dumps(w) + "\n")
+    os.replace(tmp, out_path)
+    return allw
+
+
+def _percentile(sorted_xs, q):
+    """Linear-interpolated percentile (q in 0..1) of an already sorted list."""
+    if not sorted_xs:
+        return None
+    if len(sorted_xs) == 1:
+        return sorted_xs[0]
+    pos = q * (len(sorted_xs) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_xs) - 1)
+    return sorted_xs[lo] + (sorted_xs[hi] - sorted_xs[lo]) * (pos - lo)
+
+
+def estimate_window_ratio(windows, pairs=None, now=None, recent_days=DEFAULT_TRIMMED_DAYS):
+    """Weekly-%-per-session-% from completed, usable windows.
+
+    weighted = sum(d_weekly) / sum(d_session): each window's ratio weighted by
+    its d_session, so long/busy windows count more (and small windows, where
+    rounding dominates, count little). Dispersion across windows (real
+    variation: model mix, context size, ...) is reported as stdev, weighted
+    stdev, IQR and percentiles; `se` is the ratio estimator's standard error.
+    The rounding error of the pooled estimate: `rounding_sd` (readings
+    independent, uniform +-0.5) and `rounding_worst` (every reading off by 0.5
+    in the unfavourable direction). `vs_15min` compares with the old estimate."""
+    now = now or datetime.now(UTC)
+    allw = [w for w in windows or [] if "open" not in (w.get("flags") or [])]
+    use = [w for w in allw if w.get("usable") and w.get("d_session")]
+    excluded = {}
+    for w in allw:
+        if not w.get("usable"):
+            r = (w.get("exclude_reason") or "?").split(":")[0]
+            excluded[r] = excluded.get(r, 0) + 1
+    out = {"n": len(use), "n_total": len(allw), "excluded": excluded, "min_windows": MIN_WINDOWS,
+           "min_d_session": MIN_D_SESSION, "min_coverage_frac": MIN_COVERAGE_FRAC}
+    if pairs is not None:
+        out["vs_15min"] = _vs_15min(pairs, None)
+    if not use:
+        out["status"] = "insufficient_data"
+        return out
+    S = sum(w["d_session"] for w in use)
+    W = sum(w["d_weekly"] for w in use)
+    R = W / S
+    ratios = sorted(w["ratio"] for w in use)
+    n = len(use)
+    out.update({
+        "status": "ok" if n >= MIN_WINDOWS else "low_n",
+        "weighted": R, "sum_d_session": S, "sum_d_weekly": W,
+        "mean": sum(ratios) / n, "median": _percentile(ratios, 0.5),
+        "stdev": statistics.stdev(ratios) if n >= 2 else None,
+        "weighted_stdev": (sum(w["d_session"] * (w["ratio"] - R) ** 2 for w in use) / S) ** 0.5,
+        "p10": _percentile(ratios, 0.1), "p25": _percentile(ratios, 0.25),
+        "p75": _percentile(ratios, 0.75), "p90": _percentile(ratios, 0.9),
+        "min": ratios[0], "max": ratios[-1],
+    })
+    out["iqr"] = out["p75"] - out["p25"]
+    # how much of the window-to-window spread rounding alone explains, and the rest
+    rv = sum(w["d_session"] * (w.get("rounding_var_weekly", 2 / 12.0) + w["ratio"] ** 2
+                               * w.get("rounding_var_session", 2 / 12.0)) / w["d_session"] ** 2 for w in use) / S
+    out["rounding_spread"] = rv ** 0.5
+    out["intrinsic_stdev"] = max(0.0, out["weighted_stdev"] ** 2 - rv) ** 0.5
+    if n >= 2:
+        mean_s = S / n
+        out["se"] = (sum((w["d_weekly"] - R * w["d_session"]) ** 2 for w in use) / (n * (n - 1))) ** 0.5 / mean_s
+    else:
+        out["se"] = None
+    var_w = sum(w.get("rounding_var_weekly", 2 / 12.0) for w in use)
+    var_s = sum(w.get("rounding_var_session", 2 / 12.0) for w in use)
+    out["rounding_sd"] = (var_w + R * R * var_s) ** 0.5 / S   # delta method for W/S
+    out["rounding_worst"] = list(_ratio_interval(W, S, sum(w["err_weekly"] for w in use),
+                                                 sum(w["err_session"] for w in use)))
+    cutoff = now - timedelta(days=recent_days)
+    rec = [w for w in use if (_parse_ts(w.get("window_end")) or now) >= cutoff]
+    rs = sum(w["d_session"] for w in rec)
+    out["recent_days"] = recent_days
+    out["n_recent"] = len(rec)
+    out["weighted_recent"] = sum(w["d_weekly"] for w in rec) / rs if rs > 0 else None
+    out["distribution"] = [[(w.get("window_end") or "")[5:16], round(w["ratio"], 4), w["d_session"]]
+                           for w in sorted(use, key=lambda w: w.get("window_end") or "")[-DIST_MAX:]]
+    if pairs is not None:
+        out["vs_15min"] = _vs_15min(pairs, R)
+    return out
+
+
+def _vs_15min(pairs, weighted):
+    """The old consecutive-pair estimate next to the per-window one. The
+    sum-ratio over pairs telescopes to window endpoints (nearly unbiased); the
+    median of per-pair ratios is what integer rounding drags down."""
+    cand = [p for p in pairs if p["d_session"] > 0]
+    rs = sorted(p["d_weekly"] / p["d_session"] for p in cand)
+    S = sum(p["d_session"] for p in cand)
+    med = median(rs)
+    return {"n_pairs": len(cand), "median_15min": med,
+            "sum_ratio_15min": sum(p["d_weekly"] for p in cand) / S if S > 0 else None,
+            "share_zero_weekly": round(sum(1 for p in cand if p["d_weekly"] == 0) / len(cand), 3) if cand else None,
+            "factor_vs_median": (weighted / med) if weighted is not None and med else None}
+
+
+def preferred_ratio(snap):
+    """The ratio consumers should use: the per-window weighted estimate once
+    MIN_WINDOWS usable windows exist, else the old 15-min median (flagged).
+    Accepts a compute() snapshot; returns {value, source, n, flagged, spread, note}."""
+    rw = (snap or {}).get("ratio_windows") or {}
+    old = (snap or {}).get("ratio") or {}
+    if rw.get("status") == "ok":
+        return {"value": rw["weighted"], "source": "windows", "n": rw["n"], "flagged": False,
+                "spread": rw.get("weighted_stdev"), "iqr": rw.get("iqr"), "se": rw.get("se"),
+                "rounding_sd": rw.get("rounding_sd")}
+    if old.get("status") == "ok":
+        return {"value": old.get("median"), "source": "15min_median", "n": old.get("n"), "flagged": True,
+                "spread": None, "note": f"only {rw.get('n', 0)} usable session windows (< {MIN_WINDOWS}); "
+                                        "15-min median is biased low by integer rounding"}
+    return {"value": None, "source": None, "n": 0, "flagged": True, "note": "insufficient data"}
+
+
 # ------------------------------------------------------------------ attribution
 
 def estimate_side_rates(pairs):
@@ -240,10 +618,12 @@ def estimate_weekly_share(pairs, rates, current_weekly_resets):
 
 # ------------------------------------------------------------------ snapshot
 
-def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS):
+def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
     """Full snapshot from a list of already-parsed sample rows (oldest
     first). Pure function, easy to unit test with synthetic rows and to call
-    from usage_sampler.py with in-memory rows (no extra file I/O there)."""
+    from usage_sampler.py with in-memory rows (no extra file I/O there).
+    `windows`: stored per-session-window records (data/session_windows.jsonl);
+    merged with the windows derivable from `rows` (stored ones win)."""
     now = now or datetime.now(UTC)
     pairs = build_pairs(rows)
     ratio_est = estimate_ratio(pairs, now=now, trimmed_days=trimmed_days)
@@ -262,18 +642,26 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS):
     share = (estimate_weekly_share(pairs, rates, weekly_resets_now)
              if weekly_resets_now is not None else {"status": "insufficient_data", "reason": "no current weekly sample"})
 
-    return {
+    wins = merge_windows(windows, build_windows(rows, now=now))
+    snap = {
         "generated_at": now.isoformat(),
         "ratio": ratio_est,
         "windows_per_week": windows_per_week(ratio),
         "windows_left_this_week": windows_left_this_week(ratio, weekly_pct_now),
         "weekly_pct_now": weekly_pct_now,
         "attribution": {"rates": rates, "week_share": share},
+        "ratio_windows": estimate_window_ratio(wins, pairs=pairs, now=now, recent_days=trimmed_days),
     }
+    pref = preferred_ratio(snap)
+    pref["windows_per_week"] = windows_per_week(pref["value"])
+    pref["windows_left_this_week"] = windows_left_this_week(pref["value"], weekly_pct_now)
+    snap["preferred_ratio"] = pref
+    return snap
 
 
-def compute_from_file(path=SAMPLES, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS):
-    return compute(load_samples(path), now=now, trimmed_days=trimmed_days)
+def compute_from_file(path=SAMPLES, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows_path=SESSION_WINDOWS):
+    return compute(load_samples(path), now=now, trimmed_days=trimmed_days,
+                   windows=load_windows(windows_path) if windows_path else None)
 
 
 # ------------------------------------------------------------------ CLI
@@ -299,10 +687,24 @@ def human_summary(snap):
         lines.append(f"Session->weekly ratio: median {_fmt_ratio(r['median'])} weekly-%/session-% "
                      f"(n={r['n']}), trimmed mean over last {r['trimmed_days']}d: "
                      f"{_fmt_ratio(r['trimmed_mean']) if r['trimmed_mean'] is not None else 'insufficient data (n_recent=' + str(r['n_recent']) + ')'}")
-        lines.append(f"  -> about {snap['windows_per_week']:.1f} full session windows fit in one week")
-        if snap["weekly_pct_now"] is not None:
+        if snap["windows_per_week"] is not None:
+            lines.append(f"  -> about {snap['windows_per_week']:.1f} full session windows fit in one week")
+        if snap["weekly_pct_now"] is not None and snap["windows_left_this_week"] is not None:
             lines.append(f"  -> at {_fmt_pct(snap['weekly_pct_now'], 0)} weekly used now: "
                          f"{snap['windows_left_this_week']:.1f} session windows left this week")
+    rw = snap.get("ratio_windows") or {}
+    if rw.get("weighted") is not None:
+        vs = rw.get("vs_15min") or {}
+        lines.append(f"Per-session-window ratio ({rw['status']}): weighted {_fmt_ratio(rw['weighted'])} "
+                     f"(n={rw['n']} of {rw['n_total']} windows; stdev {_fmt_ratio(rw.get('stdev'))}, "
+                     f"IQR {_fmt_ratio(rw.get('p25'))}..{_fmt_ratio(rw.get('p75'))}, se {_fmt_ratio(rw.get('se'))}, "
+                     f"rounding sd {_fmt_ratio(rw.get('rounding_sd'))}); old 15-min median "
+                     f"{_fmt_ratio(vs.get('median_15min'))}")
+    else:
+        lines.append(f"Per-session-window ratio: insufficient data (0 usable of {rw.get('n_total', 0)} windows)")
+    pref = snap.get("preferred_ratio") or {}
+    lines.append(f"  -> preferred: {_fmt_ratio(pref.get('value'))} (source {pref.get('source')}"
+                 f"{', flagged' if pref.get('flagged') else ''})")
     rates = snap["attribution"]["rates"]
     lines.append(f"AFClaude (own) rate: {_fmt_ratio(rates['own']['rate'])} session-%/weighted-token (n={rates['own']['n']})")
     lines.append(f"User (other) rate: {_fmt_ratio(rates['other']['rate'])} session-%/weighted-token (n={rates['other']['n']})")
@@ -321,9 +723,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--samples", default=SAMPLES)
     ap.add_argument("--trimmed-days", type=int, default=DEFAULT_TRIMMED_DAYS)
+    ap.add_argument("--windows", default=SESSION_WINDOWS, help="per-session-window file (never pruned)")
+    ap.add_argument("--backfill-windows", action="store_true",
+                    help="rebuild --windows from --samples (keeps stored windows the samples no longer cover)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    snap = compute_from_file(args.samples, trimmed_days=args.trimmed_days)
+    if args.backfill_windows:
+        allw = backfill_windows(args.samples, args.windows)
+        use = [w for w in allw if w.get("usable")]
+        print(f"{args.windows}: {len(allw)} windows, {len(use)} usable")
+        for w in allw:
+            r = w.get("ratio")
+            print(f"  {w['window_end'][:16]}  ds={w['d_session']:>5g} dw={w['d_weekly']:>4g}  "
+                  f"ratio={'n/a' if r is None else f'{r:.4f}'}"
+                  f" [{_fmt_ratio(w.get('ratio_lo'))}..{_fmt_ratio(w.get('ratio_hi'))}]"
+                  f"  cov={w['coverage_frac']:.0%} {','.join(w['flags'])}")
+        return
+    snap = compute_from_file(args.samples, trimmed_days=args.trimmed_days, windows_path=args.windows)
     if args.json:
         print(json.dumps(snap, indent=1, default=str))
     else:

@@ -97,5 +97,47 @@ class T(unittest.TestCase):
         self.assertNotIn("human_prompts", us.series_line({"at": "x", "usage": {}}))
 
 
+class RatioSnapshot(unittest.TestCase):
+    def rows(self):
+        from datetime import timedelta
+        end = datetime(2026, 9, 26, 17, 0, tzinfo=UTC)
+        rows = [{"at": (end - timedelta(hours=5, minutes=10)).isoformat(),
+                 "usage": {"session": {"percent": 0.0, "resets_at": None},
+                           "weekly": {"percent": 30.0, "resets_at": R}}}]
+        for i in range(1, 20):
+            rows.append({"at": (end - timedelta(hours=5) + timedelta(minutes=15 * i)).isoformat(),
+                         "usage": {"session": {"percent": float(2 * i), "resets_at": end},   # datetimes, as in memory
+                                   "weekly": {"percent": 30.0 + (6 * i) // 19, "resets_at": R}}})
+        return rows, end
+
+    def test_records_completed_window_once_and_keeps_old_fields(self):
+        import os
+        import tempfile
+        from datetime import timedelta
+        rows, end = self.rows()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session_windows.jsonl")
+            t = end - timedelta(minutes=20)
+            snap = us.ratio_snapshot(rows, t, windows_path=path)     # window still open
+            self.assertFalse(os.path.exists(path))
+            self.assertIn("ratio", snap)
+            t = end + timedelta(minutes=5)
+            snap = us.ratio_snapshot(rows, t, windows_path=path)
+            snap = us.ratio_snapshot(rows, t, windows_path=path)     # second run: no duplicate
+            with open(path) as fh:
+                self.assertEqual(len(fh.readlines()), 1)
+            self.assertEqual(snap["ratio_windows"]["n"], 1)
+            self.assertAlmostEqual(snap["ratio_windows"]["weighted"], 6 / 38)
+            for k in ("ratio", "windows_per_week", "windows_left_this_week", "weekly_pct_now",
+                      "attribution", "preferred_ratio"):
+                self.assertIn(k, snap)
+
+    def test_window_file_failure_never_sinks_the_snapshot(self):
+        from datetime import timedelta
+        rows, end = self.rows()
+        snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
+        self.assertEqual(snap["ratio_windows"]["n"], 1)   # derived from rows instead
+
+
 if __name__ == "__main__":
     unittest.main()
