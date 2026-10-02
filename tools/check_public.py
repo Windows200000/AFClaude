@@ -8,7 +8,7 @@ Modes
                                   tree plus the author/committer/message of new commits
 
 What it blocks
-  - forbidden paths: local-only notes (BACKLOG.md, ALERTS.md, OPEN_QUESTIONS.md),
+  - forbidden paths: local-only notes (BACKLOG.md, ALERTS.md, OPEN_QUESTIONS.md, DECISIONS.md),
     runtime state (data/, run/, probe/, logs, *.db, keepalive_state.json), secrets
     (docker/secrets/, .env, *.key, *.pem, ssh keys), .venv/, __pycache__/
   - private key headers and well-known token formats (GitHub, Anthropic/OpenAI sk-,
@@ -46,7 +46,7 @@ LOCAL_PART_HASHES = {  # public-check: allow
 }
 
 FORBIDDEN_PATHS = [
-    "BACKLOG.md", "ALERTS.md", "OPEN_QUESTIONS.md",
+    "BACKLOG.md", "ALERTS.md", "OPEN_QUESTIONS.md", "DECISIONS.md",
     "data/*", "run/*", "probe/*", "docker/secrets/*", ".venv/*", "*/__pycache__/*", "__pycache__/*",
     "keepalive_state.json", "keepalive.lock", "STOP", "PAUSED",
     "*.log", "*.db", "*.sqlite", "*.sqlite3", "*.bak",
