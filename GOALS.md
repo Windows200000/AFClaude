@@ -5,7 +5,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 1. [ ] Check that the 00:00 window-start fire of 30.09. acted (plan = send-keys into tmux ka-f2897285) and log the result
 2. [x] Host-wide stalled-session detector + SQLite store (`stalled.py`, `store.py`), 29.09.
 3. [x] Task store (`tasks.py`) with the project/stage priority model (ordered projects; stages high/medium/low, default high), 29.09.
-4. [x] Local MCP server (`mcp_server.py`, 9 tools), 29.09. The user still has to register it (OPEN_QUESTIONS)
+4. [x] Local MCP server (`mcp_server.py`, 9 tools), 29.09. registered and verified (task 1 via MCP, 29.09.)
 5. [x] Dispatcher (`dispatcher.py`), 29.09.: armed via cron every 10 min; approved stalled sessions + queued tasks, never takes over RC-server threads
 6. [ ] Usage model: first review done 01.10. (reserve model in usage_model.py, b02a13e; live with the pending rebuild). Next: follow-ups in PROGRESS.md (pause on yield, session anchoring at T−5 h, multi-fire last mile, nightly cost), refit data/user_model.json after 3–4 closed weeks; next review 29.10.
 7. [~] Dashboard: design done (docs/dashboard_design.md, 0d4b076); 9 build phases in the task store (1: config + schema v4 + actions.py … 9: retire the quickview + seed the backlog)
