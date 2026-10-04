@@ -217,7 +217,7 @@ class Stalled(Base):
         msg = " ".join(call)
         self.assertIn("The user asked AFClaude to continue", msg)   # continue_foreign.md: the user's session
         self.assertIn("Guard hooks", msg)
-        self.assertNotIn("PROJECT MANAGER", msg)                     # neutral: no manager rules
+        self.assertNotIn("TASK-MANAGER", msg)                     # neutral: no manager rules
         self.assertEqual(call[call.index("--model") + 1], "claude-sonnet-test")   # its own model
         skips = "\n".join(rep["skip"])
         self.assertIn(f"{sid(2)[:8]}: undecided", skips)
@@ -707,7 +707,7 @@ class Prompts(Base):
         c = ka.session_message("continue_foreign", manager=False, reason="r", context="ctx")
         self.assertIn("ctx", c)
         self.assertNotIn("{", c)
-        self.assertNotIn("PROJECT MANAGER", c)
+        self.assertNotIn("TASK-MANAGER", c)
 
     def test_task_session_continue_keeps_opus_and_task_hint(self):
         self.project("p1")
@@ -723,7 +723,7 @@ class Prompts(Base):
         call = self.resume_calls()[-1]
         msg = " ".join(call)
         self.assertIn(f"AFClaude task #{t['id']}", msg)
-        self.assertIn("PROJECT MANAGER", msg)
+        self.assertIn("TASK-MANAGER", msg)
         self.assertEqual(call[call.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(call.count("--new"), 0)
 
@@ -739,7 +739,7 @@ class Prompts(Base):
 
     def test_keepalive_message_keeps_all_manager_rules(self):
         m = ka.session_message("continue", reason="r", progress="P.md")
-        for part in ("PROJECT MANAGER", "usage_report.py", "OPEN_QUESTIONS.md", "PUBLIC", "worktree"):
+        for part in ("TASK-MANAGER", "usage_report.py", "OPEN_QUESTIONS.md", "PUBLIC", "worktree"):
             self.assertIn(part, m)
 
 
