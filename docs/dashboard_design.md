@@ -46,7 +46,6 @@ Session and component roles:
 - **The only difference between manager and editor is forcing an immediate run** (D-190). Owners, managers and editors can all decide agent proposals in the dashboard (F9). Further differences, *proposals* for the owner:
   - Managers can grant and revoke **editor** and **viewer** access to their project (not manager or owner; those stay with owners) (D-192).
   - Managers and editors both **make** (confirm) project-scoped decisions; task-managers only **propose** them (§7.6, D-192). Install-wide decisions are confirmed by owners only.
-  - *Proposal:* **prompt overrides** for the project are manager-only, because they change what every session of the project receives (high impact); global overrides are owner only.
 - The last owner that isn't group-derived can't be removed or demoted, so a group change at the OIDC provider can't leave the install without an owner (D-183).
 - Granting **editor** or **manager** on a project lets that user steer autonomous sessions that run with the guard hooks bypassed on the execution host (an answer, a stage or a message becomes a session's input). The grant dialog says so.
 - **Choosing the work is algorithmic** (D-189): which project runs and which task or stage inside it is picked by the dispatcher, by project rank and stage priority (D-064); people steer it through the ranks, the priorities and run-now (§5.4). The project's task-manager then does the run and delegates to agents.
@@ -157,7 +156,7 @@ Hand-offs and compaction are **per tmux session** (one `driven_sessions` row). A
 
 ### 7.1 Conventions
 - SQLite in WAL mode at `/data/afclaude.db`; `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict; validation in Python. The WAL is archived for `db_wal_retention_days` (default 7) instead of being discarded at checkpoint, so the DB can be rolled back to any moment in that window (D-175, §11.1).
-- **Schema guard (review A1):** code refuses to write when the DB's `schema_version` is newer than its own; non-additive changes (e.g. the `prompt_overrides` key, §7.6) go through an explicit migrate step after a backup.
+- **Schema guard (review A1):** code refuses to write when the DB's `schema_version` is newer than its own; non-additive changes go through an explicit migrate step after a backup.
 - `version` column (trigger-bumped) on every owner-editable table; writes carry the version they saw, a mismatch is a 409. Idempotency keys for 7 days. Both built.
 - Telemetry and runner tables carry `account_id` (one row in `accounts` now, D-156), so the future pool needs no migration.
 - Secrets in the DB (TOTP seeds, OIDC client secret, recovery-code hashes' pepper, the bridge key if stored) are encrypted with the master key (§10.2).
@@ -170,7 +169,7 @@ Hand-offs and compaction are **per tmux session** (one `driven_sessions` row). A
 | observation | `sessions`, `limit_hits`, `run_log`, `driven_sessions`, `action_requests` | built (runners write them from phase 3a) |
 | config | `settings`, `meta`, `installation` (id, epoch, restored_from), `accounts` | settings built; rest new |
 | audit | `audit_log` (append-only), `idempotency_keys` | built |
-| prompts | `prompt_overrides` (+ `project_id`) | built; scope new |
+| prompts | `prompt_overrides` (system-wide, D-193) | built |
 | decisions | `decisions`, `decision_links`, `decisions_fts` | new (§7.6) |
 | hand-offs | `handoffs` | new (§5.5) |
 | agent proposals | `agent_proposals` (project, session, run, kind, payload, summary, status `proposed`/`approved`/`edited`/`rejected`, reviewer, note, ts), `agent_runs` (session, project, task, started/ended, summary, reviewed by/at) | new (§7.9, D-182) |
@@ -213,11 +212,11 @@ What moves from files (each with a one-time importer that checks row counts, the
   - **Display:** per-user time zone, theme, `ui_chat_reset_hours` (default 5, range 1–168: idle time after which the task-manager message box starts empty again, D-178).
 
 ### 7.5 Per project vs global (D-152)
-- Per project: decisions, questions, prompt overrides, hand-offs, docs (goals, progress, alerts, exceptions, reviews), agent proposals and run summaries, session settings, grants.
+- Per project: decisions, questions, hand-offs, docs (goals, progress, alerts, exceptions, reviews), agent proposals and run summaries, session settings, grants.
 - Global: windows, budget, automation, auth, users, backup, accounts.
 
 ### 7.6 Prompts and the decision store
-**Prompts (D-110, D-111).** Defaults ship as `prompts/*.md`. `prompt_overrides` is keyed by `(name, project_id)` (`NULL` = global; the table is empty, so the key change is a trivial migrate). Resolution: project override > global override > default. Global overrides are owner only; *proposal:* project overrides are manager-only (§2). `prompts.py` defines one **bundle per session kind** (task-manager continue, task start, stall continue, session-end save, resume after compact, usage review, Haiku judge), so F8 shows exactly what each kind receives. Saving validates the placeholder set and test-renders; `base_sha256` flags "default changed since your edit" with a three-way view.
+**Prompts (D-110, D-111).** Defaults ship as `prompts/*.md`. Prompts are **system-wide** (D-193): `prompt_overrides` is keyed by `name` only, owner-only. Resolution: override > default. Project-specific instructions belong in that project's own `CLAUDE.md`; the AFClaude-specific prompt (`manager_afclaude.md`) moves into the AFClaude repo's `CLAUDE.md`. `prompts.py` defines one **bundle per session kind** (task-manager continue, task start, stall continue, session-end save, resume after compact, usage review, Haiku judge), so F8 shows exactly what each kind receives. Saving validates the placeholder set and test-renders; `base_sha256` flags "default changed since your edit" with a three-way view.
 
 **Decision store (D-104–D-107, D-151, D-158).**
 - `decisions`: `id` (D-NNN), `project_id` (`NULL` = install-wide), `slug` (stable unique key per project, e.g. `budget/night-gate`), `title`, `summary` (relevance-only, see retrieval), `words` (verbatim quotes with date and source, JSON), `keywords` (JSON), `scope`, `status` (`proposed | active | done`), `author` (`owner | task-manager`), `interpretation` (clearly non-binding), `updated_at/by`, `version`.
