@@ -49,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import usage_stale
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -187,7 +188,9 @@ def tail_rows(path=None, max_bytes=TAIL_BYTES):
 
 
 def _weekly(r):
-    return _dict(_dict(_dict(r).get("usage")).get("weekly"))
+    """The row's weekly meter; {} for a stale row (usage_stale: the /usage cache was not
+    refreshed, the frozen % would fake a flat or jumping week)."""
+    return _dict(usage_stale.row_usage(_dict(r)).get("weekly"))
 
 
 def _count(d, key):

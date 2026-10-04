@@ -9,7 +9,11 @@ of normal work. Everything goes to data/ as JSONL, one row per run.
 Per run:
   - fresh /usage (`claude -p --no-session-persistence /usage`, local command,
     no model call): session + weekly %, reset times, raw text (incl. the
-    "what's contributing" breakdown)
+    "what's contributing" breakdown). If /usage does not refresh the cache,
+    keepalive.refresh_usage_checked retries after one tiny token-refresh request;
+    a cache still older than usage_stale.USAGE_STALE_AFTER gives a row marked
+    usage.stale = true (kept, but ignored by pacing.py / limit_ratio.py), and
+    after STALE_ALERT_AFTER of that, one ALERTS.md entry per episode
   - incremental scan of all transcripts (subagents included) since the last run:
     tokens by model (input / cache write / cache read / output / thinking),
     assistant turns, human prompts, limit hits, active sessions, split into
@@ -43,6 +47,7 @@ sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache parsing, scrubbed env)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
+import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ignore them)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -92,13 +97,22 @@ def local_fields(t):
 
 # ------------------------------------------------------------------ usage
 
-def usage_now():
-    rc, out = ka.refresh_usage(cwd=DATA)
-    u = ka.read_usage_cache() or {}
+def usage_now(t=None):
+    """/usage (with the shared retry, keepalive.refresh_usage_checked) -> the row's usage dict.
+    A cache older than usage_stale.USAGE_STALE_AFTER is kept but marked stale: true."""
+    t = t or now_utc()
+    res = ka.refresh_usage_checked(cwd=DATA, now=t)
+    rc, out = res["rc"], res["out"]
+    u = res["usage"] or {}
     row = {"rc": rc, "fetched_at": u.get("fetched_at")}
     for k in ("session", "weekly"):
         if k in u:
             row[k] = u[k]
+    row["stale"] = usage_stale.is_stale(u.get("fetched_at"), t)
+    if row["stale"] and u.get("fetched_at"):
+        row["stale_min"] = round((t - u["fetched_at"]).total_seconds() / 60)
+    if res["retried"]:
+        row["refresh_retry"] = {"ok": res["ok"], "poke": res["poke"]}
     row["text"] = out.strip()[:3000]
     try:
         cache = host.usage_cache() if host.in_container() else json.load(open(ka.CLAUDE_JSON)).get("cachedUsageUtilization", {})
@@ -512,6 +526,8 @@ def series_line(row):
     if row.get("activity"):
         line["human_prompts"] = sum((row["activity"].get(x) or {}).get("human_prompts", 0)
                                     for x in ("own", "other"))
+    if usage_stale.row_stale(row):
+        line["stale"] = True          # the meters are the frozen cache, not a reading
     return line
 
 
@@ -533,6 +549,44 @@ def ratio_snapshot(rows, t, windows_path=None):
     return limit_ratio.compute(rows, now=t, windows=stored)
 
 
+# ------------------------------------------------------------------ stale-usage alert
+
+STALE_ALERT_AFTER = timedelta(hours=3)   # the cache stale this long -> one ALERTS.md entry
+
+
+def stale_alert(st, usage, t, notify_fn=None):
+    """One alert (ALERTS.md, D-049) per stale episode once the usage cache has been stale for
+    more than STALE_ALERT_AFTER; the episode is keyed by the frozen fetch time, so the 15-min
+    runs don't repeat it. A fresh sample ends the episode. -> True if it alerted."""
+    if not usage.get("stale"):
+        st.pop("stale_since", None)
+        st.pop("stale_alerted", None)
+        return False
+    since = _dt(st.get("stale_since")) or t
+    st["stale_since"] = since.isoformat()
+    f = _dt(usage.get("fetched_at"))
+    start = min(f, since) if f else since
+    key = f.isoformat() if f else "no-cache"
+    if st.get("stale_alerted") == key or t - start < STALE_ALERT_AFTER:
+        return False
+    if notify_fn is None:
+        from notify import notify as notify_fn
+    hours = (t - start).total_seconds() / 3600
+    subject = f"usage data stale for {hours:.0f} h: /usage does not refresh the cache"
+    body = (f"`claude -p /usage` has not refreshed ~/.claude.json since "
+            f"{f.astimezone(BERLIN).strftime('%a %d.%m. %H:%M') if f else 'n/a'} (Berlin), also not "
+            f"after a token-refresh request ({(usage.get('refresh_retry') or {}).get('poke') or 'not tried'}). "
+            f"Sampler rows are kept but marked stale (ignored by the forecast and the ratio); autonomous "
+            f"starts hold (fail-safe). Last /usage output: {(usage.get('text') or '').strip()[:200]!r}")
+    try:
+        notify_fn(subject, body)
+    except Exception as e:   # noqa: BLE001 - an alert failure must not sink the sample
+        print(f"stale alert failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return False
+    st["stale_alerted"] = key
+    return True
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -544,23 +598,28 @@ def main():
     t = now_utc()
     st = load(STATE, {})
     baseline = not st.get("offsets")
-    usage = usage_now()
+    usage = usage_now(t)
+    stale = bool(usage.get("stale"))
     agg = scan(st, baseline)
     row = {"at": t.isoformat(), **local_fields(t), "tag": args.tag, "baseline": baseline,
            "since": st.get("last_sample_at"), "usage": usage,
            "activity": summarize(agg, st["sessions"]) if agg is not None else None,
            "agents": agents_snapshot()}
     w = usage.get("weekly") or {}
-    if w.get("resets_at"):
+    if w.get("resets_at") and not stale:
         start = w["resets_at"] - ka.WEEK
         row["week_elapsed_frac"] = round((t - start) / ka.WEEK, 4)
         row["projected_linear"] = round(ka.project_weekly(w["percent"], w["resets_at"], t), 1)
     # Cheap: reuse the samples already on disk plus this row, so the ratio
     # snapshot's own history is kept alongside every sample (limit_ratio.py).
     row["limit_ratio"] = ratio_snapshot(limit_ratio.load_samples(SAMPLES) + [row], t)
-    row.update(derived_fields(usage, row["activity"], st.get("prev_pct")))
+    # stale meters: no deltas from / against them (a 34 h-old % is no previous reading)
+    row.update(derived_fields(usage, row["activity"], None if stale else st.get("prev_pct")))
     try:
-        st["prev_pct"] = pct_state(usage)
+        if stale:
+            st.pop("prev_pct", None)
+        else:
+            st["prev_pct"] = pct_state(usage)
     except Exception:
         st.pop("prev_pct", None)
     st["last_sample_at"] = t.isoformat()
@@ -569,7 +628,9 @@ def main():
         append(SERIES, series_line(row))
     except Exception:
         pass
-    track_cycle(usage, t, args.tag)
+    if not stale:                     # a frozen % would fake the cycle's max / pre-reset value
+        track_cycle(usage, t, args.tag)
+    stale_alert(st, usage, t)
     if not args.no_haiku and args.tag == "cron":
         haiku_judgement(st, t)
     dump(STATE, st)

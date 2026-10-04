@@ -46,6 +46,9 @@ import statistics
 import sys
 from datetime import datetime, timedelta, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import usage_stale  # noqa: E402  (stale rows: their meters are ignored)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 SAMPLES = os.path.join(DATA, "samples.jsonl")
@@ -138,7 +141,7 @@ def build_pairs(rows):
     pairs = []
     prev = None
     for r in rows:
-        u = r.get("usage") or {}
+        u = usage_stale.row_usage(r)
         s = u.get("session") or {}
         w = u.get("weekly") or {}
         t = _parse_ts(r.get("at"))
@@ -228,7 +231,7 @@ def _points(rows):
     ending at this sample."""
     pts = []
     for r in rows:
-        u = r.get("usage") or {}
+        u = usage_stale.row_usage(r)
         s = u.get("session") or {}
         w = u.get("weekly") or {}
         t = _parse_ts(r.get("at"))
@@ -632,7 +635,7 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
     weekly_pct_now = None
     weekly_resets_now = None
     for r in reversed(rows):
-        w = (r.get("usage") or {}).get("weekly") or {}
+        w = usage_stale.row_usage(r).get("weekly") or {}
         if w.get("percent") is not None and w.get("resets_at"):
             weekly_pct_now = w["percent"]
             weekly_resets_now = _round_reset(w["resets_at"])

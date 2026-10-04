@@ -46,6 +46,7 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
 
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -78,6 +79,10 @@ MIN_ELAPSED = timedelta(hours=24)   # forecast floor
 POLL_SECONDS = 30
 RESET_GRACE = timedelta(seconds=90)       # fire this long after the reset time
 USAGE_MAX_AGE = timedelta(minutes=10)     # refresh /usage if cache older than this
+REFRESH_OK_AGE = timedelta(minutes=2)     # /usage left the cache this young: OK (claude skips the rewrite < 60 s)
+POKE_MIN_INTERVAL = timedelta(minutes=30) # at most one token-refresh request per this (sampler + watcher + cron)
+USAGE_ALERT_AFTER = 2                     # failed usage checks in a row at one window start -> one ALERT
+USAGE_STATE_FILE = os.path.join(STATE_DIR, "usage_refresh_state.json")
 HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this often
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
 VERIFY_TIMEOUT = timedelta(minutes=10)
@@ -320,15 +325,125 @@ def refresh_usage(cwd=HERE):
         return -1, str(e)
 
 
+# A minimal real model request (Haiku, no tools, no session file). Its argv must stay one of the
+# shapes docker/host_exec.py whitelists for `claude -p --model haiku` (prompt on stdin).
+POKE_ARGV = ["claude", "-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json",
+             "--tools=", "--strict-mcp-config", "--permission-mode", "dontAsk", "--disable-slash-commands"]
+POKE_PROMPT = "Reply with the single word OK."
+LAST_REFRESH = {}   # the latest refresh_usage_checked() result (for log lines and alerts)
+
+
+def _load_usage_state():
+    try:
+        with open(USAGE_STATE_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_usage_state(d):
+    try:
+        tmp = USAGE_STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh, indent=1, default=str)
+        os.replace(tmp, USAGE_STATE_FILE)
+    except OSError as e:
+        log(f"usage state not saved: {e}")
+
+
+def poke_auth(cwd=HERE, now=None):
+    """One minimal real model request, to renew the OAuth access token. `-p /usage` is a local
+    command: on 03./04.10.2026 it printed only the cost summary and refreshed nothing for
+    34 h, until the first real request renewed the token (see usage_stale.py). Throttled to
+    one per POKE_MIN_INTERVAL across all callers. -> short result text."""
+    now = now or datetime.now(UTC)
+    st = _load_usage_state()
+    last = usage_stale.ts(st.get("poke_at"))
+    if last and timedelta(0) <= now - last < POKE_MIN_INTERVAL:
+        return f"skipped (last token-refresh request {berlin(last)})"
+    st["poke_at"] = now.isoformat()
+    _save_usage_state(st)
+    try:
+        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=cwd, env=SCRUBBED_ENV, timeout=180)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        return f"failed: {type(e).__name__}: {e}"[:200]
+    try:
+        o = json.loads(r.stdout or "{}")
+        res = f"is_error={o.get('is_error')} result={str(o.get('result'))[:60]!r}"
+    except ValueError:
+        res = f"output {(r.stdout or r.stderr or '').strip()[:80]!r}"
+    return f"rc={r.returncode} {res}"
+
+
+def _refreshed(u, before, now):
+    """/usage did its job: the cache's fetch time moved on, or it is very young (claude does not
+    rewrite a cache younger than 60 s, so 'unchanged' alone is no failure)."""
+    if not u:
+        return False
+    f = u["fetched_at"]
+    return (before is not None and f > before) or timedelta(0) <= now - f <= REFRESH_OK_AGE
+
+
+def refresh_usage_checked(cwd=HERE, now=None):
+    """The ONE usage refresh with retry, used by the sampler and the watcher / window-start paths:
+    /usage; if the cache did not refresh, one cheap real request (poke_auth: renews an expired
+    OAuth token) and /usage again. -> dict rc, out (last /usage output), usage (cache after,
+    or None), ok (refreshed), retried, poke (poke_auth result or None)."""
+    now = now or datetime.now(UTC)
+    before = (read_usage_cache() or {}).get("fetched_at")
+    rc, out = refresh_usage(cwd)
+    u = read_usage_cache()
+    res = {"rc": rc, "out": out, "usage": u, "ok": _refreshed(u, before, now), "retried": False, "poke": None}
+    if not res["ok"]:
+        log(f"/usage did not refresh the cache (rc={rc}, cache from "
+            f"{berlin(u['fetched_at']) if u else 'n/a'}): {out.strip()[:120]!r}; trying a token-refresh request")
+        res["poke"] = poke_auth(cwd, now)
+        res["retried"] = True
+        log(f"token-refresh request: {res['poke']}")
+        rc, out = refresh_usage(cwd)
+        u = read_usage_cache()
+        res.update(rc=rc, out=out, usage=u, ok=_refreshed(u, before, max(now, datetime.now(UTC))))
+    LAST_REFRESH.clear()
+    LAST_REFRESH.update(res, at=now)
+    return res
+
+
 def fresh_usage(now, force=False):
     u = read_usage_cache()
     if force or not u or now - u["fetched_at"] > USAGE_MAX_AGE:
-        rc, out = refresh_usage()
-        u = read_usage_cache()
+        r = refresh_usage_checked(now=now)
+        u = r["usage"]
         if not u or now - u["fetched_at"] > USAGE_MAX_AGE:
-            log(f"usage refresh failed or cache still stale (rc={rc}): {out.strip()[:200]!r}")
+            log(f"usage refresh failed or cache still stale (rc={r['rc']}, retried={r['retried']}): "
+                f"{r['out'].strip()[:200]!r}")
             return None
     return u
+
+
+def note_window_usage(key, ok, now, final=False):
+    """Window-start usage bookkeeping: count failed (unknown / stale) usage checks in a row per
+    window-start key; after USAGE_ALERT_AFTER of them append ONE alert to ALERTS.md (D-048 /
+    D-049), not one every 15 min; at once if `final` (no recheck follows tonight). A good check
+    resets the count. The fail-safe itself is unchanged: unknown usage never starts work.
+    -> True if it alerted."""
+    st = _load_usage_state()
+    ent = (st.get("window_start") or {}).get(key) or {"fails": 0, "alerted": False}
+    ent["fails"] = 0 if ok else ent.get("fails", 0) + 1
+    alerted = False
+    if not ok and (ent["fails"] >= USAGE_ALERT_AFTER or final) and not ent.get("alerted"):
+        cache = (LAST_REFRESH.get("usage") or read_usage_cache() or {}).get("fetched_at")
+        alert(f"weekly usage unknown at the window start ({ent['fails']} checks in a row): "
+              "no autonomous start (fail-safe)",
+              f"`claude -p /usage` did not refresh ~/.claude.json (cache from "
+              f"{berlin(cache) if cache else 'n/a'}), also not after a token-refresh request "
+              f"({LAST_REFRESH.get('poke') or 'not tried'}). Last /usage output: "
+              f"{(LAST_REFRESH.get('out') or '').strip()[:300]!r}. The watcher rechecks every 15 min; "
+              "a real Claude request (or `claude /login`) on the host usually fixes it.")
+        ent["alerted"] = alerted = True
+    st["window_start"] = {key: ent}      # older nights are over
+    _save_usage_state(st)
+    return alerted
 
 
 # ---------------------------------------------------------------- budget rule
@@ -984,6 +1099,8 @@ def window_start_pass(sid, now, args):
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
     key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
+    if not args.now:
+        note_window_usage(key, u is not None, now, final=not (d.get("postpone") and d.get("recheck_at")))
     if not args.now and getattr(args, "arm", False):
         try:                                  # score the forecast later (pacing.forecast_errors)
             import pacing
@@ -1055,8 +1172,10 @@ def deferred_window_start_pass(sid, now, st, args):
     due = parse_ts(ent.get("recheck_at")) or now
     if now < due:
         return due
-    d = budget_eval(fresh_usage(now, force=True), now)
+    u = fresh_usage(now, force=True)
+    d = budget_eval(u, now)
     log(f"window-start (postponed): {d['reason']}")
+    note_window_usage(key, u is not None, now, final=not (d.get("postpone") and d.get("recheck_at")))
     if d["go"]:
         defs.pop(key, None)
         save_deferred(defs)

@@ -633,6 +633,7 @@ class DryRun(Base):
         code = ("import sys, keepalive as ka, dispatcher as dp;"
                 f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
+                f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
                 "ka.alert=lambda s, b='': print('ALERT', s);"
                 "sys.exit(dp.main(['--once', '--now', '--json']))")
         r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True,
@@ -653,6 +654,7 @@ class DryRun(Base):
         code = ("import sys, keepalive as ka, dispatcher as dp;"
                 f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
+                f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
                 "ka.alert=lambda s, b='': None;"
                 "sys.exit(dp.main(['--once', '--now']))")
         with open(out_path, "a") as out:

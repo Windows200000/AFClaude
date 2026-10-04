@@ -30,7 +30,8 @@ _OLD_CFG = afclaude_config.CONFIG_FILE
 
 import pacing as budget  # noqa: E402
 
-_OLD_FILES = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES)
+_OLD_FILES = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES,
+              ka.USAGE_STATE_FILE, ka.alert)
 
 
 def setUpModule():
@@ -43,11 +44,15 @@ def setUpModule():
     budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
     ka.DEFER_FILE = os.path.join(_CFG_DIR.name, "deferred.json")
     budget.FIRE_FILES = []
+    # window-start usage bookkeeping (note_window_usage): a temp state file, never ALERTS.md / a push
+    ka.USAGE_STATE_FILE = os.path.join(_CFG_DIR.name, "usage_refresh_state.json")
+    ka.alert = lambda subject, body="": None
 
 
 def tearDownModule():
     afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES = _OLD_FILES
+    (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES,
+     ka.USAGE_STATE_FILE, ka.alert) = _OLD_FILES
     _CFG_DIR.cleanup()
 
 
