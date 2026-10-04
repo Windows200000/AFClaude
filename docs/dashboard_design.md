@@ -1,6 +1,6 @@
 # AFClaude dashboard and backend: target design (v2)
 
-Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-165). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the manager's and may be changed. Host names are placeholders.
+Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-180). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the manager's and may be changed. Host names are placeholders.
 
 ## 1. Goals and non-goals
 
@@ -21,29 +21,30 @@ Non-goals (v1)
 - Replacing the MCP server as the main way tasks get added.
 - A budget-rule editor. The thresholds are settings; the rule itself is code (`pacing.py`, D-141).
 
-## 2. Users, roles and access (D-149, D-156, D-160)
+## 2. Users, roles and access (D-149, D-156, D-160, D-172)
 
 | role | who | can |
 |---|---|---|
-| **owner** | the first browser registration (exactly one) | everything, incl. making/removing co-owners and transferring ownership |
-| **co-owner** | granted by the owner (or by an OIDC group, §9.4) | everything except owner-only user actions (*proposal*: co-owners manage users and project grants but can't create or remove co-owners) |
+| **owner** | the first browser registration (guarded by the one-time setup code, §9.3), plus every user an owner makes owner or an OIDC group grants it (§9.4); several owners allowed | everything, incl. making and removing owners |
 | **project edit** | granted per project | that project's stages, priorities, order, question answers, stall decisions for its sessions; propose decisions |
 | **project view** | granted per project | read that project (stages, questions, decisions, hand-offs, effective prompts, its driven sessions) |
 | *(none)* | every other registered login | nothing; sees "no access yet" (default for new users, D-149) |
 | **agent** | AFClaude's autonomous sessions (MCP/CLI) | add/edit tasks and ask questions in its project, write its own hand-offs and its project's manager docs, propose decisions; never owner-only actions (D-160) |
 | **runner** | the runner daemon's components | the state changes the runners own (task start/finish, run log, telemetry), audited as `runner:<component>` |
 
-- Only owner and co-owners see global settings (windows, budget, auth, users, backup) (D-149).
-- *Proposal:* run-now, prompt overrides, project-scope "always continue" rules and decision confirmation are owner/co-owner only, because they spend the shared budget or bind autonomous sessions.
+- Only owners see global settings (windows, budget, auth, users, backup) (D-149).
+- *Proposal:* run-now, prompt overrides, project-scope "always continue" rules and decision confirmation are owner only, because they spend the shared budget or bind autonomous sessions.
+- *Proposal:* the last owner that isn't group-derived can't be removed or demoted, so a group change at the OIDC provider can't leave the install without an owner.
 - Granting **edit** on a project lets that user steer autonomous sessions that run with the guard hooks bypassed on the execution host (an answer or a stage becomes a session's input). The grant dialog says so.
 - The audit actor is the user (`user:<id>`), the session (`agent:<session>`) or the component (`runner:dispatcher`).
-- v1 enforcement of the agent role is advisory (D-160): rejected attempts are audited and raise an alert; see §9.6 for its limits.
+- v1 enforcement of the agent role is advisory (D-160, D-173): rejected attempts are audited and raise an alert; see §9.6 for its limits.
 
 ## 3. Main flows (phone first)
 
 One column, large tap targets, no hover-only controls, no drag-and-drop as the only way to reorder, every page useful on its first screen. Top bar: automation state (running / paused, toggle), tonight's window ("23:00–09:00, 2 × 5 h"), weekly usage and the projected end of week, inbox badge. Every view is filtered by the viewer's grants.
 
 - **F1 Inbox (home).** Only real questions (D-083): open questions (`kind='question'`) and blocked tasks, with a text box each; decision proposals waiting for confirmation. Never stalls, never untitled sessions. Answering removes the card at once (the server returns the new inbox). Empty inbox = one line.
+- **F14 Message the manager (D-178), on the inbox page next to the answers.** A general box for anything that isn't an answer to an open question, mainly questions to the manager or new goals; a minimal embedded chat. It starts as one text box; after sending, it shows the message and, once it arrives, the manager's one reply. It grows into a chat (the thread with a new box under it) only when the user sends a follow-up. After `ui_chat_reset_hours` (default 5 h) without a new message in the thread, the thread is closed and the page shows an empty box again (closed threads stay in the DB, reachable from "earlier messages"). Mechanics: each message is a row in `chat_messages` (§7.2); sending queues a `manager_message` request and wakes the runner, which delivers it to the manager immediately, like run-now (D-153, §5.4: no window or budget check, works while paused, preflight applies): a running manager session gets a short notice at its next idle point, an idle one is resumed with it. The manager reads the thread and replies through MCP (`afclaude_messages`, `afclaude_reply`); goals it accepts it records through its normal tools (tasks, docs) and says so in the reply. While waiting, the card shows the request state (queued → delivered → answered). *Proposal:* messaging the AFClaude manager is owner only (it wakes a session immediately and spends the budget, like run-now); a project's own manager can be messaged by users with edit on that project, and without the owner role the message waits for that manager's next regular run instead of waking it.
 - **F2 Stalled sessions.** Only sessions whose last entry is a limit notice (D-041), newest first, own AFClaude sessions hidden by default. Card: title (or cwd + first prompt), project, stall kind, reset time, the effective decision and its source. Buttons: Continue, Ignore, "Always…" (session rule or project rule, preselecting the most specific cwd), and **Run now** (§5.4). Undecided stalls never expire; decided ones move to a "decided" filter. RC-server threads show "continue it from the app" (§10.8).
 - **F3 Queue and projects.** Ranked projects with their stages and a priority chip (tap cycles high → medium → low, D-064). Up/down buttons, "move to position…", optional drag on desktop. Per-project menu: whole project to medium/low, edit, manage/unmanage, **Work on now** (D-036, §5.4), members (grants). A second tab shows the flat execution order and why an item is skipped.
 - **F4 Window planner.** Seven rows Mon..Sun with each night's window or "off"; linked days share a colour (D-034, §6). Editor: change all linked / only this day / whole week; preview over the next 7 nights incl. DST nights and the weekly-reset marker; the measured ratios (`limit_ratio.py`: weekly % per session window, windows per week and left, AFClaude vs user share, each with "insufficient data" when honest). Save applies at once (the runner is woken).
@@ -58,7 +59,7 @@ One column, large tap targets, no hover-only controls, no drag-and-drop as the o
 - **F13 Host.** The host validation (D-164, §10.5): tmux, Claude Code, login, bridge, working root, permissions, MCP, each ok / warn / fail with a fix hint; "run all checks" and the end-to-end session test.
 - **Add task** (secondary): title, description, project, priority.
 
-First login: a popup offers the browser's time zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`). For the owner it sets the global `window_tz`; for everyone it sets their display time zone. Both stay adjustable (D-148).
+First login: a popup offers the browser's time zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`). For the first owner it sets the global `window_tz` (Europe/Berlin until then, D-173); for everyone it sets their display time zone. Both stay adjustable (D-148).
 
 ### 3.1 UX rules (owner, kept)
 - **Visual design (D-074):** purple main accent; vibrant colours that directly represent status (done / in progress / pending / blocked / alert), used the same everywhere; rigid but sleek: a strict grid, clear boxes and chips, compact, no decorative fluff.
@@ -89,7 +90,7 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 
 ## 5. Runners
 
-### 5.1 One resident runner daemon (*proposal*, follows from D-153)
+### 5.1 One resident runner daemon (D-153, D-173)
 `runner.py` replaces supercronic, the `at` shim and the keep-alive watcher. It is one process with an internal scheduler; every job runs in a child process with a timeout, so a crash doesn't stop the loop. Job intervals are settings.
 
 | job | default |
@@ -100,8 +101,9 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 | usage sampler + pre/post-reset samples | every 15 min + scheduled jobs |
 | usage review | when due |
 | status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily |
+| WAL archiver (Litestream, §11.1), a supervised child process; its replication lag is part of the health | continuous |
 
-- **Wake:** after any write that the runner must act on (run-now, window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
+- **Wake:** after any write that the runner must act on (run-now, a message to the manager, window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
 - Health: the runner writes its last tick per job to `runner_state`; the web container's health check and F5 read it; the container restarts on a stale heartbeat.
 - Pause (`automation_paused`) stops automatic starts and continues; it never kills running sessions.
 
@@ -113,9 +115,9 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 - `afc-<project-slug>-<role>`: `afc-afclaude-manager`, `afc-spending-task42`, `afc-stall-<title-slug>-<id4>`, `afc-review`. Charset `[a-z0-9-]`, ≤ 40 chars, a short suffix only on collision. The same string is the RC `--name`.
 - Runners find their sessions through `driven_sessions` (tmux name ↔ session id), never by a name regex (today `ka-[0-9a-f]{8}`).
 
-### 5.4 Run now (D-153, D-036)
-- Kinds: `continue_now` (one stalled session), `work_on_now` (a project: its manager session, or its next ready stage), `review_now`.
-- Run-now **skips the time window and the budget check** (incl. the session-usage stop) and starts **immediately**: the write queues the request and wakes the runner (§5.1). It still passes the safety preflight (never take over an RC-server thread or a live holder; never fork a session). *Proposal:* it also runs while automation is paused (pause is about the automatic schedule) and isn't limited by the automatic concurrency cap; the button warns when the session limit is nearly used up.
+### 5.4 Run now (D-153, D-036, D-173)
+- Kinds: `continue_now` (one stalled session), `work_on_now` (a project: its manager session, or its next ready stage), `review_now`; `manager_message` (F14) is delivered the same way.
+- Run-now **skips the time window and the budget check** (incl. the session-usage stop) and starts **immediately**: the write queues the request and wakes the runner (§5.1). It still passes the safety preflight (never take over an RC-server thread or a live holder; never fork a session). It also runs while automation is paused (pause is about the automatic schedule) and isn't limited by the automatic concurrency cap; the button warns when the session limit is nearly used up.
 - Feedback: the request row moves queued → started (tmux name) / refused (reason), shown live on the card.
 
 ### 5.5 Compaction hand-offs (D-144, D-155)
@@ -138,7 +140,7 @@ For sessions whose total run is longer than one session length (the managers; ot
 ## 7. Data model: everything in the DB (D-161)
 
 ### 7.1 Conventions
-- SQLite in WAL mode at `/data/afclaude.db`; `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict; validation in Python.
+- SQLite in WAL mode at `/data/afclaude.db`; `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict; validation in Python. The WAL is archived for `db_wal_retention_days` (default 7) instead of being discarded at checkpoint, so the DB can be rolled back to any moment in that window (D-175, §11.1).
 - **Schema guard (review A1):** code refuses to write when the DB's `schema_version` is newer than its own; non-additive changes (e.g. the `prompt_overrides` key, §7.6) go through an explicit migrate step after a backup.
 - `version` column (trigger-bumped) on every owner-editable table; writes carry the version they saw, a mismatch is a 409. Idempotency keys for 7 days. Both built.
 - Telemetry and runner tables carry `account_id` (one row in `accounts` now, D-156), so the future pool needs no migration.
@@ -155,6 +157,7 @@ For sessions whose total run is longer than one session length (the managers; ot
 | prompts | `prompt_overrides` (+ `project_id`) | built; scope new |
 | decisions | `decisions`, `decision_links`, `decisions_fts` | new (§7.6) |
 | hand-offs | `handoffs` | new (§5.5) |
+| messages | `chat_threads` (user, project, opened, last activity, closed), `chat_messages` (thread, author `user:<id>` or `agent:<session>`, text, ts, request id) | new (F14, D-178) |
 | docs | `docs` (whole documents: goals, exceptions, backlog), `doc_entries` (append logs: progress, alerts, reviews, drift) — per project | new |
 | auth | `users`, `grants`, `identities` (OIDC iss+sub), `credentials` (password, TOTP, WebAuthn), `recovery_codes`, `auth_sessions`, `remembered_devices`, `mds_cache` | new (§9) |
 | telemetry | `usage_samples`, `usage_weekly_series`, `usage_session_windows`, `forecast_log`, `haiku_judgements`, `weekly_cycles`, `usage_reports`, `user_model`, `usage_reviews` | new (replace the JSONL/JSON files) |
@@ -188,9 +191,9 @@ What moves from files (each with a one-time importer that checks row counts, the
   - **Sessions:** model/effort/permission mode per session kind (overridable per project).
   - **Auth & sessions:** §9.5, OIDC config and the group map (§9.4).
   - **Host:** working root, config dir mode (separate / shared, §10.4), bridge user, host-check interval, tested Claude Code version, owner-session continuation on/off.
-  - **Backup:** schedule, retention, target, include credentials in exports (off) (§11).
+  - **Backup:** schedule, retention, target, include credentials in exports (on, shown in red, D-174), `db_wal_retention_days` (default 7, range 1–30, D-175) (§11).
   - **Data:** telemetry and log retention; docs export per project (§7.7).
-  - **Display:** per-user time zone, theme.
+  - **Display:** per-user time zone, theme, `ui_chat_reset_hours` (default 5, range 1–168: idle time after which the manager message box starts empty again, D-178).
 
 ### 7.5 Per project vs global (D-152)
 - Per project: decisions, questions, prompt overrides, hand-offs, docs (goals, progress, alerts, exceptions, reviews), session settings, grants.
@@ -200,10 +203,10 @@ What moves from files (each with a one-time importer that checks row counts, the
 **Prompts (D-110, D-111).** Defaults ship as `prompts/*.md`. `prompt_overrides` is keyed by `(name, project_id)` (`NULL` = global; the table is empty, so the key change is a trivial migrate). Resolution: project override > global override > default. `prompts.py` defines one **bundle per session kind** (manager continue, task start, stall continue, session-end save, resume after compact, usage review, Haiku judge), so F8 shows exactly what each kind receives. Saving validates the placeholder set and test-renders; `base_sha256` flags "default changed since your edit" with a three-way view.
 
 **Decision store (D-104–D-107, D-151, D-158).**
-- `decisions`: `id` (D-NNN), `project_id` (`NULL` = install-wide), `slug` (stable unique key per project, e.g. `budget/night-gate`), `title`, `summary`, `words` (verbatim quotes with date and source, JSON), `keywords` (JSON), `scope`, `status` (`proposed | active | done`), `author` (`owner | co-owner | manager`), `interpretation` (clearly non-binding), `updated_at/by`, `version`.
+- `decisions`: `id` (D-NNN), `project_id` (`NULL` = install-wide), `slug` (stable unique key per project, e.g. `budget/night-gate`), `title`, `summary` (relevance-only, see retrieval), `words` (verbatim quotes with date and source, JSON), `keywords` (JSON), `scope`, `status` (`proposed | active | done`), `author` (`owner | manager`), `interpretation` (clearly non-binding), `updated_at/by`, `version`.
 - **Only the current decision per entry** (D-158): a change overwrites the row. There are no superseded entries in the store; each change is in the audit log (old and new text), which is the history view. A decision that no longer applies is deleted (audited).
-- Who writes: owner and co-owners edit or confirm directly. Managers, agents and project editors **propose**: a proposal is a question whose payload is the new or changed decision; the active entry stays in force until a human with the right role confirms (D-104). Manager decisions (D-105) are proposals with `author=manager` that briefs may follow but that never override an owner entry.
-- Retrieval for briefs (D-107): MCP `afclaude_decisions(project, keywords, full=false)` matches keywords plus FTS5 over title/summary/words and returns summaries; full text only on request. Typed `decision_links` (`refines | requires | conflicts`) surface related and conflicting entries with each hit.
+- Who writes: owners edit or confirm directly. Managers, agents and project editors **propose**: a proposal is a question whose payload is the new or changed decision; the active entry stays in force until a human with the right role confirms (D-104). Manager decisions (D-105) are proposals with `author=manager` that briefs may follow but that never override an owner entry.
+- Retrieval for briefs (D-107, D-176): MCP `afclaude_decisions(project, keywords, full=false)` matches keywords plus FTS5 over title/summary/words. With `full=false` it returns per hit only the id, slug and a **very brief summary: a few words naming the topic** (e.g. "night gate: when a full window may run"), deliberately **not enough to act on**, only to decide whether the entry is relevant. To read the rule itself the agent **must expand it** (`full=true`, or the entry by id), which returns the title, the owner's words, scope and interpretation. The MCP tool description says this explicitly, and every `full=false` result carries the same line ("summaries name the topic only; expand an entry before acting on it"). The `summary` field is constrained on write: a short length cap (e.g. 80 chars) and no rule content (no values, thresholds, do/don't instructions). `actions.py` enforces the cap; the content rule is stated in the proposal prompts and the seeding step, and the confirm dialog shows the summary on its own so the owner can see it carries only the topic. Typed `decision_links` (`refines | requires | conflicts`) surface related and conflicting entries with each hit.
 - Seeding (phase 4b): active owner entries import verbatim as `active`; superseded and drift entries are written to the audit log only; partially superseded entries are merged by the manager into one current entry with status `proposed` for the owner to confirm.
 - Design note from the reference project the owner named (D-158): a stable unique key per entry with upsert-overwrite (no history in the store), typed links between entries with contradictions shown inline on retrieval, and deterministic full-text lookup that injects only a few high-confidence matches into a session.
 
@@ -231,7 +234,7 @@ With everything in the DB, a DB failure is the single biggest failure mode, so e
 
 All under `/api/v1`, JSON; HTML pages call the same handlers (htmx gets fragments). Reads are GET; writes are POST/PUT/PATCH/DELETE with an `Idempotency-Key` and the `version` where one exists. Every write is one `actions.py` call. Every handler checks the role (§2) before anything else.
 
-Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`, `window` (settings + next 7 windows + ratios), `usage` (the snapshot), `runs`, `sessions/driven`, `handoffs`, `decisions`, `prompts`, `prompts/{name}` (default, overrides, bundle, diff), `docs`, `reviews`, `audit`, `settings`, `users`, `me` (logins, sessions), `host` (latest checks), `backups`, `health` (no secrets).
+Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`, `window` (settings + next 7 windows + ratios), `usage` (the snapshot), `runs`, `sessions/driven`, `handoffs`, `messages` (the open thread, or a closed one by id), `decisions`, `prompts`, `prompts/{name}` (default, overrides, bundle, diff), `docs`, `reviews`, `audit`, `settings`, `users`, `me` (logins, sessions), `host` (latest checks), `backups`, `health` (no secrets).
 
 | write | effect | conflict |
 |---|---|---|
@@ -244,9 +247,10 @@ Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`
 | `settings/window` | day, start, n, mode | version |
 | `prompts/{name}?project=` PUT / DELETE | override / reset | base_sha256 + version |
 | `requests` | `continue_now`, `work_on_now`, `review_now` (wakes the runner) | one open per (kind, target) |
+| `messages` | send a message to the manager (F14): appends to the open thread or opens one, queues `manager_message`, wakes the runner; the reply arrives through MCP `afclaude_reply` | thread closed by the reset → a new thread |
 | `users`, `grants` | invite, role, project scope, remove | version |
 | `auth/*` | login, factors, passkeys, OIDC, step-up, logout, sessions | §9 |
-| `backup`, `export` create / download; restore (setup only) | §11 | one running at a time |
+| `backup`, `export` create / download; restore (setup only); point-in-time rollback to a moment in the WAL window | §11 | one running at a time |
 | `host/checks` | run all checks or one (and the end-to-end test) now | one run at a time |
 
 Concurrency: WAL + `BEGIN IMMEDIATE` + 30 s busy timeout serialise writers across containers; dashboard transactions do no I/O. `start_task` claims only pending tasks atomically, so "answer" vs "start" and "cancel" vs "start" have exactly one winner. Shrinking a window or pausing never kills running sessions.
@@ -271,13 +275,13 @@ Attackers: anyone on the internet; a CSRF page in a user's browser; a stolen ses
   - Sign counters are checked (clone detection).
   - **Phone caveat:** iOS and Android create synced passkeys by default (iCloud Keychain, Google Password Manager; BE = 1). On a phone use a hardware security key over NFC or USB-C, or the OIDC route.
 - **Factor rule:** a login is complete with (a) OIDC, (b) a hardware passkey with UV, or (c) two different factors from {password, TOTP, synced passkey, recovery code}.
-- **First registration (D-149):** while `users` is empty, `/setup` registers the owner. *Proposal:* it requires a one-time setup code that the web container prints to its log on start, so a fresh install that happens to be reachable can't be claimed by a stranger. The owner registers locally (password + TOTP, or a hardware passkey); OIDC is configured afterwards. Setup can instead restore a backup (§11).
+- **First registration (D-149, D-172, D-173):** while `users` is empty, `/setup` registers the first owner. It requires a one-time setup code that the web container prints to its log on start, so a fresh install that happens to be reachable can't be claimed by a stranger. The first owner registers locally (password + TOTP, or a hardware passkey); OIDC and further owners come afterwards. Setup can instead restore a backup or export (§11.3).
 - Lockout recovery: `docker exec afclaude-web afclaude admin reset-auth` (host access = owner) or recovery codes.
 
-### 9.4 Authorization and OIDC groups (D-149, D-150)
+### 9.4 Authorization and OIDC groups (D-149, D-150, D-172)
 - Deny by default: a route-table test asserts that every route except `health` and the login pages needs a session, and an action-matrix test asserts each `actions.py` action × role (§2).
-- Grants: `grants(user, scope = coowner | project:<id>, level = view | edit, source = manual | oidc:<group>)`.
-- **Group map** (setting `auth_oidc_group_map`): `[{group, grant}]`, e.g. `afclaude-admins → coowner`, `team-x → project:spending:edit`. Group grants are recomputed at every OIDC login (removed when the group is gone); manual grants are separate. The owner role is never granted by a group. A login with no matching group = registered, no access.
+- Grants: `grants(user, scope = owner | project:<id>, level = view | edit, source = manual | oidc:<group>)`.
+- **Group map** (setting `auth_oidc_group_map`): `[{group, grant}]`, e.g. `afclaude-admins → owner`, `team-x → project:spending:edit`. Group grants are recomputed at every OIDC login (removed when the group is gone); manual grants are separate. The owner role can be granted by a group (D-172): whoever controls that group at the provider then controls the install, so mapping a group to `owner` is a high-impact write with a warning saying so. A login with no matching group = registered, no access.
 
 ### 9.5 Session lifetimes (D-162): settings with defaults
 Defaults follow NIST SP 800-63B AAL2 (30 min idle, 12 h total) and keep friction low through one-tap passkeys and remembered devices.
@@ -286,14 +290,14 @@ Defaults follow NIST SP 800-63B AAL2 (30 min idle, 12 h total) and keep friction
 |---|---|---|---|
 | `auth_idle_timeout_min` | 30 | 5–480 | no request for this long → sign in again |
 | `auth_absolute_lifetime_h` | 12 | 1–168 | one login lasts at most this long, active or not |
-| `auth_remember_device_days` | 30 | 0–90 (0 = off) | on a remembered device a password login skips the second factor; never the first factor, never step-up; revoked on password or factor change |
+| `auth_remember_device_days` | 7 (D-179) | 0–90 (0 = off) | on a remembered device a password login skips the second factor; never the first factor, never step-up; revoked on password or factor change |
 | `auth_reauth_window_min` | 10 | 1–60 | high-impact writes need a full authentication within this window (step-up; OIDC with `max_age`) |
 | `auth_max_sessions_per_user` | 10 | 1–50 | oldest session ends first |
 | `auth_login_rate` | 5 failures / 15 min per account, 20 per IP | | then exponential backoff; repeated failures raise an alert |
 | `auth_oidc_backchannel_logout` | on | | the provider's logout ends our sessions |
 
 - Server-side session rows (revocable, listed in F11); cookie `__Host-` prefix, Secure, HttpOnly, SameSite=Lax; the session id rotates at login and step-up.
-- **High-impact writes** (step-up + confirm dialog + an alert entry): prompt overrides, project-scope "always continue" rules, unpause, window changes, run-now, decision confirmation, users/grants/roles, auth settings, host settings, backup/export download and restore.
+- **High-impact writes** (step-up + confirm dialog + an alert entry): prompt overrides, project-scope "always continue" rules, unpause, window changes, run-now, decision confirmation, users/grants/roles, auth settings, host settings, backup/export download, restore and point-in-time rollback.
 
 ### 9.6 Agent role and its limits (D-160)
 - MCP and CLI writes from AFClaude's own sessions (the session is in `driven_sessions`, or the CLI runs with `CLAUDE_GUARD_DISABLE=1`) act as `agent:<session>`. Allowed: tasks and questions in its project, its own hand-offs, its project's docs, decision proposals. Everything else is refused, audited and alerted.
@@ -308,7 +312,7 @@ Container isolation: `afclaude-web` gets only the data volume and its port; no C
 ## 10. Deployment
 
 ### 10.1 Containers (D-163)
-One image, one compose file usable by plain docker and by Coolify (docker-compose deploy):
+One image, one compose file usable by plain docker and by Coolify (docker-compose deploy). `/data` in every service is the host directory `AFCLAUDE_DATA` (§10.2):
 
 | service | command | mounts | port |
 |---|---|---|---|
@@ -321,8 +325,11 @@ One image, one compose file usable by plain docker and by Coolify (docker-compos
 |---|---|---|
 | `AFCLAUDE_PUBLIC_URL` | yes | external URL: OIDC redirect URI and the WebAuthn RP ID (passkeys are bound to this domain) |
 | `AFCLAUDE_MASTER_KEY` | no | encrypts secrets in the DB; if unset, generated once into `/data/master.key` and wrapped into every backup |
-| `AFCLAUDE_DATA` | no | data path, default `/data` |
+| `AFCLAUDE_DATA` | yes, **no default** (D-180) | the host directory that holds the DB, its WAL archive, backups and the runner socket; mounted as `/data` in all three services |
 | `AFCLAUDE_BRIDGE_HOST` | no | the host's address for the SSH bridge, default `host.docker.internal`; the bridge key and host key are mounted files, the bridge user is a setting |
+
+- **`AFCLAUDE_DATA` unset → nothing starts.** The compose file uses `${AFCLAUDE_DATA:?…}`, so compose (and Coolify's deploy) stops with "AFCLAUDE_DATA is not set: choose the data directory (see setup)"; the entrypoint also refuses to start when `/data` isn't a mounted volume, so no install ever writes into a silent default location.
+- **Set during setup, with an optional restore.** The setup step (`afclaude setup` on the host, or the env form in Coolify) asks for the data directory. An empty directory gives `/setup` two choices: a new install (first owner, §9.3) or **restore from a backup or export** into it (§11.3). A directory that already holds an AFClaude DB is used as it is.
 
 Everything else (windows, budget, auth, users, OIDC client, intervals, retention, session settings) is a DB setting edited in the dashboard. `docker/.env` and `data/afclaude.json` shrink to this list.
 
@@ -330,11 +337,11 @@ Everything else (windows, budget, auth, users, OIDC client, intervals, retention
 In the repo: all code, templates, vendored assets, default prompts, compose files with `${VARS}`, `env.example`, this doc. Local or in the DB only: the DB and its backups, the master key, `.env`, the bridge key, the backlog, the decision store, identities. `tools/check_public.py` guards every commit and push.
 
 ### 10.4 AFClaude's own working root and Claude config (D-165)
-- **First-startup wizard** (in `/setup`, after the owner registers; `afclaude setup` on the CLI until the dashboard exists): host check (§10.5) → pick the **AFClaude working root** on the host → Claude config and login → trust and permission setup → time zone. Or "restore from backup" instead (§11.3).
+- **First-startup wizard** (in `/setup`, after the first owner registers; `afclaude setup` on the CLI until the dashboard exists; the data directory `AFCLAUDE_DATA` is chosen before the containers start, §10.2): host check (§10.5) → pick the **AFClaude working root** on the host → Claude config and login → trust and permission setup → time zone. Or "restore from a backup or export" instead (§11.3).
 - The working root is a dedicated directory, **not the default/home directory** and not inside a tree of non-AFClaude projects. The wizard refuses `$HOME` and `/`, and warns when the path already holds transcripts of sessions AFClaude didn't start, or has an ancestor `CLAUDE.md`. Every AFClaude-run session, the managers included, runs with its cwd under it (`<root>/<project-slug>/…`; project repos are cloned there), so their transcripts (`<config>/projects/<encoded path>/`) are separable from everything else.
-- **A separate `CLAUDE_CONFIG_DIR` for AFClaude's sessions?**
+- **AFClaude's sessions get their own `CLAUDE_CONFIG_DIR`** (D-173), with the shared default dir as the fallback if a check in phase 5d fails:
 
-| | separate config dir, e.g. `<afclaude-home>/claude` (**recommended**) | shared default `~/.claude` |
+| | separate config dir, e.g. `<afclaude-home>/claude` (**chosen**) | shared default `~/.claude` (fallback) |
 |---|---|---|
 | settings, hooks, MCP registration, trust flags | AFClaude's own `settings.json` and `.claude.json`; nothing leaks into or from the owner's interactive setup | mixed with the owner's; the export must pick keys out of shared files |
 | transcripts | the whole `projects/` of that dir is AFClaude's | separable only by the working-root path prefix |
@@ -369,7 +376,7 @@ The new check commands extend `host_exec.py`'s whitelist. The owner installs the
 ### 10.6 Transition from today
 - The current manager container (D-120) and the host bridge (D-121) keep running while phases 2–5 land; each runner change is deployed like today (autonomous deploys within the gates, D-106).
 - The temp dashboard keeps working through the transition as side work (not a dashboard phase); its stall scan moves to the runner's own tick in phase 3a.
-- Phase 5b switches to the three-service layout; the host crontab lines and supercronic are retired. Phase 5e moves this installation into its own working root (§11.5).
+- Phase 5b switches to the three-service layout; the host crontab lines and supercronic are retired. Phase 5e sets this installation up again under a new data directory and its own working root, through backup → export → restore (§11.5).
 
 ### 10.7 Retiring the temp dashboard (side task after 8d, not a phase)
 About a week of overlap once the dashboard is live, then stop the export, remove the temp dashboard's container and route, and replace the `/private` page with a link to the dashboard.
@@ -385,6 +392,13 @@ Driven sessions run as individual RC sessions (`--remote-control --name <tmux na
 2. `manifest.json`: installation id and epoch, app version, schema version, created at, row counts per table, sha256 of every file.
 3. The master key, wrapped with the backup passphrase.
 4. Encrypted as a whole (passphrase → argon2id → authenticated encryption). Stored in `/data/backups` (retention setting), optionally copied off-host (a mounted directory first, S3/SFTP later).
+5. The WAL archive of the retention window (below) goes into the bundle, so a restored or moved install can still roll back within that window.
+
+**Point-in-time recovery: the WAL archive (D-175).** The DB keeps its WAL for a reasonable timeframe: WAL changes are archived instead of being discarded at checkpoint, for `db_wal_retention_days` (default 7, range 1–30). The DB can then be rolled back to any moment in that window, e.g. to just before a bad write, a corrupting bug or a wrong bulk change, which a daily bundle alone can't do.
+- **Tool: Litestream, not custom code.** Existing options checked first: Litestream (streams SQLite WAL changes to a file, S3 or SFTP target; since v0.5 in the LTX format with compaction and `litestream restore -timestamp` for point-in-time restore, retention configurable), `sqlite3_rsync` (snapshots only, no point in time), LiteFS (FUSE-based replication with a lease, built for multi-node, far heavier than needed), frequent `VACUUM INTO` snapshots (coarse and costly on disk), the SQLite session extension (app-level changesets, much custom code). Litestream fits: it already solves the hard parts (copying WAL frames before a checkpoint can drop them, detecting a break in WAL continuity and re-snapshotting, timestamp restore). Copying the WAL ourselves across three writing containers would repeat that with more risk.
+- **How it runs:** the pinned Litestream binary (checksum-verified) is in the image; the runner runs it as a supervised child process (§5.1) with a config generated from the settings, replicating `/data/afclaude.db` to a file replica in `/data/wal-archive` (an off-host target later, like the backups). Per Litestream's guidance every AFClaude connection sets `PRAGMA wal_autocheckpoint = 0` and Litestream does the checkpoints. If Litestream is down, the WAL grows: the runner alerts on replication lag, and past a WAL size limit it checkpoints itself (Litestream re-snapshots when it's back; the gap in the window is shown). The cross-container setup and restore times are verified in phase 5c.
+- **Disk cost:** the archive holds the snapshots plus the compressed changes of the window, roughly the DB size plus what was written in `db_wal_retention_days` (for AFClaude's tens-of-MB DB, telemetry appends dominate; expected tens to a few hundred MB for 7 days, measured in 5c). F10 shows the archive's current size and the oldest restorable moment next to the setting; the bundles grow by the archive size.
+- **Rollback** (F10 → "roll back to…", step-up; or `afclaude restore --at <time>`): automation pauses and all services stop writing (writes get a clear "maintenance" error), Litestream restores the chosen moment into a new file, the integrity check runs, the current DB is kept as `afclaude.db.before-<time>`, the new file is swapped in, the installation epoch is bumped and the install starts paused like any restore (§11.3). A rollback only rewinds the DB: sessions that ran and commits that were pushed in the meantime stay; the banner says so.
 
 ### 11.2 Full export: DB + the required Claude data (D-165)
 The dashboard's **Export** (F10, step-up) = the §11.1 bundle + a `claude/` part read from the host through the bridge + a generated reinstate guide. Every item is in the manifest with its checksum, so a restore can prove it is complete.
@@ -392,7 +406,7 @@ The dashboard's **Export** (F10, step-up) = the §11.1 bundle + a `claude/` part
 | item | source | note |
 |---|---|---|
 | transcripts of AFClaude-run sessions, incl. subagent files and per-session side files (e.g. file history) | `<config>/projects/<encoded working-root paths>/` | selected by `driven_sessions` and the working root; the exact file list is fixed in phase 5d against the real layout |
-| credentials | `<config>/.credentials.json` | **off by default**; including it shows a warning: whoever has the bundle and passphrase can use the Claude account, and the old host must stop using it |
+| credentials | `<config>/.credentials.json` | **included by default** (D-174); the option is shown ticked and in red with the warning that whoever has the bundle and passphrase can use the Claude account and that the old host must stop using it; untick it to leave the credentials out |
 | permission setup for the autonomous modes | `settings.json` (allow rules, default permission mode, env) | the bypass env and per-launch flags are code + DB settings, already in the bundle |
 | hooks | the guard and reminder hook scripts that `settings.json` references | |
 | MCP registration | AFClaude's `mcpServers` entry in `.claude.json` | |
@@ -405,14 +419,14 @@ Excluded: caches, the owner's other sessions and projects, anything outside the 
 ### 11.3 Restore and the reinstate guide
 The export carries a step-by-step guide generated for its content (also shown in the dashboard):
 1. New host: install docker, tmux, Claude Code (the manifest's version or newer), sshd and the bridge (`install_host_bridge.sh`).
-2. Deploy the containers with the same `AFCLAUDE_PUBLIC_URL` (passkeys are bound to the domain; a new domain means re-registering passkeys and updating the OIDC redirect URI).
-3. `/setup` → "restore from backup" (setup code + passphrase), or `afclaude restore <bundle>`: decrypt, verify checksums and manifest, refuse a schema newer than the code, migrate forward if older, bump the installation epoch, record `restored_from`.
+2. Deploy the containers with the same `AFCLAUDE_PUBLIC_URL` (passkeys are bound to the domain; a new domain means re-registering passkeys and updating the OIDC redirect URI) and `AFCLAUDE_DATA` pointing at a new, empty data directory (§10.2).
+3. `/setup` → "restore from a backup or export" (setup code + passphrase), or `afclaude restore <bundle>`: decrypt, verify checksums and manifest, refuse a schema newer than the code, migrate forward if older, bump the installation epoch, record `restored_from`. The bundle's WAL archive comes along, so the restored DB can be taken at the bundle's latest moment or any earlier one in its window (§11.1).
 4. Choose the working root: the same path as before (recommended: transcripts are keyed by the encoded cwd) or a new one with a path map (§11.5).
 5. The runner writes the `claude/` part to the host through a whitelisted restore command: config dir files, trust flags, MCP registration, hooks, `CLAUDE.md`.
 6. Sign Claude in for that config dir if the credentials weren't included.
 7. Clone the project repos into the root (the guide lists them with their remotes).
 8. Post-restore validation: every manifest item present with its checksum, plus all host checks (§10.5) incl. the end-to-end session.
-9. The install **starts paused** (*proposal*, setting `restore_starts_paused`, default on) with a banner "restored from <backup time>: check and resume". One tap resumes; managed projects `--resume` their session where the transcript is present, otherwise they start fresh from the latest hand-off (§5.5).
+9. The install **starts paused** (D-173, setting `restore_starts_paused`, default on) with a banner "restored from <backup time>: check and resume". One tap resumes; managed projects `--resume` their session where the transcript is present, otherwise they start fresh from the latest hand-off (§5.5).
 
 ### 11.4 Move to another host
 1. Old host: pause automation; managed sessions get the session-end save prompt (§5.5), so their hand-offs are current and their work is pushed; wait for running sessions to finish or save.
@@ -420,21 +434,22 @@ The export carries a step-by-step guide generated for its content (also shown in
 3. New host: §11.3.
 - A restore test (export → fresh install → equal row counts and checksums → a dry-run dispatcher pass decides the same) runs in CI and as part of gate 8a.
 
-### 11.5 One-off migration of this installation (D-165)
-Today AFClaude's sessions share a root directory and the default `~/.claude` with sessions and projects AFClaude doesn't manage. Moving this installation into its own working root (and its own config dir, §10.4) is **the validation that the export is complete**:
-- **Only the export's content set.** The migration runs the export code itself, with one addition: a selection filter that picks AFClaude's sessions and projects out of the shared root (from `driven_sessions`, `projects.path`, the manager session and the own-sessions list; the owner confirms the list). It carries nothing the export wouldn't carry.
+### 11.5 One-off migration of this installation (D-165, D-180)
+Today AFClaude's sessions share a root directory and the default `~/.claude` with sessions and projects AFClaude doesn't manage. This installation is set up again **on this host, under a new data directory** (`AFCLAUDE_DATA`), in its own working root and its own config dir (§10.4), through the normal setup with a restore (§10.2, §11.3). That run is **the end-to-end test of the whole backup → export → restore path** and the validation that the export is complete:
+- **One-off flow derived from the normal backup and export.** The migration runs the normal backup (§11.1) and export (§11.2) code, with one addition: a selection filter that picks only AFClaude's sessions and projects out of the shared root and shared config dir, never other sessions (from `driven_sessions`, `projects.path`, the manager session and the own-sessions list; the owner confirms the list). It carries nothing the export wouldn't carry.
+- **Restored at setup.** The new install starts with `AFCLAUDE_DATA` set to the new, empty directory and takes "restore from a backup or export" with that bundle, so setup, restore, the `claude/` part and the post-restore validation all run exactly as on a new host.
 - **Path map.** Restore takes `old prefix → new root` and rewrites the encoded project-dir names and the cwd in the session metadata. This is a normal restore feature, not a migration-only one. Whether `--resume` accepts a moved transcript is verified in phase 5e; if not, those projects continue from their hand-offs.
 - **Nothing by hand.** Whatever turns out missing or wrong on the new side is fixed by correcting or expanding the export (code + manifest); then export and restore run again from scratch, until the post-restore validation, the end-to-end session and one real manager continue pass.
-- Cut-over: the old setup is paused and fenced, the new one unpaused; the old transcripts stay in place, untouched.
+- Cut-over: the old setup is paused and fenced, the new one unpaused; the old data directory and the old transcripts stay in place, untouched.
 
 ## 12. Testing strategy
-- **Unit (offline, temp DBs):** every `actions.py` action (validation, audit, version, idempotent replay, role matrix incl. agent); `schedule.py` (DST nights both ways, N × session_hours, link groups, the window-start key, nights until the reset); `prompts.py` (project > global > default, placeholders, bundles); importers (file → DB, row counts equal); hand-off lifecycle; the schema guard.
-- **Auth:** factor rules; passkeys with recorded attestation fixtures (hardware BE=0 + MDS-verified passes alone; BE=1 needs a second factor; revoked AAGUID refused; bad signature refused); TOTP windows and replay; recovery codes single-use; lifetimes and step-up with a fake clock; OIDC against a stub provider (state/nonce/PKCE, group map add/remove, no e-mail linking); setup code.
+- **Unit (offline, temp DBs):** every `actions.py` action (validation, audit, version, idempotent replay, role matrix incl. agent); `schedule.py` (DST nights both ways, N × session_hours, link groups, the window-start key, nights until the reset); `prompts.py` (project > global > default, placeholders, bundles); importers (file → DB, row counts equal); hand-off lifecycle; the schema guard; decision summaries (length cap; `full=false` returns no rule text and carries the expand notice); manager messages (thread open/append, reset after `ui_chat_reset_hours`, reply via MCP).
+- **Auth:** factor rules; passkeys with recorded attestation fixtures (hardware BE=0 + MDS-verified passes alone; BE=1 needs a second factor; revoked AAGUID refused; bad signature refused); TOTP windows and replay; recovery codes single-use; lifetimes and step-up with a fake clock; OIDC against a stub provider (state/nonce/PKCE, group map add/remove incl. a group granting `owner`, no e-mail linking); several owners and the last-owner guard; setup code.
 - **API (TestClient):** route-table auth test, CSRF/Origin, 409s, idempotency, size limits, headers/CSP, no secret in any response.
 - **Runner:** dry-runs with settings rows (moved window, pause, run-now skipping window and budget, the manager as a managed project, readable tmux names, wake socket, compaction sequence) with the stub-PATH fixtures; two processes hammering the DB (one winner, no lock errors).
-- **Backup and export:** round trip and a move rehearsal on temp volumes; wrong passphrase and tampered bundle refused; the export's selection (only AFClaude's sessions, nothing else) and the path map on fixture config dirs; the manifest check catches a missing item.
+- **Backup and export:** round trip and a move rehearsal on temp volumes; point-in-time rollback to a moment inside the WAL window (three writing processes, a checkpoint gap while Litestream is down); wrong passphrase and tampered bundle refused; the export's selection (only AFClaude's sessions, nothing else) and the path map on fixture config dirs; the manifest check catches a missing item.
 - **Host checks:** each check against stub host commands (ok / warn / fail), a stale bridge version, a logged-out `claude`.
-- **Containers:** compose up with only `AFCLAUDE_PUBLIC_URL` → setup page; health checks; read-only fs.
+- **Containers:** compose up with only `AFCLAUDE_PUBLIC_URL` and `AFCLAUDE_DATA` → setup page; without `AFCLAUDE_DATA` → refuses to start with the clear message; health checks; read-only fs.
 - **UI:** every page at 390 px in a headless browser (screenshots in the phase report).
 - **Every commit:** `python3 tools/check_public.py --tree HEAD` and the hooks, never bypassed.
 
@@ -454,19 +469,19 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
    - **3c Compaction hand-offs (D-144, D-155):** `handoffs`, save prompt trigger, MCP tool, `/compact` + resume prompt.
 4. **Content stores**
    - **4a `prompts.py` (D-111, D-152):** project scope (migrate step), bundles per session kind, every sender uses it.
-   - **4b Questions and decisions in the DB (D-151, D-158):** `decisions` + links + FTS, proposals as questions, MCP tools, seeding, exports, prompts and CLAUDE.md rules switched to the DB.
+   - **4b Questions, decisions and manager messages in the DB (D-151, D-158, D-176, D-178):** `decisions` + links + FTS, proposals as questions, MCP tools (relevance-only summaries, expand before acting), seeding, exports, prompts and CLAUDE.md rules switched to the DB; `chat_threads`/`chat_messages`, the `manager_message` request waking the manager, MCP `afclaude_messages`/`afclaude_reply` and the manager prompt's instructions for them.
 5. **Users, packaging, backup**
    - **5a Users, roles, agent role (D-149, D-160):** users/grants schema, actor = user, the role matrix in `actions.py`, agent detection, alerts on violations.
    - **5b Containers + host checks (D-163, D-164):** one image, web/runner/mcp services, compose for docker and Coolify, minimal env, master key, MCP in a container, cut-over from the current container and host crontab; sessions stay on the host via the bridge; the host checks (§10.5) as a runner job + CLI, with the bridge whitelist extension.
-   - **5c DB backup / restore / move (D-161):** bundle, restore, `restore_starts_paused`, move fence, CI round trip.
+   - **5c DB backup / restore / move (D-161, D-175, D-180):** bundle, restore, `restore_starts_paused`, move fence, CI round trip; the WAL archive with Litestream (`db_wal_retention_days`, rollback to a moment, archive in the bundle, disk use measured); `AFCLAUDE_DATA` required with no default, set at setup together with the optional restore.
    - **5d Claude data export + working root (D-165):** first-startup working root and config dir (CLI; the UI follows in 6a), verify `CLAUDE_CONFIG_DIR` on the host (RC, `/usage`, `claude agents`, login), the `claude/` export part, whitelisted restore command, path map, the generated reinstate guide, post-restore validation.
-   - **5e One-off migration of this installation (§11.5):** the export with the AFClaude selection filter out of the shared root, restored into the dedicated root; every gap fixed in the export and the run repeated from scratch, until validation, the end-to-end session and a real manager continue pass.
+   - **5e One-off migration of this installation (§11.5, D-180):** the end-to-end test of backup → export → restore: the normal backup and export with the AFClaude selection filter out of the shared root and config dir, restored at setup into a new data directory on this host, with the dedicated working root and config dir; every gap fixed in the export and the run repeated from scratch, until validation, the end-to-end session and a real manager continue pass.
 6. **Dashboard**
    - **6a Skeleton + local auth:** Starlette app, layout + top bar (D-074), sessions and lifetimes (§9.5), password + TOTP + recovery codes, setup/first registration and the first-startup wizard (§10.4), CSRF, headers, route-table and matrix tests, `health`.
    - **6b Passkeys + OIDC (D-150, D-159):** python-fido2 with MDS3, BE rules and warnings, Authlib OIDC with the group map, step-up re-auth, F11.
    - **6c Read views:** F1–F9, F12, F13, the threshold panel, RC URL source verified.
 7. **Writes**
-   - **7a Work writes:** answers, tasks, projects, priorities, moves, decisions and proposals, 409 handling.
+   - **7a Work writes:** answers, the manager message box (F14, D-178), tasks, projects, priorities, moves, decisions and proposals, 409 handling.
    - **7b Control writes:** stalls and rules, window editor, prompt editor, pause, run-now with live feedback, Settings page with reset/undo (D-075), users/grants, backup and export UI, confirm + step-up for high-impact writes.
 8. **Deploy gates, strictly in this order (D-072, D-145, D-157):**
    - **8a Thorough review (Opus 5.5, ultracode/max effort).** The whole dashboard and its integration: `actions.py`, `schedule.py`, `prompts.py`, the runner, auth (OIDC + groups, password + 2FA, passkeys + MDS), backup, export and restore, the host checks, containers. It also checks that **the docs and every owner decision agree with the actual code**, not only with comments and explainer files; every discrepancy goes to the owner to decide, none is fixed silently. It also **validates the users and roles** (D-168): every role's effective permissions match its description in §2, the group→role map, the first-owner setup, and the user records themselves. Findings fixed and re-reviewed before 8b.
