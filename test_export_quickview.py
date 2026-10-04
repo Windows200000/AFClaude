@@ -160,11 +160,15 @@ class NextRunBlock(unittest.TestCase):
         try:
             pacing.next_run = lambda u, now, decision=None: {
                 "at": at, "kind": "last_stretch", "label": "last stretch", "reason": "predicted 98.6% > 84.6%",
-                "predicted_end": 98.6123, "threshold": 84.58, "last_stretch_at": at}
+                "predicted_end": 98.6123, "threshold": 84.58, "last_stretch_at": at,
+                "expected": {"at": at, "kind": "last_stretch", "label": "last stretch", "reason": "r",
+                             "predicted_end": 101.04, "last_stretch_at": at}}
             b = qv.next_run_block({}, datetime(2026, 10, 4, tzinfo=timezone.utc))
             self.assertEqual((b["kind"], b["label"], b["predicted_end"], b["threshold"]),
                              ("last_stretch", "last stretch", 98.6, 84.6))
             self.assertTrue(b["at_berlin"].startswith("Thu 08.10. 14:00"))
+            self.assertEqual((b["expected"]["kind"], b["expected"]["predicted_end"]), ("last_stretch", 101.0))
+            self.assertTrue(b["expected"]["at_berlin"].startswith("Thu 08.10. 14:00"))
 
             def boom(*a, **kw):
                 raise RuntimeError("x")
@@ -177,7 +181,9 @@ class NextRunBlock(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()
         self.assertIn("k.next_run", page)
-        self.assertIn("Next run", page)
+        self.assertIn("Next run (if you use nothing more)", page)   # D-200
+        self.assertIn("With your forecast usage", page)
+        self.assertIn("nr.expected", page)
         self.assertNotIn("budget_rule_now", page)
         self.assertNotIn("Budget rule", page)
 

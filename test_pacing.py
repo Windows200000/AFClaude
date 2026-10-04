@@ -458,40 +458,60 @@ class NextRun(unittest.TestCase):
         return pm.next_run_core(w, R, now or self.NOW, ratio, fc, "auto", lm, WIN, current, **kw)
 
     def test_tonight_passes(self):
-        d = self.nr(30, fc=flat_fc(0.1))                             # 30 + 12.5 + 9.4 = 51.9
+        d = self.nr(30, fc=flat_fc(0.1))                             # no more usage: 30 + 12.5 + 9.2 = 51.7
         self.assertEqual((d["kind"], d["at"], d["label"]), ("night", SUN, "night window"))
         self.assertIn("≤ 87.5%", d["reason"])
-        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.1 * 94)
+        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.1 * 92)
+        e = d["expected"]                                            # with the forecast until the start: +0.2
+        self.assertEqual((e["kind"], e["at"]), ("night", SUN))
+        self.assertAlmostEqual(e["predicted_end"], 30 + 0.1 * 2 + 12.5 + 0.1 * 92)
+
+    def test_no_more_usage_vs_forecast(self):
+        """D-200: the primary result keeps the weekly % at each start = now; the gate there still
+        adds run_cost + the forecast from the start to the reset. "expected" adds the forecast
+        until the start, too."""
+        d = self.nr(30, fc=flat_fc(0.5))                             # Sun 30+12.5+46 > 87.5; Mon 30+12.5+34 <=
+        self.assertEqual((d["kind"], d["at"]), ("night", SUN + timedelta(days=1)))
+        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.5 * 68)
+        e = d["expected"]                                            # 89.5 > 87.5 every night: last stretch
+        self.assertEqual((e["kind"], e["at"]), ("last_stretch", R - timedelta(hours=10)))   # w at Thu 09:00 = 72
+        self.assertEqual(e["last_stretch_at"], e["at"])
+        self.assertIn("> 87.5%", e["reason"])
+        self.assertIn("last stretch Thu 09:00", e["reason"])
 
     def test_no_night_passes_last_stretch(self):
-        d = self.nr(30, fc=flat_fc(0.5))                             # 89.5 > 87.5 every night
-        self.assertEqual(d["kind"], "last_stretch")
-        self.assertEqual(d["at"], R - timedelta(hours=10))           # w at Thu 09:00 = 72: 2 session windows
+        d = self.nr(80, fc=flat_fc(0.5))                             # 80 + 12.5 > 87.5 every night
+        self.assertEqual((d["kind"], d["at"]), ("last_stretch", R - timedelta(hours=10)))   # from w now: 2 windows
         self.assertEqual(d["last_stretch_at"], d["at"])
-        self.assertIn("> 87.5%", d["reason"])
         self.assertIn("last stretch Thu 09:00", d["reason"])
+        self.assertEqual(d["expected"]["kind"], "after_reset")      # forecast to be used up before the stretch
 
-    def test_last_stretch_length_from_the_forecast(self):
-        d = self.nr(50, fc=flat_fc(0.5))                             # w at the stretch ~ 92-95: one window
+    def test_last_stretch_length(self):
+        d = self.nr(90, fc=flat_fc(0.05))                            # from w now = 90: one session window
         self.assertEqual((d["kind"], d["at"]), ("last_stretch", R - timedelta(hours=5)))
         self.assertIn("last stretch Thu 14:00", d["reason"])
+        e = self.nr(50, fc=flat_fc(0.5))["expected"]                 # w at the stretch ~ 92-95: one window
+        self.assertEqual((e["kind"], e["at"]), ("last_stretch", R - timedelta(hours=5)))
+        self.assertIn("last stretch Thu 14:00", e["reason"])
 
     def test_straight_line_walks_the_nights(self):
         d = self.nr(40)                                              # Sun: 52.5 > 44.8; Mon: <= 57.3
         self.assertEqual((d["kind"], d["at"]), ("night", SUN + timedelta(days=1)))
         self.assertIn("straight line", d["reason"])
+        self.assertEqual(d["expected"]["at"], d["at"])               # no forecast: both the same
 
     def test_session_window_rest(self):
         d = self.nr(30, fc=flat_fc(0.1), session_pct=60, session_resets_at=SUN + timedelta(hours=1))
-        self.assertAlmostEqual(d["predicted_end"], 30 + 0.125 * 40 + 0.1 * 94)   # the rest of the live window
+        self.assertAlmostEqual(d["predicted_end"], 30 + 0.125 * 40 + 0.1 * 92)   # the rest of the live window
         d = self.nr(30, fc=flat_fc(0.1), session_pct=60, session_resets_at=SUN + timedelta(seconds=0.4))
-        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.1 * 94)         # resets at the start: full
+        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.1 * 92)         # resets at the start: full
 
     def test_current_decision(self):
         go = core(30, SUN, fc=flat_fc(0.1))
         self.assertTrue(go["go"])
         d = self.nr(30, now=SUN, fc=flat_fc(0.1), current=go)
         self.assertEqual((d["kind"], d["at"]), ("now", SUN))
+        self.assertEqual((d["expected"]["kind"], d["expected"]["at"]), ("now", SUN))
         held = core(30, SUN + timedelta(minutes=5), msu=10.0, fc=flat_fc(0.1))
         self.assertTrue(held["postpone"])
         d = self.nr(30, now=SUN + timedelta(minutes=5), fc=flat_fc(0.1), current=held)
@@ -512,12 +532,15 @@ class NextRun(unittest.TestCase):
 
     def test_after_the_reset(self):
         thu = pm.next_window_start(R, WIN)                            # Thu 23:00, the first night after
-        d = self.nr(30, fc=flat_fc(0.5), lm=0)                        # last stretch off
+        d = self.nr(80, fc=flat_fc(0.5), lm=0)                        # last stretch off, no night passes
         self.assertEqual((d["kind"], d["at"]), ("after_reset", thu))
         self.assertIsNone(d["last_stretch_at"])
         self.assertEqual(self.nr(100)["kind"], "after_reset")
-        d = self.nr(40, fc=flat_fc(1.0))                              # the user is forecast to use it all up
+        d = self.nr(80, fc=flat_fc(0.5), lm=0)["expected"]
         self.assertEqual((d["kind"], d["at"]), ("after_reset", thu))
+        d = self.nr(40, fc=flat_fc(1.0))                              # the user is forecast to use it all up
+        self.assertEqual((d["expected"]["kind"], d["expected"]["at"]), ("after_reset", thu))
+        self.assertEqual((d["kind"], d["at"]), ("night", SUN + timedelta(days=3)))   # without more use: Wed
 
     def test_unknown(self):
         self.assertEqual(self.nr(None)["kind"], "unknown")

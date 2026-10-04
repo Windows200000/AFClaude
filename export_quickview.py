@@ -356,16 +356,21 @@ def threshold_block(now, decision=None):
 
 def next_run_block(u, now, decision=None):
     """pacing.next_run(): when the next autonomous run takes place (D-166: the page shows this,
-    not the budget rule): Berlin time, kind, a one-line reason."""
+    not the budget rule): Berlin time, kind, a one-line reason. The main result assumes no more
+    usage (D-200); "expected" = the same with the user's forecast usage."""
     try:
         import pacing
         d = pacing.next_run(u, now, decision)
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"error": f"{type(e).__name__}: {e}"}
     r = lambda x: round(x, 1) if isinstance(x, (int, float)) else None   # noqa: E731
+    e = d.get("expected") or {}
     return {"at_berlin": bstr(d.get("at")), "kind": d.get("kind"), "label": d.get("label"),
             "reason": d.get("reason"), "predicted_end": r(d.get("predicted_end")),
-            "threshold": r(d.get("threshold")), "last_stretch_berlin": bstr(d.get("last_stretch_at"))}
+            "threshold": r(d.get("threshold")), "last_stretch_berlin": bstr(d.get("last_stretch_at")),
+            "expected": {"at_berlin": bstr(e.get("at")), "kind": e.get("kind"), "label": e.get("label"),
+                         "reason": e.get("reason"), "predicted_end": r(e.get("predicted_end"))}
+            if e else None}
 
 
 def keepalive_and_usage(now):

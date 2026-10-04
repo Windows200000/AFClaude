@@ -633,8 +633,8 @@ def _bs(t):
 
 
 def _last_stretch_start(w, resets_at, now, ratio, lm_setting, fc):
-    """Start of the last stretch, with its length from the weekly % forecast at its start
-    (w + the user's forecast use until then). None = off, or the week is forecast to be used up."""
+    """Start of the last stretch, with its length from the weekly % at its start (w + fc(now, start):
+    the user's forecast use until then, or 0 = no more usage). None = off, or the week is used up."""
     h, seen = last_mile_hours(min(w, 100.0), ratio, lm_setting), []
     while h not in seen:
         seen.append(h)
@@ -649,84 +649,105 @@ def _last_stretch_start(w, resets_at, now, ratio, lm_setting, fc):
     return resets_at - timedelta(hours=h) if h > 0 else None
 
 
+def _no_usage(a, b):
+    return 0.0
+
+
 def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None, threshold="auto",
                   lm_setting="auto", win=None, current=None, session_pct=None, session_resets_at=None,
                   P=None, max_nights=8):
     """When the next autonomous run will take place (pure). Walks the upcoming window starts until
-    the weekly reset and evaluates the night gate at each, with the weekly % at that start =
-    w + forecast(now, start): predicted_end = w_start + run_cost + forecast(start, reset) <=
-    threshold (the straight line without a forecast). The first start that passes is the next run;
-    if none passes, the start of the last stretch before the reset (D-020); without one, the first
-    night after the reset. current = the decide() dict for now: a run allowed now (inside the window
-    or the last stretch) is "now", a postponed one (yield, D-018) is "postponed" to its recheck.
-    -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at}; kind in NEXT_RUN_LABELS."""
+    the weekly reset and evaluates the night gate at each start: predicted_end = w_start + run_cost
+    + forecast(start, reset) <= threshold (the straight line without a forecast), as the real gate
+    will at that time. The primary result assumes NO MORE USAGE (D-200): w_start = w now. The first
+    start that passes is the next run; if none passes, the start of the last stretch before the reset
+    (D-020, its length from w now); without one, the first night after the reset. "expected" holds the
+    same walk with the user's forecast use until each start (w_start = w + forecast(now, start)).
+    current = the decide() dict for now: a run allowed now (inside the window or the last stretch)
+    is "now", a postponed one (yield, D-018) is "postponed" to its recheck (both results).
+    -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at,
+        expected: {at, kind, label, reason, predicted_end, last_stretch_at}}; kind in NEXT_RUN_LABELS."""
     P = {**DEFAULTS, **(P or {})}
     win = win or afclaude_config.window()
     thr, _ = threshold_for(ratio, threshold)
-    fc = forecast or (lambda a, b: 0.0)
+    fc = forecast or _no_usage
     out = {"at": None, "kind": "unknown", "reason": None, "predicted_end": None, "threshold": thr,
            "last_stretch_at": None}
 
     def res(kind, at, reason, **kw):
         return dict(out, kind=kind, label=NEXT_RUN_LABELS[kind], at=at, reason=reason, **kw)
 
+    def both(r, expected=None):
+        e = expected or r
+        r["expected"] = {k: e.get(k) for k in ("at", "kind", "label", "reason", "predicted_end",
+                                               "last_stretch_at")}
+        return r
+
     resets_at = _round_reset(resets_at)
     if weekly_pct is None or resets_at is None or resets_at <= now:
-        return res("unknown", None, "weekly usage unknown or stale: no forecast of the next run")
+        return both(res("unknown", None, "weekly usage unknown or stale: no forecast of the next run"))
     w = float(weekly_pct)
     after = next_window_start(resets_at - timedelta(seconds=1), win)
     if w >= 100:
-        return res("after_reset", after, f"weekly limit used up until the reset {_bs(resets_at)}")
-    lm = _last_stretch_start(w, resets_at, now, ratio, lm_setting, fc)
-    out["last_stretch_at"] = lm
+        return both(res("after_reset", after, f"weekly limit used up until the reset {_bs(resets_at)}"))
+    out["last_stretch_at"] = _last_stretch_start(w, resets_at, now, ratio, lm_setting, _no_usage)
     cur = current or {}
     if cur.get("mode") in ("night", "last_mile") and (cur.get("mode") == "last_mile" or in_window(now, win)):
         why = str(cur.get("reason") or "").split(";")[0].replace("HOLD: ", "")
         if cur.get("go"):
             what = "last stretch" if cur["mode"] == "last_mile" else "night gate passed"
-            return res("now", now, f"{what}: budget +{float(cur.get('headroom') or 0):.1f}% "
-                                   f"(up to {float(cur.get('target') or 0):.1f}%)",
-                       predicted_end=cur.get("predicted_end"))
+            return both(res("now", now, f"{what}: budget +{float(cur.get('headroom') or 0):.1f}% "
+                                        f"(up to {float(cur.get('target') or 0):.1f}%)",
+                            predicted_end=cur.get("predicted_end")))
         if cur.get("postpone") and cur.get("recheck_at"):
             r = res("postponed", cur["recheck_at"], why, predicted_end=cur.get("predicted_end"))
             if "session guard" in why or "unknown" in why:
                 r["label"] = "postponed (" + ("session guard" if "session guard" in why else "activity unknown") + ")"
-            return r
-    if lm is not None and now >= lm:
-        return res("last_stretch", now, f"in the last stretch before the reset {_bs(resets_at)}")
+            return both(r)
     full = full_session_cost(ratio)
-    first, s = None, next_window_start(now, win)
-    for _ in range(max_nights):
-        if s >= resets_at or (lm is not None and s >= lm):
-            break
-        ws = w + fc(now, s)
-        if ws >= 100:
-            break
-        cost = full
-        if session_pct is not None and session_resets_at is not None and _round_reset(session_resets_at) > s:
-            cost = ratio * max(100.0 - float(session_pct), 0.0)
-        cost = min(cost, 100.0 - ws)
-        if forecast is not None:
-            pred, line = ws + cost + fc(s, resets_at), thr
-            txt = f"predicted {pred:.1f}% {{}} {thr:.1f}%"
-        else:
-            end = min(window_end(s, win), resets_at)
-            line = thr * min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
-            pred = ws + cost
-            txt = f"straight line {pred:.1f}% {{}} {line:.1f}% (threshold {thr:.1f}% x elapsed)"
-        if first is None or pred < first[0]:
-            first = (pred, txt)          # the closest night: the reason shows the best case
-        if pred <= line and cost > P["min_gap"]:
-            return res("night", s, txt.format("≤") + f" at {_bs(s)}", predicted_end=pred)
-        s = next_window_start(s + timedelta(minutes=1), win)
-    head = first[1].format(">") + f" until {_bs(lm or resets_at)}" if first else \
-        "no night window before " + ("the last stretch" if lm else "the reset")
-    if first:
-        out["predicted_end"] = first[0]
-    if lm is not None:
-        return res("last_stretch", lm, f"{head}; last stretch {_bs(lm)}")
-    return res("after_reset", after, f"{head}; no last stretch (off or the week forecast used up); "
-                                      f"first night after the reset {_bs(after)}")
+
+    def walk(pre):
+        """The night walk with pre(now, start) = the user's use until each start."""
+        lm = _last_stretch_start(w, resets_at, now, ratio, lm_setting, pre)
+        if lm is not None and now >= lm:
+            return res("last_stretch", now, f"in the last stretch before the reset {_bs(resets_at)}",
+                       last_stretch_at=lm)
+        first, s = None, next_window_start(now, win)
+        for _ in range(max_nights):
+            if s >= resets_at or (lm is not None and s >= lm):
+                break
+            ws = w + pre(now, s)
+            if ws >= 100:
+                break
+            cost = full
+            if session_pct is not None and session_resets_at is not None and _round_reset(session_resets_at) > s:
+                cost = ratio * max(100.0 - float(session_pct), 0.0)
+            cost = min(cost, 100.0 - ws)
+            if forecast is not None:
+                pred, line = ws + cost + fc(s, resets_at), thr
+                txt = f"predicted {pred:.1f}% {{}} {thr:.1f}%"
+            else:
+                end = min(window_end(s, win), resets_at)
+                line = thr * min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
+                pred = ws + cost
+                txt = f"straight line {pred:.1f}% {{}} {line:.1f}% (threshold {thr:.1f}% x elapsed)"
+            if first is None or pred < first[0]:
+                first = (pred, txt)          # the closest night: the reason shows the best case
+            if pred <= line and cost > P["min_gap"]:
+                return res("night", s, txt.format("≤") + f" at {_bs(s)}", predicted_end=pred,
+                           last_stretch_at=lm)
+            s = next_window_start(s + timedelta(minutes=1), win)
+        head = first[1].format(">") + f" until {_bs(lm or resets_at)}" if first else \
+            "no night window before " + ("the last stretch" if lm else "the reset")
+        pe = first[0] if first else None
+        if lm is not None:
+            return res("last_stretch", lm, f"{head}; last stretch {_bs(lm)}", predicted_end=pe,
+                       last_stretch_at=lm)
+        return res("after_reset", after, f"{head}; no last stretch (off or the week used up); "
+                                         f"first night after the reset {_bs(after)}",
+                   predicted_end=pe, last_stretch_at=lm)
+
+    return both(walk(_no_usage), walk(fc))
 
 
 def next_run(usage, now, decision=None, rows=None, fires=None):
