@@ -445,7 +445,7 @@ class BudgetWiring(unittest.TestCase):
         with open(self.cfg, "w") as fh:
             json.dump(kw, fh)
 
-    def samples(self, now, prompt_minutes_ago=None, week=30.0, own_prompt_minutes_ago=None, minutes=300):
+    def samples(self, now, prompt_minutes_ago=None, week=15.0, own_prompt_minutes_ago=None, minutes=300):
         """Sampler rows every 15 min up to `now` (weekly `week`%); one prompt in a non-AFClaude
         session `prompt_minutes_ago` ago, one in an AFClaude session `own_prompt_minutes_ago` ago."""
         with open(self.bm.SAMPLES_FILE, "w") as fh:
@@ -456,7 +456,7 @@ class BudgetWiring(unittest.TestCase):
                                      "usage": {"weekly": {"percent": week, "resets_at": self.R.isoformat()}},
                                      "activity": {"own": own, "other": other}}) + "\n")
 
-    def u(self, week=30.0, sess=0.0, sess_reset=None):
+    def u(self, week=15.0, sess=0.0, sess_reset=None):
         return usage(week, self.R, sess, sess_reset)
 
     def test_config_switch(self):
@@ -500,6 +500,8 @@ class BudgetWiring(unittest.TestCase):
             ka.fresh_usage, ka.datetime, sys.argv = olds
         self.assertIn(d["reason"], out.getvalue())
         self.assertIn(d["text"], out.getvalue())
+        self.assertIn("one session window left", out.getvalue())          # pacing.threshold_info()
+        self.assertIn("model error", out.getvalue())
         # the continue message (window start, dry-run) carries that text
         msgs = []
         oldm, oldp = ka.session_message, ka.preflight

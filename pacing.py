@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""Weekly budget model "pacing" (stdlib only): forecast-driven, the original linear rule as its
-fallback. The default of keepalive.budget_eval() (data/afclaude.json "usage_model": "pacing").
+"""Weekly budget model "pacing" (stdlib only): a forecast-driven night gate, the original linear
+rule as its fallback. The default of keepalive.budget_eval() (data/afclaude.json "usage_model": "pacing").
 
-Goal: during the week fill the weekly limit to `week_target` (data/afclaude.json, default 90,
-80..95) with autonomous night work, leaving room for what the user is forecast to use, then
-fill the last stretch right before the reset to 100%.
+Goal: use the weekly limit with autonomous night work in FULL session windows, but only while the
+week is predicted to end at or below the reserve threshold; then fill the last stretch right
+before the reset to 100% (owner decision 04.10.2026).
+
+Night gate (every decision; each session window of the night is re-checked, a run uses its session
+window to the end):
+    w             = the weekly % now
+    run_cost      = the weekly % of the session window AFClaude would use: ratio x (100 - session %)
+                    of the live session window, else ratio x 100 = full_session_cost (a fresh one)
+    predicted_end = w + run_cost + forecast(now, weekly reset)
+    RUN iff predicted_end <= threshold: budget for this run (headroom) = run_cost (one number:
+    reason, --decide, the continue message, the quickview; ~ 1 session window). Otherwise no run
+    (no partial runs); the next session window / night re-checks.
+    threshold     = data/afclaude.json reserve_threshold: "auto" (default) = one session window
+                    left = 100 - full_session_cost from the measured ratio (dynamic_threshold), or a %
+                    override in 50..99 (a legacy week_target is honoured as the override).
+    The model has NO margin: the threshold is the only spare.
+    No forecast (< MIN_FORECAST_HOURS of closed-week user data): the straight line: RUN iff
+    w + run_cost <= threshold x the elapsed fraction of the week at tonight's window end.
 
 Forecast (the predictor): the user's typical weekly-% rise per hour of the week (Berlin weekday x
 hour), from the closed weekly cycles in data/samples.jsonl (last 4; user-only: intervals inside
 an autonomous AFClaude run, from a recorded fire until the next prompt in an AFClaude session,
 are left out; usage the user drives in AFClaude sessions counts as the user's). Hours without
-data use the mean rate. forecast(a, b) = forecast_margin (1.25) x the sum over [a, b).
-Needs >= MIN_FORECAST_HOURS (72) of covered hours, else the straight line below is used.
-Every window-start decision is logged (data/forecast_log.jsonl) and forecast_errors()
-compares it with what the user really used once the week has closed.
+data use the mean rate. forecast(a, b) = the sum over [a, b). Needs >= MIN_FORECAST_HOURS (72)
+of covered hours, else the straight line above is used.
 
-Night plan (every decision belongs to a night: the window start t0 to the next one):
-    w0       = weekly % at t0 (data/samples.jsonl)
-    allow    = week_target - w0 - forecast(t0, reset)        AFClaude's share of the rest
-    tonight  = allow x tonight's session windows / the night session windows before the
-               last stretch                                   (spread over the nights)
-    target   = w0 + max(tonight, 0)
-    no forecast: target = the original linear line at the window end, week_target x elapsed / 7 d
-    budget for this run (headroom) = target - w   (one number: reason, --decide, the continue
-               message, the quickview; ~ session windows = headroom / (100 x ratio))
-    CONTINUE iff headroom > min_gap (1%): run full session windows (cap 85%) to the target.
-    Re-planned every night with the updated forecast; daytime decisions (--now, --work-on)
-    spend what is left of the last night's target.
+Accuracy, computed in code: forecast_backtest() back-calculates the predictor's error from the
+usage data (at every past night session-window start, the profile fitted on the cycles closed
+before it vs the user's real use until the reset); ratio_stats() gives the session/weekly ratio's
+dispersion per session window (limit_ratio.py); threshold_info() puts both, the full-session cost
++- its uncertainty, the dynamic default and the active threshold together for the UI. Window-start
+decisions are also logged (data/forecast_log.jsonl) and forecast_errors() scores them.
 
 Last stretch: the final min(ceil(sessions_left), 2) x 5 h before the reset, sessions_left =
 (100 - w) / (100 x ratio): budget 100 - w, session cap 100% (last_mile_hours "auto"; a number
@@ -38,9 +46,8 @@ POSTPONES: recheck at last activity + idle_min (60). Unknown sampler data = acti
 15 min. Also in the last stretch unless last_mile_yield is false. Fail-safes: unknown usage or
 a stale reset time -> HOLD (recheck 15 min); exhausted -> HOLD.
 
-ratio = weekly % per session % = limit_ratio.py's median (biased low by the integer weekly %, so
-the last stretch tends to its 2-session cap; a per-session-window measurement is being added to
-limit_ratio separately), else 0.2 (conservative), and the reason says which.
+ratio = weekly % per session % = limit_ratio.preferred_ratio() (the per-session-window estimate,
+else the 15-min median), else 0.2 (conservative), and the reason says which.
 """
 import json
 import math
@@ -68,8 +75,8 @@ FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an a
 WEEK = timedelta(days=7)
 SESSION_H = afclaude_config.SESSION_LENGTH.total_seconds() / 3600
 LAST_MILE_MAX_SESSIONS = 2
-DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": True,
-            "forecast_margin": 1.25}
+DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": True}
+THRESHOLD_RANGE = (50.0, 99.0)
 LAST_MILE_SESSION_CAP = 100.0
 DEFAULT_RATIO = 0.2
 RATIO_RANGE = (0.01, 1.0)
@@ -80,20 +87,20 @@ SAMPLE_MAX_AGE = timedelta(minutes=30)
 ANCHOR_MAX_AGE = timedelta(minutes=30)
 FIRE_SLACK = timedelta(minutes=2)
 AUTO_MAX = timedelta(hours=10)
-TAIL_BYTES = 512 * 1024              # activity, anchor: about the last 40 h
+TAIL_BYTES = 512 * 1024              # activity: about the last 40 h
 LONG_BYTES = 10 * 1024 * 1024        # ratio, forecast: about the last 4-5 weeks
 
 
 # ------------------------------------------------------------------ params
 
 def parse_params(d):
-    """Optional overrides from user_model.json (top level or a "pacing" object)."""
+    """Optional overrides from user_model.json (top level or a "pacing" object). The retired
+    forecast_margin is ignored: the model has no margin, the threshold is the only spare."""
     if not isinstance(d, dict):
         raise ValueError("not an object")
     src = d.get("pacing") if isinstance(d.get("pacing"), dict) else d
     over = {}
-    for key, lo, hi in (("idle_min", 0, 1440), ("min_gap", 0, 50), ("session_cap", 1, 100),
-                        ("forecast_margin", 1, 3)):
+    for key, lo, hi in (("idle_min", 0, 1440), ("min_gap", 0, 50), ("session_cap", 1, 100)):
         v = src.get(key)
         if v is not None:
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
@@ -239,64 +246,87 @@ def minutes_since_user(now, rows=None):
         return None
 
 
-def weekly_at(rows, t0, resets_at, now):
-    """Weekly % at t0 in the cycle that resets at `resets_at`: the latest sample in
-    [t0 - 30 min, t0 + 1 min], else the first one after t0. None if there is none."""
-    cyc = _round_reset(resets_at)
-    pts = []
-    for r in rows or ():
-        w = _weekly(r)
-        t, p = _ts(_dict(r).get("at")), w.get("percent")
-        if t is None or not _num(p) or _round_reset(w.get("resets_at")) != cyc or t > now + timedelta(minutes=1):
-            continue
-        pts.append((t, float(p)))
-    pts.sort(key=lambda x: x[0])
-    before = [p for t, p in pts if t0 - ANCHOR_MAX_AGE <= t <= t0 + timedelta(minutes=1)]
-    if before:
-        return before[-1]
-    after = [p for t, p in pts if t > t0]
-    return after[0] if after else None
-
-
 # ------------------------------------------------------------------ ratio, last stretch
 
-def ratio_info(rows=None):
-    """-> (weekly % per session %, source text): limit_ratio.py's median (the sampler stores a
-    snapshot in every row; else computed over the rows), else DEFAULT_RATIO (conservative: a
-    shorter last stretch)."""
+def _ratio_snapshot(rows):
+    """The latest limit_ratio snapshot (the sampler stores one in every row), else computed over
+    the rows, else None."""
     if rows is None:
         try:
             rows = tail_rows(max_bytes=LONG_BYTES)
         except Exception:   # noqa: BLE001
             rows = []
-    full = None
     for r in reversed(rows):
         if isinstance(_dict(r).get("limit_ratio"), dict):
-            full = r["limit_ratio"]
-            break
-    if full is None and rows:
+            return r["limit_ratio"]
+    if rows:
         try:
             import limit_ratio
-            full = limit_ratio.compute(rows)
+            return limit_ratio.compute(rows)
         except Exception:   # noqa: BLE001
-            full = None
-    # prefer the per-session-window estimate (unbiased by the integer weekly %) once it has
-    # enough windows; limit_ratio.preferred_ratio() falls back to the old 15-min median
+            return None
+    return None
+
+
+def _ratio_pick(full):
+    """-> (ratio, source text, kind "windows" | "15min_median" | "default")."""
     try:
         import limit_ratio
         pr = limit_ratio.preferred_ratio(full)
         v = pr.get("value")
         if pr.get("source") == "windows" and _num(v) and RATIO_RANGE[0] <= v <= RATIO_RANGE[1]:
-            return float(v), f"per-session-window ratio, n={pr.get('n')} windows"
+            return float(v), f"per-session-window ratio, n={pr.get('n')} windows", "windows"
     except Exception:   # noqa: BLE001
         pass
     snap = _dict(_dict(full).get("ratio"))
     med = snap.get("median")
     if snap.get("status") == "ok" and _num(med) and RATIO_RANGE[0] <= med <= RATIO_RANGE[1]:
-        return float(med), f"limit_ratio median, n={snap.get('n')}"
+        return float(med), f"limit_ratio median, n={snap.get('n')}", "15min_median"
     why = (f"insufficient data, n={snap.get('n')}" if snap.get("status") == "insufficient_data"
            else "no limit_ratio data")
-    return DEFAULT_RATIO, f"conservative default {DEFAULT_RATIO:g} (limit_ratio: {why})"
+    return DEFAULT_RATIO, f"conservative default {DEFAULT_RATIO:g} (limit_ratio: {why})", "default"
+
+
+def ratio_info(rows=None):
+    """-> (weekly % per session %, source text): limit_ratio.preferred_ratio() (the
+    per-session-window estimate, unbiased by the integer weekly %), else the 15-min median,
+    else DEFAULT_RATIO (conservative: a shorter last stretch, a lower dynamic threshold)."""
+    return _ratio_pick(_ratio_snapshot(rows))[:2]
+
+
+def ratio_stats(rows=None):
+    """The ratio the model uses and its dispersion across session windows (limit_ratio.py's
+    per-window measurement, data/session_windows.jsonl): value, source, n, mean, stdev,
+    weighted_stdev (the spread), intrinsic_stdev (the spread minus integer-rounding noise),
+    se (standard error of the estimate), rounding_sd, p10 / p90. Fields are None when unknown."""
+    full = _ratio_snapshot(rows)
+    v, src, kind = _ratio_pick(full)
+    rw = _dict(_dict(full).get("ratio_windows"))
+    windows = kind == "windows"
+    out = {"value": v, "source": src, "kind": kind,
+           "n": rw.get("n") if windows else _dict(_dict(full).get("ratio")).get("n")}
+    for k in ("mean", "median", "stdev", "weighted_stdev", "intrinsic_stdev", "se", "rounding_sd", "p10", "p90"):
+        x = rw.get(k) if windows else None
+        out[k] = float(x) if _num(x) else None
+    return out
+
+
+def full_session_cost(ratio):
+    """Weekly % of one full session window (100 session %)."""
+    return 100.0 * float(ratio)
+
+
+def dynamic_threshold(ratio):
+    """The default reserve threshold: one session window left = 100 - full_session_cost."""
+    return min(max(100.0 - full_session_cost(ratio), THRESHOLD_RANGE[0]), THRESHOLD_RANGE[1])
+
+
+def threshold_for(ratio, setting="auto"):
+    """-> (threshold %, source text). setting "auto"/None = dynamic_threshold(ratio), else a %."""
+    if setting in (None, "auto"):
+        return dynamic_threshold(ratio), (f"dynamic: one session window left = 100 - "
+                                          f"{full_session_cost(ratio):.1f}%")
+    return float(setting), "override"
 
 
 def sessions_left(weekly_pct, ratio):
@@ -338,29 +368,6 @@ def window_end(start, win):
 def next_window_start(t, win):
     s = latest_window_start(t, win)
     return s if s > t else _wall(s.astimezone(BERLIN).date() + timedelta(days=1), win[0])
-
-
-def night_sessions(a, b, win):
-    """Session windows of night-window time in [a, b) (fractional)."""
-    if b <= a:
-        return 0.0
-    s, tot = latest_window_start(a, win), timedelta(0)
-    while s < b:
-        lo, hi = max(s, a), min(window_end(s, win), b)
-        if hi > lo:
-            tot += hi.astimezone(UTC) - lo.astimezone(UTC)   # same-tzinfo subtraction ignores DST
-        s = _wall(s.astimezone(BERLIN).date() + timedelta(days=1), win[0])
-    return tot.total_seconds() / 3600 / SESSION_H
-
-
-def night_start(now, resets_at, win):
-    """-> (t0, has_night): the night `now` belongs to; if its window started last week, the
-    weekly reset (a night only if the reset falls inside a window)."""
-    ws = latest_window_start(now, win)
-    week_start = resets_at - WEEK
-    if ws >= week_start:
-        return ws, True
-    return week_start, in_window(week_start, win)
 
 
 def _b(t):
@@ -452,8 +459,8 @@ def fit_profile(rows, fires, now):
     return rates, f"forecast from {len(keep)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% user usage"
 
 
-def forecast_user(rates, a, b, margin=1.0):
-    """Forecast of the user's weekly-% use in [a, b)."""
+def forecast_user(rates, a, b):
+    """Forecast of the user's weekly-% use in [a, b) (no margin: the threshold is the spare)."""
     if rates is None or b <= a:
         return 0.0
     tot, t = 0.0, a
@@ -461,7 +468,7 @@ def forecast_user(rates, a, b, margin=1.0):
         nxt = min((t.astimezone(UTC) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0), b)
         tot += rates[_how(t)] * (nxt - t).total_seconds() / 3600
         t = nxt
-    return margin * tot
+    return tot
 
 
 _PROFILE_CACHE = {}
@@ -486,17 +493,20 @@ def profile(rows=None, now=None, fires=None):
 # ------------------------------------------------------------------ decision
 
 def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, session_resets_at=None,
-                activity_known=True, ratio=DEFAULT_RATIO, lm_setting="auto", win=None, week_target=90.0,
-                forecast=None, anchor=None):
+                activity_known=True, ratio=DEFAULT_RATIO, lm_setting="auto", win=None, threshold="auto",
+                forecast=None):
     """Pure decision. forecast = a function (a, b) -> the user's forecast weekly % in [a, b), or
-    None (no forecast: the straight line). anchor = the weekly % at the night's start, or a
-    function t0 -> that (None: the current %). -> dict(go, headroom, target, mode, postpone,
-    recheck_at, session_cap, reason, ...)."""
+    None (no forecast: the straight line). threshold = "auto"/None (dynamic_threshold(ratio)) or a
+    %. -> dict(go, headroom, target, mode, postpone, recheck_at, session_cap, reason, threshold,
+    predicted_end, run_cost, ...)."""
     P = {**DEFAULTS, **(P or {})}
     win = win or afclaude_config.window()
+    thr, thr_src = threshold_for(ratio, threshold)
     d = {"go": False, "headroom": None, "target": None, "mode": None, "postpone": False, "recheck_at": None,
          "session_cap": P["session_cap"], "user_active": None, "ratio": ratio, "last_mile_h": None,
-         "last_mile_start": None, "t0": None, "w0": None, "forecast": None, "allow": None}
+         "last_mile_start": None, "t0": None, "w0": None, "forecast": None, "run_cost": None,
+         "full_session_cost": full_session_cost(ratio), "predicted_end": None, "threshold": thr,
+         "threshold_source": thr_src}
     if weekly_pct is None or resets_at is None:
         return dict(d, postpone=True, recheck_at=now + RETRY,
                     reason=f"HOLD: weekly usage unknown (fail-safe), recheck {_b(now + RETRY)}")
@@ -523,37 +533,41 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
                 + f"): week {w:.0f}% used, budget for this run +{head:.1f}% (up to 100%)")
         cap, check_user = LAST_MILE_SESSION_CAP, P["last_mile_yield"]
     else:
-        t0, has_night = night_start(now, resets_at, win)
-        if not has_night:
-            nxt = next_window_start(now, win)
-            return dict(d, mode="none", headroom=0.0, target=w, t0=t0, recheck_at=nxt,
-                        reason=f"HOLD: no night window since the weekly reset yet (next {_b(nxt)}); "
-                               f"budget for this run +0.0%")
-        w0 = anchor(t0) if callable(anchor) else anchor
-        w0 = w if w0 is None else min(float(w0), w)
-        end = min(window_end(t0, win), resets_at)
-        if forecast is not None:
-            lm0 = resets_at - timedelta(hours=last_mile_hours(w0, ratio, lm_setting))
-            fc = forecast(t0, resets_at)
-            allow = week_target - w0 - fc
-            tonight = night_sessions(t0, min(end, lm0), win)
-            nights = night_sessions(t0, lm0, win)
-            share = allow * tonight / nights if nights > 0 else allow
-            target = w0 + max(share, 0.0)
-            how = (f"plan: {week_target:g}% target - {w0:.0f}% at {_b(t0)} - {fc:.1f}% forecast user use "
-                   f"until the reset = {allow:.1f}% x {tonight:.1f} of {nights:.1f} night sessions = {share:.1f}%")
-            d.update(forecast=fc, allow=allow)
+        # the night gate: a full session window, only if the week still ends <= the threshold
+        full = full_session_cost(ratio)
+        if s_live:
+            cost = ratio * max(100.0 - float(session_pct), 0.0)
+            what = f"the rest of this session window ({float(session_pct):.0f}% used)"
         else:
+            cost, what = full, "a full session window"
+        cost = min(cost, 100.0 - w)
+        thr_txt = f"threshold {thr:.1f}% ({thr_src})"
+        if forecast is not None:
+            fc = forecast(now, resets_at)
+            pred = w + cost + fc
+            ok = pred <= thr
+            how = (f"predicted end {w:.0f}% now + {cost:.1f}% for {what} + {fc:.1f}% forecast user use until "
+                   f"the reset {_b(resets_at)} = {pred:.1f}% {'<=' if ok else '>'} {thr_txt}")
+            d.update(forecast=fc, predicted_end=pred)
+        else:
+            ws = latest_window_start(now, win)
+            end = min(max(window_end(ws, win), now), resets_at)
             frac = min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
-            target = week_target * frac
-            how = f"straight line {week_target:g}% x elapsed at the window end {_b(end)} = {target:.1f}%"
-        head = max(min(target - w, 100.0 - w), 0.0)
-        d.update(mode="night", headroom=head, target=target, t0=t0, w0=w0)
-        base = (f"week {w:.0f}% used; tonight up to {target:.1f}% ({how}); budget for this run +{head:.1f}% "
-                f"(≈ {head / (100.0 * ratio):.1f} session windows)")
-        if head <= P["min_gap"]:
+            line = thr * frac
+            pred = w + cost
+            ok = pred <= line
+            how = (f"straight line: {w:.0f}% now + {cost:.1f}% for {what} = {pred:.1f}% "
+                   f"{'<=' if ok else '>'} {thr:.1f}% x elapsed at the window end {_b(end)} = {line:.1f}% "
+                   f"({thr_src})")
+            d.update(predicted_end=pred)
+        head = cost if ok else 0.0
+        d.update(mode="night", headroom=head, target=w + head, t0=now, w0=w, run_cost=cost)
+        base = (f"week {w:.0f}% used; {how}; budget for this run +{head:.1f}% "
+                f"(≈ {head / full:.1f} session windows)")
+        if not ok or head <= P["min_gap"]:
             nxt = next_window_start(now, win)
-            return dict(d, recheck_at=nxt, reason=f"HOLD: on or ahead of the plan, next night {_b(nxt)}; {base}")
+            why = "the week would end above the threshold" if not ok else "no room left"
+            return dict(d, recheck_at=nxt, reason=f"HOLD: no run ({why}), next night {_b(nxt)}; {base}")
         cap, check_user = P["session_cap"], True
     if check_user and not activity_known:
         r = now + RETRY
@@ -573,9 +587,9 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
 
 
 def decide(usage, now, params=None, rows=None, long_rows=None, msu=None, activity_known=None, fires=None):
-    """Decision from a keepalive usage dict. rows = sampler rows for activity and the anchor
-    (default: the tail of data/samples.jsonl); long_rows for the ratio and the forecast
-    (default: rows if given, else a longer tail)."""
+    """Decision from a keepalive usage dict. rows = sampler rows for activity (default: the tail
+    of data/samples.jsonl); long_rows for the ratio and the forecast (default: rows if given,
+    else a longer tail)."""
     P, src = params or load_params()
     w = (usage or {}).get("weekly") or {}
     s = (usage or {}).get("session") or {}
@@ -592,10 +606,14 @@ def decide(usage, now, params=None, rows=None, long_rows=None, msu=None, activit
     ratio, rsrc = ratio_info(long_rows)
     rates, fsrc = profile(long_rows, now, fires)
     resets_at = w.get("resets_at")
-    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b, P["forecast_margin"]))
+    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))
+    setting, tsrc = afclaude_config.reserve_threshold_setting()
     d = decide_core(w.get("percent"), resets_at, now, msu, P, s.get("percent"), s.get("resets_at"),
                     activity_known, ratio, afclaude_config.last_mile_setting(), afclaude_config.window(),
-                    afclaude_config.week_target(), fc, lambda t0: weekly_at(rows, t0, resets_at, now))
+                    setting, fc)
+    if setting != "auto":
+        d["threshold_source"] = tsrc
+        d["reason"] = d["reason"].replace("(override)", f"({tsrc})")
     d.update(source=src, ratio_source=rsrc, forecast_source=fsrc)
     if d["headroom"] is not None:
         d["reason"] += f" [pacing: {fsrc}; ratio {ratio:.3g} ({rsrc})]"
@@ -606,7 +624,8 @@ def budget_text(d, weekly_pct=None):
     """The 'budget for this run' line of a continue message (the same number as the reason)."""
     if d.get("headroom") is None:
         return "budget unknown"
-    where = "last stretch, up to 100%" if d.get("mode") == "last_mile" else f"up to {d['target']:.1f}% tonight"
+    where = ("last stretch, up to 100%" if d.get("mode") == "last_mile" else
+             f"one session window, up to {d['target']:.1f}%")
     now_txt = f"now {float(weekly_pct):.0f}%, " if weekly_pct is not None else ""
     sw = f" ≈ {d['headroom'] / (100.0 * d['ratio']):.1f} session windows" if d.get("ratio") else ""
     return f"budget for this run: about +{d['headroom']:.1f} weekly % ({now_txt}{where}){sw}"
@@ -614,13 +633,19 @@ def budget_text(d, weekly_pct=None):
 
 # ------------------------------------------------------------------ forecast quality
 
+def _r2(x):
+    return round(x, 2) if _num(x) else None
+
+
 def record_forecast(d, resets_at, path=None):
-    """Log one night's plan (once per window start) so forecast_errors() can score it later."""
+    """Log one window-start decision (the forecast from d["t0"], the decision time, to the
+    reset) so forecast_errors() can score it later."""
     if d.get("forecast") is None or d.get("t0") is None:
         return False
     rec = {"at": d["t0"].astimezone(UTC).isoformat(), "reset": _round_reset(resets_at).isoformat(),
-           "w0": d["w0"], "forecast_user": round(d["forecast"], 2), "allow": round(d["allow"], 2),
-           "target": round(d["target"], 2), "logged_at": datetime.now(UTC).isoformat()}
+           "w0": d["w0"], "forecast_user": round(d["forecast"], 2), "run_cost": _r2(d.get("run_cost")),
+           "predicted_end": _r2(d.get("predicted_end")), "threshold": _r2(d.get("threshold")),
+           "go": d.get("go"), "target": _r2(d.get("target")), "logged_at": datetime.now(UTC).isoformat()}
     with open(path or FORECAST_LOG, "a") as fh:
         fh.write(json.dumps(rec) + "\n")
     return True
@@ -647,6 +672,156 @@ def forecast_errors(rows, fires, now, path=None):
     return out
 
 
+# ------------------------------------------------------------------ model accuracy (for the UI)
+
+MIN_BACKTEST_CLOSED = 7     # closed-horizon points (about a week of nights) before the error is "ok"
+
+
+def forecast_backtest(rows, fires, now, win=None, min_coverage=0.8):
+    """Back-calculate the predictor's error from the usage data. At every past night
+    session-window start t (the window start, + 5 h, ... inside the window) the profile fitted on
+    the cycles closed before t (what the gate would have used) forecasts the user's use until
+    the weekly reset (for the open cycle: until now, a partial horizon); actual = the user's real
+    use over the same span (user_intervals, the definition the fit uses). Spans the samples cover
+    less than min_coverage are skipped. -> [{at, reset, end, closed, horizon_h, predicted, actual,
+    error}], error = actual - predicted (> 0: the model under-predicted, the week ended higher)."""
+    win = win or afclaude_config.window()
+    rows = sorted((r for r in rows or () if _ts(_dict(r).get("at"))), key=lambda r: _ts(r["at"]))
+    cycles = sorted({c for c in (_round_reset(_weekly(r).get("resets_at")) for r in rows) if c is not None})
+    iv = user_intervals(rows, fires)
+    step = timedelta(hours=SESSION_H)
+    out = []
+    for c in cycles:
+        start, end = c - WEEK, min(c, now)
+        prior = [r for r in rows if _ts(r["at"]) <= start]
+        rates = fit_profile(prior, fires, start)[0] if prior else None
+        if rates is None:
+            continue
+        cyc_iv = [x for x in iv if x[0] >= start and x[1] <= c + timedelta(minutes=5)]
+        ws = latest_window_start(start, win)
+        while ws < end:
+            k, we = ws, window_end(ws, win)
+            while k < we:
+                if start <= k and end - k >= step:
+                    span = [x for x in cyc_iv if x[0] >= k and x[1] <= end + timedelta(minutes=5)]
+                    hz = (end - k).total_seconds() / 3600
+                    if sum((x[1] - x[0]).total_seconds() for x in span) / 3600 >= min_coverage * hz:
+                        pred, act = forecast_user(rates, k, end), sum(x[2] for x in span)
+                        out.append({"at": k.astimezone(UTC).isoformat(), "reset": c.isoformat(),
+                                    "end": end.isoformat(), "closed": end == c, "horizon_h": round(hz, 1),
+                                    "predicted": pred, "actual": act, "error": act - pred})
+                k = (k.astimezone(UTC) + step).astimezone(BERLIN)
+            ws = _wall(ws.astimezone(BERLIN).date() + timedelta(days=1), win[0])
+    return out
+
+
+def error_stats(errs):
+    """bias (mean error), sd, rmse, worst under-prediction, n of a forecast_backtest() list.
+    status "ok" with >= MIN_BACKTEST_CLOSED closed-horizon points, else "preliminary" (or
+    "insufficient_data" without any)."""
+    e = [x["error"] for x in errs]
+    n, closed = len(e), sum(1 for x in errs if x.get("closed"))
+    out = {"n": n, "n_closed": closed, "bias": None, "sd": None, "rmse": None, "worst": None,
+           "mean_horizon_h": None}
+    if not n:
+        return dict(out, status="insufficient_data",
+                    note="no past decision point with a fitted forecast yet (needs a closed week before it)")
+    mean = sum(e) / n
+    out.update(bias=mean, rmse=(sum(x * x for x in e) / n) ** 0.5, worst=max(e),
+               mean_horizon_h=sum(x["horizon_h"] for x in errs) / n,
+               sd=(sum((x - mean) ** 2 for x in e) / (n - 1)) ** 0.5 if n >= 2 else None)
+    if closed >= MIN_BACKTEST_CLOSED:
+        return dict(out, status="ok", note="back-calculated at past night session-window starts")
+    return dict(out, status="preliminary",
+                note=f"only {closed} point(s) with a full horizon to the reset (< {MIN_BACKTEST_CLOSED}); "
+                     f"the rest end at now; points of one week overlap (correlated)")
+
+
+def _rnd(x, k=1):
+    return round(x, k) if _num(x) else None
+
+
+def threshold_info(rows=None, fires=None, now=None, decision=None):
+    """Everything the threshold setting shows, computed in code: the session/weekly ratio +- its
+    spread per session window, the full-session weekly cost +- its uncertainty, the predictor's
+    back-calculated error (forecast_backtest), the uncertainty of the predicted week end, the
+    dynamic default threshold (one session window left) and the active threshold and its source.
+    decision = a decide() dict to add the current gate numbers ("now")."""
+    now = now or datetime.now(UTC)
+    if rows is None:
+        try:
+            rows = tail_rows(max_bytes=LONG_BYTES)
+        except Exception:   # noqa: BLE001
+            rows = []
+    fires = fire_times() if fires is None else fires
+    rs = ratio_stats(rows)
+    ratio = rs["value"]
+    cost = full_session_cost(ratio)
+    intr, se, spread = rs["intrinsic_stdev"], rs["se"], rs["weighted_stdev"]
+    cost_sd = 100.0 * ((intr or 0.0) ** 2 + (se or 0.0) ** 2) ** 0.5 if intr is not None or se is not None else None
+    try:
+        me = error_stats(forecast_backtest(rows, fires, now))
+    except Exception as e:   # noqa: BLE001 - advisory
+        me = dict(error_stats([]), note=f"backtest failed: {type(e).__name__}")
+    try:
+        logged = [x["actual"] - x["forecast"] for x in forecast_errors(rows, fires, now)]
+    except Exception:   # noqa: BLE001
+        logged = []
+    setting, tsrc = afclaude_config.reserve_threshold_setting()
+    dyn = dynamic_threshold(ratio)
+    active = dyn if setting == "auto" else float(setting)
+    end_sd = (me["sd"] ** 2 + cost_sd ** 2) ** 0.5 if me["sd"] is not None and cost_sd is not None else None
+    out = {
+        "ratio": {"value": _rnd(ratio, 4), "source": rs["source"], "kind": rs["kind"], "n": rs["n"],
+                  "spread": _rnd(spread, 4), "stdev": _rnd(rs["stdev"], 4),
+                  "intrinsic_stdev": _rnd(intr, 4), "se": _rnd(se, 4), "rounding_sd": _rnd(rs["rounding_sd"], 4),
+                  "p10": _rnd(rs["p10"], 4), "p90": _rnd(rs["p90"], 4)},
+        "full_session_cost": {"value": _rnd(cost), "sd": _rnd(cost_sd), "spread": _rnd(100 * spread if spread is not None else None),
+                              "se": _rnd(100 * se if se is not None else None),
+                              "note": "weekly % of one full session window = 100 x ratio; sd = per-session "
+                                      "variation without integer-rounding noise (intrinsic) and the estimate's se"},
+        "model_error": {**{k: _rnd(v) if isinstance(v, float) else v for k, v in me.items()},
+                        "sign": "actual - predicted user use until the reset (> 0: under-predicted)",
+                        "logged": {"n": len(logged), "bias": _rnd(sum(logged) / len(logged)) if logged else None}},
+        "predicted_end_sd": _rnd(end_sd),
+        "threshold": {"active": _rnd(active), "source": "dynamic" if setting == "auto" else tsrc,
+                      "dynamic_default": _rnd(dyn), "dynamic_default_sd": _rnd(cost_sd),
+                      "override": None if setting == "auto" else float(setting),
+                      "range": list(THRESHOLD_RANGE),
+                      "rule": "a night runs a full session window only if the week is predicted to end <= the "
+                              "threshold; the model has no margin, the threshold is the only spare"},
+    }
+    if decision is not None:
+        pe, thr = decision.get("predicted_end"), decision.get("threshold")
+        out["now"] = {"mode": decision.get("mode"), "go": decision.get("go"),
+                      "predicted_end": _rnd(pe), "threshold": _rnd(thr), "run_cost": _rnd(decision.get("run_cost")),
+                      "forecast_user": _rnd(decision.get("forecast")),
+                      "slack": _rnd(thr - pe) if _num(pe) and _num(thr) else None,
+                      "slack_in_sd": _rnd((thr - pe) / end_sd, 2) if _num(pe) and _num(thr) and end_sd else None}
+    return out
+
+
+def threshold_lines(ti):
+    """threshold_info() as a few text lines (keepalive.py --decide, python3 pacing.py)."""
+    r, c, m, t = ti["ratio"], ti["full_session_cost"], ti["model_error"], ti["threshold"]
+    pm = lambda x: f" ± {x:g}" if x is not None else ""   # noqa: E731
+    out = [f"ratio {r['value']:g}{pm(r['spread'])} (spread over {r['n']} session windows; {r['source']})",
+           f"full session window = {c['value']:g}{pm(c['sd'])} weekly %",
+           (f"model error ({m['status']}): bias {m['bias']:+g}, sd {m['sd'] if m['sd'] is not None else '?'}, "
+            f"rmse {m['rmse']:g}, worst {m['worst']:+g} weekly %, n={m['n']} ({m['n_closed']} to the reset), "
+            f"actual - predicted user use" if m["n"] else f"model error: {m['note']}"),
+           f"predicted week end ± {ti['predicted_end_sd']:g} weekly %" if ti["predicted_end_sd"] is not None
+           else "predicted week end ± ? (too little data)",
+           f"threshold {t['active']:g}% ({t['source']}; dynamic default {t['dynamic_default']:g}%"
+           f"{pm(t['dynamic_default_sd'])} = one session window left)"]
+    n = ti.get("now")
+    if n and n.get("predicted_end") is not None:
+        out.append(f"now: predicted end {n['predicted_end']:g}% vs threshold {n['threshold']:g}% "
+                   f"(slack {n['slack']:+g}%" + (f", {n['slack_in_sd']:+g} sd" if n.get("slack_in_sd") is not None
+                                                 else "") + ")")
+    return out
+
+
 def budget_decision(usage, now):
     d = decide(usage, now)
     return d["go"], d["reason"]
@@ -665,3 +840,4 @@ if __name__ == "__main__":     # quick look: python3 pacing.py
     print(load_params()[1], "| minutes since user:", minutes_since_user(_now), "| ratio:", ratio_info())
     print(_d["go"], _d["reason"])
     print(budget_text(_d, ((_u or {}).get("weekly") or {}).get("percent")))
+    print("\n".join(threshold_lines(threshold_info(now=_now, decision=_d))))

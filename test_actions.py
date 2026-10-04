@@ -525,6 +525,7 @@ class SettingActions(Base):
                           s["projection_threshold"]["value"], s["session_usage_stop"]["value"],
                           s["automation_paused"]["value"]),
                          ("Europe/Berlin", 5.0, "auto", 90.0, 85.0, False))
+        self.assertEqual(s["reserve_threshold"]["value"], "auto")      # dynamic: one session window left
 
     def test_local_config_feeds_the_defaults(self):
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
@@ -557,9 +558,18 @@ class SettingActions(Base):
                                 ("projection_threshold", "90", "number"), ("automation_paused", 1, "true or false"),
                                 ("window_tz", "Mars/Olympus", "unknown time zone"),
                                 ("last_mile_hours", -1, "0..168"), ("last_mile_hours", "soon", "auto"),
-                                ("session_hours", None, "not be null")):
+                                ("session_hours", None, "not be null"),
+                                ("reserve_threshold", 40, "50..99"), ("reserve_threshold", "high", "auto")):
             with self.assertRaisesRegex(ValueError, msg, msg=key):
                 self.do("setting.set", key=key, value=value)
+
+    def test_reserve_threshold_auto_or_override(self):
+        self.assertEqual(self.do("setting.set", key="reserve_threshold", value=88)["value"], 88.0)
+        self.assertEqual(self.do("setting.set", key="reserve_threshold", value="auto", version=1)["value"], "auto")
+        with open(afclaude_config.CONFIG_FILE, "w") as fh:          # a legacy week_target is the default
+            json.dump({"week_target": 92}, fh)
+        self.do("setting.reset", key="reserve_threshold", version=2)
+        self.assertEqual(actions.get_setting(self.conn, "reserve_threshold"), 92.0)
 
     def test_automation_pause_is_idempotent(self):
         self.assertEqual(self.do("automation.set", paused=True)["value"], True)

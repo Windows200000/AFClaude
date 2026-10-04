@@ -72,7 +72,7 @@ The usual approach applies: `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict
 ### 4.1 `settings`
 `key TEXT PK, value TEXT (JSON), updated_at, updated_by`. Typed accessors live in `schedule.py` and `actions.py`, and code defaults apply when a key is missing, so an empty table reproduces today's behaviour exactly.
 - `window.days` (per-weekday windows, §4.2.1), `window.tz` ("Europe/Berlin"), `window.session_hours` (5, the limit length; shown, overridable if it ever changes), `window.legacy_end` (today's 09:00, used only until the first GUI save, see §10 Q1)
-- `budget.week_target` (90, 80..95: the weekly % the nights fill to before the last stretch), `budget.last_mile_hours` (**"auto"** = min(ceil(session windows of quota left), 2) × `window.session_hours`, the last stretch before the weekly reset that fills to 100%; or a number of hours, 0 = off; the only end-of-week setting), `budget.session_usage_stop` (85, from `dispatcher.json`; 100 inside the last stretch). Model parameters (forecast_margin, idle_min, …) stay in the local `data/user_model.json`. Only for the linear fallback: `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: "11:00 after a 09:00 window end")
+- `budget.reserve_threshold` (**"auto"** = one session window left = 100 − the measured full-session weekly cost, now ≈ 84.6%; or a % override 50..99; a legacy `week_target` counts as the override: a night runs a full session window only if the week is predicted to end at or below it, see "Reserve threshold UI" below), `budget.last_mile_hours` (**"auto"** = min(ceil(session windows of quota left), 2) × `window.session_hours`, the last stretch before the weekly reset that fills to 100%; or a number of hours, 0 = off; the only end-of-week setting), `budget.session_usage_stop` (85, from `dispatcher.json`; 100 inside the last stretch). Model parameters (idle_min, …) stay in the local `data/user_model.json` (there is no forecast margin any more: the threshold is the only spare). Only for the linear fallback: `budget.projection_threshold` (90), `budget.cutoff_after_window_h` (2: "11:00 after a 09:00 window end")
 - `automation.paused` (bool, checked by every runner in addition to the `PAUSED` file)
 
 ### 4.2 Window semantics (`schedule.py`)
@@ -228,7 +228,7 @@ Preliminary status page: until phase 9, the quickview gets a small **phase visua
 
 ## Decisions by the owner (29.09.2026)
 
-- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff "no later than 11:00 after the window" now only applies to the linear fallback; the default budget model (pacing.py, 02.10.2026) plans the nights to `week_target` and ends the week with the "auto" last stretch instead.
+- **Q1 window:** the default automation window is **23:00–09:00 Europe/Berlin** (10 h = 2 session windows of 5 h). The weekly-reset cutoff "no later than 11:00 after the window" now only applies to the linear fallback; the default budget model (pacing.py, 02.10.2026; night gate since 04.10.2026) runs a night's full session window only while the week is predicted to end at or below the reserve threshold, and ends the week with the "auto" last stretch instead.
 - **Q2 login:** the dashboard implements **both** a general SSO (standard OpenID Connect, any provider, e.g. the existing Authelia) **and** a simple local username/password login (hashed passwords, rate limiting, secure session cookies). Either can be enabled via config. The reverse-proxy pattern stays as defence in depth.
 - **Q3 MCP tasks:** tasks added through MCP are treated exactly like tasks created in the UI; **no approval step**. The MCP server's instructions and tool descriptions must say that the tools are only to be used when the user explicitly asks for AFClaude.
 
@@ -254,6 +254,16 @@ The owner likes the preliminary quickview's look and wants it kept for the main 
 - "Reset this page/section" and "Reset all settings", each with a warning dialog that lists what will change, plus an UNDO (the previous values are kept in the audit log / settings versions, so one tap restores them).
 - Every setting has a short explanation: what it does, what it can affect (e.g. "can make AFClaude run during your daytime"), and its default.
 - The settings registry (actions.SETTINGS) is the single source for defaults, types, validation, the explanation texts and the "important" flag; the UI renders from it.
+
+## Reserve threshold UI (owner, 04.10.2026)
+
+- The reserve threshold control (`budget.reserve_threshold`: "auto" or a %) must show, next to the control, the numbers it depends on, all computed in code by `pacing.threshold_info()` (the quickview's "Reserve threshold" tile shows the same today):
+  - the session→weekly ratio ± its spread over the measured session windows (and n), dynamically calculated (`limit_ratio.py`, `data/session_windows.jsonl`);
+  - the weekly cost of one full session window ± its uncertainty, and the dynamic default it gives ("one session window left" = 100 − that cost);
+  - the prediction model's inaccuracy, back-calculated from the usage data (`pacing.forecast_backtest()`): bias, sd, rmse, n and how many points reach the reset, plus its status (preliminary / ok);
+  - the uncertainty of the predicted week end (model sd and session-cost sd combined), and the current predicted end vs the threshold (slack, also in sd);
+  - the active threshold and its source (dynamic default vs override), with "reset to default" returning to "auto".
+- The page explains the rule in one line: a night runs a FULL session window only if the week is then predicted to end at or below the threshold; the model itself has no margin, the threshold is the only spare.
 
 ## Owner decision store (owner, 02.10.2026)
 
