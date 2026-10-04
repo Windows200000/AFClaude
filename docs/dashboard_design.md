@@ -92,14 +92,14 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 ### 5.1 One resident runner daemon (*proposal*, follows from D-153)
 `runner.py` replaces supercronic, the `at` shim and the keep-alive watcher. It is one process with an internal scheduler; every job runs in a child process with a timeout, so a crash doesn't stop the loop. Job intervals are settings.
 
-| job | default | today |
-|---|---|---|
-| dispatcher pass (approved stalls, task starts, managed projects incl. the AFClaude manager, cleanup, verification) | every 10 min + on wake | cron `*/10` |
-| window-start tick: the first pass at/after a window start fires each managed project's window-start continue once per window (dedup key = the window's end date); a POSTPONE defers it to last activity + 60 min (D-018) | in the dispatcher pass | cron `0 21,22` UTC (fixed to 23:xx) |
-| stall scan (`stalled.scan`, own tick) | every 3 min | inside the temp dashboard's export |
-| usage sampler + pre/post-reset samples | every 15 min + scheduled jobs | cron + `at` shim |
-| usage review | when due | cron hourly check |
-| status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily | temp dashboard export |
+| job | default |
+|---|---|
+| dispatcher pass (approved stalls, task starts, managed projects incl. the AFClaude manager, cleanup, verification) | every 10 min + on wake |
+| window-start tick: the first pass at/after a window start fires each managed project's window-start continue once per window (dedup key = the window's end date); a POSTPONE defers it to last activity + 60 min (D-018) | in the dispatcher pass |
+| stall scan (`stalled.scan`, own tick) | every 3 min |
+| usage sampler + pre/post-reset samples | every 15 min + scheduled jobs |
+| usage review | when due |
+| status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily |
 
 - **Wake:** after any write that the runner must act on (run-now, window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
 - Health: the runner writes its last tick per job to `runner_state`; the web container's health check and F5 read it; the container restarts on a stale heartbeat.
