@@ -6,6 +6,8 @@ data/
 run/
 probe/
 keepalive_state.json
+keepalive_deferred.json
+usage_refresh_state.json
 keepalive.lock
 *.log
 STOP
