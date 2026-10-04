@@ -462,8 +462,10 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 
 The quickview's phase strip (D-085) shows these phases incl. the sub-phases and 8a–8d.
 
+**Status display (D-166):** the status views show when the next run will take place (date/time, kind, one-line reason, from `pacing.next_run()`), not the budget rule itself; the rule details belong to the threshold/settings view.
+
 ## 14. Future (after phase 9, not phases)
-- **Shared account pool (D-156).** Several Claude accounts as one pool, never assigned to projects; the runner picks an account with headroom. Needs installations talking to each other. Hooks left open now: `accounts` table and `account_id` on telemetry and runner rows; an `AccountPool` interface with one single-account implementation; `installation` id and epoch; a peer API (signed, per-installation keys) to be designed later.
+- **Shared account pool (D-156).** Several Claude accounts as one pool, never assigned to projects; the runner picks an account with headroom. Needs installations talking to each other. Hooks left open now: `accounts` table and `account_id` on telemetry and runner rows; an `AccountPool` interface with one single-account implementation; `installation` id and epoch; a peer API (signed, per-installation keys) to be designed later. Build on the existing open-source `claude-accounts` project (owner decision D-167): preferably contribute a small API upstream that AFClaude calls, so it stays current, instead of copying its code; opening that PR needs the owner's go.
 - **Window recommendations (D-035).** The usage monitor recommends shifting windows when the owner is usually active during a window or usually idle elsewhere; it aggregates by weekday + hour only, shows the evidence (weeks per slot) and proposes a concrete F4 edit, applied as a normal `window.set`.
 - **Experience store across users (D-137)** and the usage split (D-138): universal vs user-specific data stay separate, with format versions.
 - **Hooking into `claude rc` server mode (D-052).**
