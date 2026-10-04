@@ -212,6 +212,20 @@ What moves from files (each with a one-time importer that checks row counts, the
 - For AFClaude, `PROGRESS.md`, `GOALS.md` and `EXCEPTIONS.md` stay the public build log: exported into the repo and committed by the manager, through the `check_public` hooks.
 - Exports are read-only copies; nobody edits them. The CLAUDE.md rule "delete resolved items from OPEN_QUESTIONS.md first" becomes "close the question in the DB first" (phase 4b).
 
+### 7.8 DB error handling and escalation (D-171)
+With everything in the DB, a DB failure is the single biggest failure mode, so every DB access goes through one error path in `store.py`/`actions.py`:
+
+| class | examples | handling |
+|---|---|---|
+| transient | `SQLITE_BUSY`/locked, short I/O hiccup | retry with backoff (bounded, e.g. 5 tries / ~10 s), then treat as persistent |
+| caller error | constraint violation, version conflict (409), validation | no retry; a structured error back to the caller |
+| persistent | disk full, read-only FS, corruption (`PRAGMA quick_check` fails), schema newer than code, DB missing | stop writing; runners pause automation (no autonomous starts on a broken DB); escalate |
+
+- **Hand-back to Claude:** every error reaches the calling session as a structured result, never a silent failure or a raw traceback: MCP tools return an error object (class, message, what was not saved, suggested next step); the CLI exits non-zero with the same text. The session prompts (`prompts/*.md`) tell Claude: on a persistent DB error, stop the affected work, don't work around the DB (no hand-edited files as a substitute), and escalate to the user.
+- **Escalation can't depend on the DB:** if the DB itself is broken, a question can't be stored in it. Escalation therefore has an out-of-DB path: an append to a fallback alert file in the data volume (`data/ALERTS.fallback.md`, imported into the DB once it's healthy again), the notifier, and a red banner from the web container's health check. The runner re-checks the DB each tick and resumes on its own once it's healthy (an alert says so).
+- **Never lose the write:** an action that failed persistently is recorded in the fallback file (actor, action, payload hash, time), so it can be replayed or consciously dropped by the owner.
+- Tests: fault injection for each class (locked DB, read-only file, corrupted file, newer schema), covering the runner, MCP, CLI and web paths; gate 8a checks no DB call bypasses the error path.
+
 ## 8. API surface
 
 All under `/api/v1`, JSON; HTML pages call the same handlers (htmx gets fragments). Reads are GET; writes are POST/PUT/PATCH/DELETE with an `Idempotency-Key` and the `version` where one exists. Every write is one `actions.py` call. Every handler checks the role (§2) before anything else.
@@ -429,7 +443,7 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 
 1. **Config + v4 schema + `actions.py`.** Done (01.10.).
 2. **Backend foundation**
-   - **2a Settings in the DB (D-146):** every tunable into `SETTINGS` (afclaude.json, dispatcher.json), one-time import, runners and pacing read the DB, schema guard (A1).
+   - **2a Settings in the DB (D-146):** every tunable into `SETTINGS` (afclaude.json, dispatcher.json), one-time import, runners and pacing read the DB, schema guard (A1), the DB error path and escalation (§7.8, D-171).
    - **2b `schedule.py` (D-148):** the only window code, pacing included; DST tests; `window_tz` plumbing.
    - **2c Telemetry into the DB (D-161):** usage tables + importers; sampler, `limit_ratio`, `pacing`, `usage_review`, `usage_report` read/write the DB; `account_id`.
    - **2d Runner state + docs into the DB (D-161):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries` with exporters.
