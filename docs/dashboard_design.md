@@ -1,6 +1,6 @@
 # AFClaude dashboard and backend: target design (v2)
 
-Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-191). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the task-manager's and may be changed. Host names are placeholders.
+Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-199). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the task-manager's and may be changed. Host names are placeholders.
 
 **Terms (D-189).** A **task-manager** is the Claude session that runs a project: exactly one per project, frequently compacted (§5.5); there is no global task-manager, and AFClaude's own project simply has its task-manager like any other (`projects.manager_session` holds the task-manager's session id). A **manager** is a user role (§2). **Agents** are the worker sessions and subagents that work for a task-manager.
 
