@@ -620,6 +620,134 @@ def decide(usage, now, params=None, rows=None, long_rows=None, msu=None, activit
     return d
 
 
+# ------------------------------------------------------------------ next run (D-166)
+
+NEXT_RUN_LABELS = {"now": "running now", "night": "night window", "last_stretch": "last stretch",
+                   "postponed": "postponed after activity", "after_reset": "after the weekly reset",
+                   "unknown": "unknown"}
+
+
+def _bs(t):
+    """Short Berlin time for one-line reasons: 'Thu 14:00'."""
+    return t.astimezone(BERLIN).strftime("%a %H:%M")
+
+
+def _last_stretch_start(w, resets_at, now, ratio, lm_setting, fc):
+    """Start of the last stretch, with its length from the weekly % forecast at its start
+    (w + the user's forecast use until then). None = off, or the week is forecast to be used up."""
+    h, seen = last_mile_hours(min(w, 100.0), ratio, lm_setting), []
+    while h not in seen:
+        seen.append(h)
+        wl = w + fc(now, max(resets_at - timedelta(hours=h), now))
+        h2 = last_mile_hours(min(wl, 100.0), ratio, lm_setting)
+        if h2 == h:
+            break
+        if h2 in seen:      # 5 h <-> 10 h flip-flop: take the longer stretch (the earlier run)
+            h = max(seen[seen.index(h2):])
+            break
+        h = h2
+    return resets_at - timedelta(hours=h) if h > 0 else None
+
+
+def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None, threshold="auto",
+                  lm_setting="auto", win=None, current=None, session_pct=None, session_resets_at=None,
+                  P=None, max_nights=8):
+    """When the next autonomous run will take place (pure). Walks the upcoming window starts until
+    the weekly reset and evaluates the night gate at each, with the weekly % at that start =
+    w + forecast(now, start): predicted_end = w_start + run_cost + forecast(start, reset) <=
+    threshold (the straight line without a forecast). The first start that passes is the next run;
+    if none passes, the start of the last stretch before the reset (D-020); without one, the first
+    night after the reset. current = the decide() dict for now: a run allowed now (inside the window
+    or the last stretch) is "now", a postponed one (yield, D-018) is "postponed" to its recheck.
+    -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at}; kind in NEXT_RUN_LABELS."""
+    P = {**DEFAULTS, **(P or {})}
+    win = win or afclaude_config.window()
+    thr, _ = threshold_for(ratio, threshold)
+    fc = forecast or (lambda a, b: 0.0)
+    out = {"at": None, "kind": "unknown", "reason": None, "predicted_end": None, "threshold": thr,
+           "last_stretch_at": None}
+
+    def res(kind, at, reason, **kw):
+        return dict(out, kind=kind, label=NEXT_RUN_LABELS[kind], at=at, reason=reason, **kw)
+
+    resets_at = _round_reset(resets_at)
+    if weekly_pct is None or resets_at is None or resets_at <= now:
+        return res("unknown", None, "weekly usage unknown or stale: no forecast of the next run")
+    w = float(weekly_pct)
+    after = next_window_start(resets_at - timedelta(seconds=1), win)
+    if w >= 100:
+        return res("after_reset", after, f"weekly limit used up until the reset {_bs(resets_at)}")
+    lm = _last_stretch_start(w, resets_at, now, ratio, lm_setting, fc)
+    out["last_stretch_at"] = lm
+    cur = current or {}
+    if cur.get("mode") in ("night", "last_mile") and (cur.get("mode") == "last_mile" or in_window(now, win)):
+        why = str(cur.get("reason") or "").split(";")[0].replace("HOLD: ", "")
+        if cur.get("go"):
+            what = "last stretch" if cur["mode"] == "last_mile" else "night gate passed"
+            return res("now", now, f"{what}: budget +{float(cur.get('headroom') or 0):.1f}% "
+                                   f"(up to {float(cur.get('target') or 0):.1f}%)",
+                       predicted_end=cur.get("predicted_end"))
+        if cur.get("postpone") and cur.get("recheck_at"):
+            r = res("postponed", cur["recheck_at"], why, predicted_end=cur.get("predicted_end"))
+            if "session guard" in why or "unknown" in why:
+                r["label"] = "postponed (" + ("session guard" if "session guard" in why else "activity unknown") + ")"
+            return r
+    if lm is not None and now >= lm:
+        return res("last_stretch", now, f"in the last stretch before the reset {_bs(resets_at)}")
+    full = full_session_cost(ratio)
+    first, s = None, next_window_start(now, win)
+    for _ in range(max_nights):
+        if s >= resets_at or (lm is not None and s >= lm):
+            break
+        ws = w + fc(now, s)
+        if ws >= 100:
+            break
+        cost = full
+        if session_pct is not None and session_resets_at is not None and _round_reset(session_resets_at) > s:
+            cost = ratio * max(100.0 - float(session_pct), 0.0)
+        cost = min(cost, 100.0 - ws)
+        if forecast is not None:
+            pred, line = ws + cost + fc(s, resets_at), thr
+            txt = f"predicted {pred:.1f}% {{}} {thr:.1f}%"
+        else:
+            end = min(window_end(s, win), resets_at)
+            line = thr * min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
+            pred = ws + cost
+            txt = f"straight line {pred:.1f}% {{}} {line:.1f}% (threshold {thr:.1f}% x elapsed)"
+        if first is None or pred < first[0]:
+            first = (pred, txt)          # the closest night: the reason shows the best case
+        if pred <= line and cost > P["min_gap"]:
+            return res("night", s, txt.format("≤") + f" at {_bs(s)}", predicted_end=pred)
+        s = next_window_start(s + timedelta(minutes=1), win)
+    head = first[1].format(">") + f" until {_bs(lm or resets_at)}" if first else \
+        "no night window before " + ("the last stretch" if lm else "the reset")
+    if first:
+        out["predicted_end"] = first[0]
+    if lm is not None:
+        return res("last_stretch", lm, f"{head}; last stretch {_bs(lm)}")
+    return res("after_reset", after, f"{head}; no last stretch (off or the week forecast used up); "
+                                      f"first night after the reset {_bs(after)}")
+
+
+def next_run(usage, now, decision=None, rows=None, fires=None):
+    """next_run_core() from a keepalive usage dict with the live ratio, forecast and settings
+    (as decide()); decision = the decide()/budget_eval() dict for now (computed if None)."""
+    w = (usage or {}).get("weekly") or {}
+    s = (usage or {}).get("session") or {}
+    if decision is None:
+        decision = decide(usage, now, rows=rows, fires=fires)
+    ratio, _ = ratio_info(rows)
+    rates, fsrc = profile(rows, now, fires)
+    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))
+    setting, _ = afclaude_config.reserve_threshold_setting()
+    P, _ = load_params()
+    d = next_run_core(w.get("percent"), w.get("resets_at"), now, ratio, fc, setting,
+                      afclaude_config.last_mile_setting(), afclaude_config.window(), decision,
+                      s.get("percent"), s.get("resets_at"), P)
+    d["forecast_source"] = fsrc
+    return d
+
+
 def budget_text(d, weekly_pct=None):
     """The 'budget for this run' line of a continue message (the same number as the reason)."""
     if d.get("headroom") is None:
@@ -787,9 +915,7 @@ def threshold_info(rows=None, fires=None, now=None, decision=None):
         "threshold": {"active": _rnd(active), "source": "dynamic" if setting == "auto" else tsrc,
                       "dynamic_default": _rnd(dyn), "dynamic_default_sd": _rnd(cost_sd),
                       "override": None if setting == "auto" else float(setting),
-                      "range": list(THRESHOLD_RANGE),
-                      "rule": "a night runs a full session window only if the week is predicted to end <= the "
-                              "threshold; the model has no margin, the threshold is the only spare"},
+                      "range": list(THRESHOLD_RANGE)},
     }
     if decision is not None:
         pe, thr = decision.get("predicted_end"), decision.get("threshold")

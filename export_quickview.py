@@ -4,8 +4,9 @@
 Writes into data/quickview/ (gitignored), which the key-gated nginx in quickview/
 serves at /afclaude/:
 
-  status.json   keepalive+usage (incl. the reserve threshold and the model's
-                accuracy, pacing.threshold_info), progress (from GOALS.md, plus the
+  status.json   keepalive+usage (incl. when the next run takes place, pacing.next_run,
+                and the reserve threshold and the model's accuracy,
+                pacing.threshold_info), progress (from GOALS.md, plus the
                 project's stages from the task store as a phase strip), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget rule, window)
+import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget evaluation, window)
 import store  # noqa: E402  (read-only: pending_user_input)
 import limit_ratio  # noqa: E402  (reads the per-sample ratio snapshot; never recomputes here)
 import afclaude_config  # noqa: E402  (local machine-specific values)
@@ -353,6 +354,20 @@ def threshold_block(now, decision=None):
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def next_run_block(u, now, decision=None):
+    """pacing.next_run(): when the next autonomous run takes place (D-166: the page shows this,
+    not the budget rule): Berlin time, kind, a one-line reason."""
+    try:
+        import pacing
+        d = pacing.next_run(u, now, decision)
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"}
+    r = lambda x: round(x, 1) if isinstance(x, (int, float)) else None   # noqa: E731
+    return {"at_berlin": bstr(d.get("at")), "kind": d.get("kind"), "label": d.get("label"),
+            "reason": d.get("reason"), "predicted_end": r(d.get("predicted_end")),
+            "threshold": r(d.get("threshold")), "last_stretch_berlin": bstr(d.get("last_stretch_at"))}
+
+
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
     out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
@@ -361,6 +376,7 @@ def keepalive_and_usage(now):
     out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
     if not u:
         out["usage_error"] = "no usage cache in ~/.claude.json"
+        out["next_run"] = next_run_block(None, now)
         out["threshold"] = threshold_block(now)
         return out
     out["fetched_at_berlin"] = bstr(u["fetched_at"])
@@ -369,10 +385,7 @@ def keepalive_and_usage(now):
         if u.get(k):
             out[k] = {"percent": u[k]["percent"], "resets_at_berlin": bstr(u[k]["resets_at"])}
     d = ka.budget_eval(u, now)
-    out["budget_rule_now"] = {"continue": d["go"], "reason": d["reason"], "headroom": d.get("headroom"),
-                              "budget": d.get("text"),
-                              "recheck_berlin": bstr(d["recheck_at"]) if d.get("postpone") and d.get("recheck_at")
-                              else None}
+    out["next_run"] = next_run_block(u, now, d)
     out["limits"] = limits_block()
     out["threshold"] = threshold_block(now, d)
     return out

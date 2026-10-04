@@ -188,10 +188,13 @@ button.chip.sel { border-color: #a855f7; }
     else {
       out.push(pctTile("Session", k.session));
       out.push(pctTile("Week", k.weekly));
-      var b = k.budget_rule_now || {};
-      var head = (b.headroom === null || b.headroom === undefined) ? "" : " +" + Number(b.headroom).toFixed(1) + "%";
-      out.push(tile("Budget rule", (b["continue"] ? '<span class="ok">CONTINUE</span>' : '<span class="warn">HOLD</span>') + esc(head),
-        '<div class="mut">' + esc(b.reason || "") + (b.recheck_berlin ? " (recheck " + esc(b.recheck_berlin) + ")" : "") + "</div>"));
+    }
+    var nr = k.next_run || {};   // D-166: when the next run takes place, not the budget rule
+    if (nr.error) out.push(tile("Next run", "–", '<div class="mut">' + esc(nr.error) + "</div>"));
+    else if (nr.kind) {
+      out.push(tile("Next run", nr.kind === "now" ? '<span class="ok">now</span>' : esc(nr.at_berlin || "?"),
+        '<div class="mut"><strong>' + esc(nr.label || nr.kind) + "</strong></div>" +
+        (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "")));
     }
     var lim = k.limits || {};
     if (lim.ratio_pref != null && lim.ratio_pref_source === "windows") {

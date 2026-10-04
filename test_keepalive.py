@@ -527,10 +527,13 @@ class BudgetWiring(unittest.TestCase):
         eq.watcher_running, ka.tmux_alive = (lambda: False), (lambda sid: False)
         eq.limits_block, eq.usage_review = (lambda: {}), (lambda: None)
         try:
-            q = eq.keepalive_and_usage(now)["budget_rule_now"]
+            q = eq.keepalive_and_usage(now)
         finally:
             ka.read_usage_cache, eq.watcher_running, ka.tmux_alive, eq.limits_block, eq.usage_review = oldq
-        self.assertEqual((q["headroom"], q["reason"], q["budget"]), (d["headroom"], d["reason"], d["text"]))
+        self.assertNotIn("budget_rule_now", q)                          # D-166: the next run, not the rule
+        nr = q["next_run"]
+        self.assertEqual(nr["kind"], "now", nr)
+        self.assertIn(f"{num}%", nr["reason"])                            # the same number there too
 
     def test_own_session_prompt_is_not_user_activity(self):
         """Requirement 1: the user's input to an AFClaude session does not hold AFClaude."""

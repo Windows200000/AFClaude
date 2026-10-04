@@ -147,5 +147,40 @@ class ThresholdBlock(unittest.TestCase):
             self.assertIn(needle, page)
 
 
+
+class NextRunBlock(unittest.TestCase):
+    """D-166: the keep-alive + usage section shows when the next run takes place
+    (pacing.next_run), not the budget rule; a failure is shown, not raised."""
+
+    def test_block(self):
+        import pacing
+        from datetime import timezone
+        old = pacing.next_run
+        at = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        try:
+            pacing.next_run = lambda u, now, decision=None: {
+                "at": at, "kind": "last_stretch", "label": "last stretch", "reason": "predicted 98.6% > 84.6%",
+                "predicted_end": 98.6123, "threshold": 84.58, "last_stretch_at": at}
+            b = qv.next_run_block({}, datetime(2026, 10, 4, tzinfo=timezone.utc))
+            self.assertEqual((b["kind"], b["label"], b["predicted_end"], b["threshold"]),
+                             ("last_stretch", "last stretch", 98.6, 84.6))
+            self.assertTrue(b["at_berlin"].startswith("Thu 08.10. 14:00"))
+
+            def boom(*a, **kw):
+                raise RuntimeError("x")
+            pacing.next_run = boom
+            self.assertIn("RuntimeError", qv.next_run_block({}, datetime(2026, 10, 4))["error"])
+        finally:
+            pacing.next_run = old
+
+    def test_page_shows_the_next_run_not_the_rule(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        self.assertIn("k.next_run", page)
+        self.assertIn("Next run", page)
+        self.assertNotIn("budget_rule_now", page)
+        self.assertNotIn("Budget rule", page)
+
+
 if __name__ == "__main__":
     unittest.main()
