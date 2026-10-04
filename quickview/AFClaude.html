@@ -190,13 +190,13 @@ button.chip.sel { border-color: #a855f7; }
       out.push(pctTile("Week", k.weekly));
     }
     var nr = k.next_run || {};   // D-166: when the next run takes place, not the budget rule
-    if (nr.error) out.push(tile("Next run", "–", '<div class="mut">' + esc(nr.error) + "</div>"));
+    if (nr.error) out.push(tile("Holding until", "–", '<div class="mut">' + esc(nr.error) + "</div>"));
     else if (nr.kind) {
       // D-200: the main line assumes no more usage; the forecast-based expectation is secondary
       var ex = nr.expected, exTxt = "";
       if (ex && ex.kind) exTxt = '<div class="mut" style="font-size:.85em;margin-top:.3em">With your forecast usage: ' +
-        (ex.kind === "now" ? "now" : esc(ex.at_berlin || "?")) + ", " + esc(ex.label || ex.kind) + "</div>";
-      out.push(tile("Next run (if you use nothing more)", nr.kind === "now" ? '<span class="ok">now</span>' : esc(nr.at_berlin || "?"),
+        (ex.kind === "now" ? "running now" : "holding until " + esc(ex.at_berlin || "?")) + ", " + esc(ex.label || ex.kind) + "</div>";
+      out.push(tile(nr.kind === "now" ? "Running" : "Holding until (if you use nothing more)", nr.kind === "now" ? '<span class="ok">now</span>' : esc(nr.at_berlin || "?"),
         '<div class="mut"><strong>' + esc(nr.label || nr.kind) + "</strong></div>" +
         (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "") + exTxt));
     }
