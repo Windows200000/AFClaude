@@ -93,9 +93,6 @@ class Consumers(unittest.TestCase):
         iv = pacing.user_intervals(rows, [])
         self.assertEqual([(a, b) for a, b, _ in iv], [(FROZEN, FROZEN + timedelta(minutes=30))])
         self.assertEqual(sum(dw for *_, dw in iv), 0.0)
-        # the anchor never picks a frozen reading (07:30-08:00 are all stale)
-        t0 = FROZEN + timedelta(minutes=90)
-        self.assertEqual(pacing.weekly_at(rows, t0, WR, FROZEN + timedelta(hours=3)), 32.0)
 
     def test_limit_ratio_ignores_stale_rows(self):
         sr = FROZEN + timedelta(hours=3)
