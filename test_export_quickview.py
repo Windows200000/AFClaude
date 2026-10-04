@@ -118,5 +118,34 @@ class LimitsBlock(unittest.TestCase):
         self.assertEqual(b["ratio_median"], 0.1333)   # old field unchanged
 
 
+class ThresholdBlock(unittest.TestCase):
+    """The keep-alive + usage section carries pacing.threshold_info() (the reserve threshold,
+    the ratio's variance and the model's inaccuracy); a failure is shown, not raised."""
+
+    def test_threshold_block(self):
+        import pacing
+        old = pacing.threshold_info
+        seen = {}
+        try:
+            pacing.threshold_info = lambda now=None, decision=None: seen.update(d=decision) or {"threshold": {"active": 84.6}}
+            self.assertEqual(qv.threshold_block(datetime(2026, 10, 4), {"mode": "night"})["threshold"]["active"], 84.6)
+            self.assertEqual(seen["d"], {"mode": "night"})
+            qv.threshold_block(datetime(2026, 10, 4), {"mode": "linear"})       # not a pacing decision
+            self.assertIsNone(seen["d"])
+
+            def boom(**kw):
+                raise RuntimeError("x")
+            pacing.threshold_info = boom
+            self.assertIn("RuntimeError", qv.threshold_block(datetime(2026, 10, 4))["error"])
+        finally:
+            pacing.threshold_info = old
+
+    def test_page_renders_the_tile(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        for needle in ("k.threshold", "Reserve threshold", "model error", "dynamic default"):
+            self.assertIn(needle, page)
+
+
 if __name__ == "__main__":
     unittest.main()

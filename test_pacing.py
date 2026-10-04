@@ -28,9 +28,9 @@ def flat_fc(rate=0.2):
     return lambda a, b: rate * (b - a).total_seconds() / 3600
 
 
-def core(w, now, msu=600.0, ratio=0.125, anchor=None, known=True, P=None, s_pct=None, s_reset=None,
-         lm="auto", fc=None, target=90.0):
-    return pm.decide_core(w, R, now, msu, P, s_pct, s_reset, known, ratio, lm, WIN, target, fc, anchor)
+def core(w, now, msu=600.0, ratio=0.125, known=True, P=None, s_pct=None, s_reset=None,
+         lm="auto", fc=None, thr="auto"):
+    return pm.decide_core(w, R, now, msu, P, s_pct, s_reset, known, ratio, lm, WIN, thr, fc)
 
 
 def row(at, w=None, reset=R, own=None, other=None, ratio=None):
@@ -92,7 +92,6 @@ class LastStretch(unittest.TestCase):
         d = pm.decide_core(85, r, r - timedelta(hours=9), 600.0, None, None, None, True, 0.125, "auto", WIN)
         self.assertEqual(d["last_mile_start"], Z("2026-10-25T08:00:00Z"))   # 10 real hours
         self.assertEqual(d["mode"], "last_mile")
-        self.assertAlmostEqual(pm.night_sessions(Z("2026-10-24T12:00:00Z"), r, WIN), 11 / 5)  # an 11-h night
 
 
 class Ratio(unittest.TestCase):
@@ -108,84 +107,119 @@ class Ratio(unittest.TestCase):
         self.assertEqual(pm.ratio_info(rows)[0], pm.DEFAULT_RATIO)        # implausible
 
 
-class Plan(unittest.TestCase):
-    """The nights fill the week to week_target minus the forecast user use, re-planned every
-    night, as full session windows; the original straight line when there is no forecast."""
+class Gate(unittest.TestCase):
+    """The night gate (owner decision 04.10.2026): a FULL session window only if the week is then
+    predicted to end <= the threshold (w + session cost + forecast user use until the reset);
+    no margin; the threshold defaults to one session window left; the straight line without a
+    forecast. ratio 0.125: a full session window = 12.5 weekly %, the dynamic threshold 87.5%."""
+    FC = 0.2 * (R - SUN).total_seconds() / 3600                     # 92 h x 0.2 = 18.4
 
-    def test_straight_line_fallback(self):
-        d = core(30, SUN)                                            # no forecast
-        end = Z("2026-10-05T07:00:00Z")                               # Mon 09:00, tonight's window end
-        self.assertAlmostEqual(d["target"], 90 * ((end - (R - pm.WEEK)) / pm.WEEK))
-        self.assertAlmostEqual(d["headroom"], d["target"] - 30)
+    def test_runs_only_if_predicted_end_le_threshold(self):
+        d = core(50, SUN, fc=flat_fc())
         self.assertTrue(d["go"], d["reason"])
-        self.assertIn("straight line", d["reason"])
-        d = core(70, SUN)                                            # ahead of the line: no run tonight
+        self.assertAlmostEqual(d["forecast"], self.FC)              # no margin on the forecast
+        self.assertAlmostEqual(d["predicted_end"], 50 + 12.5 + self.FC)
+        self.assertEqual((d["threshold"], d["run_cost"], d["headroom"]), (87.5, 12.5, 12.5))
+        self.assertAlmostEqual(d["target"], 62.5)
+        self.assertIn("predicted end", d["reason"])
+        edge = 87.5 - 12.5 - self.FC                                 # exactly at the threshold: runs
+        self.assertTrue(core(edge, SUN, fc=flat_fc())["go"])
+        d = core(edge + 0.5, SUN, fc=flat_fc())
         self.assertFalse(d["go"])
         self.assertFalse(d["postpone"])
-        self.assertIn("ahead of the plan", d["reason"])
+        self.assertEqual(d["headroom"], 0.0)                         # no partial / short run
+        self.assertIn("above the threshold", d["reason"])
+        self.assertEqual(d["recheck_at"], pm.next_window_start(SUN, WIN))
 
-    def test_forecast_share(self):
-        d = core(20, SUN, fc=flat_fc(), anchor=20)
-        nights = pm.night_sessions(SUN, R - timedelta(hours=10), WIN)   # 80% left: a 2-window stretch
-        self.assertAlmostEqual(nights, 8.0)            # Sun, Mon, Tue, Wed nights (the stretch starts Thu 09:00)
-        fc = 0.2 * (R - SUN).total_seconds() / 3600
-        allow = 90 - 20 - fc
-        self.assertAlmostEqual(d["forecast"], fc)
-        self.assertAlmostEqual(d["allow"], allow)
-        self.assertAlmostEqual(d["target"], 20 + allow * 2 / nights)
-        self.assertAlmostEqual(d["headroom"], d["target"] - 20)
-        self.assertIn("session windows", d["reason"])
+    def test_full_session_or_nothing(self):
+        for w in range(0, 80, 3):
+            d = core(w, SUN, fc=flat_fc())
+            self.assertIn(d["headroom"], (0.0, 12.5), w)
+
+    def test_rest_of_a_live_session_window(self):
+        d = core(50, SUN, fc=flat_fc(), s_pct=40, s_reset=SUN + timedelta(hours=2))
+        self.assertAlmostEqual(d["run_cost"], 0.125 * 60)
+        self.assertAlmostEqual(d["predicted_end"], 50 + 7.5 + self.FC)
+        self.assertAlmostEqual(d["headroom"], 7.5)
+        # the run's own use does not flip the gate mid-session: w and the session rise together
+        later = core(50 + 0.125 * 30, SUN + timedelta(hours=1), fc=lambda a, b: 0.0, s_pct=70,
+                     s_reset=SUN + timedelta(hours=2))
+        self.assertAlmostEqual(later["predicted_end"], 50 + 7.5)
 
     def test_heavy_forecast_no_run(self):
         d = core(40, SUN, fc=flat_fc(1.0))                            # the user is forecast to fill it
-        self.assertLess(d["allow"], 0)
         self.assertFalse(d["go"])
         self.assertEqual(d["headroom"], 0.0)
 
-    def test_simulated_week_fills_to_the_target(self):
-        """Light user (0.1 %/h): every night runs a full catch-up, the week reaches about
-        week_target before the last stretch, which takes the rest."""
-        w, t, runs = 0.0, Z("2026-10-01T21:00:00Z"), []
+    def test_dynamic_threshold_and_override(self):
+        self.assertAlmostEqual(pm.dynamic_threshold(0.154), 84.6)
+        self.assertAlmostEqual(pm.dynamic_threshold(0.2), 80.0)
+        self.assertEqual(pm.dynamic_threshold(0.9), pm.THRESHOLD_RANGE[0])    # clamped
+        self.assertEqual(pm.threshold_for(0.125, "auto")[0], 87.5)
+        self.assertEqual(pm.threshold_for(0.125, 92), (92.0, "override"))
+        self.assertEqual(core(60, SUN, fc=flat_fc(), ratio=0.1)["threshold"], 90.0)   # follows the ratio
+        w = 57.0                                                     # 87.9 predicted
+        self.assertFalse(core(w, SUN, fc=flat_fc())["go"])
+        d = core(w, SUN, fc=flat_fc(), thr=95)
+        self.assertTrue(d["go"])
+        self.assertEqual((d["threshold"], d["threshold_source"]), (95.0, "override"))
+        self.assertFalse(core(50, SUN, fc=flat_fc(), thr=80)["go"])  # 80.9 > 80
+
+    def test_straight_line_fallback(self):
+        d = core(10, SUN)                                            # no forecast
+        end = Z("2026-10-05T07:00:00Z")                               # Mon 09:00, tonight's window end
+        line = 87.5 * ((end - (R - pm.WEEK)) / pm.WEEK)
+        self.assertTrue(d["go"], d["reason"])
+        self.assertEqual(d["headroom"], 12.5)                         # a full session window
+        self.assertIn("straight line", d["reason"])
+        self.assertIn(f"{line:.1f}%", d["reason"])
+        d = core(line - 12, SUN)                                      # the session would cross the line
+        self.assertFalse(d["go"])
+        self.assertFalse(d["postpone"])
+        self.assertEqual(d["headroom"], 0.0)
+
+    def test_recheck_per_session_window(self):
+        w, t = 40.0, SUN
+        d = core(w, t, fc=flat_fc())                                 # 40 + 12.5 + 18.4 = 70.9
+        self.assertTrue(d["go"])
+        w += d["headroom"]
+        d = core(w, t + timedelta(hours=5), fc=flat_fc())            # 04:00: 52.5 + 12.5 + 17.4 = 82.4
+        self.assertTrue(d["go"], d["reason"])
+        w += d["headroom"]
+        d = core(w, pm.next_window_start(t + timedelta(hours=6), WIN), fc=flat_fc())   # Mon 23:00: 91.1
+        self.assertFalse(d["go"], d["reason"])
+
+    def test_simulated_week_ends_at_the_threshold(self):
+        """Light user (0.1 %/h): full session windows while the predicted end allows, the week
+        reaches the threshold (not more), the last stretch takes the rest."""
+        w, t, runs, rate = 0.0, Z("2026-10-01T21:00:00Z"), [], 0.1
         while t < R:
-            d = core(w, t, fc=flat_fc(0.1), anchor=w)
+            d = core(w, t, fc=flat_fc(rate))
             if d["mode"] == "last_mile":
                 break
-            self.assertTrue(d["go"], d["reason"])
-            runs.append(d["headroom"])
-            w += d["headroom"] + 0.1 * 24                              # AFClaude to the target, the user's day
-            t = pm.next_window_start(t + timedelta(hours=1), WIN)
-        self.assertEqual(len(runs), 7)
-        self.assertGreater(min(runs), 5.0)                             # full runs, not a trickle
-        self.assertGreater(w, 85.0)
-        self.assertLessEqual(w, 95.0)
-        d = core(w, R - timedelta(hours=4), fc=flat_fc(0.1))
+            if d["go"]:
+                self.assertLessEqual(d["predicted_end"], 87.5 + 1e-9)
+                runs.append(d["headroom"])
+                w += d["headroom"]
+            nxt = t + timedelta(hours=5)
+            if not pm.in_window(nxt, WIN):
+                nxt = pm.next_window_start(nxt, WIN)
+            nxt = min(nxt, R)
+            w += rate * (nxt - t).total_seconds() / 3600
+            t = nxt
+        self.assertTrue(all(x == 12.5 for x in runs), runs)          # only full runs
+        self.assertGreaterEqual(len(runs), 5)
+        self.assertLessEqual(w + rate * (R - t).total_seconds() / 3600, 87.5 + 1e-6)
+        self.assertGreater(w, 87.5 - 12.5 - rate * (R - t).total_seconds() / 3600 - 1e-6)
+        d = core(w, R - timedelta(hours=4), fc=flat_fc(rate))
         self.assertEqual(d["mode"], "last_mile")
         self.assertAlmostEqual(d["headroom"], 100.0 - w)
 
-    def test_headroom_counts_down_through_the_night(self):
-        d0 = core(30, SUN, fc=flat_fc(0.1), anchor=30)
-        d1 = core(33, SUN + timedelta(hours=2), fc=flat_fc(0.1), anchor=30)
-        self.assertAlmostEqual(d1["target"], d0["target"])
-        self.assertAlmostEqual(d1["headroom"], d0["headroom"] - 3)
-        day = core(31, Z("2026-10-05T12:00:00Z"), fc=flat_fc(0.1), anchor=30)   # Mon 14:00: still Sunday's
-        self.assertEqual(day["t0"], SUN)
-        self.assertAlmostEqual(day["target"], d0["target"])
-
-    def test_week_target_setting(self):
-        a = core(20, SUN, fc=flat_fc(0.1), anchor=20, target=80)
-        b = core(20, SUN, fc=flat_fc(0.1), anchor=20, target=95)
-        self.assertLess(a["target"], b["target"])
-
-    def test_gap_and_reset_inside_a_window(self):
-        d = core(1, R - pm.WEEK + timedelta(hours=2))                  # Thu 21:00, before the first window
-        self.assertEqual(d["mode"], "none")
-        self.assertEqual(d["headroom"], 0.0)
-        self.assertEqual(d["recheck_at"], Z("2026-10-01T21:00:00Z"))
+    def test_reset_inside_a_window(self):
         r = Z("2026-10-08T23:30:00Z")                                  # Fri 01:30 Berlin
         d = pm.decide_core(0, r, r - pm.WEEK + timedelta(minutes=30), 600.0, None, None, None, True, 0.125,
-                           "auto", WIN, 90.0, flat_fc(0.1), 0)
+                           "auto", WIN, "auto", flat_fc(0.1))
         self.assertEqual(d["mode"], "night")
-        self.assertEqual(d["t0"], r - pm.WEEK)
         self.assertTrue(d["go"])
 
     def test_dst_windows(self):
@@ -197,21 +231,21 @@ class Plan(unittest.TestCase):
 
 class Postpone(unittest.TestCase):
     def test_user_active_postpones(self):
-        d = core(30, SUN, msu=20.0, fc=flat_fc(0.1), anchor=30)
+        d = core(30, SUN, msu=20.0, fc=flat_fc(0.1))
         self.assertFalse(d["go"])
         self.assertTrue(d["postpone"])
         self.assertEqual(d["recheck_at"], SUN + timedelta(minutes=40))
         self.assertIn("postponed", d["reason"])
-        self.assertTrue(core(30, d["recheck_at"], msu=60.0, fc=flat_fc(0.1), anchor=30)["go"])
+        self.assertTrue(core(30, d["recheck_at"], msu=60.0, fc=flat_fc(0.1))["go"])
 
     def test_unknown_and_session_guard(self):
-        d = core(30, SUN, msu=None, known=False, fc=flat_fc(0.1), anchor=30)
+        d = core(30, SUN, msu=None, known=False, fc=flat_fc(0.1))
         self.assertTrue(d["postpone"])
         self.assertEqual(d["recheck_at"], SUN + pm.RETRY)
         sr = SUN + timedelta(hours=2)
-        d = core(30, SUN, fc=flat_fc(0.1), anchor=30, s_pct=86, s_reset=sr)
+        d = core(30, SUN, fc=flat_fc(0.1), s_pct=86, s_reset=sr)
         self.assertEqual(d["recheck_at"], sr)
-        self.assertTrue(core(30, SUN, fc=flat_fc(0.1), anchor=30, s_pct=84, s_reset=sr)["go"])
+        self.assertTrue(core(30, SUN, fc=flat_fc(0.1), s_pct=84, s_reset=sr)["go"])
 
 
 class Activity(unittest.TestCase):
@@ -240,7 +274,7 @@ class Activity(unittest.TestCase):
         self.assertAlmostEqual(pm.minutes_since_user(self.NOW, self.rows(other={"human_prompts": "x"})), 15)
 
     def test_decide_end_to_end(self):
-        u = {"weekly": {"percent": 30, "resets_at": R}, "session": {"percent": 10, "resets_at": None}}
+        u = {"weekly": {"percent": 15, "resets_at": R}, "session": {"percent": 10, "resets_at": None}}
         rows = self.rows(own={"human_prompts": 2, "assistant_turns": 4})
         d = pm.decide(u, self.NOW, params=(dict(pm.DEFAULTS), "t"), rows=rows, fires=[])
         self.assertTrue(d["go"], d["reason"])                       # straight line: no closed week yet
@@ -280,12 +314,12 @@ class Predictor(unittest.TestCase):
         self.assertAlmostEqual(rates[pm._how(SUN)], 0.1, places=3)
         self.assertAlmostEqual(pm.forecast_user(rates, Z("2026-10-06T07:00:00Z"), Z("2026-10-06T19:00:00Z")),
                                24.0, places=2)
-        self.assertAlmostEqual(pm.forecast_user(rates, SUN, SUN + timedelta(hours=10), 1.25), 1.25, places=2)
-        # the night before the busy Tuesday plans with less room than the night after it
+        self.assertAlmostEqual(pm.forecast_user(rates, SUN, SUN + timedelta(hours=10)), 1.0, places=2)  # no margin
+        # the night before the busy Tuesday predicts a higher week end than the night after it
         fc = lambda a, b: pm.forecast_user(rates, a, b)   # noqa: E731
-        mon = core(10, Z("2026-10-05T21:00:00Z"), fc=fc, anchor=10)
-        wed = core(10, Z("2026-10-07T21:00:00Z"), fc=fc, anchor=10)
-        self.assertGreater(wed["allow"], mon["allow"])
+        mon = core(10, Z("2026-10-05T21:00:00Z"), fc=fc)
+        wed = core(10, Z("2026-10-07T21:00:00Z"), fc=fc)
+        self.assertGreater(mon["predicted_end"], wed["predicted_end"])
 
     def test_autonomous_runs_are_not_user_demand(self):
         fire = self.OLD - timedelta(days=2)
@@ -315,7 +349,8 @@ class Predictor(unittest.TestCase):
             log = os.path.join(d, "fl.jsonl")
             rows = self.week()
             t0 = self.OLD - timedelta(days=2)
-            dd = {"forecast": 30.0, "t0": t0, "w0": 40.0, "allow": 20.0, "target": 45.0}
+            dd = {"forecast": 30.0, "t0": t0, "w0": 40.0, "run_cost": 12.5, "predicted_end": 82.5,
+                  "threshold": 87.5, "go": True, "target": 52.5}
             self.assertTrue(pm.record_forecast(dd, self.OLD, log))
             self.assertFalse(pm.record_forecast({"forecast": None}, self.OLD, log))
             errs = pm.forecast_errors(rows, [], R, log)
@@ -326,10 +361,99 @@ class Predictor(unittest.TestCase):
             self.assertEqual(pm.forecast_errors(rows, [], self.OLD - timedelta(days=1), log), [])  # not closed
 
 
+class Accuracy(unittest.TestCase):
+    """The model's inaccuracy back-calculated from the usage data and threshold_info() for the UI."""
+    SNAP = {"ratio_windows": {"status": "ok", "weighted": 0.15, "n": 10, "weighted_stdev": 0.02,
+                              "intrinsic_stdev": 0.012, "se": 0.005, "rounding_sd": 0.003, "stdev": 0.03,
+                              "p10": 0.11, "p90": 0.18, "mean": 0.14, "median": 0.15}}
+
+    def cycles(self, rates, until):
+        """Cycles ending R - 7 d, R, R + 7 d ... sampled every 15 min up to `until`; rates[i] =
+        the user's %/h in cycle i."""
+        rows, start = [], R - 2 * pm.WEEK
+        for i, rate in enumerate(rates):
+            reset, w, t = start + pm.WEEK, 0.0, start
+            while t < min(reset, until):
+                w += rate / 4
+                rows.append(row(t + timedelta(minutes=15), round(w, 4), reset=reset))
+                t += timedelta(minutes=15)
+            start = reset
+        rows[-1]["limit_ratio"] = self.SNAP
+        return rows
+
+    def test_backtest_matches_a_steady_user(self):
+        now = R + timedelta(days=1)
+        rows = self.cycles([0.2, 0.2, 0.2], now)
+        bt = pm.forecast_backtest(rows, [], now, WIN)
+        self.assertTrue(bt)
+        self.assertTrue(all(abs(x["error"]) < 0.3 for x in bt), [x["error"] for x in bt])
+        closed = [x for x in bt if x["closed"]]
+        self.assertGreaterEqual(len(closed), 14)                      # 2 session windows x 7 nights of cycle 2
+        first = Z(closed[0]["at"])
+        self.assertTrue(pm.in_window(first, WIN))
+        st = pm.error_stats(bt)
+        self.assertEqual(st["status"], "ok")
+        self.assertAlmostEqual(st["bias"], 0.0, delta=0.3)
+
+    def test_backtest_sees_an_under_prediction(self):
+        now = R + timedelta(hours=1)
+        bt = pm.forecast_backtest(self.cycles([0.1, 0.3], now), [], now, WIN)   # the user got busier
+        st = pm.error_stats(bt)
+        self.assertGreater(st["bias"], 0)                               # actual - predicted > 0
+        self.assertEqual(st["n_closed"], st["n"])
+        self.assertEqual(pm.error_stats([])["status"], "insufficient_data")
+        # no closed week before any decision point: nothing to back-calculate
+        self.assertEqual(pm.forecast_backtest(self.cycles([0.2], R - pm.WEEK), [], R, WIN), [])
+
+    def test_ratio_stats(self):
+        rs = pm.ratio_stats([dict(row(SUN, 10), limit_ratio=self.SNAP)])
+        self.assertEqual((rs["value"], rs["kind"], rs["n"], rs["weighted_stdev"], rs["intrinsic_stdev"]),
+                         (0.15, "windows", 10, 0.02, 0.012))
+        rs = pm.ratio_stats([])
+        self.assertEqual((rs["value"], rs["kind"], rs["weighted_stdev"]), (pm.DEFAULT_RATIO, "default", None))
+
+    def test_threshold_info_shape(self):
+        now = R + timedelta(days=1)
+        rows = self.cycles([0.2, 0.2, 0.2], now)
+        d = pm.decide_core(30, R + pm.WEEK, now, 600.0, None, None, None, True, 0.15, "auto", WIN, "auto",
+                           flat_fc(0.2))
+        ti = pm.threshold_info(rows, [], now, d)
+        self.assertEqual(set(ti), {"ratio", "full_session_cost", "model_error", "predicted_end_sd", "threshold", "now"})
+        self.assertEqual((ti["ratio"]["value"], ti["ratio"]["n"], ti["ratio"]["spread"]), (0.15, 10, 0.02))
+        self.assertEqual(ti["full_session_cost"]["value"], 15.0)
+        self.assertAlmostEqual(ti["full_session_cost"]["sd"], 100 * (0.012 ** 2 + 0.005 ** 2) ** 0.5, places=1)
+        self.assertEqual(ti["full_session_cost"]["spread"], 2.0)
+        me = ti["model_error"]
+        for k in ("n", "n_closed", "bias", "sd", "rmse", "worst", "status", "note", "logged"):
+            self.assertIn(k, me)
+        self.assertEqual(me["status"], "ok")
+        t = ti["threshold"]
+        self.assertEqual((t["active"], t["source"], t["dynamic_default"], t["override"]), (85.0, "dynamic", 85.0, None))
+        self.assertEqual(t["range"], [50.0, 99.0])
+        self.assertIsNotNone(ti["predicted_end_sd"])
+        self.assertEqual(ti["now"]["threshold"], 85.0)
+        self.assertAlmostEqual(ti["now"]["slack"], 85.0 - d["predicted_end"], places=1)
+        self.assertTrue(pm.threshold_lines(ti))
+        old = afclaude_config.CONFIG_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            afclaude_config.CONFIG_FILE = os.path.join(tmp, "c.json")
+            try:
+                with open(afclaude_config.CONFIG_FILE, "w") as fh:
+                    json.dump({"reserve_threshold": 90}, fh)
+                t = pm.threshold_info(rows, [], now)["threshold"]
+            finally:
+                afclaude_config.CONFIG_FILE = old
+        self.assertEqual((t["active"], t["source"], t["dynamic_default"], t["override"]), (90.0, "override", 85.0, 90.0))
+        ti = pm.threshold_info([], [], now)                           # no data at all: still a valid shape
+        self.assertEqual(ti["model_error"]["status"], "insufficient_data")
+        self.assertEqual(ti["threshold"]["active"], 80.0)             # the conservative default ratio 0.2
+        self.assertTrue(pm.threshold_lines(ti))
+
+
 class OneNumber(unittest.TestCase):
     def test_reason_and_text(self):
         for w, t, fc in ((30, SUN, flat_fc(0.1)), (90, R - timedelta(hours=2), None)):
-            d = core(w, t, fc=fc, anchor=w)
+            d = core(w, t, fc=fc)
             self.assertIn(f"budget for this run +{d['headroom']:.1f}%", d["reason"])
             self.assertIn(f"+{d['headroom']:.1f} weekly %", pm.budget_text(d, w))
 
@@ -337,10 +461,11 @@ class OneNumber(unittest.TestCase):
 class Params(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(pm.parse_params({"pacing": {"forecast_margin": 1.5, "last_mile_yield": False}}),
-                         {"forecast_margin": 1.5, "last_mile_yield": False})
+                         {"last_mile_yield": False})                # the retired margin is ignored
+        self.assertNotIn("forecast_margin", pm.DEFAULTS)
         self.assertEqual(pm.parse_params({"envelope_weekly_pct_by_hours": {"1": 2}, "idle_min": 30}),
                          {"idle_min": 30.0})
-        for bad in ({"forecast_margin": 9}, {"last_mile_yield": "no"}):
+        for bad in ({"idle_min": -1}, {"last_mile_yield": "no"}):
             with self.assertRaises(ValueError):
                 pm.parse_params(bad)
         with tempfile.TemporaryDirectory() as d:
@@ -375,13 +500,35 @@ class Config(unittest.TestCase):
             self.setcfg(last_mile_hours=bad)
             self.assertEqual(afclaude_config.last_mile_setting(), "auto", bad)
 
-    def test_week_target(self):
-        self.assertEqual(afclaude_config.week_target(), 90.0)
-        self.setcfg(week_target=95)
-        self.assertEqual(afclaude_config.week_target(), 95.0)
-        for bad in (99, 50, "90", True):
+    def test_reserve_threshold_setting(self):
+        rt = afclaude_config.reserve_threshold_setting
+        self.assertEqual(rt(), ("auto", "dynamic"))
+        self.setcfg(reserve_threshold=88)
+        self.assertEqual(rt(), (88.0, "override"))
+        self.setcfg(reserve_threshold="auto", week_target=92)            # explicit auto wins
+        self.assertEqual(rt(), ("auto", "dynamic"))
+        self.setcfg(week_target=92)                                       # backward compatibility
+        self.assertEqual(rt(), (92.0, "override (legacy week_target)"))
+        for bad in (40, 100, "90", True):
+            self.setcfg(reserve_threshold=bad)
+            self.assertEqual(rt(), ("auto", "dynamic"), bad)
             self.setcfg(week_target=bad)
-            self.assertEqual(afclaude_config.week_target(), 90.0, bad)
+            self.assertEqual(rt(), ("auto", "dynamic"), bad)
+
+    def test_decide_honours_the_override(self):
+        u = {"weekly": {"percent": 15, "resets_at": R}, "session": {"percent": 0, "resets_at": None}}
+        args = dict(params=(dict(pm.DEFAULTS), "t"), rows=[row(SUN, 15)], fires=[], msu=600.0,
+                    activity_known=True)
+        d = pm.decide(u, SUN, **args)
+        self.assertEqual((d["threshold"], d["threshold_source"]), (80.0, d["threshold_source"]))   # ratio 0.2
+        self.assertIn("dynamic", d["threshold_source"])
+        self.setcfg(reserve_threshold=95)
+        d = pm.decide(u, SUN, **args)
+        self.assertEqual((d["threshold"], d["threshold_source"]), (95.0, "override"))
+        self.setcfg(week_target=85)
+        d = pm.decide(u, SUN, **args)
+        self.assertEqual((d["threshold"], d["threshold_source"]), (85.0, "override (legacy week_target)"))
+        self.assertIn("legacy week_target", d["reason"])
 
     def test_usage_model_switch(self):
         self.assertEqual(afclaude_config.usage_model(), "pacing")

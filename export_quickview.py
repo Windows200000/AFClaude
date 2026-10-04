@@ -4,8 +4,9 @@
 Writes into data/quickview/ (gitignored), which the key-gated nginx in quickview/
 serves at /afclaude/:
 
-  status.json   keepalive+usage, progress (from GOALS.md, plus the project's
-                stages from the task store as a phase strip), latest keep-alive
+  status.json   keepalive+usage (incl. the reserve threshold and the model's
+                accuracy, pacing.threshold_info), progress (from GOALS.md, plus the
+                project's stages from the task store as a phase strip), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
@@ -340,6 +341,18 @@ def window_info(now):
             "next_window_berlin": bstr(nxt)}
 
 
+def threshold_block(now, decision=None):
+    """pacing.threshold_info(): the reserve threshold (dynamic default vs override), the
+    session/weekly ratio +- its spread, the full-session cost +- its uncertainty and the
+    prediction model's back-calculated error (small aggregates only, never raw samples)."""
+    try:
+        import pacing
+        d = decision if decision and decision.get("mode") in ("night", "last_mile") else None
+        return pacing.threshold_info(now=now, decision=d)
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
     out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
@@ -348,6 +361,7 @@ def keepalive_and_usage(now):
     out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
     if not u:
         out["usage_error"] = "no usage cache in ~/.claude.json"
+        out["threshold"] = threshold_block(now)
         return out
     out["fetched_at_berlin"] = bstr(u["fetched_at"])
     out["age_minutes"] = round((now - u["fetched_at"]).total_seconds() / 60, 1)
@@ -360,6 +374,7 @@ def keepalive_and_usage(now):
                               "recheck_berlin": bstr(d["recheck_at"]) if d.get("postpone") and d.get("recheck_at")
                               else None}
     out["limits"] = limits_block()
+    out["threshold"] = threshold_block(now, d)
     return out
 
 

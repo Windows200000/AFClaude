@@ -13,10 +13,12 @@ if the weekly budget rule allows it, resumes that session in place with
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
 
-Budget rule: by default pacing.py (the original linear rule evolved: the nights run full
-session windows to fill the week to week_target (90%) minus what the user is forecast to
-use, re-planned every night; the final <= 2 session windows before the weekly reset fill to
-100%; AFClaude yields to an active user by POSTPONING to last activity + 60 min).
+Budget rule: by default pacing.py (the original linear rule evolved into a night gate: a
+night runs a FULL session window only if the week is then predicted to end at or below the
+reserve threshold (default: one session window left), w + session cost + the user's forecast
+use until the weekly reset; re-checked per session window; the final <= 2 session windows
+before the weekly reset fill to 100%; AFClaude yields to an active user by POSTPONING to last
+activity + 60 min).
 data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
 the fallback if pacing.py fails:
   projected end-of-week usage < 90%                          -> continue
@@ -1249,11 +1251,8 @@ def main():
             print(f"forecast: {d['forecast_source']}")
         try:
             import pacing
-            errs = pacing.forecast_errors(pacing.tail_rows(max_bytes=pacing.LONG_BYTES), pacing.fire_times(), now)
-            if errs:
-                e = [x["error"] for x in errs]
-                print(f"forecast quality: {len(e)} scored nights, mean error {sum(e) / len(e):+.1f}%, "
-                      f"mean abs error {sum(abs(x) for x in e) / len(e):.1f}% (forecast - actual user use)")
+            for line in pacing.threshold_lines(pacing.threshold_info(now=now, decision=d)):
+                print(line)
         except Exception:   # noqa: BLE001 - advisory
             pass
         if args.session:

@@ -493,7 +493,7 @@ def _default_last_mile_hours():
 
 
 def _hours_or_auto(lo, hi):
-    """last_mile_hours: "auto" (the pacing.py formula) or a number of hours in lo..hi."""
+    """"auto" or a number in lo..hi (last_mile_hours: hours; reserve_threshold: weekly %)."""
     num = _number(lo, hi)
 
     def check(v, conn=None):
@@ -567,8 +567,11 @@ SETTINGS = {
     "last_mile_hours": Setting(_default_last_mile_hours, _hours_or_auto(0, 168),
                                'last stretch before the weekly reset (filled to 100%): "auto" = '
                                'min(ceil(session windows of quota left), 2) x session_hours, or hours (0 = off)'),
-    "week_target": Setting(afclaude_config.week_target, _number(80, 95),
-                           "pacing: weekly % the nights fill to before the last stretch"),
+    "reserve_threshold": Setting(afclaude_config.reserve_threshold_value, _hours_or_auto(50, 99),
+                                 'pacing night gate: a night runs a full session window only if the week is '
+                                 'predicted to end <= this weekly %; "auto" = one session window left '
+                                 '(100 - the measured full-session cost), or a % (the UI shows '
+                                 'pacing.threshold_info() next to it)'),
     "projection_threshold": Setting(lambda: 90.0, _number(1, 100), "linear rule: projected weekly %"),
     "cutoff_after_window_hours": Setting(lambda: 2.0, _number(0, 24),
                                          "budget rule: a weekly reset this long after the window end still "

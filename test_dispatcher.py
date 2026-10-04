@@ -453,11 +453,10 @@ class BudgetModel(Base):
         super().setUp()
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
             json.dump({"usage_model": "pacing"}, fh)
-        self._bm = (budget.minutes_since_user, budget.weekly_at)
-        budget.weekly_at = lambda rows, t0, r, now: None          # anchor: the current weekly %
+        self._bm = budget.minutes_since_user
 
     def tearDown(self):
-        budget.minutes_since_user, budget.weekly_at = self._bm
+        budget.minutes_since_user = self._bm
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
             json.dump({"usage_model": "linear"}, fh)
         super().tearDown()

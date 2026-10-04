@@ -15,10 +15,11 @@ SESSION_LENGTH = timedelta(hours=5)          # one Claude session-limit window
 DEFAULTS = {"last_mile_hours": "auto",   # "auto" = pacing.last_mile_hours(), or a number of hours
             "window_start": "23:00",
             "window_hours": 10,
-            "week_target": 90,          # weekly % the nights fill to before the last stretch (80..95)
+            "reserve_threshold": None,  # the night gate's weekly-% threshold: None / "auto" = one
+                                        # session window left (pacing.dynamic_threshold), or a % (50..99)
             "usage_model": "pacing"}    # weekly budget model: "pacing" (pacing.py) | "linear"
 USAGE_MODELS = ("pacing", "linear")
-WEEK_TARGET_RANGE = (80.0, 95.0)
+RESERVE_THRESHOLD_RANGE = (50.0, 99.0)
 
 
 def load():
@@ -87,14 +88,34 @@ def usage_model():
     return v if v in USAGE_MODELS else DEFAULTS["usage_model"]
 
 
-def week_target():
-    """Weekly % the nights fill to before the last stretch (data/afclaude.json week_target,
-    80..95, default 90; invalid -> 90)."""
-    v = load().get("week_target", DEFAULTS["week_target"])
+def _pct(v, rng):
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
-            or not WEEK_TARGET_RANGE[0] <= v <= WEEK_TARGET_RANGE[1]:
-        return float(DEFAULTS["week_target"])
+            or not rng[0] <= v <= rng[1]:
+        return None
     return float(v)
+
+
+def reserve_threshold_setting():
+    """The night gate's threshold (pacing.py): -> ("auto", "dynamic") or (pct, source).
+    data/afclaude.json reserve_threshold: "auto" (default: one session window left,
+    100 - the measured full-session weekly cost) or a % in 50..99. Backward compatibility:
+    without reserve_threshold, a valid legacy week_target (the old 80..95 setting) is the
+    override. Anything invalid means "auto"."""
+    cfg = load()
+    v = cfg.get("reserve_threshold")
+    if v is not None and not (isinstance(v, str) and v.strip().lower() == "auto"):
+        p = _pct(v, RESERVE_THRESHOLD_RANGE)
+        return ("auto", "dynamic") if p is None else (p, "override")
+    if v is None:
+        p = _pct(cfg.get("week_target"), RESERVE_THRESHOLD_RANGE)
+        if p is not None:
+            return p, "override (legacy week_target)"
+    return "auto", "dynamic"
+
+
+def reserve_threshold_value():
+    """The setting as one value for the settings store: "auto" or a %."""
+    return reserve_threshold_setting()[0]
 
 
 def _hhmm(s):

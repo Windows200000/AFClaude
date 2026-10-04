@@ -209,6 +209,25 @@ button.chip.sel { border-color: #a855f7; }
     } else {
       out.push(tile("Session→week ratio", "–", '<div class="mut">insufficient data</div>'));
     }
+    var th = k.threshold || {};
+    if (th.threshold) {
+      var t = th.threshold, c = th.full_session_cost || {}, r = th.ratio || {}, m = th.model_error || {}, nw = th.now;
+      var pmx = function (x) { return x != null ? " ± " + x : ""; };
+      var sgn = function (x) { return (x > 0 ? "+" : "") + x; };
+      var lines = ['<div class="mut">' + (t.source === "dynamic" ? "dynamic default: one session window left"
+          : esc(t.source) + " (dynamic default " + t.dynamic_default + "%" + pmx(t.dynamic_default_sd) + ")") + "</div>",
+        '<div class="mut">full session window ' + c.value + pmx(c.sd) + " weekly % · ratio " + r.value + pmx(r.spread) +
+          (r.n != null ? " (" + r.n + " session windows)" : "") + "</div>",
+        '<div class="mut">model error' + (m.status ? " (" + esc(m.status) + ")" : "") + ": " +
+          (m.n ? "bias " + sgn(m.bias) + pmx(m.sd) + " weekly % (actual − predicted, n=" + m.n +
+            ", " + m.n_closed + " to the reset)" : esc(m.note || "no data yet")) + "</div>"];
+      if (th.predicted_end_sd != null) lines.push('<div class="mut">predicted week end ± ' + th.predicted_end_sd + " weekly %</div>");
+      if (nw && nw.predicted_end != null) lines.push('<div class="mut">now: predicted end ' + nw.predicted_end + "% vs " +
+        nw.threshold + "% (slack " + sgn(nw.slack) + "%)</div>");
+      out.push(tile("Reserve threshold", t.active + "%", lines.join("")));
+    } else if (th.error) {
+      out.push(tile("Reserve threshold", "–", '<div class="mut">' + esc(th.error) + "</div>"));
+    }
     if (lim.share_status === "ok") {
       out.push(tile("AFClaude vs user (week)",
         Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",

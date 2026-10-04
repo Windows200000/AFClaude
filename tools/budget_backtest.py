@@ -143,30 +143,19 @@ def new_pacing(ctx, t, w, s_pct, s_open):
     if msu is None:
         msu = 10 ** 6
     d = pacing.decide_core(w, ctx["reset"], t, msu, ctx["P"], s_pct, (s_open + SESSION) if s_open else None,
-                           True, ctx["ratio"], ctx.get("lm", "auto"), ctx["win"], ctx["week_target"],
-                           ctx["forecast"], anchor=ctx["anchor"])
+                           True, ctx["ratio"], ctx.get("lm", "auto"), ctx["win"], ctx["threshold"],
+                           ctx["forecast"])
     ctx["last_d"] = d
-    if d.get("forecast") is not None and d.get("t0") is not None:
-        ctx["forecasts"].setdefault(d["t0"], d["forecast"])
+    if d.get("forecast") is not None and pacing.in_window(t, ctx["win"]):   # the first forecast of each night
+        ctx["forecasts"].setdefault(pacing.latest_window_start(t, ctx["win"]), (t, d["forecast"]))
     return d["go"], (d["target"] if d["target"] is not None else w), d["session_cap"]
 
 
 def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="auto", trace=False,
-        forecast=None, week_target=90.0):
+        forecast=None, threshold="auto"):
     ctx = dict(reset=reset, win=win, P=P, env=env, ratio=ratio, lm=lm, last_act=None, forecast=forecast,
-               week_target=week_target, forecasts={})
+               threshold=threshold, forecasts={})
     w = w0
-    hist = []                       # (t, w) of the simulated weekly %, for the night anchor
-
-    def anchor(t0):
-        best = None
-        for t, x in hist:
-            if t <= t0 + timedelta(minutes=1):
-                best = x
-            else:
-                break
-        return best if best is not None else (hist[0][1] if hist else w)
-    ctx["anchor"] = anchor
     s_open, s_val, af_in_win = None, 0.0, False
     running, target, cap = False, w, 85.0
     out = dict(af=0.0, blocked=0.0, blocked_steps=0, heads=[], sess_hits_af=0, sess_hits_self=0,
@@ -175,7 +164,6 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
         t, dt = st["t"], st["dt"]
         if s_open is not None and t >= s_open + SESSION:
             s_open, s_val, af_in_win = None, 0.0, False
-        hist.append((t, w))
         allowed_win = pacing.in_window(t, win)
         if model == "linear":
             in_lm = timedelta(0) < reset - t <= timedelta(hours=5)
@@ -234,7 +222,7 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
             out["heads"].append(100 - w)        # the same user moments for every model
     out["final"] = w
     out["nights"] = {n for n, v in out["night_spend"].items() if v > 0.1}
-    errs = [fc - sum(x["dw"] for x in steps if x["t"] > t0) for t0, fc in ctx["forecasts"].items()]
+    errs = [fc - sum(x["dw"] for x in steps if x["t"] > t0) for t0, fc in ctx["forecasts"].values()]
     out["fc_err"] = (sum(errs) / len(errs), sum(abs(e) for e in errs) / len(errs)) if errs else None
     return out
 
@@ -265,8 +253,8 @@ def main():
     ap.add_argument("--ratio", type=float, default=None, help="ratio pacing uses (default: per session window)")
     ap.add_argument("--user-scale", type=float, default=1.0)
     ap.add_argument("--late-burst", type=float, default=0.0)
-    ap.add_argument("--week-target", type=float, default=90.0)
-    ap.add_argument("--margin", type=float, default=None, help="forecast_margin")
+    ap.add_argument("--threshold", default="auto",
+                    help='the night gate\'s reserve threshold: "auto" (one session window left) or a weekly %%')
     ap.add_argument("--no-lm-yield", action="store_true")
     ap.add_argument("--trace", default=None)
     a = ap.parse_args()
@@ -277,8 +265,7 @@ def main():
     upto = [r for r in rows if ts(r["at"]) <= reset + timedelta(minutes=10)]
     ratio = a.ratio if a.ratio is not None else pacing.ratio_info(upto)[0]
     P = dict(pacing.DEFAULTS)
-    if a.margin is not None:
-        P["forecast_margin"] = a.margin
+    thr = "auto" if a.threshold == "auto" else float(a.threshold)
     if a.no_lm_yield:
         P["last_mile_yield"] = False
     pacing.FIRE_FILES = [(os.path.join(a.data, "keepalive", "keepalive_state.json"), "handled", "at"),
@@ -287,7 +274,7 @@ def main():
     rates, fsrc = pacing.fit_profile(upto, pacing.fire_times(), reset + timedelta(minutes=10))   # in-sample
     if rates:
         rates = [x * a.user_scale for x in rates]
-    fc = (lambda x, y: pacing.forecast_user(rates, x, y, P["forecast_margin"])) if rates else None
+    fc = (lambda x, y: pacing.forecast_user(rates, x, y)) if rates else None
     try:
         with open(a.user_model) as fh:
             user_env, weeks, _ = usage_model.parse_user_model(json.load(fh))
@@ -297,8 +284,8 @@ def main():
     nights = nights_in(steps, win, reset)
     print(f"cycle reset {reset:%Y-%m-%d %H:%M}Z, replay from {t0:%a %d.%m. %H:%M}Z at {w0:.0f}%, "
           f"user demand {sum(s['dw'] for s in steps):.1f}%, {len(nights)} observed nights; "
-          f"RAF {a.raf:g} %/h, k {a.k:g}, ratio {ratio:.3g}, week_target {a.week_target:g}, "
-          f"margin {P['forecast_margin']:g}, last_mile_yield {P['last_mile_yield']}, user x{a.user_scale:g}, "
+          f"RAF {a.raf:g} %/h, k {a.k:g}, ratio {ratio:.3g}, threshold {pacing.threshold_for(ratio, thr)[0]:.1f}% "
+          f"({a.threshold}), last_mile_yield {P['last_mile_yield']}, user x{a.user_scale:g}, "
           f"late burst {a.late_burst:g} h; {fsrc}")
     print(f"{'model':28s} {'final':>6s} {'AF+':>6s} {'minH':>5s} {'p10H':>5s} {'blk%':>5s} {'blkN':>4s} "
           f"{'sessAF':>6s} {'nights':>7s} {'fcErr':>11s}  per-night AF spend")
@@ -312,7 +299,7 @@ def main():
         cases.append(("pacing, forecast", "pacing", P, None, fc))
     for label, model, PP, env, f in cases:
         o = run(model, steps, w0, reset, win, a.raf, a.k, PP, env, ratio, trace=(a.trace == label),
-                forecast=f, week_target=a.week_target)
+                forecast=f, threshold=thr)
         per = " ".join(f"{o['night_spend'].get(n, 0):.1f}" for n in nights)
         fe = f"{o['fc_err'][0]:+.1f}/{o['fc_err'][1]:.1f}" if o.get("fc_err") else "-"
         print(f"{label:28s} {o['final']:6.1f} {o['af']:6.1f} {min(o['heads'] or [100]):5.1f} {p10(o['heads']):5.1f} "
