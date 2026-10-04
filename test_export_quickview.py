@@ -181,7 +181,7 @@ class NextRunBlock(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()
         self.assertIn("k.next_run", page)
-        self.assertIn("Holding until (if you use nothing more)", page)   # D-200, D-201
+        self.assertIn("Holding until", page)   # D-200, D-201
         self.assertIn("With your forecast usage", page)
         self.assertIn("nr.expected", page)
         self.assertNotIn("budget_rule_now", page)

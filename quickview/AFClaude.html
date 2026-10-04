@@ -196,7 +196,7 @@ button.chip.sel { border-color: #a855f7; }
       var ex = nr.expected, exTxt = "";
       if (ex && ex.kind) exTxt = '<div class="mut" style="font-size:.85em;margin-top:.3em">With your forecast usage: ' +
         (ex.kind === "now" ? "running now" : "holding until " + esc(ex.at_berlin || "?")) + ", " + esc(ex.label || ex.kind) + "</div>";
-      out.push(tile(nr.kind === "now" ? "Running" : "Holding until (if you use nothing more)", nr.kind === "now" ? '<span class="ok">now</span>' : esc(nr.at_berlin || "?"),
+      out.push(tile(nr.kind === "now" ? "Running" : "Holding until", nr.kind === "now" ? '<span class="ok">now</span>' : esc(nr.at_berlin || "?"),
         '<div class="mut"><strong>' + esc(nr.label || nr.kind) + "</strong></div>" +
         (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "") + exTxt));
     }
