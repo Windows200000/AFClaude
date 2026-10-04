@@ -1,6 +1,6 @@
 # AFClaude dashboard and backend: target design (v2)
 
-Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-180). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the manager's and may be changed. Host names are placeholders.
+Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner's architecture review (D-143/D-145; answers D-146–D-182). Phase 1 (schema v4, `actions.py`, `afclaude_config.py`) is built. This doc replaces v1 as a whole; where v1 and this doc differ, this doc holds. `D-NNN` ids point at the owner's local decision store; owner decisions are binding, everything marked *proposal* is the manager's and may be changed. Host names are placeholders.
 
 ## 1. Goals and non-goals
 
@@ -21,7 +21,7 @@ Non-goals (v1)
 - Replacing the MCP server as the main way tasks get added.
 - A budget-rule editor. The thresholds are settings; the rule itself is code (`pacing.py`, D-141).
 
-## 2. Users, roles and access (D-149, D-156, D-160, D-172)
+## 2. Users, roles and access (D-149, D-156, D-160, D-172, D-182)
 
 | role | who | can |
 |---|---|---|
@@ -29,22 +29,23 @@ Non-goals (v1)
 | **project edit** | granted per project | that project's stages, priorities, order, question answers, stall decisions for its sessions; propose decisions |
 | **project view** | granted per project | read that project (stages, questions, decisions, hand-offs, effective prompts, its driven sessions) |
 | *(none)* | every other registered login | nothing; sees "no access yet" (default for new users, D-149) |
-| **agent** | AFClaude's autonomous sessions (MCP/CLI) | add/edit tasks and ask questions in its project, write its own hand-offs and its project's manager docs, propose decisions; never owner-only actions (D-160) |
+| **manager** | a project's manager session (`projects.manager_session`), incl. the AFClaude manager for its own project | in its project: write the docs, goals and progress, add/edit/order tasks, ask the owners questions, propose decisions to the owners, write its hand-offs, reply to manager messages (F14), review its agents' proposals (§7.9); never owner-only actions (D-160) |
+| **agent** | every other AFClaude session working for a project (task and worker sessions, subagents told apart from their manager) | only the direct writes of §9.6 (own hand-offs, its task's status and notes, escalations, its own branch); everything else becomes a proposal to its project's manager (§7.9, D-182) |
 | **runner** | the runner daemon's components | the state changes the runners own (task start/finish, run log, telemetry), audited as `runner:<component>` |
 
 - Only owners see global settings (windows, budget, auth, users, backup) (D-149).
 - *Proposal:* run-now, prompt overrides, project-scope "always continue" rules and decision confirmation are owner only, because they spend the shared budget or bind autonomous sessions.
 - *Proposal:* the last owner that isn't group-derived can't be removed or demoted, so a group change at the OIDC provider can't leave the install without an owner.
 - Granting **edit** on a project lets that user steer autonomous sessions that run with the guard hooks bypassed on the execution host (an answer or a stage becomes a session's input). The grant dialog says so.
-- The audit actor is the user (`user:<id>`), the session (`agent:<session>`) or the component (`runner:dispatcher`).
-- v1 enforcement of the agent role is advisory (D-160, D-173): rejected attempts are audited and raise an alert; see §9.6 for its limits.
+- The audit actor is the user (`user:<id>`), the manager session (`manager:<session>`), the agent session (`agent:<session>`) or the component (`runner:dispatcher`).
+- v1 enforcement of the manager and agent roles is advisory (D-160, D-173): rejected attempts are audited and raise an alert; see §9.6 for its limits.
 
 ## 3. Main flows (phone first)
 
 One column, large tap targets, no hover-only controls, no drag-and-drop as the only way to reorder, every page useful on its first screen. Top bar: automation state (running / paused, toggle), tonight's window ("23:00–09:00, 2 × 5 h"), weekly usage and the projected end of week, inbox badge. Every view is filtered by the viewer's grants.
 
-- **F1 Inbox (home).** Only real questions (D-083): open questions (`kind='question'`) and blocked tasks, with a text box each; decision proposals waiting for confirmation. Never stalls, never untitled sessions. Answering removes the card at once (the server returns the new inbox). Empty inbox = one line.
-- **F14 Message the manager (D-178), on the inbox page next to the answers.** A general box for anything that isn't an answer to an open question, mainly questions to the manager or new goals; a minimal embedded chat. It starts as one text box; after sending, it shows the message and, once it arrives, the manager's one reply. It grows into a chat (the thread with a new box under it) only when the user sends a follow-up. After `ui_chat_reset_hours` (default 5 h) without a new message in the thread, the thread is closed and the page shows an empty box again (closed threads stay in the DB, reachable from "earlier messages"). Mechanics: each message is a row in `chat_messages` (§7.2); sending queues a `manager_message` request and wakes the runner, which delivers it to the manager immediately, like run-now (D-153, §5.4: no window or budget check, works while paused, preflight applies): a running manager session gets a short notice at its next idle point, an idle one is resumed with it. The manager reads the thread and replies through MCP (`afclaude_messages`, `afclaude_reply`); goals it accepts it records through its normal tools (tasks, docs) and says so in the reply. While waiting, the card shows the request state (queued → delivered → answered). *Proposal:* messaging the AFClaude manager is owner only (it wakes a session immediately and spends the budget, like run-now); a project's own manager can be messaged by users with edit on that project, and without the owner role the message waits for that manager's next regular run instead of waking it.
+- **F1 Inbox (home).** Only real questions (D-083): open questions (`kind='question'`) and blocked tasks, with a text box each (from agents only once their manager forwarded them, §7.9); decision proposals waiting for confirmation. Never stalls, never untitled sessions. Answering removes the card at once (the server returns the new inbox). Empty inbox = one line.
+- **F14 Message the manager (D-178), on the inbox page next to the answers.** A general box for anything that isn't an answer to an open question, mainly questions to the manager or new goals; a minimal embedded chat. It starts as one text box; after sending, it shows the message and, once it arrives, the manager's one reply. It grows into a chat (the thread with a new box under it) only when the user sends a follow-up. After `ui_chat_reset_hours` (default 5 h) without a new message in the thread, the thread is closed and the page shows an empty box again (closed threads stay in the DB, reachable from "earlier messages"). Mechanics: each message is a row in `chat_messages` (§7.2); sending queues a `manager_message` request and wakes the runner, which delivers it to the manager immediately, like run-now (D-153, §5.4: no window or budget check, works while paused, preflight applies): a running manager session gets a short notice at its next idle point, an idle one is resumed with it. The manager reads the thread and replies through MCP (`afclaude_messages`, `afclaude_reply`; the reply is a manager write, not an agent write); goals it accepts it records through its normal tools (tasks, docs) and says so in the reply. While waiting, the card shows the request state (queued → delivered → answered). *Proposal:* messaging the AFClaude manager is owner only (it wakes a session immediately and spends the budget, like run-now); a project's own manager can be messaged by users with edit on that project, and without the owner role the message waits for that manager's next regular run instead of waking it.
 - **F2 Stalled sessions.** Only sessions whose last entry is a limit notice (D-041), newest first, own AFClaude sessions hidden by default. Card: title (or cwd + first prompt), project, stall kind, reset time, the effective decision and its source. Buttons: Continue, Ignore, "Always…" (session rule or project rule, preselecting the most specific cwd), and **Run now** (§5.4). Undecided stalls never expire; decided ones move to a "decided" filter. RC-server threads show "continue it from the app" (§10.8).
 - **F3 Queue and projects.** Ranked projects with their stages and a priority chip (tap cycles high → medium → low, D-064). Up/down buttons, "move to position…", optional drag on desktop. Per-project menu: whole project to medium/low, edit, manage/unmanage, **Work on now** (D-036, §5.4), members (grants). A second tab shows the flat execution order and why an item is skipped.
 - **F4 Window planner.** Seven rows Mon..Sun with each night's window or "off"; linked days share a colour (D-034, §6). Editor: change all linked / only this day / whole week; preview over the next 7 nights incl. DST nights and the weekly-reset marker; the measured ratios (`limit_ratio.py`: weekly % per session window, windows per week and left, AFClaude vs user share, each with "insufficient data" when honest). Save applies at once (the runner is woken).
@@ -52,7 +53,7 @@ One column, large tap targets, no hover-only controls, no drag-and-drop as the o
 - **F6 Driven sessions.** Every session AFClaude started or continued: readable tmux name (§5.3), kind, project, state, RC link when known, the latest hand-off.
 - **F7 Decisions.** Per project (and install-wide): the current decisions (D-104, D-158), keyword filter, proposals with "confirm / reject / edit", "propose a change".
 - **F8 Prompts.** Every prompt with its placeholders and the session kinds that use it; default, global override, project override, the effective bundle per session kind, diffs. Edit, validate, save, reset.
-- **F9 Docs.** Per project: goals, progress, alerts, exceptions, reviews, the phase strip (D-084, D-085); the generated exports.
+- **F9 Docs.** Per project: goals, progress, alerts, exceptions, reviews, the phase strip (D-084, D-085); the agent-proposal queue and the run summaries with their review state (§7.9).
 - **F10 Settings.** Grouped sections (§7.4), incl. auth and session lifetimes (§9.5), users and grants, backup and the full export with its reinstate guide (§11).
 - **F11 Account.** My logins: passkeys (with the hardware / synced badge), TOTP, recovery codes, OIDC links, active sessions and remembered devices with "sign out", display time zone.
 - **F12 Audit.** The last N writes with actor, via, before/after summary; undo where the action supports it (D-075).
@@ -78,7 +79,7 @@ browser ──https──> reverse proxy (Traefik / Coolify)
    afclaude-mcp ──────┤      ^                         ^
    afclaude-runner ───┘      │ wake (unix socket in /data/run)
      ├ dispatcher tick, window-start tick, run-now
-     ├ stall scan, sampler, usage review, exporters, backups
+     ├ stall scan, sampler, usage review, build-log export, backups
      └ session executor ──ssh bridge──> host: tmux + Claude CLI sessions (D-164)
 ```
 
@@ -100,10 +101,10 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 | stall scan (`stalled.scan`, own tick) | every 3 min |
 | usage sampler + pre/post-reset samples | every 15 min + scheduled jobs |
 | usage review | when due |
-| status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily |
+| status snapshot, AFClaude build-log export (§7.7), backups (§11) | each pass / on change / daily |
 | WAL archiver (Litestream, §11.1), a supervised child process; its replication lag is part of the health | continuous |
 
-- **Wake:** after any write that the runner must act on (run-now, a message to the manager, window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
+- **Wake:** after any write that the runner must act on (run-now, a message to the manager, an urgent agent proposal (§7.9), window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
 - Health: the runner writes its last tick per job to `runner_state`; the web container's health check and F5 read it; the container restarts on a stale heartbeat.
 - Pause (`automation_paused`) stops automatic starts and continues; it never kills running sessions.
 
@@ -123,10 +124,10 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 ### 5.5 Compaction hand-offs (D-144, D-155)
 For sessions whose total run is longer than one session length (the managers; others only if they run that long):
 1. **Save prompt.** Before the session window ends (the earlier of `handoff_before_reset_min`, default 20 min before the session reset, and `handoff_session_pct`, default 90%, below the 95% night stop of D-014), the runner sends `session_end_save.md`: finish the current step, commit, write the hand-off, compaction follows at the next start.
-2. **Structured hand-off.** The session writes it through MCP (`afclaude_handoff`) into `handoffs`: summary, done, in progress, next steps, open question ids, decision ids, files touched, notes (JSON, size-limited). One open hand-off per project; a new one replaces the open one.
+2. **Structured hand-off.** The session writes it through MCP (`afclaude_handoff`) into `handoffs`: summary, done, in progress, next steps, open question ids, decision ids, files touched, notes (JSON, size-limited). One open hand-off per session; a new one replaces that session's open one. The manager's is the project's hand-off; an agent's hand-off is one of its direct writes and is listed in its run summary (§7.9).
 3. **Compact on resume.** At the next continue the runner resumes the session, sends `/compact` first, waits for the compaction marker in the transcript, then sends the continue prompt with the hand-off in `{handoff}` and marks it consumed.
 4. No hand-off (crash, missed save): the continue prompt says so and points at the latest progress entries and run log.
-- The dashboard shows the latest hand-off per project (F6, F9). Hand-offs are in the backup (§11) and let a moved install resume cleanly even when a transcript can't be resumed.
+- The dashboard shows the latest hand-off per session (F6) and the manager's per project (F9). Hand-offs are in the backup (§11) and let a moved install resume cleanly even when a transcript can't be resumed.
 
 ## 6. Schedule (D-148, D-030, D-033, D-034)
 
@@ -157,7 +158,8 @@ For sessions whose total run is longer than one session length (the managers; ot
 | prompts | `prompt_overrides` (+ `project_id`) | built; scope new |
 | decisions | `decisions`, `decision_links`, `decisions_fts` | new (§7.6) |
 | hand-offs | `handoffs` | new (§5.5) |
-| messages | `chat_threads` (user, project, opened, last activity, closed), `chat_messages` (thread, author `user:<id>` or `agent:<session>`, text, ts, request id) | new (F14, D-178) |
+| agent proposals | `agent_proposals` (project, session, run, kind, payload, summary, status `proposed`/`approved`/`edited`/`rejected`, reviewer, note, ts), `agent_runs` (session, project, task, started/ended, summary, reviewed by/at) | new (§7.9, D-182) |
+| messages | `chat_threads` (user, project, opened, last activity, closed), `chat_messages` (thread, author `user:<id>` or `manager:<session>`, text, ts, request id) | new (F14, D-178) |
 | docs | `docs` (whole documents: goals, exceptions, backlog), `doc_entries` (append logs: progress, alerts, reviews, drift) — per project | new |
 | auth | `users`, `grants`, `identities` (OIDC iss+sub), `credentials` (password, TOTP, WebAuthn), `recovery_codes`, `auth_sessions`, `remembered_devices`, `mds_cache` | new (§9) |
 | telemetry | `usage_samples`, `usage_weekly_series`, `usage_session_windows`, `forecast_log`, `haiku_judgements`, `weekly_cycles`, `usage_reports`, `user_model`, `usage_reviews` | new (replace the JSONL/JSON files) |
@@ -172,8 +174,8 @@ What moves from files (each with a one-time importer that checks row counts, the
 | `samples.jsonl`, `weekly_series.jsonl`, `session_windows.jsonl`, `forecast_log.jsonl`, `haiku.jsonl`, `weekly_cycles.json`, `usage_reports.jsonl`, `user_model.json` | telemetry tables (raw samples get a retention setting; session windows are never pruned) |
 | `dispatcher_state.json`, `own_sessions.txt`, `keepalive_state.json`, `keepalive_deferred.json`, `sampler_state.json`, `usage_review_state.json`, `at_spool/` | `runner_state`, `driven_sessions`, `scheduled_jobs` |
 | `*.log` | `run_log` (decisions) + `app_log` (lines, retention), also on container stdout |
-| `PROGRESS.md`, `GOALS.md`, `ALERTS.md`, `EXCEPTIONS.md`, `data/reviews/*`, the drift log | `docs` / `doc_entries` (exports, §7.7) |
-| `OPEN_QUESTIONS.md`, `DECISIONS.md` | questions as tasks, `decisions` (§7.6) |
+| `PROGRESS.md`, `GOALS.md`, `ALERTS.md`, `EXCEPTIONS.md`, `data/reviews/*`, the drift log | `docs` / `doc_entries`; only AFClaude's public build log (PROGRESS, GOALS, EXCEPTIONS) is still written out as files (§7.7) |
+| `OPEN_QUESTIONS.md`, `DECISIONS.md` | questions as tasks, `decisions` (§7.6); the files are retired, not exported |
 | `BACKLOG.md` | seeded at gate 8d (D-065), then `docs` + backlog projects |
 
 ### 7.3 Write path (D-154)
@@ -187,16 +189,16 @@ What moves from files (each with a one-time importer that checks row counts, the
 - Sections and keys (flat names as built):
   - **Schedule:** `window_days`, `window_tz`, `session_hours`.
   - **Budget:** `reserve_threshold`, `last_mile_hours`, `session_usage_stop`, `usage_model`, the pacing model parameters, the linear fallback's `projection_threshold` and `cutoff_after_window_hours`.
-  - **Automation:** `automation_paused`, job intervals, concurrency cap, `handoff_before_reset_min`, `handoff_session_pct`, the `continue_now` safety options.
+  - **Automation:** `automation_paused`, job intervals, concurrency cap, `handoff_before_reset_min`, `handoff_session_pct`, the `continue_now` safety options, `proposal_alert_hours` (default 24: oldest unreviewed agent proposal older than this raises an alert, §7.9).
   - **Sessions:** model/effort/permission mode per session kind (overridable per project).
   - **Auth & sessions:** §9.5, OIDC config and the group map (§9.4).
   - **Host:** working root, config dir mode (separate / shared, §10.4), bridge user, host-check interval, tested Claude Code version, owner-session continuation on/off.
   - **Backup:** schedule, retention, target, include credentials in exports (on, shown in red, D-174), `db_wal_retention_days` (default 7, range 1–30, D-175) (§11).
-  - **Data:** telemetry and log retention; docs export per project (§7.7).
+  - **Data:** telemetry and log retention.
   - **Display:** per-user time zone, theme, `ui_chat_reset_hours` (default 5, range 1–168: idle time after which the manager message box starts empty again, D-178).
 
 ### 7.5 Per project vs global (D-152)
-- Per project: decisions, questions, prompt overrides, hand-offs, docs (goals, progress, alerts, exceptions, reviews), session settings, grants.
+- Per project: decisions, questions, prompt overrides, hand-offs, docs (goals, progress, alerts, exceptions, reviews), agent proposals and run summaries, session settings, grants.
 - Global: windows, budget, automation, auth, users, backup, accounts.
 
 ### 7.6 Prompts and the decision store
@@ -205,15 +207,17 @@ What moves from files (each with a one-time importer that checks row counts, the
 **Decision store (D-104–D-107, D-151, D-158).**
 - `decisions`: `id` (D-NNN), `project_id` (`NULL` = install-wide), `slug` (stable unique key per project, e.g. `budget/night-gate`), `title`, `summary` (relevance-only, see retrieval), `words` (verbatim quotes with date and source, JSON), `keywords` (JSON), `scope`, `status` (`proposed | active | done`), `author` (`owner | manager`), `interpretation` (clearly non-binding), `updated_at/by`, `version`.
 - **Only the current decision per entry** (D-158): a change overwrites the row. There are no superseded entries in the store; each change is in the audit log (old and new text), which is the history view. A decision that no longer applies is deleted (audited).
-- Who writes: owners edit or confirm directly. Managers, agents and project editors **propose**: a proposal is a question whose payload is the new or changed decision; the active entry stays in force until a human with the right role confirms (D-104). Manager decisions (D-105) are proposals with `author=manager` that briefs may follow but that never override an owner entry.
+- Who writes: owners edit or confirm directly. Managers and project editors **propose**: a proposal is a question whose payload is the new or changed decision; the active entry stays in force until a human with the right role confirms (D-104). Manager decisions (D-105) are proposals with `author=manager` that briefs may follow but that never override an owner entry. Agents don't propose to the owners: their decision proposals go to their manager (§7.9), which forwards the ones it supports as its own proposal (the agent named as origin) or rejects them.
 - Retrieval for briefs (D-107, D-176): MCP `afclaude_decisions(project, keywords, full=false)` matches keywords plus FTS5 over title/summary/words. With `full=false` it returns per hit only the id, slug and a **very brief summary: a few words naming the topic** (e.g. "night gate: when a full window may run"), deliberately **not enough to act on**, only to decide whether the entry is relevant. To read the rule itself the agent **must expand it** (`full=true`, or the entry by id), which returns the title, the owner's words, scope and interpretation. The MCP tool description says this explicitly, and every `full=false` result carries the same line ("summaries name the topic only; expand an entry before acting on it"). The `summary` field is constrained on write: a short length cap (e.g. 80 chars) and no rule content (no values, thresholds, do/don't instructions). `actions.py` enforces the cap; the content rule is stated in the proposal prompts and the seeding step, and the confirm dialog shows the summary on its own so the owner can see it carries only the topic. Typed `decision_links` (`refines | requires | conflicts`) surface related and conflicting entries with each hit.
 - Seeding (phase 4b): active owner entries import verbatim as `active`; superseded and drift entries are written to the audit log only; partially superseded entries are merged by the manager into one current entry with status `proposed` for the owner to confirm.
 - Design note from the reference project the owner named (D-158): a stable unique key per entry with upsert-overwrite (no history in the store), typed links between entries with contradictions shown inline on retrieval, and deterministic full-text lookup that injects only a few high-confidence matches into a session.
 
-### 7.7 Exports
-- The runner regenerates files from the DB on change: `OPEN_QUESTIONS.md`, `DECISIONS.md`, `ALERTS.md` (local, gitignored) and per project the docs it opts into (`docs_export`: none | local | repo).
-- For AFClaude, `PROGRESS.md`, `GOALS.md` and `EXCEPTIONS.md` stay the public build log: exported into the repo and committed by the manager, through the `check_public` hooks.
-- Exports are read-only copies; nobody edits them. The CLAUDE.md rule "delete resolved items from OPEN_QUESTIONS.md first" becomes "close the question in the DB first" (phase 4b).
+### 7.7 File output (D-181)
+- **No local file exports of DB content.** Questions, decisions, alerts and project docs are read in the dashboard or through MCP; there is no `OPEN_QUESTIONS.md`, `DECISIONS.md`, `ALERTS.md` or per-project doc file generated from the DB.
+- **The only file output is AFClaude's public build log:** `PROGRESS.md`, `GOALS.md` and `EXCEPTIONS.md`, regenerated from the DB into the AFClaude repo and committed by the manager through the `check_public` hooks. They are read-only copies; nobody edits them.
+- Beyond that, the DB content leaves the DB only in backups and exports (§11).
+- `data/ALERTS.fallback.md` (§7.8) is not an export: it is the out-of-DB escalation path written only while the DB is broken, and imported into the DB once it is healthy again.
+- The CLAUDE.md rule "delete resolved items from OPEN_QUESTIONS.md first" becomes "close the question in the DB first" (phase 4b).
 
 ### 7.8 DB error handling and escalation (D-171)
 With everything in the DB, a DB failure is the single biggest failure mode, so every DB access goes through one error path in `store.py`/`actions.py`:
@@ -230,11 +234,21 @@ With everything in the DB, a DB failure is the single biggest failure mode, so e
 - **Never lose the write:** an action that failed persistently is recorded in the fallback file (actor, action, payload hash, time), so it can be replayed or consciously dropped by the owner.
 - Tests: fault injection for each class (locked DB, read-only file, corrupted file, newer schema), covering the runner, MCP, CLI and web paths; gate 8a checks no DB call bypasses the error path.
 
+### 7.9 Agent proposals and the manager review (D-182)
+The project's manager keeps the project's docs, goals, progress and tasks, so it stays up to date and decides with its broader context. Agents therefore don't write those themselves: their writes become **proposals** the manager reviews, and the manager gets one summary of everything each agent run wrote.
+- **Writing as an agent.** Agents use the same MCP tools and CLI as today. `actions.py` checks the actor (§9.6): a write that is one of the agent's direct writes (§9.6) is applied as usual; any other write is not applied but stored as an `agent_proposals` row (kind = the action, payload = its arguments incl. the `version` the agent saw, a one-line summary, status `proposed`), and the tool returns "proposed as P-n, waiting for the manager's review". Questions to the owners and decision proposals go the same way.
+- **Which manager.** The project's manager session. *Proposal:* for a project without one, the AFClaude manager reviews.
+- **Run summary.** Each agent run (a session from start to end, or a subagent run where it can be told apart) gets an `agent_runs` row. When the run ends (done, blocked, saved for a hand-off, killed or stalled) the runner builds **one summary of all the run's writes**, direct ones included, from the proposals and the audit log (actor = `agent:<session>`): proposals with their payload, direct task status changes and notes, hand-offs, escalations, branches pushed. The manager reviews the run as one item.
+- **Review.** The manager lists and decides through MCP (`afclaude_proposals(project)`, `afclaude_review(id, approve | edit | reject, note, payload?)`), one by one or the whole run at once. Approve or edit applies the (edited) payload through `actions.py` with the manager as the actor (`manager:<session>`, `via=proposal`; the audit row names the proposal and the agent). A version mismatch is a 409: the manager edits it onto the current state or rejects it. Direct writes in the summary are acknowledged, or corrected by the manager's normal writes (reopen the task, undo where the action supports it). The run is marked reviewed when nothing in it is still `proposed`.
+- **Questions from agents.** The manager answers itself if it can (the answer goes back to the agent: into its task's notes and, while the agent runs, its next MCP result); otherwise it forwards the question to the owners (approve creates the owner question, actor manager, the agent named as origin). A task an agent set `blocked` (a direct write, §9.6) reaches the owners' inbox only when the manager forwards it.
+- **Notification.** Pending reviews are part of the manager's next turn: the continue prompt lists them, and a running manager gets a short notice at its next idle point (like F14). *Proposal:* an agent can mark a proposal `urgent` (e.g. its task can't go on without it); an urgent proposal queues a `manager_review` request and wakes the runner (D-153), which delivers it to the manager at once when a window is open and the budget allows it (not like run-now: no window or budget override); otherwise at the next window start.
+- **Manager down or busy.** Proposals wait; **nothing auto-applies** and nothing is approved by timeout. F9 and F5 show the queue length and the oldest pending proposal; past `proposal_alert_hours` an alert tells the owners. *Proposal:* owners (and project editors for their project) can decide a proposal from F9 as `user:<id>`; the manager sees that decision in its next turn.
+
 ## 8. API surface
 
 All under `/api/v1`, JSON; HTML pages call the same handlers (htmx gets fragments). Reads are GET; writes are POST/PUT/PATCH/DELETE with an `Idempotency-Key` and the `version` where one exists. Every write is one `actions.py` call. Every handler checks the role (§2) before anything else.
 
-Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`, `window` (settings + next 7 windows + ratios), `usage` (the snapshot), `runs`, `sessions/driven`, `handoffs`, `messages` (the open thread, or a closed one by id), `decisions`, `prompts`, `prompts/{name}` (default, overrides, bundle, diff), `docs`, `reviews`, `audit`, `settings`, `users`, `me` (logins, sessions), `host` (latest checks), `backups`, `health` (no secrets).
+Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`, `window` (settings + next 7 windows + ratios), `usage` (the snapshot), `runs`, `sessions/driven`, `handoffs`, `messages` (the open thread, or a closed one by id), `proposals` (per project, with the run summaries), `decisions`, `prompts`, `prompts/{name}` (default, overrides, bundle, diff), `docs`, `reviews`, `audit`, `settings`, `users`, `me` (logins, sessions), `host` (latest checks), `backups`, `health` (no secrets).
 
 | write | effect | conflict |
 |---|---|---|
@@ -243,6 +257,7 @@ Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`
 | `stalls/{session}/decision` | continue / ignore / clear with the `stall_ref` shown | 409 if it stalled again |
 | `rules` | session / project rule | unique (scope, match) |
 | `decisions` create, edit, confirm, delete | §7.6 | version |
+| `proposals/{id}` approve / edit / reject (owners, project editors; managers do it through MCP) | applies or drops an agent proposal (§7.9) | 409 unless `proposed`; the payload's version |
 | `settings/{key}` set / reset; `settings/reset` (section, all) | registry-validated; undo from audit | version |
 | `settings/window` | day, start, n, mode | version |
 | `prompts/{name}?project=` PUT / DELETE | override / reset | base_sha256 + version |
@@ -299,8 +314,16 @@ Defaults follow NIST SP 800-63B AAL2 (30 min idle, 12 h total) and keep friction
 - Server-side session rows (revocable, listed in F11); cookie `__Host-` prefix, Secure, HttpOnly, SameSite=Lax; the session id rotates at login and step-up.
 - **High-impact writes** (step-up + confirm dialog + an alert entry): prompt overrides, project-scope "always continue" rules, unpause, window changes, run-now, decision confirmation, users/grants/roles, auth settings, host settings, backup/export download, restore and point-in-time rollback.
 
-### 9.6 Agent role and its limits (D-160)
-- MCP and CLI writes from AFClaude's own sessions (the session is in `driven_sessions`, or the CLI runs with `CLAUDE_GUARD_DISABLE=1`) act as `agent:<session>`. Allowed: tasks and questions in its project, its own hand-offs, its project's docs, decision proposals. Everything else is refused, audited and alerted.
+### 9.6 Manager and agent roles and their limits (D-160, D-182)
+- **Who is who.** MCP and CLI writes from AFClaude's own sessions (the session is in `driven_sessions`, or the CLI runs with `CLAUDE_GUARD_DISABLE=1`) act as `manager:<session>` when the session is a project's `projects.manager_session`, otherwise as `agent:<session>`. A session that can't be identified counts as an agent (least privilege). Subagents a manager starts inside its own session report to it in that session; their MCP writes carry the manager's session id and so count as the manager's unless Claude Code exposes a subagent id to the MCP server (checked in phase 5a; if it does, they are agent writes).
+- **Manager:** the writes of its row in §2, in its own project only. Owner-only actions are refused, audited and alerted.
+- **Agent, direct writes** (applied at once, all listed in the run summary for the manager, §7.9):
+  1. hand-offs of its own session (§5.5) (owner-approved, D-182);
+  2. *proposal:* status and progress notes of the task it is assigned to (start, notes, blocked with the reason, done with a result summary), because the runner schedules on them; the manager sees them in the summary and can reopen the task;
+  3. *proposal:* failure escalations and alerts (DB errors per §7.8 incl. its fallback file, security and safety alerts), because the manager may itself be affected;
+  4. *proposal:* code and files in its own branch or worktree; merging is the manager's;
+  5. *proposal:* automatic telemetry and observation rows (run log, usage report) are runner writes (`runner:<component>`), not agent writes, so they need no exception.
+- **Agent, everything else is a proposal to its manager** (§7.9): project docs, goals and progress, new tasks, edits to other tasks, questions to the owners, decision proposals. Owner-only actions are refused outright, audited and alerted.
 - v1 is **advisory**: while sessions run on the same host as the same UID with a shell, a session can bypass MCP (write the DB, edit prompt files). Detection = audit + alerts + the 8a/8c checks. Sessions stay on the host (D-164), so enforcement would need a separate UID for the DB and prompts; that stays a later option.
 - The MCP server's instructions keep saying its tools are used only when the user explicitly asks for AFClaude; MCP tasks count like UI tasks, no approval step (D-068).
 
@@ -379,7 +402,7 @@ The new check commands extend `host_exec.py`'s whitelist. The owner installs the
 - Phase 5b switches to the three-service layout; the host crontab lines and supercronic are retired. Phase 5e sets this installation up again under a new data directory and its own working root, through backup → export → restore (§11.5).
 
 ### 10.7 Retiring the temp dashboard (side task after 8d, not a phase)
-About a week of overlap once the dashboard is live, then stop the export, remove the temp dashboard's container and route, and replace the `/private` page with a link to the dashboard.
+About a week of overlap once the dashboard is live, then stop the quickview export, remove the temp dashboard's container and route, and replace the `/private` page with a link to the dashboard.
 
 ### 10.8 Remote Control visibility (D-042, D-052)
 Driven sessions run as individual RC sessions (`--remote-control --name <tmux name>`); F6 links them when the RC URL is known (source to verify in phase 6c). Threads hosted by the owner's `claude rc` server are never taken over (two writers on one transcript); they show "continue it from the app" with the skip reason. Hooking into rc server mode stays on the roadmap.
@@ -443,7 +466,7 @@ Today AFClaude's sessions share a root directory and the default `~/.claude` wit
 - Cut-over: the old setup is paused and fenced, the new one unpaused; the old data directory and the old transcripts stay in place, untouched.
 
 ## 12. Testing strategy
-- **Unit (offline, temp DBs):** every `actions.py` action (validation, audit, version, idempotent replay, role matrix incl. agent); `schedule.py` (DST nights both ways, N × session_hours, link groups, the window-start key, nights until the reset); `prompts.py` (project > global > default, placeholders, bundles); importers (file → DB, row counts equal); hand-off lifecycle; the schema guard; decision summaries (length cap; `full=false` returns no rule text and carries the expand notice); manager messages (thread open/append, reset after `ui_chat_reset_hours`, reply via MCP).
+- **Unit (offline, temp DBs):** every `actions.py` action (validation, audit, version, idempotent replay, role matrix incl. manager and agent: each of the agent's direct writes applies, every other agent write becomes a proposal and changes nothing); agent proposals (approve / edit / reject apply through `actions.py` with the manager as actor, a stale version gives a 409, nothing applies while the manager is down, the run summary lists every write of the run incl. the direct ones, urgent proposals wake only inside a window); `schedule.py` (DST nights both ways, N × session_hours, link groups, the window-start key, nights until the reset); `prompts.py` (project > global > default, placeholders, bundles); importers (file → DB, row counts equal); hand-off lifecycle; the schema guard; decision summaries (length cap; `full=false` returns no rule text and carries the expand notice); manager messages (thread open/append, reset after `ui_chat_reset_hours`, reply via MCP).
 - **Auth:** factor rules; passkeys with recorded attestation fixtures (hardware BE=0 + MDS-verified passes alone; BE=1 needs a second factor; revoked AAGUID refused; bad signature refused); TOTP windows and replay; recovery codes single-use; lifetimes and step-up with a fake clock; OIDC against a stub provider (state/nonce/PKCE, group map add/remove incl. a group granting `owner`, no e-mail linking); several owners and the last-owner guard; setup code.
 - **API (TestClient):** route-table auth test, CSRF/Origin, 409s, idempotency, size limits, headers/CSP, no secret in any response.
 - **Runner:** dry-runs with settings rows (moved window, pause, run-now skipping window and budget, the manager as a managed project, readable tmux names, wake socket, compaction sequence) with the stub-PATH fixtures; two processes hammering the DB (one winner, no lock errors).
@@ -462,16 +485,16 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
    - **2a Settings in the DB (D-146):** every tunable into `SETTINGS` (afclaude.json, dispatcher.json), one-time import, runners and pacing read the DB, schema guard (A1), the DB error path and escalation (§7.8, D-171).
    - **2b `schedule.py` (D-148):** the only window code, pacing included; DST tests; `window_tz` plumbing.
    - **2c Telemetry into the DB (D-161):** usage tables + importers; sampler, `limit_ratio`, `pacing`, `usage_review`, `usage_report` read/write the DB; `account_id`.
-   - **2d Runner state + docs into the DB (D-161):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries` with exporters.
+   - **2d Runner state + docs into the DB (D-161, D-181):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries`, with the AFClaude build-log export (§7.7) as the only file output.
 3. **Runners**
    - **3a Resident runner (§5.1):** daemon with the job table, stall-scan tick, status snapshot, wake socket, all runner writes via `actions.py` (D-154), `run_log`/`driven_sessions` filled.
    - **3b Manager unification + run-now (D-147, D-153, D-036):** the manager as a managed project in the dispatcher, keep-alive continuation retired, readable tmux names, `continue_now`/`work_on_now`/`review_now` skipping window and budget.
    - **3c Compaction hand-offs (D-144, D-155):** `handoffs`, save prompt trigger, MCP tool, `/compact` + resume prompt.
 4. **Content stores**
    - **4a `prompts.py` (D-111, D-152):** project scope (migrate step), bundles per session kind, every sender uses it.
-   - **4b Questions, decisions and manager messages in the DB (D-151, D-158, D-176, D-178):** `decisions` + links + FTS, proposals as questions, MCP tools (relevance-only summaries, expand before acting), seeding, exports, prompts and CLAUDE.md rules switched to the DB; `chat_threads`/`chat_messages`, the `manager_message` request waking the manager, MCP `afclaude_messages`/`afclaude_reply` and the manager prompt's instructions for them.
+   - **4b Questions, decisions and manager messages in the DB (D-151, D-158, D-176, D-178, D-181):** `decisions` + links + FTS, proposals as questions, MCP tools (relevance-only summaries, expand before acting), seeding, `OPEN_QUESTIONS.md`/`DECISIONS.md` retired (no export, D-181), prompts and CLAUDE.md rules switched to the DB; `chat_threads`/`chat_messages`, the `manager_message` request waking the manager, MCP `afclaude_messages`/`afclaude_reply` and the manager prompt's instructions for them.
 5. **Users, packaging, backup**
-   - **5a Users, roles, agent role (D-149, D-160):** users/grants schema, actor = user, the role matrix in `actions.py`, agent detection, alerts on violations.
+   - **5a Users, roles, manager and agent roles (D-149, D-160, D-182):** users/grants schema, actor = user, the role matrix in `actions.py`, manager/agent detection (incl. whether subagents can be told apart), `agent_proposals`/`agent_runs`, run summaries, MCP `afclaude_proposals`/`afclaude_review`, urgent wake, the manager and agent prompts' instructions, alerts on violations.
    - **5b Containers + host checks (D-163, D-164):** one image, web/runner/mcp services, compose for docker and Coolify, minimal env, master key, MCP in a container, cut-over from the current container and host crontab; sessions stay on the host via the bridge; the host checks (§10.5) as a runner job + CLI, with the bridge whitelist extension.
    - **5c DB backup / restore / move (D-161, D-175, D-180):** bundle, restore, `restore_starts_paused`, move fence, CI round trip; the WAL archive with Litestream (`db_wal_retention_days`, rollback to a moment, archive in the bundle, disk use measured); `AFCLAUDE_DATA` required with no default, set at setup together with the optional restore.
    - **5d Claude data export + working root (D-165):** first-startup working root and config dir (CLI; the UI follows in 6a), verify `CLAUDE_CONFIG_DIR` on the host (RC, `/usage`, `claude agents`, login), the `claude/` export part, whitelisted restore command, path map, the generated reinstate guide, post-restore validation.
@@ -486,7 +509,7 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 8. **Deploy gates, strictly in this order (D-072, D-145, D-157):**
    - **8a Thorough review (Opus 5.5, ultracode/max effort).** The whole dashboard and its integration: `actions.py`, `schedule.py`, `prompts.py`, the runner, auth (OIDC + groups, password + 2FA, passkeys + MDS), backup, export and restore, the host checks, containers. It also checks that **the docs and every owner decision agree with the actual code**, not only with comments and explainer files; every discrepancy goes to the owner to decide, none is fixed silently. It also **validates the users and roles** (D-168): every role's effective permissions match its description in §2, the group→role map, the first-owner setup, and the user records themselves. Findings fixed and re-reviewed before 8b.
    - **8b Deploy without the Claude connection (with the owner's approval).** The three services on a staging volume that no live runner reads, the session executor disabled; **no internet route** (tunnel or VPN only). Curl checks: no session → 401/login, wrong Origin → 403, health fresh.
-   - **8c Live pentest with full code access** against the 8b deployment: auth bypass, setup-code race, password/TOTP brute force, passkey policy bypass (BE flag, attestation, MDS), OIDC flow and group-claim injection, session fixation and lifetimes, CSRF, IDOR across projects and roles, **role-boundary tests (D-168): for each role, a test user tries to reach what the role description says it should not (other projects, global settings, owner-only actions, user management, other users' sessions)**, agent-role escalation via MCP, injection, headers/CSP, backup and export download, the bridge whitelist (restore and check commands). Fixed, re-tested, 8a re-run on non-trivial fixes.
+   - **8c Live pentest with full code access** against the 8b deployment: auth bypass, setup-code race, password/TOTP brute force, passkey policy bypass (BE flag, attestation, MDS), OIDC flow and group-claim injection, session fixation and lifetimes, CSRF, IDOR across projects and roles, **role-boundary tests (D-168): for each role, a test user tries to reach what the role description says it should not (other projects, global settings, owner-only actions, user management, other users' sessions)**, agent-role escalation via MCP (an agent posing as a manager, a direct write outside the §9.6 list, a tampered proposal payload), injection, headers/CSP, backup and export download, the bridge whitelist (restore and check commands). Fixed, re-tested, 8a re-run on non-trivial fixes.
    - **8d Attach the Claude connection, seed the backlog, open the route (with the owner's approval).** Point the services at the live volume and enable the executor; seed `BACKLOG.md` locally (D-065); then add the public route behind the login.
 
 The temp dashboard's phase strip (D-085) shows these phases incl. the sub-phases and 8a–8d.
