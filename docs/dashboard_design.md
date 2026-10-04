@@ -35,7 +35,7 @@ User roles (people logged in to the dashboard, and machine users, below):
 | **viewer** | granted per project | read-only: that project's stages, questions (seen in the inbox, but not answerable, D-196), decisions, hand-offs, effective prompts, its driven sessions |
 | *(none)* | every other registered login | nothing; sees "no access yet" (default for new users, D-149) |
 
-**Machine users (D-195).** Interactive Claude sessions that use the MCP server on the user's request act as a separate user per **machine**: a host or VM with Claude Code installed. Every machine whose Claude Code has the AFClaude MCP server registered is one machine user (`users.kind = machine`), labelled with its hostname at registration and renamable by owners; all interactive sessions on that machine share it. A machine user has no dashboard login; it is identified by a per-machine token issued at registration (§9.7). It gets grants like any user (viewer, editor or manager per project) and then has exactly that role's rights through MCP. A newly registered machine user has **no access until an owner grants it** a role; the setup wizard offers to grant this host's machine user one (§10.4) (D-195). *Proposal:* the owner role can't be granted to a machine user (MCP exposes no owner-only actions, and a token stored on a machine is a weaker credential than an owner's login).
+**Machine users (D-195).** Interactive Claude sessions that use the MCP server on the user's request act as a separate user per **machine**: a host or VM with Claude Code installed. Every machine whose Claude Code has the AFClaude MCP server registered is one machine user (`users.kind = machine`), labelled with its hostname at registration and renamable by owners; all interactive sessions on that machine share it. A machine user has no dashboard login; it is identified by a per-machine token issued at registration (§9.7). It gets grants like any user (viewer, editor or manager per project) and then has exactly that role's rights through MCP. A newly registered machine user has **no access until an owner grants it** a role; the setup wizard offers to grant this host's machine user one (§10.4) (D-195). A machine user can be granted any role, including owner (D-198).
 
 Session and component roles:
 
@@ -102,7 +102,7 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 - **One image, three services** (D-163): `afclaude-web` (the dashboard's HTTP port), `afclaude-runner` (a resident daemon, §5.1), `afclaude-mcp` (the MCP server; its only port is the remote MCP transport, §4). All share the data volume. SQLite WAL across containers is fine on one kernel; never on a network filesystem, so all three run on one host.
 - **Usage numbers** reach the dashboard through a `status_snapshot` row the runner writes each pass (usage %, resets, budget decision, `threshold_info()`, ratios). The web container imports no model code and never reads `~/.claude.json`, calls `/usage`, `claude`, tmux or the bridge. Pages show the snapshot's age.
 - **Sessions stay on the host** (D-164): AFClaude itself (web, runner, MCP) is containerised; the Claude CLI sessions run in tmux on the host, started by the runner through the whitelisted SSH bridge (D-120, D-121), in AFClaude's own working root (§10.4). The dashboard validates the host setup (§10.5).
-- **MCP transport:** the `afclaude-mcp` container. On the AFClaude host it is registered as a stdio command (`docker exec -i afclaude-mcp afclaude mcp`), which works today. Other machines reach it through a remote MCP transport (*proposal:* streamable HTTP on an internal port of `afclaude-mcp`, routed by the reverse proxy at `<AFCLAUDE_PUBLIC_URL>/mcp` with TLS, so it follows the exposure stages of §9.2: tunnel or VPN only until gate 8d). Every interactive connection authenticates with its machine's token (§9.7).
+- **MCP transport:** the `afclaude-mcp` container. On the AFClaude host it is registered as a stdio command (`docker exec -i afclaude-mcp afclaude mcp`), which works today. Other machines reach it through a remote MCP transport (D-198: streamable HTTP on an internal port of `afclaude-mcp`, routed by the reverse proxy at `<AFCLAUDE_PUBLIC_URL>/mcp` with TLS, so it follows the exposure stages of §9.2: tunnel or VPN only until gate 8d). Every interactive connection authenticates with its machine's token (§9.7).
 - Code layout: `dashboard/` (app, routes, templates, static), `actions.py`, `schedule.py`, `prompts.py`, `runner.py` (daemon), `auth/` (sessions, password, TOTP, WebAuthn, OIDC), `backup.py`, `docker/`. The flat modules stay.
 
 ## 5. Runners
@@ -369,7 +369,7 @@ One image, one compose file usable by plain docker and by Coolify (docker-compos
 |---|---|---|---|
 | `afclaude-web` | `afclaude web` | `/data` | 8080 (internal; proxied) |
 | `afclaude-runner` | `afclaude runner` | `/data`, the bridge key and host key (read-only) | none |
-| `afclaude-mcp` | `afclaude mcp` (stdio via `docker exec`; remote transport for other machines, §4, §9.7) | `/data` | internal only, for the remote transport via the proxy (*proposal*) |
+| `afclaude-mcp` | `afclaude mcp` (stdio via `docker exec`; remote transport for other machines, §4, §9.7) | `/data` | internal only, for the remote transport via the proxy (D-198) |
 
 ### 10.2 Minimal env
 | env | required | purpose |
