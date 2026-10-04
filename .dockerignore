@@ -20,3 +20,6 @@ PAUSED
 BACKLOG.md
 ALERTS.md
 OPEN_QUESTIONS.md
+
+# agent worktrees and local Claude state
+.claude/
