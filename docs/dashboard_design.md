@@ -6,7 +6,7 @@ Status: target design for phases 2–9, rewritten on 04.10.2026 after the owner'
 
 Goals
 - One place, usable from a phone, for everything AFClaude needs from people or wants to show: questions, blocked tasks, stalled sessions, the queue, windows, usage and budget, decisions, prompts, the sessions AFClaude drives, hand-offs and the manager docs.
-- Built from scratch with its own architecture (D-070). The quickview (`export_quickview.py` + `quickview/`, the `/private` page) is only the temporary dashboard until phase 9.
+- Built from scratch with its own architecture (D-070). The temp dashboard (the read-only `/private` status page, `export_quickview.py` + `quickview/`) is NOT part of this design; it stays in use until the dashboard is live and is then retired as a separate side task (§10.7).
 - **Everything lives in one DB** (D-161): config, auth, work, decisions, questions, hand-offs, prompt overrides, usage telemetry, runner state and the manager docs. A backup or a move to another host restores a complete, clean continue (§11). Only prompt *defaults* ship with the code.
 - **Everything the dashboard can change is a DB setting** that the runners read there (D-146). Env vars only bootstrap a container (D-163).
 - **One write path**: dashboard, runners, MCP and CLI all write through `actions.py`, which validates and audits every write (D-154).
@@ -61,7 +61,7 @@ One column, large tap targets, no hover-only controls, no drag-and-drop as the o
 First login: a popup offers the browser's time zone (`Intl.DateTimeFormat().resolvedOptions().timeZone`). For the owner it sets the global `window_tz`; for everyone it sets their display time zone. Both stay adjustable (D-148).
 
 ### 3.1 UX rules (owner, kept)
-- **Visual design (D-074):** purple main accent; vibrant colours that directly represent status (done / in progress / pending / blocked / alert), used the same everywhere; rigid but sleek: a strict grid, clear boxes and chips, compact, no decorative fluff. Baseline: the tokens, dark/light themes, typography and spacing of `quickview/AFClaude.html`.
+- **Visual design (D-074):** purple main accent; vibrant colours that directly represent status (done / in progress / pending / blocked / alert), used the same everywhere; rigid but sleek: a strict grid, clear boxes and chips, compact, no decorative fluff.
 - **Settings UX (D-075):** only the most important settings on the main views (pause, tonight's window, `last_mile_hours`, the budget mode); everything else on the Settings page in sections. Every setting has a default, its own reset, a short explanation of what it does and what it can affect (e.g. "can make AFClaude run during your daytime"). "Reset this section" and "Reset all" show a warning listing what changes, plus one-tap UNDO from the audit log. The registry (§7.4) is the single source; the UI renders from it.
 - **Reserve threshold UI (D-141):** next to `reserve_threshold` ("auto" or a %) show, all computed in code by `pacing.threshold_info()`: the session→weekly ratio ± spread (n); the weekly cost of one full session window ± uncertainty and the dynamic default (100 − that cost); the model's back-calculated inaccuracy (`forecast_backtest()`: bias, sd, rmse, n, points reaching the reset, preliminary/ok); the predicted week end's uncertainty and its slack to the threshold; the active threshold and its source. One line explains the rule: a night runs a FULL session window only if the week is then predicted to end at or below the threshold; the model has no margin, the threshold is the only spare.
 
@@ -96,10 +96,10 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 |---|---|---|
 | dispatcher pass (approved stalls, task starts, managed projects incl. the AFClaude manager, cleanup, verification) | every 10 min + on wake | cron `*/10` |
 | window-start tick: the first pass at/after a window start fires each managed project's window-start continue once per window (dedup key = the window's end date); a POSTPONE defers it to last activity + 60 min (D-018) | in the dispatcher pass | cron `0 21,22` UTC (fixed to 23:xx) |
-| stall scan (`stalled.scan`, own tick so stalls stay fresh without the quickview) | every 3 min | inside `export_quickview.py` |
+| stall scan (`stalled.scan`, own tick) | every 3 min | inside the temp dashboard's export |
 | usage sampler + pre/post-reset samples | every 15 min + scheduled jobs | cron + `at` shim |
 | usage review | when due | cron hourly check |
-| status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily | quickview export |
+| status snapshot, exporters (§7.7), backups (§11) | each pass / on change / daily | temp dashboard export |
 
 - **Wake:** after any write that the runner must act on (run-now, window, pause, answer, decision), `actions.py` sends one datagram to `/data/run/runner.sock` after the commit. The runner then reads `action_requests` and settings from the DB. The DB is the truth; a lost wake is caught by the next tick. No polling interval for run-now (D-153).
 - Health: the runner writes its last tick per job to `runner_state`; the web container's health check and F5 read it; the container restarts on a stale heartbeat.
@@ -244,7 +244,7 @@ A write here is close to "run code on the execution host": answers, stages and p
 Attackers: anyone on the internet; a CSRF page in a user's browser; a stolen session cookie or device; a phished password; a compromised or misconfigured OIDC provider or a hostile group claim; a user escalating beyond their grants (IDOR across projects); an autonomous session, prompt-injected by content it read, writing back through MCP or the CLI; a stolen backup bundle.
 
 ### 9.2 Exposure stages (D-073, D-157)
-- Until gates 8a–8c pass: **no internet route.** The app runs on the internal docker network or localhost, reached through an SSH tunnel or VPN. The `/private` quickview stays the temporary dashboard.
+- Until gates 8a–8c pass: **no internet route.** The app runs on the internal docker network or localhost, reached through an SSH tunnel or VPN. The temp dashboard (`/private`) stays in use meanwhile.
 - From gate 8d: a public route through the reverse proxy (Traefik or Coolify's proxy) with TLS. The old key-header + forwarded-user model of v1 is gone; the app does its own login. A proxy-level login or IP allowlist may stay as optional defence in depth.
 
 ### 9.3 Login methods (D-150, D-159)
@@ -353,11 +353,11 @@ The new check commands extend `host_exec.py`'s whitelist. The owner installs the
 
 ### 10.6 Transition from today
 - The current manager container (D-120) and the host bridge (D-121) keep running while phases 2–5 land; each runner change is deployed like today (autonomous deploys within the gates, D-106).
-- The quickview keeps working through the transition: as data moves into the DB, `export_quickview.py` reads the DB; its stall scan moves to the runner's own tick in phase 3a.
+- The temp dashboard keeps working through the transition as side work (not a dashboard phase); its stall scan moves to the runner's own tick in phase 3a.
 - Phase 5b switches to the three-service layout; the host crontab lines and supercronic are retired. Phase 5e moves this installation into its own working root (§11.5).
 
-### 10.7 Retiring the quickview (phase 9)
-Before retirement the dashboard has F9 (docs + phase strip). About a week of overlap, then stop the export, remove the quickview container and route, and replace the `/private` page with a link to the dashboard.
+### 10.7 Retiring the temp dashboard (side task after 8d, not a phase)
+About a week of overlap once the dashboard is live, then stop the export, remove the temp dashboard's container and route, and replace the `/private` page with a link to the dashboard.
 
 ### 10.8 Remote Control visibility (D-042, D-052)
 Driven sessions run as individual RC sessions (`--remote-control --name <tmux name>`); F6 links them when the RC URL is known (source to verify in phase 6c). Threads hosted by the owner's `claude rc` server are never taken over (two writers on one transcript); they show "continue it from the app" with the skip reason. Hooking into rc server mode stays on the roadmap.
@@ -432,7 +432,7 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
    - **2a Settings in the DB (D-146):** every tunable into `SETTINGS` (afclaude.json, dispatcher.json), one-time import, runners and pacing read the DB, schema guard (A1).
    - **2b `schedule.py` (D-148):** the only window code, pacing included; DST tests; `window_tz` plumbing.
    - **2c Telemetry into the DB (D-161):** usage tables + importers; sampler, `limit_ratio`, `pacing`, `usage_review`, `usage_report` read/write the DB; `account_id`.
-   - **2d Runner state + docs into the DB (D-161):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries` with exporters; the quickview reads the DB.
+   - **2d Runner state + docs into the DB (D-161):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries` with exporters.
 3. **Runners**
    - **3a Resident runner (§5.1):** daemon with the job table, stall-scan tick, status snapshot, wake socket, all runner writes via `actions.py` (D-154), `run_log`/`driven_sessions` filled.
    - **3b Manager unification + run-now (D-147, D-153, D-036):** the manager as a managed project in the dispatcher, keep-alive continuation retired, readable tmux names, `continue_now`/`work_on_now`/`review_now` skipping window and budget.
@@ -451,16 +451,15 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
    - **6b Passkeys + OIDC (D-150, D-159):** python-fido2 with MDS3, BE rules and warnings, Authlib OIDC with the group map, step-up re-auth, F11.
    - **6c Read views:** F1–F9, F12, F13, the threshold panel, RC URL source verified.
 7. **Writes**
-   - **7a Work writes:** answers, tasks, projects, priorities, moves, decisions and proposals, 409 handling; parity with the quickview.
+   - **7a Work writes:** answers, tasks, projects, priorities, moves, decisions and proposals, 409 handling.
    - **7b Control writes:** stalls and rules, window editor, prompt editor, pause, run-now with live feedback, Settings page with reset/undo (D-075), users/grants, backup and export UI, confirm + step-up for high-impact writes.
 8. **Deploy gates, strictly in this order (D-072, D-145, D-157):**
    - **8a Thorough review (Opus 5.5, ultracode/max effort).** The whole dashboard and its integration: `actions.py`, `schedule.py`, `prompts.py`, the runner, auth (OIDC + groups, password + 2FA, passkeys + MDS), backup, export and restore, the host checks, containers. It also checks that **the docs and every owner decision agree with the actual code**, not only with comments and explainer files; every discrepancy goes to the owner to decide, none is fixed silently. It also **validates the users and roles** (D-168): every role's effective permissions match its description in §2, the group→role map, the first-owner setup, and the user records themselves. Findings fixed and re-reviewed before 8b.
    - **8b Deploy without the Claude connection (with the owner's approval).** The three services on a staging volume that no live runner reads, the session executor disabled; **no internet route** (tunnel or VPN only). Curl checks: no session → 401/login, wrong Origin → 403, health fresh.
    - **8c Live pentest with full code access** against the 8b deployment: auth bypass, setup-code race, password/TOTP brute force, passkey policy bypass (BE flag, attestation, MDS), OIDC flow and group-claim injection, session fixation and lifetimes, CSRF, IDOR across projects and roles, **role-boundary tests (D-168): for each role, a test user tries to reach what the role description says it should not (other projects, global settings, owner-only actions, user management, other users' sessions)**, agent-role escalation via MCP, injection, headers/CSP, backup and export download, the bridge whitelist (restore and check commands). Fixed, re-tested, 8a re-run on non-trivial fixes.
    - **8d Attach the Claude connection, seed the backlog, open the route (with the owner's approval).** Point the services at the live volume and enable the executor; seed `BACKLOG.md` locally (D-065); then add the public route behind the login.
-9. **Retire the quickview** (§10.7); the README and PROGRESS updated.
 
-The quickview's phase strip (D-085) shows these phases incl. the sub-phases and 8a–8d.
+The temp dashboard's phase strip (D-085) shows these phases incl. the sub-phases and 8a–8d.
 
 **Status display (D-166):** the status views show when the next run will take place (date/time, kind, one-line reason, from `pacing.next_run()`), not the budget rule itself; the rule details belong to the threshold/settings view.
 
