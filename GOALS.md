@@ -1,8 +1,8 @@
-# Goals (in order; the manager keeps this current)
+# Goals (in order; the task-manager keeps this current)
 
 Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN_QUESTIONS.md)
 
-0a. [ ] NEXT RUN, do first: compaction for long-running agents (D-144): a session-end script prompts "save your work, compaction follows"; a structured hand-off path; at the start of each session /compact then resume from the hand-off. Only for agents running longer than one session length in total (the manager).
+0a. [ ] NEXT RUN, do first: compaction for long-running sessions (D-144, D-191), per tmux session: a session-end script prompts "save your work, compaction follows"; a structured hand-off path; at the next start /compact then resume from the hand-off. Only for a tmux session that ran longer than one session length in total: at the end of a session window, compact if it already existed during the previous session window (in practice the task-manager).
 0b. [!] Before ANY dashboard build work (phase 2+): prepare the list of cascading architecture decisions of the dashboard + backend (D-143; skip small/easily changed ones), put it in OPEN_QUESTIONS.md, go through it with the owner. Phase 2 starts only after that.
 1. [ ] Check that the 00:00 window-start fire of 30.09. acted (plan = send-keys into tmux ka-f2897285) and log the result
 2. [x] Host-wide stalled-session detector + SQLite store (`stalled.py`, `store.py`), 29.09.
@@ -22,5 +22,5 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 Side work:
 - [x] Quickview status page (`export_quickview.py`, `quickview/`), 29.09. Follow-up: the export should read GOALS.md + OPEN_QUESTIONS.md + the task inbox instead of parsing PROGRESS.md
 - [x] Limit-ratio monitoring (`limit_ratio.py`), 29.09.:: how fast session % vs weekly % rise, per user, split AFClaude vs user; surfaced on the quickview for window planning
-- [x] Manager usage report (`usage_report.py`), 29.09.: per-subagent + session tokens, deltas via --record/--last
-- [x] Container as manager, host executes (whitelisted SSH bridge, host.py routes every host call). Done 01.10. 14:10: the `afclaude` container (docker/compose.yml) runs the schedule (supercronic: sampler, watcher + watchdog, window-start, usage review, quickview export, dispatcher, at shim); the host crontab has no AFClaude lines any more (backup data/host_crontab.bak)
+- [x] Task-manager usage report (`usage_report.py`), 29.09.: per-subagent + session tokens, deltas via --record/--last
+- [x] Container runs the schedule, host executes (whitelisted SSH bridge, host.py routes every host call). Done 01.10. 14:10: the `afclaude` container (docker/compose.yml) runs the schedule (supercronic: sampler, watcher + watchdog, window-start, usage review, quickview export, dispatcher, at shim); the host crontab has no AFClaude lines any more (backup data/host_crontab.bak)

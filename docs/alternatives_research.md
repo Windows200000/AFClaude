@@ -11,7 +11,7 @@ repo page itself (stars/forks/commits/dates), not secondary blog posts.
 
 AFClaude's `keepalive.py` already does more than any of these: a nightly window,
 a weekly budget-projection rule, RC-thread-safety (never take over a `claude rc`
-thread), project-manager-mode prompts, and dry-run-by-default. The community
+thread), task-manager-mode prompts, and dry-run-by-default. The community
 projects below only do the first, simplest piece ("detect the limit notice,
 resume at reset"):
 
@@ -24,7 +24,7 @@ resume at reset"):
 | Anthropic Desktop "Auto-continue when limits reset" (Aug 2026) | official, built into the Desktop app | Desktop only (not CLI/headless), no window/budget rule, no task queue; an open CLI feature request (`anthropics/claude-code#35744`) is still unresolved | official but partial |
 
 **Recommendation: BUILD (keep `keepalive.py` as is).** None of these cover the
-window + budget rule + RC-safety + project-manager-mode combination, which is
+window + budget rule + RC-safety + task-manager-mode combination, which is
 the actual hard part. Worth a watch-item: if Anthropic ships native CLI
 auto-continue (issue #35744), re-check whether it can replace the resume
 mechanics under `keepalive.py` while AFClaude keeps the window/budget layer on
