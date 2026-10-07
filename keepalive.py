@@ -273,18 +273,55 @@ def next_window_start(now):
     return start if start > local else start + timedelta(days=1)
 
 
+def _win():
+    return (WINDOW_START, WINDOW_END)
+
+
+def session_window_starts(now):
+    """The session-window starts (D-202) of the night window `now` is in, else of the latest one
+    (Berlin wall clock): window start + k x 5 h while the session window ends by the window
+    end, i.e. 23:00 and 04:00 for the default 23:00 x 10 h (pacing.session_starts)."""
+    import pacing
+    return pacing.session_starts(pacing.latest_window_start(now, _win()), _win())
+
+
+def session_start_at(now):
+    """The session-window start whose hour `now` is in (the cron runs --window-start at :00 of
+    each start's hour), else None."""
+    if not in_window(now):
+        return None
+    return next((s for s in session_window_starts(now) if s <= now < s + timedelta(hours=1)), None)
+
+
 def is_window_start_hour(now):
-    """--window-start acts only in WINDOW_START's Berlin hour. Cron fires it at 21:00 and
-    22:00 UTC (`0 21,22 * * *`); exactly one of them is 23:xx Berlin (21:00 in CEST,
-    22:00 in CET). A different window_start needs a different cron line."""
-    return now.astimezone(BERLIN).hour == WINDOW_START.hour
+    """--window-start acts only in the Berlin hour of a session-window start (D-202: 23:xx and
+    04:xx by default). Cron fires it at `0 2,3,21,22 * * *` (UTC); exactly one of 21/22 is 23:xx
+    Berlin (21:00 in CEST, 22:00 in CET) and one of 2/3 is 04:xx (02:00 in CEST, 03:00 in CET),
+    also on the DST nights. A different window_start needs different cron hours."""
+    return session_start_at(now) is not None
+
+
+def latest_session_start(now):
+    """The latest session-window start <= now inside the window, else None."""
+    import pacing
+    return pacing.latest_session_start(now, _win())
+
+
+def next_session_start(now):
+    """The first session-window start after `now`."""
+    import pacing
+    return pacing.next_session_start(now, _win())
 
 
 def window_start_key(now):
-    """Dedup key of the window-start continue: the window's END date (its "night", as the
-    fire cap uses), so a 23:00 start on 29.09. is window-start-2026-09-30. On the switch
-    night that equals the old 00:00 start's key of 30.09., which is right: one per night."""
-    return f"window-start-{current_window_end(now).date()}"
+    """Dedup key of the window-start continue, one per SESSION-WINDOW START (D-202): the
+    window's END date (its "night", as the fire cap uses), so the 23:00 start on 29.09. is
+    window-start-2026-09-30 (the old once-per-night key) and the 04:00 start the night's
+    second session window, window-start-2026-09-30-s2. Outside the window: the next night's
+    first start."""
+    s = latest_session_start(now)
+    k = session_window_starts(now).index(s) if s is not None else 0
+    return f"window-start-{current_window_end(now).date()}" + (f"-s{k + 1}" if k else "")
 
 
 # ---------------------------------------------------------------- usage
@@ -937,6 +974,32 @@ def save_state(st):
     os.replace(tmp, STATE_FILE)
 
 
+RUN_IDLE = timedelta(minutes=15)      # run_active(): the run's transcripts were written this recently
+RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # fires that started a run
+
+
+def run_active(session_id, now, st=None):
+    """A keep-alive run is going right now (read-only; the quickview's next run, D-202): a real
+    fire for this session (a window-start, postponed start, last-stretch slot or stall continue;
+    not a dry-run or a refused preflight) less than one session length ago, and the session's
+    transcript or one of its subagents' written within RUN_IDLE. -> the fire time or None."""
+    st = st if st is not None else load_state()
+    fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
+             if isinstance(v, dict) and v.get("result") in RUN_RESULTS]
+    fired = [t for t in fired if t and now - afclaude_config.SESSION_LENGTH <= t <= now]
+    if not fired:
+        return None
+    path = transcript_path(session_id)
+    if not path:
+        return None
+    files = [path] + glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
+    try:
+        last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
+    except ValueError:
+        return None
+    return max(fired) if now - datetime.fromtimestamp(last, UTC) <= RUN_IDLE else None
+
+
 def progress_note(line):
     host.append_note(PROGRESS_FILE, f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n")
 
@@ -1093,16 +1156,30 @@ def last_mile_pass(sid, now, st, args):
 
 # ---------------------------------------------------------------- window start
 
+def postpone_deadline(now):
+    """A start postponed at the session-window start of `now` must begin before this (the next
+    session-window start of the night, which checks itself); `now` at the last start or outside
+    the window: no postponement (D-202, pacing.postpone_deadline)."""
+    import pacing
+    s = latest_session_start(now)
+    return pacing.postpone_deadline(s, _win()) if s is not None else now
+
+
 def window_start_pass(sid, now, args):
-    """The start-of-window continue (no stall needed), one decision per night: FIRE, a final
-    HOLD, or a POSTPONE (e.g. the user was active) that the watcher re-decides at its recheck
-    time within the same window (deferred_window_start_pass). -> the decision dict."""
+    """The session-window-start continue (no stall needed), one decision per session-window start
+    of the night (D-202: 23:00 and 04:00): FIRE, a final HOLD, or a POSTPONE (e.g. the user was
+    active) that the watcher re-decides at its recheck time (deferred_window_start_pass), but only
+    while that is before the night's next session-window start: a later recheck (also any at the
+    last start, the run would end after the window end) is skipped; the next session-window start
+    decides again. -> the decision dict."""
     u = fresh_usage(now, force=True)
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
     key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
+    deadline = postpone_deadline(now)
+    defer = bool(d.get("postpone") and d.get("recheck_at") and not args.now and d["recheck_at"] < deadline)
     if not args.now:
-        note_window_usage(key, u is not None, now, final=not (d.get("postpone") and d.get("recheck_at")))
+        note_window_usage(key, u is not None, now, final=not defer)
     if not args.now and getattr(args, "arm", False):
         try:                                  # score the forecast later (pacing.forecast_errors)
             import pacing
@@ -1112,9 +1189,13 @@ def window_start_pass(sid, now, args):
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
         handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
-    elif d.get("postpone") and d.get("recheck_at") and not args.now:
-        defer_window_start(key, sid, d["recheck_at"], d["reason"])
+    elif defer:
+        defer_window_start(key, sid, d["recheck_at"], d["reason"], deadline)
         progress_note(f"window-start {berlin(now)}: postponed to {berlin(d['recheck_at'])}, {d['reason']}")
+    elif d.get("postpone") and d.get("recheck_at") and not args.now:
+        progress_note(f"window-start {berlin(now)}: not resumed, postponed past the night's next session-window "
+                      f"start ({berlin(d['recheck_at'])} >= {berlin(deadline)}), skipped to the next "
+                      f"session-window start {berlin(next_session_start(now))} (D-202); {d['reason']}")
     else:
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
     return d
@@ -1141,23 +1222,39 @@ def save_deferred(d):
     os.replace(tmp, DEFER_FILE)
 
 
-def defer_window_start(key, sid, recheck_at, reason):
-    """The window-start decision was a POSTPONE (the user was active, ...): the watcher
-    re-decides at recheck_at, still once per window (same dedup key)."""
-    d = {k: v for k, v in load_deferred().items() if k == key}   # older nights are over
+def defer_window_start(key, sid, recheck_at, reason, deadline=None):
+    """The session-window-start decision was a POSTPONE (the user was active, ...): the watcher
+    re-decides at recheck_at, still once per session-window start (same dedup key), and only
+    before `deadline` (the night's next session-window start, D-202)."""
+    d = {k: v for k, v in load_deferred().items() if k == key}   # older starts are over
     d[key] = {"session": sid, "recheck_at": recheck_at.astimezone(UTC).isoformat(), "reason": reason,
               "deferred_at": datetime.now(UTC).isoformat()}
+    if deadline is not None:
+        d[key]["deadline"] = deadline.astimezone(UTC).isoformat()
     save_deferred(d)
 
 
+def pending_deferral(sid, now):
+    """The recheck time of the postponed session-window start the watcher will still re-decide
+    for this session (deferred_window_start_pass), or None. Read-only (the quickview's next run)."""
+    if not in_window(now):
+        return None
+    ent = load_deferred().get(window_start_key(now))
+    if not ent or ent.get("session") != sid or window_start_key(now) in load_state().get("handled", {}):
+        return None
+    return parse_ts(ent.get("recheck_at"))
+
+
 def deferred_window_start_pass(sid, now, st, args):
-    """Watcher side of a postponed window start: at its recheck time, decide again and fire
-    under the same window-start key, postpone again, or drop it (a final HOLD, or the window
-    is over). -> the next recheck time or None."""
+    """Watcher side of a postponed session-window start: at its recheck time, decide again and
+    fire under the same window-start key, postpone again, or drop it (a final HOLD, or the
+    recheck would reach the night's next session-window start or the window end: that start
+    decides itself, D-202). -> the next recheck time or None."""
     defs = load_deferred()
     if not defs:
         return None
-    key = window_start_key(now) if (in_window(now) or in_last_mile(now)) else None
+    # the key changes at each session-window start, so an entry is stale from the next start on
+    key = window_start_key(now) if in_window(now) else None
     ent = defs.get(key) if key else None
     stale = [k for k in defs if k != key or (ent and ent.get("session") != sid)]
     if ent and ent.get("session") != sid:
@@ -1177,21 +1274,28 @@ def deferred_window_start_pass(sid, now, st, args):
     u = fresh_usage(now, force=True)
     d = budget_eval(u, now)
     log(f"window-start (postponed): {d['reason']}")
-    note_window_usage(key, u is not None, now, final=not (d.get("postpone") and d.get("recheck_at")))
+    deadline = postpone_deadline(now)
+    again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
+    note_window_usage(key, u is not None, now, final=not again)
     if d["go"]:
         defs.pop(key, None)
         save_deferred(defs)
         handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
                     "window start (postponed), " + d["reason"], st, args)
         return None
-    if d.get("postpone") and d.get("recheck_at"):
+    if again:
         ent["recheck_at"] = d["recheck_at"].astimezone(UTC).isoformat()
         ent["reason"] = d["reason"]
         save_deferred(defs)
         return d["recheck_at"]
     defs.pop(key, None)
     save_deferred(defs)
-    progress_note(f"window-start (postponed) {berlin(now)}: not resumed, {d['reason']}")
+    if d.get("postpone") and d.get("recheck_at"):
+        progress_note(f"window-start (postponed) {berlin(now)}: not resumed, postponed past the night's next "
+                      f"session-window start ({berlin(d['recheck_at'])} >= {berlin(deadline)}), skipped to the "
+                      f"next session-window start {berlin(next_session_start(now))} (D-202); {d['reason']}")
+    else:
+        progress_note(f"window-start (postponed) {berlin(now)}: not resumed, {d['reason']}")
     return None
 
 
@@ -1311,7 +1415,7 @@ def main():
     ap.add_argument("--last-mile", action="store_true",
                     help="one-shot: continue the session if the last-mile period before the weekly reset is open")
     ap.add_argument("--window-start", action="store_true",
-                    help="one-shot: at window start, continue the session if the budget rule allows")
+                    help="one-shot: at a session-window start (23:00, 04:00; D-202), continue the session if the budget rule allows")
     ap.add_argument("--now", action="store_true",
                     help="ignore the 23:00-09:00 window (and, with --window-start, the start-hour gate); budget rule still applies")
     ap.add_argument("--work-on", metavar="PROJECT",
@@ -1340,7 +1444,7 @@ def main():
     if args.window_start and not args.session:
         sys.exit("--window-start needs --session")
     if args.window_start:
-        # Start-of-window continue (no stall needed): budget rule + window, then fire.
+        # Session-window-start continue (no stall needed, D-202): budget rule + window, then fire.
         now = datetime.now(UTC)
         if not args.now and not is_window_start_hour(now):
             return

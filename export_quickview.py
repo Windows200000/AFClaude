@@ -354,13 +354,31 @@ def threshold_block(now, decision=None):
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def runner_state(now):
+    """What the runner is doing for this manager session (D-202): a run going (the fire time) and
+    a pending postponed session-window start (its recheck). Read-only; unknown -> None."""
+    out = {"active": None, "deferred": None}
+    try:
+        out["active"] = ka.run_active(SELF_SESSION, now)
+    except Exception:   # noqa: BLE001 - advisory: the walk still shows the next start
+        pass
+    try:
+        p = ka.pending_deferral(SELF_SESSION, now)
+        out["deferred"] = p if p is not None else False      # False = known: none pending
+    except Exception:   # noqa: BLE001 - None = unknown: inferred from the decision
+        pass
+    return out
+
+
 def next_run_block(u, now, decision=None):
     """pacing.next_run(): when the next autonomous run takes place (D-166: the page shows this,
-    not the budget rule): Berlin time, kind, a one-line reason. The main result assumes no more
-    usage (D-200); "expected" = the same with the user's forecast usage."""
+    not the budget rule): Berlin time, kind, a one-line reason. Only what the runner will
+    actually do (D-202): "now" only while a run is going, in the last stretch, or when a
+    session-window start's check is due and passes. The main result assumes no more usage
+    (D-200); "expected" = the same with the user's forecast usage."""
     try:
         import pacing
-        d = pacing.next_run(u, now, decision)
+        d = pacing.next_run(u, now, decision, **runner_state(now))
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"error": f"{type(e).__name__}: {e}"}
     r = lambda x: round(x, 1) if isinstance(x, (int, float)) else None   # noqa: E731

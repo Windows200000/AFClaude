@@ -158,7 +158,8 @@ class NextRunBlock(unittest.TestCase):
         old = pacing.next_run
         at = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
         try:
-            pacing.next_run = lambda u, now, decision=None: {
+            seen = {}
+            pacing.next_run = lambda u, now, decision=None, **kw: seen.update(kw) or {
                 "at": at, "kind": "last_stretch", "label": "last stretch", "reason": "predicted 98.6% > 84.6%",
                 "predicted_end": 98.6123, "threshold": 84.58, "last_stretch_at": at,
                 "expected": {"at": at, "kind": "last_stretch", "label": "last stretch", "reason": "r",
@@ -169,6 +170,7 @@ class NextRunBlock(unittest.TestCase):
             self.assertTrue(b["at_berlin"].startswith("Thu 08.10. 14:00"))
             self.assertEqual((b["expected"]["kind"], b["expected"]["predicted_end"]), ("last_stretch", 101.0))
             self.assertTrue(b["expected"]["at_berlin"].startswith("Thu 08.10. 14:00"))
+            self.assertEqual(set(seen), {"active", "deferred"})          # D-202: the runner's state
 
             def boom(*a, **kw):
                 raise RuntimeError("x")
@@ -176,6 +178,56 @@ class NextRunBlock(unittest.TestCase):
             self.assertIn("RuntimeError", qv.next_run_block({}, datetime(2026, 10, 4))["error"])
         finally:
             pacing.next_run = old
+
+    def test_runner_state(self):
+        from datetime import timezone
+        now = datetime(2026, 10, 5, 6, 18, tzinfo=timezone.utc)
+        olds = (qv.ka.run_active, qv.ka.pending_deferral)
+        try:
+            qv.ka.run_active, qv.ka.pending_deferral = (lambda sid, n: None), (lambda sid, n: None)
+            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": False})
+            t = datetime(2026, 10, 5, 2, 0, tzinfo=timezone.utc)
+            qv.ka.run_active, qv.ka.pending_deferral = (lambda sid, n: t), (lambda sid, n: t)
+            self.assertEqual(qv.runner_state(now), {"active": t, "deferred": t})
+
+            def boom(sid, n):
+                raise OSError("x")
+            qv.ka.run_active, qv.ka.pending_deferral = boom, boom
+            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": None})   # unknown
+        finally:
+            qv.ka.run_active, qv.ka.pending_deferral = olds
+
+    def test_no_running_between_session_window_starts(self):
+        """D-202: Mon 08:18 Berlin with a passing gate and nothing running -> 'Holding until' the
+        next session-window start (Mon 23:00), not 'Running now'; at 04:05 (a due start) -> now."""
+        import pacing
+        from datetime import time as dtime, timedelta, timezone
+        Z = timezone.utc
+        reset = datetime(2026, 10, 8, 17, 0, tzinfo=Z)
+        win = (dtime(23, 0), dtime(9, 0))
+        tmp = tempfile.TemporaryDirectory()
+        olds = (pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state)
+        pacing.SAMPLES_FILE = os.path.join(tmp.name, "samples.jsonl")
+        pacing.USER_MODEL_FILE = os.path.join(tmp.name, "user_model.json")
+        pacing.FIRE_FILES = []
+        qv.runner_state = lambda now: {"active": None, "deferred": False}
+        try:
+            u = {"weekly": {"percent": 10.0, "resets_at": reset}, "session": {"percent": 0.0, "resets_at": None}}
+            for now, kind, at in ((datetime(2026, 10, 5, 6, 18, tzinfo=Z), "night", "Mon 05.10. 23:00"),
+                                  (datetime(2026, 10, 5, 2, 5, tzinfo=Z), "now", None)):
+                d = pacing.decide_core(10.0, reset, now, 600.0, None, None, None, True, 0.2, "auto", win)
+                self.assertTrue(d["go"], d["reason"])                      # the gate passes at that moment
+                b = qv.next_run_block(u, now, d)
+                self.assertEqual(b["kind"], kind, b)
+                if at:
+                    self.assertTrue(b["at_berlin"].startswith(at), b)
+            qv.runner_state = lambda now: {"active": now - timedelta(hours=1), "deferred": False}
+            now = datetime(2026, 10, 5, 3, 0, tzinfo=Z)
+            d = pacing.decide_core(10.0, reset, now, 600.0, None, None, None, True, 0.2, "auto", win)
+            self.assertEqual(qv.next_run_block(u, now, d)["kind"], "now")   # a run is going
+        finally:
+            pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state = olds
+            tmp.cleanup()
 
     def test_page_shows_the_next_run_not_the_rule(self):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:

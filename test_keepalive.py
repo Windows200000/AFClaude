@@ -166,44 +166,91 @@ class Window(unittest.TestCase):
             self.assertEqual(ka.next_window_start(Z(now)), Z(now))
 
     def test_window_start_hour(self):
-        """Cron `0 21,22 * * *` (UTC): exactly one of the two fires is 23:xx Berlin."""
-        for day, acting in [("2026-09-29", "21"),   # CEST
-                            ("2026-10-24", "21"),   # DST end night (still CEST at 23:00)
-                            ("2026-10-25", "22"),   # first CET evening
-                            ("2026-10-27", "22"),   # CET
-                            ("2027-03-27", "22"),   # DST start night (still CET at 23:00)
-                            ("2027-03-28", "21")]:  # first CEST evening
+        """D-202: cron `0 2,3,21,22 * * *` (UTC). Exactly one of 21/22 is 23:xx Berlin (the first
+        session-window start) and one of 2/3 is 04:xx (the second), also on the DST nights."""
+        for day, evening, morning in [("2026-09-29", "21", "02"),   # CEST
+                                      ("2026-10-24", "21", "03"),   # DST end night: 23:00 CEST, 04:00 CET
+                                      ("2026-10-25", "22", "03"),   # first CET evening
+                                      ("2026-10-27", "22", "03"),   # CET
+                                      ("2027-03-27", "22", "02"),   # DST start night: 23:00 CET, 04:00 CEST
+                                      ("2027-03-28", "21", "02")]:  # first CEST evening
+            nxt = (Z(f"{day}T12:00:00Z") + timedelta(days=1)).date().isoformat()
             for hour in ("21", "22"):
                 with self.subTest(day=day, hour=hour):
-                    self.assertEqual(ka.is_window_start_hour(Z(f"{day}T{hour}:00:05Z")), hour == acting)
+                    self.assertEqual(ka.is_window_start_hour(Z(f"{day}T{hour}:00:05Z")), hour == evening)
+            for hour in ("02", "03"):
+                with self.subTest(day=nxt, hour=hour):
+                    self.assertEqual(ka.is_window_start_hour(Z(f"{nxt}T{hour}:00:05Z")), hour == morning)
+            # never between the starts (e.g. 08:18 Berlin) or outside the window
+            for h in ("00", "01", "04", "05", "06", "07", "10", "20"):
+                self.assertFalse(ka.is_window_start_hour(Z(f"{nxt}T{h}:18:00Z")), (nxt, h))
+
+    def test_crontab_covers_every_session_window_start(self):
+        """docker/crontab's window-start line: every day of a year (both DST switches) has exactly
+        two acting fires, one in each session-window start's hour (23:xx and 04:xx Berlin)."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "crontab")) as fh:
+            line = next(x for x in fh if x.rstrip().endswith("# AFClaude window-start"))
+        minute, hours = line.split()[:2]
+        self.assertEqual((minute, hours), ("0", "2,3,21,22"))
+        day = Z("2026-01-01T00:00:00Z")
+        while day < Z("2027-01-01T00:00:00Z"):
+            acting = [day.replace(hour=int(h)) for h in hours.split(",")
+                      if ka.is_window_start_hour(day.replace(hour=int(h)))]
+            with self.subTest(day=day.date()):
+                self.assertEqual(sorted(ka.berlin(t)[11:13] for t in acting), ["04", "23"])
+            day += timedelta(days=1)
+
+    def test_session_window_starts(self):
+        """23:00 and 04:00 (wall clock) for the default 23:00 x 10 h window, also on the DST nights."""
+        for now, starts in [
+            ("2026-09-29T21:30:00Z", ["2026-09-29T21:00:00Z", "2026-09-30T02:00:00Z"]),   # CEST
+            ("2026-10-24T23:00:00Z", ["2026-10-24T21:00:00Z", "2026-10-25T03:00:00Z"]),   # DST end: 6 h apart
+            ("2027-03-28T01:30:00Z", ["2027-03-27T22:00:00Z", "2027-03-28T02:00:00Z"]),   # DST start: 4 h apart
+            ("2026-10-27T06:00:00Z", ["2026-10-26T22:00:00Z", "2026-10-27T03:00:00Z"]),   # CET
+        ]:
+            with self.subTest(now=now):
+                self.assertEqual(ka.session_window_starts(Z(now)), [Z(s) for s in starts])
+        # each start's 5-h session window ends by the window end (09:00): the last one exactly
+        for now in ("2026-09-29T21:30:00Z", "2026-10-24T23:00:00Z", "2027-03-28T01:30:00Z"):
+            last = ka.session_window_starts(Z(now))[-1]
+            self.assertEqual(last + timedelta(hours=5), ka.current_window_end(Z(now)))
 
     def test_window_start_key(self):
-        # 23:00 CEST on 29.09. -> the window ending 30.09. 09:00 (one window-start per night)
+        # 23:00 CEST on 29.09. -> the window ending 30.09. 09:00; its 04:00 start gets -s2 (D-202)
         self.assertEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")), "window-start-2026-09-30")
+        self.assertEqual(ka.window_start_key(Z("2026-09-30T02:00:05Z")), "window-start-2026-09-30-s2")
         self.assertEqual(ka.window_start_key(Z("2026-10-26T22:00:05Z")), "window-start-2026-10-27")
+        self.assertEqual(ka.window_start_key(Z("2026-10-27T03:00:05Z")), "window-start-2026-10-27-s2")
         self.assertEqual(ka.window_start_key(Z("2027-03-27T22:00:05Z")), "window-start-2027-03-28")
+        self.assertEqual(ka.window_start_key(Z("2027-03-28T02:00:05Z")), "window-start-2027-03-28-s2")
 
-    def test_window_start_dedup_across_midnight(self):
-        """One window-start continue per night: every moment of one window (before and
-        after midnight, incl. the DST nights) has the same key; the next night a new one."""
+    def test_window_start_dedup_per_session_window_start(self):
+        """D-202: one window-start continue per SESSION-WINDOW START: every moment from a start
+        until the next start (across midnight, incl. the DST nights) has that start's key."""
         for night, moments in [
-            ("2026-09-30", ["2026-09-29T21:00:05Z", "2026-09-29T21:59:59Z", "2026-09-29T22:30:00Z",
-                            "2026-09-30T06:59:59Z"]),                  # CEST: 23:00, 23:59, 00:30, 08:59
-            ("2026-10-27", ["2026-10-26T22:00:05Z", "2026-10-26T23:30:00Z", "2026-10-27T07:59:59Z"]),  # CET
-            ("2026-10-25", ["2026-10-24T21:00:05Z", "2026-10-25T00:30:00Z", "2026-10-25T01:30:00Z",
-                            "2026-10-25T07:59:59Z"]),                  # DST end (02:30 twice)
-            ("2027-03-28", ["2027-03-27T22:00:05Z", "2027-03-28T00:59:59Z", "2027-03-28T01:00:00Z",
-                            "2027-03-28T06:59:59Z"]),                  # DST start
+            ("2026-09-30", [("2026-09-29T21:00:05Z", ""), ("2026-09-29T21:59:59Z", ""),
+                            ("2026-09-29T22:30:00Z", ""), ("2026-09-30T01:59:59Z", ""),      # 03:59 CEST
+                            ("2026-09-30T02:00:00Z", "-s2"), ("2026-09-30T06:59:59Z", "-s2")]),
+            ("2026-10-27", [("2026-10-26T22:00:05Z", ""), ("2026-10-26T23:30:00Z", ""),
+                            ("2026-10-27T02:59:59Z", ""), ("2026-10-27T03:00:00Z", "-s2"),
+                            ("2026-10-27T07:59:59Z", "-s2")]),                                # CET
+            ("2026-10-25", [("2026-10-24T21:00:05Z", ""), ("2026-10-25T00:30:00Z", ""),
+                            ("2026-10-25T01:30:00Z", ""), ("2026-10-25T02:59:59Z", ""),       # 03:59 CET
+                            ("2026-10-25T03:00:00Z", "-s2"), ("2026-10-25T07:59:59Z", "-s2")]),  # DST end
+            ("2027-03-28", [("2027-03-27T22:00:05Z", ""), ("2027-03-28T00:59:59Z", ""),
+                            ("2027-03-28T01:59:59Z", ""), ("2027-03-28T02:00:00Z", "-s2"),    # 04:00 CEST
+                            ("2027-03-28T06:59:59Z", "-s2")]),                                # DST start
         ]:
-            for m in moments:
+            for m, suffix in moments:
                 with self.subTest(m=m):
-                    self.assertEqual(ka.window_start_key(Z(m)), f"window-start-{night}")
+                    self.assertEqual(ka.window_start_key(Z(m)), f"window-start-{night}{suffix}")
         self.assertNotEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")),
                             ka.window_start_key(Z("2026-09-30T21:00:05Z")))
 
     def test_window_start_handled_key_not_fired_again_after_midnight(self):
         """handle_fire skips a key already handled (before preflight): a 23:00 window-start
-        and a second --window-start run at 00:30 the same night fire once."""
+        and a second --window-start run at 00:30 the same night fire once; the 04:00 start has
+        its own key (D-202)."""
         st = {"handled": {ka.window_start_key(Z("2026-09-29T21:00:05Z")): {"result": "continued"}},
               "fires": {}}
         old = ka.preflight
@@ -213,6 +260,9 @@ class Window(unittest.TestCase):
             ka.handle_fire(SID, stall, "window start", st, None)
         finally:
             ka.preflight = old
+        self.assertNotIn(ka.window_start_key(Z("2026-09-30T02:00:05Z")), st["handled"])
+
+
 
 
 class WindowConfig(unittest.TestCase):
@@ -720,6 +770,169 @@ class BudgetWiring(unittest.TestCase):
             ka.handle_fire = oldh
         self.assertEqual(fired, [])
         self.assertEqual(ka.load_deferred(), {})
+
+
+    # ---- D-202: the gate at each session-window start (23:00, 04:00), postponed starts end by 09:00
+
+    S2 = Z("2026-10-05T02:00:00Z")                      # Mon 04:00 Berlin, the night's second start
+
+    def _patched(self, decisions, fired):
+        """budget_eval returns decisions[i] in turn (a postpone to `recheck_at`, or a go);
+        handle_fire records the key and marks it handled."""
+        it = iter(decisions)
+
+        def be(u, now):
+            r = next(it)
+            if r == "go":
+                return {"go": True, "postpone": False, "recheck_at": None, "reason": "CONTINUE: test",
+                        "text": "budget t"}
+            return {"go": False, "postpone": True, "recheck_at": r, "text": "budget t",
+                    "reason": f"HOLD: user active 10 min ago (yield); postponed to {ka.berlin(r)}"}
+
+        def hf(sid, stall, reason, st, args):          # the real dedup: a handled key is skipped
+            if stall["uuid"] in st["handled"]:
+                return
+            fired.append(stall["uuid"])
+            st["handled"][stall["uuid"]] = {"result": "test", "at": "x"}
+            ka.save_state(st)
+        olds = (ka.budget_eval, ka.fresh_usage, ka.handle_fire)
+        ka.budget_eval, ka.fresh_usage, ka.handle_fire = be, (lambda n, force=False: self.u()), hf
+        return olds
+
+    def _restore(self, olds):
+        ka.budget_eval, ka.fresh_usage, ka.handle_fire = olds
+
+    def progress(self):
+        try:
+            with open(ka.PROGRESS_FILE) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def test_postponed_start_runs_only_until_the_next_session_window_start(self):
+        """A 23:00 start postponed to 01:30 is deferred (deadline 04:00, the next start); one
+        postponed to 04:10 is skipped (the 04:00 start decides itself); the last start (04:00)
+        is never postponed: its run would end after 09:00 (D-202)."""
+        fired = []
+        start = self.NIGHT + timedelta(seconds=5)
+        olds = self._patched([start + timedelta(hours=2, minutes=30),          # 01:30: deferred
+                              self.S2 + timedelta(minutes=10),                  # 04:10: skipped
+                              self.S2 + timedelta(minutes=40)], fired)          # at 04:00 -> 04:40: skipped
+        try:
+            ka.window_start_pass(SID, start, Args())
+            ent = ka.load_deferred()[ka.window_start_key(start)]
+            self.assertEqual(ka.parse_ts(ent["deadline"]), self.S2)
+            self.assertEqual(ka.parse_ts(ent["recheck_at"]), start + timedelta(hours=2, minutes=30))
+            os.remove(ka.DEFER_FILE)
+            ka.window_start_pass(SID, start, Args())
+            self.assertEqual(ka.load_deferred(), {})
+            self.assertIn("skipped to the next session-window start 2026-10-05 04:00:00", self.progress())
+            ka.window_start_pass(SID, self.S2 + timedelta(seconds=5), Args())
+            self.assertEqual(ka.load_deferred(), {})
+            self.assertIn("skipped to the next session-window start 2026-10-05 23:00:00", self.progress())
+            self.assertEqual(fired, [])
+        finally:
+            self._restore(olds)
+
+    def test_deferred_start_dropped_at_the_next_session_window_start(self):
+        """The watcher's recheck: re-postponed past 04:00 -> dropped; reached only after 04:00
+        (the next start's key) -> dropped as stale, never fired late."""
+        fired, st = [], {"handled": {}, "fires": {}}
+        start = self.NIGHT + timedelta(seconds=5)
+        key = ka.window_start_key(start)
+        olds = self._patched([self.S2 + timedelta(minutes=20)], fired)         # 03:00 -> 04:20
+        try:
+            ka.defer_window_start(key, SID, self.S2 - timedelta(hours=1), "r", self.S2)
+            self.assertIsNone(ka.deferred_window_start_pass(SID, self.S2 - timedelta(hours=1), st, Args()))
+            self.assertEqual((ka.load_deferred(), fired), ({}, []))
+            self.assertIn("postponed past the night's next session-window start", self.progress())
+            ka.defer_window_start(key, SID, self.S2 - timedelta(minutes=30), "r", self.S2)
+            self.assertIsNone(ka.deferred_window_start_pass(SID, self.S2 + timedelta(minutes=5), st, Args()))
+            self.assertEqual((ka.load_deferred(), fired), ({}, []))
+        finally:
+            self._restore(olds)
+
+    def test_second_session_window_start_fires_under_its_own_key(self):
+        """The 04:00 check is deduplicated on its own (the 23:00 key does not block it, a second
+        04:xx run does not fire again), and the 23:00 check of the next night is new."""
+        fired = []
+        olds = self._patched(["go"] * 4, fired)
+        old_rec = self.bm.record_forecast
+        self.bm.record_forecast = lambda *a, **k: None
+        try:
+            for t in (self.NIGHT, self.S2, self.S2 + timedelta(minutes=30), self.NIGHT + timedelta(days=1)):
+                ka.window_start_pass(SID, t + timedelta(seconds=5), Args())
+            self.assertEqual(fired, ["window-start-2026-10-05", "window-start-2026-10-05-s2",
+                                     "window-start-2026-10-06"])
+        finally:
+            self.bm.record_forecast = old_rec
+            self._restore(olds)
+
+    def test_run_still_going_at_the_second_start_is_not_started_twice(self):
+        """A run from 23:00 still going at 04:00 (live in our tmux ka-<id8>): the 04:00 check
+        only types into that same session (plan send-keys, no new process, no --new) and the key
+        dedups a second 04:xx run."""
+        calls = []
+        olds = (ka.budget_eval, ka.fresh_usage, ka.tmux_alive, ka.tmux_pids, ka.registry_holders,
+                ka.fire, ka.verify_reply, ka.agent_entries, ka.PROJECTS_DIR, self.bm.record_forecast)
+        ka.budget_eval = lambda u, now: {"go": True, "postpone": False, "recheck_at": None,
+                                         "reason": "CONTINUE: test", "text": "budget t"}
+        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.tmux_alive, ka.tmux_pids, ka.registry_holders = (lambda s: True), (lambda s: {300}), (lambda s: [])
+        ka.fire = lambda sid, cwd, msg, plan, new=False, **k: calls.append((plan, new)) or (0, "sent-keys", "")
+        ka.verify_reply = lambda path, since, timeout=None: {"message": {"model": "claude-opus-5-5"}}
+        ka.agent_entries = lambda s: []
+        ka.PROJECTS_DIR = self.tmp.name
+        self.bm.record_forecast = lambda *a, **k: None
+        write_transcript(self.tmp.name, SID, [USER, REPLY])
+
+        class Armed(Args):
+            arm = True
+        try:
+            ka.save_state({"handled": {ka.window_start_key(self.NIGHT): {"result": "continued-in-place"}},
+                           "fires": {}})
+            ka.window_start_pass(SID, self.S2 + timedelta(seconds=5), Armed())
+            ka.window_start_pass(SID, self.S2 + timedelta(minutes=30), Armed())
+        finally:
+            (ka.budget_eval, ka.fresh_usage, ka.tmux_alive, ka.tmux_pids, ka.registry_holders,
+             ka.fire, ka.verify_reply, ka.agent_entries, ka.PROJECTS_DIR, self.bm.record_forecast) = olds
+        self.assertEqual(calls, [("send-keys", False)])
+        self.assertEqual(ka.load_state()["handled"]["window-start-2026-10-05-s2"]["plan"], "send-keys")
+
+    def test_run_active_and_pending_deferral(self):
+        """The quickview's runner state: a real fire < 5 h ago with a transcript written in the
+        last 15 min is a run going; a dry-run, an old fire or an idle transcript is not."""
+        now = self.S2 + timedelta(hours=4, minutes=18)                     # Mon 08:18 Berlin
+        old = ka.PROJECTS_DIR
+        ka.PROJECTS_DIR = self.tmp.name
+        try:
+            write_transcript(self.tmp.name, SID, [USER, REPLY])
+            path = ka.transcript_path(SID)
+            fresh = now.timestamp() - 60
+            os.utime(path, (fresh, fresh))
+            st = {"handled": {"k": {"result": "continued-in-place", "at": (now - timedelta(hours=1)).isoformat()}}}
+            self.assertEqual(ka.run_active(SID, now, st), now - timedelta(hours=1))
+            st["handled"]["k"]["at"] = (now - timedelta(hours=6)).isoformat()   # the 23:00... fire: over
+            self.assertIsNone(ka.run_active(SID, now, st))
+            st["handled"]["k"].update(at=(now - timedelta(hours=1)).isoformat(), result="dry-run")
+            self.assertIsNone(ka.run_active(SID, now, st))
+            st["handled"]["k"]["result"] = "continued-in-place"
+            idle = now.timestamp() - 3600
+            os.utime(path, (idle, idle))
+            self.assertIsNone(ka.run_active(SID, now, st))                  # finished: idle for an hour
+            sub = os.path.join(path[:-len(".jsonl")], "subagents")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "agent-1.jsonl"), "w") as fh:
+                fh.write("{}\n")
+            os.utime(os.path.join(sub, "agent-1.jsonl"), (fresh, fresh))
+            self.assertIsNotNone(ka.run_active(SID, now, st))              # a subagent is working
+        finally:
+            ka.PROJECTS_DIR = old
+        start = self.NIGHT + timedelta(seconds=5)
+        ka.defer_window_start(ka.window_start_key(start), SID, start + timedelta(hours=1), "r", self.S2)
+        self.assertEqual(ka.pending_deferral(SID, start + timedelta(minutes=30)), start + timedelta(hours=1))
+        self.assertIsNone(ka.pending_deferral("other", start + timedelta(minutes=30)))
+        self.assertIsNone(ka.pending_deferral(SID, self.S2 + timedelta(minutes=1)))   # the next start's key
 
 
 class Args:

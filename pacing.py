@@ -52,7 +52,7 @@ else the 15-min median), else 0.2 (conservative), and the reason says which.
 import json
 import math
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
@@ -370,6 +370,58 @@ def next_window_start(t, win):
     return s if s > t else _wall(s.astimezone(BERLIN).date() + timedelta(days=1), win[0])
 
 
+# Session-window starts (D-202): the night gate is checked at the start of EACH 5-h session window
+# inside the night window (23:00 and 04:00 by default), never at arbitrary times in between.
+
+def window_minutes(win):
+    """Wall-clock length of the window in minutes (it may span midnight)."""
+    a, b = (t.hour * 60 + t.minute for t in win)
+    return (b - a) % (24 * 60) or 24 * 60
+
+
+def session_starts(ws, win):
+    """The session-window starts of the night window that starts at `ws`: ws + k x 5 h on the wall
+    clock for every k whose 5-h session window still ends by the window end (D-148: the window is
+    N x 5 h, so k < N; at least the window start itself). Wall clock, so on a DST night the last
+    one still ends at the window end (09:00): 23:00 and 04:00 for the default 23:00 x 10 h."""
+    step = round(SESSION_H * 60)
+    n = max(int((window_minutes(win) + 1e-6) // step), 1)
+    d0, m0 = ws.astimezone(BERLIN).date(), win[0].hour * 60 + win[0].minute
+    out = []
+    for k in range(n):
+        m = m0 + k * step
+        out.append(_wall(d0 + timedelta(days=m // (24 * 60)),
+                         dtime(m % (24 * 60) // 60, m % 60)))
+    return out
+
+
+def latest_session_start(t, win):
+    """The latest session-window start <= t of the night window `t` is in; None outside the window."""
+    if not in_window(t, win):
+        return None
+    starts = [s for s in session_starts(latest_window_start(t, win), win) if s <= t]
+    return starts[-1] if starts else None
+
+
+def next_session_start(t, win):
+    """The first session-window start strictly after t (this night's next one, or the next night's first)."""
+    ws = latest_window_start(t, win)
+    for s in session_starts(ws, win) + session_starts(next_window_start(ws + timedelta(minutes=1), win), win):
+        if s > t:
+            return s
+    return next_window_start(t, win)
+
+
+def postpone_deadline(s, win):
+    """A start postponed from the session-window start `s` (yield, D-018) must begin before this:
+    the next session-window start of the same night (which checks the gate itself), so its 5-h
+    session window still ends by the window end. For the last start it is `s` itself: a
+    postponement there skips to the next night's first start (D-202)."""
+    starts = session_starts(latest_window_start(s, win), win)
+    later = [x for x in starts if x > s]
+    return later[0] if later else s
+
+
 def _b(t):
     return t.astimezone(BERLIN).strftime("%a %d.%m. %H:%M")
 
@@ -565,9 +617,10 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
         base = (f"week {w:.0f}% used; {how}; budget for this run +{head:.1f}% "
                 f"(≈ {head / full:.1f} session windows)")
         if not ok or head <= P["min_gap"]:
-            nxt = next_window_start(now, win)
+            nxt = next_session_start(now, win)     # D-202: the next session-window start re-checks
             why = "the week would end above the threshold" if not ok else "no room left"
-            return dict(d, recheck_at=nxt, reason=f"HOLD: no run ({why}), next night {_b(nxt)}; {base}")
+            return dict(d, recheck_at=nxt, reason=f"HOLD: no run ({why}), next check at the session-window "
+                                                  f"start {_b(nxt)}; {base}")
         cap, check_user = P["session_cap"], True
     if check_user and not activity_known:
         r = now + RETRY
@@ -653,18 +706,30 @@ def _no_usage(a, b):
     return 0.0
 
 
+START_DUE = timedelta(hours=1)   # the cron runs --window-start at :00 of each session-window start's hour
+
+
 def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None, threshold="auto",
                   lm_setting="auto", win=None, current=None, session_pct=None, session_resets_at=None,
-                  P=None, max_nights=8):
-    """When the next autonomous run will take place (pure). Walks the upcoming window starts until
-    the weekly reset and evaluates the night gate at each start: predicted_end = w_start + run_cost
+                  P=None, max_nights=8, active=None, deferred=None):
+    """When the next autonomous run will take place (pure): only what the runner will actually do
+    (D-202). The runner checks the night gate only at each SESSION-WINDOW START inside the night
+    window (session_starts(): 23:00 and 04:00 by default), so this walks the upcoming session-window
+    starts until the weekly reset and evaluates the gate at each: predicted_end = w_start + run_cost
     + forecast(start, reset) <= threshold (the straight line without a forecast), as the real gate
     will at that time. The primary result assumes NO MORE USAGE (D-200): w_start = w now. The first
     start that passes is the next run; if none passes, the start of the last stretch before the reset
-    (D-020, its length from w now); without one, the first night after the reset. "expected" holds the
-    same walk with the user's forecast use until each start (w_start = w + forecast(now, start)).
-    current = the decide() dict for now: a run allowed now (inside the window or the last stretch)
-    is "now", a postponed one (yield, D-018) is "postponed" to its recheck (both results).
+    (D-020, its length from w now); without one, the first session-window start after the reset.
+    "expected" holds the same walk with the user's forecast use until each start
+    (w_start = w + forecast(now, start)).
+    "now" only when the runner runs at this moment: `active` (a run is going; truthy, e.g. the time
+    of its fire), current = the decide() dict for now is a go inside the last stretch, or a go at a
+    session-window start whose check is due now (within START_DUE of it). Between starts a passing
+    gate is NOT "now" (e.g. 08:18: the next start). A postponed start (yield, D-018) is "postponed"
+    to its recheck only while that is before postpone_deadline() (the next start of the night; a
+    postponed start never runs past the window end), else the walk. deferred = the runner's pending
+    postponed start (its recheck time), False = none, None = unknown (inferred from current).
+    In the last stretch a postponed current is "postponed" (the last-stretch pass rechecks).
     -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at,
         expected: {at, kind, label, reason, predicted_end, last_stretch_at}}; kind in NEXT_RUN_LABELS."""
     P = {**DEFAULTS, **(P or {})}
@@ -687,33 +752,59 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     if weekly_pct is None or resets_at is None or resets_at <= now:
         return both(res("unknown", None, "weekly usage unknown or stale: no forecast of the next run"))
     w = float(weekly_pct)
-    after = next_window_start(resets_at - timedelta(seconds=1), win)
+    after = next_session_start(resets_at - timedelta(seconds=1), win)
     if w >= 100:
         return both(res("after_reset", after, f"weekly limit used up until the reset {_bs(resets_at)}"))
     out["last_stretch_at"] = _last_stretch_start(w, resets_at, now, ratio, lm_setting, _no_usage)
     cur = current or {}
-    if cur.get("mode") in ("night", "last_mile") and (cur.get("mode") == "last_mile" or in_window(now, win)):
-        why = str(cur.get("reason") or "").split(";")[0].replace("HOLD: ", "")
+    if active:
+        since = f" (started {_bs(active)})" if isinstance(active, datetime) else ""
+        return both(res("now", now, f"a run is going{since}", predicted_end=cur.get("predicted_end")))
+    why = str(cur.get("reason") or "").split(";")[0].replace("HOLD: ", "")
+
+    def go_now(what):
+        return both(res("now", now, f"{what}: budget +{float(cur.get('headroom') or 0):.1f}% "
+                                    f"(up to {float(cur.get('target') or 0):.1f}%)",
+                        predicted_end=cur.get("predicted_end")))
+
+    def postponed(at, reason=None):
+        r = res("postponed", at, reason or why, predicted_end=cur.get("predicted_end"))
+        if "session guard" in r["reason"] or "unknown" in r["reason"]:
+            r["label"] = "postponed (" + ("session guard" if "session guard" in r["reason"]
+                                          else "activity unknown") + ")"
+        return both(r)
+
+    s0 = latest_session_start(now, win) if cur.get("mode") == "night" else None
+    if cur.get("mode") == "last_mile":
         if cur.get("go"):
-            what = "last stretch" if cur["mode"] == "last_mile" else "night gate passed"
-            return both(res("now", now, f"{what}: budget +{float(cur.get('headroom') or 0):.1f}% "
-                                        f"(up to {float(cur.get('target') or 0):.1f}%)",
-                            predicted_end=cur.get("predicted_end")))
+            return go_now("last stretch")
         if cur.get("postpone") and cur.get("recheck_at"):
-            r = res("postponed", cur["recheck_at"], why, predicted_end=cur.get("predicted_end"))
-            if "session guard" in why or "unknown" in why:
-                r["label"] = "postponed (" + ("session guard" if "session guard" in why else "activity unknown") + ")"
-            return both(r)
+            return postponed(cur["recheck_at"])
+    elif s0 is not None:
+        if cur.get("go") and now - s0 < START_DUE:
+            return go_now(f"session-window start {_bs(s0)}, night gate passed")
+        dl = postpone_deadline(s0, win)
+        pend = deferred if isinstance(deferred, datetime) else \
+            (cur.get("recheck_at") if deferred is None and cur.get("postpone") else None)
+        if pend is not None and pend < dl:
+            if cur.get("go"):
+                if now >= pend:
+                    return go_now(f"postponed session-window start {_bs(s0)}, night gate passed")
+                return postponed(pend, f"postponed session-window start {_bs(s0)}, recheck {_bs(pend)}")
+            if cur.get("postpone") and cur.get("recheck_at") and cur["recheck_at"] < dl:
+                return postponed(cur["recheck_at"])
+        # otherwise no run before the next session-window start (a postponement past it is
+        # skipped, D-202): the walk below
     full = full_session_cost(ratio)
 
     def walk(pre):
-        """The night walk with pre(now, start) = the user's use until each start."""
+        """The walk over the session-window starts with pre(now, start) = the user's use until each."""
         lm = _last_stretch_start(w, resets_at, now, ratio, lm_setting, pre)
         if lm is not None and now >= lm:
             return res("last_stretch", now, f"in the last stretch before the reset {_bs(resets_at)}",
                        last_stretch_at=lm)
-        first, s = None, next_window_start(now, win)
-        for _ in range(max_nights):
+        first, s = None, next_session_start(now, win)
+        for _ in range(max_nights * len(session_starts(s, win))):
             if s >= resets_at or (lm is not None and s >= lm):
                 break
             ws = w + pre(now, s)
@@ -727,32 +818,33 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
                 pred, line = ws + cost + fc(s, resets_at), thr
                 txt = f"predicted {pred:.1f}% {{}} {thr:.1f}%"
             else:
-                end = min(window_end(s, win), resets_at)
+                end = min(window_end(latest_window_start(s, win), win), resets_at)
                 line = thr * min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
                 pred = ws + cost
                 txt = f"straight line {pred:.1f}% {{}} {line:.1f}% (threshold {thr:.1f}% x elapsed)"
             if first is None or pred < first[0]:
-                first = (pred, txt)          # the closest night: the reason shows the best case
+                first = (pred, txt)          # the closest start: the reason shows the best case
             if pred <= line and cost > P["min_gap"]:
                 return res("night", s, txt.format("≤") + f" at {_bs(s)}", predicted_end=pred,
                            last_stretch_at=lm)
-            s = next_window_start(s + timedelta(minutes=1), win)
+            s = next_session_start(s, win)
         head = first[1].format(">") + f" until {_bs(lm or resets_at)}" if first else \
-            "no night window before " + ("the last stretch" if lm else "the reset")
+            "no session-window start before " + ("the last stretch" if lm else "the reset")
         pe = first[0] if first else None
         if lm is not None:
             return res("last_stretch", lm, f"{head}; last stretch {_bs(lm)}", predicted_end=pe,
                        last_stretch_at=lm)
         return res("after_reset", after, f"{head}; no last stretch (off or the week used up); "
-                                         f"first night after the reset {_bs(after)}",
+                                         f"first session-window start after the reset {_bs(after)}",
                    predicted_end=pe, last_stretch_at=lm)
 
     return both(walk(_no_usage), walk(fc))
 
 
-def next_run(usage, now, decision=None, rows=None, fires=None):
+def next_run(usage, now, decision=None, rows=None, fires=None, active=None, deferred=None):
     """next_run_core() from a keepalive usage dict with the live ratio, forecast and settings
-    (as decide()); decision = the decide()/budget_eval() dict for now (computed if None)."""
+    (as decide()); decision = the decide()/budget_eval() dict for now (computed if None); active /
+    deferred = the runner's state (keepalive.run_active(), keepalive.pending_deferral())."""
     w = (usage or {}).get("weekly") or {}
     s = (usage or {}).get("session") or {}
     if decision is None:
@@ -764,7 +856,7 @@ def next_run(usage, now, decision=None, rows=None, fires=None):
     P, _ = load_params()
     d = next_run_core(w.get("percent"), w.get("resets_at"), now, ratio, fc, setting,
                       afclaude_config.last_mile_setting(), afclaude_config.window(), decision,
-                      s.get("percent"), s.get("resets_at"), P)
+                      s.get("percent"), s.get("resets_at"), P, active=active, deferred=deferred)
     d["forecast_source"] = fsrc
     return d
 
