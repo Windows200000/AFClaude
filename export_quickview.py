@@ -355,9 +355,10 @@ def threshold_block(now, decision=None):
 
 
 def runner_state(now):
-    """What the runner is doing for this manager session (D-202): a run going (the fire time) and
-    a pending postponed session-window start (its recheck). Read-only; unknown -> None."""
-    out = {"active": None, "deferred": None}
+    """What the runner is doing for this manager session (D-202): a run going (the fire time), a
+    pending postponed session-window start (its recheck) and, in the last stretch, whether the
+    current slot already ran (keepalive.last_mile_next_slot(), D-204). Read-only; unknown -> None."""
+    out = {"active": None, "deferred": None, "slot_next": None}
     try:
         out["active"] = ka.run_active(SELF_SESSION, now)
     except Exception:   # noqa: BLE001 - advisory: the walk still shows the next start
@@ -366,6 +367,10 @@ def runner_state(now):
         p = ka.pending_deferral(SELF_SESSION, now)
         out["deferred"] = p if p is not None else False      # False = known: none pending
     except Exception:   # noqa: BLE001 - None = unknown: inferred from the decision
+        pass
+    try:
+        out["slot_next"] = ka.last_mile_next_slot(now)
+    except Exception:   # noqa: BLE001 - None = unknown: the decision decides
         pass
     return out
 

@@ -4,10 +4,10 @@ Every prompt AFClaude sends lives here, so the dashboard can show and edit them 
 
 | file | used for | placeholders |
 |---|---|---|
-| `continue.md` | continue message for a resumed AFClaude session (keepalive.py, dispatcher.py) | `{reason}`, `{progress}` |
+| `continue.md` | continue message for a resumed AFClaude session: the task-manager at a session-window start or last-stretch slot start (keepalive.py), an approved stalled session in the AFClaude repo (dispatcher.py) | `{reason}`, `{progress}` |
 | `project_start.md` | first message of a new project session (`--work-on`) | `{title}`, `{desc}`, `{slug}` |
-| `continue_foreign.md` | neutral continue message for an approved stalled session that is not an AFClaude session (dispatcher.py; the user's own sessions get only this + `guard_respect.md`, and resume on their own model). With a `{context}` it also continues dispatcher task sessions and the task-manager sessions of managed projects | `{reason}`, `{context}` |
-| `task_start.md` | first message of a task session started by the dispatcher (also used to resume a blocked task's session with the answer) | `{id}`, `{title}`, `{project}`, `{description}`, `{qa}` |
+| `continue_foreign.md` | neutral continue message for an approved stalled session that is not an AFClaude session (dispatcher.py; the user's own sessions get only this + `guard_respect.md`, and resume on their own model). (`{context}` is empty since D-205: task sessions and task-managers are never continued at a limit reset, D-204) | `{reason}`, `{context}` |
+| `task_start.md` | first message of a task session; unused since D-205 (the dispatcher starts no task sessions, a project's task-manager works its tasks), kept for design phase 3b | `{id}`, `{title}`, `{project}`, `{description}`, `{qa}` |
 | `guard_respect.md` | appended to every session message: respect the guard hooks even when they're bypassed | — |
 | `manager.md` | appended to all of them except the user's own sessions: act as the project's task-manager and delegate to subagents | — |
 | `manager_afclaude.md` | appended after `manager.md` only for sessions working on AFClaude itself: usage report, GOALS/OPEN_QUESTIONS, public-repo rule, worktrees | — |

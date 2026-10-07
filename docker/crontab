@@ -10,5 +10,5 @@
 7,22,37,52 * * * * [ -e $AFCLAUDE_DIR/PAUSED ] || $AFCLAUDE_DIR/docker/start_watcher.sh >/dev/null 2>>$KEEPALIVE_STATE_DIR/watchdog.log # AFClaude watcher watchdog (no-op if running)
 0 * * * * cd $AFCLAUDE_DIR && python3 usage_review.py >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude usage-model review (runs when data/usage_review_state.json next_run_at has passed)
 */3 * * * * flock -n $AFCLAUDE_DIR/data/.quickview.lock python3 $AFCLAUDE_DIR/export_quickview.py >> $AFCLAUDE_DIR/data/quickview_export.log 2>&1 # AFClaude quickview export
-*/10 * * * * cd $AFCLAUDE_DIR && python3 dispatcher.py --arm --once >> $AFCLAUDE_DIR/data/dispatcher.log 2>&1 # AFClaude dispatcher (acts only inside the 23:00-09:00 Berlin window or the last mile)
+*/10 * * * * cd $AFCLAUDE_DIR && python3 dispatcher.py --arm --once >> $AFCLAUDE_DIR/data/dispatcher.log 2>&1 # AFClaude dispatcher (10-min pass: cleanup, health checks, approved stalled sessions at their reset at any time; starts no runs, D-205/D-206)
 * * * * * python3 $AFCLAUDE_DIR/docker/at_shim.py --run-due >> $AFCLAUDE_DIR/data/at_shim.log 2>&1 # AFClaude at-shim (the sampler's pre/post weekly-reset samples)

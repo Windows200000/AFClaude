@@ -430,26 +430,33 @@ class Evaluate(unittest.TestCase):
         self.assertEqual(self.ev("2026-09-26T03:01:00Z")[0], "NO_STALL")
 
     def test_sequence(self):
+        """evaluate() = an APPROVED stall's continue (D-206): at the reset + grace, no budget gate."""
         write_transcript(self.tmp.name, SID, [USER, REPLY, STALL] + TRAILING)
         # reset 02:49Z (04:49 Berlin) + 90s grace
         self.assertEqual(self.ev("2026-09-26T02:50:00Z", usage(10))[0], "WAIT_RESET")
         self.assertEqual(self.ev("2026-09-26T02:50:31Z", usage(10))[0], "FIRE")
-        self.assertEqual(self.ev("2026-09-26T02:50:31Z", usage(32))[0], "HOLD")
-        self.assertEqual(self.ev("2026-09-26T02:50:31Z", None)[0], "HOLD")
+        self.assertEqual(self.ev("2026-09-26T02:50:31Z", usage(32))[0], "FIRE")    # no AFClaude budget gate
+        self.assertEqual(self.ev("2026-09-26T02:50:31Z", None)[0], "FIRE")         # usage unknown: still the reset
         # live usage says the session limit is still on
         self.assertEqual(self.ev("2026-09-26T02:51:00Z",
                                  usage(10, sess_pct=100, sess_reset=Z("2026-09-26T03:30:00Z")))[0], "WAIT_RESET")
+        self.assertEqual(self.ev("2026-09-26T02:51:00Z", usage(100))[0], "WAIT_RESET")   # weekly limit on
+        # detection only (the watcher's view): no usage fetched, no decision
+        self.assertEqual(ka.stall_status(SID, Z("2026-09-26T02:50:00Z"))[0], "WAIT_RESET")
+        act, detail, stall = ka.stall_status(SID, Z("2026-09-26T02:50:31Z"))
+        self.assertEqual((act, stall["reset"]), ("RESET_PASSED", Z("2026-09-26T02:49:00Z")))
 
-    def test_reset_after_window_waits_for_next_night(self):
+    def test_approved_stall_fires_at_its_reset_outside_the_window(self):
+        """D-206: approved stalls continue at their reset at ANY time of day (the windows are only
+        for AFClaude)."""
         late = dict(STALL, timestamp="2026-09-26T05:30:00.000Z",
                     message=dict(STALL["message"], content=[{"type": "text",
                                  "text": "You've hit your session limit · resets 10am (UTC)"}]))
         write_transcript(self.tmp.name, SID, [USER, late])
-        act, detail = self.ev("2026-09-26T10:05:00Z", usage(10))
-        self.assertEqual(act, "WAIT_WINDOW")
-        self.assertIn("2026-09-26 23:00:00 CEST", detail)
-        self.assertEqual(self.ev("2026-09-26T20:59:59Z", usage(10))[0], "WAIT_WINDOW")
-        self.assertEqual(self.ev("2026-09-26T21:00:10Z", usage(10))[0], "FIRE")
+        self.assertEqual(self.ev("2026-09-26T10:01:00Z", usage(10))[0], "WAIT_RESET")
+        act, detail = self.ev("2026-09-26T10:01:31Z", usage(90))           # 12:01 Berlin, week at 90%
+        self.assertEqual(act, "FIRE")
+        self.assertIn("D-206", detail)
 
     def test_other_api_error_not_fired(self):
         err = dict(STALL, error="overloaded", message=dict(STALL["message"], content=[
@@ -673,42 +680,67 @@ class BudgetWiring(unittest.TestCase):
         finally:
             ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = olds
 
-    def test_evaluate_postpones_and_window_gate_in_last_mile(self):
+    def test_approved_stall_continue_has_no_pacing_gate(self):
+        """D-206: an approved stall (the owner's session) is continued at its reset even while the
+        owner is active, the week is far above the threshold or it is daytime; no budget text."""
         with tempfile.TemporaryDirectory() as d:
             ka.PROJECTS_DIR, old = d, ka.PROJECTS_DIR
             try:
-                stall = dict(STALL, timestamp="2026-10-04T20:00:00.000Z",
+                stall = dict(STALL, timestamp="2026-10-07T09:00:00.000Z",
                              message=dict(STALL["message"], content=[{"type": "text",
-                                          "text": "You've hit your session limit · resets 9pm (UTC)"}]))
+                                          "text": "You've hit your session limit · resets 10am (UTC)"}]))
                 write_transcript(d, SID, [USER, stall])
-                now = self.NIGHT + timedelta(minutes=5)                   # 23:05 Berlin, in the window
-                cache = self.u()
-                ka.read_usage_cache, oldc = (lambda: cache), ka.read_usage_cache
-                try:
-                    self.samples(now, prompt_minutes_ago=15)
-                    action, detail, st = ka.evaluate(SID, now, lambda n: cache)
-                    self.assertEqual(action, "POSTPONE", detail)
-                    self.assertEqual(st["recheck_at"], now - timedelta(minutes=15) + timedelta(minutes=60))
-                    self.samples(now)
-                    action, detail, st = ka.evaluate(SID, now, lambda n: cache)
-                    self.assertEqual(action, "FIRE", detail)
-                    self.assertIn(f"+{ka.budget_headroom(cache, now)[0]:.1f}", st["budget"])
-                    # outside the window: only inside the last stretch (it yields too)
-                    day = Z("2026-10-08T13:00:00Z")                         # Thu 15:00, 4 h to the reset
-                    cache = self.u(90.0)
-                    self.samples(day, week=90)
-                    self.assertEqual(ka.evaluate(SID, day, lambda n: cache)[0], "FIRE")
-                    self.samples(day, prompt_minutes_ago=0, week=90)
-                    self.assertEqual(ka.evaluate(SID, day, lambda n: cache)[0], "POSTPONE")
-                    self.samples(day, week=90)
-                    self.assertEqual(ka.evaluate(SID, Z("2026-10-07T10:00:00Z"), lambda n: cache)[0],
-                                     "WAIT_WINDOW")
-                    self.setcfg(last_mile_hours=0)                          # no last mile: the window gate holds
-                    self.assertEqual(ka.evaluate(SID, day, lambda n: cache)[0], "WAIT_WINDOW")
-                finally:
-                    ka.read_usage_cache = oldc
+                day = Z("2026-10-07T10:05:00Z")                             # Wed 12:05 Berlin
+                cache = self.u(90.0)
+                self.samples(day, prompt_minutes_ago=0, week=90)            # the owner is active
+                action, detail, st = ka.evaluate(SID, day, lambda n: cache)
+                self.assertEqual(action, "FIRE", detail)
+                self.assertNotIn("budget", st)
             finally:
                 ka.PROJECTS_DIR = old
+
+    def test_stalled_task_manager_waits_for_the_slot_start(self):
+        """D-204 in the last stretch: the task-manager stopped at a limit; the slot start waits for
+        the limit reset, then decides itself (fires once); nothing else continues it."""
+        fired = []
+        with tempfile.TemporaryDirectory() as d:
+            old = (ka.PROJECTS_DIR, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire)
+            ka.PROJECTS_DIR = d
+            stall = dict(STALL, timestamp="2026-10-08T07:30:00.000Z",
+                         message=dict(STALL["message"], content=[{"type": "text",
+                                      "text": "You've hit your session limit · resets 9am (UTC)"}]))
+            write_transcript(d, SID, [USER, stall])
+            cache = {"fetched_at": self.R, "weekly": {"percent": 70.0, "resets_at": self.R},
+                     "session": {"percent": 0.0, "resets_at": None}}
+            ka.read_usage_cache = lambda: cache
+            ka.fresh_usage = lambda n, force=False: cache
+
+            def hf(sid, stall, reason, st, args):
+                fired.append(stall["uuid"])
+                st["handled"][stall["uuid"]] = {"result": "test"}
+            ka.handle_fire = hf
+            try:
+                st = {"handled": {}, "fires": {}}
+                now = self.R - timedelta(hours=9, minutes=30)               # slot 2, before the 09:00Z reset
+                self.samples(now, week=70)
+                self.assertEqual(ka.last_mile_pass(SID, now, st, None), Z("2026-10-08T09:00:00Z") + ka.RESET_GRACE)
+                self.assertEqual(fired, [])
+                self.assertIsNone(ka.last_mile_next_slot(now, st))          # the slot start is still due
+                now = Z("2026-10-08T09:02:00Z")
+                self.samples(now, week=70)
+                self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
+                self.assertEqual(len(fired), 1)
+                self.assertTrue(fired[0].endswith("-s2"))
+                # slot 2 ran: the next run is the slot-1 start, the final one after the reset
+                self.assertEqual(ka.last_mile_next_slot(now, st), self.R - timedelta(hours=5))
+                ka.last_mile_pass(SID, now + timedelta(hours=1), st, None)
+                self.assertEqual(len(fired), 1)
+                self.assertIsNone(ka.last_mile_next_slot(self.R - timedelta(hours=4), st))
+                self.samples(self.R - timedelta(hours=4), week=70)
+                ka.last_mile_pass(SID, self.R - timedelta(hours=4), st, None)
+                self.assertEqual(ka.last_mile_next_slot(self.R - timedelta(hours=4), st), False)
+            finally:
+                ka.PROJECTS_DIR, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire = old
 
     def test_postponed_window_start_fires_60_min_after_the_last_activity(self):
         """Requirement 2: the window-start HOLD for an active user is deferred within the window
@@ -926,6 +958,9 @@ class BudgetWiring(unittest.TestCase):
                 fh.write("{}\n")
             os.utime(os.path.join(sub, "agent-1.jsonl"), (fresh, fresh))
             self.assertIsNotNone(ka.run_active(SID, now, st))              # a subagent is working
+            write_transcript(self.tmp.name, SID, [USER, REPLY, STALL])      # D-204: the limit ended the run
+            os.utime(path, (fresh, fresh))
+            self.assertIsNone(ka.run_active(SID, now, st))
         finally:
             ka.PROJECTS_DIR = old
         start = self.NIGHT + timedelta(seconds=5)
@@ -990,27 +1025,6 @@ class LastMile(unittest.TestCase):
         r = Z("2026-10-25T16:59:59Z")          # reset on the CEST->CET day
         self.assertIsNotNone(ka.last_mile_left(r, r - timedelta(hours=4, minutes=59)))
         self.assertIsNone(ka.last_mile_left(r, r - timedelta(hours=5, minutes=1)))
-
-    def test_evaluate_window_exempt_in_last_mile(self):
-        with tempfile.TemporaryDirectory() as d:
-            ka.PROJECTS_DIR, old = d, ka.PROJECTS_DIR
-            try:
-                stall = dict(STALL, timestamp="2026-10-01T11:00:00.000Z",
-                             message=dict(STALL["message"], content=[{"type": "text",
-                                          "text": "You've hit your session limit · resets 12pm (UTC)"}]))
-                write_transcript(d, SID, [USER, stall])
-                cache = {"fetched_at": self.R, "weekly": {"percent": 95.0, "resets_at": self.R},
-                         "session": {"percent": 0.0, "resets_at": None}}
-                ka.read_usage_cache, oldc = (lambda: cache), ka.read_usage_cache
-                try:
-                    now = Z("2026-10-01T12:05:00Z")        # 14:05 Berlin, outside the night window
-                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "FIRE")
-                    self.setcfg(last_mile_hours=0)
-                    self.assertEqual(ka.evaluate(SID, now, lambda n: cache)[0], "WAIT_WINDOW")
-                finally:
-                    ka.read_usage_cache = oldc
-            finally:
-                ka.PROJECTS_DIR = old
 
     def test_last_mile_pass_once_per_cycle(self):
         fired = []
@@ -1302,6 +1316,50 @@ class FakeProcHolders(unittest.TestCase):
         self.assertFalse(ka.preflight(self.SID)[0])                  # opt-in only
         ka.TAKE_OVER_IDLE = True
         self.assertEqual(ka.preflight(self.SID), (True, [], "take-over:200"))
+
+
+class WatcherNoContinue(unittest.TestCase):
+    """D-204: the watcher (run loop) never continues the task-manager at a limit reset; it logs
+    the limit hit once (PROGRESS note), and the start passes (last-stretch slot, postponed
+    session-window start) still run while the session is stalled."""
+    def test_limit_hit_is_logged_never_continued(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_transcript(d, SID, [USER, REPLY, STALL] + TRAILING)     # reset long passed
+            names = ("PROJECTS_DIR", "STATE_FILE", "LOCK_FILE", "STOP_FILE", "PROGRESS_FILE", "DEFER_FILE",
+                     "handle_fire", "fire", "fresh_usage", "read_usage_cache", "last_mile_pass",
+                     "deferred_window_start_pass", "log")
+            old = {n: getattr(ka, n) for n in names}
+            calls, logs = [], []
+            ka.PROJECTS_DIR = d
+            ka.STATE_FILE, ka.LOCK_FILE = os.path.join(d, "st.json"), os.path.join(d, "ka.lock")
+            ka.STOP_FILE, ka.PROGRESS_FILE = os.path.join(d, "STOP"), os.path.join(d, "P.md")
+            ka.DEFER_FILE = os.path.join(d, "deferred.json")
+            ka.handle_fire = lambda *a, **k: calls.append("handle_fire")
+            ka.fire = lambda *a, **k: calls.append("fire") or (0, "", "")
+            ka.fresh_usage = lambda n, force=False: calls.append("usage")
+            ka.read_usage_cache = lambda: None
+            ka.last_mile_pass = lambda sid, now, st, args: calls.append("last_mile_pass")
+            ka.deferred_window_start_pass = lambda sid, now, st, args: calls.append("deferred")
+            ka.log = logs.append
+
+            class A:
+                session, arm, once, now = SID, True, True, False
+            try:
+                ka.run(A())
+                ka.run(A())                                                # same stall: noted once
+            finally:
+                for n, v in old.items():
+                    setattr(ka, n, v)
+            self.assertEqual(calls, ["last_mile_pass", "deferred"] * 2)     # never handle_fire / fire
+            self.assertTrue(any(ln.startswith("LIMIT_HIT:") and "D-204" in ln for ln in logs), logs)
+            with open(os.path.join(d, "P.md")) as fh:
+                notes = fh.read()
+            self.assertEqual(notes.count("hit its session limit"), 1)
+            self.assertIn("no continue at the limit reset (D-204)", notes)
+            with open(os.path.join(d, "st.json")) as fh:
+                st = json.load(fh)
+            self.assertEqual(list(st["limit_hits"]), ["stall-1"])
+            self.assertEqual(st["handled"], {})
 
 
 class DryRunLoop(unittest.TestCase):

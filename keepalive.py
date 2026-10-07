@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Keep-alive prototype for the task-manager project (no dashboard).
+Keep-alive for the AFClaude task-manager session (no dashboard).
 
-Watches ONE Claude Code session's transcript. When the session's last message
-is the synthetic "You've hit your ... limit" notice, it waits for the limit to
-reset and then, only inside the nightly window 23:00-09:00 Europe/Berlin (it
-spans midnight) and only
-if the weekly budget rule allows it, resumes that session in place with
+Runs begin only at STARTS (D-205): each session-window start of the night window (cron
+--window-start, 23:00 and 04:00 Berlin for 23:00 x 10 h, D-202/D-203; a start postponed for
+an active user is re-decided by the watcher before the next start, D-018) and each last-stretch
+slot start (D-020). A start that passes the budget rule continues the task-manager session with
 
     ka_resume.sh --session <full-uuid> --message "<continue msg>"   (tmux, no --bg)
 
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
+Today only AFClaude has a task-manager, so a start = this session (picking the project by
+rank/priority among several task-managers is design phase 3b).
+
+No continue after a limit (D-204): when the session stops on the synthetic "You've hit your
+... limit" notice, the run is done. The watcher only detects and logs it (once per stall: a
+PROGRESS note); it never continues the session at the limit reset. The next session-window
+start (or the next last-stretch slot start) decides by its own check; that start may well
+find the previous run stopped at a limit and continue it (e.g. limit hit before 04:00, next
+run at 04:00). Approved stalled sessions of the owner are the dispatcher's job (D-206).
 
 Budget rule: by default pacing.py (the original linear rule evolved into a night gate: a
 night runs a FULL session window only if the week is then predicted to end at or below the
@@ -89,7 +97,7 @@ HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this oft
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
 VERIFY_TIMEOUT = timedelta(minutes=10)
 
-IGNORE_WINDOW = False  # --now: skip the window / window-start-hour gate (budget rule still applies)
+IGNORE_WINDOW = False  # --now: skip the window-start-hour gate (budget rule still applies)
 BACKLOG_FILE = os.path.join(HERE, "BACKLOG.md")
 TAKE_OVER_IDLE = False  # opt-in: SIGTERM an idle interactive holder (e.g. an open terminal)
 # Core AFClaude sessions always run on Opus 5.5 with high effort (user rule, 2026-09-26);
@@ -980,9 +988,10 @@ RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # fires that s
 
 def run_active(session_id, now, st=None):
     """A keep-alive run is going right now (read-only; the quickview's next run, D-202): a real
-    fire for this session (a window-start, postponed start, last-stretch slot or stall continue;
-    not a dry-run or a refused preflight) less than one session length ago, and the session's
-    transcript or one of its subagents' written within RUN_IDLE. -> the fire time or None."""
+    fire for this session (a window-start, postponed start or last-stretch slot; not a dry-run or
+    a refused preflight) less than one session length ago, and the session's transcript or one of
+    its subagents' written within RUN_IDLE, and the session not stopped at a limit (D-204: a limit
+    hit ends the run). -> the fire time or None."""
     st = st if st is not None else load_state()
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
              if isinstance(v, dict) and v.get("result") in RUN_RESULTS]
@@ -990,7 +999,7 @@ def run_active(session_id, now, st=None):
     if not fired:
         return None
     path = transcript_path(session_id)
-    if not path:
+    if not path or stall_info(last_message(path)):
         return None
     files = [path] + glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
     try:
@@ -1006,10 +1015,10 @@ def progress_note(line):
 
 # ---------------------------------------------------------------- main loop
 
-def evaluate(session_id, now, usage_getter=fresh_usage):
-    """One decision pass. Returns (action, detail, stall) where action is one
-    of: NO_STALL, WAIT_RESET, WAIT_WINDOW, HOLD, POSTPONE (a HOLD with
-    stall["recheck_at"], e.g. the user was active), FIRE."""
+def stall_status(session_id, now):
+    """Limit detection only (no window, no budget, no usage fetch). -> (action, detail, stall),
+    action one of NO_TRANSCRIPT, OTHER_ERROR, NO_STALL, WAIT_RESET (the limit has not reset +
+    RESET_GRACE yet), RESET_PASSED; stall["reset"] = the reset time."""
     path = transcript_path(session_id)
     if not path:
         return "NO_TRANSCRIPT", "transcript not found", None
@@ -1027,23 +1036,58 @@ def evaluate(session_id, now, usage_getter=fresh_usage):
         u = (read_usage_cache() or {}).get(stall["kind"]) or {}
         reset = u.get("resets_at") if u.get("resets_at") and u["resets_at"] > stall["timestamp"] \
             else stall["timestamp"] + timedelta(hours=5)
+    stall["reset"] = reset
     not_before = reset + RESET_GRACE
     if now < not_before:
-        return "WAIT_RESET", f"{stall['kind']} limit resets {berlin(reset)}; fire not before {berlin(not_before)}", stall
-    if not IGNORE_WINDOW and not in_window(now) and not in_last_mile(now):
-        return "WAIT_WINDOW", f"reset passed; outside window, next window {berlin(next_window_start(now))}", stall
+        return "WAIT_RESET", f"{stall['kind']} limit resets {berlin(reset)}; not before {berlin(not_before)}", stall
+    return "RESET_PASSED", f"{stall['kind']} limit reset {berlin(reset)} has passed", stall
+
+
+def evaluate(session_id, now, usage_getter=fresh_usage):
+    """Continue decision for an APPROVED stalled session (the owner's own, D-206; the
+    dispatcher's 10-min duty): right at its limit reset + RESET_GRACE, any time of day, with no
+    window and no AFClaude budget/pacing gate; only a live session limit still at 100% waits.
+    The AFClaude task-manager and every other AFClaude run never get this (D-204: a limit hit
+    ends the run; the watcher only logs it). -> (action, detail, stall), action one of
+    NO_TRANSCRIPT, OTHER_ERROR, NO_STALL, WAIT_RESET, FIRE."""
+    action, detail, stall = stall_status(session_id, now)
+    if action != "RESET_PASSED":
+        return action, detail, stall
     usage = usage_getter(now)   # only fetched when a fire is actually on the table
     s = (usage or {}).get("session") or {}
     if s.get("percent", 0) >= 100 and s.get("resets_at") and s["resets_at"] > now:
         return "WAIT_RESET", f"live usage still shows session limit 100% until {berlin(s['resets_at'])}", stall
-    d = budget_eval(usage, now)
-    stall["budget"] = d["text"]          # the continue message carries this very number
-    if d["go"]:
-        return "FIRE", d["reason"], stall
-    if d.get("postpone"):                # yield/unknown/session guard: recheck, don't drop the run
-        stall["recheck_at"] = d.get("recheck_at")
-        return "POSTPONE", d["reason"], stall
-    return "HOLD", d["reason"], stall
+    w = (usage or {}).get("weekly") or {}
+    if w.get("percent", 0) >= 100 and w.get("resets_at") and w["resets_at"] > now:
+        return "WAIT_RESET", f"live usage still shows weekly limit 100% until {berlin(w['resets_at'])}", stall
+    return "FIRE", f"{detail}; approved stall, continued at its reset (D-206)", stall
+
+
+LIMIT_HIT_NOTE = ("the run is over: no continue at the limit reset (D-204); the next session-window start or "
+                  "last-stretch slot start decides by its own check")
+
+
+def note_limit_hit(sid, stall, st, now):
+    """Once per stall of the watched (task-manager) session: log + PROGRESS note that the run
+    ended at the limit (D-204: if the session is full, that is the job done for the run)."""
+    key = stall.get("uuid") or str(stall.get("timestamp"))
+    if key in st.setdefault("limit_hits", {}):
+        return False
+    # merge into the file as it is now: the cron --window-start process writes it too, and the
+    # watcher's in-memory state may be days old (never overwrite its handled keys)
+    disk = load_state()
+    hits = disk.setdefault("limit_hits", {})
+    hits.update(st["limit_hits"])
+    hits[key] = now.isoformat()
+    for k in sorted(hits, key=lambda k: hits[k])[:-20]:     # keep the last 20
+        hits.pop(k, None)
+    save_state(disk)
+    st["limit_hits"] = dict(hits)
+    nxt = next_session_start(now)
+    progress_note(f"{sid[:8]} hit its {stall.get('kind')} limit at {berlin(stall['timestamp']) if stall.get('timestamp') else '?'}"
+                  f" (resets {berlin(stall['reset']) if stall.get('reset') else '?'}): {LIMIT_HIT_NOTE}; "
+                  f"next session-window start {berlin(nxt)}")
+    return True
 
 
 def run(args):
@@ -1057,7 +1101,6 @@ def run(args):
     log(f"keepalive start ({mode}) target={sid} window {WINDOW_START:%H:%M}-{WINDOW_END:%H:%M} Europe/Berlin pid={os.getpid()}")
     st = load_state()
     last_line = None
-    last_action = None
     next_eval = datetime.min.replace(tzinfo=UTC)
     while True:
         if os.path.exists(STOP_FILE):
@@ -1066,26 +1109,25 @@ def run(args):
         now = datetime.now(UTC)
         if now >= next_eval:
             reload_window()
-            action, detail, stall = evaluate(sid, now)
-            last_action = action
+            # Detection + logging only: a limit hit ends the run, the watcher never continues the
+            # session at the reset (D-204). Runs begin only at starts: the session-window starts
+            # (cron --window-start, a postponed one below) and the last-stretch slot starts.
+            action, detail, stall = stall_status(sid, now)
+            if stall:
+                action, detail = "LIMIT_HIT", f"{detail}; {LIMIT_HIT_NOTE}"
+                note_limit_hit(sid, stall, st, now)
             line = f"{action}: {detail}"
             if line != last_line:
                 log(line)
                 last_line = line
-            next_eval = now + (HOLD_RECHECK if action == "HOLD" else timedelta(seconds=POLL_SECONDS))
-            if action == "POSTPONE":
-                next_eval = max((stall or {}).get("recheck_at") or now + HOLD_RECHECK,
-                                now + timedelta(seconds=POLL_SECONDS))
-            if action == "FIRE":
-                handle_fire(sid, stall, detail, st, args)
-                last_line = None
-            elif action == "NO_STALL":
-                next_lm = last_mile_pass(sid, now, st, args)
-                if next_lm:
-                    next_eval = max(next_eval, next_lm)
-        if last_action == "NO_STALL":
-            # a postponed window start (stalled sessions are continued by the stall path)
-            deferred_window_start_pass(sid, now, st, args)
+            next_eval = now + timedelta(seconds=POLL_SECONDS)
+            # a last-stretch slot start decides by its own check, stalled or not (D-204)
+            next_lm = last_mile_pass(sid, now, st, args)
+            if next_lm:
+                next_eval = max(next_eval, next_lm)
+        # a postponed session-window start (D-018/D-202), also when the previous run ended at a
+        # limit (D-204: "limit hit before 4am and the next run starts at 4am")
+        deferred_window_start_pass(sid, now, st, args)
         if args.once:
             return
         time.sleep(POLL_SECONDS)
@@ -1132,11 +1174,30 @@ def last_mile_handled(key, handled):
     return False
 
 
+def last_mile_next_slot(now, st=None):
+    """Read-only (the quickview's next run, D-204): inside the last stretch, None while the
+    current slot's start is still due (not handled yet), else the next slot start, or False if
+    the final slot was handled (no more run before the weekly reset: nothing continues at a
+    limit reset in between). Outside the last stretch: None."""
+    w = (read_usage_cache() or {}).get("weekly") or {}
+    left = last_mile_left(w.get("resets_at"), now, w.get("percent"))
+    if left is None:
+        return None
+    slot = last_mile_slot(left)
+    st = st if st is not None else load_state()
+    if not last_mile_handled(last_mile_key(w["resets_at"], slot), st.get("handled") or {}):
+        return None
+    return _round_reset(w["resets_at"]) - (slot - 1) * afclaude_config.SESSION_LENGTH if slot > 1 else False
+
+
 def last_mile_pass(sid, now, st, args):
     """Once per last-mile slot (one session length, counted back from the weekly reset):
-    continue the (not stalled) session when the last mile opens and again at each later
-    slot, even outside the night window, so the remaining quota gets used. Returns the
-    next re-check time after a HOLD, else None."""
+    continue the session when the last mile opens and again at each later slot start, even
+    outside the night window, so the remaining quota gets used (D-020). A slot start is a
+    start like a session-window start (D-204): it decides by its own check whether or not the
+    previous slot's run ended at a limit, and nothing continues at a limit reset in between
+    (a slot already handled waits for the next slot). A limit that has not reset yet makes the
+    slot's start wait for that reset. Returns the next re-check time after a HOLD, else None."""
     w = (read_usage_cache() or {}).get("weekly") or {}
     left = last_mile_left(w.get("resets_at"), now, w.get("percent"))
     if left is None:
@@ -1144,6 +1205,10 @@ def last_mile_pass(sid, now, st, args):
     key = last_mile_key(w["resets_at"], last_mile_slot(left))
     if last_mile_handled(key, st["handled"]):
         return None
+    action, detail, stall = stall_status(sid, now)
+    if action == "WAIT_RESET":
+        log(f"last-mile: slot start waits for the limit reset, {detail}")
+        return stall["reset"] + RESET_GRACE
     d = budget_eval(fresh_usage(now, force=True), now)
     log(f"last-mile: {d['reason']}")
     if not d["go"]:
@@ -1417,7 +1482,7 @@ def main():
     ap.add_argument("--window-start", action="store_true",
                     help="one-shot: at a session-window start (23:00, 04:00; D-202), continue the session if the budget rule allows")
     ap.add_argument("--now", action="store_true",
-                    help="ignore the 23:00-09:00 window (and, with --window-start, the start-hour gate); budget rule still applies")
+                    help="with --window-start: ignore the start-hour gate (a manual start now); budget rule still applies")
     ap.add_argument("--work-on", metavar="PROJECT",
                     help="start a BACKLOG.md project right now in a new tmux session (list number or title substring); "
                          "needs --arm to actually start")
@@ -1479,7 +1544,7 @@ def main():
         except Exception:   # noqa: BLE001 - advisory
             pass
         if args.session:
-            print(evaluate(args.session, now, lambda n: u)[:2])
+            print(stall_status(args.session, now)[:2])
         return
     if not args.session or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", args.session):
         sys.exit("--session must be the FULL session UUID (a short id or a prefix makes resume fork)")

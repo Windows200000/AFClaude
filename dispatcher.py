@@ -1,52 +1,44 @@
 #!/usr/bin/env python3
 """
-AFClaude dispatcher (goal 5): keepalive.py keeps ONE session alive; the
-dispatcher runs everything else AFClaude should run, in the same nightly
-window (23:00-09:00 Europe/Berlin) and under the same budget rule
-(keepalive.budget_eval / budget_decision: pacing.py by default). One pass per invocation
-(cron-friendly):
+AFClaude dispatcher: the 10-minute pass (cron). AFClaude runs begin only at STARTS (D-205):
+the session-window starts of the night window and the last-stretch slot starts, which
+keepalive.py handles (the gate decides; if it passes, the start continues the task-manager,
+which works its own tasks). The dispatcher starts NO task sessions and no runs of its own;
+one pass per invocation does:
 
-  1. Approved stalled sessions: store.stalled_decisions() rows whose effective
-     decision is 'continue', plus the manager sessions of managed projects
-     (unless explicitly ignored). Each is continued after its reset via
-     ka_resume.sh, with keepalive's evaluate() (reset + grace, window, budget)
-     and preflight() (send-keys / resume / take-over of archived or idle
-     holders / refuse on busy). Sessions keepalive.py's own watcher targets are
-     skipped (it continues them itself). Forks (sessions sharing entry uuids,
-     detected by the uuid of their first message) are grouped into families,
-     and at most one per family is continued: the explicitly decided one
-     (one-off decision or session rule), else the one with the most recent
+  1. Approved stalled sessions (D-206): store.stalled_decisions() rows whose effective
+     decision is 'continue' (the owner's own sessions) are continued right at their limit
+     reset (+ grace), ANY time of day: no night window and no AFClaude budget/pacing gate
+     (the windows are only for AFClaude). keepalive.evaluate() checks the reset (and that live
+     usage no longer shows the limit at 100%); keepalive.preflight() still applies (send-keys
+     / resume / take-over of archived or idle holders; never an RC-server thread, an sdk-url
+     child or a busy session). Never continued (D-204: a limit hit ends an AFClaude run): the
+     sessions keepalive.py targets (config keepalive_sessions = the AFClaude task-manager, any
+     running watcher's --session), the task-manager sessions of managed projects
+     (projects.manager_session) and AFClaude task sessions (assigned to a task or tracked as
+     one). Forks (sessions sharing entry uuids, detected by the uuid of their first message)
+     are grouped into families, and at most one per family is continued: the explicitly
+     decided one (one-off decision or session rule), else the one with the most recent
      activity of its own (entries the other copies don't have).
-  2. Task queue: pending tasks (kind 'task') in store.execution_order (high ->
-     medium -> low, by project rank, then stage), skipping the --skip-task list
-     and the stages of managed projects (projects.manager_session: that session
-     works through them itself). Each task starts in a NEW session (ka_resume.sh
-     --new; cwd = the project's path, else the creating session's cwd; Opus 5.5,
-     effort high) with prompts/task_start.md, and is marked in_progress for it
-     (store.start_task). A task that was blocked and answered resumes its old
-     session instead. Every task session gets a session-scoped standing rule
-     'continue' and goes into data/own_sessions.txt, so when it stalls later it
-     is an approved stalled session by itself.
-  3. Concurrency + budget: at most max_concurrent (default 2) dispatcher
-     sessions alive at once; before EACH start: window, budget rule, and session
-     usage < session_usage_stop (default 85%; 100% inside the last mile). Also a
-     per-night start cap. A budget POSTPONE (the user was active) is not final:
-     the next pass (cron, every 10 min) decides again.
-  4. Cleanup (any time of day): tmux sessions the dispatcher started (tracked in
-     its state) that finished (their task is done/blocked/cancelled and the
-     session is idle, or idle for > 2 h after an end_turn), and are not stalled,
-     get their tmux session killed (logged). Nothing else is ever killed, and
-     never the manager's tmux session.
+  2. Verification: a continued session that shows no real reply within verify_minutes alerts.
+  3. Cleanup (unchanged): tmux sessions the dispatcher started (tracked in its state) that
+     finished (their task is done/blocked/cancelled and the session is idle, or idle for > 2 h
+     after an end_turn), and are not stalled, get their tmux session killed (logged). Nothing
+     else is ever killed, and never the task-manager's tmux session.
+
+Phase 3b (not built): with several task-managers, the session-window start picks the project by
+rank/priority and continues ITS task-manager; that selection belongs to the start
+(keepalive.window_start_pass), not to this pass. See start_project_seam() below.
 
 Default is DRY-RUN: it decides and logs what it WOULD do and changes nothing
 (no stalled.py scan, no DB writes besides store.connect()'s schema check, no
-state, no own_sessions.txt, no ka_resume, no tmux kill). It reads the DB as the
-last scan left it (export_quickview.py scans every 3 min).
+state, no ka_resume, no tmux kill). It reads the DB as the last scan left it
+(export_quickview.py scans every 3 min).
 --arm acts. State: data/dispatcher_state.json, log: data/dispatcher.log,
 config (optional JSON, keys as in DEFAULTS): data/dispatcher.json. Failures go
 through keepalive.alert().
 
-    dispatcher.py [--arm] [--once] [--now] [--skip-task ID|TITLE ...] [--max-concurrent N]
+    dispatcher.py [--arm] [--once] [--no-scan] [--json]
 """
 import argparse
 import fcntl
@@ -57,7 +49,6 @@ import re
 import subprocess
 import sys
 import traceback
-import uuid
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,7 +57,7 @@ import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fir
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
-import afclaude_config  # noqa: E402  (local machine-specific values: manager session, trust root)
+import afclaude_config  # noqa: E402  (local machine-specific values: the task-manager session)
 
 UTC = timezone.utc
 DATA_DIR = os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data"))
@@ -74,24 +65,17 @@ STATE_FILE = os.path.join(DATA_DIR, "dispatcher_state.json")
 LOG_FILE = os.path.join(DATA_DIR, "dispatcher.log")
 LOCK_FILE = os.path.join(DATA_DIR, ".dispatcher.lock")
 CONFIG_FILE = os.path.join(DATA_DIR, "dispatcher.json")
-# The AFClaude manager session (kept alive by keepalive.py's watcher + window-start cron);
+# The AFClaude task-manager session (continued by keepalive.py at each session-window start);
 # same source as export_quickview.py's SELF_SESSION (data/afclaude.json manager_session).
 MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
-TRUST_ROOT = os.environ.get("KA_TRUST_ROOT") or afclaude_config.trust_root()   # as in ka_resume.sh
-UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TMUX_RE = re.compile(r"ka-[0-9a-f]{8}")
 
 DEFAULTS = {
-    "max_concurrent": 2,            # dispatcher sessions alive at once
-    "session_usage_stop": 85.0,     # no new starts at/above this session %
-    "max_starts_per_window": 6,     # safety cap per night
     "idle_cleanup_hours": 2.0,      # idle after an end_turn this long -> kill its tmux
     "finished_grace_minutes": 10,   # task done/blocked: idle this long -> kill its tmux
-    "verify_minutes": 15,           # no real reply this long after a start -> alert
-    "launch_failure_limit": 2,      # a task whose launch failed this often is skipped
+    "verify_minutes": 15,           # no real reply this long after a continue -> alert
     "take_over_idle": True,         # preflight: SIGTERM an idle interactive holder of an approved session
-    "skip_tasks": [],               # task ids or exact titles (case-insensitive) never started
-    "keepalive_sessions": [MANAGER_SESSION],   # continued by keepalive.py, never by the dispatcher
+    "keepalive_sessions": [MANAGER_SESSION],   # the task-manager: started by keepalive.py, never by the dispatcher
     "exclude_sessions": [],         # never continued, never cleaned up
 }
 FINISHED_TASK = ("done", "blocked", "cancelled")
@@ -146,7 +130,7 @@ def load_state():
             st = json.load(fh)
     except (OSError, json.JSONDecodeError):
         st = {}
-    for k in ("sessions", "handled", "starts", "launch_failures", "alerted", "rc_held"):
+    for k in ("sessions", "handled", "starts", "alerted", "rc_held"):
         st.setdefault(k, {})
     return st
 
@@ -283,18 +267,8 @@ def kill_tmux(name):
     return r.returncode, (r.stderr or "").strip()
 
 
-def running(st):
-    """Tracked dispatcher sessions whose tmux session is alive."""
-    return {sid: s for sid, s in st["sessions"].items() if s.get("status") == "running" and tmux_alive(s["tmux"])}
-
-
 def is_afclaude_cwd(cwd):
     return any(mk in (cwd or "") for mk in stalled.OWN_CWD_MARKERS)
-
-
-def inside_trust_root(path):
-    p, root = os.path.realpath(path), os.path.realpath(TRUST_ROOT)
-    return p == root or p.startswith(root + os.sep)
 
 
 def session_cwd(conn, sid):
@@ -328,93 +302,34 @@ def reply_after(sid, since):
     return None
 
 
-def append_own(sid):
-    try:
-        with open(stalled.OWN_LIST, "a") as fh:
-            fh.write(sid + "\n")
-    except OSError as e:
-        log(f"could not add {sid[:8]} to {stalled.OWN_LIST}: {e}")
+def task_of(conn, sid):
+    """The open AFClaude task this session works on (in_progress / blocked), or None."""
+    return next((t for t in store.list_tasks(conn, status=["in_progress", "blocked"])
+                 if t["assigned_session"] == sid), None)
 
 
-def skip_match(task, skips):
-    s = {str(x).strip().lower() for x in skips}
-    return str(task["id"]) in s or (task["title"] or "").strip().lower() in s
-
-
-def budget_gate(usage, now, cfg):
-    """-> (go, reason). Budget rule (keepalive.budget_eval) plus the session-usage headroom
-    stop: session_usage_stop (85%) outside the last mile, the model's cap (100%) inside it."""
-    d = ka.budget_eval(usage, now)
-    s = (usage or {}).get("session") or {}
-    stop = float(d.get("session_cap") or 100.0) if d.get("last_mile") else float(cfg["session_usage_stop"])
-    if s.get("percent") is not None and s["percent"] >= stop and (not s.get("resets_at") or s["resets_at"] > now):
-        return False, f"STOP: session usage {s['percent']:.0f}% >= {stop:.0f}% (headroom for the user)"
-    return d["go"], d["reason"]
-
-
-def task_context(conn, sid):
-    for t in store.list_tasks(conn, status=["in_progress", "blocked"]):
-        if t["assigned_session"] == sid:
-            return (f"This session works on AFClaude task #{t['id']} ({t['title']}): when it is finished, or "
-                    f"when you need the user, update it with afclaude_update_task (id {t['id']}, status done "
-                    f"with a result summary, or blocked with the question, as note).")
-    return ""
-
-
-def task_message(t):
-    qa = ""
-    if t.get("blocked_question"):
-        qa = f"Earlier question: {t['blocked_question']}"
-        qa += f" Answer from the user: {t['answer']}" if t.get("answer") else " (not answered yet)"
-    return ka.session_message(
-        "task_start", afclaude=is_afclaude_cwd(t.get("_cwd")), id=t["id"], title=t["title"],
-        project=t.get("project") or "(none)", description=t.get("description") or "(none)", qa=qa)
+def start_project_seam(conn):
+    """Design phase 3b seam (NOT built, D-205): with several task-managers, a session-window start
+    (keepalive.window_start_pass, after its gate passed) would pick the project to run by rank /
+    priority (store.execution_order over the managed projects) and continue THAT project's
+    task-manager (projects.manager_session), which works its own tasks. Today only AFClaude has a
+    task-manager, so the start always continues it. The 10-min pass never starts anything.
+    -> the managed projects in rank order (read-only; nothing calls this for a decision yet)."""
+    return sorted(managed_projects(conn).values(), key=lambda p: (p.get("rank") or 1 << 30, p.get("name") or ""))
 
 
 # ---------------------------------------------------------------- the pass
 
 class Pass:
-    def __init__(self, conn, cfg, st, now, arm, usage_getter=None, ignore_window=False):
+    def __init__(self, conn, cfg, st, now, arm, usage_getter=None):
         self.conn, self.cfg, self.st, self.now, self.arm = conn, cfg, st, now, arm
         self.usage_getter = usage_getter or ka.fresh_usage
-        self.ignore_window = ignore_window
-        self.report = {"continue": [], "start": [], "skip": [], "cleanup": [], "verify": [], "stop": None}
-        self.night = ka.current_window_end(now).date().isoformat()
-        self.planned = 0      # starts this pass (dry-run: would-starts), for the caps
-        self.alive = None
+        self.report = {"continue": [], "skip": [], "cleanup": [], "verify": []}
+        self.day = now.astimezone(ka.BERLIN).date().isoformat()
 
     # -- bookkeeping
     def skip(self, what, why):
         self.report["skip"].append(f"{what}: {why}")
-
-    def slots_free(self, sid):
-        """Concurrency + nightly cap for starting `sid` (a tracked alive session costs nothing)."""
-        if self.alive is None:
-            self.alive = running(self.st)
-        if sid in self.alive:
-            return True, ""
-        n = len(self.alive) + (0 if self.arm else self.planned)   # armed starts are in self.alive
-        if n >= int(self.cfg["max_concurrent"]):
-            return False, f"concurrency cap: {n} dispatcher session(s) running or starting, max {self.cfg['max_concurrent']}"
-        started = self.st["starts"].get(self.night, 0) + (0 if self.arm else self.planned)
-        if started >= int(self.cfg["max_starts_per_window"]):
-            return False, f"nightly start cap {self.cfg['max_starts_per_window']} reached"
-        return True, ""
-
-    def gate(self):
-        """Window + budget + session headroom, checked before EACH start."""
-        if self.report["stop"]:
-            return False, self.report["stop"]
-        if not self.ignore_window and not ka.in_window(self.now) and not ka.in_last_mile(self.now):
-            return False, f"outside the window, next {ka.berlin(ka.next_window_start(self.now))}"
-        go, reason = budget_gate(self.usage_getter(datetime.now(UTC) if self.arm else self.now), self.now, self.cfg)
-        if not go:
-            self.report["stop"] = reason
-        return go, reason
-
-    def plan_start(self, sid):
-        if sid not in (self.alive or {}):
-            self.planned += 1
 
     def track(self, sid, **info):
         prev = self.st["sessions"].get(sid, {})
@@ -422,10 +337,19 @@ class Pass:
         self.st["sessions"][sid] = dict(prev, **info, tmux=ka.tmux_name(sid), status="running",
                                         own_tmux=own_tmux or (prev.get("own_tmux") and prev.get("status") == "running"),
                                         sent_at=store.iso(self.now), verified=None)
-        if self.alive is not None:
-            self.alive[sid] = self.st["sessions"][sid]
 
-    # -- 1. approved stalled sessions
+    # -- 1. approved stalled sessions (D-206)
+    def afclaude_run(self, sid, managed):
+        """Why `sid` is an AFClaude run that is never continued at a limit reset (D-204), or None."""
+        if sid in managed:
+            return (f"task-manager of the project {managed[sid]['name']!r}: no continue after a session limit "
+                    f"(D-204), the next session-window start decides (several task-managers: phase 3b)")
+        t = task_of(self.conn, sid)
+        if t or self.st["sessions"].get(sid, {}).get("kind") == "task":
+            what = f"task #{t['id']}" if t else "an AFClaude task"
+            return f"AFClaude task session ({what}): no continue after a session limit (D-204)"
+        return None
+
     def stalled_candidates(self, excluded):
         managed = managed_projects(self.conn)
         fams = fork_families(self.conn)
@@ -433,10 +357,15 @@ class Pass:
         for r in store.stalled_decisions(self.conn):
             sid = r["session_id"]
             label = f"stalled {sid[:8]}"
-            approved = r["decision"] == "continue" or (sid in managed and r["decision"] != "ignore")
+            approved = r["decision"] == "continue"
             if sid in excluded:
                 if approved or r["decision"] is None:
                     self.skip(label, f"skipped: {excluded[sid]}")
+                continue
+            run = self.afclaude_run(sid, managed)
+            if run:
+                if r["decision"] != "ignore":
+                    self.skip(label, run)
                 continue
             if not approved:
                 self.skip(label, "ignored" if r["decision"] == "ignore" else "undecided (waiting for the user)")
@@ -455,31 +384,17 @@ class Pass:
             if h:
                 self.skip(label, f"this stall was already continued at {h.get('at')} ({h.get('result')})")
                 continue
-            out.append((r, key, managed.get(sid)))
+            out.append((r, key))
         return out
 
-    def continue_stalled(self, r, key, managed_project):
+    def continue_stalled(self, r, key):
+        """D-206: right at the reset (+ grace), any time of day, no window / budget / pacing gate;
+        the preflight still refuses RC-server threads, sdk-url children and busy sessions."""
         sid = r["session_id"]
         label = f"stalled {sid[:8]}"
-        # keepalive's per-session decision: reset + grace, window, budget
-        usage_cache = {}
-
-        def getter(n):
-            if "u" not in usage_cache:
-                usage_cache["u"] = self.usage_getter(n)
-            return usage_cache["u"]
-        action, detail, _ = ka.evaluate(sid, self.now, getter)
+        action, detail, _ = ka.evaluate(sid, self.now, self.usage_getter)
         if action != "FIRE":
-            self.skip(label, f"{action}: {detail}")
-            if action in ("HOLD", "POSTPONE"):   # POSTPONE: retried by a later pass (every 10 min)
-                self.report["stop"] = self.report["stop"] or detail
-            return
-        ok, why = self.slots_free(sid)
-        if not ok:
-            return self.skip(label, why)
-        go, reason = self.gate()
-        if not go:
-            return self.skip(label, reason)
+            return self.skip(label, f"{action}: {detail}")
         cwd = session_cwd(self.conn, sid)
         if not cwd:
             return self.skip(label, "no existing working directory recorded; not resumable")
@@ -500,25 +415,18 @@ class Pass:
                 alert_once(self.st, f"preflight:{key}", f"dispatcher did NOT continue {sid[:8]}: preflight failed",
                            "; ".join(problems))
             return
-        ctx = task_context(self.conn, sid)
-        if not ctx and managed_project:
-            ctx = (f"This session manages the AFClaude project {managed_project['name']!r}: keep working through "
-                   f"its open stages (afclaude_list_tasks) and keep their status current (afclaude_update_task).")
         reason_txt = "dispatcher, " + detail
         af = is_afclaude_cwd(cwd)
-        model = None                                  # AFClaude sessions: LAUNCH (Opus 5.5, high)
-        if af and not ctx:
+        model = None                                  # AFClaude-repo sessions: LAUNCH (Opus 5.5, high)
+        if af:
             prog = os.path.join(cwd, "PROGRESS.md")
             msg = ka.session_message("continue", reason=reason_txt,
                                      progress=prog if os.path.exists(prog) else ka.PROGRESS_FILE)
-        elif ctx:                                     # AFClaude-run: a task session or a project manager
-            msg = ka.session_message("continue_foreign", afclaude=af, reason=reason_txt, context=ctx)
         else:                                         # the user's own session: neutral, on its own model
             msg = ka.session_message("continue_foreign", manager=False, reason=reason_txt, context="")
             model = session_model(sid)
         name = r.get("title") or ka.tmux_name(sid)
         entry = {"sid": sid, "plan": plan, "cwd": cwd, "reason": detail, "model": model or ka.LAUNCH["model"]}
-        self.plan_start(sid)
         if not self.arm:
             self.report["continue"].append(entry)
             log(f"WOULD CONTINUE (dry-run) {sid[:8]} plan={plan} cwd={cwd} name={name!r} model={entry['model']}: "
@@ -530,7 +438,7 @@ class Pass:
         log(f"CONTINUED {sid[:8]} plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()[-300:]!r}")
         self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "rc": rc,
                                    "result": "launched" if rc == 0 else "launcher-failed"}
-        self.st["starts"][self.night] = self.st["starts"].get(self.night, 0) + 1
+        self.st["starts"][self.day] = self.st["starts"].get(self.day, 0) + 1   # a count, no cap (D-206)
         if rc != 0:
             alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed (rc={rc})",
                        f"plan={plan} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
@@ -539,86 +447,7 @@ class Pass:
         self.track(sid, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
                    own_tmux=plan != "send-keys" or tracked.get("own_tmux", False))
 
-    # -- 2. task queue
-    def task_candidates(self):
-        managed = {p["id"]: sid for sid, p in managed_projects(self.conn).items()}
-        out = []
-        for t in store.execution_order(self.conn, kind="task"):
-            label = f"task #{t['id']} {t['title']!r}"
-            if skip_match(t, self.cfg["skip_tasks"]):
-                self.skip(label, "on the skip list")
-                continue
-            if t["project_id"] in managed:
-                self.skip(label, f"managed project {t['project']!r}: its manager session "
-                                 f"{managed[t['project_id']][:8]} works the stages itself")
-                continue
-            fails = self.st["launch_failures"].get(str(t["id"]), 0)
-            if fails >= int(self.cfg["launch_failure_limit"]):
-                self.skip(label, f"launch failed {fails} times; reopen it by hand after fixing the cause")
-                continue
-            out.append(t)
-        return out
-
-    def task_cwd(self, t):
-        p = store.get_project(self.conn, t["project_id"]) if t["project_id"] else None
-        if p and p.get("path"):
-            return p["path"], "project path"
-        s = store.get_session(self.conn, t["created_by_session"]) if t.get("created_by_session") else None
-        if s and s.get("cwd"):
-            return s["cwd"], "cwd of the session that created it"
-        return None, "no project path and no creating session cwd"
-
-    def start_task(self, t):
-        label = f"task #{t['id']} {t['title']!r}"
-        cwd, src = self.task_cwd(t)
-        if not cwd or not os.path.isdir(cwd):
-            return self.skip(label, f"no usable working directory ({cwd or src})")
-        if not inside_trust_root(cwd):
-            return self.skip(label, f"cwd {cwd} is outside {TRUST_ROOT}; ka_resume.sh won't trust it")
-        old = t.get("assigned_session")
-        resume = bool(old and UUID_RE.fullmatch(old) and ka.transcript_path(old))
-        sid = old if resume else str(uuid.uuid4())
-        ok, why = self.slots_free(sid)
-        if not ok:
-            return self.skip(label, why)
-        go, reason = self.gate()
-        if not go:
-            return self.skip(label, reason)
-        plan = "new"
-        if resume:
-            ok, problems, plan = ka.preflight(sid)
-            if not ok:
-                return self.skip(label, f"its session {sid[:8]} can't be resumed: " + "; ".join(problems))
-        t = dict(t, _cwd=cwd)
-        msg = task_message(t)
-        name = f"ka-task{t['id']} {t['title']}"[:60]
-        entry = {"task": t["id"], "sid": sid, "new": not resume, "plan": plan, "cwd": cwd, "reason": reason}
-        self.plan_start(sid)
-        if not self.arm:
-            self.report["start"].append(entry)
-            log(f"WOULD START (dry-run) {label} in {'its session ' + sid[:8] if resume else 'a new session'} "
-                f"plan={plan} cwd={cwd} ({src}): {msg[:160]!r}...")
-            return
-        with store.transaction(self.conn):
-            store.start_task(self.conn, t["id"], sid)
-            store.add_rule(self.conn, "session", sid, "continue", note=f"dispatcher task #{t['id']}")
-        if not resume:
-            append_own(sid)
-        rc, out, err = ka.fire(sid, cwd, msg, plan, new=not resume, name=name)
-        entry.update(rc=rc, stdout=out.strip(), stderr=err.strip()[-500:])
-        self.report["start"].append(entry)
-        log(f"STARTED {label} session={sid} plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()[-300:]!r}")
-        self.st["starts"][self.night] = self.st["starts"].get(self.night, 0) + 1
-        if rc != 0:
-            store.reopen_task(self.conn, t["id"], f"dispatcher launch failed (rc={rc})")
-            k = str(t["id"])
-            self.st["launch_failures"][k] = self.st["launch_failures"].get(k, 0) + 1
-            ka.alert(f"dispatcher could not start task #{t['id']} (rc={rc})",
-                     f"stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
-            return
-        self.track(sid, kind="task", task_id=t["id"], cwd=cwd, own_tmux=plan != "send-keys")
-
-    # -- 3. verification of earlier starts, 4. cleanup
+    # -- 2. verification of earlier continues, 3. cleanup
     def verify(self):
         for sid, s in self.st["sessions"].items():
             if s.get("status") != "running" or s.get("verified") is not None or not s.get("sent_at"):
@@ -696,10 +525,10 @@ class Pass:
         excluded = excluded_sessions(self.cfg)
         self.verify()
         self.cleanup(excluded)
-        for r, key, mp in self.stalled_candidates(excluded):
-            self.continue_stalled(r, key, mp)
-        for t in self.task_candidates():
-            self.start_task(t)
+        for r, key in self.stalled_candidates(excluded):
+            self.continue_stalled(r, key)
+        # no task-session starts and no in-window starts of task-managers here (D-205): runs
+        # begin only at the session-window / last-stretch slot starts (keepalive.py)
         return self.report
 
 
@@ -711,13 +540,13 @@ def prune_state(st, now, days=7):
     st["handled"] = {k: v for k, v in st["handled"].items() if (v.get("at") or "9") > cut}
     st["rc_held"] = {k: v for k, v in st["rc_held"].items() if v > cut}
     st["starts"] = dict(sorted(st["starts"].items())[-14:])
+    st.pop("launch_failures", None)       # task starts are gone (D-205)
 
 
-def run_pass(conn, cfg, st, now, arm, usage_getter=None, ignore_window=False):
+def run_pass(conn, cfg, st, now, arm, usage_getter=None):
     """One dispatcher pass; returns the report. Armed: the caller saves `st`."""
     ka.TAKE_OVER_IDLE = bool(cfg["take_over_idle"])
-    ka.IGNORE_WINDOW = ignore_window
-    p = Pass(conn, cfg, st, now, arm, usage_getter, ignore_window)
+    p = Pass(conn, cfg, st, now, arm, usage_getter)
     rep = p.run()
     if arm:
         prune_state(st, now)
@@ -726,20 +555,14 @@ def run_pass(conn, cfg, st, now, arm, usage_getter=None, ignore_window=False):
 
 def summary(rep, arm):
     verb = "" if arm else "would "
-    parts = [f"{verb}continue {len(rep['continue'])}", f"{verb}start {len(rep['start'])}",
-             f"{verb}clean up {len(rep['cleanup'])}", f"{len(rep['skip'])} skipped"]
-    return ", ".join(parts) + (f" | {rep['stop']}" if rep["stop"] else "")
+    return ", ".join([f"{verb}continue {len(rep['continue'])}", f"{verb}clean up {len(rep['cleanup'])}",
+                      f"{len(rep['skip'])} skipped"])
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", action="store_true", help="act (default: dry-run, changes nothing)")
     ap.add_argument("--once", action="store_true", help="one pass (always the case; for cron symmetry)")
-    ap.add_argument("--now", action="store_true", help="ignore the 23:00-09:00 window (budget rule still applies)")
-    ap.add_argument("--skip-task", action="append", default=[], metavar="ID|TITLE",
-                    help="never start this task (id or exact title, case-insensitive); repeatable, "
-                         "adds to the config's skip_tasks")
-    ap.add_argument("--max-concurrent", type=int, help=f"default {DEFAULTS['max_concurrent']}")
     ap.add_argument("--config", help=f"JSON config (default {CONFIG_FILE})")
     ap.add_argument("--no-scan", action="store_true", help="armed: skip the stalled.py scan first")
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -752,22 +575,20 @@ def main(argv=None):
         print("another dispatcher.py pass holds the lock; exiting")
         return 0
     ka.log = log            # keepalive's own log lines (usage refresh, alerts) go to dispatcher.log too
-    cfg = load_config(args.config, {"max_concurrent": args.max_concurrent})
-    cfg["skip_tasks"] = list(cfg["skip_tasks"]) + args.skip_task
+    cfg = load_config(args.config)
     now = datetime.now(UTC)
     conn = store.connect()
     try:
         if args.arm and not args.no_scan:
             stalled.scan(conn)
         st = load_state()
-        rep = run_pass(conn, cfg, st, now, args.arm, ignore_window=args.now)
+        rep = run_pass(conn, cfg, st, now, args.arm)
         seen = set(st.get("last_skips") or []) if args.arm else set()
         for line in rep["skip"]:
             if line not in seen:        # armed (cron): each skip reason is logged when it first shows up
                 log("  skip " + line)
         st["last_skips"] = rep["skip"]
-        log(f"pass ({'ARMED' if args.arm else 'DRY-RUN'}{', window ignored' if args.now else ''}): "
-            + summary(rep, args.arm))
+        log(f"pass ({'ARMED' if args.arm else 'DRY-RUN'}): " + summary(rep, args.arm))
         if args.arm:
             save_state(st)
         if args.json:
