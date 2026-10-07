@@ -532,6 +532,20 @@ class NextRun(unittest.TestCase):
         self.assertEqual(self.nr(90, now=t)["at"], t)
         self.assertEqual(self.nr(90, now=t, current=core(90, t))["kind"], "now")
 
+    def test_last_stretch_slot_already_ran(self):
+        """D-204: a slot whose run already happened (ended at a limit or not) is not "now": the
+        next slot start, or after the reset once the final slot ran; a run going is still "now"."""
+        t = R - timedelta(hours=7)                                      # slot 2 of a 10 h stretch
+        cur = core(70, t)
+        self.assertEqual(self.nr(70, now=t, current=cur)["kind"], "now")             # slot start due
+        d = self.nr(70, now=t, current=cur, slot_next=R - timedelta(hours=5))
+        self.assertEqual((d["kind"], d["at"]), ("last_stretch", R - timedelta(hours=5)))
+        self.assertIn("D-204", d["reason"])
+        d = self.nr(70, now=R - timedelta(hours=2), current=core(70, R - timedelta(hours=2)), slot_next=False)
+        self.assertEqual((d["kind"], d["at"]), ("after_reset", pm.next_window_start(R, WIN)))
+        self.assertEqual(self.nr(70, now=t, current=cur, slot_next=R - timedelta(hours=5), active=t)["kind"],
+                         "now")
+
     def test_after_the_reset(self):
         thu = pm.next_window_start(R, WIN)                            # Thu 23:00, the first night after
         d = self.nr(80, fc=flat_fc(0.5), lm=0)                        # last stretch off, no night passes

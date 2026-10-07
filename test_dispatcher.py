@@ -131,7 +131,7 @@ class Base(unittest.TestCase):
         self.saved = {"PATH": os.environ["PATH"], "ka": (ka.PROJECTS_DIR, ka.KA_RESUME, dict(ka.SCRUBBED_ENV),
                                                          ka.TAKE_OVER_IDLE, ka.IGNORE_WINDOW),
                       "dp": (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE,
-                             dp.TRUST_ROOT, dp.keepalive_targets),
+                             dp.keepalive_targets),
                       "own": stalled.OWN_LIST, "alert": ka.alert}
         self.alerts, self.logs = [], []
         self.saved["log"] = dp.log
@@ -144,7 +144,6 @@ class Base(unittest.TestCase):
         data = os.path.join(d, "data")
         dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE = data, os.path.join(data, "st.json"), os.path.join(data, "d.log")
         dp.LOCK_FILE, dp.CONFIG_FILE = os.path.join(data, ".lock"), os.path.join(data, "cfg.json")
-        dp.TRUST_ROOT = d
         dp.keepalive_targets = lambda: set()
         self.own = stalled.OWN_LIST = os.path.join(d, "own_sessions.txt")
         self.conn = store.connect(os.path.join(d, "t.db"))
@@ -157,7 +156,7 @@ class Base(unittest.TestCase):
         (ka.PROJECTS_DIR, ka.KA_RESUME, env, ka.TAKE_OVER_IDLE, ka.IGNORE_WINDOW) = self.saved["ka"]
         ka.SCRUBBED_ENV.clear()
         ka.SCRUBBED_ENV.update(env)
-        (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE, dp.TRUST_ROOT,
+        (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE,
          dp.keepalive_targets) = self.saved["dp"]
         stalled.OWN_LIST = self.saved["own"]
         ka.alert = self.saved["alert"]
@@ -228,16 +227,40 @@ class Stalled(Base):
         self.assertEqual(len(self.resume_calls()), 1)
         self.assertTrue(any("already continued" in s for s in rep["skip"]))
 
-    def test_waits_for_window_and_reset(self):
+    def test_waits_for_the_reset_then_continues_any_time(self):
+        """D-206: an approved stall continues right at its reset (+ grace) at any time of day."""
         self.stalled_session(sid(1))
         self.scan()
         store.decide_session(self.conn, sid(1), "continue")
-        rep = self.run_pass(now=datetime(2026, 9, 30, 7, 30, tzinfo=UTC))    # reset passed, 09:30 Berlin
-        self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any("WAIT_WINDOW" in s for s in rep["skip"]))
         rep = self.run_pass(now=datetime(2026, 9, 29, 20, 0, tzinfo=UTC))   # before the 21:00 UTC reset
         self.assertTrue(any("WAIT_RESET" in s for s in rep["skip"]))
+        rep = self.run_pass(now=datetime(2026, 9, 29, 21, 1, tzinfo=UTC))   # inside the 90 s grace
+        self.assertTrue(any("WAIT_RESET" in s for s in rep["skip"]))
         self.assertEqual(self.resume_calls(), [])
+        rep = self.run_pass(now=datetime(2026, 9, 29, 21, 2, tzinfo=UTC))   # 23:02 Berlin
+        self.assertEqual(self.resumed_sessions(), [sid(1)])
+        self.assertIn("D-206", rep["continue"][0]["reason"])
+
+    def test_outside_the_window_without_budget_gate(self):
+        """D-206: no night window, no AFClaude budget/pacing gate, no session-usage stop, no cap."""
+        for n in (1, 2, 3):
+            self.stalled_session(sid(n), prefix=f"x{n}")
+        self.scan()
+        for n in (1, 2, 3):
+            store.decide_session(self.conn, sid(n), "continue")
+        rep = self.run_pass(now=DAY + timedelta(days=1), u=usage(session=90, weekly=80))   # 14:00 Berlin
+        self.assertEqual(sorted(self.resumed_sessions()), [sid(1), sid(2), sid(3)])
+        self.assertEqual(len(rep["continue"]), 3)
+        self.assertNotIn("start", rep)
+
+    def test_live_limit_still_on_waits(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        u = usage(session=100)                                         # resets NOW + 3 h
+        rep = self.run_pass(u=u)
+        self.assertEqual(self.resume_calls(), [])
+        self.assertTrue(any("live usage still shows session limit 100%" in s for s in rep["skip"]))
 
     def test_keepalive_target_is_never_continued(self):
         self.stalled_session(sid(1))
@@ -252,7 +275,7 @@ class Stalled(Base):
         self.assertTrue(any("running keepalive.py watcher" in s for s in rep["skip"]))
 
     def test_keepalive_targets_reads_proc(self):
-        self.assertIsInstance(self.saved["dp"][6](), set)
+        self.assertIsInstance(self.saved["dp"][5](), set)
 
 
 class Forks(Base):
@@ -273,7 +296,7 @@ class Forks(Base):
     def test_most_recent_own_activity_wins(self):
         self.fork_pair()
         store.add_rule(self.conn, "project", self.work, "continue")
-        rep = self.run_pass(max_concurrent=5)
+        rep = self.run_pass()
         self.assertEqual(sorted(self.resumed_sessions()), [sid(2), sid(3)])
         self.assertTrue(any(f"{sid(1)[:8]}: fork of {sid(2)[:8]}" in s for s in rep["skip"]))
 
@@ -281,174 +304,78 @@ class Forks(Base):
         self.fork_pair()
         store.add_rule(self.conn, "project", self.work, "continue")
         store.decide_session(self.conn, sid(1), "continue")          # one-off beats the project rule
-        rep = self.run_pass(max_concurrent=5)
+        rep = self.run_pass()
         self.assertIn(sid(1), self.resumed_sessions())
         self.assertNotIn(sid(2), self.resumed_sessions())
         self.assertTrue(any("explicitly decided" in s for s in rep["skip"]))
 
 
-class Tasks(Base):
-    def test_order_and_start_marking(self):
+class NoStarts(Base):
+    """D-205: the 10-min pass starts no task sessions and no task-manager runs; D-204: AFClaude
+    runs (task-managers, task sessions) are never continued at a limit reset."""
+    def test_pending_tasks_are_never_started(self):
         self.project("p1")
-        self.project("p2")
-        t_p2 = store.add_task(self.conn, "p2 high", project="p2")
-        t_p1m = store.add_task(self.conn, "p1 medium", project="p1", priority="medium")
-        t_p1h = store.add_task(self.conn, "p1 high", project="p1", description="the details")
-        rep = self.run_pass(max_concurrent=5)
-        self.assertEqual([s["task"] for s in rep["start"]], [t_p1h["id"], t_p2["id"], t_p1m["id"]])
-        calls = self.resume_calls()
-        self.assertTrue(all("--new" in c for c in calls))
-        first = " ".join(calls[0])
-        self.assertIn(f"[AFClaude task #{t_p1h['id']}]", first)
-        self.assertIn("the details", first)
-        self.assertIn("afclaude_update_task", first)
-        self.assertIn("claude-opus-5-5", calls[0])
-        self.assertEqual(calls[0][calls[0].index("--cwd") + 1], os.path.join(self.d, "p1"))
-        for s, tid in zip(self.resumed_sessions(), (t_p1h["id"], t_p2["id"], t_p1m["id"])):
-            t = store.get_task(self.conn, tid)
-            self.assertEqual((t["status"], t["assigned_session"]), ("in_progress", s))
-            self.assertEqual(store.effective_decision(self.conn, s)[0], "continue")   # stalls approved by rule
-            self.assertEqual(self.st["sessions"][s]["task_id"], tid)
-        with open(self.own) as fh:
-            self.assertEqual(fh.read().split(), self.resumed_sessions())
+        ts = [store.add_task(self.conn, f"t{i}", project="p1") for i in range(3)]
+        for when in (NOW, DAY):
+            rep = self.run_pass(now=when)
+            self.assertEqual(self.resume_calls(), [])
+            self.assertNotIn("start", rep)
+        for t in ts:
+            self.assertEqual(store.get_task(self.conn, t["id"])["status"], "pending")
+        self.assertFalse(os.path.exists(self.own))
+        self.assertFalse(hasattr(dp.Pass, "start_task"))
 
-    def test_task_without_project_uses_creator_cwd(self):
-        self.stalled_session(sid(9))
-        self.scan()
-        t = store.add_task(self.conn, "loose", created_by_session=sid(9))
-        rep = self.run_pass()
-        self.assertEqual(rep["start"][0]["cwd"], self.work)
-        self.assertEqual(store.get_task(self.conn, t["id"])["status"], "in_progress")
-        t2 = store.add_task(self.conn, "nowhere")
-        rep = self.run_pass()
-        self.assertTrue(any(f"#{t2['id']}" in s and "no usable working directory" in s for s in rep["skip"]))
-
-    def test_skip_list(self):
-        self.project("p1")
-        a = store.add_task(self.conn, " TeSt ", project="p1")
-        b = store.add_task(self.conn, "by id", project="p1")
-        c = store.add_task(self.conn, "real", project="p1")
-        rep = self.run_pass(skip_tasks=["test", str(b["id"])])
-        self.assertEqual([s["task"] for s in rep["start"]], [c["id"]])
-        self.assertEqual(store.get_task(self.conn, a["id"])["status"], "pending")
-        self.assertEqual(store.get_task(self.conn, b["id"])["status"], "pending")
-        self.assertEqual(sum("on the skip list" in s for s in rep["skip"]), 2)
-
-    def test_answered_task_resumes_its_session(self):
-        self.project("p1")
-        t = store.add_task(self.conn, "needs input", project="p1")
-        self.run_pass()
-        s = self.resumed_sessions()[0]
-        store.block_task(self.conn, t["id"], "which colour?")
-        store.answer_task(self.conn, t["id"], "blue")
-        self.transcript(s, [user("q1", NOW - timedelta(hours=1), self.work),
-                            reply("q2", NOW - timedelta(minutes=50), self.work)])
-        open(self.alive, "w").close()                              # its tmux was cleaned up meanwhile
-        self.st["sessions"][s]["status"] = "cleaned"
-        self.run_pass()
-        last = self.resume_calls()[-1]
-        self.assertEqual(last[last.index("--session") + 1], s)
-        self.assertNotIn("--new", last)
-        self.assertIn("blue", " ".join(last))
-        self.assertEqual(store.get_task(self.conn, t["id"])["status"], "in_progress")
-
-    def test_launch_failure_reopens_and_gives_up(self):
-        self.project("p1")
-        t = store.add_task(self.conn, "flaky", project="p1")
-        open(self.failfile, "w").close()
-        for _ in range(3):
-            self.run_pass()
-        self.assertEqual(len(self.resume_calls()), 2)              # launch_failure_limit
-        self.assertEqual(store.get_task(self.conn, t["id"])["status"], "pending")
-        self.assertEqual(len(self.alerts), 2)
-
-    def test_managed_project_is_skipped_and_its_manager_kept_alive(self):
+    def test_task_manager_of_a_managed_project_is_not_continued(self):
         mgr = sid(7)
         self.stalled_session(mgr)
         self.scan()
         self.project("managed", manager=mgr)
-        self.project("free")
-        tm = store.add_task(self.conn, "managed stage", project="managed")
-        tf = store.add_task(self.conn, "free stage", project="free")
-        rep = self.run_pass(max_concurrent=5)
-        self.assertEqual([s["task"] for s in rep["start"]], [tf["id"]])
-        self.assertEqual(store.get_task(self.conn, tm["id"])["status"], "pending")
-        self.assertTrue(any(f"#{tm['id']}" in s and "managed project" in s for s in rep["skip"]))
-        # the undecided manager session is continued like an approved one, with a project hint
-        self.assertEqual([c["sid"] for c in rep["continue"]], [mgr])
-        msg = " ".join(next(c for c in self.resume_calls() if mgr in c))
-        self.assertIn("manages the AFClaude project 'managed'", msg)
+        store.add_task(self.conn, "managed stage", project="managed")
+        rep = self.run_pass()                                       # undecided
+        self.assertEqual(self.resume_calls(), [])
+        self.assertTrue(any(f"{mgr[:8]}: task-manager of the project 'managed'" in s and "D-204" in s
+                            for s in rep["skip"]), rep["skip"])
+        store.decide_session(self.conn, mgr, "continue")            # even an explicit continue
+        rep = self.run_pass(now=NOW + timedelta(hours=1))
+        self.assertEqual(self.resume_calls(), [])
+        self.assertEqual(rep["continue"], [])
+        self.assertEqual([p["name"] for p in dp.start_project_seam(self.conn)], ["managed"])   # phase 3b seam
 
     def test_managed_manager_ignored_or_kept_by_keepalive(self):
         mgr = sid(7)
         self.stalled_session(mgr)
         self.scan()
         self.project("managed", manager=mgr)
-        store.add_task(self.conn, "managed stage", project="managed")
-        rep = self.run_pass(keepalive_sessions=[mgr])              # keepalive.py already does it
+        rep = self.run_pass(keepalive_sessions=[mgr])              # the AFClaude task-manager
         self.assertEqual(self.resume_calls(), [])
         self.assertTrue(any("keepalive.py" in s for s in rep["skip"]))
         store.decide_session(self.conn, mgr, "ignore")
         rep = self.run_pass(keepalive_sessions=[])
         self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any(f"{mgr[:8]}: ignored" in s for s in rep["skip"]))
+        self.assertFalse(any(mgr[:8] in s for s in rep["skip"]))   # ignored: quietly left alone
 
-
-class Limits(Base):
-    def three_tasks(self):
+    def test_task_session_is_not_continued(self):
         self.project("p1")
-        return [store.add_task(self.conn, f"t{i}", project="p1") for i in range(3)]
-
-    def test_concurrency_cap(self):
-        ts = self.three_tasks()
-        rep = self.run_pass()                                        # default max_concurrent 2
-        self.assertEqual([s["task"] for s in rep["start"]], [ts[0]["id"], ts[1]["id"]])
-        self.assertTrue(any("concurrency cap" in s for s in rep["skip"]))
-        rep = self.run_pass()                                        # both still alive: nothing new
-        self.assertEqual(rep["start"], [])
-        # one of them finishes and its tmux goes away: a slot frees up
-        first = self.resumed_sessions()[0]
-        with open(self.alive) as fh:
-            rest = [ln for ln in fh.read().split() if ln != ka.tmux_name(first)]
-        with open(self.alive, "w") as fh:
-            fh.write("\n".join(rest) + "\n")
+        t = store.add_task(self.conn, "long one", project="p1")
+        s = sid(5)
+        store.start_task(self.conn, t["id"], s)
+        store.add_rule(self.conn, "session", s, "continue", note=f"dispatcher task #{t['id']}")
+        t0 = NOW - timedelta(hours=6)
+        self.transcript(s, [user("k1", t0, self.work), reply("k2", t0, self.work, stop="tool_use"),
+                            stall("k3", t0 + timedelta(minutes=1), self.work, reset="9pm")])
+        self.scan()
         rep = self.run_pass()
-        self.assertEqual([s["task"] for s in rep["start"]], [ts[2]["id"]])
-
-    def test_session_usage_headroom(self):
-        self.three_tasks()
-        rep = self.run_pass(u=usage(session=86))
-        self.assertEqual(rep["start"], [])
-        self.assertIn("86% >= 85%", rep["stop"])
         self.assertEqual(self.resume_calls(), [])
-        rep = self.run_pass(u=usage(session=84))
-        self.assertEqual(len(rep["start"]), 2)
-
-    def test_budget_rule_hold(self):
-        self.three_tasks()
-        rep = self.run_pass(u=usage(weekly=80))                      # projects far above 90%
-        self.assertEqual(rep["start"], [])
-        self.assertTrue(rep["stop"].startswith("HOLD"))
-        rep = self.run_pass(u={"fetched_at": NOW})                   # unknown usage: fail-safe
-        self.assertEqual(rep["start"], [])
-
-    def test_budget_checked_before_each_start(self):
-        self.three_tasks()
-        seq = iter([usage(session=50), usage(session=90), usage(session=10)])
-        self.cfg.update(max_concurrent=5)
-        rep = dp.run_pass(self.conn, self.cfg, self.st, NOW, True, usage_getter=lambda n: next(seq))
-        self.assertEqual(len(rep["start"]), 1)
-        self.assertIn("90%", rep["stop"])
-
-    def test_outside_window(self):
-        self.three_tasks()
-        rep = self.run_pass(now=DAY)
-        self.assertEqual(rep["start"], [])
-        self.assertTrue(any("outside the window" in s for s in rep["skip"]))
+        self.assertTrue(any(f"task #{t['id']}" in x and "D-204" in x for x in rep["skip"]), rep["skip"])
+        store.finish_task(self.conn, t["id"], "ok")                 # an old tracked task session
+        self.st["sessions"][s] = {"tmux": ka.tmux_name(s), "status": "ended", "kind": "task"}
+        rep = self.run_pass()
+        self.assertEqual(self.resume_calls(), [])
 
 
-class BudgetModel(Base):
-    """The dispatcher's budget gate is keepalive.budget_eval, so it follows the budget model."""
+class NoGate(Base):
+    """D-206 with the budget model: an active owner, a week above the threshold, a full session
+    window: none of them stops an approved stall (the windows and pacing are only for AFClaude)."""
     def setUp(self):
         super().setUp()
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
@@ -461,35 +388,14 @@ class BudgetModel(Base):
             json.dump({"usage_model": "linear"}, fh)
         super().tearDown()
 
-    def test_postpones_for_an_active_user(self):
-        self.project("p1")
-        store.add_task(self.conn, "t0", project="p1")
-        budget.minutes_since_user = lambda now, rows=None: 10.0
-        rep = self.run_pass(u=usage(weekly=20))
-        self.assertEqual(rep["start"], [])
-        self.assertIn("yield", rep["stop"])
-        self.assertIn("postponed", rep["stop"])
-        budget.minutes_since_user = lambda now, rows=None: 300.0      # idle: tonight's budget
-        rep = self.run_pass(u=usage(weekly=20))
-        self.assertEqual(len(rep["start"]), 1, rep)
-        self.assertIn("budget for this run +", rep["start"][0]["reason"])
-
-    def test_last_mile_session_cap_is_100(self):
-        self.project("p1")
-        for i in range(3):
-            store.add_task(self.conn, f"t{i}", project="p1")
-        budget.minutes_since_user = lambda now, rows=None: 300.0       # idle user
-        lm_now = WEEK_RESET - timedelta(hours=3)                       # 92%: one window, 5 h
-        u = {"fetched_at": lm_now, "session": {"percent": 90.0, "resets_at": lm_now + timedelta(hours=2)},
-             "weekly": {"percent": 92.0, "resets_at": WEEK_RESET}}
-        olds = ka.read_usage_cache
-        ka.read_usage_cache = lambda: u                                # in_last_mile() reads the cache
-        try:
-            rep = self.run_pass(now=lm_now, u=u)
-        finally:
-            ka.read_usage_cache = olds
-        self.assertEqual(len(rep["start"]), 2, rep)                    # 90% session < 100% cap
-        self.assertIn("last stretch", rep["start"][0]["reason"])
+    def test_active_owner_does_not_postpone(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        budget.minutes_since_user = lambda now, rows=None: 2.0
+        rep = self.run_pass(u=usage(session=86, weekly=95))
+        self.assertEqual(self.resumed_sessions(), [sid(1)])
+        self.assertNotIn("budget for this run", rep["continue"][0]["reason"])
 
 
 class Cleanup(Base):
@@ -553,9 +459,13 @@ class Cleanup(Base):
         self.assertEqual(self.st["sessions"][sid(1)]["status"], "ended")
         self.assertEqual(len(self.alerts), 1)
 
+    def approved(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+
     def test_verify_alerts_once_without_a_reply(self):
-        self.project("p1")
-        store.add_task(self.conn, "x", project="p1")
+        self.approved()
         self.run_pass()
         s = self.resumed_sessions()[0]
         self.run_pass(now=NOW + timedelta(minutes=5))
@@ -566,8 +476,7 @@ class Cleanup(Base):
         self.assertEqual(len(self.alerts), 1)
 
     def test_verify(self):
-        self.project("p1")
-        store.add_task(self.conn, "x", project="p1")
+        self.approved()
         self.run_pass()
         s = self.resumed_sessions()[0]
         self.assertIsNone(self.st["sessions"][s]["verified"])
@@ -595,9 +504,9 @@ class DryRun(Base):
         db = os.path.join(self.d, "t.db")
         dump = lambda: "\n".join(sqlite3.connect(db).iterdump())  # noqa: E731
         before_db = dump()
-        rep = self.run_pass(arm=False, max_concurrent=5)
+        rep = self.run_pass(arm=False)
         self.assertEqual([c["sid"] for c in rep["continue"]], [sid(1)])
-        self.assertEqual([s["task"] for s in rep["start"]], [t["id"]])
+        self.assertEqual(store.get_task(self.conn, t["id"])["status"], "pending")
         self.assertEqual([c["sid"] for c in rep["cleanup"]], [s2])
         self.assertEqual(self.resume_calls(), [])
         self.assertEqual(self.killed_calls(), [])
@@ -610,15 +519,8 @@ class DryRun(Base):
             return []
         return [ln for ln in open(self.calls["tmux"]).read().splitlines() if ln.startswith("kill")]
 
-    def test_dry_run_respects_the_cap(self):
-        self.project("p1")
-        for i in range(3):
-            store.add_task(self.conn, f"t{i}", project="p1")
-        rep = self.run_pass(arm=False)
-        self.assertEqual(len(rep["start"]), 2)
-
     def test_cli_dry_run(self):
-        """The real CLI in a subprocess, dry-run with --now: it never calls ka_resume."""
+        """The real CLI in a subprocess, dry-run: it never calls ka_resume."""
         self.stalled_session(sid(1))
         self.scan()
         store.decide_session(self.conn, sid(1), "continue")
@@ -628,18 +530,18 @@ class DryRun(Base):
         env = dict(os.environ, AFCLAUDE_DB=os.path.join(self.d, "t.db"), DISPATCHER_DATA_DIR=data,
                    KEEPALIVE_PROJECTS_DIR=self.proj, KEEPALIVE_KA_RESUME=ka.KA_RESUME,
                    AFCLAUDE_OWN_LIST=self.own, KA_TRUST_ROOT=self.d)
-        # stub claude inside SCRUBBED_ENV too, and no usage cache: the budget rule holds (fail-safe)
+        # stub claude inside SCRUBBED_ENV too, and no usage cache: an approved stall needs no budget (D-206)
         code = ("import sys, keepalive as ka, dispatcher as dp;"
                 f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
                 f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
                 "ka.alert=lambda s, b='': print('ALERT', s);"
-                "sys.exit(dp.main(['--once', '--now', '--json']))")
+                "sys.exit(dp.main(['--once', '--json']))")
         r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True,
                            timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("DRY-RUN", r.stdout)
-        self.assertIn("HOLD: weekly usage unknown", r.stdout)
+        self.assertIn("would continue 1", r.stdout)
         self.assertNotIn("ALERT", r.stdout)
         self.assertEqual(self.resume_calls(), [])
         self.assertFalse(os.path.exists(os.path.join(data, "dispatcher_state.json")))
@@ -655,7 +557,7 @@ class DryRun(Base):
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
                 f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
                 "ka.alert=lambda s, b='': None;"
-                "sys.exit(dp.main(['--once', '--now']))")
+                "sys.exit(dp.main(['--once']))")
         with open(out_path, "a") as out:
             r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, stdout=out,
                                stderr=subprocess.STDOUT, timeout=120)
@@ -695,37 +597,10 @@ class DryRun(Base):
 
 class Prompts(Base):
     def test_messages_are_one_line_and_filled(self):
-        t = {"id": 5, "title": "T {x}", "project": "p", "description": "d", "_cwd": self.work,
-             "blocked_question": "q?", "answer": "a!"}
-        m = dp.task_message(t)
-        self.assertNotIn("\n", m)
-        self.assertIn("T {x}", m)
-        self.assertIn("Answer from the user: a!", m)
-        self.assertNotIn("OPEN_QUESTIONS", m)                       # not an AFClaude cwd
-        m2 = dp.task_message(dict(t, _cwd="/x/work/AFClaude"))
-        self.assertIn("OPEN_QUESTIONS", m2)
         c = ka.session_message("continue_foreign", manager=False, reason="r", context="ctx")
         self.assertIn("ctx", c)
         self.assertNotIn("{", c)
         self.assertNotIn("TASK-MANAGER", c)
-
-    def test_task_session_continue_keeps_opus_and_task_hint(self):
-        self.project("p1")
-        t = store.add_task(self.conn, "long one", project="p1")
-        self.run_pass()
-        s = self.resumed_sessions()[0]
-        t0 = NOW - timedelta(hours=6)
-        self.transcript(s, [user("k1", t0, self.work), reply("k2", t0, self.work, stop="tool_use"),
-                            stall("k3", t0 + timedelta(minutes=1), self.work, reset="9pm")])
-        self.scan()
-        rep = self.run_pass()                                        # stalled task session: approved by its rule
-        self.assertEqual([c["sid"] for c in rep["continue"]], [s])
-        call = self.resume_calls()[-1]
-        msg = " ".join(call)
-        self.assertIn(f"AFClaude task #{t['id']}", msg)
-        self.assertIn("TASK-MANAGER", msg)
-        self.assertEqual(call[call.index("--model") + 1], "claude-opus-5-5")
-        self.assertEqual(call.count("--new"), 0)
 
     def test_rc_server_argv(self):
         server = ["claude", "rc"]
@@ -800,6 +675,15 @@ class Holders(Base):
         self.rows = []
         rep = self.run_pass()
         self.assertEqual(self.resumed_sessions(), [sid(1)])
+
+    def test_dispatcher_refuses_a_busy_holder_outside_the_window(self):
+        """D-206 drops the window and budget gates, never the preflight."""
+        self.approved_stall()
+        self.rows = [{"sessionId": sid(1), "pid": 200, "kind": "interactive", "status": "busy"}]
+        rep = self.run_pass(now=DAY + timedelta(days=1), take_over_idle=True)
+        self.assertEqual(self.resume_calls(), [])
+        self.assertTrue(any("preflight refused" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
 
     def test_dispatcher_takes_over_plain_idle_holder(self):
         self.approved_stall()

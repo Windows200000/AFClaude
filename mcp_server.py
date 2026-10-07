@@ -60,8 +60,8 @@ INSTRUCTIONS = (
     "(adding, listing, reprioritizing or answering AFClaude tasks, its projects, what is waiting for them, "
     "stalled-session decisions or rules), or when the AFClaude task prompt this session was started with tells "
     "you to report through them. Never on your own initiative, e.g. not as your own todo list. A task added here "
-    "counts exactly like one the user added in the UI: there is no approval step, and the dispatcher starts "
-    "pending tasks on its own in the nightly window. Tasks are stages of ranked projects; execution order is all "
+    "counts exactly like one the user added in the UI: there is no approval step, and the project's task-manager "
+    "works it on its own in its next run (runs begin at the nightly session-window starts). Tasks are stages of ranked projects; execution order is all "
     "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin.")
 
 server = MCPServer(
@@ -318,7 +318,7 @@ async def afclaude_ask(question: str, project: Optional[str] = None, ctx: Option
       "move (name, rank); prio (name, priority: sets every open stage of the project); edit (name, new_name/"
       "description/path/manager_session). name may be '.' = the caller's project; path '.' = the caller's "
       "directory. manager_session (session id or unique prefix; '' = none) makes the project managed: that "
-      "session works its stages itself and the dispatcher starts no task sessions for it.")
+      "session (the project's task-manager) works its stages itself.")
 async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"], name: Optional[str] = None,
                            rank: Optional[int] = None, priority: Optional[Priority] = None,
                            description: Optional[str] = None, new_name: Optional[str] = None,

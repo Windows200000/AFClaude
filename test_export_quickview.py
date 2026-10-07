@@ -170,7 +170,7 @@ class NextRunBlock(unittest.TestCase):
             self.assertTrue(b["at_berlin"].startswith("Thu 08.10. 14:00"))
             self.assertEqual((b["expected"]["kind"], b["expected"]["predicted_end"]), ("last_stretch", 101.0))
             self.assertTrue(b["expected"]["at_berlin"].startswith("Thu 08.10. 14:00"))
-            self.assertEqual(set(seen), {"active", "deferred"})          # D-202: the runner's state
+            self.assertEqual(set(seen), {"active", "deferred", "slot_next"})   # D-202/D-204: the runner's state
 
             def boom(*a, **kw):
                 raise RuntimeError("x")
@@ -182,20 +182,22 @@ class NextRunBlock(unittest.TestCase):
     def test_runner_state(self):
         from datetime import timezone
         now = datetime(2026, 10, 5, 6, 18, tzinfo=timezone.utc)
-        olds = (qv.ka.run_active, qv.ka.pending_deferral)
+        olds = (qv.ka.run_active, qv.ka.pending_deferral, qv.ka.last_mile_next_slot)
         try:
             qv.ka.run_active, qv.ka.pending_deferral = (lambda sid, n: None), (lambda sid, n: None)
-            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": False})
+            qv.ka.last_mile_next_slot = lambda n: None
+            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": False, "slot_next": None})
             t = datetime(2026, 10, 5, 2, 0, tzinfo=timezone.utc)
             qv.ka.run_active, qv.ka.pending_deferral = (lambda sid, n: t), (lambda sid, n: t)
-            self.assertEqual(qv.runner_state(now), {"active": t, "deferred": t})
+            qv.ka.last_mile_next_slot = lambda n: t
+            self.assertEqual(qv.runner_state(now), {"active": t, "deferred": t, "slot_next": t})
 
-            def boom(sid, n):
+            def boom(*a):
                 raise OSError("x")
-            qv.ka.run_active, qv.ka.pending_deferral = boom, boom
-            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": None})   # unknown
+            qv.ka.run_active, qv.ka.pending_deferral, qv.ka.last_mile_next_slot = boom, boom, boom
+            self.assertEqual(qv.runner_state(now), {"active": None, "deferred": None, "slot_next": None})   # unknown
         finally:
-            qv.ka.run_active, qv.ka.pending_deferral = olds
+            qv.ka.run_active, qv.ka.pending_deferral, qv.ka.last_mile_next_slot = olds
 
     def test_no_running_between_session_window_starts(self):
         """D-202: Mon 08:18 Berlin with a passing gate and nothing running -> 'Holding until' the

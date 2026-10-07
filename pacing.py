@@ -711,7 +711,7 @@ START_DUE = timedelta(hours=1)   # the cron runs --window-start at :00 of each s
 
 def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None, threshold="auto",
                   lm_setting="auto", win=None, current=None, session_pct=None, session_resets_at=None,
-                  P=None, max_nights=8, active=None, deferred=None):
+                  P=None, max_nights=8, active=None, deferred=None, slot_next=None):
     """When the next autonomous run will take place (pure): only what the runner will actually do
     (D-202). The runner checks the night gate only at each SESSION-WINDOW START inside the night
     window (session_starts(): 23:00 and 04:00 by default), so this walks the upcoming session-window
@@ -730,6 +730,10 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     postponed start never runs past the window end), else the walk. deferred = the runner's pending
     postponed start (its recheck time), False = none, None = unknown (inferred from current).
     In the last stretch a postponed current is "postponed" (the last-stretch pass rechecks).
+    slot_next = the runner's last-stretch slot state (keepalive.last_mile_next_slot()): a datetime
+    = this slot already ran, the next slot starts then; False = the final slot already ran; None =
+    the slot start is still due / unknown. A run ended at a limit is not continued at the reset
+    (D-204), so in the last stretch "now" needs a due slot start (or `active`).
     -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at,
         expected: {at, kind, label, reason, predicted_end, last_stretch_at}}; kind in NEXT_RUN_LABELS."""
     P = {**DEFAULTS, **(P or {})}
@@ -760,6 +764,14 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     if active:
         since = f" (started {_bs(active)})" if isinstance(active, datetime) else ""
         return both(res("now", now, f"a run is going{since}", predicted_end=cur.get("predicted_end")))
+    if slot_next is False or isinstance(slot_next, datetime):
+        # the current last-stretch slot already ran (D-204: no continue at a limit reset)
+        if isinstance(slot_next, datetime) and slot_next > now:
+            return both(res("last_stretch", slot_next, f"this last-stretch slot already ran (no continue at a "
+                                                       f"limit reset, D-204); next slot start {_bs(slot_next)}"))
+        return both(res("after_reset", after, f"the final last-stretch slot already ran (no continue at a "
+                                              f"limit reset, D-204); first session-window start after the "
+                                              f"reset {_bs(after)}"))
     why = str(cur.get("reason") or "").split(";")[0].replace("HOLD: ", "")
 
     def go_now(what):
@@ -841,10 +853,11 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     return both(walk(_no_usage), walk(fc))
 
 
-def next_run(usage, now, decision=None, rows=None, fires=None, active=None, deferred=None):
+def next_run(usage, now, decision=None, rows=None, fires=None, active=None, deferred=None, slot_next=None):
     """next_run_core() from a keepalive usage dict with the live ratio, forecast and settings
     (as decide()); decision = the decide()/budget_eval() dict for now (computed if None); active /
-    deferred = the runner's state (keepalive.run_active(), keepalive.pending_deferral())."""
+    deferred / slot_next = the runner's state (keepalive.run_active(), keepalive.pending_deferral(),
+    keepalive.last_mile_next_slot())."""
     w = (usage or {}).get("weekly") or {}
     s = (usage or {}).get("session") or {}
     if decision is None:
@@ -856,7 +869,8 @@ def next_run(usage, now, decision=None, rows=None, fires=None, active=None, defe
     P, _ = load_params()
     d = next_run_core(w.get("percent"), w.get("resets_at"), now, ratio, fc, setting,
                       afclaude_config.last_mile_setting(), afclaude_config.window(), decision,
-                      s.get("percent"), s.get("resets_at"), P, active=active, deferred=deferred)
+                      s.get("percent"), s.get("resets_at"), P, active=active, deferred=deferred,
+                      slot_next=slot_next)
     d["forecast_source"] = fsrc
     return d
 
