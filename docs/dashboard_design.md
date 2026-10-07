@@ -113,7 +113,7 @@ browser ──https──> reverse proxy (Traefik / Coolify)
 | job | default |
 |---|---|
 | dispatcher pass (approved stalls, picking the next project and task by rank and priority, every project's task-manager incl. AFClaude's own, cleanup, verification) | every 10 min + on wake |
-| window-start tick: the first pass at/after a window start fires each project's task-manager window-start continue once per window (dedup key = the window's end date); a POSTPONE defers it to last activity + 60 min (D-018) | in the dispatcher pass |
+| window-start tick: a check at each session-window start inside the window (start + k × 5 h: 23:00 and 04:00 by default, never in between; D-202): the first pass at/after it fires each project's task-manager window-start continue once per session-window start (dedup key = the window's end date + the session slot); a POSTPONE defers it to last activity + 60 min (D-018), but only until the night's next session-window start, so the run still ends by the window end; later, it is skipped to that start | in the dispatcher pass |
 | stall scan (`stalled.scan`, own tick) | every 3 min |
 | usage sampler + pre/post-reset samples | every 15 min + scheduled jobs |
 | usage review | when due |
