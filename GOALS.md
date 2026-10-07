@@ -4,11 +4,11 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 
 0a. [ ] Compaction for long-running sessions (D-144, D-155, D-191): built as design phase 3c (needs 3a runner + 3b task-manager unification); store hand-offs in the DB.
 0b. [x] Architecture review with the owner done 04.10. (D-143..D-199); design v2 in docs/dashboard_design.md.
-1. [ ] Check that the 00:00 window-start fire of 30.09. acted (plan = send-keys into tmux ka-f2897285) and log the result
+1. [x] Night starts verified and reworked 07.10.: the gate runs at each session-window start (23:00, 04:00; D-202/D-203), no continue after a session limit (D-204).
 2. [x] Host-wide stalled-session detector + SQLite store (`stalled.py`, `store.py`), 29.09.
 3. [x] Task store (`tasks.py`) with the project/stage priority model (ordered projects; stages high/medium/low, default high), 29.09.
 4. [x] Local MCP server (`mcp_server.py`, 9 tools), 29.09. registered and verified (task 1 via MCP, 29.09.)
-5. [x] Dispatcher (`dispatcher.py`), 29.09.: armed via cron every 10 min; approved stalled sessions + queued tasks, never takes over RC-server threads
+5. [x] Dispatcher (`dispatcher.py`), cron every 10 min: since 07.10. only verification, cleanup and the owner's approved stalled sessions at their reset, any time (D-205/D-206); no task sessions; project selection among task-managers = phase 3b.
 6. [~] Usage model: forecast-driven night gate live 04.10. (D-141: a full session runs only if the predicted week end ≤ the reserve threshold, auto = one session left; no margin; threshold_info). Follow-ups: stale filter in usage_report.py/usage_review.py; the model error fills in once a clean week closes; next review 29.10. (prediction model only, D-142)
 7. [~] Dashboard: phase 1 done; design v2 (§13 plan: 2a–2d, 3a–3c, 4a–4b, 5a–5e, 6a–6c, 7a–7b, gates 8a–8d; tasks #32–#50, #25–#28). NEXT auto session: phase 2a (settings in the DB + schema guard + DB error path §7.8).
 8. [x] Pre-public scrub: history squashed into one commit after an audit, with a pre-commit/pre-push guard (`tools/check_public.py`), 29.09.; host-specific values into config still to do
