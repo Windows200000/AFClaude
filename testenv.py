@@ -24,6 +24,7 @@ import actions  # noqa: E402
 
 DB = os.environ["AFCLAUDE_DB"]
 store.DB_PATH = DB
+store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes ALERTS.md
 store.connect(DB).close()          # an empty DB: no "no database" log line from the settings reads
 
 

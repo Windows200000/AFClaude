@@ -573,6 +573,26 @@ def summary(rep, arm):
                       f"{len(rep['skip'])} skipped"])
 
 
+def db_paused(arm):
+    """A broken AFClaude database pauses the pass (no continues, no clean-ups, no scan; design
+    §7.8, D-171). Armed: store.db_gate (the owner is alerted once per episode; the first pass
+    that finds it healthy again says that automation resumes); a dry run only checks. Logged
+    when the problem first shows up. -> True = skip this pass."""
+    problem = store.db_gate("dispatcher") if arm else store.health()
+    st = load_state() if arm else {}
+    seen = st.get("db_problem")
+    now_seen = f"{problem.kind}: {problem}" if problem is not None else None
+    if problem is not None and (now_seen != seen or not arm):
+        tail = f"; {problem.escalation}" if arm and problem.escalation else ""
+        log(f"pass skipped (paused): database problem ({now_seen}){tail}")
+    elif problem is None and seen:
+        log("database healthy again: passes resume")
+    if arm and now_seen != seen:
+        st["db_problem"] = now_seen
+        save_state(st)
+    return problem is not None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arm", action="store_true", help="act (default: dry-run, changes nothing)")
@@ -592,6 +612,8 @@ def main(argv=None):
     afclaude_config.LOG = log   # settings problems (and the one-time import) too
     cfg = load_config(args.config)
     now = datetime.now(UTC)
+    if db_paused(args.arm):
+        return 0
     conn = store.connect()
     try:
         if args.arm and not args.no_scan:

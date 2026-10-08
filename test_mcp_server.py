@@ -286,6 +286,58 @@ class CallerDir(Env):
         self.assertEqual((t["project"], t["project_source"]), ("RootsProj", "roots"))
 
 
+class DBErrors(Env):
+    """docs/dashboard_design.md §7.8 (D-171): a database error reaches the session as a
+    structured tool error (class, message, what was not saved, escalation, next step), never
+    a traceback; a failed write is recorded in the fallback file next to the DB."""
+    def setUp(self):
+        super().setUp()
+        self.alerts = []
+        self._saved = (store.NOTIFY, store._sleep)
+        store.NOTIFY = lambda s, b="": self.alerts.append(s) or "sent"
+        store._sleep = lambda d: None
+        run(ms.afclaude_add_task("before"))
+
+    def tearDown(self):
+        store.NOTIFY, store._sleep = self._saved
+        os.chmod(self.db, 0o644)
+        super().tearDown()
+
+    def error(self, coro):
+        with self.assertRaises(ToolError) as cm:
+            asyncio.run(coro)
+        text = str(cm.exception)
+        self.assertNotIn("Traceback", text)
+        return json.loads(text)["error"]
+
+    def test_write_on_a_read_only_db(self):
+        os.chmod(self.db, 0o444)
+        self.assertEqual([t["title"] for t in run(ms.afclaude_list_tasks())["tasks"]], ["before"])   # reads go on
+        e = self.error(ms.afclaude_add_task("lost?"))
+        self.assertEqual((e["error_class"], e["kind"]), ("persistent", "read_only"))
+        self.assertIn("task.add was not applied; recorded in", e["not_saved"])
+        self.assertIn("not escalated yet", e["escalation"])
+        self.assertIn("retry this once", e["next_step"])
+        self.assertIn("don't work around it", e["next_step"])
+        self.assertEqual(self.alerts, [])
+        e = self.error(ms.afclaude_add_task("lost?"))                    # the retry fails too: escalate
+        self.assertIn("has been alerted", e["escalation"])
+        self.assertEqual(len(self.alerts), 1)
+        recs = store.fallback_events(store.fallback_path(self.db))
+        self.assertEqual([(r["actor"], r["action"], r["params"]["title"]) for r in recs if r["event"] == "failed"],
+                         [(f"mcp:{CALLER}", "task.add", "lost?")] * 2)
+
+    def test_corrupted_db(self):
+        with open(self.db, "wb") as fh:
+            fh.write(b"not a database" * 100)
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(self.db + ext):
+                os.unlink(self.db + ext)
+        e = self.error(ms.afclaude_list_tasks())
+        self.assertEqual((e["error_class"], e["kind"]), ("persistent", "corrupt"))
+        self.assertEqual(e["not_saved"], "nothing was changed by this call")
+
+
 class Stdio(unittest.TestCase):
     """Spawn the server like Claude Code does (stdio, initialize handshake) on a temp DB."""
     def setUp(self):

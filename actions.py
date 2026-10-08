@@ -24,6 +24,11 @@ A no-op (nothing changed) writes no audit row. Errors: ValueError (bad input),
 store.NotFound (LookupError), store.InvalidTransition (wrong state), Conflict
 (an InvalidTransition: stale version / reused key / the session stalled again),
 Forbidden (a ValueError: an autonomous session may not do this through MCP).
+Database errors take the DB error path (store.retrying, design §7.8, D-171): a transient
+one (locked, a short I/O error) is retried with backoff; one that persists is a
+store.DBError (SchemaMismatch included), and the failed action is recorded in the fallback
+file next to the DB (store.report_db_error: actor, action, payload and its hash, time) so it
+can be replayed or dropped; the same request failing again alerts the owner, once per episode.
 
 The autonomous-writer rule (§6.2): AFClaude's own sessions (driven_sessions,
 data/own_sessions.txt, the manager session, the manager_session of a managed
@@ -176,6 +181,27 @@ def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | Non
     ctx = Ctx(actor, via, key, autonomous)
     request_sha = hashlib.sha256(json.dumps({"action": name, "params": params}, sort_keys=True,
                                             ensure_ascii=False, default=str).encode()).hexdigest()
+    req: Mapping[str, Any] = params
+    try:   # the DB error path (§7.8): transient errors retried, persistent ones escalated
+        return store.retrying(lambda: _perform(conn, spec, name, req, ctx, request_sha), conn)
+    except store.DBError as e:
+        if e.escalation is None:
+            store.report_db_error(e, actor=actor, action=name, params=req, payload_sha=request_sha,
+                                  db_path=_db_path(conn))
+        raise
+
+
+def _db_path(conn: sqlite3.Connection) -> str | None:
+    try:
+        return store._db_file(conn)
+    except sqlite3.Error:
+        return None
+
+
+def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[str, Any], ctx: Ctx,
+             request_sha: str) -> Any:
+    """One try of perform(): the action, its audit row and idempotency key in one transaction."""
+    actor, via, key = ctx.actor, ctx.via, ctx.key
     with store.transaction(conn):
         if key is not None:
             hit = store.get_idempotency(conn, key)

@@ -50,10 +50,13 @@ the caller commits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -344,15 +347,36 @@ def parse_iso(s: str | None) -> datetime | None:
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
-    """Open the database (WAL, foreign keys on) and bring its schema up to date (init)."""
-    path = path or DB_PATH
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    init(conn)
-    return conn
+    """Open the database (WAL, foreign keys on) and bring its schema up to date (init), on
+    the DB error path (§7.8): a transient error is retried, a persistent one is a DBError.
+    A database this process can't write to (read-only file or file system) still opens,
+    read-only (PRAGMA query_only): reads go on, every write is a DBError (read_only)."""
+    db = path or DB_PATH
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
+    except OSError as e:
+        raise DBUnavailable(f"the database directory of {db} can't be created ({e})", "missing") from e
+
+    def open_() -> sqlite3.Connection:
+        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            init(conn)
+        except sqlite3.Error as e:
+            if classify(e) == ("persistent", "read_only"):
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute("PRAGMA query_only=ON")
+                return conn
+            conn.close()
+            raise
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+    return retrying(open_)
 
 
 def init(conn: sqlite3.Connection) -> None:
@@ -395,11 +419,27 @@ def _stored_version(conn: sqlite3.Connection) -> int | None:
 
 # ---- schema guard (§7.1) and the explicit migrate step
 
-class SchemaMismatch(RuntimeError):
+ErrorClass = Literal["transient", "caller", "persistent"]
+
+
+class DBError(RuntimeError):
+    """A database failure that retrying didn't fix (§7.8; the DB error path section below).
+    error_class: persistent (transient: a raw error on a path that didn't retry); kind:
+    locked | io | read_only | disk_full | corrupt | missing | schema | error. report_db_error()
+    adds what was not saved and the escalation (the hand-back, handback())."""
+    def __init__(self, msg: str, kind: str = "error", error_class: ErrorClass = "persistent") -> None:
+        super().__init__(msg)
+        self.kind: str = kind
+        self.error_class: ErrorClass = error_class
+        self.not_saved: str | None = None
+        self.escalation: str | None = None
+
+
+class SchemaMismatch(DBError):
     """The database's schema_version doesn't fit this code, so it refuses to write
     (reads go on). db_version / code_version: the two versions."""
     def __init__(self, msg: str, db_version: int, code_version: int) -> None:
-        super().__init__(msg)
+        super().__init__(msg, "schema")
         self.db_version, self.code_version = db_version, code_version
 
 
@@ -1604,6 +1644,329 @@ def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: in
         rows = conn.execute(f"SELECT * FROM action_requests WHERE status=? ORDER BY id DESC LIMIT {int(limit)}",
                             (status,))
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- the DB error path (§7.8, D-171)
+#
+# Every DB access goes through one error path: retrying() (connect() and actions.perform use
+# it). Transient errors (SQLITE_BUSY/LOCKED, a short I/O error) are retried with backoff
+# (RETRY_DELAYS: 5 tries, each waiting up to BUSY_TIMEOUT for a lock), then count as
+# persistent. Caller errors (a constraint, validation, a version conflict) are never retried
+# and reach the caller as they are (an IntegrityError as a ValueError). Persistent ones (disk
+# full, read-only, corrupt, schema newer than the code or needing a migration, DB missing)
+# raise DBError: nothing is written.
+# Escalation can't depend on the DB: report_db_error() records a failed action (actor, action,
+# payload hash and payload, time) in the fallback file ALERTS.fallback.md next to the DB (the
+# data volume; "never lose the write": it can be replayed or dropped, and is imported into the
+# DB later) and alerts the owner (notify.py) only when the same request failed again (the
+# session's own retry, D-171: escalate only if trying again doesn't fix it), once per episode.
+# The runners call db_gate() before autonomous starts: a broken DB pauses them and alerts once
+# per episode; the first check that finds it healthy again closes the episode with an alert
+# that automation resumes.
+
+# 5 tries with 7.5 s of backoff; each try waits up to BUSY_TIMEOUT for a lock (SQLite's busy
+# handler), so a lock held throughout fails after ~30 s, as the single 30-s wait did before
+# (the stalled-session scan holds the write lock for its whole pass).
+BUSY_TIMEOUT = 5.0
+RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+MIN_FREE_BYTES = 4 * 1024 * 1024                         # less free space = disk full (health())
+FALLBACK_NAME = "ALERTS.fallback.md"
+FALLBACK_MARK = "<!-- afclaude-fallback "
+FALLBACK_HEADER = ("# AFClaude: database failures recorded outside the database (§7.8)\n\n"
+                   "Written only while the database is broken: failed actions (replay or drop them), "
+                   "the alerts sent and when it was healthy again. Imported into the database later.\n\n")
+PAYLOAD_MAX = 4096                                       # characters of a payload kept for a replay
+NOTIFY: Callable[[str, str], object] | None = None       # None = notify.notify (tests set a recorder)
+NEXT_STEP = ("Wait about 30 seconds and retry this once. If it fails again, stop the work that needs the "
+             "AFClaude database, don't work around it (no hand-edited files or other stores instead), and "
+             "tell the user it needs their intervention (they are alerted outside the database).")
+_sleep = time.sleep                                      # patched by tests
+
+# (sqlite error name prefixes, message fragments, class, kind): the first match wins
+_SQLITE_CLASSES: tuple[tuple[tuple[str, ...], tuple[str, ...], ErrorClass, str], ...] = (
+    (("SQLITE_READONLY",), ("readonly database", "read-only"), "persistent", "read_only"),
+    (("SQLITE_BUSY", "SQLITE_LOCKED"), ("is locked", "database is busy"), "transient", "locked"),
+    (("SQLITE_FULL",), ("disk is full",), "persistent", "disk_full"),
+    (("SQLITE_CORRUPT", "SQLITE_NOTADB"), ("malformed", "not a database"), "persistent", "corrupt"),
+    (("SQLITE_CANTOPEN",), ("unable to open database",), "persistent", "missing"),
+    (("SQLITE_IOERR",), ("disk i/o error",), "transient", "io"),
+    (("SQLITE_CONSTRAINT",), ("constraint failed",), "caller", "constraint"),
+)
+
+
+class DBUnavailable(DBError):
+    """A persistent SQLite failure (or a transient one that outlasted the retries)."""
+
+
+def classify(exc: BaseException) -> tuple[ErrorClass, str] | None:
+    """(class, kind) of an error on the DB error path; None = neither a DB nor a caller
+    error (a bug: let it raise)."""
+    if isinstance(exc, DBError):
+        return exc.error_class, exc.kind
+    if isinstance(exc, sqlite3.Error):
+        name = str(getattr(exc, "sqlite_errorname", "") or "")   # Python >= 3.11
+        msg = str(exc).lower()
+        for names, frags, cls, kind in _SQLITE_CLASSES:
+            if name.startswith(names) or any(f in msg for f in frags):
+                return cls, kind
+        if isinstance(exc, sqlite3.IntegrityError):
+            return "caller", "constraint"
+        return "persistent", "error"
+    if isinstance(exc, (ValueError, LookupError)):   # validation, NotFound, InvalidTransition, Conflict
+        return "caller", "invalid"
+    return None
+
+
+def as_db_error(exc: BaseException) -> DBError:
+    """exc as a DBError (a raw sqlite3.Error from a path that didn't retry keeps its class)."""
+    if isinstance(exc, DBError):
+        return exc
+    found: tuple[ErrorClass, str] = classify(exc) or ("persistent", "error")
+    cls, kind = found
+    err = DBUnavailable(f"database {kind.replace('_', ' ')}: {exc}", kind, cls)
+    err.__cause__ = exc
+    return err
+
+
+def retrying(fn: Callable[[], _T], conn: sqlite3.Connection | None = None) -> _T:
+    """Run fn() on the DB error path: a transient error is retried with backoff, then
+    persistent; a caller error raises at once (an IntegrityError as a ValueError); a
+    persistent one is a DBError (DBUnavailable). Inside a caller's open transaction there
+    is one try only (the caller's transaction is the unit to repeat). -> fn()'s result."""
+    tries = 1 if conn is not None and conn.in_transaction else len(RETRY_DELAYS) + 1
+    attempt, waited = 0, 0.0
+    while True:
+        try:
+            return fn()
+        except DBError:
+            raise
+        except sqlite3.Error as e:
+            found: tuple[ErrorClass, str] = classify(e) or ("persistent", "error")
+            cls, kind = found
+            if cls == "caller":
+                raise ValueError(f"rejected by the database: {e}") from e
+            attempt += 1
+            if cls == "transient" and attempt < tries:
+                _sleep(RETRY_DELAYS[attempt - 1])
+                waited += RETRY_DELAYS[attempt - 1]
+                continue
+            if cls == "transient" and tries > 1:
+                raise DBUnavailable(f"database {kind.replace('_', ' ')}: {e} (still failing after {attempt} "
+                                    f"tries over {waited:g} s of backoff)", kind) from e
+            raise DBUnavailable(f"database {kind.replace('_', ' ')}: {e}", kind,
+                                "transient" if cls == "transient" else "persistent") from e
+
+
+def health(path: str | None = None) -> DBError | None:
+    """Can this code write to the database? None = healthy, else the problem (persistent).
+    Never creates or writes the database: missing; the file or its directory not writable
+    (read-only file or file system); less than MIN_FREE_BYTES free; unreadable; PRAGMA
+    quick_check failing (corruption); the schema guard (newer schema, migration needed)."""
+    path = os.path.abspath(path or DB_PATH)
+    if not os.path.isfile(path):
+        return DBUnavailable(f"the database {path} is missing", "missing")
+    d = os.path.dirname(path)
+    if not (os.access(path, os.W_OK) and os.access(d, os.W_OK)):
+        return DBUnavailable(f"the database {path} is read-only (the file or its file system is not writable)",
+                             "read_only")
+    try:
+        fs = os.statvfs(d)
+        if fs.f_bavail * fs.f_frsize < MIN_FREE_BYTES:
+            return DBUnavailable(f"disk full: {fs.f_bavail * fs.f_frsize} bytes free for {path}", "disk_full")
+    except OSError:
+        pass
+
+    def check() -> DBError | None:
+        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=BUSY_TIMEOUT)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            bad = [str(r[0]) for r in conn.execute("PRAGMA quick_check(5)")]
+            if bad != ["ok"]:
+                return DBUnavailable(f"the database {path} is corrupt (PRAGMA quick_check: "
+                                     f"{'; '.join(bad)[:300]})", "corrupt")
+            return schema_problem(conn)
+        finally:
+            conn.close()
+    try:
+        return retrying(check)
+    except DBError as e:
+        return _detached(e)
+    except ValueError as e:
+        return DBUnavailable(str(e), "error")
+
+
+def _detached(e: DBError) -> DBError:
+    """e without its tracebacks, so a returned (not raised) error doesn't keep the caller's
+    frames alive (e.g. a runner's lock file) through a reference cycle."""
+    for x in (e, e.__cause__, e.__context__):
+        if x is not None:
+            x.__traceback__ = None
+    return e
+
+
+# ---- the fallback alert file (escalation without the DB)
+
+def fallback_path(db_path: str | None = None) -> str:
+    """ALERTS.fallback.md next to the database (data/, the data volume)."""
+    return os.path.join(os.path.dirname(os.path.abspath(db_path or DB_PATH)), FALLBACK_NAME)
+
+
+def _spare_path(path: str) -> str:
+    """Where records go when the data volume itself can't be written (read-only, full)."""
+    return os.path.join(tempfile.gettempdir(),
+                        f"afclaude-{hashlib.sha256(path.encode()).hexdigest()[:12]}-{FALLBACK_NAME}")
+
+
+def fallback_events(path: str) -> list[Row]:
+    """The records of a fallback file (and its spare copy), oldest first."""
+    out: list[Row] = []
+    for p in (path, _spare_path(path)):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                for line in fh:
+                    i = line.find(FALLBACK_MARK)
+                    if i < 0:
+                        continue
+                    try:
+                        rec = json.loads(line[i + len(FALLBACK_MARK):].rsplit("-->", 1)[0])
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict):
+                        out.append(rec)
+        except OSError:
+            continue
+    return sorted(out, key=lambda r: str(r.get("time", "")))
+
+
+def _append_record(path: str, headline: str, rec: Mapping[str, Any]) -> str | None:
+    """Append one record: a readable line plus its JSON (for the import / a replay).
+    -> the file it went to (the spare copy if the data volume can't be written), else None
+    (then it goes to stderr, the runner's log)."""
+    js = json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str).replace("-->", "--\\u003e")
+    text = f"- **{rec.get('time')}** {' '.join(headline.split())}\n  {FALLBACK_MARK}{js} -->\n"
+    for p in (path, _spare_path(path)):
+        try:
+            new = not os.path.exists(p)
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write((FALLBACK_HEADER if new else "") + text)
+            return p
+        except OSError:
+            continue
+    sys.stderr.write(text)
+    return None
+
+
+def _open_alert(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """The alert that opened the current episode; None = no open episode."""
+    opened: Mapping[str, Any] | None = None
+    for e in events:
+        if e.get("event") == "alert" and opened is None:
+            opened = e
+        elif e.get("event") == "recovered":
+            opened = None
+    return opened
+
+
+def _notify(subject: str, body: str) -> str:
+    """notify.py (ALERTS.md, PROGRESS.md, a push), never raising."""
+    try:
+        fn = NOTIFY
+        if fn is None:
+            import importlib
+            fn = getattr(importlib.import_module("notify"), "notify")
+        return str(fn(subject, body))
+    except Exception as e:   # noqa: BLE001 - an alert must never take the caller down
+        return f"notify failed: {type(e).__name__}: {e}"
+
+
+def _alert(path: str, subject: str, body: str, who: str) -> str:
+    """Alert the owner once per episode (the first alert opens it). -> what happened."""
+    opened = _open_alert(fallback_events(path))
+    if opened is not None:
+        return f"the owner was already alerted at {opened.get('time')} (one alert per episode)"
+    _append_record(path, f"ALERT ({who}): {subject}",
+                   {"event": "alert", "time": now_iso(), "who": who, "subject": subject})
+    _notify(subject, body)
+    return "the owner has been alerted (notify.py)"
+
+
+def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[str, Any] | None = None,
+                    write: bool = True, db_path: str | None = None, payload_sha: str | None = None) -> DBError:
+    """The escalation of a failed DB action (§7.8): record it in the fallback file (a write with
+    its payload, so nothing is lost), and alert the owner when the same request by the same
+    actor already failed in this episode (its retry failed too, D-171), once per episode.
+    Sets err.not_saved and err.escalation (the hand-back). Never raises. -> err"""
+    try:
+        path = fallback_path(db_path)
+        payload = json.dumps({"action": action, "params": dict(params or {})}, sort_keys=True,
+                             ensure_ascii=False, default=str)
+        sha = payload_sha or hashlib.sha256(payload.encode()).hexdigest()
+        events = fallback_events(path)
+        since = max((i for i, e in enumerate(events) if e.get("event") == "recovered"), default=-1)
+        repeat = any(e.get("event") == "failed" and e.get("payload_sha256") == sha and e.get("actor") == actor
+                     for e in events[since + 1:])
+        rec: Row = {"event": "failed", "time": now_iso(), "actor": actor, "action": action, "write": write,
+                    "payload_sha256": sha, "error_class": err.error_class, "kind": err.kind,
+                    "message": str(err)[:500]}
+        rec["params"] = dict(params or {}) if len(payload) <= PAYLOAD_MAX else None   # None: too big
+        where = _append_record(path, f"failed {'write' if write else 'read'}: {action} by {actor} "
+                                     f"({err.kind}: {str(err)[:200]})", rec)
+        err.not_saved = ("nothing was changed by this call" if not write else
+                         f"{action} was not applied; recorded in {where} (payload sha256 {sha[:12]}) for a replay"
+                         if where else f"{action} was not applied")
+        if repeat:
+            err.escalation = _alert(path, f"AFClaude DB error ({err.kind}): {action} failed again",
+                                    f"{actor}: {action} failed twice: {err}\nRecorded in {where or 'stderr'}; "
+                                    "the database needs the owner's intervention.", actor)
+        else:
+            opened = _open_alert(events)
+            err.escalation = (f"the owner was already alerted at {opened.get('time')}" if opened is not None else
+                              "not escalated yet: if a retry of the same request fails too, the owner is alerted")
+    except Exception as e:   # noqa: BLE001 - the escalation must never hide the error itself
+        err.escalation = f"the escalation failed ({type(e).__name__}: {e})"
+    return err
+
+
+def handback(err: DBError) -> dict[str, str]:
+    """What the calling session gets back (the MCP error object, the CLI's text): class, kind,
+    message, what was not saved, the escalation and the suggested next step."""
+    return {"error_class": err.error_class, "kind": err.kind, "message": str(err),
+            "not_saved": err.not_saved or "unknown", "escalation": err.escalation or "none",
+            "next_step": NEXT_STEP}
+
+
+def handback_text(err: DBError) -> str:
+    h = handback(err)
+    return (f"error: database {h['kind']} ({h['error_class']}): {h['message']}\n"
+            f"not saved: {h['not_saved']}\nescalation: {h['escalation']}\nnext step: {h['next_step']}")
+
+
+def db_gate(component: str, db_path: str | None = None) -> DBError | None:
+    """For the runners, before any autonomous start: None = the DB is healthy, go on; else the
+    problem: pause (start nothing). The owner is alerted once per episode; the first healthy
+    check after an alerted episode closes it with an alert that automation resumes. Never raises."""
+    path = db_path or DB_PATH
+    try:
+        problem = health(path)
+        fb = fallback_path(path)
+        if problem is None:
+            opened = _open_alert(fallback_events(fb))
+            if opened is not None:
+                _append_record(fb, f"RECOVERED ({component}): the database is healthy again; automation resumes",
+                               {"event": "recovered", "time": now_iso(), "who": component})
+                _notify("AFClaude DB healthy again: automation resumes",
+                        f"{component}: {path} passed its health check (problem since {opened.get('time')}: "
+                        f"{opened.get('subject')}). Actions that failed meanwhile are recorded in {fb} "
+                        "(replay or drop them).")
+            return None
+        problem.escalation = _alert(fb, f"AFClaude DB problem ({problem.kind}): automation paused",
+                                    f"{component}: {problem}\nNo autonomous starts until the database is healthy "
+                                    "again; AFClaude resumes on its own then (another alert says so). Failed "
+                                    f"actions are recorded in {fb}.", component)
+        return problem
+    except Exception as e:   # noqa: BLE001 - a broken check pauses, it never crashes the runner
+        return DBUnavailable(f"the database health check failed: {type(e).__name__}: {e}", "error")
 
 
 # ---------------------------------------------------------------- CLI: the explicit migrate step

@@ -615,6 +615,13 @@ def main():
     ap.add_argument("--no-haiku", action="store_true")
     args = ap.parse_args()
     os.makedirs(DATA, exist_ok=True)
+    try:   # the sampler starts nothing; as a frequent cron job it reports a broken AFClaude DB
+        import store   # (alert once per episode) and its recovery (design §7.8, store.db_gate)
+        problem = store.db_gate("sampler")
+        if problem is not None:
+            print(f"database problem ({problem.kind}): {problem}; {problem.escalation}", file=sys.stderr)
+    except Exception as e:   # noqa: BLE001 - never sinks the sample
+        print(f"database check failed: {type(e).__name__}: {e}", file=sys.stderr)
     t = now_utc()
     st = load(STATE, {})
     baseline = not st.get("offsets")

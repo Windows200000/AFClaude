@@ -27,7 +27,9 @@ created_by_session is $CLAUDE_CODE_SESSION_ID, when the client passes it on.
 Env: AFCLAUDE_DB (database), AFCLAUDE_PROJECTS_DIR (transcripts root for the
 stalled-session scan, default ~/.claude/projects). Results are compact JSON;
 times are Europe/Berlin. Expected failures (unknown id, wrong state, bad
-value) come back as tool errors with a one-line message.
+value) come back as tool errors with a one-line message; a database error
+(docs/dashboard_design.md §7.8) as a tool error holding a JSON object
+{"error": {error_class, kind, message, not_saved, escalation, next_step}}.
 """
 import functools
 import json
@@ -189,8 +191,21 @@ async def resolve_dir_arg(ctx: Optional[Context], value: str | None) -> str | No
     return v
 
 
+def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> ToolError:
+    """A database error -> the structured hand-back (§7.8, D-171) as the tool error: JSON
+    {"error": {error_class, kind, message, not_saved, escalation, next_step}}. A write that
+    failed was already recorded and escalated by actions.perform; any other DB error (a read,
+    opening the DB) is reported here."""
+    err = store.as_db_error(e)
+    if err.escalation is None:
+        store.report_db_error(err, actor=actor(), action=f"mcp:{tool_name}", params=params, write=False,
+                              db_path=os.environ.get("AFCLAUDE_DB") or store.DB_PATH)
+    return ToolError(json.dumps({"error": store.handback(err)}, ensure_ascii=False))
+
+
 def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
-    """Store errors -> ToolError with a one-line message (no traceback)."""
+    """Caller errors -> ToolError with a one-line message (no traceback); database errors ->
+    the structured hand-back (db_error)."""
     @functools.wraps(fn)
     async def wrapper(*a: P.args, **kw: P.kwargs) -> str:
         try:
@@ -203,10 +218,8 @@ def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
             raise ToolError(f"invalid transition: {e}") from None
         except ValueError as e:
             raise ToolError(str(e)) from None
-        except store.SchemaMismatch as e:                # schema guard: the DB is newer / needs migrate
-            raise ToolError(str(e)) from None
-        except sqlite3.OperationalError as e:
-            raise ToolError(f"database error (try again): {e}") from None
+        except (store.DBError, sqlite3.Error) as e:      # incl. the schema guard (SchemaMismatch)
+            raise db_error(e, getattr(fn, "__name__", "tool"), {k: v for k, v in kw.items() if k != "ctx"}) from None
     return wrapper
 
 

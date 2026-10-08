@@ -437,16 +437,34 @@ def parser():
     return ap
 
 
+def db_error(e, args):
+    """A database error -> the hand-back text on stderr (docs/dashboard_design.md §7.8): class,
+    message, what was not saved, the escalation, the next step. -> exit code 1. A failed write
+    was already recorded and escalated by actions.perform; any other (a read, opening the DB)
+    is reported here."""
+    err = store.as_db_error(e)
+    if err.escalation is None:
+        store.report_db_error(err, actor="cli", action=f"cli:{args.cmd}", write=False,
+                              params={k: v for k, v in vars(args).items() if k not in ("db", "func")},
+                              db_path=args.db)
+    print(store.handback_text(err), file=sys.stderr)
+    return 1
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
-    conn = store.connect(args.db)
+    try:
+        conn = store.connect(args.db)
+    except (store.DBError, sqlite3.Error) as e:
+        return db_error(e, args)
     try:
         return run(conn, args)
-    except (ValueError, LookupError, store.SchemaMismatch) as e:   # validation, bad transition, not found,
-        #                                                          schema guard (newer DB / needs migrate)
+    except (ValueError, LookupError) as e:          # validation, bad transition, not found
         msg = e.args[0] if isinstance(e, LookupError) and e.args else str(e)
         print(f"error: {msg}", file=sys.stderr)
         return 1
+    except (store.DBError, sqlite3.Error) as e:     # the DB error path, incl. the schema guard
+        return db_error(e, args)
     finally:
         conn.close()
 

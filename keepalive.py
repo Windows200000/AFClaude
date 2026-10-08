@@ -1398,6 +1398,30 @@ def watch_run_usage(sid, now):
         log(f"run usage reading failed: {type(e).__name__}: {e}")
 
 
+_DB_PAUSE = None   # the database problem the starts are paused for (logged once per problem)
+
+
+def db_paused(what):
+    """A broken AFClaude database pauses every autonomous start (docs/dashboard_design.md §7.8,
+    D-171): store.db_gate checks it (alerting the owner once per episode) and the start is not
+    marked handled, so the next check (the watcher's next tick, the next slot or session-window
+    start) starts it on its own once the database is healthy again. -> True = don't start."""
+    global _DB_PAUSE
+    import store
+    problem = store.db_gate("keepalive")
+    if problem is None:
+        if _DB_PAUSE is not None:
+            log("database healthy again: autonomous starts resume")
+            _DB_PAUSE = None
+        return False
+    msg = f"{problem.kind}: {problem}"
+    if msg != _DB_PAUSE:
+        log(f"PAUSED, not starting {what}: database problem ({msg}); {problem.escalation}")
+        progress_note(f"keep-alive paused, not starting {what}: AFClaude database problem ({problem.kind})")
+        _DB_PAUSE = msg
+    return True
+
+
 def handle_fire(sid, stall, reason, st, args):
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
@@ -1405,6 +1429,8 @@ def handle_fire(sid, stall, reason, st, args):
     night = current_window_end(datetime.now(UTC)).date().isoformat()
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
         log(f"fire cap reached for window ending {night}; not firing")
+        return
+    if db_paused(f"{sid[:8]} ({reason})"):
         return
     ok, problems, plan = preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
