@@ -1,9 +1,12 @@
 """Shared local settings for AFClaude (data/afclaude.json, optional, gitignored).
 The dashboard will edit these later (schema v4 settings). Defaults live here."""
+from __future__ import annotations
+
 import json
 import math
 import os
 from datetime import time as dtime, timedelta
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("AFCLAUDE_CONFIG", os.path.join(HERE, "data", "afclaude.json"))
@@ -22,7 +25,7 @@ USAGE_MODELS = ("pacing", "linear")
 RESERVE_THRESHOLD_RANGE = (50.0, 99.0)
 
 
-def load():
+def load() -> dict[str, Any]:
     cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_FILE) as fh:
@@ -44,18 +47,18 @@ LEGACY_MANAGER_SESSION = "f2897285-dd97-49d9-b29a-2334b4753dee"
 LEGACY_TRUST_ROOT = "/mnt/BlockVolume/Claude"
 
 
-def get(key, default=None):
+def get(key: str, default: Any = None) -> Any:
     """One value of the local file (or DEFAULTS); `default` if neither has it or it is null."""
     v = load().get(key)
     return default if v is None else v
 
 
-def _text(key, legacy):
+def _text(key: str, legacy: str) -> str:
     v = get(key)
     return v.strip() if isinstance(v, str) and v.strip() else legacy
 
 
-def manager_session():
+def manager_session() -> str:
     """Session id of the AFClaude manager (keep-alive target; the dispatcher never touches it)."""
     return _text("manager_session", LEGACY_MANAGER_SESSION)
 
@@ -65,7 +68,7 @@ def trust_root():
     return _text("trust_root", LEGACY_TRUST_ROOT)
 
 
-def last_mile_setting():
+def last_mile_setting() -> str | float:
     """The last stretch before the weekly reset (the only end-of-week setting): "auto"
     (default: min(ceil(session windows of quota left), 2) x SESSION_LENGTH, see pacing.py)
     or a number of hours >= 0 (0 = off). Anything invalid means "auto"."""
@@ -95,7 +98,7 @@ def _pct(v, rng):
     return float(v)
 
 
-def reserve_threshold_setting():
+def reserve_threshold_setting() -> tuple[str | float, str]:
     """The night gate's threshold (pacing.py): -> ("auto", "dynamic") or (pct, source).
     data/afclaude.json reserve_threshold: "auto" (default: one session window left,
     100 - the measured full-session weekly cost) or a % in 50..99. Backward compatibility:
@@ -113,7 +116,7 @@ def reserve_threshold_setting():
     return "auto", "dynamic"
 
 
-def reserve_threshold_value():
+def reserve_threshold_value() -> str | float:
     """The setting as one value for the settings store: "auto" or a %."""
     return reserve_threshold_setting()[0]
 

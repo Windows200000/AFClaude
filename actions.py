@@ -34,16 +34,26 @@ step), but never decide sessions, change rules, settings, prompts or request run
 Settings (§4.1, §4.2.1) are typed here (SETTINGS): a key without a row (or reset
 to null) is its code default, so an empty table reproduces today's behaviour. The
 runners start reading them in phase 2; nothing reads them yet.
+
+Types (mypy --strict, D-209): action parameters arrive as untrusted JSON values
+(perform() checks only their names), so the action functions take them as Any and
+pass them to the checks that validate them (store._text/_enum/_position/_priority,
+the setting checks, _check_version) or use them only as lookup keys.
 """
+from __future__ import annotations
+
 import copy
 import hashlib
 import inspect
 import json
 import os
 import re
+import sqlite3
 import string
 import sys
+from collections.abc import Iterable, Mapping
 from datetime import timedelta
+from typing import Any, Callable, Optional, TypeVar
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,7 +76,7 @@ DASHBOARD_LIMITS = {"title": 200, "name": 200, "answer": 8192, "question": 8192,
 class Conflict(store.InvalidTransition):
     """Stale version, reused idempotency key, or the target changed since the caller
     looked (HTTP 409). `current` is the current row, when there is one."""
-    def __init__(self, msg, current=None):
+    def __init__(self, msg: str, current: Any = None) -> None:
         super().__init__(msg)
         self.current = current
 
@@ -79,11 +89,11 @@ class Ctx:
     """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive), via
     (cli | mcp | dashboard | runner), the idempotency key, and whether the caller
     knows it is an autonomous AFClaude session."""
-    def __init__(self, actor, via, key=None, autonomous=False):
+    def __init__(self, actor: str, via: str, key: str | None = None, autonomous: bool = False) -> None:
         self.actor, self.via, self.key, self.autonomous = actor, via, key, bool(autonomous)
 
     @property
-    def session(self):
+    def session(self) -> str | None:
         return self.actor.split(":", 1)[1] if self.actor.startswith("mcp:") else None
 
 
@@ -93,41 +103,48 @@ class Result:
     changed go into the audit row. changed=False (or before == after) = no-op."""
     NOISE = ("version", "updated_at")
 
-    def __init__(self, result, target_id=None, before=None, after=None, changed=None):
+    def __init__(self, result: Any, target_id: object = None, before: Any = None, after: Any = None,
+                 changed: bool | None = None) -> None:
         self.result, self.target_id, self.before, self.after = result, target_id, before, after
         self.changed = changed
 
-    def audit_pair(self):
+    def audit_pair(self) -> tuple[Any, Any]:
         b, a = self.before, self.after
         if isinstance(b, dict) and isinstance(a, dict):
             keys = [k for k in dict.fromkeys(list(b) + list(a)) if k not in self.NOISE and b.get(k) != a.get(k)]
             return {k: b.get(k) for k in keys}, {k: a.get(k) for k in keys}
         return b, a
 
-    def is_noop(self):
+    def is_noop(self) -> bool:
         if self.changed is not None:
             return not self.changed
         b, a = self.audit_pair()
-        return b == a
+        return bool(b == a)
+
+
+ActionFn = Callable[..., Result]          # fn(conn, ctx, **params) -> Result
+_A = TypeVar("_A", bound=ActionFn)
 
 
 class Spec:
-    def __init__(self, name, fn, target_type, owner_only):
+    def __init__(self, name: str, fn: ActionFn, target_type: str, owner_only: bool) -> None:
         self.name, self.fn, self.target_type, self.owner_only = name, fn, target_type, owner_only
         sig = inspect.signature(fn)
         ps = list(sig.parameters.values())[2:]                      # after (conn, ctx)
         self.params = {p.name for p in ps if p.kind is p.POSITIONAL_OR_KEYWORD}
         self.required = {p.name for p in ps if p.kind is p.POSITIONAL_OR_KEYWORD and p.default is p.empty}
         self.extra = next((p.name for p in ps if p.kind is p.VAR_KEYWORD), None)
+        self.extra_names: tuple[str, ...] = ()
 
 
-ACTIONS = {}
+ACTIONS: dict[str, Spec] = {}
 
 
-def action(name, target_type, owner_only=False, extra=None):
+def action(name: str, target_type: str, owner_only: bool = False,
+           extra: Optional[Iterable[str]] = None) -> Callable[[_A], _A]:
     """Register fn(conn, ctx, **params) -> Result as action `name`. extra: the names
     a **fields parameter accepts."""
-    def deco(fn):
+    def deco(fn: _A) -> _A:
         spec = Spec(name, fn, target_type, owner_only)
         spec.extra_names = tuple(extra or ())
         ACTIONS[name] = spec
@@ -137,7 +154,8 @@ def action(name, target_type, owner_only=False, extra=None):
 
 # ---------------------------------------------------------------- the write path
 
-def perform(conn, name, params=None, *, actor, via, key=None, autonomous=False):
+def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | None = None, *, actor: str,
+            via: str, key: str | None = None, autonomous: bool = False) -> Any:
     """Run action `name` with `params` (a dict) as one transaction; see the module doc.
     -> the action's result (a JSON-compatible value; a replayed key returns the stored one)."""
     spec = ACTIONS.get(name)
@@ -177,7 +195,7 @@ def perform(conn, name, params=None, *, actor, via, key=None, autonomous=False):
         return res.result
 
 
-def _check_params(spec, params):
+def _check_params(spec: Spec, params: Mapping[str, Any]) -> None:
     unknown = set(params) - spec.params - (set(spec.extra_names) if spec.extra else set())
     if unknown:
         raise ValueError(f"{spec.name}: unknown parameter(s) {sorted(unknown)}")
@@ -186,7 +204,7 @@ def _check_params(spec, params):
         raise ValueError(f"{spec.name}: missing parameter(s) {sorted(missing)}")
 
 
-def _check_limits(params):
+def _check_limits(params: Mapping[str, Any]) -> None:
     for k, v in params.items():
         if isinstance(v, dict):
             _check_limits(v)
@@ -194,7 +212,7 @@ def _check_limits(params):
             raise ValueError(f"{k} is too long ({len(v)} > {DASHBOARD_LIMITS[k]} characters)")
 
 
-def _check_version(row, version, what):
+def _check_version(row: Mapping[str, Any] | None, version: object, what: str) -> None:
     """row: the current state (None = never saved: version 0)."""
     if version is None:
         return
@@ -208,7 +226,7 @@ def _check_version(row, version, what):
 
 # ---------------------------------------------------------------- autonomous writers
 
-def _own_list():
+def _own_list() -> set[str]:
     try:
         with open(OWN_LIST) as fh:
             return {ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")}
@@ -216,7 +234,7 @@ def _own_list():
         return set()
 
 
-def autonomous_sessions(conn):
+def autonomous_sessions(conn: sqlite3.Connection) -> set[str]:
     """Session ids AFClaude drives: driven_sessions, data/own_sessions.txt, the
     manager session (data/afclaude.json) and every managed project's manager_session."""
     ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions")}
@@ -226,7 +244,7 @@ def autonomous_sessions(conn):
     return ids
 
 
-def is_autonomous(conn, ctx):
+def is_autonomous(conn: sqlite3.Connection, ctx: Ctx) -> bool:
     """Only MCP writes are checked (the CLI and the dashboard are the owner's)."""
     if ctx.via != "mcp":
         return False
@@ -235,11 +253,11 @@ def is_autonomous(conn, ctx):
 
 # ---------------------------------------------------------------- tasks
 
-def _task(conn, task_id):
+def _task(conn: sqlite3.Connection, task_id: Any) -> store.Row:
     return store._task_row(conn, store._position(task_id, "task id"))
 
 
-def _task_change(conn, task_id, version, fn):
+def _task_change(conn: sqlite3.Connection, task_id: Any, version: Any, fn: Callable[[], store.Row]) -> Result:
     before = _task(conn, task_id)
     _check_version(before, version, f"task #{task_id}")
     after = fn()
@@ -247,42 +265,43 @@ def _task_change(conn, task_id, version, fn):
 
 
 @action("task.add", "task")
-def task_add(conn, ctx, title, description=None, project=None, priority=store.DEFAULT_PRIORITY, kind="task",
-             created_by_session=None):
+def task_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, description: Any = None, project: Any = None,
+             priority: Any = store.DEFAULT_PRIORITY, kind: Any = "task", created_by_session: Any = None) -> Result:
     t = store.add_task(conn, title, description, project, priority, kind, created_by_session)
     return Result(t, t["id"], None, t)
 
 
 @action("task.ask", "task")
-def task_ask(conn, ctx, question, project=None, created_by_session=None, title=None):
+def task_ask(conn: sqlite3.Connection, ctx: Ctx, question: Any, project: Any = None, created_by_session: Any = None,
+             title: Any = None) -> Result:
     """A manager question: a task of kind 'question', born blocked (§4.6)."""
     t = store.ask_question(conn, question, project, created_by_session or ctx.session, title)
     return Result(t, t["id"], None, t)
 
 
 @action("task.edit", "task", extra=store.TASK_EDITABLE)
-def task_edit(conn, ctx, task_id, version=None, **fields):
+def task_edit(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, version: Any = None, **fields: Any) -> Result:
     """title / description / project (None = no project) / priority / kind."""
     return _task_change(conn, task_id, version, lambda: store.update_task(conn, task_id, **fields))
 
 
 @action("task.priority", "task")
-def task_priority(conn, ctx, task_id, priority, version=None):
+def task_priority(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, priority: Any, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.set_stage_priority(conn, task_id, priority))
 
 
 @action("task.move", "task")
-def task_move(conn, ctx, task_id, stage, version=None):
+def task_move(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, stage: Any, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.move_stage(conn, task_id, stage))
 
 
 @action("task.block", "task")
-def task_block(conn, ctx, task_id, question, version=None):
+def task_block(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, question: Any, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.block_task(conn, task_id, question))
 
 
 @action("task.answer", "task")
-def task_answer(conn, ctx, task_id, answer, version=None):
+def task_answer(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, answer: Any, version: Any = None) -> Result:
     """blocked -> pending (a question: -> done). From the dashboard, the same answer
     again right after it was given is a no-op success (a double submit), not an error."""
     t = _task(conn, task_id)
@@ -294,27 +313,28 @@ def task_answer(conn, ctx, task_id, answer, version=None):
 
 
 @action("task.start", "task")
-def task_start(conn, ctx, task_id, session=None, version=None):
+def task_start(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, session: Any = None, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.start_task(conn, task_id, session))
 
 
 @action("task.finish", "task")
-def task_finish(conn, ctx, task_id, summary=None, version=None):
+def task_finish(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, summary: Any = None, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.finish_task(conn, task_id, summary))
 
 
 @action("task.cancel", "task")
-def task_cancel(conn, ctx, task_id, reason=None, version=None):
+def task_cancel(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = None, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.cancel_task(conn, task_id, reason))
 
 
 @action("task.reopen", "task")
-def task_reopen(conn, ctx, task_id, reason=None, version=None):
+def task_reopen(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = None, version: Any = None) -> Result:
     return _task_change(conn, task_id, version, lambda: store.reopen_task(conn, task_id, reason))
 
 
 @action("task.update", "task")
-def task_update(conn, ctx, task_id, fields=None, stage=None, status=None, note=None, session=None, version=None):
+def task_update(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, fields: Any = None, stage: Any = None,
+                status: Any = None, note: Any = None, session: Any = None, version: Any = None) -> Result:
     """Several changes to one task at once (the MCP tool afclaude_update_task): fields
     (as task.edit), then stage (position in its project), then status: done (note =
     summary), cancelled (note = reason), blocked (note = the question), in_progress
@@ -322,13 +342,13 @@ def task_update(conn, ctx, task_id, fields=None, stage=None, status=None, note=N
     if fields is not None and not isinstance(fields, dict):
         raise ValueError("fields must be an object")
 
-    def apply():
+    def apply() -> store.Row:
         if fields:
             store.update_task(conn, task_id, **fields)
         if stage is not None:
             store.move_stage(conn, task_id, stage)
         if status is not None:
-            cur = store.get_task(conn, task_id)
+            cur = store._task_row(conn, task_id)
             if status == "done":
                 store.finish_task(conn, task_id, note)
             elif status == "cancelled":
@@ -349,18 +369,19 @@ def task_update(conn, ctx, task_id, fields=None, stage=None, status=None, note=N
 
 # ---------------------------------------------------------------- projects
 
-def _project(conn, project):
+def _project(conn: sqlite3.Connection, project: Any) -> store.Row:
     return store._project_row(conn, project)
 
 
 @action("project.add", "project")
-def project_add(conn, ctx, name, description=None, path=None, rank=None):
+def project_add(conn: sqlite3.Connection, ctx: Ctx, name: Any, description: Any = None, path: Any = None,
+                rank: Any = None) -> Result:
     p = store.add_project(conn, name, description, path, rank)
     return Result(p, p["id"], None, p)
 
 
 @action("project.edit", "project", extra=store.PROJECT_EDITABLE)
-def project_edit(conn, ctx, project, version=None, **fields):
+def project_edit(conn: sqlite3.Connection, ctx: Ctx, project: Any, version: Any = None, **fields: Any) -> Result:
     """name / description / path / manager_session (None = unmanaged)."""
     before = _project(conn, project)
     _check_version(before, version, f"project {before['name']!r}")
@@ -369,7 +390,7 @@ def project_edit(conn, ctx, project, version=None, **fields):
 
 
 @action("project.move", "project")
-def project_move(conn, ctx, project, rank, version=None):
+def project_move(conn: sqlite3.Connection, ctx: Ctx, project: Any, rank: Any, version: Any = None) -> Result:
     before = _project(conn, project)
     _check_version(before, version, f"project {before['name']!r}")
     after = store.move_project(conn, before["id"], rank)
@@ -377,7 +398,7 @@ def project_move(conn, ctx, project, rank, version=None):
 
 
 @action("project.priority", "project")
-def project_priority(conn, ctx, project, priority):
+def project_priority(conn: sqlite3.Connection, ctx: Ctx, project: Any, priority: Any) -> Result:
     """Every open stage of the project -> priority (naturally idempotent)."""
     p = _project(conn, project)
     r = store.set_project_priority(conn, p["id"], priority)
@@ -388,7 +409,8 @@ def project_priority(conn, ctx, project, priority):
 # ---------------------------------------------------------------- stalled sessions and rules
 
 @action("session.decide", "session", owner_only=True)
-def session_decide(conn, ctx, session_id, decision, note=None, stall_ref=None, version=None):
+def session_decide(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, decision: Any, note: Any = None,
+                   stall_ref: Any = None, version: Any = None) -> Result:
     """continue / ignore for the session's CURRENT stall. stall_ref (what the caller
     showed): if the session has stalled again since, Conflict (§5)."""
     s = store.get_session(conn, session_id)
@@ -404,16 +426,16 @@ def session_decide(conn, ctx, session_id, decision, note=None, stall_ref=None, v
 
 
 @action("session.clear", "session", owner_only=True)
-def session_clear(conn, ctx, session_id):
+def session_clear(conn: sqlite3.Connection, ctx: Ctx, session_id: Any) -> Result:
     before = store.get_decision(conn, session_id)
     cleared = store.clear_decision(conn, session_id)
     return Result({"session_id": session_id, "cleared": cleared}, session_id, before, None, changed=cleared)
 
 
 @action("rule.add", "rule", owner_only=True)
-def rule_add(conn, ctx, scope, match, decision, note=None):
+def rule_add(conn: sqlite3.Connection, ctx: Ctx, scope: Any, match: Any, decision: Any, note: Any = None) -> Result:
     """Standing rule; the same scope+match again replaces the old one (store.add_rule)."""
-    old = None
+    old: store.Row | None = None
     if scope in store.RULE_SCOPES and isinstance(match, str) and match.strip():
         m = store._norm_match(scope, match)
         r = conn.execute("SELECT * FROM standing_rules WHERE scope=? AND match=?", (scope, m)).fetchone()
@@ -424,7 +446,7 @@ def rule_add(conn, ctx, scope, match, decision, note=None):
 
 
 @action("rule.remove", "rule", owner_only=True)
-def rule_remove(conn, ctx, rule_id, version=None):
+def rule_remove(conn: sqlite3.Connection, ctx: Ctx, rule_id: Any, version: Any = None) -> Result:
     r = conn.execute("SELECT * FROM standing_rules WHERE id=?", (store._position(rule_id, "rule id"),)).fetchone()
     if r is None:
         raise store.NotFound(f"no rule #{rule_id}")
@@ -441,36 +463,41 @@ GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
 
 
-def _number(lo, hi):
-    def check(v, conn=None):
+SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, conn) -> normalized value
+
+
+def _number(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Connection]], float]:
+    def check(v: Any, conn: sqlite3.Connection | None = None) -> float:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
             raise ValueError(f"must be a number in {lo}..{hi}, got {v!r}")
         return float(v)
     return check
 
 
-def _bool(v, conn=None):
+def _bool(v: Any, conn: sqlite3.Connection | None = None) -> bool:
     if not isinstance(v, bool):
         raise ValueError(f"must be true or false, got {v!r}")
     return v
 
 
-def _tz(v, conn=None):
+def _tz(v: Any, conn: sqlite3.Connection | None = None) -> str:
     try:
         ZoneInfo(v)
     except Exception:
         raise ValueError(f"unknown time zone {v!r}") from None
+    if not isinstance(v, str):      # ZoneInfo only accepts str keys; this states it for the type checker
+        raise ValueError(f"unknown time zone {v!r}")
     return v
 
 
-def _hhmm(v):
+def _hhmm(v: Any) -> str:
     m = re.match(r"^(\d{1,2}):(\d{2})$", v) if isinstance(v, str) else None
     if not m or int(m[1]) > 23 or m[2] not in ("00", "30"):
         raise ValueError(f"start must be HH:MM on the 30-minute grid (e.g. 23:00, 23:30), got {v!r}")
     return f"{int(m[1]):02d}:{m[2]}"
 
 
-def _default_window_days():
+def _default_window_days() -> dict[str, Any]:
     """Owner decision 29.09.2026: every day 23:00 + 2 session windows, one weekly link
     group. Taken from the local window_start / window_hours (afclaude_config, branch
     `window`) when set, so both describe the same window."""
@@ -484,19 +511,19 @@ def _default_window_days():
     return {d: {"start": start, "n": n, "group": "weekly"} for d in DAYS}
 
 
-def _default_session_hours():
+def _default_session_hours() -> float:
     return afclaude_config.SESSION_LENGTH.total_seconds() / 3600
 
 
-def _default_last_mile_hours():
+def _default_last_mile_hours() -> str | float:
     return afclaude_config.last_mile_setting()
 
 
-def _hours_or_auto(lo, hi):
+def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Connection]], str | float]:
     """"auto" or a number in lo..hi (last_mile_hours: hours; reserve_threshold: weekly %)."""
     num = _number(lo, hi)
 
-    def check(v, conn=None):
+    def check(v: Any, conn: sqlite3.Connection | None = None) -> str | float:
         if isinstance(v, str) and v.strip().lower() == "auto":
             return "auto"
         try:
@@ -506,19 +533,20 @@ def _hours_or_auto(lo, hi):
     return check
 
 
-def _fmt_min(m):
+def _fmt_min(m: int) -> str:
     m %= WEEK_MIN
     return f"{DAYS[m // 1440]} {m % 1440 // 60:02d}:{m % 60:02d}"
 
 
-def _window_days(v, conn=None):
+def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Validate + normalize {mon..sun: {start, n, group} | null}: start on the 30-min
     grid, 1 <= n with n x session_hours <= 24 h, identical windows within a link group,
     no overlap between any two days' windows (the week wraps around)."""
     if not isinstance(v, dict) or set(v) != set(DAYS):
         raise ValueError(f"window_days needs exactly the keys {', '.join(DAYS)}")
     sh = get_setting(conn, "session_hours") if conn is not None else _default_session_hours()
-    out, groups = {}, {}
+    out: dict[str, Any] = {}
+    groups: dict[str, tuple[str, str, int]] = {}
     for d in DAYS:
         w = v[d]
         if w is None:
@@ -537,7 +565,7 @@ def _window_days(v, conn=None):
         g = groups.setdefault(w["group"], (d, out[d]["start"], n))
         if (g[1], g[2]) != (out[d]["start"], n):
             raise ValueError(f"{d} and {g[0]} are linked (group {w['group']}) but have different windows")
-    spans = []
+    spans: list[tuple[str, int, int]] = []
     for i, d in enumerate(DAYS):
         if out[d]:
             h, m = map(int, out[d]["start"].split(":"))
@@ -555,7 +583,7 @@ def _window_days(v, conn=None):
 
 
 class Setting:
-    def __init__(self, default, check, doc):
+    def __init__(self, default: Callable[[], Any], check: SettingCheck, doc: str) -> None:
         self.default, self.check, self.doc = default, check, doc
 
 
@@ -582,41 +610,41 @@ SETTINGS = {
 }
 
 
-def _setting_spec(key):
+def _setting_spec(key: str) -> Setting:
     s = SETTINGS.get(key)
     if s is None:
         raise ValueError(f"unknown setting {key!r} (known: {', '.join(SETTINGS)})")
     return s
 
 
-def get_setting(conn, key):
+def get_setting(conn: sqlite3.Connection | None, key: str) -> Any:
     """The effective value: the saved one, else the code default."""
     spec = _setting_spec(key)
     row = store.get_setting_row(conn, key) if conn is not None else None
     return copy.deepcopy(row["value"]) if row and row["value"] is not None else spec.default()
 
 
-def settings(conn):
+def settings(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     """{key: {value, default, source: db|default, version, updated_at, updated_by, doc}}."""
     rows = store.setting_rows(conn)
-    out = {}
+    out: dict[str, dict[str, Any]] = {}
     for k, spec in SETTINGS.items():
         r = rows.get(k)
         saved = r is not None and r["value"] is not None
-        out[k] = {"value": r["value"] if saved else spec.default(), "default": spec.default(),
+        out[k] = {"value": r["value"] if r is not None and saved else spec.default(), "default": spec.default(),
                   "source": "db" if saved else "default", "version": r["version"] if r else 0,
                   "updated_at": r["updated_at"] if r else None, "updated_by": r["updated_by"] if r else None,
                   "doc": spec.doc}
     return out
 
 
-def _setting_view(conn, key):
+def _setting_view(conn: sqlite3.Connection, key: str) -> dict[str, Any]:
     r = store.get_setting_row(conn, key)
     return {"key": key, "value": get_setting(conn, key), "version": r["version"] if r else 0,
             "source": "db" if r and r["value"] is not None else "default"}
 
 
-def _write_setting(conn, ctx, key, value, version):
+def _write_setting(conn: sqlite3.Connection, ctx: Ctx, key: str, value: Any, version: Any) -> Result:
     """value None = reset to the default. -> Result."""
     spec = _setting_spec(key)
     row = store.get_setting_row(conn, key)
@@ -634,24 +662,24 @@ def _write_setting(conn, ctx, key, value, version):
 
 
 @action("setting.set", "setting", owner_only=True)
-def setting_set(conn, ctx, key, value, version=None):
+def setting_set(conn: sqlite3.Connection, ctx: Ctx, key: Any, value: Any, version: Any = None) -> Result:
     if value is None:
         raise ValueError("value must not be null (use setting.reset)")
     return _write_setting(conn, ctx, key, value, version)
 
 
 @action("setting.reset", "setting", owner_only=True)
-def setting_reset(conn, ctx, key, version=None):
+def setting_reset(conn: sqlite3.Connection, ctx: Ctx, key: Any, version: Any = None) -> Result:
     return _write_setting(conn, ctx, key, None, version)
 
 
 @action("automation.set", "setting", owner_only=True)
-def automation_set(conn, ctx, paused):
+def automation_set(conn: sqlite3.Connection, ctx: Ctx, paused: Any) -> Result:
     """Pause / resume every runner (idempotent). Running sessions keep running."""
     return _write_setting(conn, ctx, "automation_paused", _bool(paused), None)
 
 
-def _fresh_group(days):
+def _fresh_group(days: Mapping[str, Any]) -> str:
     used = {w["group"] for w in days.values() if w}
     i = 1
     while f"g{i}" in used:
@@ -660,7 +688,8 @@ def _fresh_group(days):
 
 
 @action("window.set", "setting", owner_only=True)
-def window_set(conn, ctx, day, start, n=None, mode="linked", group=None, version=None):
+def window_set(conn: sqlite3.Connection, ctx: Ctx, day: Any, start: Any, n: Any = None, mode: Any = "linked",
+               group: Any = None, version: Any = None) -> Result:
     """Edit the per-weekday windows (§4.2.1, F4). start None = no window ("off").
     mode: linked (every day of `day`'s link group moves together), individual (only
     `day`; it gets a fresh group), week (all seven days, one fresh group), link (`day`
@@ -701,7 +730,7 @@ def window_set(conn, ctx, day, start, n=None, mode="linked", group=None, version
 PROMPT_NAME_RE = re.compile(r"^[a-z0-9_]+\.md$")
 
 
-def prompt_default(name):
+def prompt_default(name: object) -> str:
     """The default text of prompts/<name> (name = file name, e.g. continue.md)."""
     if not isinstance(name, str) or not PROMPT_NAME_RE.match(name) or name == "README.md":
         raise ValueError(f"bad prompt name {name!r} (a file name under prompts/, e.g. continue.md)")
@@ -713,15 +742,16 @@ def prompt_default(name):
         raise store.NotFound(f"no prompt {name}") from None
 
 
-def placeholders(text):
+def placeholders(text: str) -> set[str] | None:
     """The {placeholder} names of a str.format template; None if it isn't one (unbalanced braces)."""
     try:
-        return {f.split(".")[0].split("[")[0] for _, f, _, _ in string.Formatter().parse(text) if f is not None}
+        return {f.split(".")[0].split("[")[0]
+                for _literal, f, _spec, _conv in string.Formatter().parse(text) if f is not None}
     except ValueError:
         return None
 
 
-def check_prompt(name, body):
+def check_prompt(name: object, body: object) -> str:
     """An override must keep the default's placeholder set (literal braces doubled) and
     render with dummy values. -> the default text."""
     default = prompt_default(name)
@@ -742,14 +772,17 @@ def check_prompt(name, body):
     return default
 
 
-def prompt_text(conn, name):
+def prompt_text(conn: sqlite3.Connection, name: str) -> str:
     """What a sender should use: the override if there is one, else the file (phase 3 wires it in)."""
     o = store.get_prompt_override(conn, name)
-    return o["body"] if o and o["body"] is not None else prompt_default(name)
+    if o and o["body"] is not None:
+        body: str = o["body"]
+        return body
+    return prompt_default(name)
 
 
 @action("prompt.set", "prompt", owner_only=True)
-def prompt_set(conn, ctx, name, body, version=None):
+def prompt_set(conn: sqlite3.Connection, ctx: Ctx, name: Any, body: Any, version: Any = None) -> Result:
     default = check_prompt(name, body)
     row = store.get_prompt_override(conn, name)
     _check_version(row, version, f"prompt {name}")
@@ -761,7 +794,7 @@ def prompt_set(conn, ctx, name, body, version=None):
 
 
 @action("prompt.reset", "prompt", owner_only=True)
-def prompt_reset(conn, ctx, name, version=None):
+def prompt_reset(conn: sqlite3.Connection, ctx: Ctx, name: Any, version: Any = None) -> Result:
     prompt_default(name)
     row = store.get_prompt_override(conn, name)
     _check_version(row, version, f"prompt {name}")
@@ -777,7 +810,7 @@ REQUEST_KINDS = ("continue_now", "review_now")
 
 
 @action("request.add", "request", owner_only=True)
-def request_add(conn, ctx, kind, target=None):
+def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = None) -> Result:
     """Queue continue_now (target = a stalled session id) or review_now (no target).
     One open request per (kind, target): asking again returns the open one."""
     store._enum(kind, REQUEST_KINDS, "kind")

@@ -29,13 +29,17 @@ find its last user/assistant entry.
 list/history scan first (it is incremental and cheap); --no-scan skips that.
 Everything under ~/.claude/projects is only read, never written.
 """
+from __future__ import annotations
+
 import argparse
 import glob
 import json
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -158,7 +162,8 @@ def process_chunk(conn, sid, chunk, row):
     return new_hits, upd
 
 
-def scan(conn=None, projects_dir=None, own_list=None):
+def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None,
+         own_list: str | None = None) -> dict[str, Any]:
     """Incremental scan of all top-level transcripts. Returns a stats dict."""
     t0 = time.monotonic()
     own_conn = conn is None

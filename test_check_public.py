@@ -83,6 +83,13 @@ class HookTests(unittest.TestCase):
                             "00000000-0000-4000-8000-000000000001.\n")
         self.assertEqual(res.returncode, 0, res.stderr)
 
+    def test_type_gate_refuses_a_commit_without_mypy(self):
+        """With mypy.ini (the type-checking gate, D-209) the hook needs the .venv's mypy:
+        this temp repo has no .venv, so no commit (the gate can't be skipped silently)."""
+        self.r.write("mypy.ini", "[mypy]\nstrict = True\nfiles = a.py\n")
+        self.r.git("add", "mypy.ini")
+        self.assertRejected(self.r.commit("a.py", "x = 1\n"), "no mypy in .venv")
+
     def test_fake_private_key_rejected(self):
         self.assertRejected(self.r.commit("deploy.txt", FAKE_KEY), "private key")
 

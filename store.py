@@ -27,6 +27,17 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Writes from the CLI, the MCP server and the dashboard go through
                actions.py (validation, audit row, idempotency, version checks).
 
+Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
+database whose schema_version it knows. A newer one (written by newer code) is left
+untouched: connect() opens it read-only (reads go on; transaction() raises
+SchemaTooNew naming both versions; any other write fails in SQLite). Non-additive
+changes (a table rebuild, a dropped or renamed column) never run on connect(): they
+go into MIGRATIONS, and a database that needs one stays read-only (MigrationNeeded)
+until the explicit migrate step, which backs it up first:
+    python3 store.py migrate [--db PATH]
+Additive changes (new tables, COLUMNS, triggers) still apply on connect(). The v2 -> v3
+rebuild (_migrate_v3) predates this rule and still runs on connect(), after a backup.
+
 Times are stored as ISO-8601 UTC strings (transcript timestamps as written,
 e.g. 2026-09-25T15:40:19.679Z; computed ones as 2026-09-25T17:00:00Z; task and
 decision times always with milliseconds, so they sort as strings).
@@ -36,15 +47,30 @@ read-check-write like start_task is safe between processes) and commit. If the
 caller already has an open transaction they run inside a savepoint instead and
 the caller commits.
 """
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import sqlite3
+import sys
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Any, Literal, TypeVar, overload
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("AFCLAUDE_DB", os.path.join(HERE, "data", "afclaude.db"))
 SCHEMA_VERSION = 4
+
+Row = dict[str, Any]        # a table row as a dict (what the read functions return)
+_T = TypeVar("_T")
+
+# Non-additive migrations: {the schema_version they produce: fn(conn)}. connect() never
+# runs them; `python3 store.py migrate` does, after a backup, each in one transaction
+# with foreign keys off (migrate()). A step gets the database as the previous version
+# left it. Additive changes need no entry (SCHEMA, COLUMNS, VERSION_TRIGGERS).
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
 
 # The tasks table, v3. {name} so _migrate_v3 can build it as tasks_v3 and rename it.
 TASKS_DDL = """
@@ -300,7 +326,7 @@ SESSION_FIELDS = (
 )
 
 
-def iso(dt):
+def iso(dt: datetime | str | None) -> str | None:
     """datetime -> '2026-09-25T17:00:00Z' (None passes through)."""
     if dt is None:
         return None
@@ -313,11 +339,12 @@ def iso(dt):
     return s + "Z"
 
 
-def parse_iso(s):
+def parse_iso(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
-def connect(path=None):
+def connect(path: str | None = None) -> sqlite3.Connection:
+    """Open the database (WAL, foreign keys on) and bring its schema up to date (init)."""
     path = path or DB_PATH
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
@@ -328,7 +355,13 @@ def connect(path=None):
     return conn
 
 
-def init(conn):
+def init(conn: sqlite3.Connection) -> None:
+    """Create or (additively) upgrade the schema. Schema guard: a database that is newer
+    than this code, or needs a non-additive migration first, is left untouched and the
+    connection becomes read-only (PRAGMA query_only); see the module doc."""
+    if schema_problem(conn) is not None:
+        conn.execute("PRAGMA query_only=ON")
+        return
     if not _migrate_v3(conn):  # before SCHEMA: its tasks_order index needs the v3 columns
         _backup_v3(conn)       # (a v2 database was just backed up by _migrate_v3)
     before = _stored_version(conn)
@@ -350,7 +383,7 @@ def init(conn):
                      (str(SCHEMA_VERSION),))
 
 
-def _stored_version(conn):
+def _stored_version(conn: sqlite3.Connection) -> int | None:
     """meta.schema_version as an int; None for a fresh database (no meta table yet)."""
     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
         return None
@@ -360,7 +393,127 @@ def _stored_version(conn):
         return 0
 
 
-def _backup_v3(conn):
+# ---- schema guard (§7.1) and the explicit migrate step
+
+class SchemaMismatch(RuntimeError):
+    """The database's schema_version doesn't fit this code, so it refuses to write
+    (reads go on). db_version / code_version: the two versions."""
+    def __init__(self, msg: str, db_version: int, code_version: int) -> None:
+        super().__init__(msg)
+        self.db_version, self.code_version = db_version, code_version
+
+
+class SchemaTooNew(SchemaMismatch):
+    """Written by newer code: this code must not write to it."""
+
+
+class MigrationNeeded(SchemaMismatch):
+    """Needs a non-additive migration (MIGRATIONS) first: `python3 store.py migrate`."""
+
+
+def pending_migrations(version: int) -> list[int]:
+    """The non-additive steps a database at `version` needs, in order."""
+    return sorted(v for v in MIGRATIONS if version < v <= SCHEMA_VERSION)
+
+
+def schema_problem(conn: sqlite3.Connection) -> SchemaMismatch | None:
+    """Why this code must not write to the database (None = it may). A database without
+    a schema_version is a fresh one (init creates the current schema)."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+        return None
+    raw = get_meta(conn, "schema_version")
+    if raw is None:
+        return None
+    try:
+        stored = int(raw)
+    except ValueError:
+        stored = 0
+    where = _db_file(conn) or "(in memory)"
+    if stored > SCHEMA_VERSION:
+        return SchemaTooNew(f"the database {where} has schema_version {stored}, newer than this code's "
+                            f"{SCHEMA_VERSION}: refusing to write (reads still work); update the code",
+                            stored, SCHEMA_VERSION)
+    steps = pending_migrations(stored)
+    if steps:
+        return MigrationNeeded(f"the database {where} has schema_version {stored}; this code "
+                               f"({SCHEMA_VERSION}) needs the non-additive migration to "
+                               f"{', '.join(map(str, steps))} first: refusing to write until "
+                               "`python3 store.py migrate` (it backs the database up first)",
+                               stored, SCHEMA_VERSION)
+    return None
+
+
+def check_writable(conn: sqlite3.Connection) -> None:
+    """Raise SchemaMismatch if this code must not write to the database (schema guard)."""
+    problem = schema_problem(conn)
+    if problem is not None:
+        raise problem
+
+
+def _backup_copy(conn: sqlite3.Connection, path: str, tag: str) -> str:
+    """Copy the database to <path>.<tag>-<utc>.bak (SQLite online backup). -> its path."""
+    dst_path = f"{path}.{tag}-{_utcnow():%Y%m%dT%H%M%SZ}.bak"
+    dst = sqlite3.connect(dst_path)
+    try:
+        conn.backup(dst)
+    finally:
+        dst.close()
+    return dst_path
+
+
+def migrate(path: str | None = None) -> dict[str, Any]:
+    """The explicit migrate step (§7.1): if the database needs non-additive migrations,
+    copy it to <db>.v<old>-<utc>.bak first, then run each (MIGRATIONS, in order; one
+    transaction each, foreign keys off, foreign_key_check before the commit), then the
+    additive part (init). Refuses a database newer than this code (SchemaTooNew).
+    -> {db, from, to, steps, backup}."""
+    path = path or DB_PATH
+    if not os.path.isfile(path):
+        raise NotFound(f"no database at {path}")
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        stored = _stored_version(conn)
+        problem = schema_problem(conn)
+        if isinstance(problem, SchemaTooNew):
+            raise problem
+        steps = pending_migrations(stored) if stored is not None else []
+        backup = _backup_copy(conn, path, f"v{stored}") if steps else None
+        for v in steps:
+            _run_migration(conn, v)
+        init(conn)
+        return {"db": path, "from": stored, "to": SCHEMA_VERSION, "steps": steps, "backup": backup}
+    finally:
+        conn.close()
+
+
+def _run_migration(conn: sqlite3.Connection, version: int) -> None:
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")        # no effect inside a transaction: set it first
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            have = _stored_version(conn)
+            if have is not None and have >= version:   # another migrate ran while we waited
+                conn.rollback()
+                return
+            MIGRATIONS[version](conn)
+            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                raise sqlite3.IntegrityError(f"migration to v{version} left dangling references: "
+                                             f"{[tuple(b) for b in bad]}")
+            set_meta(conn, "schema_version", version)
+            set_meta(conn, f"migrated_v{version}_at", now_iso())
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _backup_v3(conn: sqlite3.Connection) -> str | None:
     """v3 -> v4 is additive (new tables, a version column, triggers; init does it in
     place), but like the v3 rebuild it first copies a non-empty database to
     <db>.v3-<utc>.bak. Only for a stored schema_version of 3: v4+ needs nothing, a
@@ -374,13 +527,7 @@ def _backup_v3(conn):
     if not path or not rows:
         return None
     conn.commit()
-    dst_path = f"{path}.v3-{_utcnow():%Y%m%dT%H%M%SZ}.bak"
-    dst = sqlite3.connect(dst_path)
-    try:
-        conn.backup(dst)
-    finally:
-        dst.close()
-    return dst_path
+    return _backup_copy(conn, path, "v3")
 
 
 V2_TASK_COLUMNS = ("id", "title", "description", "project", "status", "kind", "created_at", "updated_at",
@@ -388,12 +535,13 @@ V2_TASK_COLUMNS = ("id", "title", "description", "project", "status", "kind", "c
                    "answered_at", "result_summary", "done_at")
 
 
-def _db_file(conn):
+def _db_file(conn: sqlite3.Connection) -> str | None:
     r = conn.execute("PRAGMA database_list").fetchone()
-    return r[2] if r and r[2] else None
+    path: str | None = r[2] if r and r[2] else None
+    return path
 
 
-def _migrate_v3(conn, backup=True):
+def _migrate_v3(conn: sqlite3.Connection, backup: bool = True) -> bool:
     """v2 -> v3, in place: rebuild tasks with project_id/stage_seq and a
     high|medium|low priority. Every old integer priority becomes 'high'; each
     distinct free-text project becomes a projects row (ranked by first use; a
@@ -402,7 +550,7 @@ def _migrate_v3(conn, backup=True):
     'migrated' event. A non-empty database is first copied to
     <db>.v2-<utc>.bak. No-op on a fresh or already-migrated database; True if
     it migrated."""
-    def task_cols():
+    def task_cols() -> set[str]:
         return {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     if not task_cols() or "project_id" in task_cols():
         return False
@@ -426,7 +574,7 @@ def _migrate_v3(conn, backup=True):
             cols = ", ".join(V2_TASK_COLUMNS)
             conn.execute(f"INSERT INTO tasks_v3 ({cols}, priority) SELECT {cols}, 'high' FROM tasks")
             ts = now_iso()
-            names = {}
+            names: dict[str, str] = {}
             for (value,) in conn.execute("SELECT project FROM tasks WHERE TRIM(COALESCE(project, '')) != '' "
                                          "GROUP BY project ORDER BY MIN(created_at), MIN(id)").fetchall():
                 p = _ensure_project(conn, value, nearest=False)
@@ -437,17 +585,17 @@ def _migrate_v3(conn, backup=True):
                         (value,)).fetchall()):
                     conn.execute("UPDATE tasks_v3 SET project_id=?, stage_seq=? WHERE id=?", (p["id"], seq + i, tid))
             for tid, prio, value in conn.execute("SELECT id, priority, project FROM tasks ORDER BY id").fetchall():
-                d = {"priority": [prio, "high"]}
+                d: dict[str, Any] = {"priority": [prio, "high"]}
                 if value in names:
                     d["project"] = names[value]
                 _event(conn, tid, ts, "migrated", d)
-            seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='tasks'").fetchone()
+            last = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='tasks'").fetchone()
             conn.execute("DROP TABLE tasks")
             conn.execute("ALTER TABLE tasks_v3 RENAME TO tasks")
-            if seq:                                 # ids are never reused
-                conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name='tasks'", (seq[0],))
+            if last:                                # ids are never reused
+                conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name='tasks'", (last[0],))
                 conn.execute("INSERT INTO sqlite_sequence(name, seq) SELECT 'tasks', ? WHERE NOT EXISTS "
-                             "(SELECT 1 FROM sqlite_sequence WHERE name='tasks')", (seq[0],))
+                             "(SELECT 1 FROM sqlite_sequence WHERE name='tasks')", (last[0],))
             bad = conn.execute("PRAGMA foreign_key_check").fetchall()
             if bad:
                 raise sqlite3.IntegrityError(f"v3 migration left dangling references: {[tuple(b) for b in bad]}")
@@ -461,22 +609,26 @@ def _migrate_v3(conn, backup=True):
     return True
 
 
-def get_meta(conn, key, default=None):
+@overload
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None: ...
+@overload
+def get_meta(conn: sqlite3.Connection, key: str, default: _T) -> str | _T: ...
+def get_meta(conn: sqlite3.Connection, key: str, default: object = None) -> object:
     r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return r[0] if r else default
 
 
-def set_meta(conn, key, value):
+def set_meta(conn: sqlite3.Connection, key: str, value: object) -> None:
     conn.execute("INSERT INTO meta(key, value) VALUES (?, ?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
 
-def get_session(conn, session_id):
+def get_session(conn: sqlite3.Connection, session_id: str) -> Row | None:
     r = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
     return dict(r) if r else None
 
 
-def upsert_session(conn, session_id, **fields):
+def upsert_session(conn: sqlite3.Connection, session_id: str, **fields: Any) -> None:
     """Insert the session or update only the given fields."""
     bad = set(fields) - set(SESSION_FIELDS)
     if bad:
@@ -492,7 +644,8 @@ def upsert_session(conn, session_id, **fields):
     conn.execute(sql, [session_id] + list(fields.values()))
 
 
-def add_hit(conn, session_id, entry_uuid, ts, kind, reset_at, text):
+def add_hit(conn: sqlite3.Connection, session_id: str, entry_uuid: str | None, ts: datetime | str | None,
+            kind: str | None, reset_at: datetime | str | None, text: str | None) -> bool:
     """Record one limit notice. Returns True if it was new."""
     cur = conn.execute(
         "INSERT OR IGNORE INTO limit_hits(session_id, entry_uuid, ts, kind, reset_at, text) "
@@ -501,7 +654,7 @@ def add_hit(conn, session_id, entry_uuid, ts, kind, reset_at, text):
     return cur.rowcount > 0
 
 
-def stalled_sessions(conn, include_resolved=False):
+def stalled_sessions(conn: sqlite3.Connection, include_resolved: bool = False) -> list[Row]:
     """Currently stalled sessions (or, with include_resolved, every session
     that ever hit a limit), with their hit counts, newest stall first."""
     where = "s.session_id IN (SELECT session_id FROM limit_hits)" if include_resolved else "s.stalled = 1"
@@ -513,18 +666,18 @@ def stalled_sessions(conn, include_resolved=False):
     return [dict(r) for r in rows]
 
 
-def find_sessions(conn, prefix):
+def find_sessions(conn: sqlite3.Connection, prefix: str) -> list[Row]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM sessions WHERE session_id LIKE ? ORDER BY session_id", (prefix + "%",))]
 
 
-def session_history(conn, session_id):
+def session_history(conn: sqlite3.Connection, session_id: str) -> list[Row]:
     """All limit hits of one session, oldest first."""
     return [dict(r) for r in conn.execute(
         "SELECT * FROM limit_hits WHERE session_id=? ORDER BY ts, id", (session_id,))]
 
 
-def counts(conn):
+def counts(conn: sqlite3.Connection) -> dict[str, int]:
     one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
     return {"sessions": one("SELECT COUNT(*) FROM sessions"),
             "hits": one("SELECT COUNT(*) FROM limit_hits"),
@@ -566,18 +719,21 @@ class InvalidTransition(ValueError):
     """The task (or session) is not in a state that allows this change."""
 
 
-def _utcnow():            # patched by tests
+def _utcnow() -> datetime:            # patched by tests
     return datetime.now(timezone.utc)
 
 
-def now_iso():
+def now_iso() -> str:
     """Current UTC time, always with milliseconds: 2026-09-29T10:00:00.000Z."""
     dt = _utcnow().astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
 
 
 @contextmanager
-def transaction(conn):
+def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """BEGIN IMMEDIATE ... COMMIT (a savepoint inside a caller's transaction). A new
+    transaction checks the schema guard first and again under the write lock (a newer
+    process may have upgraded the database meanwhile): SchemaMismatch, nothing written."""
     if conn.in_transaction:
         conn.execute("SAVEPOINT afclaude_tx")
         try:
@@ -588,8 +744,10 @@ def transaction(conn):
             raise
         conn.execute("RELEASE afclaude_tx")
     else:
+        check_writable(conn)        # the clear error, before BEGIN fails on a read-only connection
         conn.execute("BEGIN IMMEDIATE")
         try:
+            check_writable(conn)
             yield conn
         except BaseException:
             conn.rollback()
@@ -597,13 +755,17 @@ def transaction(conn):
         conn.commit()
 
 
-def _enum(value, allowed, what):
-    if value not in allowed:
+def _enum(value: object, allowed: Sequence[str], what: str) -> str:
+    if not isinstance(value, str) or value not in allowed:
         raise ValueError(f"{what} must be one of {'|'.join(allowed)}, got {value!r}")
     return value
 
 
-def _text(value, what, required=False):
+@overload
+def _text(value: object, what: str, required: Literal[True]) -> str: ...
+@overload
+def _text(value: object, what: str, required: bool = ...) -> str | None: ...
+def _text(value: object, what: str, required: bool = False) -> str | None:
     if value is None:
         if required:
             raise ValueError(f"{what} is required")
@@ -616,14 +778,14 @@ def _text(value, what, required=False):
     return value or None
 
 
-def _priority(value):
+def _priority(value: object) -> str:
     """high|medium|low (case and surrounding blanks ignored)."""
     if not isinstance(value, str):
         raise ValueError(f"priority must be one of {'|'.join(PRIORITIES)}, got {value!r}")
     return _enum(value.strip().lower(), PRIORITIES, "priority")
 
 
-def _clean_task_field(name, value):
+def _clean_task_field(name: str, value: object) -> str | None:
     if name == "title":
         return _text(value, "title", required=True)
     if name == "priority":
@@ -635,18 +797,18 @@ def _clean_task_field(name, value):
     return _text(value, name)
 
 
-def _position(value, what):
+def _position(value: object, what: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{what} must be an integer, got {value!r}")
     return value
 
 
-def _event(conn, task_id, ts, event, detail=None):
+def _event(conn: sqlite3.Connection, task_id: int, ts: str, event: str, detail: object = None) -> None:
     conn.execute("INSERT INTO task_events(task_id, ts, event, detail) VALUES (?, ?, ?, ?)",
                  (task_id, ts, event, None if detail is None else json.dumps(detail, ensure_ascii=False)))
 
 
-def _task_dict(r):
+def _task_dict(r: sqlite3.Row) -> Row:
     """A task row as the API returns it: 'project' is the project's NAME (it
     replaces the legacy v2 free-text column; 'project_name' is the same value,
     kept for readers like export_quickview.py), plus 'project_rank'."""
@@ -655,39 +817,39 @@ def _task_dict(r):
     return d
 
 
-def _task_row(conn, task_id):
+def _task_row(conn: sqlite3.Connection, task_id: int) -> Row:
     r = conn.execute(TASK_SELECT + " WHERE t.id=?", (task_id,)).fetchone()
     if r is None:
         raise NotFound(f"no task #{task_id}")
     return _task_dict(r)
 
 
-def get_task(conn, task_id):
+def get_task(conn: sqlite3.Connection, task_id: int) -> Row | None:
     r = conn.execute(TASK_SELECT + " WHERE t.id=?", (task_id,)).fetchone()
     return _task_dict(r) if r else None
 
 
 # ---- projects
 
-def _norm_path(p):
+def _norm_path(p: str) -> str:
     return os.path.normpath(os.path.abspath(os.path.expanduser(p)))
 
 
-def _project_by_path(conn, path, nearest=True):
+def _project_by_path(conn: sqlite3.Connection, path: str, nearest: bool = True) -> Row | None:
     """The project whose path is `path`, or (nearest) the one with the longest
     path that is a parent of it."""
     path = _norm_path(path)
     r = conn.execute("SELECT * FROM projects WHERE path=?", (path,)).fetchone()
     if r or not nearest:
         return dict(r) if r else None
-    best = None
+    best: Row | None = None
     for r in conn.execute("SELECT * FROM projects WHERE path IS NOT NULL"):
         if path.startswith(r["path"].rstrip("/") + "/") and (best is None or len(r["path"]) > len(best["path"])):
             best = dict(r)
     return best
 
 
-def get_project(conn, ref, nearest=True):
+def get_project(conn: sqlite3.Connection, ref: object, nearest: bool = True) -> Row | None:
     """By id (int), by path (a string starting with / or ~: that directory's
     project, or with nearest the closest parent's) or by name. None if unknown."""
     if isinstance(ref, int) and not isinstance(ref, bool):
@@ -700,14 +862,14 @@ def get_project(conn, ref, nearest=True):
     return dict(r) if r else None
 
 
-def _project_row(conn, ref):
+def _project_row(conn: sqlite3.Connection, ref: object) -> Row:
     p = get_project(conn, ref)
     if p is None:
         raise NotFound(f"no project {ref!r}")
     return p
 
 
-def _free_name(conn, *candidates):
+def _free_name(conn: sqlite3.Connection, *candidates: str) -> str:
     for c in candidates:
         if not conn.execute("SELECT 1 FROM projects WHERE name=?", (c,)).fetchone():
             return c
@@ -717,31 +879,41 @@ def _free_name(conn, *candidates):
     return f"{base} ({i})"
 
 
-def add_project(conn, name, description=None, path=None, rank=None):
+def _rowid(cur: sqlite3.Cursor) -> int:
+    """The id an INSERT just created."""
+    rid = cur.lastrowid
+    if rid is None:             # never after a successful INSERT
+        raise sqlite3.InterfaceError("the INSERT returned no row id")
+    return rid
+
+
+def add_project(conn: sqlite3.Connection, name: object, description: object = None, path: object = None,
+                rank: object = None) -> Row:
     """New project at the bottom of the list (or at `rank`, pushing the others down)."""
     name = _text(name, "name", required=True)
     if name.startswith(("/", "~")):
         raise ValueError(f"a project name can't start with / or ~ (that's a path): {name!r}")
-    path = _norm_path(path) if _text(path, "path") else None
+    path = _norm_path(path) if _text(path, "path") and isinstance(path, str) else None
     if rank is not None:
         _position(rank, "rank")
     with transaction(conn):
         if get_project(conn, name):
             raise ValueError(f"project {name!r} already exists")
-        if path and _project_by_path(conn, path, nearest=False):
-            raise ValueError(f"project {_project_by_path(conn, path, nearest=False)['name']!r} "
-                             f"already has path {path}")
+        other = _project_by_path(conn, path, nearest=False) if path else None
+        if other:
+            raise ValueError(f"project {other['name']!r} already has path {path}")
         ts = now_iso()
         n = conn.execute("SELECT COALESCE(MAX(rank), 0) FROM projects").fetchone()[0]
         cur = conn.execute("INSERT INTO projects(name, rank, description, path, created_at, updated_at) "
                            "VALUES (?, ?, ?, ?, ?, ?)", (name, n + 1, _text(description, "description"),
                                                          path, ts, ts))
+        pid = _rowid(cur)
         if rank is not None:
-            move_project(conn, cur.lastrowid, rank)
-        return get_project(conn, cur.lastrowid)
+            move_project(conn, pid, rank)
+        return _project_row(conn, pid)
 
 
-def _ensure_project(conn, ref, nearest=True):
+def _ensure_project(conn: sqlite3.Connection, ref: object, nearest: bool = True) -> Row:
     """The project `ref` names; a new one (at the bottom) if there is none. A
     path creates a project named after its last component (if that name is
     taken: parent/last, then the whole path without the leading /)."""
@@ -756,16 +928,16 @@ def _ensure_project(conn, ref, nearest=True):
     return add_project(conn, ref)
 
 
-def project_for_path(conn, path, create=True):
+def project_for_path(conn: sqlite3.Connection, path: str, create: bool = True) -> Row | None:
     """The project of a working directory: the one with that path or the
     nearest parent path; with create, a new one named after the directory."""
     return _ensure_project(conn, path) if create else _project_by_path(conn, path)
 
 
-def list_projects(conn):
+def list_projects(conn: sqlite3.Connection) -> list[Row]:
     """Projects by rank, each with 'open' (number of open stages) and
     'ready' {high, medium, low}: pending stages per priority."""
-    out = []
+    out: list[Row] = []
     for r in conn.execute("SELECT * FROM projects ORDER BY rank, id").fetchall():
         d = dict(r)
         cnt = dict(conn.execute("SELECT status || ':' || priority, COUNT(*) FROM tasks WHERE project_id=? "
@@ -776,7 +948,7 @@ def list_projects(conn):
     return out
 
 
-def update_project(conn, ref, **fields):
+def update_project(conn: sqlite3.Connection, ref: object, **fields: object) -> Row:
     """Rename a project or change its description/path/manager_session. A
     manager_session (full session id; empty = none) makes the project managed:
     the dispatcher keeps that session alive and starts no task sessions for it."""
@@ -786,52 +958,55 @@ def update_project(conn, ref, **fields):
                          "order changes go through move_project)")
     with transaction(conn):
         p = _project_row(conn, ref)
-        clean = {}
+        clean: dict[str, str | None] = {}
         if "name" in fields:
-            clean["name"] = _text(fields["name"], "name", required=True)
-            if clean["name"].startswith(("/", "~")):
-                raise ValueError(f"a project name can't start with / or ~: {clean['name']!r}")
-            other = get_project(conn, clean["name"])
+            name = _text(fields["name"], "name", required=True)
+            if name.startswith(("/", "~")):
+                raise ValueError(f"a project name can't start with / or ~: {name!r}")
+            other = get_project(conn, name)
             if other and other["id"] != p["id"]:
-                raise ValueError(f"project {clean['name']!r} already exists")
+                raise ValueError(f"project {name!r} already exists")
+            clean["name"] = name
         if "description" in fields:
             clean["description"] = _text(fields["description"], "description")
         if "path" in fields:
-            clean["path"] = _norm_path(fields["path"]) if _text(fields["path"], "path") else None
-            other = clean["path"] and _project_by_path(conn, clean["path"], nearest=False)
+            raw = fields["path"]
+            path = _norm_path(raw) if _text(raw, "path") and isinstance(raw, str) else None
+            clean["path"] = path
+            other = _project_by_path(conn, path, nearest=False) if path else None
             if other and other["id"] != p["id"]:
-                raise ValueError(f"project {other['name']!r} already has path {clean['path']}")
+                raise ValueError(f"project {other['name']!r} already has path {path}")
         if "manager_session" in fields:
             clean["manager_session"] = _text(fields["manager_session"], "manager_session")
         clean = {k: v for k, v in clean.items() if p[k] != v}
         if clean:
             conn.execute(f"UPDATE projects SET {', '.join(f'{k}=?' for k in clean)}, updated_at=? WHERE id=?",
                          list(clean.values()) + [now_iso(), p["id"]])
-        return get_project(conn, p["id"])
+        return _project_row(conn, p["id"])
 
 
-def _reorder(ids, item, new_pos):
+def _reorder(ids: list[int], item: int, new_pos: int) -> list[int]:
     """ids without item, item re-inserted at 1-based new_pos (clamped)."""
     rest = [i for i in ids if i != item]
     k = min(max(new_pos, 1), len(rest) + 1) - 1
     return rest[:k] + [item] + rest[k:]
 
 
-def move_project(conn, ref, new_rank):
+def move_project(conn: sqlite3.Connection, ref: object, new_rank: object) -> Row:
     """Put a project at rank new_rank (1 = top, clamped to the list); the
     others shift. Ranks stay 1..n."""
-    _position(new_rank, "rank")
+    pos = _position(new_rank, "rank")
     with transaction(conn):
         p = _project_row(conn, ref)
         ids = [r[0] for r in conn.execute("SELECT id FROM projects ORDER BY rank, id")]
         ts = now_iso()
-        for rank, pid in enumerate(_reorder(ids, p["id"], new_rank), 1):
+        for rank, pid in enumerate(_reorder(ids, p["id"], pos), 1):
             conn.execute("UPDATE projects SET rank=?, updated_at=CASE WHEN id=? THEN ? ELSE updated_at END "
                          "WHERE id=? AND rank IS NOT ?", (rank, p["id"], ts, pid, rank))
-        return get_project(conn, p["id"])
+        return _project_row(conn, p["id"])
 
 
-def set_project_priority(conn, ref, level):
+def set_project_priority(conn: sqlite3.Connection, ref: object, level: object) -> dict[str, Any]:
     """Bulk: give every OPEN stage of a project the same priority (e.g. the
     whole project -> medium, so none of it runs before the high stages of the
     other projects). Logs a 'priority' event (via: project) per changed stage.
@@ -851,14 +1026,19 @@ def set_project_priority(conn, ref, level):
 
 # ---- tasks (the stages of a project)
 
-def _next_seq(conn, project_id, table="tasks"):
+@overload
+def _next_seq(conn: sqlite3.Connection, project_id: int, table: str = ...) -> int: ...
+@overload
+def _next_seq(conn: sqlite3.Connection, project_id: int | None, table: str = ...) -> int | None: ...
+def _next_seq(conn: sqlite3.Connection, project_id: int | None, table: str = "tasks") -> int | None:
     if project_id is None:
         return None
-    return conn.execute(f"SELECT COALESCE(MAX(stage_seq), 0) + 1 FROM {table} WHERE project_id=?",
-                        (project_id,)).fetchone()[0]
+    seq: int = conn.execute(f"SELECT COALESCE(MAX(stage_seq), 0) + 1 FROM {table} WHERE project_id=?",
+                            (project_id,)).fetchone()[0]
+    return seq
 
 
-def _compact_stages(conn, project_id):
+def _compact_stages(conn: sqlite3.Connection, project_id: int | None) -> None:
     if project_id is None:
         return
     ids = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE project_id=? ORDER BY stage_seq, id",
@@ -867,9 +1047,9 @@ def _compact_stages(conn, project_id):
         conn.execute("UPDATE tasks SET stage_seq=? WHERE id=? AND stage_seq IS NOT ?", (seq, tid, seq))
 
 
-def task_events(conn, task_id):
+def task_events(conn: sqlite3.Connection, task_id: int) -> list[Row]:
     """History of one task, oldest first; detail decoded from JSON."""
-    out = []
+    out: list[Row] = []
     for r in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)):
         d = dict(r)
         d["detail"] = json.loads(d["detail"]) if d["detail"] else None
@@ -877,8 +1057,8 @@ def task_events(conn, task_id):
     return out
 
 
-def add_task(conn, title, description=None, project=None, priority=DEFAULT_PRIORITY, kind="task",
-             created_by_session=None):
+def add_task(conn: sqlite3.Connection, title: object, description: object = None, project: object = None,
+             priority: object = DEFAULT_PRIORITY, kind: object = "task", created_by_session: object = None) -> Row:
     """New pending task, appended as the last stage of `project` (a name or a
     directory, see get_project; an unknown one is created at the bottom of the
     project list). project=None: no project."""
@@ -887,8 +1067,9 @@ def add_task(conn, title, description=None, project=None, priority=DEFAULT_PRIOR
     return _add_task(conn, title, description, project, priority, kind, created_by_session)
 
 
-def _add_task(conn, title, description, project, priority, kind, created_by_session):
-    fields = {"title": _clean_task_field("title", title),
+def _add_task(conn: sqlite3.Connection, title: object, description: object, project: object, priority: object,
+              kind: object, created_by_session: object) -> Row:
+    fields: dict[str, str | None] = {"title": _clean_task_field("title", title),
               "description": _clean_task_field("description", description),
               "priority": _priority(priority),
               "kind": _enum(kind, ALL_TASK_KINDS, "kind"),
@@ -903,17 +1084,19 @@ def _add_task(conn, title, description, project, priority, kind, created_by_sess
             "updated_at, created_by_session) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
             (fields["title"], fields["description"], pid, _next_seq(conn, pid), fields["priority"],
              fields["kind"], ts, ts, fields["created_by_session"]))
-        tid = cur.lastrowid
+        tid = _rowid(cur)
         if p:
             fields["project"] = p["name"]
         _event(conn, tid, ts, "created", {k: v for k, v in fields.items() if v is not None})
         return _task_row(conn, tid)
 
 
-def list_tasks(conn, status=None, project=None, kind=None, limit=None):
+def list_tasks(conn: sqlite3.Connection, status: str | Iterable[str] | None = None, project: object = None,
+               kind: object = None, limit: int | None = None) -> list[Row]:
     """Tasks in execution order (see above). status: one value or a list.
     project: a name, id or directory (NotFound if there is no such project)."""
-    where, args = [], []
+    where: list[str] = []
+    args: list[Any] = []
     if status is not None:
         sts = [status] if isinstance(status, str) else list(status)
         for s in sts:
@@ -935,18 +1118,19 @@ def list_tasks(conn, status=None, project=None, kind=None, limit=None):
     return [_task_dict(r) for r in conn.execute(sql, args)]
 
 
-def execution_order(conn, kind=None, project=None, limit=None):
+def execution_order(conn: sqlite3.Connection, kind: object = None, project: object = None,
+                    limit: int | None = None) -> list[Row]:
     """The ready queue: pending tasks in the order the dispatcher takes them."""
     return list_tasks(conn, status="pending", kind=kind, project=project, limit=limit)
 
 
-def next_ready_task(conn, kind=None, project=None):
+def next_ready_task(conn: sqlite3.Connection, kind: object = None, project: object = None) -> Row | None:
     """The pending task that should run next (or None). Read-only: claim it with start_task."""
     r = execution_order(conn, kind=kind, project=project, limit=1)
     return r[0] if r else None
 
 
-def _update(conn, task_id, event, fields):
+def _update(conn: sqlite3.Connection, task_id: int, event: str, fields: Mapping[str, object]) -> Row:
     clean = {k: _clean_task_field(k, v) for k, v in fields.items() if k != "project"}
     with transaction(conn):
         t = _task_row(conn, task_id)
@@ -973,7 +1157,7 @@ def _update(conn, task_id, event, fields):
         return _task_row(conn, task_id)
 
 
-def update_task(conn, task_id, **fields):
+def update_task(conn: sqlite3.Connection, task_id: int, **fields: object) -> Row:
     """Change title/description/project/priority/kind. Logs one 'updated'
     event with {field: [old, new]} (nothing is logged if nothing changed).
     A new project appends the task as that project's last stage."""
@@ -984,7 +1168,7 @@ def update_task(conn, task_id, **fields):
     return _update(conn, task_id, "updated", fields)
 
 
-def set_stage_priority(conn, task_id, level):
+def set_stage_priority(conn: sqlite3.Connection, task_id: int, level: object) -> Row:
     """high|medium|low for one task (stage); logs a 'priority' event."""
     return _update(conn, task_id, "priority", {"priority": level})
 
@@ -992,17 +1176,17 @@ def set_stage_priority(conn, task_id, level):
 set_priority = set_stage_priority
 
 
-def move_stage(conn, task_id, new_seq):
+def move_stage(conn: sqlite3.Connection, task_id: int, new_seq: object) -> Row:
     """Put a task at position new_seq (1 = first, clamped) among its project's
     stages; the others shift. Logs a 'moved' event {from, to}."""
-    _position(new_seq, "stage")
+    pos = _position(new_seq, "stage")
     with transaction(conn):
         t = _task_row(conn, task_id)
         if t["project_id"] is None:
             raise InvalidTransition(f"task #{task_id} has no project, so it has no stage order")
         ids = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE project_id=? ORDER BY stage_seq, id",
                                           (t["project_id"],))]
-        order = _reorder(ids, task_id, new_seq)
+        order = _reorder(ids, task_id, pos)
         if order == ids:
             _compact_stages(conn, t["project_id"])
             return _task_row(conn, task_id)
@@ -1019,7 +1203,8 @@ _VERB = {"blocked": "block", "answered": "answer", "started": "start", "done": "
 NOW = object()   # placeholder for "the event timestamp" in _transition fields
 
 
-def _transition(conn, task_id, allowed_from, to_status, event, detail=None, **fields):
+def _transition(conn: sqlite3.Connection, task_id: int, allowed_from: Sequence[str], to_status: str, event: str,
+                detail: Mapping[str, object] | None = None, **fields: object) -> Row:
     """Status change with a state check. Field values of NOW become the event timestamp."""
     with transaction(conn):
         t = _task_row(conn, task_id)
@@ -1031,21 +1216,21 @@ def _transition(conn, task_id, allowed_from, to_status, event, detail=None, **fi
         fields.update(status=to_status, updated_at=ts)
         conn.execute(f"UPDATE tasks SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
                      list(fields.values()) + [task_id])
-        d = {"from": t["status"]}
+        d: dict[str, Any] = {"from": t["status"]}
         d.update(detail or {})
         _event(conn, task_id, ts, event, d)
         return _task_row(conn, task_id)
 
 
 
-def block_task(conn, task_id, question):
+def block_task(conn: sqlite3.Connection, task_id: int, question: object) -> Row:
     """A run needs the user: park the task with a question (clears any old answer)."""
     q = _text(question, "question", required=True)
     return _transition(conn, task_id, ("pending", "in_progress"), "blocked", "blocked", {"question": q},
                        blocked_question=q, blocked_at=NOW, answer=None, answered_at=None)
 
 
-def answer_task(conn, task_id, answer):
+def answer_task(conn: sqlite3.Connection, task_id: int, answer: object) -> Row:
     """The user's answer; the task is pending again (ready for the next pass).
     blocked_question and assigned_session stay, so the next run sees the Q&A
     and the dispatcher can resume the same session. A question (kind
@@ -1060,7 +1245,8 @@ def answer_task(conn, task_id, answer):
                            answer=a, answered_at=NOW)
 
 
-def ask_question(conn, question, project=None, created_by_session=None, title=None):
+def ask_question(conn: sqlite3.Connection, question: object, project: object = None,
+                 created_by_session: object = None, title: object = None) -> Row:
     """v4: a question for the user from a (manager) session, as a task of kind
     'question' that is born blocked, so it is in the inbox like any blocked task.
     Its answer closes it (done); the dispatcher never starts it (it only takes
@@ -1074,7 +1260,7 @@ def ask_question(conn, question, project=None, created_by_session=None, title=No
         return block_task(conn, t["id"], q)
 
 
-def start_task(conn, task_id, session):
+def start_task(conn: sqlite3.Connection, task_id: int, session: object) -> Row:
     """Claim a pending task for a session. Starting it again for the same
     session is a no-op; any other state raises InvalidTransition."""
     session = _text(session, "session")
@@ -1088,19 +1274,19 @@ def start_task(conn, task_id, session):
                            assigned_session=session)
 
 
-def finish_task(conn, task_id, summary=None):
+def finish_task(conn: sqlite3.Connection, task_id: int, summary: object = None) -> Row:
     s = _text(summary, "summary")
     return _transition(conn, task_id, ("pending", "in_progress"), "done", "done", {"summary": s},
                        result_summary=s, done_at=NOW)
 
 
-def cancel_task(conn, task_id, reason=None):
+def cancel_task(conn: sqlite3.Connection, task_id: int, reason: object = None) -> Row:
     r = _text(reason, "reason")
     return _transition(conn, task_id, ("pending", "in_progress", "blocked"), "cancelled", "cancelled",
                        {"reason": r} if r else None, done_at=NOW)
 
 
-def reopen_task(conn, task_id, reason=None):
+def reopen_task(conn: sqlite3.Connection, task_id: int, reason: object = None) -> Row:
     """Back to pending from done/cancelled, or from in_progress (a run died). A
     question goes back to blocked (asked again, the old answer cleared)."""
     r = _text(reason, "reason")
@@ -1115,11 +1301,12 @@ def reopen_task(conn, task_id, reason=None):
 
 # ---- stalled-session decisions
 
-def _stall_ref(sess):
-    return (sess or {}).get("stall_uuid") or (sess or {}).get("stalled_since")
+def _stall_ref(sess: Mapping[str, Any] | None) -> str | None:
+    ref: str | None = (sess or {}).get("stall_uuid") or (sess or {}).get("stalled_since")
+    return ref
 
 
-def decide_session(conn, session_id, decision, note=None):
+def decide_session(conn: sqlite3.Connection, session_id: str, decision: object, note: object = None) -> Row | None:
     """One-off continue/ignore for the session's CURRENT stall. A later stall
     of the same session is undecided again unless a standing rule covers it."""
     _enum(decision, DECISIONS, "decision")
@@ -1139,24 +1326,24 @@ def decide_session(conn, session_id, decision, note=None):
     return get_decision(conn, session_id)
 
 
-def clear_decision(conn, session_id):
+def clear_decision(conn: sqlite3.Connection, session_id: str) -> bool:
     with transaction(conn):
         return conn.execute("DELETE FROM session_decisions WHERE session_id=?", (session_id,)).rowcount > 0
 
 
-def get_decision(conn, session_id):
+def get_decision(conn: sqlite3.Connection, session_id: str) -> Row | None:
     r = conn.execute("SELECT * FROM session_decisions WHERE session_id=?", (session_id,)).fetchone()
     return dict(r) if r else None
 
 
-def _norm_match(scope, match):
+def _norm_match(scope: object, match: object) -> str:
     m = _text(match, "match", required=True)
     if scope == "project" and m.startswith("/"):
         m = os.path.normpath(m)
     return m
 
 
-def add_rule(conn, scope, match, decision, note=None):
+def add_rule(conn: sqlite3.Connection, scope: object, match: object, decision: object, note: object = None) -> Row:
     """Standing rule. The same scope+match again replaces the old rule."""
     _enum(scope, RULE_SCOPES, "scope")
     _enum(decision, DECISIONS, "decision")
@@ -1170,17 +1357,17 @@ def add_rule(conn, scope, match, decision, note=None):
         return dict(conn.execute("SELECT * FROM standing_rules WHERE scope=? AND match=?", (scope, m)).fetchone())
 
 
-def remove_rule(conn, rule_id):
+def remove_rule(conn: sqlite3.Connection, rule_id: object) -> None:
     with transaction(conn):
         if conn.execute("DELETE FROM standing_rules WHERE id=?", (rule_id,)).rowcount == 0:
             raise NotFound(f"no rule #{rule_id}")
 
 
-def list_rules(conn):
+def list_rules(conn: sqlite3.Connection) -> list[Row]:
     return [dict(r) for r in conn.execute("SELECT * FROM standing_rules ORDER BY scope, match")]
 
 
-def _project_rule_rank(rule, sess):
+def _project_rule_rank(rule: Mapping[str, Any], sess: Mapping[str, Any]) -> tuple[int, int, int] | None:
     """None if the project rule doesn't match; else a sort key (higher = more specific).
     Path rules match the session's cwd and its subdirectories (longest path wins)
     and beat project_dir-name rules."""
@@ -1193,7 +1380,8 @@ def _project_rule_rank(rule, sess):
     return (0, 0, rule["id"]) if m == sess.get("project_dir") else None
 
 
-def _effective(sess, decision, rules):
+def _effective(sess: Mapping[str, Any], decision: Mapping[str, Any] | None,
+               rules: Sequence[Mapping[str, Any]]) -> tuple[str | None, str | None]:
     if decision and decision.get("stall_ref") == _stall_ref(sess):
         return decision["decision"], "session"
     for r in rules:
@@ -1207,7 +1395,7 @@ def _effective(sess, decision, rules):
     return None, None
 
 
-def effective_decision(conn, session_id):
+def effective_decision(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, str | None]:
     """(decision, source) for a session: its own decision for the current stall
     ('session'), else a session rule ('session_rule:<id>'), else the most
     specific project rule ('project_rule:<id>'), else (None, None) = undecided."""
@@ -1215,19 +1403,19 @@ def effective_decision(conn, session_id):
     return _effective(sess, get_decision(conn, session_id), list_rules(conn))
 
 
-def stalled_decisions(conn):
+def stalled_decisions(conn: sqlite3.Connection) -> list[Row]:
     """Every currently stalled session with 'decision' and 'decision_source'
     (None = undecided). The dispatcher resumes those with decision == 'continue'."""
     rules = list_rules(conn)
     decisions = {r["session_id"]: dict(r) for r in conn.execute("SELECT * FROM session_decisions")}
-    out = []
+    out: list[Row] = []
     for s in stalled_sessions(conn):
         s["decision"], s["decision_source"] = _effective(s, decisions.get(s["session_id"]), rules)
         out.append(s)
     return out
 
 
-def pending_user_input(conn, include_own=False):
+def pending_user_input(conn: sqlite3.Connection, include_own: bool = False) -> dict[str, list[Row]]:
     """Everything waiting for the user: blocked tasks (priority order) and
     stalled sessions with no decision (newest stall first). Undecided stalls
     never expire. AFClaude's own sessions are left out by default: the
@@ -1243,27 +1431,27 @@ def pending_user_input(conn, include_own=False):
 # idempotency are actions.py's job: every write from the CLI, the MCP server and
 # the dashboard goes through actions.perform().
 
-def _json_or_none(v):
+def _json_or_none(v: object) -> str | None:
     return None if v is None else json.dumps(v, ensure_ascii=False, sort_keys=True)
 
 
-def _loads(s):
+def _loads(s: str | None) -> Any:
     return None if s is None else json.loads(s)
 
 
-def get_setting_row(conn, key):
+def get_setting_row(conn: sqlite3.Connection, key: str) -> Row | None:
     """{key, value (decoded; None = the code default), version, updated_at, updated_by},
     or None if the key was never saved (version 0)."""
     r = conn.execute("SELECT * FROM settings WHERE key=?", (key,)).fetchone()
     return dict(r, value=json.loads(r["value"])) if r else None
 
 
-def setting_rows(conn):
+def setting_rows(conn: sqlite3.Connection) -> dict[str, Row]:
     return {r["key"]: dict(r, value=json.loads(r["value"]))
             for r in conn.execute("SELECT * FROM settings ORDER BY key")}
 
 
-def put_setting(conn, key, value, updated_by=None):
+def put_setting(conn: sqlite3.Connection, key: str, value: object, updated_by: str | None = None) -> Row | None:
     conn.execute("INSERT INTO settings(key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, "
                  "updated_by=excluded.updated_by", (key, json.dumps(value, ensure_ascii=False), now_iso(),
@@ -1271,22 +1459,23 @@ def put_setting(conn, key, value, updated_by=None):
     return get_setting_row(conn, key)
 
 
-def reset_setting(conn, key, updated_by=None):
+def reset_setting(conn: sqlite3.Connection, key: str, updated_by: str | None = None) -> Row | None:
     """Back to the code default: the value becomes JSON null (the row and its version stay)."""
     return put_setting(conn, key, None, updated_by)
 
 
-def get_prompt_override(conn, name):
+def get_prompt_override(conn: sqlite3.Connection, name: str) -> Row | None:
     r = conn.execute("SELECT * FROM prompt_overrides WHERE name=?", (name,)).fetchone()
     return dict(r) if r else None
 
 
-def list_prompt_overrides(conn):
+def list_prompt_overrides(conn: sqlite3.Connection) -> list[Row]:
     """The prompts that currently have an override (body not NULL)."""
     return [dict(r) for r in conn.execute("SELECT * FROM prompt_overrides WHERE body IS NOT NULL ORDER BY name")]
 
 
-def put_prompt_override(conn, name, body, base_sha256, updated_by=None):
+def put_prompt_override(conn: sqlite3.Connection, name: str, body: str, base_sha256: str | None,
+                        updated_by: str | None = None) -> Row | None:
     conn.execute("INSERT INTO prompt_overrides(name, body, base_sha256, updated_at, updated_by) "
                  "VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body, "
                  "base_sha256=excluded.base_sha256, updated_at=excluded.updated_at, "
@@ -1294,26 +1483,29 @@ def put_prompt_override(conn, name, body, base_sha256, updated_by=None):
     return get_prompt_override(conn, name)
 
 
-def reset_prompt_override(conn, name, updated_by=None):
+def reset_prompt_override(conn: sqlite3.Connection, name: str, updated_by: str | None = None) -> Row | None:
     """Back to the default file: body and base_sha256 NULL (the row and its version stay)."""
     conn.execute("UPDATE prompt_overrides SET body=NULL, base_sha256=NULL, updated_at=?, updated_by=? "
                  "WHERE name=?", (now_iso(), updated_by, name))
     return get_prompt_override(conn, name)
 
 
-def add_audit(conn, actor, via, action, target_type=None, target_id=None, before=None, after=None,
-              request_id=None, ts=None):
+def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,
+              target_id: object = None, before: object = None, after: object = None,
+              request_id: str | None = None, ts: str | None = None) -> int:
     cur = conn.execute(
         "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts or now_iso(), actor, via, action, target_type, None if target_id is None else str(target_id),
          _json_or_none(before), _json_or_none(after), request_id))
-    return cur.lastrowid
+    return _rowid(cur)
 
 
-def audit_log(conn, limit=50, target_type=None, target_id=None):
+def audit_log(conn: sqlite3.Connection, limit: int = 50, target_type: str | None = None,
+              target_id: object = None) -> list[Row]:
     """Newest first; before/after decoded."""
-    where, args = [], []
+    where: list[str] = []
+    args: list[Any] = []
     if target_type is not None:
         where.append("target_type=?")
         args.append(target_type)
@@ -1325,32 +1517,34 @@ def audit_log(conn, limit=50, target_type=None, target_id=None):
     return [dict(r, before=_loads(r["before"]), after=_loads(r["after"])) for r in conn.execute(sql, args)]
 
 
-def get_idempotency(conn, key):
+def get_idempotency(conn: sqlite3.Connection, key: str) -> Row | None:
     r = conn.execute("SELECT * FROM idempotency_keys WHERE key=?", (key,)).fetchone()
     return dict(r) if r else None
 
 
-def put_idempotency(conn, key, actor, action, request_sha256, response):
+def put_idempotency(conn: sqlite3.Connection, key: str, actor: str, action: str, request_sha256: str,
+                    response: object) -> None:
     conn.execute("INSERT INTO idempotency_keys(key, actor, action, request_sha256, response, created_at) "
                  "VALUES (?, ?, ?, ?, ?, ?)",
                  (key, actor, action, request_sha256, json.dumps(response, ensure_ascii=False), now_iso()))
 
 
-def prune_idempotency(conn, older_than):
+def prune_idempotency(conn: sqlite3.Connection, older_than: datetime) -> int:
     """Delete keys created before `older_than` (a datetime). -> number deleted."""
     return conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (iso(older_than),)).rowcount
 
 
-def add_run_log(conn, component, decision, reason=None, session_id=None, task_id=None, ts=None):
+def add_run_log(conn: sqlite3.Connection, component: object, decision: object, reason: str | None = None,
+                session_id: str | None = None, task_id: int | None = None, ts: datetime | str | None = None) -> int:
     """One keep-alive/dispatcher decision (written by the runners from phase 2 on)."""
     cur = conn.execute("INSERT INTO run_log(ts, component, session_id, task_id, decision, reason) "
                        "VALUES (?, ?, ?, ?, ?, ?)",
                        (iso(ts) if ts else now_iso(), _text(component, "component", required=True), session_id,
                         task_id, _text(decision, "decision", required=True), reason))
-    return cur.lastrowid
+    return _rowid(cur)
 
 
-def run_log(conn, component=None, limit=50):
+def run_log(conn: sqlite3.Connection, component: str | None = None, limit: int = 50) -> list[Row]:
     if component is None:
         rows = conn.execute(f"SELECT * FROM run_log ORDER BY id DESC LIMIT {int(limit)}")
     else:
@@ -1362,7 +1556,7 @@ def run_log(conn, component=None, limit=50):
 DRIVEN_FIELDS = ("tmux", "kind", "task_id", "started_at", "last_seen", "ended_at", "holder_kind", "rc_url")
 
 
-def upsert_driven_session(conn, session_id, **fields):
+def upsert_driven_session(conn: sqlite3.Connection, session_id: str, **fields: Any) -> Row | None:
     """Insert (kind and started_at needed then) or update the given fields."""
     bad = set(fields) - set(DRIVEN_FIELDS)
     if bad:
@@ -1381,32 +1575,54 @@ def upsert_driven_session(conn, session_id, **fields):
     return get_driven_session(conn, session_id)
 
 
-def get_driven_session(conn, session_id):
+def get_driven_session(conn: sqlite3.Connection, session_id: str) -> Row | None:
     r = conn.execute("SELECT * FROM driven_sessions WHERE session_id=?", (session_id,)).fetchone()
     return dict(r) if r else None
 
 
-def driven_sessions(conn, include_ended=True):
+def driven_sessions(conn: sqlite3.Connection, include_ended: bool = True) -> list[Row]:
     sql = "SELECT * FROM driven_sessions" + ("" if include_ended else " WHERE ended_at IS NULL")
     return [dict(r) for r in conn.execute(sql + " ORDER BY started_at DESC, session_id")]
 
 
-def open_request(conn, kind, target=None):
+def open_request(conn: sqlite3.Connection, kind: str, target: str | None = None) -> Row | None:
     r = conn.execute("SELECT * FROM action_requests WHERE status='open' AND kind=? AND COALESCE(target, '')=?",
                      (kind, target or "")).fetchone()
     return dict(r) if r else None
 
 
-def add_request(conn, actor, kind, target=None):
+def add_request(conn: sqlite3.Connection, actor: str, kind: str, target: str | None = None) -> Row:
     cur = conn.execute("INSERT INTO action_requests(ts, actor, kind, target) VALUES (?, ?, ?, ?)",
                        (now_iso(), actor, kind, target))
     return dict(conn.execute("SELECT * FROM action_requests WHERE id=?", (cur.lastrowid,)).fetchone())
 
 
-def list_requests(conn, status=None, limit=50):
+def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: int = 50) -> list[Row]:
     if status is None:
         rows = conn.execute(f"SELECT * FROM action_requests ORDER BY id DESC LIMIT {int(limit)}")
     else:
         rows = conn.execute(f"SELECT * FROM action_requests WHERE status=? ORDER BY id DESC LIMIT {int(limit)}",
                             (status,))
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- CLI: the explicit migrate step
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="AFClaude store maintenance.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    m = sub.add_parser("migrate", help="back up the database, then run the migrations this code needs "
+                                       "(the non-additive ones only run here)")
+    m.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    args = ap.parse_args(argv)
+    try:
+        r = migrate(args.db)
+    except (SchemaMismatch, NotFound) as e:
+        print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return 1
+    print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

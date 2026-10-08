@@ -169,7 +169,7 @@ Hand-offs and compaction are **per tmux session** (one `driven_sessions` row). A
 
 ### 7.1 Conventions
 - SQLite in WAL mode at `/data/afclaude.db`; `CREATE TABLE IF NOT EXISTS` plus the `COLUMNS` dict; validation in Python. The WAL is archived for `db_wal_retention_days` (default 7) instead of being discarded at checkpoint, so the DB can be rolled back to any moment in that window (D-175, §11.1).
-- **Schema guard (review A1):** code refuses to write when the DB's `schema_version` is newer than its own; non-additive changes go through an explicit migrate step after a backup.
+- **Schema guard (review A1):** code refuses to write when the DB's `schema_version` is newer than its own; non-additive changes go through an explicit migrate step after a backup. Built (2a): `store.connect()` opens a newer DB read-only (reads go on, a write raises `SchemaTooNew` naming both versions); non-additive steps (`store.MIGRATIONS`) never run on connect, a DB that needs one stays read-only (`MigrationNeeded`) until `python3 store.py migrate`, which copies it to `<db>.v<old>-<utc>.bak` first.
 - `version` column (trigger-bumped) on every owner-editable table; writes carry the version they saw, a mismatch is a 409. Idempotency keys for 7 days. Both built.
 - Telemetry and runner tables carry `account_id` (one row in `accounts` now, D-156), so the future pool needs no migration.
 - Secrets in the DB (TOTP seeds, OIDC client secret, recovery-code hashes' pepper, the bridge key if stored) are encrypted with the master key (§10.2).
