@@ -5,15 +5,16 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import afclaude_config  # noqa: E402
 import pacing as pm  # noqa: E402
+import schedule  # noqa: E402
 
 UTC = timezone.utc
-WIN = (dtime(23, 0), dtime(9, 0))                 # the default window, Berlin wall clock
+WIN = schedule.Config.every_day()                 # the default: every night 23:00 x 2, Europe/Berlin
 
 
 def Z(s):
@@ -129,7 +130,7 @@ class Gate(unittest.TestCase):
         self.assertFalse(d["postpone"])
         self.assertEqual(d["headroom"], 0.0)                         # no partial / short run
         self.assertIn("above the threshold", d["reason"])
-        self.assertEqual(d["recheck_at"], pm.next_session_start(SUN, WIN))   # D-202: Mon 04:00
+        self.assertEqual(d["recheck_at"], schedule.next_session_start(SUN, WIN))   # D-202: Mon 04:00
         self.assertEqual(d["recheck_at"], SUN + timedelta(hours=5))
         self.assertIn("next check at the session-window start Mon 05.10. 04:00", d["reason"])
 
@@ -188,7 +189,7 @@ class Gate(unittest.TestCase):
         d = core(w, t + timedelta(hours=5), fc=flat_fc())            # 04:00: 52.5 + 12.5 + 17.4 = 82.4
         self.assertTrue(d["go"], d["reason"])
         w += d["headroom"]
-        d = core(w, pm.next_window_start(t + timedelta(hours=6), WIN), fc=flat_fc())   # Mon 23:00: 91.1
+        d = core(w, schedule.next_window_start(t + timedelta(hours=6), WIN), fc=flat_fc())   # Mon 23:00: 91.1
         self.assertFalse(d["go"], d["reason"])
 
     def test_simulated_week_ends_at_the_threshold(self):
@@ -204,8 +205,8 @@ class Gate(unittest.TestCase):
                 runs.append(d["headroom"])
                 w += d["headroom"]
             nxt = t + timedelta(hours=5)
-            if not pm.in_window(nxt, WIN):
-                nxt = pm.next_window_start(nxt, WIN)
+            if not schedule.in_window(nxt, WIN):
+                nxt = schedule.next_window_start(nxt, WIN)
             nxt = min(nxt, R)
             w += rate * (nxt - t).total_seconds() / 3600
             t = nxt
@@ -225,10 +226,15 @@ class Gate(unittest.TestCase):
         self.assertTrue(d["go"])
 
     def test_dst_windows(self):
-        self.assertEqual(pm.latest_window_start(Z("2026-10-26T02:00:00Z"), WIN), Z("2026-10-25T22:00:00Z"))
-        self.assertTrue(pm.in_window(Z("2027-03-28T21:30:00Z"), WIN))
-        self.assertFalse(pm.in_window(Z("2027-03-28T20:30:00Z"), WIN))
-        self.assertEqual(pm.window_end(Z("2026-10-24T21:00:00Z"), WIN), Z("2026-10-25T08:00:00Z"))
+        self.assertEqual(schedule.current_window(Z("2026-10-26T02:00:00Z"), WIN).start, Z("2026-10-25T22:00:00Z"))
+        self.assertTrue(schedule.in_window(Z("2027-03-28T21:30:00Z"), WIN))
+        self.assertFalse(schedule.in_window(Z("2027-03-28T20:30:00Z"), WIN))
+        # D-148: 10 h absolute, the DST-end night ends 08:00 CET (07:00Z)
+        self.assertEqual(schedule.current_window(Z("2026-10-24T21:00:00Z"), WIN).end, Z("2026-10-25T07:00:00Z"))
+        # the straight line uses that end
+        d = pm.decide_core(10, Z("2026-10-29T17:00:00Z"), Z("2026-10-24T21:00:00Z"), 600.0, None, None,
+                           None, True, 0.125, "auto", WIN)
+        self.assertIn("window end Sun 25.10. 08:00", d["reason"])
 
 
 class Postpone(unittest.TestCase):
@@ -392,7 +398,7 @@ class Accuracy(unittest.TestCase):
         closed = [x for x in bt if x["closed"]]
         self.assertGreaterEqual(len(closed), 14)                      # 2 session windows x 7 nights of cycle 2
         first = Z(closed[0]["at"])
-        self.assertTrue(pm.in_window(first, WIN))
+        self.assertTrue(schedule.in_window(first, WIN))
         st = pm.error_stats(bt)
         self.assertEqual(st["status"], "ok")
         self.assertAlmostEqual(st["bias"], 0.0, delta=0.3)
@@ -538,12 +544,12 @@ class NextRun(unittest.TestCase):
         self.assertEqual((d["kind"], d["at"]), ("last_stretch", R - timedelta(hours=5)))
         self.assertIn("D-204", d["reason"])
         d = self.nr(70, now=R - timedelta(hours=2), current=core(70, R - timedelta(hours=2)), slot_next=False)
-        self.assertEqual((d["kind"], d["at"]), ("after_reset", pm.next_window_start(R, WIN)))
+        self.assertEqual((d["kind"], d["at"]), ("after_reset", schedule.next_window_start(R, WIN)))
         self.assertEqual(self.nr(70, now=t, current=cur, slot_next=R - timedelta(hours=5), active=t)["kind"],
                          "now")
 
     def test_after_the_reset(self):
-        thu = pm.next_window_start(R, WIN)                            # Thu 23:00, the first night after
+        thu = schedule.next_window_start(R, WIN)                            # Thu 23:00, the first night after
         d = self.nr(80, fc=flat_fc(0.5), lm=0)                        # last stretch off, no night passes
         self.assertEqual((d["kind"], d["at"]), ("after_reset", thu))
         self.assertIsNone(d["last_stretch_at"])
@@ -556,7 +562,7 @@ class NextRun(unittest.TestCase):
 
     def test_unknown(self):
         self.assertEqual(self.nr(None)["kind"], "unknown")
-        self.assertEqual(pm.next_run_core(30, R, R + timedelta(minutes=1), win=WIN)["kind"], "unknown")
+        self.assertEqual(pm.next_run_core(30, R, R + timedelta(minutes=1), sched=WIN)["kind"], "unknown")
 
     def test_wrapper(self):
         u = {"weekly": {"percent": 10, "resets_at": R}}
@@ -566,35 +572,37 @@ class NextRun(unittest.TestCase):
 
 
 class SessionStarts(unittest.TestCase):
-    """D-202: the gate is checked at each session-window start of the night (23:00, 04:00)."""
+    """D-202: the gate is checked at each session-window start of the night (23:00, 04:00);
+    pacing uses schedule.py (test_schedule.py has the full window tests)."""
 
     def test_starts_and_dst(self):
         for night, starts in [
             ("2026-10-04T21:00:00Z", ["2026-10-04T21:00:00Z", "2026-10-05T02:00:00Z"]),   # CEST
-            ("2026-10-24T21:00:00Z", ["2026-10-24T21:00:00Z", "2026-10-25T03:00:00Z"]),   # DST end (6 h)
-            ("2027-03-27T22:00:00Z", ["2027-03-27T22:00:00Z", "2027-03-28T02:00:00Z"]),   # DST start (4 h)
+            ("2026-10-24T21:00:00Z", ["2026-10-24T21:00:00Z", "2026-10-25T02:00:00Z"]),   # DST end: 03:00 CET
+            ("2027-03-27T22:00:00Z", ["2027-03-27T22:00:00Z", "2027-03-28T03:00:00Z"]),   # DST start: 05:00 CEST
         ]:
-            ws = pm.latest_window_start(Z(night), WIN)
-            self.assertEqual(pm.session_starts(ws, WIN), [Z(s) for s in starts])
-            self.assertEqual(pm.session_starts(ws, WIN)[-1] + timedelta(hours=5), pm.window_end(ws, WIN))
-        self.assertEqual(len(pm.session_starts(SUN, (dtime(23, 0), dtime(4, 0)))), 1)      # 5 h: one
-        self.assertEqual(len(pm.session_starts(SUN, (dtime(22, 0), dtime(5, 0)))), 1)      # 7 h: one ends by 05:00
-        self.assertEqual(len(pm.session_starts(SUN, (dtime(21, 0), dtime(12, 0)))), 3)     # 15 h: three
+            w = schedule.current_window(Z(night), WIN)
+            self.assertEqual(schedule.session_starts(w), [Z(s) for s in starts])
+            self.assertEqual(schedule.session_starts(w)[-1] + timedelta(hours=5), w.end)   # N x 5 h absolute
+        one = schedule.current_window(SUN, schedule.Config.every_day("23:00", 1))
+        self.assertEqual(len(schedule.session_starts(one)), 1)
+        three = schedule.current_window(SUN, schedule.Config.every_day("21:00", 3))
+        self.assertEqual(len(schedule.session_starts(three)), 3)
 
     def test_latest_next_and_deadline(self):
         s2 = SUN + timedelta(hours=5)
-        self.assertEqual(pm.latest_session_start(SUN + timedelta(hours=2), WIN), SUN)
-        self.assertEqual(pm.latest_session_start(s2 + timedelta(hours=4), WIN), s2)       # 08:00
-        self.assertIsNone(pm.latest_session_start(SUN - timedelta(hours=1), WIN))         # 22:00: outside
-        self.assertEqual(pm.next_session_start(SUN - timedelta(hours=1), WIN), SUN)
-        self.assertEqual(pm.next_session_start(SUN, WIN), s2)                             # strictly after
-        self.assertEqual(pm.next_session_start(s2 + timedelta(hours=4, minutes=18), WIN),
-                         SUN + timedelta(days=1))                                         # 08:18 -> 23:00
-        self.assertEqual(pm.postpone_deadline(SUN, WIN), s2)
-        self.assertEqual(pm.postpone_deadline(s2, WIN), s2)                               # the last: none
+        self.assertEqual(schedule.latest_session_start(SUN + timedelta(hours=2), WIN), SUN)
+        self.assertEqual(schedule.latest_session_start(s2 + timedelta(hours=4), WIN), s2)       # 08:00
+        self.assertIsNone(schedule.latest_session_start(SUN - timedelta(hours=1), WIN))         # 22:00: outside
+        self.assertEqual(schedule.next_session_start(SUN - timedelta(hours=1), WIN), SUN)
+        self.assertEqual(schedule.next_session_start(SUN, WIN), s2)                             # strictly after
+        self.assertEqual(schedule.next_session_start(s2 + timedelta(hours=4, minutes=18), WIN),
+                         SUN + timedelta(days=1))                                               # 08:18 -> 23:00
+        self.assertEqual(schedule.postpone_deadline(SUN, WIN), s2)
+        self.assertEqual(schedule.postpone_deadline(s2, WIN), s2)                               # the last: none
         fall = Z("2026-10-24T21:00:00Z")
-        self.assertEqual(pm.next_session_start(fall, WIN), Z("2026-10-25T03:00:00Z"))     # 04:00 CET
-        self.assertEqual(pm.next_session_start(Z("2026-10-25T03:00:00Z"), WIN), Z("2026-10-25T22:00:00Z"))
+        self.assertEqual(schedule.next_session_start(fall, WIN), Z("2026-10-25T02:00:00Z"))     # 03:00 CET
+        self.assertEqual(schedule.next_session_start(Z("2026-10-25T02:00:00Z"), WIN), Z("2026-10-25T22:00:00Z"))
 
 
 class NextRunSessionStarts(unittest.TestCase):
@@ -656,12 +664,12 @@ class NextRunSessionStarts(unittest.TestCase):
         self.assertIn("postponed session-window start", d["reason"])
 
     def test_walk_over_a_dst_night(self):
-        """Sat 24.10. 23:00 CEST fails, Sun 25.10. 04:00 CET (6 h later) passes."""
+        """Sat 24.10. 23:00 CEST fails, Sun 25.10. 03:00 CET (5 h later: N x 5 h absolute, D-148) passes."""
         reset = Z("2026-10-29T17:00:00Z")
         now = Z("2026-10-24T18:00:00Z")
         d = pm.next_run_core(19, reset, now, 0.125, flat_fc(0.5), "auto", "auto", WIN, None)
-        self.assertEqual((d["kind"], d["at"]), ("night", Z("2026-10-25T03:00:00Z")))
-        self.assertAlmostEqual(d["predicted_end"], 19 + 12.5 + 0.5 * 110)
+        self.assertEqual((d["kind"], d["at"]), ("night", Z("2026-10-25T02:00:00Z")))
+        self.assertAlmostEqual(d["predicted_end"], 19 + 12.5 + 0.5 * 111)
 
 
 class OneNumber(unittest.TestCase):

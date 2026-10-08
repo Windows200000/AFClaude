@@ -67,6 +67,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
+import schedule  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
@@ -485,8 +486,7 @@ def rule_remove(conn: sqlite3.Connection, ctx: Ctx, rule_id: Any, version: Any =
 
 # ---------------------------------------------------------------- settings (§7.4, D-146, D-075)
 
-DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-WEEK_MIN = 7 * 24 * 60
+DAYS = schedule.DAYS
 GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
 SESSION_HOURS = afclaude_config.SESSION_LENGTH.total_seconds() / 3600   # 5: one session-limit window
@@ -550,11 +550,6 @@ def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Conn
     return check
 
 
-def _fmt_min(m: int) -> str:
-    m %= WEEK_MIN
-    return f"{DAYS[m // 1440]} {m % 1440 // 60:02d}:{m % 60:02d}"
-
-
 def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Validate + normalize {mon..sun: {start, n, group} | null}: start on the 30-min
     grid, 1 <= n whole session windows (D-148) with n x session_hours <= 24 h, identical
@@ -583,20 +578,7 @@ def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, An
         g = groups.setdefault(w["group"], (d, out[d]["start"], n))
         if (g[1], g[2]) != (out[d]["start"], n):
             raise ValueError(f"{d} and {g[0]} are linked (group {w['group']}) but have different windows")
-    spans: list[tuple[str, int, int]] = []
-    for i, d in enumerate(DAYS):
-        if out[d]:
-            h, m = map(int, out[d]["start"].split(":"))
-            s = i * 1440 + h * 60 + m
-            spans.append((d, s, s + int(round(out[d]["n"] * sh * 60))))
-    for i, (a, sa, ea) in enumerate(spans):
-        for b, sb, eb in spans[i + 1:]:
-            for k in (-WEEK_MIN, 0, WEEK_MIN):
-                if max(sa, sb + k) < min(ea, eb + k):
-                    first, second = ((a, sa, ea), (b, sb + k, eb + k)) if sa <= sb + k else ((b, sb + k, eb + k), (a, sa, ea))
-                    raise ValueError(f"{first[0]} {out[first[0]]['start']} x {out[first[0]]['n']} ends "
-                                     f"{_fmt_min(first[2])}, so {second[0]} can't start at "
-                                     f"{out[second[0]]['start']} (overlap)")
+    schedule.check_overlap(out, sh)
     return out
 
 
@@ -649,7 +631,7 @@ USAGE_MODELS = ("pacing", "linear")
 # Everything the dashboard can change (D-146): the runners read these (afclaude_config.setting()),
 # DB value > code default; data/afclaude.json keeps only machine identity. Names are flat (§7.4).
 SETTINGS: dict[str, Setting] = {
-    # --- schedule (§6, D-148): windows are whole session windows; runners: afclaude_config.window()
+    # --- schedule (§6, D-148): windows are whole session windows; the runners read them through schedule.py
     "window_days": Setting({d: {"start": "23:00", "n": 2, "group": "weekly"} for d in DAYS}, _window_days,
                            "Automation window per weekday {mon..sun: {start, n, group} | null}: AFClaude works "
                            "from start for n whole session windows (default every night 23:00 x 2 = until "

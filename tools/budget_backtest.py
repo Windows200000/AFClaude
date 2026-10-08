@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import afclaude_config  # noqa: E402
 import pacing  # noqa: E402
+import schedule  # noqa: E402
 import usage_model  # noqa: E402
 
 UTC = timezone.utc
@@ -107,8 +108,20 @@ def build_steps(rows, reset, user_until, user_scale=1.0, late_burst_h=0.0):
 
 # ------------------------------------------------------------------ models
 
+def latest_window(t, win):
+    """The window `t` is in, else the latest one before it (schedule.py)."""
+    ws = [w for w in schedule.windows(t - timedelta(days=8), t + timedelta(microseconds=1), win) if w.start <= t]
+    return ws[-1] if ws else None
+
+
 def window_end(t, win):
-    return pacing.window_end(pacing.latest_window_start(t, win), win)
+    w = latest_window(t, win)
+    return w.end if w else t
+
+
+def night_of(t, win):
+    w = latest_window(t, win)
+    return w.local(w.start).date().isoformat() if w else "none"
 
 
 def linear(ctx, t, w):
@@ -146,8 +159,8 @@ def new_pacing(ctx, t, w, s_pct, s_open):
                            True, ctx["ratio"], ctx.get("lm", "auto"), ctx["win"], ctx["threshold"],
                            ctx["forecast"])
     ctx["last_d"] = d
-    if d.get("forecast") is not None and pacing.in_window(t, ctx["win"]):   # the first forecast of each night
-        ctx["forecasts"].setdefault(pacing.latest_window_start(t, ctx["win"]), (t, d["forecast"]))
+    if d.get("forecast") is not None and schedule.in_window(t, ctx["win"]):   # the first forecast of each night
+        ctx["forecasts"].setdefault(night_of(t, ctx["win"]), (t, d["forecast"]))
     return d["go"], (d["target"] if d["target"] is not None else w), d["session_cap"]
 
 
@@ -164,11 +177,11 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
         t, dt = st["t"], st["dt"]
         if s_open is not None and t >= s_open + SESSION:
             s_open, s_val, af_in_win = None, 0.0, False
-        allowed_win = pacing.in_window(t, win)
+        cw = schedule.current_window(t, win)
+        allowed_win = cw is not None
         if model == "linear":
             in_lm = timedelta(0) < reset - t <= timedelta(hours=5)
-            lt = t.astimezone(pacing.BERLIN)
-            start_tick = allowed_win and lt.hour == win[0].hour and lt.minute < 15
+            start_tick = cw is not None and t - cw.start < timedelta(minutes=15)
             decide_now = start_tick or (allowed_win and s_open is None and not running) or in_lm
             ok = allowed_win or in_lm
             if decide_now and ok:
@@ -195,7 +208,7 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
                 af_in_win = True
                 w += af
                 out["af"] += af
-                night = pacing.latest_window_start(t, win).date().isoformat()
+                night = night_of(t, win)
                 out["night_spend"][night] = out["night_spend"].get(night, 0.0) + af
                 if trace:
                     print("   ", t.astimezone(pacing.BERLIN).strftime("%a %H:%M"),
@@ -229,8 +242,8 @@ def run(model, steps, w0, reset, win, raf, k, P=None, env=None, ratio=0.16, lm="
 
 def nights_in(steps, win, reset):
     first = steps[0]["t"]
-    return sorted({pacing.latest_window_start(s["t"], win).date().isoformat() for s in steps
-                   if pacing.in_window(s["t"], win) and s["t"] >= first})
+    return sorted({night_of(s["t"], win) for s in steps
+                   if schedule.in_window(s["t"], win) and s["t"] >= first})
 
 
 def p10(xs):
@@ -261,7 +274,7 @@ def main():
     reset, until = ts(a.reset), ts(a.user_until)
     rows = load_rows(a.samples)
     w0, t0, steps = build_steps(rows, reset, until, a.user_scale, a.late_burst)
-    win = afclaude_config.window()
+    win = schedule.load()
     upto = [r for r in rows if ts(r["at"]) <= reset + timedelta(minutes=10)]
     ratio = a.ratio if a.ratio is not None else pacing.ratio_info(upto)[0]
     P = dict(pacing.DEFAULTS)

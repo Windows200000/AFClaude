@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import keepalive as ka  # noqa: E402
+import schedule  # noqa: E402
 
 UTC = timezone.utc
 
@@ -95,245 +96,23 @@ class ResetText(unittest.TestCase):
         self.assertIsNone(ka.parse_reset_text("no reset here", Z("2026-09-25T20:00:00Z")))
 
 
-class Window(unittest.TestCase):
-    """Window 23:00-09:00 Europe/Berlin: it starts the evening before and spans midnight."""
-    cases = [
-        # CEST (night 25./26.09.2026)
-        ("2026-09-25T20:59:59Z", False),  # 22:59:59 CEST
-        ("2026-09-25T21:00:00Z", True),   # 23:00 CEST
-        ("2026-09-25T22:00:00Z", True),   # 00:00 CEST
-        ("2026-09-26T06:59:59Z", True),   # 08:59:59 CEST
-        ("2026-09-26T07:00:00Z", False),  # 09:00 CEST
-        ("2026-09-26T10:00:00Z", False),  # 12:00 CEST
-        # CET (night 26./27.10.2026)
-        ("2026-10-26T21:59:59Z", False),  # 22:59:59 CET
-        ("2026-10-26T22:00:00Z", True),   # 23:00 CET
-        ("2026-10-26T23:00:00Z", True),   # 00:00 CET
-        ("2026-10-27T07:59:59Z", True),   # 08:59:59 CET
-        ("2026-10-27T08:00:00Z", False),  # 09:00 CET
-        # DST end night (2026-10-25, 03:00 CEST -> 02:00 CET): window is 11 real hours
-        ("2026-10-24T20:59:59Z", False),  # 22:59:59 CEST
-        ("2026-10-24T21:00:00Z", True),   # 23:00 CEST
-        ("2026-10-25T00:30:00Z", True),   # 02:30 CEST (first pass)
-        ("2026-10-25T01:30:00Z", True),   # 02:30 CET (second pass)
-        ("2026-10-25T07:59:59Z", True),   # 08:59:59 CET
-        ("2026-10-25T08:00:00Z", False),  # 09:00 CET
-        # DST start night (2027-03-28, 02:00 CET -> 03:00 CEST): window is 9 real hours
-        ("2027-03-27T21:59:59Z", False),  # 22:59:59 CET
-        ("2027-03-27T22:00:00Z", True),   # 23:00 CET
-        ("2027-03-28T00:59:59Z", True),   # 01:59:59 CET
-        ("2027-03-28T01:00:00Z", True),   # 03:00 CEST
-        ("2027-03-28T06:59:59Z", True),   # 08:59:59 CEST
-        ("2027-03-28T07:00:00Z", False),  # 09:00 CEST
-    ]
-
-    def test_in_window(self):
-        for ts, want in self.cases:
-            with self.subTest(ts=ts):
-                self.assertEqual(ka.in_window(Z(ts)), want)
-
-    def test_window_end(self):
-        for now, end in [
-            ("2026-09-25T21:30:00Z", "2026-09-26T07:00:00Z"),  # 23:30 CEST -> 09:00 CEST next day
-            ("2026-09-26T03:00:00Z", "2026-09-26T07:00:00Z"),  # 05:00 CEST, same window
-            ("2026-09-26T10:00:00Z", "2026-09-27T07:00:00Z"),  # daytime: the next window's end
-            ("2026-09-26T20:00:00Z", "2026-09-27T07:00:00Z"),  # 22:00 CEST, just before tonight's window
-            ("2026-10-26T22:00:00Z", "2026-10-27T08:00:00Z"),  # 23:00 CET
-            ("2026-10-24T21:30:00Z", "2026-10-25T08:00:00Z"),  # DST end: starts CEST, ends CET
-            ("2027-03-27T22:30:00Z", "2027-03-28T07:00:00Z"),  # DST start: starts CET, ends CEST
-            ("2026-12-31T22:30:00Z", "2027-01-01T08:00:00Z"),  # across the year boundary
-        ]:
-            with self.subTest(now=now):
-                self.assertEqual(ka.current_window_end(Z(now)), Z(end))
-
-    def test_next_window_start(self):
-        for now, start in [
-            ("2026-09-26T10:00:00Z", "2026-09-26T21:00:00Z"),  # 12:00 CEST -> 23:00 CEST today
-            ("2026-09-26T07:00:00Z", "2026-09-26T21:00:00Z"),  # 09:00 CEST (window just ended)
-            ("2026-09-26T20:59:59Z", "2026-09-26T21:00:00Z"),  # 22:59:59 CEST
-            ("2026-10-26T10:00:00Z", "2026-10-26T22:00:00Z"),  # CET
-            ("2026-10-24T12:00:00Z", "2026-10-24T21:00:00Z"),  # DST end night starts in CEST
-            ("2026-10-25T12:00:00Z", "2026-10-25T22:00:00Z"),  # the evening after is CET
-            ("2027-03-27T12:00:00Z", "2027-03-27T22:00:00Z"),  # DST start night starts in CET
-            ("2027-03-28T12:00:00Z", "2027-03-28T21:00:00Z"),  # the evening after is CEST
-        ]:
-            with self.subTest(now=now):
-                self.assertEqual(ka.next_window_start(Z(now)), Z(start))
-        for now in ("2026-09-25T21:30:00Z", "2026-09-26T03:00:00Z"):   # inside: now
-            self.assertEqual(ka.next_window_start(Z(now)), Z(now))
-
-    def test_window_start_hour(self):
-        """D-202: cron `0 2,3,21,22 * * *` (UTC). Exactly one of 21/22 is 23:xx Berlin (the first
-        session-window start) and one of 2/3 is 04:xx (the second), also on the DST nights."""
-        for day, evening, morning in [("2026-09-29", "21", "02"),   # CEST
-                                      ("2026-10-24", "21", "03"),   # DST end night: 23:00 CEST, 04:00 CET
-                                      ("2026-10-25", "22", "03"),   # first CET evening
-                                      ("2026-10-27", "22", "03"),   # CET
-                                      ("2027-03-27", "22", "02"),   # DST start night: 23:00 CET, 04:00 CEST
-                                      ("2027-03-28", "21", "02")]:  # first CEST evening
-            nxt = (Z(f"{day}T12:00:00Z") + timedelta(days=1)).date().isoformat()
-            for hour in ("21", "22"):
-                with self.subTest(day=day, hour=hour):
-                    self.assertEqual(ka.is_window_start_hour(Z(f"{day}T{hour}:00:05Z")), hour == evening)
-            for hour in ("02", "03"):
-                with self.subTest(day=nxt, hour=hour):
-                    self.assertEqual(ka.is_window_start_hour(Z(f"{nxt}T{hour}:00:05Z")), hour == morning)
-            # never between the starts (e.g. 08:18 Berlin) or outside the window
-            for h in ("00", "01", "04", "05", "06", "07", "10", "20"):
-                self.assertFalse(ka.is_window_start_hour(Z(f"{nxt}T{h}:18:00Z")), (nxt, h))
-
-    def test_crontab_covers_every_session_window_start(self):
-        """docker/crontab's window-start line: every day of a year (both DST switches) has exactly
-        two acting fires, one in each session-window start's hour (23:xx and 04:xx Berlin)."""
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "crontab")) as fh:
-            line = next(x for x in fh if x.rstrip().endswith("# AFClaude window-start"))
-        minute, hours = line.split()[:2]
-        self.assertEqual((minute, hours), ("0", "2,3,21,22"))
-        day = Z("2026-01-01T00:00:00Z")
-        while day < Z("2027-01-01T00:00:00Z"):
-            acting = [day.replace(hour=int(h)) for h in hours.split(",")
-                      if ka.is_window_start_hour(day.replace(hour=int(h)))]
-            with self.subTest(day=day.date()):
-                self.assertEqual(sorted(ka.berlin(t)[11:13] for t in acting), ["04", "23"])
-            day += timedelta(days=1)
-
-    def test_session_window_starts(self):
-        """23:00 and 04:00 (wall clock) for the default 23:00 x 10 h window, also on the DST nights."""
-        for now, starts in [
-            ("2026-09-29T21:30:00Z", ["2026-09-29T21:00:00Z", "2026-09-30T02:00:00Z"]),   # CEST
-            ("2026-10-24T23:00:00Z", ["2026-10-24T21:00:00Z", "2026-10-25T03:00:00Z"]),   # DST end: 6 h apart
-            ("2027-03-28T01:30:00Z", ["2027-03-27T22:00:00Z", "2027-03-28T02:00:00Z"]),   # DST start: 4 h apart
-            ("2026-10-27T06:00:00Z", ["2026-10-26T22:00:00Z", "2026-10-27T03:00:00Z"]),   # CET
-        ]:
-            with self.subTest(now=now):
-                self.assertEqual(ka.session_window_starts(Z(now)), [Z(s) for s in starts])
-        # each start's 5-h session window ends by the window end (09:00): the last one exactly
-        for now in ("2026-09-29T21:30:00Z", "2026-10-24T23:00:00Z", "2027-03-28T01:30:00Z"):
-            last = ka.session_window_starts(Z(now))[-1]
-            self.assertEqual(last + timedelta(hours=5), ka.current_window_end(Z(now)))
-
-    def test_window_start_key(self):
-        # 23:00 CEST on 29.09. -> the window ending 30.09. 09:00; its 04:00 start gets -s2 (D-202)
-        self.assertEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")), "window-start-2026-09-30")
-        self.assertEqual(ka.window_start_key(Z("2026-09-30T02:00:05Z")), "window-start-2026-09-30-s2")
-        self.assertEqual(ka.window_start_key(Z("2026-10-26T22:00:05Z")), "window-start-2026-10-27")
-        self.assertEqual(ka.window_start_key(Z("2026-10-27T03:00:05Z")), "window-start-2026-10-27-s2")
-        self.assertEqual(ka.window_start_key(Z("2027-03-27T22:00:05Z")), "window-start-2027-03-28")
-        self.assertEqual(ka.window_start_key(Z("2027-03-28T02:00:05Z")), "window-start-2027-03-28-s2")
-
-    def test_window_start_dedup_per_session_window_start(self):
-        """D-202: one window-start continue per SESSION-WINDOW START: every moment from a start
-        until the next start (across midnight, incl. the DST nights) has that start's key."""
-        for night, moments in [
-            ("2026-09-30", [("2026-09-29T21:00:05Z", ""), ("2026-09-29T21:59:59Z", ""),
-                            ("2026-09-29T22:30:00Z", ""), ("2026-09-30T01:59:59Z", ""),      # 03:59 CEST
-                            ("2026-09-30T02:00:00Z", "-s2"), ("2026-09-30T06:59:59Z", "-s2")]),
-            ("2026-10-27", [("2026-10-26T22:00:05Z", ""), ("2026-10-26T23:30:00Z", ""),
-                            ("2026-10-27T02:59:59Z", ""), ("2026-10-27T03:00:00Z", "-s2"),
-                            ("2026-10-27T07:59:59Z", "-s2")]),                                # CET
-            ("2026-10-25", [("2026-10-24T21:00:05Z", ""), ("2026-10-25T00:30:00Z", ""),
-                            ("2026-10-25T01:30:00Z", ""), ("2026-10-25T02:59:59Z", ""),       # 03:59 CET
-                            ("2026-10-25T03:00:00Z", "-s2"), ("2026-10-25T07:59:59Z", "-s2")]),  # DST end
-            ("2027-03-28", [("2027-03-27T22:00:05Z", ""), ("2027-03-28T00:59:59Z", ""),
-                            ("2027-03-28T01:59:59Z", ""), ("2027-03-28T02:00:00Z", "-s2"),    # 04:00 CEST
-                            ("2027-03-28T06:59:59Z", "-s2")]),                                # DST start
-        ]:
-            for m, suffix in moments:
-                with self.subTest(m=m):
-                    self.assertEqual(ka.window_start_key(Z(m)), f"window-start-{night}{suffix}")
-        self.assertNotEqual(ka.window_start_key(Z("2026-09-29T21:00:05Z")),
-                            ka.window_start_key(Z("2026-09-30T21:00:05Z")))
+class WindowStartDedup(unittest.TestCase):
+    """The window code itself is schedule.py (test_schedule.py); keepalive dedups per start key."""
 
     def test_window_start_handled_key_not_fired_again_after_midnight(self):
         """handle_fire skips a key already handled (before preflight): a 23:00 window-start
         and a second --window-start run at 00:30 the same night fire once; the 04:00 start has
         its own key (D-202)."""
-        st = {"handled": {ka.window_start_key(Z("2026-09-29T21:00:05Z")): {"result": "continued"}},
+        st = {"handled": {schedule.start_key(Z("2026-09-29T21:00:05Z")): {"result": "continued"}},
               "fires": {}}
         old = ka.preflight
         ka.preflight = lambda *a, **k: self.fail("preflight must not run for a handled key")
         try:
-            stall = {"uuid": ka.window_start_key(Z("2026-09-29T22:30:00Z")), "timestamp": Z("2026-09-29T22:30:00Z")}
+            stall = {"uuid": schedule.start_key(Z("2026-09-29T22:30:00Z")), "timestamp": Z("2026-09-29T22:30:00Z")}
             ka.handle_fire(SID, stall, "window start", st, None)
         finally:
             ka.preflight = old
-        self.assertNotIn(ka.window_start_key(Z("2026-09-30T02:00:05Z")), st["handled"])
-
-
-
-
-class WindowConfig(unittest.TestCase):
-    """The window comes from the window_days setting in the DB (afclaude_config.window); the
-    default is the owner's weekly window 23:00 x 2 session windows = 23:00-09:00 (design §6)."""
-
-    def tearDown(self):
-        setcfg(usage_model="linear")
-        ka.reload_window()
-
-    @staticmethod
-    def days(start, n, **per_day):
-        d = {day: {"start": start, "n": n, "group": "weekly"} for day in ("mon", "tue", "wed", "thu", "fri",
-                                                                          "sat", "sun")}
-        d.update(per_day)
-        return d
-
-    def test_default(self):
-        from datetime import time
-        self.assertEqual(afclaude_config.window(), (time(23, 0), time(9, 0)))
-        ka.reload_window()
-        self.assertEqual((ka.WINDOW_START, ka.WINDOW_END), (time(23, 0), time(9, 0)))
-
-    def test_db_value_is_read(self):
-        from datetime import time
-        setcfg(window_days=self.days("00:00", 1))                  # a same-day window of one session
-        self.assertEqual(afclaude_config.window(), (time(0, 0), time(5, 0)))
-        ka.reload_window()
-        self.assertTrue(ka.in_window(Z("2026-09-25T22:00:00Z")))    # 00:00 CEST
-        self.assertFalse(ka.in_window(Z("2026-09-25T21:00:00Z")))   # 23:00 CEST
-        self.assertFalse(ka.in_window(Z("2026-09-26T03:00:00Z")))   # 05:00 CEST
-        self.assertEqual(ka.next_window_start(Z("2026-09-26T10:00:00Z")), Z("2026-09-26T22:00:00Z"))
-        setcfg(window_days=self.days("22:30", 1), session_hours=4)  # n x session_hours
-        self.assertEqual(afclaude_config.window(), (time(22, 30), time(2, 30)))
-
-    def test_per_day_window_current_or_next(self):
-        """Until schedule.py (2b) the runners know one daily window: the one `now` is in, else
-        the next to start. All nights off: an empty window (never inside)."""
-        from datetime import time
-        setcfg(window_days=self.days("23:00", 2, sat={"start": "20:00", "n": 1, "group": "g1"}, sun=None))
-        sat_2130 = Z("2026-10-03T19:30:00Z")                        # Sat 21:30 CEST: inside Sat's window
-        self.assertEqual(afclaude_config.window(sat_2130), (time(20, 0), time(1, 0)))
-        sat_1200 = Z("2026-10-03T10:00:00Z")                        # Sat noon: Sat's window is next
-        self.assertEqual(afclaude_config.window(sat_1200), (time(20, 0), time(1, 0)))
-        fri_0300 = Z("2026-10-02T01:00:00Z")                        # Fri 03:00: inside Thu's window
-        self.assertEqual(afclaude_config.window(fri_0300), (time(23, 0), time(9, 0)))
-        sun_1200 = Z("2026-10-04T10:00:00Z")                        # Sun off: Mon's window is next
-        self.assertEqual(afclaude_config.window(sun_1200), (time(23, 0), time(9, 0)))
-        ka.reload_window(sat_2130)
-        self.assertTrue(ka.in_window(sat_2130))
-        setcfg(window_days={d: None for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")})
-        ka.reload_window()
-        self.assertEqual((ka.WINDOW_START, ka.WINDOW_END), (time(0, 0), time(0, 0)))
-        self.assertFalse(any(ka.in_window(Z("2026-10-03T00:00:00Z") + timedelta(minutes=30 * i))
-                             for i in range(48)))
-
-    def test_db_unavailable_falls_back_to_the_defaults(self):
-        from datetime import time
-        import store
-        setcfg(window_days=self.days("00:00", 1))
-        old = store.DB_PATH
-        with tempfile.TemporaryDirectory() as d:
-            bad = os.path.join(d, "garbage.db")
-            with open(bad, "w") as fh:
-                fh.write("not a database " * 100)
-            for path in (os.path.join(d, "missing.db"), d, bad):     # no DB; a directory; not a DB
-                store.DB_PATH = path
-                try:
-                    self.assertEqual(afclaude_config.window(), (time(23, 0), time(9, 0)), path)
-                    self.assertEqual(afclaude_config.usage_model(), "pacing")
-                    self.assertEqual(afclaude_config.last_mile_setting(), "auto")
-                finally:
-                    store.DB_PATH = old
-        self.assertEqual(afclaude_config.window(), (time(0, 0), time(5, 0)))   # the DB again
+        self.assertNotIn(schedule.start_key(Z("2026-09-30T02:00:05Z")), st["handled"])
 
 
 class Budget(unittest.TestCase):
@@ -388,14 +167,15 @@ class Budget(unittest.TestCase):
         self.assertFalse(ka.budget_decision(usage(95, Z("2026-10-27T10:00:01Z")), now)[0])
 
     def test_cutoff_dst_nights(self):
-        # DST end: starts 23:30 CEST 24.10., cutoff 25.10. 11:00 CET = 10:00Z
+        # D-148: the window is 10 h absolute, so it ends 08:00 CET / 10:00 CEST on the DST nights
+        # DST end: 23:30 CEST 24.10., the window ends 25.10. 08:00 CET, cutoff 10:00 CET = 09:00Z
         now = Z("2026-10-24T21:30:00Z")
-        self.assertTrue(ka.budget_decision(usage(95, Z("2026-10-25T10:00:00Z")), now)[0])
-        self.assertFalse(ka.budget_decision(usage(95, Z("2026-10-25T10:00:01Z")), now)[0])
-        # DST start: starts 23:30 CET 27.03., cutoff 28.03. 11:00 CEST = 09:00Z
+        self.assertTrue(ka.budget_decision(usage(95, Z("2026-10-25T09:00:00Z")), now)[0])
+        self.assertFalse(ka.budget_decision(usage(95, Z("2026-10-25T09:00:01Z")), now)[0])
+        # DST start: 23:30 CET 27.03., the window ends 28.03. 10:00 CEST, cutoff 12:00 CEST = 10:00Z
         now = Z("2027-03-27T22:30:00Z")
-        self.assertTrue(ka.budget_decision(usage(95, Z("2027-03-28T09:00:00Z")), now)[0])
-        self.assertFalse(ka.budget_decision(usage(95, Z("2027-03-28T09:00:01Z")), now)[0])
+        self.assertTrue(ka.budget_decision(usage(95, Z("2027-03-28T10:00:00Z")), now)[0])
+        self.assertFalse(ka.budget_decision(usage(95, Z("2027-03-28T10:00:01Z")), now)[0])
 
     def test_unknown_usage_fails_safe(self):
         self.assertFalse(ka.budget_decision(None, self.NOW)[0])
@@ -795,7 +575,7 @@ class BudgetWiring(unittest.TestCase):
             d = ka.window_start_pass(SID, start, Args())
             self.assertTrue(d["postpone"], d["reason"])
             self.assertEqual(fired, [])
-            key = ka.window_start_key(start)
+            key = schedule.start_key(start)
             ent = ka.load_deferred()[key]
             self.assertEqual(ka.parse_ts(ent["recheck_at"]), activity + timedelta(minutes=60))
             st = {"handled": {}, "fires": {}}
@@ -817,7 +597,7 @@ class BudgetWiring(unittest.TestCase):
 
     def test_postponed_window_start_dropped_after_the_window(self):
         start = self.NIGHT + timedelta(minutes=2)
-        ka.defer_window_start(ka.window_start_key(start), SID, start + timedelta(minutes=30), "r")
+        ka.defer_window_start(schedule.start_key(start), SID, start + timedelta(minutes=30), "r")
         fired = []
         oldh = ka.handle_fire
         ka.handle_fire = lambda *a: fired.append(a)
@@ -878,7 +658,7 @@ class BudgetWiring(unittest.TestCase):
                               self.S2 + timedelta(minutes=40)], fired)          # at 04:00 -> 04:40: skipped
         try:
             ka.window_start_pass(SID, start, Args())
-            ent = ka.load_deferred()[ka.window_start_key(start)]
+            ent = ka.load_deferred()[schedule.start_key(start)]
             self.assertEqual(ka.parse_ts(ent["deadline"]), self.S2)
             self.assertEqual(ka.parse_ts(ent["recheck_at"]), start + timedelta(hours=2, minutes=30))
             os.remove(ka.DEFER_FILE)
@@ -897,7 +677,7 @@ class BudgetWiring(unittest.TestCase):
         (the next start's key) -> dropped as stale, never fired late."""
         fired, st = [], {"handled": {}, "fires": {}}
         start = self.NIGHT + timedelta(seconds=5)
-        key = ka.window_start_key(start)
+        key = schedule.start_key(start)
         olds = self._patched([self.S2 + timedelta(minutes=20)], fired)         # 03:00 -> 04:20
         try:
             ka.defer_window_start(key, SID, self.S2 - timedelta(hours=1), "r", self.S2)
@@ -947,7 +727,7 @@ class BudgetWiring(unittest.TestCase):
         class Armed(Args):
             arm = True
         try:
-            ka.save_state({"handled": {ka.window_start_key(self.NIGHT): {"result": "continued-in-place"}},
+            ka.save_state({"handled": {schedule.start_key(self.NIGHT): {"result": "continued-in-place"}},
                            "fires": {}})
             ka.window_start_pass(SID, self.S2 + timedelta(seconds=5), Armed())
             ka.window_start_pass(SID, self.S2 + timedelta(minutes=30), Armed())
@@ -990,7 +770,7 @@ class BudgetWiring(unittest.TestCase):
         finally:
             ka.PROJECTS_DIR = old
         start = self.NIGHT + timedelta(seconds=5)
-        ka.defer_window_start(ka.window_start_key(start), SID, start + timedelta(hours=1), "r", self.S2)
+        ka.defer_window_start(schedule.start_key(start), SID, start + timedelta(hours=1), "r", self.S2)
         self.assertEqual(ka.pending_deferral(SID, start + timedelta(minutes=30)), start + timedelta(hours=1))
         self.assertIsNone(ka.pending_deferral("other", start + timedelta(minutes=30)))
         self.assertIsNone(ka.pending_deferral(SID, self.S2 + timedelta(minutes=1)))   # the next start's key

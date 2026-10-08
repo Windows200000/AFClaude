@@ -90,6 +90,9 @@ class WindowInfo(unittest.TestCase):
         self.assertEqual(out["next_window_berlin"], "Wed 30.09. 23:00 CEST")
         out = qv.window_info(self.Z("2026-10-25T12:00:00Z"))        # first CET evening
         self.assertEqual(out["next_window_berlin"], "Sun 25.10. 23:00 CET")
+        out = qv.window_info(self.Z("2026-10-24T23:00:00Z"))        # the DST-end night: 10 h absolute (D-148)
+        self.assertEqual(out["window_berlin"], "23:00–08:00")
+        self.assertEqual(out["window_end_berlin"], "Sun 25.10. 08:00 CET")
 
 
 
@@ -203,10 +206,11 @@ class NextRunBlock(unittest.TestCase):
         """D-202: Mon 08:18 Berlin with a passing gate and nothing running -> 'Holding until' the
         next session-window start (Mon 23:00), not 'Running now'; at 04:05 (a due start) -> now."""
         import pacing
-        from datetime import time as dtime, timedelta, timezone
+        import schedule
+        from datetime import timedelta, timezone
         Z = timezone.utc
         reset = datetime(2026, 10, 8, 17, 0, tzinfo=Z)
-        win = (dtime(23, 0), dtime(9, 0))
+        win = schedule.Config.every_day()
         tmp = tempfile.TemporaryDirectory()
         olds = (pacing.SAMPLES_FILE, pacing.FIRE_FILES, qv.runner_state)
         pacing.SAMPLES_FILE = os.path.join(tmp.name, "samples.jsonl")

@@ -4,7 +4,7 @@ Settings: everything the dashboard can change (window, budget, pacing, dispatche
 lives in the DB `settings` table, typed in actions.SETTINGS with its code default (D-169).
 Every runner reads it through ONE accessor, setting(name): the saved value, else the code
 default (DB > code default; no file and no env overrides a setting). A long-running runner
-re-reads per loop (keepalive.reload_window). If the DB can't be read, setting() logs it once
+re-reads per loop (schedule.py reads the window settings on every call). If the DB can't be read, setting() logs it once
 and returns the code default (the full DB error path is phase 2a step 3, §7.8 / D-171).
 
 Machine identity stays in the local file data/afclaude.json (gitignored; or $AFCLAUDE_CONFIG;
@@ -24,7 +24,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -34,8 +34,8 @@ CONFIG_FILE = os.environ.get("AFCLAUDE_CONFIG", os.path.join(HERE, "data", "afcl
 DISPATCHER_CONFIG_FILE = os.path.join(os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data")),
                                       "dispatcher.json")
 USER_MODEL_FILE = os.path.join(os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data")), "user_model.json")
-SESSION_LENGTH = timedelta(hours=5)          # one Claude session-limit window (code constant; 2b: session_hours)
-BERLIN = ZoneInfo("Europe/Berlin")           # the runners' wall clock until schedule.py (2b) reads window_tz
+SESSION_LENGTH = timedelta(hours=5)          # one Claude session-limit window (code constant; schedule.py reads session_hours)
+BERLIN = ZoneInfo("Europe/Berlin")           # log time stamps (the windows are in window_tz: schedule.py)
 USAGE_MODELS = ("pacing", "linear")
 RESERVE_THRESHOLD_RANGE = (50.0, 99.0)
 
@@ -148,41 +148,6 @@ def pacing_params() -> dict[str, Any]:
     s = settings("pacing_idle_min", "pacing_min_gap", "pacing_session_cap", "pacing_last_mile_yield")
     return {"idle_min": s["pacing_idle_min"], "min_gap": s["pacing_min_gap"],
             "session_cap": s["pacing_session_cap"], "last_mile_yield": s["pacing_last_mile_yield"]}
-
-
-def window_for(days: dict, session_hours: float, now: datetime | None = None) -> tuple[dtime, dtime]:
-    """(start, end) Berlin wall-clock times of one automation window of window_days: the one
-    `now` is in, else the next one to start (end exclusive; end < start = spans midnight; the
-    end is start + n x session_hours on the wall clock). The runners still know one daily
-    window (per-weekday windows and DST-exact lengths are schedule.py, phase 2b). No window on
-    any day -> (start, start) = empty: never inside."""
-    now = (now or datetime.now(BERLIN)).astimezone(BERLIN)
-    week = 7 * 1440
-    now_m = now.weekday() * 1440 + now.hour * 60 + now.minute
-    best = None
-    for i, d in enumerate(("mon", "tue", "wed", "thu", "fri", "sat", "sun")):
-        w = days.get(d)
-        if not w:
-            continue
-        h, m = (int(x) for x in str(w["start"]).split(":"))
-        length = min(int(round(w["n"] * session_hours * 60)), 1439)   # a 24-h window can't be told from none
-        s = i * 1440 + h * 60 + m
-        if any(s + k <= now_m < s + k + length for k in (-week, 0)):
-            rank = -1                                       # the window we are in
-        else:
-            rank = (s - now_m) % week                       # minutes until it starts
-        if best is None or rank < best[0]:
-            best = (rank, h * 60 + m, length)
-    if best is None:
-        return dtime(0, 0), dtime(0, 0)
-    start, end = best[1], (best[1] + best[2]) % 1440
-    return dtime(start // 60, start % 60), dtime(end // 60, end % 60)
-
-
-def window(now: datetime | None = None) -> tuple[dtime, dtime]:
-    """The automation window from the window_days and session_hours settings (window_for)."""
-    s = settings("window_days", "session_hours")
-    return window_for(s["window_days"], s["session_hours"], now)
 
 
 # ---- machine identity (dashboard design §7.3), the local file. Committed template with
@@ -389,4 +354,5 @@ if __name__ == "__main__":
     else:
         for k, v in settings().items():
             print(f"{k} = {json.dumps(v)}")
-        print(f"window (Berlin, now) = {'%s-%s' % tuple(t.strftime('%H:%M') for t in window())}")
+        import schedule
+        print(f"schedule = {schedule.describe()}")

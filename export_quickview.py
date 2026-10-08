@@ -332,16 +332,19 @@ def limits_from_snapshot(snap):
 
 
 def window_info(now):
-    """The nightly window for the page: its wall-clock span, whether `now` is inside, the
-    current window's end, and the NEXT window's start (after the current one if inside;
-    the window spans midnight, so that is this evening or tomorrow evening)."""
-    inside = ka.in_window(now)
-    end = ka.current_window_end(now)
-    nxt = ka.next_window_start(end if inside else now)
-    return {"window_berlin": f"{ka.WINDOW_START:%H:%M}–{ka.WINDOW_END:%H:%M}",
-            "in_window": inside,
-            "window_end_berlin": bstr(end) if inside else None,
-            "next_window_berlin": bstr(nxt)}
+    """The automation window for the page (schedule.py): the current window's wall-clock span in
+    window_tz (else the next one's), whether `now` is inside, the current window's end, and the
+    NEXT window's start (after the current one if inside). No window on any day: "off"."""
+    import schedule
+    cfg = schedule.load()
+    cur = schedule.current_window(now, cfg)
+    show = cur or schedule.next_window(now, cfg)
+    nxt = schedule.next_window(cur.start if cur else now, cfg)
+    return {"window_berlin": show.span() if show else "off",
+            "window_tz": cfg.tz,
+            "in_window": cur is not None,
+            "window_end_berlin": bstr(cur.end) if cur else None,
+            "next_window_berlin": bstr(nxt.start) if nxt else None}
 
 
 def threshold_block(now, decision=None):
@@ -479,7 +482,6 @@ def cron_berlin(sched):
 
 def main():
     now = datetime.now(UTC)
-    ka.reload_window(now)        # the window_days setting (DB) as of now
     os.makedirs(OUT, exist_ok=True)
     os.chmod(OUT, 0o755)
 

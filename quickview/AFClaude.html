@@ -275,7 +275,7 @@ button.chip.sel { border-color: #a855f7; }
     out.push(tile("tmux ka-f2897285", k.tmux_ka_exists ? '<span class="ok">up</span>' : '<span class="bad">down</span>'));
     out.push(tile(k.in_window ? "Window (now)" : "Next window",
       k.in_window ? '<span class="ok">until ' + esc(k.window_end_berlin || "?") + "</span>" : esc(k.next_window_berlin || "?"),
-      '<div class="mut">' + esc(k.window_berlin || "") + " Berlin" + (k.in_window ? ", next " + esc(k.next_window_berlin || "?") : "") + "</div>"));
+      '<div class="mut">' + esc(k.window_berlin || "") + " " + esc(k.window_tz || "Europe/Berlin") + (k.in_window ? ", next " + esc(k.next_window_berlin || "?") : "") + "</div>"));
     out.push(tile("Next usage review", esc(k.next_usage_review_berlin || "–")));
     $("usage").innerHTML = out.join("");
   }

@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
@@ -229,7 +229,8 @@ class Accessor(FileCase):
         self.assertEqual(len([ln for ln in self.logs if "no database" in ln]), 1)   # once, not every loop
         with open(store.DB_PATH, "w") as fh:
             fh.write("garbage " * 200)
-        self.assertEqual(ac.window(), (dtime(23, 0), dtime(9, 0)))
+        import schedule
+        self.assertEqual(schedule.load(), schedule.Config.every_day())          # the code defaults
         self.assertTrue(any("unreadable (DatabaseError" in ln for ln in self.logs), self.logs)
         os.unlink(store.DB_PATH)
         store.connect(store.DB_PATH, create=True).close()    # restored: a deliberate act, not automatic
@@ -259,7 +260,6 @@ class RunnersReadTheDB(unittest.TestCase):
 
     def tearDown(self):
         testenv.clear_settings()
-        self.ka.reload_window()
 
     def usage(self, pct):
         return {"fetched_at": self.R, "weekly": {"percent": pct, "resets_at": self.R},
@@ -288,15 +288,19 @@ class RunnersReadTheDB(unittest.TestCase):
         self.assertFalse(self.ka.in_last_mile(now, self.usage(95)))
         self.assertEqual(self.ka.last_mile_hours(95), 0.0)
 
-    def test_reload_window_and_the_quickview(self):
+    def test_the_window_settings_and_the_quickview(self):
+        """schedule.py reads window_days / session_hours / window_tz on every call."""
         import export_quickview as qv
+        import schedule
         testenv.setcfg(usage_model="linear",
                        window_days={d: {"start": "21:30", "n": 1, "group": "weekly"} for d in DAYS})
-        self.ka.reload_window()
-        self.assertEqual((self.ka.WINDOW_START, self.ka.WINDOW_END), (dtime(21, 30), dtime(2, 30)))
+        self.assertEqual(schedule.current_or_next(self.R).span(), "21:30–02:30")
         self.assertEqual(qv.window_info(self.R)["window_berlin"], "21:30–02:30")
+        testenv.setcfg(usage_model="linear", window_tz="America/New_York", session_hours=4)
+        info = qv.window_info(self.R)
+        self.assertEqual((info["window_berlin"], info["window_tz"]), ("23:00–07:00", "America/New_York"))
+        self.assertEqual(info["next_window_berlin"], "Fri 02.10. 05:00 CEST")   # 23:00 EDT
         testenv.setcfg(usage_model="linear")
-        self.ka.reload_window()
         self.assertEqual(qv.window_info(self.R)["window_berlin"], "23:00–09:00")
 
 
