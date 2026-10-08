@@ -5,6 +5,7 @@ Writes into data/quickview/ (gitignored), which the key-gated nginx in quickview
 serves at /afclaude/:
 
   status.json   keepalive+usage (incl. when the next run takes place, pacing.next_run,
+                the session fill time of AFClaude's runs, run_metrics.summary,
                 and the reserve threshold and the model's accuracy,
                 pacing.threshold_info), progress (from GOALS.md, plus the
                 project's stages from the task store as a phase strip), latest keep-alive
@@ -42,6 +43,7 @@ SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manag
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 UTC = timezone.utc
+RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # run_metrics.py rows (the sampler writes them)
 
 DOCS = [  # (published name, source, title)
     ("PROGRESS.md", os.path.join(HERE, "PROGRESS.md"), "Progress log"),
@@ -402,6 +404,7 @@ def keepalive_and_usage(now):
            **window_info(now)}
     rev = usage_review()
     out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
+    out["fill"] = fill_block()
     if not u:
         out["usage_error"] = "no usage cache in ~/.claude.json"
         out["next_run"] = next_run_block(None, now)
@@ -417,6 +420,16 @@ def keepalive_and_usage(now):
     out["limits"] = limits_block()
     out["threshold"] = threshold_block(now, d)
     return out
+
+
+def fill_block():
+    """How long AFClaude's runs take to fill the session limit (D-207, run_metrics.summary over
+    data/afclaude_runs.jsonl, which the sampler keeps): the last run and the median."""
+    try:
+        import run_metrics
+        return run_metrics.summary(run_metrics.read_rows(RUNS_FILE))
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def usage_review():

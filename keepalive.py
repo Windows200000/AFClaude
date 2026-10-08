@@ -984,6 +984,7 @@ def save_state(st):
 
 RUN_IDLE = timedelta(minutes=15)      # run_active(): the run's transcripts were written this recently
 RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # fires that started a run
+RUN_READING_EVERY = timedelta(minutes=5)  # = run_metrics.RUN_SAMPLE_EVERY: extra usage readings during a run
 
 
 def run_active(session_id, now, st=None):
@@ -1101,7 +1102,7 @@ def run(args):
     log(f"keepalive start ({mode}) target={sid} window {WINDOW_START:%H:%M}-{WINDOW_END:%H:%M} Europe/Berlin pid={os.getpid()}")
     st = load_state()
     last_line = None
-    next_eval = datetime.min.replace(tzinfo=UTC)
+    next_eval = next_reading = datetime.min.replace(tzinfo=UTC)
     while True:
         if os.path.exists(STOP_FILE):
             log("STOP file present, exiting")
@@ -1128,6 +1129,9 @@ def run(args):
         # a postponed session-window start (D-018/D-202), also when the previous run ended at a
         # limit (D-204: "limit hit before 4am and the next run starts at 4am")
         deferred_window_start_pass(sid, now, st, args)
+        if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
+            next_reading = now + RUN_READING_EVERY
+            watch_run_usage(sid, now)
         if args.once:
             return
         time.sleep(POLL_SECONDS)
@@ -1364,6 +1368,26 @@ def deferred_window_start_pass(sid, now, st, args):
     return None
 
 
+def _fire_usage():
+    """The usage cache at a fire (session/weekly %, reset times, fetch time; the start decision
+    just refreshed it), JSON-safe, or None. Never fails a fire."""
+    try:
+        import run_metrics
+        return run_metrics.fire_usage(read_usage_cache())
+    except Exception:   # noqa: BLE001 - advisory: run_metrics falls back to the sampler rows
+        return None
+
+
+def watch_run_usage(sid, now):
+    """While a run is going: one extra usage reading per run_metrics.RUN_SAMPLE_EVERY into
+    data/run_usage.jsonl (D-207, the fill-time measurement). Never fails the watcher."""
+    try:
+        import run_metrics
+        run_metrics.watch_sample(sid, now)
+    except Exception as e:   # noqa: BLE001 - advisory
+        log(f"run usage reading failed: {type(e).__name__}: {e}")
+
+
 def handle_fire(sid, stall, reason, st, args):
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
@@ -1392,10 +1416,12 @@ def handle_fire(sid, stall, reason, st, args):
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})")
         return
     sent_at = datetime.now(UTC)
+    at_fire = _fire_usage()          # the run's start values (run_metrics.py, D-207)
     rc, out, err = fire(sid, cwd, msg, plan)
     st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
-    result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason}
+    result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
+              "session": sid, "usage": at_fire}
     reply = verify_reply(path, sent_at) if rc == 0 else None
     live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
     result["env"] = [process_env_flags(a["pid"]) for a in live]

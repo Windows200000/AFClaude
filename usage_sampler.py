@@ -29,6 +29,8 @@ Per run:
     check (by model). A separate, purely algorithmic load estimate (model-
     weighted token volume vs. fixed thresholds) is computed and logged
     alongside Haiku's answer for comparison. Haiku's own cost is recorded too.
+  - the AFClaude runs' fill-time rows (run_metrics.py, D-207): data/afclaude_runs.jsonl,
+    recomputed until each run's row is final
 
 Times in rows are UTC ISO plus Berlin-local convenience fields.
 """
@@ -587,6 +589,24 @@ def stale_alert(st, usage, t, notify_fn=None):
     return True
 
 
+# ------------------------------------------------------------------ AFClaude runs (D-207)
+
+RUNS = os.path.join(DATA, "afclaude_runs.jsonl")      # one row per AFClaude run (run_metrics.py)
+RUN_USAGE = os.path.join(DATA, "run_usage.jsonl")     # the watcher's extra readings during runs
+
+
+def update_runs(t):
+    """The fill-time rows of every AFClaude run not final yet, with this sample included
+    (run_metrics.update; the first call backfills all past runs). Never sinks the sample."""
+    try:
+        import run_metrics
+        rows = run_metrics.update(now=t, out_path=RUNS, samples_path=SAMPLES, watch_path=RUN_USAGE)
+        return len(rows)
+    except Exception as e:   # noqa: BLE001 - advisory
+        print(f"run metrics failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+
 # ------------------------------------------------------------------ main
 
 def main():
@@ -630,6 +650,7 @@ def main():
         pass
     if not stale:                     # a frozen % would fake the cycle's max / pre-reset value
         track_cycle(usage, t, args.tag)
+    update_runs(t)
     stale_alert(st, usage, t)
     if not args.no_haiku and args.tag == "cron":
         haiku_judgement(st, t)

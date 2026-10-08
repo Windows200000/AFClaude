@@ -182,6 +182,32 @@ button.chip.sel { border-color: #a855f7; }
     return tile(k, pc + "%", '<div class="bar"><div class="' + (pc >= 80 ? "hi" : "") + '" style="width:' +
       Math.min(100, pc) + '%"></div></div><div class="mut">resets ' + esc(u.resets_at_berlin || "?") + "</div>");
   }
+  function hm(min) {
+    if (min == null) return "?";
+    var m = Math.round(min);
+    return Math.floor(m / 60) + "h" + ("0" + (m % 60)).slice(-2) + "m";
+  }
+  // D-207: how long an AFClaude run takes to fill the session limit (run_metrics.summary)
+  function fillTile(f) {
+    if (!f) return tile("Session fill time", "–");
+    if (f.error) return tile("Session fill time", "–", '<div class="mut">' + esc(f.error) + "</div>");
+    if (!f.n) return tile("Session fill time", "–", '<div class="mut">no AFClaude run recorded yet</div>');
+    var l = f.last || {}, v, lines = [];
+    if (l.fill_min != null) v = hm(l.fill_min) + " to 100%";
+    else if (l.fill_min_est != null) v = "~" + hm(l.fill_min_est) + " est.";
+    else v = "–";
+    lines.push('<div class="mut">' + (l.ongoing ? "running since " : "last run ") + esc(l.start_berlin || "?") + " (" +
+      esc(l.kind || "?") + "): " + (l.session_start_pct != null ? l.session_start_pct : "?") + "% → " +
+      (l.session_end_pct != null ? l.session_end_pct : "?") + "% in " + hm(l.duration_min) +
+      (l.ongoing ? "" : ", ended: " + esc(l.end_reason || "?") + (l.limit_kind ? " (" + esc(l.limit_kind) + ")" : "")) + "</div>");
+    if (l.rate_pct_per_h != null) lines.push('<div class="mut">' + l.rate_pct_per_h + " session %/h" +
+      (l.t95_min != null ? " · 95% after " + hm(l.t95_min) : "") +
+      (l.weekly_delta != null ? " · week +" + l.weekly_delta + "%" : "") + "</div>");
+    lines.push('<div class="mut">median empty → full: ' + (f.median_empty_to_full_min != null ? hm(f.median_empty_to_full_min) : "–") +
+      (f.p25_p75_empty_to_full_min ? " (IQR " + hm(f.p25_p75_empty_to_full_min[0]) + "–" + hm(f.p25_p75_empty_to_full_min[1]) + ")" : "") +
+      " over " + (f.n_rated || 0) + " of " + f.n + " runs</div>");
+    return tile("Session fill time", v, lines.join(""));
+  }
   function renderUsage(s) {
     var k = s.keepalive || {}, out = [];
     if (k.usage_error) out.push(tile("Usage", "–", '<div class="mut">' + esc(k.usage_error) + "</div>"));
@@ -200,6 +226,7 @@ button.chip.sel { border-color: #a855f7; }
         '<div class="mut"><strong>' + esc(nr.label || nr.kind) + "</strong></div>" +
         (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "") + exTxt));
     }
+    out.push(fillTile(k.fill));
     var lim = k.limits || {};
     if (lim.ratio_pref != null && lim.ratio_pref_source === "windows") {
       out.push(tile("Session→week ratio", lim.ratio_pref + (lim.ratio_spread != null ? " ± " + lim.ratio_spread : ""),
