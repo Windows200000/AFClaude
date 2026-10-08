@@ -117,6 +117,21 @@ class LimitsBlock(unittest.TestCase):
         self.assertEqual((b["windows_per_week_pref"], b["windows_left_pref"]), (6.5, 5.2))
         self.assertEqual(b["ratio_median"], 0.1333)   # old field unchanged
 
+    def test_share_method(self):
+        b = qv.limits_from_snapshot(self.OLD)                # older snapshot: the token split by session
+        self.assertEqual((b["share_method"], b["own_share_week"]), ("tokens", 1.0))
+        self.assertIsNone(b["own_pct_week"])
+        snap = dict(self.OLD, attribution={
+            "week_share": {"status": "ok", "method": "time", "own_share": 0.12, "other_share": 0.88,
+                           "own_pct": 9.0, "user_pct": 66.04, "user_unseen_pct": 12.0,
+                           "runs_in_cycle": 1, "run_hours": 2.5},
+            "week_share_tokens": {"status": "ok", "own_share": 0.94376, "other_share": 0.05624}})
+        b = qv.limits_from_snapshot(snap)
+        self.assertEqual((b["share_method"], b["own_share_week"], b["user_share_week"]), ("time", 0.12, 0.88))
+        self.assertEqual((b["own_pct_week"], b["user_pct_week"], b["user_unseen_pct_week"]), (9.0, 66.0, 12.0))
+        self.assertEqual((b["runs_week"], b["run_hours_week"]), (1, 2.5))
+        self.assertEqual(b["afc_session_token_share_week"], 0.944)
+
 
 class ThresholdBlock(unittest.TestCase):
     """The keep-alive + usage section carries pacing.threshold_info() (the reserve threshold,

@@ -294,6 +294,7 @@ def limits_from_snapshot(snap):
     rw = snap.get("ratio_windows") or {}
     pref = snap.get("preferred_ratio") or {}
     share = (snap.get("attribution") or {}).get("week_share") or {}
+    tok = (snap.get("attribution") or {}).get("week_share_tokens") or {}
 
     def r4(x):
         return round(x, 4) if x is not None else None
@@ -314,6 +315,16 @@ def limits_from_snapshot(snap):
         "share_status": share.get("status"),
         "own_share_week": r3(share.get("own_share")),
         "user_share_week": r3(share.get("other_share")),
+        # "time": weekly % risen during autonomous AFClaude runs vs everything else (the owner's
+        # chats with the task-manager and other devices are user usage); absent = an older
+        # snapshot whose share was the token split by session (it counted those chats as AFClaude)
+        "share_method": share.get("method") or ("tokens" if share.get("status") else None),
+        "own_pct_week": r1(share.get("own_pct")),
+        "user_pct_week": r1(share.get("user_pct")),
+        "user_unseen_pct_week": r1(share.get("user_unseen_pct")),
+        "runs_week": share.get("runs_in_cycle"),
+        "run_hours_week": r1(share.get("run_hours")),
+        "afc_session_token_share_week": r3(tok.get("own_share")) if tok.get("status") == "ok" else None,
         "as_of": snap.get("generated_at"),
         # per-session-window estimate (limit_ratio.estimate_window_ratio) and the
         # ratio consumers should use; absent in snapshots older than this field

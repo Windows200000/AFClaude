@@ -447,18 +447,31 @@ def fire_times(files=None):
 
 def autonomous_spans(rows, fires):
     """[(start, end)]: from each fire to the next AFClaude-session prompt that is not the fire's
-    own typed-in message (the user came back), at most AUTO_MAX."""
+    own typed-in message (the user came back), or to the start of the first sample interval after
+    the fire with no AFClaude turn at all (the run went idle, as keepalive.RUN_IDLE), at most
+    AUTO_MAX. Everything outside these spans is user usage, including the owner's own chats with
+    the task-manager session (D-018) and rises no local transcript explains. The fires' typed-in messages are
+    counted by the first sample after them (samples are 15 min apart), so a sample's own prompts
+    are reduced by the fires inside its interval first (as usage_model.user_signal does); without
+    that, every run ended at its first sample and its usage was fitted as the user's."""
     spans = []
     for f in fires:
         end = f + AUTO_MAX
+        prev_t = None
         for r in rows:
             t = _ts(r["at"])
+            start, prev_t = _ts(r.get("since")) or prev_t or t - timedelta(minutes=15), t
             if t <= f + FIRE_SLACK:
                 continue
             if t >= end:
                 break
-            if _count(_dict(_dict(r.get("activity")).get("own")), "human_prompts"):
+            act = r.get("activity")
+            own = _dict(_dict(act).get("own"))
+            if _count(own, "human_prompts") > sum(1 for x in fires if start - FIRE_SLACK < x <= t):
                 end = t
+                break
+            if start >= f and isinstance(act, dict) and "own" in act and not any(_count(own, k) for k in TURNS):
+                end = start      # a whole sample interval without an AFClaude turn: the run is over
                 break
         spans.append((f, end))
     return spans

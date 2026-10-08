@@ -138,6 +138,24 @@ class RatioSnapshot(unittest.TestCase):
         snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
         self.assertEqual(snap["ratio_windows"]["n"], 1)   # derived from rows instead
 
+    def test_time_split_uses_the_run_spans(self):
+        from datetime import timedelta
+        rows, end = self.rows()
+        old = us.limit_ratio.load_autonomous_spans
+        try:
+            us.limit_ratio.load_autonomous_spans = lambda rows, now=None, runs_path=None: []
+            snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
+            share = snap["attribution"]["week_share"]
+            self.assertEqual((share["method"], share["status"], share["other_share"]), ("time", "ok", 1.0))
+
+            def boom(*a, **k):
+                raise OSError("x")
+            us.limit_ratio.load_autonomous_spans = boom          # never sinks the sample
+            snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
+            self.assertEqual(snap["attribution"]["week_share"]["status"], "insufficient_data")
+        finally:
+            us.limit_ratio.load_autonomous_spans = old
+
 
 if __name__ == "__main__":
     unittest.main()

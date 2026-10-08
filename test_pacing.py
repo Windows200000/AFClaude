@@ -297,10 +297,12 @@ class Predictor(unittest.TestCase):
         while t < self.OLD:
             lt = t.astimezone(pm.BERLIN)
             rate = tue_rate if lt.weekday() == 1 and 9 <= lt.hour < 21 else other_rate
-            if burn and burn[0] <= t < burn[1]:
+            busy = bool(burn and burn[0] <= t < burn[1])
+            if busy:
                 rate += 5.0
             w += rate / 4
-            rows.append(row(t + timedelta(minutes=15), round(w, 4), reset=self.OLD))
+            rows.append(row(t + timedelta(minutes=15), round(w, 4), reset=self.OLD,
+                            own={"assistant_turns": 3} if busy else None))
             t += timedelta(minutes=15)
         return rows
 
@@ -336,6 +338,27 @@ class Predictor(unittest.TestCase):
                 r["activity"]["own"] = {"human_prompts": 1}
         back, _ = pm.fit_profile(rows, [fire], R)
         self.assertAlmostEqual(sum(back), 10.0, places=3)
+
+    def test_autonomous_span_ends_when_the_run_goes_idle_not_at_its_own_prompt(self):
+        f = Z("2026-10-01T12:00:32Z")
+        rows = [row(f - timedelta(seconds=32) + timedelta(minutes=15 * i)) for i in range(8)]
+        for i in (1, 2, 3):                                  # the run's turns 12:00-12:45
+            rows[i]["activity"]["own"] = {"assistant_turns": 5}
+        rows[1]["activity"]["own"]["human_prompts"] = 1      # the fire's typed-in message (12:15 sample)
+        self.assertEqual(pm.autonomous_spans(rows, [f]), [(f, Z("2026-10-01T12:45:00Z"))])   # idle from 12:45
+        # a duplicate fire a minute later types a second message into the same interval
+        rows[1]["activity"]["own"]["human_prompts"] = 2
+        f2 = f + timedelta(minutes=1)
+        self.assertEqual(pm.autonomous_spans(rows, [f, f2])[0], (f, Z("2026-10-01T12:45:00Z")))
+        # the owner typing into the session during the run still ends the span there
+        rows[1]["activity"]["own"]["human_prompts"] = 1
+        rows[2]["activity"]["own"]["human_prompts"] = 1
+        self.assertEqual(pm.autonomous_spans(rows, [f]), [(f, Z("2026-10-01T12:30:00Z"))])
+        # rows without activity data (sampler scan failed) do not end a span
+        rows[3]["activity"] = None
+        rows[4]["activity"]["own"] = {"assistant_turns": 2}
+        rows[2]["activity"]["own"]["human_prompts"] = 0
+        self.assertEqual(pm.autonomous_spans(rows, [f]), [(f, Z("2026-10-01T13:00:00Z"))])
 
     def test_fire_times(self):
         with tempfile.TemporaryDirectory() as d:

@@ -548,7 +548,11 @@ def ratio_snapshot(rows, t, windows_path=None):
         stored, _new = limit_ratio.append_new_windows(rows, path=windows_path, now=t)
     except Exception:   # noqa: BLE001
         stored = None
-    return limit_ratio.compute(rows, now=t, windows=stored)
+    try:   # the autonomous AFClaude runs: the time-based AFClaude vs user split of the week
+        spans = limit_ratio.load_autonomous_spans(rows, now=t, runs_path=RUNS)
+    except Exception:   # noqa: BLE001 - the split is then reported as unavailable
+        spans = None
+    return limit_ratio.compute(rows, now=t, windows=stored, spans=spans)
 
 
 # ------------------------------------------------------------------ stale-usage alert
