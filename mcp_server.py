@@ -451,7 +451,7 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
             raise ValueError("add needs scope, match and decision")
         m: str | None = match.strip()
         if scope == "session":
-            m = cli.resolve_session(conn, m)
+            m = cli.resolve_session(conn, match.strip())
         else:
             m = await resolve_dir_arg(ctx, m)
         r = act(conn, "rule.add", scope=scope, match=m, decision=decision, note=note)

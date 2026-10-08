@@ -738,7 +738,8 @@ def session_history(conn: sqlite3.Connection, session_id: str) -> list[Row]:
 
 
 def counts(conn: sqlite3.Connection) -> dict[str, int]:
-    one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
+    def one(sql: str) -> int:
+        return int(conn.execute(sql).fetchone()[0])
     return {"sessions": one("SELECT COUNT(*) FROM sessions"),
             "hits": one("SELECT COUNT(*) FROM limit_hits"),
             "sessions_with_hits": one("SELECT COUNT(DISTINCT session_id) FROM limit_hits"),
