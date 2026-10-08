@@ -3,7 +3,7 @@
 Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN_QUESTIONS.md)
 
 0a. [ ] Compaction for long-running sessions (D-144, D-155, D-191): built as design phase 3c (needs 3a runner + 3b task-manager unification); store hand-offs in the DB.
-0c. [ ] NEXT SESSION: verify the "AFClaude vs user (week)" split on the temp dashboard. The owner believes they used more than the ~6% shown as theirs this week (their interactive sessions incl. the long AFClaude chats of 04.10. count as user usage). Find what limit_ratio/usage_sampler attribute to "own" vs "other", fix the attribution if wrong (goal 12 usage split), report the corrected numbers.
+0c. [x] Usage split fixed 08.10. (b783ff3): time-based (weekly rise during autonomous runs = AFClaude, all else = user); this week 0% AFClaude / 100% user; pacing spans no longer cut at the fire's own message (user share 51% → 47%).
 0b. [x] Architecture review with the owner done 04.10. (D-143..D-199); design v2 in docs/dashboard_design.md.
 1. [x] Night starts verified and reworked 07.10.: the gate runs at each session-window start (23:00, 04:00; D-202/D-203), no continue after a session limit (D-204).
 2. [x] Host-wide stalled-session detector + SQLite store (`stalled.py`, `store.py`), 29.09.
