@@ -665,6 +665,15 @@ SETTINGS: dict[str, Setting] = {
                                  'below this weekly %', "budget"),
     "cutoff_after_window_hours": _num(2, 0, 24, "Linear model: a weekly reset this many hours after the "
                                       "window end still continues (11:00 after a 09:00 end)", "budget"),
+    # --- the task-manager's session stop and the fill-up run (D-014, D-212)
+    "session_stop_pct": _num(95, 50, 99, "At night the task-manager stops cleanly once the session window is at "
+                             "this % (D-014; the manager prompt reads it); a fill-up run uses the rest",
+                             "budget"),
+    "fillup_enabled": _flag(True, "Fill-up run (D-212): after a run ended early, continue the task-manager "
+                            "once more shortly before the session reset to use the rest of the session window",
+                            "budget"),
+    "fillup_factor": _num(1.10, 1.0, 3.0, "Fill-up start = session reset - (100 - session %) / measured fill "
+                          "rate x this factor (D-212)", "budget"),
     # --- automation
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
                                "on); read by the resident runner (phase 3a)", "automation", important=True),

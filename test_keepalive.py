@@ -42,6 +42,7 @@ def setUpModule():
     setcfg(usage_model="linear")
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
     ka.DEFER_FILE = os.path.join(_CFG_DIR.name, "deferred.json")
+    ka.FILLUP_FILE = os.path.join(_CFG_DIR.name, "fillup.json")   # the fill-up plan (D-212)
     budget.FIRE_FILES = []
     # window-start usage bookkeeping (note_window_usage): a temp state file, never ALERTS.md / a push
     ka.USAGE_STATE_FILE = os.path.join(_CFG_DIR.name, "usage_refresh_state.json")
