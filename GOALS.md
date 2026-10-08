@@ -4,7 +4,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 
 0a. [ ] Compaction for long-running sessions (D-144, D-155, D-191): built as design phase 3c (needs 3a runner + 3b task-manager unification); store hand-offs in the DB.
 0c. [x] Usage split fixed 08.10. (b783ff3): time-based (weekly rise during autonomous runs = AFClaude, all else = user); this week 0% AFClaude / 100% user; pacing spans no longer cut at the fire's own message (user share 51% → 47%).
-0e. [ ] NEXT RUN: stage ETA prediction (D-213): cumulative ETA per project stage (done in 3 d, next in 4, next in 6, …) from measured work per stage + the predicted AFClaude budget per day; shown on the temp dashboard; plus a rare review like the usage review. Research existing approaches first.
+0e. [ ] NEXT RUN: stage ETA prediction (D-213): cumulative ETA per project stage (done in 3 d, next in 4, next in 6, …) = sessions required per stage (the only new estimate) / (total available − predicted user usage, from the usage prediction), cumulative; shown on the temp dashboard; plus a rare review like the usage review. Research existing approaches first.
 0b. [x] Architecture review with the owner done 04.10. (D-143..D-199); design v2 in docs/dashboard_design.md.
 1. [x] Night starts verified and reworked 07.10.: the gate runs at each session-window start (23:00, 04:00; D-202/D-203), no continue after a session limit (D-204).
 2. [x] Host-wide stalled-session detector + SQLite store (`stalled.py`, `store.py`), 29.09.
