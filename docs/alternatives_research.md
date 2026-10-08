@@ -147,7 +147,7 @@ decision from this dashboard.
 | Session cookie signing | **itsdangerous** | ADOPT | small, already the de-facto Starlette-ecosystem signer; avoids hand-rolled crypto |
 | Password hashing (local login) | **argon2-cffi** or `passlib[argon2]` | ADOPT | standard, avoids a hand-rolled KDF for a security-critical path |
 | Login routes, CSRF, session glue | bespoke (`starlette-login`/`Imia` considered) | BUILD | the surface is small and security-critical (§6 of the design doc already scopes exactly this); a generic login framework adds indirection for ~100 lines of code the team should own directly |
-| htmx + component kit | plain vendored `htmx.min.js` + handwritten CSS | BUILD (no kit) | a kit like `htmui`/BasecoatUI needs a Tailwind build step, which the design doc explicitly avoids ("no JS build chain" is a stated Pro of Option A); the visual design is already specified (purple accent, quickview's tokens) and is a small, bespoke stylesheet |
+| htmx + component kit | plain vendored `htmx.min.js` + handwritten CSS | BUILD (no kit) | a kit like `htmui`/BasecoatUI needs a Tailwind build step, which the design doc explicitly avoids ("no JS build chain" is a stated Pro of Option A); the visual design is already specified (purple accent, quickview's tokens) and is a small, bespoke stylesheet | **Superseded 08.10.2026:** the frontend is TypeScript (Preact + esbuild), see dashboard_design.md §4.
 | Charts (window timeline, usage ratios) | **uPlot**, vendored | ADOPT | MIT, ~50 KB, zero dependencies, canvas-based; fits "no CDN" rule as a single static file; the dashboard only needs simple line/bar views (F4/F5), not uPlot's streaming ceiling, but its small footprint still beats Chart.js (~60 KB) and avoids a framework |
 
 **Impact on phases:** phase 4 ("Dashboard skeleton... auth middleware") gets
@@ -167,5 +167,5 @@ vendor uPlot for the timeline and ratio charts. No other phase changes.
 | Anthropic native features (Routines etc.) | INTEGRATE-watch (monitor, no action now) |
 | Self-hosted PM tool as dashboard replacement | BUILD (every candidate leaves the same ~70% to build, plus a sync problem) |
 | OIDC / crypto libraries | ADOPT (Authlib, itsdangerous, argon2-cffi) |
-| htmx component kit | BUILD (plain htmx + bespoke CSS; avoid a Tailwind build step) |
+| htmx component kit | superseded: TypeScript frontend (Preact + esbuild, minimal npm deps), dashboard_design.md §4 |
 | Charts | ADOPT (uPlot, vendored) |
