@@ -208,3 +208,4 @@ NEXT (14:00 last-stretch slot or next run): if mypy is installed → check out p
 
 ## Status 08.10. 14:00 (last-stretch slot 2, budget +12% ≈ 0.8 session windows)
 mypy still not installed → phase 2a stack unmerged. Started 2b (schedule.py, branch p2b-schedule stacked on p2a-missingdb): the only window code, N × 5 h absolute incl. DST nights, per-weekday windows, gate at every session-window start, cron hourly with dedup per start.
+- 14:20: 2b committed on p2b-schedule (c3ac00d, stack tip): schedule.py only window code, */30 window-start cron, dedup per session-window start (old key format kept), only DST nights change with today's settings. All 5 stack branches pushed to origin. Independent read-only review of the whole stack running. Week 91%, session 22%.
