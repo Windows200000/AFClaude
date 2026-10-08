@@ -27,14 +27,17 @@ created_by_session is $CLAUDE_CODE_SESSION_ID, when the client passes it on.
 Env: AFCLAUDE_DB (database), AFCLAUDE_PROJECTS_DIR (transcripts root for the
 stalled-session scan, default ~/.claude/projects). Results are compact JSON;
 times are Europe/Berlin. Expected failures (unknown id, wrong state, bad
-value) come back as tool errors with a one-line message.
+value) come back as tool errors with a one-line message; a database error
+(docs/dashboard_design.md §7.8) as a tool error holding a JSON object
+{"error": {error_class, kind, message, not_saved, escalation, next_step}}.
 """
 import functools
 import json
 import os
 import sqlite3
 import sys
-from typing import Literal, Optional
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from typing import Any, Literal, Optional, ParamSpec
 from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +51,7 @@ from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
 
 Priority = Literal["high", "medium", "low"]
+P = ParamSpec("P")
 READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False)
 
 # Owner decision (29.09.2026, dashboard design Q3): tasks added through MCP are treated
@@ -73,24 +77,24 @@ server = MCPServer(
 
 # ---------------------------------------------------------------- helpers
 
-def db():
+def db() -> sqlite3.Connection:
     return store.connect(os.environ.get("AFCLAUDE_DB") or store.DB_PATH)
 
 
-def out(obj):
+def out(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
-def bt(s):
+def bt(s: str | None) -> str | None:
     """UTC ISO -> '2026-09-29 12:00 CEST' (None stays None)."""
     return cli.berlin(s, "%Y-%m-%d %H:%M %Z") if s else None
 
 
-def compact(d):
+def compact(d: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None and v != ""}
 
 
-def task_brief(t):
+def task_brief(t: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
                     "project": t["project"], "stage": t["stage_seq"],
                     "kind": t["kind"] if t["kind"] != "task" else None,
@@ -98,7 +102,7 @@ def task_brief(t):
                     "updated": bt(t["updated_at"])})
 
 
-def task_full(t, events):
+def task_full(t: Mapping[str, Any], events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     d = task_brief(t)
     d.update(compact({
         "description": t["description"], "project_rank": t["project_rank"], "created": bt(t["created_at"]),
@@ -110,13 +114,13 @@ def task_full(t, events):
     return d
 
 
-def project_brief(p):
+def project_brief(p: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"rank": p["rank"], "name": p["name"], "open": p.get("open"), "ready": p.get("ready"),
                     "path": p["path"], "description": p["description"],
                     "manager_session": p.get("manager_session")})
 
 
-def session_brief(s):
+def session_brief(s: Mapping[str, Any]) -> dict[str, Any]:
     d = cli.session_json(s)
     return compact({"session_id": d["session_id"], "title": d["title"], "cwd": d["cwd"],
                     "limit": d["stall_kind"], "stalled_since": bt(d["stalled_since"]),
@@ -124,33 +128,33 @@ def session_brief(s):
                     "decision": d["decision"], "decision_source": d["decision_source"]})
 
 
-def session_id_env():
+def session_id_env() -> str | None:
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
-def actor():
+def actor() -> str:
     """mcp:<calling session> for the audit log (plain mcp if the client didn't pass its id)."""
     sid = session_id_env()
     return f"mcp:{sid}" if sid and actions.ACTOR_RE.match(f"mcp:{sid}") else "mcp"
 
 
-def act(conn, action, /, **params):
+def act(conn: sqlite3.Connection, action: str, /, **params: Any) -> Any:
     """One write through the shared write path. The guard-hook bypass marks a session
     AFClaude launched (autonomous), whatever its id."""
     return actions.perform(conn, action, params, actor=actor(), via="mcp",
                            autonomous=os.environ.get("CLAUDE_GUARD_DISABLE") == "1")
 
 
-def _no_project_dir(path):
+def _no_project_dir(path: str) -> bool:
     home = os.path.expanduser("~")
     return path in ("/", os.path.normpath(home)) if home else path == "/"
 
 
-async def caller_dir(ctx):
+async def caller_dir(ctx: Optional[Context]) -> tuple[str | None, str]:
     """(directory, source) of the calling session; directory None if unknown."""
     try:
         caps = ctx.client_capabilities if ctx is not None else None
-        if caps is not None and caps.roots is not None:
+        if ctx is not None and caps is not None and caps.roots is not None:
             import anyio
             import warnings
             with warnings.catch_warnings(), anyio.fail_after(3):
@@ -171,7 +175,7 @@ async def caller_dir(ctx):
     return (None if _no_project_dir(p) else p), "cwd"
 
 
-async def resolve_dir_arg(ctx, value):
+async def resolve_dir_arg(ctx: Optional[Context], value: str | None) -> str | None:
     """'.' -> the caller's directory; './x', '../x' relative to it; '~/x' expanded; else unchanged."""
     if value is None:
         return None
@@ -187,10 +191,23 @@ async def resolve_dir_arg(ctx, value):
     return v
 
 
-def tool_errors(fn):
-    """Store errors -> ToolError with a one-line message (no traceback)."""
+def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> ToolError:
+    """A database error -> the structured hand-back (§7.8, D-171) as the tool error: JSON
+    {"error": {error_class, kind, message, not_saved, escalation, next_step}}. A write that
+    failed was already recorded and escalated by actions.perform; any other DB error (a read,
+    opening the DB) is reported here."""
+    err = store.as_db_error(e)
+    if err.escalation is None:
+        store.report_db_error(err, actor=actor(), action=f"mcp:{tool_name}", params=params, write=False,
+                              db_path=os.environ.get("AFCLAUDE_DB") or store.DB_PATH)
+    return ToolError(json.dumps({"error": store.handback(err)}, ensure_ascii=False))
+
+
+def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
+    """Caller errors -> ToolError with a one-line message (no traceback); database errors ->
+    the structured hand-back (db_error)."""
     @functools.wraps(fn)
-    async def wrapper(*a, **kw):
+    async def wrapper(*a: P.args, **kw: P.kwargs) -> str:
         try:
             return await fn(*a, **kw)
         except ToolError:
@@ -201,13 +218,14 @@ def tool_errors(fn):
             raise ToolError(f"invalid transition: {e}") from None
         except ValueError as e:
             raise ToolError(str(e)) from None
-        except sqlite3.OperationalError as e:
-            raise ToolError(f"database error (try again): {e}") from None
+        except (store.DBError, sqlite3.Error) as e:      # incl. the schema guard (SchemaMismatch)
+            raise db_error(e, getattr(fn, "__name__", "tool"), {k: v for k, v in kw.items() if k != "ctx"}) from None
     return wrapper
 
 
-def tool(description, read_only=False):
-    def deco(fn):
+def tool(description: str, read_only: bool = False
+         ) -> Callable[[Callable[P, Awaitable[str]]], Callable[P, Awaitable[str]]]:
+    def deco(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
         wrapped = tool_errors(fn)
         server.add_tool(wrapped, name=fn.__name__, description=USE_ONLY + description, structured_output=False,
                         annotations=READ_ONLY if read_only else None)
@@ -273,8 +291,8 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
                                status: Optional[Literal["pending", "in_progress", "blocked", "done",
                                                         "cancelled"]] = None,
                                note: Optional[str] = None, ctx: Optional[Context] = None) -> str:
-    fields = {k: v for k, v in (("title", title), ("description", description), ("priority", priority))
-              if v is not None}
+    fields: dict[str, str | None] = {k: v for k, v in (("title", title), ("description", description),
+                                                       ("priority", priority)) if v is not None}
     if project is not None:
         fields["project"] = await resolve_dir_arg(ctx, project) if project.strip() else None
     if not fields and stage is None and status is None:
@@ -345,8 +363,8 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
             r = act(conn, "project.priority", project=ref, priority=priority)
             return out({"project": r["project"], "priority": r["priority"], "changed_tasks": r["changed"]})
         else:
-            f = {k: v for k, v in (("name", new_name), ("description", description), ("path", path))
-                 if v is not None}
+            f: dict[str, str | None] = {k: v for k, v in (("name", new_name), ("description", description),
+                                                          ("path", path)) if v is not None}
             if manager_session is not None:
                 f["manager_session"] = (cli.resolve_session(conn, manager_session.strip())
                                         if manager_session.strip() else None)
@@ -358,7 +376,7 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
         conn.close()
 
 
-def _scan():
+def _scan() -> str | None:
     """Incremental stalled-session scan (stalled.py) in its own connection; error text or None."""
     try:
         import stalled
@@ -372,7 +390,7 @@ def _scan():
         return f"{type(e).__name__}: {e}"
 
 
-async def _scan_async():
+async def _scan_async() -> str | None:
     import anyio
     return await anyio.to_thread.run_sync(_scan)
 
@@ -387,7 +405,8 @@ async def afclaude_inbox() -> str:
         box = store.pending_user_input(conn)
     finally:
         conn.close()
-    res = {"blocked_tasks": [dict(task_brief(t), asked=bt(t["blocked_at"])) for t in box["blocked_tasks"]],
+    res: dict[str, Any] = {"blocked_tasks": [dict(task_brief(t), asked=bt(t["blocked_at"]))
+                                             for t in box["blocked_tasks"]],
            "undecided_sessions": [session_brief(s) for s in box["undecided_sessions"]]}
     if err:
         res["scan_error"] = err
@@ -430,9 +449,9 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
             return out({"removed": id})
         if scope is None or not match or decision is None:
             raise ValueError("add needs scope, match and decision")
-        m = match.strip()
+        m: str | None = match.strip()
         if scope == "session":
-            m = cli.resolve_session(conn, m)
+            m = cli.resolve_session(conn, match.strip())
         else:
             m = await resolve_dir_arg(ctx, m)
         r = act(conn, "rule.add", scope=scope, match=m, decision=decision, note=note)

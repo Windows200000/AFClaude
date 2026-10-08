@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the code defaults, not a local data/afclaude.json
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import host  # noqa: E402
 import keepalive as ka  # noqa: E402
 import limit_ratio  # noqa: E402

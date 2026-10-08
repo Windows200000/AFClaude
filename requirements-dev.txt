@@ -1,0 +1,9 @@
+# Dev tools, not needed at runtime. Install into the repo's .venv (Python 3.12):
+#   .venv/bin/pip install -r requirements-dev.txt
+# The type-checking gate (D-209): test_typing.py and the pre-commit hook run this mypy
+# with mypy.ini. Pinned with its dependencies, so the gate never changes by itself.
+mypy==2.4.0
+mypy_extensions==1.1.0
+pathspec==1.1.1
+librt==0.16.0
+ast-serialize==0.12.1

@@ -98,7 +98,7 @@ class Base(unittest.TestCase):
             fh.write("Continue ({reason}). Progress: {progress}. Literal {{braces}}.\n")
         with open(os.path.join(actions.PROMPTS_DIR, "manager.md"), "w") as fh:
             fh.write("Act as a project manager.\n")
-        self.conn = store.connect(self.db)
+        self.conn = store.connect(self.db, create=True)
 
     def tearDown(self):
         store._utcnow, actions.OWN_LIST, actions.PROMPTS_DIR, afclaude_config.CONFIG_FILE = self._saved
@@ -476,7 +476,7 @@ class SessionActions(Base):
 
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
-                  "automation.set", "window.set", "prompt.set", "prompt.reset", "request.add"}
+                  "setting.import", "automation.set", "window.set", "prompt.set", "prompt.reset", "request.add"}
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -521,18 +521,50 @@ class SettingActions(Base):
         self.assertTrue(all(v["source"] == "default" and v["version"] == 0 for v in s.values()))
         self.assertEqual(s["window_days"]["value"],
                          {d: {"start": "23:00", "n": 2, "group": "weekly"} for d in actions.DAYS})
-        self.assertEqual((s["window_tz"]["value"], s["session_hours"]["value"], s["last_mile_hours"]["value"],
-                          s["projection_threshold"]["value"], s["session_usage_stop"]["value"],
-                          s["automation_paused"]["value"]),
-                         ("Europe/Berlin", 5.0, "auto", 90.0, 85.0, False))
-        self.assertEqual(s["reserve_threshold"]["value"], "auto")      # dynamic: one session window left
+        self.assertEqual({k: v["value"] for k, v in s.items() if k != "window_days"},
+                         {"window_tz": "Europe/Berlin", "session_hours": 5.0, "usage_model": "pacing",
+                          "reserve_threshold": "auto", "last_mile_hours": "auto", "pacing_idle_min": 60.0,
+                          "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": True,
+                          "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
+                          "automation_paused": False, "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
+                          "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0})
 
-    def test_local_config_feeds_the_defaults(self):
+    def test_registry_metadata(self):
+        """Every setting has a section, a type, a one-line explanation (D-075) and a default that
+        passes its own check; numbers carry their range, enums their choices."""
+        s = actions.settings(self.conn)
+        for k, spec in actions.SETTINGS.items():
+            self.assertIn(spec.section, actions.SECTIONS, k)
+            self.assertTrue(spec.doc and "\n" not in spec.doc, k)
+            self.assertEqual(spec.check(spec.default(), self.conn), spec.default(), k)
+            self.assertEqual((s[k]["section"], s[k]["type"], s[k]["doc"]), (spec.section, spec.kind, spec.doc))
+            if spec.kind in ("number", "auto|number"):
+                lo, hi = spec.bounds
+                self.assertEqual((s[k]["min"], s[k]["max"]), (lo, hi), k)
+                with self.assertRaises(ValueError, msg=k):
+                    spec.check(hi + 1, self.conn)
+        self.assertEqual(s["usage_model"]["choices"], ["pacing", "linear"])
+        self.assertEqual({k for k, v in s.items() if v["important"]},
+                         {"window_days", "reserve_threshold", "last_mile_hours", "automation_paused"})
+        self.assertNotIn("session_usage_stop", s)                   # D-205/D-206: nothing reads it
+
+    def test_defaults_come_from_the_code(self):
+        """D-169: a local file never feeds a default (its old tunables are imported once instead)."""
         with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump({"last_mile_hours": 2, "window_start": "22:30", "window_hours": 5}, fh)
-        self.assertEqual(actions.get_setting(self.conn, "last_mile_hours"), 2.0)
-        self.assertEqual(actions.get_setting(self.conn, "window_days")["wed"], {"start": "22:30", "n": 1,
+            json.dump({"last_mile_hours": 2, "window_start": "22:30", "window_hours": 5, "week_target": 92}, fh)
+        self.assertEqual(actions.get_setting(self.conn, "last_mile_hours"), "auto")
+        self.assertEqual(actions.get_setting(self.conn, "reserve_threshold"), "auto")
+        self.assertEqual(actions.get_setting(self.conn, "window_days")["wed"], {"start": "23:00", "n": 2,
                                                                                "group": "weekly"})
+
+    def test_effective_setting_rechecks_the_saved_value(self):
+        self.assertEqual(actions.effective_setting(self.conn, "pacing_idle_min"), (60.0, "default"))
+        self.do("setting.set", key="pacing_idle_min", value=30)
+        self.assertEqual(actions.effective_setting(self.conn, "pacing_idle_min"), (30.0, "db"))
+        store.put_setting(self.conn, "pacing_idle_min", 5000)       # around actions.py: out of range
+        value, source = actions.effective_setting(self.conn, "pacing_idle_min")
+        self.assertEqual(value, 60.0)
+        self.assertRegex(source, r"^invalid: .*0\.\.1440")
 
     def test_set_reset_versions(self):
         r = self.do("setting.set", actor="owner", via="dashboard", key="projection_threshold", value=80)
@@ -566,10 +598,13 @@ class SettingActions(Base):
     def test_reserve_threshold_auto_or_override(self):
         self.assertEqual(self.do("setting.set", key="reserve_threshold", value=88)["value"], 88.0)
         self.assertEqual(self.do("setting.set", key="reserve_threshold", value="auto", version=1)["value"], "auto")
-        with open(afclaude_config.CONFIG_FILE, "w") as fh:          # a legacy week_target is the default
-            json.dump({"week_target": 92}, fh)
         self.do("setting.reset", key="reserve_threshold", version=2)
-        self.assertEqual(actions.get_setting(self.conn, "reserve_threshold"), 92.0)
+        self.assertEqual(actions.get_setting(self.conn, "reserve_threshold"), "auto")
+        for key, value, msg in (("usage_model", "reserve", "pacing|linear"),
+                                ("pacing_last_mile_yield", "no", "true or false"),
+                                ("stall_verify_minutes", 0, "1..240")):
+            with self.assertRaisesRegex(ValueError, msg, msg=key):
+                self.do("setting.set", key=key, value=value)
 
     def test_automation_pause_is_idempotent(self):
         self.assertEqual(self.do("automation.set", paused=True)["value"], True)
@@ -718,8 +753,9 @@ class EveryAction(Base):
             ("session.decide", {"session_id": SID, "decision": "continue"}), ("session.clear", {"session_id": SID}),
             ("rule.add", {"scope": "session", "match": SID, "decision": "ignore"}),
             ("rule.remove", {"rule_id": 1}),
-            ("setting.set", {"key": "session_usage_stop", "value": 80}),
-            ("setting.reset", {"key": "session_usage_stop"}), ("automation.set", {"paused": True}),
+            ("setting.set", {"key": "stall_verify_minutes", "value": 20}),
+            ("setting.reset", {"key": "stall_verify_minutes"}), ("automation.set", {"paused": True}),
+            ("setting.import", {"source": "data/dispatcher.json", "values": {"cleanup_idle_hours": 3}}),
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
             ("request.add", {"kind": "continue_now", "target": SID}),
@@ -821,10 +857,11 @@ class MigrationV4(unittest.TestCase):
 
     def test_fresh_db_is_v4_without_migration_mark(self):
         with tempfile.TemporaryDirectory() as d:
-            conn = store.connect(os.path.join(d, "new.db"))
+            conn = store.connect(os.path.join(d, "new.db"), create=True)
             try:
                 self.assertEqual(store.get_meta(conn, "schema_version"), "4")
                 self.assertIsNone(store.get_meta(conn, "migrated_v4_at"))
+                self.assertIsNotNone(store.get_meta(conn, "install_id"))
                 self.assertFalse([f for f in os.listdir(d) if f.endswith(".bak")])
             finally:
                 conn.close()

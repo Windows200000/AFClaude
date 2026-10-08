@@ -3,7 +3,8 @@
 Keep-alive for the AFClaude task-manager session (no dashboard).
 
 Runs begin only at STARTS (D-205): each session-window start of the night window (cron
---window-start, 23:00 and 04:00 Berlin for 23:00 x 10 h, D-202/D-203; a start postponed for
+--window-start every 30 min, acting only when a start is due: 23:00 and 04:00 for the default
+23:00 x 2, generally start + k x session_hours per weekday, schedule.py, D-202/D-203; a start postponed for
 an active user is re-decided by the watcher before the next start, D-018) and each last-stretch
 slot start (D-020). A start that passes the budget rule continues the task-manager session with
 
@@ -27,10 +28,11 @@ reserve threshold (default: one session window left), w + session cost + the use
 use until the weekly reset; re-checked per session window; the final <= 2 session windows
 before the weekly reset fill to 100%; AFClaude yields to an active user by POSTPONING to last
 activity + 60 min).
-data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
-the fallback if pacing.py fails:
-  projected end-of-week usage < 90%                          -> continue
-  else weekly reset <= 11:00 Berlin after the current window -> continue
+The setting usage_model = "linear" (DB settings, afclaude_config.setting) selects the original
+linear rule, which is also the fallback if pacing.py fails:
+  projected end-of-week usage < projection_threshold (90%)   -> continue
+  else weekly reset <= window end + cutoff_after_window_hours
+       (2 h: 11:00 Berlin after a 09:00 end)                  -> continue
   else                                                       -> hold back
 Forecast (my choice): linear extrapolation of the weekly % over the elapsed
 part of the week, with elapsed floored at 24h so an early-week burst doesn't
@@ -52,10 +54,11 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
 
@@ -77,12 +80,10 @@ STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
-# Automation window, Europe/Berlin wall clock: default 23:00-09:00 (spans midnight), from
-# data/afclaude.json window_start / window_hours (afclaude_config.window()). The watcher
-# re-reads it every loop iteration (reload_window), cron runs read it at start.
-WINDOW_START, WINDOW_END = afclaude_config.window()   # END exclusive; END < START = spans midnight
-WEEKLY_CUTOFF = dtime(11, 0)        # "reset no later than 11:00 after the window" (on the window-end day)
-PROJECTION_THRESHOLD = 90.0         # percent
+# Automation windows: schedule.py (the window_days / window_tz / session_hours settings, read on
+# every call; default every night 23:00 x 2 = 23:00-09:00 Europe/Berlin). The linear rule's
+# projection threshold (90%) and reset cutoff (window end + 2 h = 11:00) are settings too, read
+# per decision.
 WEEK = timedelta(days=7)
 MIN_ELAPSED = timedelta(hours=24)   # forecast floor
 
@@ -146,6 +147,8 @@ MONTHS = {m: i for i, m in enumerate(
 
 
 def berlin(dt):
+    if dt is None:
+        return "none (no window on any day)"
     return dt.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
@@ -250,86 +253,10 @@ def parse_reset_text(text, ref):
 
 
 # ---------------------------------------------------------------- window
-
-def reload_window():
-    """Re-read the window from data/afclaude.json (the dashboard will edit it later)."""
-    global WINDOW_START, WINDOW_END
-    WINDOW_START, WINDOW_END = afclaude_config.window()
-
-
-def in_window(now):
-    t = now.astimezone(BERLIN).time()
-    if WINDOW_START <= WINDOW_END:            # window within one calendar day
-        return WINDOW_START <= t < WINDOW_END
-    return t >= WINDOW_START or t < WINDOW_END   # window spans midnight
-
-
-def current_window_end(now):
-    """WINDOW_END (Berlin) of the window `now` is in, or of the next window.
-    Its date names the window ("night"): fire caps and window-start dedup keys use it."""
-    local = now.astimezone(BERLIN)
-    d = local.date() if local.time() < WINDOW_END else local.date() + timedelta(days=1)
-    return datetime.combine(d, WINDOW_END, tzinfo=BERLIN)
-
-
-def next_window_start(now):
-    """`now` if inside the window, else the next WINDOW_START (Berlin)."""
-    if in_window(now):
-        return now
-    local = now.astimezone(BERLIN)
-    start = datetime.combine(local.date(), WINDOW_START, tzinfo=BERLIN)
-    return start if start > local else start + timedelta(days=1)
-
-
-def _win():
-    return (WINDOW_START, WINDOW_END)
-
-
-def session_window_starts(now):
-    """The session-window starts (D-202) of the night window `now` is in, else of the latest one
-    (Berlin wall clock): window start + k x 5 h while the session window ends by the window
-    end, i.e. 23:00 and 04:00 for the default 23:00 x 10 h (pacing.session_starts)."""
-    import pacing
-    return pacing.session_starts(pacing.latest_window_start(now, _win()), _win())
-
-
-def session_start_at(now):
-    """The session-window start whose hour `now` is in (the cron runs --window-start at :00 of
-    each start's hour), else None."""
-    if not in_window(now):
-        return None
-    return next((s for s in session_window_starts(now) if s <= now < s + timedelta(hours=1)), None)
-
-
-def is_window_start_hour(now):
-    """--window-start acts only in the Berlin hour of a session-window start (D-202: 23:xx and
-    04:xx by default). Cron fires it at `0 2,3,21,22 * * *` (UTC); exactly one of 21/22 is 23:xx
-    Berlin (21:00 in CEST, 22:00 in CET) and one of 2/3 is 04:xx (02:00 in CEST, 03:00 in CET),
-    also on the DST nights. A different window_start needs different cron hours."""
-    return session_start_at(now) is not None
-
-
-def latest_session_start(now):
-    """The latest session-window start <= now inside the window, else None."""
-    import pacing
-    return pacing.latest_session_start(now, _win())
-
-
-def next_session_start(now):
-    """The first session-window start after `now`."""
-    import pacing
-    return pacing.next_session_start(now, _win())
-
-
-def window_start_key(now):
-    """Dedup key of the window-start continue, one per SESSION-WINDOW START (D-202): the
-    window's END date (its "night", as the fire cap uses), so the 23:00 start on 29.09. is
-    window-start-2026-09-30 (the old once-per-night key) and the 04:00 start the night's
-    second session window, window-start-2026-09-30-s2. Outside the window: the next night's
-    first start."""
-    s = latest_session_start(now)
-    k = session_window_starts(now).index(s) if s is not None else 0
-    return f"window-start-{current_window_end(now).date()}" + (f"-s{k + 1}" if k else "")
+# All window code is schedule.py (design §6): the per-weekday windows of the window_days setting
+# in window_tz, each N whole session windows (also on the DST nights, D-148); the session-window
+# starts (D-202/D-203), the start due for a cron run (due_session_start), the postponement deadline
+# and the dedup key per start (start_key). It reads the settings on every call.
 
 
 # ---------------------------------------------------------------- usage
@@ -503,7 +430,7 @@ def project_weekly(pct, resets_at, now):
 
 
 def _budget_model():
-    """pacing.py (forecast-driven pacing) unless data/afclaude.json selects "linear"."""
+    """pacing.py (forecast-driven pacing) unless the usage_model setting is "linear"."""
     if afclaude_config.usage_model() == "linear":
         return None
     import pacing
@@ -584,7 +511,7 @@ def fallback_eval(usage, now):
 
 
 def last_mile_hours(weekly_pct, resets_at=None, now=None):
-    """Last-stretch length in hours: data/afclaude.json last_mile_hours, by default "auto" =
+    """Last-stretch length in hours: the last_mile_hours setting, by default "auto" =
     min(ceil(session windows of quota left), 2) x session length (pacing.py)."""
     setting = afclaude_config.last_mile_setting()
     if setting != "auto":
@@ -625,9 +552,15 @@ def fallback_budget_decision(usage, now):
     return d["go"], d["reason"]
 
 
+def linear_settings():
+    """The linear rule's settings: (projection threshold %, reset cutoff after the window end)."""
+    s = afclaude_config.settings("projection_threshold", "cutoff_after_window_hours")
+    return s["projection_threshold"], timedelta(hours=s["cutoff_after_window_hours"])
+
+
 def linear_budget_headroom(usage, now):
-    """Linear rule: how much more weekly % can be used before the projection reaches
-    PROJECTION_THRESHOLD (in the last mile: up to 100%). -> (extra | None, text)."""
+    """Linear rule: how much more weekly % can be used before the projection reaches the
+    projection_threshold setting (in the last mile: up to 100%). -> (extra | None, text)."""
     w = (usage or {}).get("weekly") or {}
     if w.get("percent") is None or not w.get("resets_at"):
         return None, "budget unknown"
@@ -637,13 +570,15 @@ def linear_budget_headroom(usage, now):
     else:
         elapsed = max(now - (reset - WEEK), MIN_ELAPSED)
         remaining = max(reset - now, timedelta(0))
-        extra = max(PROJECTION_THRESHOLD * elapsed / (elapsed + remaining) - pct, 0.0)
-        target = f"a projected {PROJECTION_THRESHOLD:.0f}%"
+        thr, _ = linear_settings()
+        extra = max(thr * elapsed / (elapsed + remaining) - pct, 0.0)
+        target = f"a projected {thr:.0f}%"
     return extra, f"budget for this run: about +{extra:.1f} weekly % (now {pct:.0f}%) before reaching {target}"
 
 
 def linear_budget_decision(usage, now):
-    """The linear rule (projection < 90%, 11:00 reset cutoff, last mile) -> (go, reason)."""
+    """The linear rule (projection < projection_threshold, the reset cutoff window end +
+    cutoff_after_window_hours, last mile) -> (go, reason)."""
     if not usage or "weekly" not in usage or not usage["weekly"]["resets_at"]:
         return False, "HOLD: weekly usage unknown (fail-safe)"
     w = usage["weekly"]
@@ -656,12 +591,14 @@ def linear_budget_decision(usage, now):
                       f"{int(left.total_seconds() % 3600 // 60):02d}m ({w['percent']:.0f}% used): using the remaining quota")
     proj = project_weekly(w["percent"], w["resets_at"], now)
     base = f"week {w['percent']:.0f}% used, projected {proj:.0f}% at reset {berlin(w['resets_at'])}"
-    if proj < PROJECTION_THRESHOLD:
-        return True, f"CONTINUE: {base} < {PROJECTION_THRESHOLD:.0f}%"
-    cutoff = datetime.combine(current_window_end(now).date(), WEEKLY_CUTOFF, tzinfo=BERLIN)
+    thr, after = linear_settings()
+    if proj < thr:
+        return True, f"CONTINUE: {base} < {thr:.0f}%"
+    win = schedule.current_or_next(now)
+    cutoff = (win.end if win else now) + after
     if w["resets_at"] <= cutoff:
-        return True, f"CONTINUE: {base} >= {PROJECTION_THRESHOLD:.0f}%, but weekly reset <= {berlin(cutoff)}"
-    return False, f"HOLD: {base} >= {PROJECTION_THRESHOLD:.0f}% and weekly reset after {berlin(cutoff)}"
+        return True, f"CONTINUE: {base} >= {thr:.0f}%, but weekly reset <= {berlin(cutoff)}"
+    return False, f"HOLD: {base} >= {thr:.0f}% and weekly reset after {berlin(cutoff)}"
 
 
 # ---------------------------------------------------------------- session / firing
@@ -1084,7 +1021,7 @@ def note_limit_hit(sid, stall, st, now):
         hits.pop(k, None)
     save_state(disk)
     st["limit_hits"] = dict(hits)
-    nxt = next_session_start(now)
+    nxt = schedule.next_session_start(now)
     progress_note(f"{sid[:8]} hit its {stall.get('kind')} limit at {berlin(stall['timestamp']) if stall.get('timestamp') else '?'}"
                   f" (resets {berlin(stall['reset']) if stall.get('reset') else '?'}): {LIMIT_HIT_NOTE}; "
                   f"next session-window start {berlin(nxt)}")
@@ -1099,7 +1036,7 @@ def run(args):
         sys.exit("another keepalive.py instance holds the lock; exiting")
     sid = args.session
     mode = "ARMED" if args.arm else "DRY-RUN"
-    log(f"keepalive start ({mode}) target={sid} window {WINDOW_START:%H:%M}-{WINDOW_END:%H:%M} Europe/Berlin pid={os.getpid()}")
+    log(f"keepalive start ({mode}) target={sid} windows {schedule.describe()} pid={os.getpid()}")
     st = load_state()
     last_line = None
     next_eval = next_reading = datetime.min.replace(tzinfo=UTC)
@@ -1109,7 +1046,6 @@ def run(args):
             return
         now = datetime.now(UTC)
         if now >= next_eval:
-            reload_window()
             # Detection + logging only: a limit hit ends the run, the watcher never continues the
             # session at the reset (D-204). Runs begin only at starts: the session-window starts
             # (cron --window-start, a postponed one below) and the last-stretch slot starts.
@@ -1225,13 +1161,8 @@ def last_mile_pass(sid, now, st, args):
 
 # ---------------------------------------------------------------- window start
 
-def postpone_deadline(now):
-    """A start postponed at the session-window start of `now` must begin before this (the next
-    session-window start of the night, which checks itself); `now` at the last start or outside
-    the window: no postponement (D-202, pacing.postpone_deadline)."""
-    import pacing
-    s = latest_session_start(now)
-    return pacing.postpone_deadline(s, _win()) if s is not None else now
+DB_PAUSE_RECHECK = timedelta(minutes=5)   # a DB pause at a window start: recheck this soon,
+                                           # but never past schedule.postpone_deadline (D-202)
 
 
 def window_start_pass(sid, now, args):
@@ -1240,12 +1171,14 @@ def window_start_pass(sid, now, args):
     active) that the watcher re-decides at its recheck time (deferred_window_start_pass), but only
     while that is before the night's next session-window start: a later recheck (also any at the
     last start, the run would end after the window end) is skipped; the next session-window start
-    decides again. -> the decision dict."""
+    decides again. A FIRE dropped for a DB pause (handle_fire -> db_paused) is postponed the same
+    way (db_paused's docstring): nothing else makes this start due again before then. -> the
+    decision dict."""
     u = fresh_usage(now, force=True)
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
-    key = f"manual-now-{now.isoformat()}" if args.now else window_start_key(now)
-    deadline = postpone_deadline(now)
+    key = f"manual-now-{now.isoformat()}" if args.now else schedule.start_key(now)
+    deadline = schedule.postpone_deadline(now)
     defer = bool(d.get("postpone") and d.get("recheck_at") and not args.now and d["recheck_at"] < deadline)
     if not args.now:
         note_window_usage(key, u is not None, now, final=not defer)
@@ -1257,14 +1190,23 @@ def window_start_pass(sid, now, args):
             log(f"forecast log failed: {type(e).__name__}: {e}")
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
-        handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+        fired = handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+        if fired == "db_paused" and not args.now:
+            recheck_at = now + DB_PAUSE_RECHECK
+            if recheck_at < deadline:
+                defer_window_start(key, sid, recheck_at, d["reason"], deadline)
+                progress_note(f"window-start {berlin(now)}: database problem, postponed to "
+                              f"{berlin(recheck_at)} to retry once it's healthy again (D-202)")
+            else:
+                progress_note(f"window-start {berlin(now)}: database problem at the night's last "
+                              "session-window start, not retried before the window ends (D-202)")
     elif defer:
         defer_window_start(key, sid, d["recheck_at"], d["reason"], deadline)
         progress_note(f"window-start {berlin(now)}: postponed to {berlin(d['recheck_at'])}, {d['reason']}")
     elif d.get("postpone") and d.get("recheck_at") and not args.now:
         progress_note(f"window-start {berlin(now)}: not resumed, postponed past the night's next session-window "
                       f"start ({berlin(d['recheck_at'])} >= {berlin(deadline)}), skipped to the next "
-                      f"session-window start {berlin(next_session_start(now))} (D-202); {d['reason']}")
+                      f"session-window start {berlin(schedule.next_session_start(now))} (D-202); {d['reason']}")
     else:
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
     return d
@@ -1306,10 +1248,11 @@ def defer_window_start(key, sid, recheck_at, reason, deadline=None):
 def pending_deferral(sid, now):
     """The recheck time of the postponed session-window start the watcher will still re-decide
     for this session (deferred_window_start_pass), or None. Read-only (the quickview's next run)."""
-    if not in_window(now):
+    if not schedule.in_window(now):
         return None
-    ent = load_deferred().get(window_start_key(now))
-    if not ent or ent.get("session") != sid or window_start_key(now) in load_state().get("handled", {}):
+    key = schedule.start_key(now)
+    ent = load_deferred().get(key)
+    if not ent or ent.get("session") != sid or key in load_state().get("handled", {}):
         return None
     return parse_ts(ent.get("recheck_at"))
 
@@ -1318,12 +1261,14 @@ def deferred_window_start_pass(sid, now, st, args):
     """Watcher side of a postponed session-window start: at its recheck time, decide again and
     fire under the same window-start key, postpone again, or drop it (a final HOLD, or the
     recheck would reach the night's next session-window start or the window end: that start
-    decides itself, D-202). -> the next recheck time or None."""
+    decides itself, D-202). A FIRE dropped for a DB pause (handle_fire -> db_paused) is
+    postponed again the same way, instead of being dropped with the entry already removed.
+    -> the next recheck time or None."""
     defs = load_deferred()
     if not defs:
         return None
     # the key changes at each session-window start, so an entry is stale from the next start on
-    key = window_start_key(now) if in_window(now) else None
+    key = schedule.start_key(now) if schedule.in_window(now) else None
     ent = defs.get(key) if key else None
     stale = [k for k in defs if k != key or (ent and ent.get("session") != sid)]
     if ent and ent.get("session") != sid:
@@ -1343,14 +1288,26 @@ def deferred_window_start_pass(sid, now, st, args):
     u = fresh_usage(now, force=True)
     d = budget_eval(u, now)
     log(f"window-start (postponed): {d['reason']}")
-    deadline = postpone_deadline(now)
+    deadline = schedule.postpone_deadline(now)
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
     note_window_usage(key, u is not None, now, final=not again)
     if d["go"]:
+        fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
+                            "window start (postponed), " + d["reason"], st, args)
+        if fired == "db_paused":
+            recheck_at = now + DB_PAUSE_RECHECK
+            if recheck_at < deadline:
+                ent["recheck_at"] = recheck_at.astimezone(UTC).isoformat()
+                ent["reason"] = d["reason"]
+                save_deferred(defs)
+                return recheck_at
+            defs.pop(key, None)
+            save_deferred(defs)
+            progress_note(f"window-start (postponed) {berlin(now)}: database problem at the night's last "
+                          "session-window start, not retried before the window ends (D-202)")
+            return None
         defs.pop(key, None)
         save_deferred(defs)
-        handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
-                    "window start (postponed), " + d["reason"], st, args)
         return None
     if again:
         ent["recheck_at"] = d["recheck_at"].astimezone(UTC).isoformat()
@@ -1362,7 +1319,7 @@ def deferred_window_start_pass(sid, now, st, args):
     if d.get("postpone") and d.get("recheck_at"):
         progress_note(f"window-start (postponed) {berlin(now)}: not resumed, postponed past the night's next "
                       f"session-window start ({berlin(d['recheck_at'])} >= {berlin(deadline)}), skipped to the "
-                      f"next session-window start {berlin(next_session_start(now))} (D-202); {d['reason']}")
+                      f"next session-window start {berlin(schedule.next_session_start(now))} (D-202); {d['reason']}")
     else:
         progress_note(f"window-start (postponed) {berlin(now)}: not resumed, {d['reason']}")
     return None
@@ -1388,14 +1345,48 @@ def watch_run_usage(sid, now):
         log(f"run usage reading failed: {type(e).__name__}: {e}")
 
 
+_DB_PAUSE = None   # the database problem the starts are paused for (logged once per problem)
+
+
+def db_paused(what):
+    """A broken AFClaude database pauses every autonomous start (docs/dashboard_design.md §7.8,
+    D-171): store.db_gate checks it (alerting the owner once per episode) and handle_fire does
+    not mark the start handled. A stall or last-mile-slot continue is decided again every
+    watcher tick, so that alone is enough for it to retry once the database is healthy again.
+    A session-window start is different: window_start_pass only runs once, when the cron's
+    --window-start call finds it due (schedule.due_session_start, within CRON_STEP of the
+    start) -- nothing else makes it due again, so handle_fire reports "db_paused" and its
+    caller (window_start_pass, deferred_window_start_pass) must postpone it explicitly
+    (defer_window_start) for the watcher to retry it. -> True = don't start."""
+    global _DB_PAUSE
+    import store
+    problem = store.db_gate("keepalive")
+    if problem is None:
+        if _DB_PAUSE is not None:
+            log("database healthy again: autonomous starts resume")
+            _DB_PAUSE = None
+        return False
+    msg = f"{problem.kind}: {problem}"
+    if msg != _DB_PAUSE:
+        log(f"PAUSED, not starting {what}: database problem ({msg}); {problem.escalation}")
+        progress_note(f"keep-alive paused, not starting {what}: AFClaude database problem ({problem.kind})")
+        _DB_PAUSE = msg
+    return True
+
+
 def handle_fire(sid, stall, reason, st, args):
+    """-> None (already handled, fire cap reached, or it fired/was handled below), or the
+    string "db_paused" (dropped without marking handled; a window-start caller must postpone
+    it itself, see db_paused's docstring)."""
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
-        return
-    night = current_window_end(datetime.now(UTC)).date().isoformat()
+        return None
+    night = schedule.night(datetime.now(UTC))
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
         log(f"fire cap reached for window ending {night}; not firing")
-        return
+        return None
+    if db_paused(f"{sid[:8]} ({reason})"):
+        return "db_paused"
     ok, problems, plan = preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
@@ -1506,7 +1497,8 @@ def main():
     ap.add_argument("--last-mile", action="store_true",
                     help="one-shot: continue the session if the last-mile period before the weekly reset is open")
     ap.add_argument("--window-start", action="store_true",
-                    help="one-shot: at a session-window start (23:00, 04:00; D-202), continue the session if the budget rule allows")
+                    help="one-shot (cron, every 30 min): at a due session-window start (23:00, 04:00 by default; D-202), "
+                         "continue the session if the budget rule allows")
     ap.add_argument("--now", action="store_true",
                     help="with --window-start: ignore the start-hour gate (a manual start now); budget rule still applies")
     ap.add_argument("--work-on", metavar="PROJECT",
@@ -1520,6 +1512,7 @@ def main():
     args = ap.parse_args()
     LAUNCH.update(model=args.model, effort=args.effort, name=args.name)
     global TAKE_OVER_IDLE, IGNORE_WINDOW
+    afclaude_config.LOG = log            # a settings problem (DB unreadable) lands in this log
     TAKE_OVER_IDLE = args.take_over_idle
     IGNORE_WINDOW = args.now
     if args.work_on:
@@ -1537,14 +1530,16 @@ def main():
     if args.window_start:
         # Session-window-start continue (no stall needed, D-202): budget rule + window, then fire.
         now = datetime.now(UTC)
-        if not args.now and not is_window_start_hour(now):
-            return
+        if not args.now and schedule.due_session_start(now) is None:
+            return                       # no session-window start due in this cron slot
         window_start_pass(args.session, now, args)
         return
     if args.decide:
         now = datetime.now(UTC)
         u = fresh_usage(now, force=True)
-        print(f"now {berlin(now)} in_window={in_window(now)} next_window={berlin(next_window_start(now))}")
+        nws = schedule.next_window_start(now)
+        print(f"now {berlin(now)} in_window={schedule.in_window(now)} "
+              f"next_window={berlin(nws) if nws else 'none'} ({schedule.describe()})")
         print(f"usage: {json.dumps(u, default=str)}")
         d = budget_eval(u, now)
         print((d["go"], d["reason"]))

@@ -1,3 +1,30 @@
 #!/bin/sh
-# Public-repo guard (enable per clone: git config core.hooksPath .githooks).
-exec python3 "$(git rev-parse --show-toplevel)/tools/check_public.py" --staged
+# Enable per clone: git config core.hooksPath .githooks
+top="$(git rev-parse --show-toplevel)" || exit 1
+
+# 1. Public-repo guard.
+python3 "$top/tools/check_public.py" --staged || exit 1
+
+# 2. Type-checking gate (D-209): mypy --strict over the strict module list in mypy.ini,
+#    with the pinned mypy (requirements-dev.txt) of the repo's .venv. A git worktree has
+#    no .venv of its own: then the main checkout's is used. No mypy = no commit.
+#    (It checks the working tree, not only what is staged.)
+[ -f "$top/mypy.ini" ] || exit 0          # a checkout without the gate (e.g. test_check_public's)
+main="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+py=""
+for d in "$top" "$main"; do
+    if [ -x "$d/.venv/bin/python" ] && "$d/.venv/bin/python" -c "import mypy" 2>/dev/null; then
+        py="$d/.venv/bin/python"
+        break
+    fi
+done
+if [ -z "$py" ]; then
+    echo "pre-commit: no mypy in .venv (the type-checking gate, D-209); install it with" >&2
+    echo "  .venv/bin/pip install -r requirements-dev.txt" >&2
+    exit 1
+fi
+cd "$top" || exit 1
+"$py" -m mypy --config-file mypy.ini || {
+    echo "pre-commit: mypy --strict failed (see above; the strict list is in mypy.ini)" >&2
+    exit 1
+}

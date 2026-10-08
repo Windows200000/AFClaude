@@ -39,3 +39,4 @@ id_ecdsa*
 __pycache__/
 *.pyc
 DECISIONS.md
+.mypy_cache/

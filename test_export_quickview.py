@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the default window
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import export_quickview as qv  # noqa: E402
 import store  # noqa: E402
 
@@ -52,7 +52,7 @@ class BuildStages(unittest.TestCase):
             old_path, old_proj = store.DB_PATH, qv.STAGES_PROJECT
             try:
                 store.DB_PATH = db
-                conn = store.connect(db)
+                conn = store.connect(db, create=True)
                 store.add_project(conn, "P")
                 store.add_task(conn, "Dashboard 1: a", project="P")
                 store.add_task(conn, "Other", project="P")
@@ -90,6 +90,9 @@ class WindowInfo(unittest.TestCase):
         self.assertEqual(out["next_window_berlin"], "Wed 30.09. 23:00 CEST")
         out = qv.window_info(self.Z("2026-10-25T12:00:00Z"))        # first CET evening
         self.assertEqual(out["next_window_berlin"], "Sun 25.10. 23:00 CET")
+        out = qv.window_info(self.Z("2026-10-24T23:00:00Z"))        # the DST-end night: 10 h absolute (D-148)
+        self.assertEqual(out["window_berlin"], "23:00–08:00")
+        self.assertEqual(out["window_end_berlin"], "Sun 25.10. 08:00 CET")
 
 
 
@@ -218,14 +221,14 @@ class NextRunBlock(unittest.TestCase):
         """D-202: Mon 08:18 Berlin with a passing gate and nothing running -> 'Holding until' the
         next session-window start (Mon 23:00), not 'Running now'; at 04:05 (a due start) -> now."""
         import pacing
-        from datetime import time as dtime, timedelta, timezone
+        import schedule
+        from datetime import timedelta, timezone
         Z = timezone.utc
         reset = datetime(2026, 10, 8, 17, 0, tzinfo=Z)
-        win = (dtime(23, 0), dtime(9, 0))
+        win = schedule.Config.every_day()
         tmp = tempfile.TemporaryDirectory()
-        olds = (pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state)
+        olds = (pacing.SAMPLES_FILE, pacing.FIRE_FILES, qv.runner_state)
         pacing.SAMPLES_FILE = os.path.join(tmp.name, "samples.jsonl")
-        pacing.USER_MODEL_FILE = os.path.join(tmp.name, "user_model.json")
         pacing.FIRE_FILES = []
         qv.runner_state = lambda now: {"active": None, "deferred": False}
         try:
@@ -243,7 +246,7 @@ class NextRunBlock(unittest.TestCase):
             d = pacing.decide_core(10.0, reset, now, 600.0, None, None, None, True, 0.2, "auto", win)
             self.assertEqual(qv.next_run_block(u, now, d)["kind"], "now")   # a run is going
         finally:
-            pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state = olds
+            pacing.SAMPLES_FILE, pacing.FIRE_FILES, qv.runner_state = olds
             tmp.cleanup()
 
     def test_page_shows_the_next_run_not_the_rule(self):

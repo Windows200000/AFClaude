@@ -1,12 +1,14 @@
 # AFClaude manager container crontab (supercronic, container clock = UTC like the host).
-# Mirrors the host's AFClaude crontab lines; every Claude-side action goes through the
-# SSH bridge (host.py). Keep the "# AFClaude ..." tags: export_quickview.py lists them.
+# The only AFClaude schedule (the host crontab has no AFClaude lines since 01.10.); every
+# Claude-side action goes through the SSH bridge (host.py). Keep the "# AFClaude ..." tags:
+# export_quickview.py lists them.
 */15 * * * * flock -n $AFCLAUDE_DIR/data/.sampler.lock python3 $AFCLAUDE_DIR/usage_sampler.py >> $AFCLAUDE_DIR/data/sampler.log 2>&1 # AFClaude usage sampler
-# WINDOW-START: keep this schedule identical to the host crontab's "AFClaude window-start" line
-# (it follows the session-window starts in keepalive.py, D-202: 23:00 and 04:00 Berlin for the
-# 23:00 x 10 h window; cron runs it at both possible UTC hours of each, 21/22 for 23:00 and 2/3
-# for 04:00, and keepalive.py --window-start only acts in a start's Berlin hour). Update both together.
-0 2,3,21,22 * * * cd $AFCLAUDE_DIR && python3 keepalive.py --session $AFCLAUDE_MANAGER_SESSION --window-start --arm --take-over-idle >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude window-start
+# WINDOW-START: every 30 min (the window starts are on the 30-min grid of window_days, D-030);
+# keepalive.py --window-start exits at once unless a session-window start of the configured
+# windows is due in this slot (schedule.due_session_start: start + k x session_hours in window_tz,
+# per weekday, also on the DST nights; D-148/D-202/D-203), and each start acts once (its dedup key,
+# schedule.start_key).
+*/30 * * * * cd $AFCLAUDE_DIR && python3 keepalive.py --session $AFCLAUDE_MANAGER_SESSION --window-start --arm --take-over-idle >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude window-start
 7,22,37,52 * * * * [ -e $AFCLAUDE_DIR/PAUSED ] || $AFCLAUDE_DIR/docker/start_watcher.sh >/dev/null 2>>$KEEPALIVE_STATE_DIR/watchdog.log # AFClaude watcher watchdog (no-op if running)
 0 * * * * cd $AFCLAUDE_DIR && python3 usage_review.py >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude usage-model review (runs when data/usage_review_state.json next_run_at has passed)
 */3 * * * * flock -n $AFCLAUDE_DIR/data/.quickview.lock python3 $AFCLAUDE_DIR/export_quickview.py >> $AFCLAUDE_DIR/data/quickview_export.log 2>&1 # AFClaude quickview export

@@ -12,7 +12,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the default config
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import run_metrics as rm  # noqa: E402
 import keepalive as ka  # noqa: E402
 
@@ -360,7 +360,7 @@ class Hooks(unittest.TestCase):
         cache = {"fetched_at": datetime.now(UTC), "session": {"percent": 3.0, "resets_at": None},
                  "weekly": {"percent": 70.0, "resets_at": WRESET}}
         names = ("STATE_FILE", "PROGRESS_FILE", "PROJECTS_DIR", "preflight", "fire", "verify_reply", "agent_entries",
-                 "read_usage_cache", "log", "budget_headroom")
+                 "read_usage_cache", "log", "budget_headroom", "datetime")
         old = {n: getattr(ka, n) for n in names}
         with tempfile.TemporaryDirectory() as d:
             ka.STATE_FILE, ka.PROGRESS_FILE, ka.PROJECTS_DIR = os.path.join(d, "st.json"), os.path.join(d, "P.md"), d
@@ -373,6 +373,12 @@ class Hooks(unittest.TestCase):
             ka.read_usage_cache = lambda: cache
             ka.log = lambda *a: None
             ka.budget_headroom = lambda u, now: (None, "budget t")
+
+            class FakeDT(datetime):              # the fire happens at F (handle_fire reads the clock):
+                @classmethod                     # without it the cache from F is stale a while after F
+                def now(cls, tz=None):
+                    return F + timedelta(seconds=5)
+            ka.datetime = FakeDT
 
             class A:
                 arm = True

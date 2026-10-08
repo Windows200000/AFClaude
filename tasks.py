@@ -38,10 +38,15 @@ session's cwd or a parent dir; "." = here) or a ~/.claude/projects dir name
 --json prints machine-readable output. Times are shown in Europe/Berlin.
 inbox and decide first run stalled.py's incremental scan (--no-scan skips it).
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import sqlite3
 import sys
+from collections.abc import Mapping
+from typing import Any
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +57,7 @@ import actions  # noqa: E402  (every write: validation, one transaction, audit r
 BERLIN = ZoneInfo("Europe/Berlin")
 
 
-def berlin(s, fmt="%Y-%m-%d %H:%M"):
+def berlin(s: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
     dt = store.parse_iso(s)
     return dt.astimezone(BERLIN).strftime(fmt) if dt else "-"
 
@@ -155,7 +160,7 @@ SESSION_JSON = ("session_id", "title", "cwd", "project_dir", "own", "stalled_sin
                 "stall_reset_at", "stall_text", "hits", "last_hit", "path", "decision", "decision_source")
 
 
-def session_json(s):
+def session_json(s: Mapping[str, Any]) -> dict[str, Any]:
     d = {k: s.get(k) for k in SESSION_JSON}
     d["own"] = bool(d["own"])
     d["stall_reset_at_berlin"] = berlin(s.get("stall_reset_at"), "%Y-%m-%d %H:%M %Z") \
@@ -191,7 +196,7 @@ def print_rules(rules):
 
 # ---------------------------------------------------------------- commands
 
-def resolve_session(conn, prefix):
+def resolve_session(conn: sqlite3.Connection, prefix: str) -> str:
     m = store.find_sessions(conn, prefix)
     if len(m) == 1:
         return m[0]["session_id"]
@@ -432,15 +437,34 @@ def parser():
     return ap
 
 
+def db_error(e, args):
+    """A database error -> the hand-back text on stderr (docs/dashboard_design.md §7.8): class,
+    message, what was not saved, the escalation, the next step. -> exit code 1. A failed write
+    was already recorded and escalated by actions.perform; any other (a read, opening the DB)
+    is reported here."""
+    err = store.as_db_error(e)
+    if err.escalation is None:
+        store.report_db_error(err, actor="cli", action=f"cli:{args.cmd}", write=False,
+                              params={k: v for k, v in vars(args).items() if k not in ("db", "func")},
+                              db_path=args.db)
+    print(store.handback_text(err), file=sys.stderr)
+    return 1
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
-    conn = store.connect(args.db)
+    try:
+        conn = store.connect(args.db)
+    except (store.DBError, sqlite3.Error) as e:
+        return db_error(e, args)
     try:
         return run(conn, args)
-    except (ValueError, LookupError) as e:     # validation, bad transition, not found
+    except (ValueError, LookupError) as e:          # validation, bad transition, not found
         msg = e.args[0] if isinstance(e, LookupError) and e.args else str(e)
         print(f"error: {msg}", file=sys.stderr)
         return 1
+    except (store.DBError, sqlite3.Error) as e:     # the DB error path, incl. the schema guard
+        return db_error(e, args)
     finally:
         conn.close()
 

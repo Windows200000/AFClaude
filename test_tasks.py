@@ -9,8 +9,10 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import actions  # noqa: E402
 import store  # noqa: E402
 import tasks  # noqa: E402
 
@@ -80,7 +82,7 @@ class Base(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "db", "t.db")
         self._orig_now = store._utcnow
         store._utcnow = Clock()
-        self.conn = store.connect(self.db)
+        self.conn = store.connect(self.db, create=True)
 
     def tearDown(self):
         store._utcnow = self._orig_now
@@ -645,7 +647,7 @@ class Migration(unittest.TestCase):
     def test_columns_migration_applies_to_new_tables(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "t.db")
-            store.connect(path).close()
+            store.connect(path, create=True).close()
             orig = store.COLUMNS["tasks"]
             store.COLUMNS["tasks"] = orig + [("due_hint", "TEXT")]
             try:
@@ -655,6 +657,162 @@ class Migration(unittest.TestCase):
                 conn.close()
             finally:
                 store.COLUMNS["tasks"] = orig
+
+
+class SchemaGuard(unittest.TestCase):
+    """docs/dashboard_design.md §7.1 (review A1): no writes to a database newer than the
+    code; non-additive migrations only through the explicit migrate step, after a backup."""
+    NEWER = store.SCHEMA_VERSION + 1
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "t.db")
+        conn = store.connect(self.db, create=True)
+        store.add_task(conn, "abc")
+        conn.close()
+
+    def raw(self, sql, args=()):
+        c = sqlite3.connect(self.db)
+        try:
+            return c.execute(sql, args).fetchall()
+        finally:
+            c.close()
+
+    def bump(self, version):
+        c = sqlite3.connect(self.db)
+        c.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(version),))
+        c.commit()
+        c.close()
+
+    def baks(self):
+        return sorted(f for f in os.listdir(self.tmp.name) if f.endswith(".bak"))
+
+    def test_newer_db_reads_but_refuses_writes(self):
+        c = sqlite3.connect(self.db)
+        c.execute("DROP TABLE action_requests")          # stands in for a newer schema's change
+        c.commit()
+        c.close()
+        self.bump(self.NEWER)
+        conn = store.connect(self.db)                    # opens; no DDL, no version change
+        try:
+            self.assertEqual([t["title"] for t in store.list_tasks(conn)], ["abc"])   # reads go on
+            self.assertEqual(store.get_meta(conn, "schema_version"), str(self.NEWER))
+            self.assertFalse(conn.execute("SELECT 1 FROM sqlite_master WHERE name='action_requests'").fetchone())
+            with self.assertRaises(store.SchemaTooNew) as cm:
+                store.add_task(conn, "x")
+            msg = str(cm.exception)
+            self.assertIn(f"schema_version {self.NEWER}", msg)
+            self.assertIn(f"this code's {store.SCHEMA_VERSION}", msg)
+            self.assertIn("refusing to write", msg)
+            self.assertEqual((cm.exception.db_version, cm.exception.code_version),
+                             (self.NEWER, store.SCHEMA_VERSION))
+            with self.assertRaises(store.SchemaTooNew):  # the write path: no change, no audit row
+                actions.perform(conn, "task.add", {"title": "y"}, actor="cli", via="cli")
+            with self.assertRaises(store.SchemaMismatch):
+                store.check_writable(conn)
+            with self.assertRaises(sqlite3.OperationalError):   # a raw write: the connection is read-only
+                store.upsert_session(conn, SID, cwd="/x")
+            store.init(conn)                             # again: still untouched
+        finally:
+            conn.close()
+        self.assertEqual(self.raw("SELECT title FROM tasks"), [("abc",)])
+        self.assertEqual(self.raw("SELECT COUNT(*) FROM audit_log"), [(0,)])
+        self.assertEqual(self.raw("SELECT COUNT(*) FROM sessions"), [(0,)])
+        self.assertEqual(self.raw("SELECT value FROM meta WHERE key='schema_version'"), [(str(self.NEWER),)])
+
+    def test_upgrade_by_another_process_while_connected(self):
+        conn = store.connect(self.db)
+        try:
+            store.add_task(conn, "before")
+            self.bump(self.NEWER)                        # newer code upgraded it meanwhile
+            with self.assertRaises(store.SchemaTooNew):
+                store.add_task(conn, "after")
+            self.assertEqual(len(store.list_tasks(conn)), 2)
+        finally:
+            conn.close()
+
+    def test_cli_reports_the_versions(self):
+        self.bump(self.NEWER)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = tasks.main(["--db", self.db, "add", "x"])
+            self.assertEqual(tasks.main(["--db", self.db, "list", "--json"]), 0)   # reads work
+        self.assertEqual(rc, 1)
+        self.assertIn(f"schema_version {self.NEWER}", err.getvalue())
+        self.assertEqual(self.raw("SELECT COUNT(*) FROM tasks"), [(1,)])
+
+    def test_non_additive_migration_only_through_migrate(self):
+        def upper_titles(conn):
+            conn.execute("UPDATE tasks SET title = upper(title)")
+
+        nxt = store.SCHEMA_VERSION + 1
+        with mock.patch.object(store, "SCHEMA_VERSION", nxt), mock.patch.dict(store.MIGRATIONS, {nxt: upper_titles}):
+            conn = store.connect(self.db)                # connect never migrates: read-only until migrate
+            try:
+                self.assertEqual([t["title"] for t in store.list_tasks(conn)], ["abc"])
+                with self.assertRaises(store.MigrationNeeded) as cm:
+                    store.add_task(conn, "x")
+                self.assertIn("store.py migrate", str(cm.exception))
+                self.assertIn(f"schema_version {nxt - 1}", str(cm.exception))
+                self.assertEqual(store.get_meta(conn, "schema_version"), str(nxt - 1))
+            finally:
+                conn.close()
+            self.assertEqual(self.baks(), [])
+
+            r = store.migrate(self.db)
+            self.assertEqual((r["from"], r["to"], r["steps"]), (nxt - 1, nxt, [nxt]))
+            self.assertEqual(self.baks(), [os.path.basename(r["backup"])])
+            self.assertTrue(os.path.basename(r["backup"]).startswith(f"t.db.v{nxt - 1}-"))
+            b = sqlite3.connect(r["backup"])             # the copy is the state before the step
+            self.assertEqual(b.execute("SELECT title FROM tasks").fetchall(), [("abc",)])
+            self.assertEqual(b.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone(),
+                             (str(nxt - 1),))
+            b.close()
+            conn = store.connect(self.db)
+            try:
+                self.assertEqual([t["title"] for t in store.list_tasks(conn)], ["ABC"])
+                self.assertEqual(store.get_meta(conn, "schema_version"), str(nxt))
+                self.assertIsNotNone(store.get_meta(conn, f"migrated_v{nxt}_at"))
+                store.add_task(conn, "writable again")
+            finally:
+                conn.close()
+            r = store.migrate(self.db)                   # nothing left: no step, no backup
+            self.assertEqual((r["steps"], r["backup"]), ([], None))
+            self.assertEqual(len(self.baks()), 1)
+        conn = store.connect(self.db)                    # the old code meets the migrated DB
+        try:
+            with self.assertRaises(store.SchemaTooNew):
+                store.add_task(conn, "x")
+        finally:
+            conn.close()
+
+    def test_failed_migration_rolls_back_after_the_backup(self):
+        def broken(conn):
+            conn.execute("UPDATE tasks SET title = 'half done'")
+            raise RuntimeError("boom")
+
+        nxt = store.SCHEMA_VERSION + 1
+        with mock.patch.object(store, "SCHEMA_VERSION", nxt), mock.patch.dict(store.MIGRATIONS, {nxt: broken}):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                store.migrate(self.db)
+        self.assertEqual(self.raw("SELECT title FROM tasks"), [("abc",)])
+        self.assertEqual(self.raw("SELECT value FROM meta WHERE key='schema_version'"),
+                         [(str(store.SCHEMA_VERSION),)])
+        self.assertEqual(len(self.baks()), 1)
+
+    def test_migrate_cli(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(store.main(["migrate", "--db", self.db]), 0)       # up to date: nothing to do
+            self.assertEqual(json.loads(out.getvalue())["steps"], [])
+            self.bump(self.NEWER)
+            self.assertEqual(store.main(["migrate", "--db", self.db]), 1)       # never on a newer DB
+            self.assertEqual(store.main(["migrate", "--db", self.db + ".missing"]), 1)
+        self.assertIn(f"schema_version {self.NEWER}", err.getvalue())
+        self.assertIn("no database at", err.getvalue())
+        self.assertFalse(os.path.exists(self.db + ".missing"))
+        self.assertEqual(self.baks(), [])
 
 
 class Transactions(Base):

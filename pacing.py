@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Weekly budget model "pacing" (stdlib only): a forecast-driven night gate, the original linear
-rule as its fallback. The default of keepalive.budget_eval() (data/afclaude.json "usage_model": "pacing").
+rule as its fallback. The default of keepalive.budget_eval() (the usage_model setting: "pacing").
 
 Goal: use the weekly limit with autonomous night work in FULL session windows, but only while the
 week is predicted to end at or below the reserve threshold; then fill the last stretch right
@@ -15,9 +15,9 @@ window to the end):
     RUN iff predicted_end <= threshold: budget for this run (headroom) = run_cost (one number:
     reason, --decide, the continue message, the quickview; ~ 1 session window). Otherwise no run
     (no partial runs); the next session window / night re-checks.
-    threshold     = data/afclaude.json reserve_threshold: "auto" (default) = one session window
+    threshold     = the reserve_threshold setting: "auto" (default) = one session window
                     left = 100 - full_session_cost from the measured ratio (dynamic_threshold), or a %
-                    override in 50..99 (a legacy week_target is honoured as the override).
+                    override in 50..99.
     The model has NO margin: the threshold is the only spare.
     No forecast (< MIN_FORECAST_HOURS of closed-week user data): the straight line: RUN iff
     w + run_cost <= threshold x the elapsed fraction of the week at tonight's window end.
@@ -52,17 +52,17 @@ else the 15-min median), else 0.2 (conservative), and the reason says which.
 import json
 import math
 import os
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import schedule
 import usage_stale
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
-USER_MODEL_FILE = os.path.join(DATA_DIR, "user_model.json")
 SAMPLES_FILE = os.path.join(DATA_DIR, "samples.jsonl")
 FORECAST_LOG = os.path.join(DATA_DIR, "forecast_log.jsonl")
 FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an autonomous run)
@@ -75,6 +75,7 @@ FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an a
 WEEK = timedelta(days=7)
 SESSION_H = afclaude_config.SESSION_LENGTH.total_seconds() / 3600
 LAST_MILE_MAX_SESSIONS = 2
+# the code defaults of the pacing_* settings (actions.SETTINGS; test_pacing checks they agree)
 DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": True}
 THRESHOLD_RANGE = (50.0, 99.0)
 LAST_MILE_SESSION_CAP = 100.0
@@ -93,37 +94,14 @@ LONG_BYTES = 10 * 1024 * 1024        # ratio, forecast: about the last 4-5 weeks
 
 # ------------------------------------------------------------------ params
 
-def parse_params(d):
-    """Optional overrides from user_model.json (top level or a "pacing" object). The retired
-    forecast_margin is ignored: the model has no margin, the threshold is the only spare."""
-    if not isinstance(d, dict):
-        raise ValueError("not an object")
-    src = d.get("pacing") if isinstance(d.get("pacing"), dict) else d
-    over = {}
-    for key, lo, hi in (("idle_min", 0, 1440), ("min_gap", 0, 50), ("session_cap", 1, 100)):
-        v = src.get(key)
-        if v is not None:
-            if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
-                raise ValueError(f"{key} out of range: {v!r}")
-            over[key] = float(v)
-    if src.get("last_mile_yield") is not None:
-        if not isinstance(src["last_mile_yield"], bool):
-            raise ValueError("last_mile_yield must be true or false")
-        over["last_mile_yield"] = src["last_mile_yield"]
-    return over
-
-
-def load_params(path=None):
-    """-> (params, source text). Never raises: a missing or invalid file means the defaults."""
-    P = dict(DEFAULTS)
+def load_params():
+    """-> (params, source text): the pacing settings pacing_idle_min, pacing_min_gap,
+    pacing_session_cap, pacing_last_mile_yield (DB settings, else the code defaults; they were
+    optional overrides in data/user_model.json until phase 2a imported them). Never raises."""
     try:
-        with open(path or USER_MODEL_FILE) as fh:
-            P.update(parse_params(json.load(fh)))
-    except FileNotFoundError:
-        return P, "defaults"
-    except Exception as e:   # noqa: BLE001
-        return P, f"defaults (user model ignored: {type(e).__name__})"
-    return P, "user model"
+        return {**DEFAULTS, **afclaude_config.pacing_params()}, "settings"
+    except Exception as e:   # noqa: BLE001 - the decision must not fail on its parameters
+        return dict(DEFAULTS), f"defaults (settings unreadable: {type(e).__name__})"
 
 
 # ------------------------------------------------------------------ samples
@@ -342,87 +320,14 @@ def last_mile_hours(weekly_pct, ratio, setting="auto"):
 
 
 # ------------------------------------------------------------------ windows
-
-def _wall(d, t):
-    return datetime.combine(d, t, tzinfo=BERLIN)
-
-
-def in_window(t, win):
-    start, end = win
-    lt = t.astimezone(BERLIN).time()
-    return start <= lt < end if start <= end else (lt >= start or lt < end)
-
-
-def latest_window_start(t, win):
-    d = t.astimezone(BERLIN).date()
-    s = _wall(d, win[0])
-    return s if s <= t else _wall(d - timedelta(days=1), win[0])
-
-
-def window_end(start, win):
-    """End of the window that starts at `start` (wall clock; DST nights are 9 or 11 h)."""
-    d = start.astimezone(BERLIN).date() + (timedelta(days=1) if win[1] <= win[0] else timedelta(0))
-    return _wall(d, win[1])
-
-
-def next_window_start(t, win):
-    s = latest_window_start(t, win)
-    return s if s > t else _wall(s.astimezone(BERLIN).date() + timedelta(days=1), win[0])
-
-
-# Session-window starts (D-202): the night gate is checked at the start of EACH 5-h session window
-# inside the night window (23:00 and 04:00 by default), never at arbitrary times in between.
-
-def window_minutes(win):
-    """Wall-clock length of the window in minutes (it may span midnight)."""
-    a, b = (t.hour * 60 + t.minute for t in win)
-    return (b - a) % (24 * 60) or 24 * 60
-
-
-def session_starts(ws, win):
-    """The session-window starts of the night window that starts at `ws`: ws + k x 5 h on the wall
-    clock for every k whose 5-h session window still ends by the window end (D-148: the window is
-    N x 5 h, so k < N; at least the window start itself). Wall clock, so on a DST night the last
-    one still ends at the window end (09:00): 23:00 and 04:00 for the default 23:00 x 10 h."""
-    step = round(SESSION_H * 60)
-    n = max(int((window_minutes(win) + 1e-6) // step), 1)
-    d0, m0 = ws.astimezone(BERLIN).date(), win[0].hour * 60 + win[0].minute
-    out = []
-    for k in range(n):
-        m = m0 + k * step
-        out.append(_wall(d0 + timedelta(days=m // (24 * 60)),
-                         dtime(m % (24 * 60) // 60, m % 60)))
-    return out
-
-
-def latest_session_start(t, win):
-    """The latest session-window start <= t of the night window `t` is in; None outside the window."""
-    if not in_window(t, win):
-        return None
-    starts = [s for s in session_starts(latest_window_start(t, win), win) if s <= t]
-    return starts[-1] if starts else None
-
-
-def next_session_start(t, win):
-    """The first session-window start strictly after t (this night's next one, or the next night's first)."""
-    ws = latest_window_start(t, win)
-    for s in session_starts(ws, win) + session_starts(next_window_start(ws + timedelta(minutes=1), win), win):
-        if s > t:
-            return s
-    return next_window_start(t, win)
-
-
-def postpone_deadline(s, win):
-    """A start postponed from the session-window start `s` (yield, D-018) must begin before this:
-    the next session-window start of the same night (which checks the gate itself), so its 5-h
-    session window still ends by the window end. For the last start it is `s` itself: a
-    postponement there skips to the next night's first start (D-202)."""
-    starts = session_starts(latest_window_start(s, win), win)
-    later = [x for x in starts if x > s]
-    return later[0] if later else s
+# All window code is schedule.py (design §6): the session-window starts (D-202/D-203: the night
+# gate is checked at the start of EACH session window inside a window, never in between), nights
+# of different lengths or without a window (per-weekday window_days), DST nights (N x 5 h absolute).
 
 
 def _b(t):
+    if t is None:
+        return "none (no window on any day)"
     return t.astimezone(BERLIN).strftime("%a %d.%m. %H:%M")
 
 
@@ -558,14 +463,14 @@ def profile(rows=None, now=None, fires=None):
 # ------------------------------------------------------------------ decision
 
 def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, session_resets_at=None,
-                activity_known=True, ratio=DEFAULT_RATIO, lm_setting="auto", win=None, threshold="auto",
+                activity_known=True, ratio=DEFAULT_RATIO, lm_setting="auto", sched=None, threshold="auto",
                 forecast=None):
     """Pure decision. forecast = a function (a, b) -> the user's forecast weekly % in [a, b), or
     None (no forecast: the straight line). threshold = "auto"/None (dynamic_threshold(ratio)) or a
-    %. -> dict(go, headroom, target, mode, postpone, recheck_at, session_cap, reason, threshold,
-    predicted_end, run_cost, ...)."""
+    %. sched = the schedule.Config (None: the settings). -> dict(go, headroom, target, mode,
+    postpone, recheck_at, session_cap, reason, threshold, predicted_end, run_cost, ...)."""
     P = {**DEFAULTS, **(P or {})}
-    win = win or afclaude_config.window()
+    sched = sched or schedule.load()
     thr, thr_src = threshold_for(ratio, threshold)
     d = {"go": False, "headroom": None, "target": None, "mode": None, "postpone": False, "recheck_at": None,
          "session_cap": P["session_cap"], "user_active": None, "ratio": ratio, "last_mile_h": None,
@@ -615,8 +520,8 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
                    f"the reset {_b(resets_at)} = {pred:.1f}% {'<=' if ok else '>'} {thr_txt}")
             d.update(forecast=fc, predicted_end=pred)
         else:
-            ws = latest_window_start(now, win)
-            end = min(max(window_end(ws, win), now), resets_at)
+            cw = schedule.current_window(now, sched)
+            end = min(max(cw.end if cw else now, now), resets_at)
             frac = min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
             line = thr * frac
             pred = w + cost
@@ -630,7 +535,7 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
         base = (f"week {w:.0f}% used; {how}; budget for this run +{head:.1f}% "
                 f"(≈ {head / full:.1f} session windows)")
         if not ok or head <= P["min_gap"]:
-            nxt = next_session_start(now, win)     # D-202: the next session-window start re-checks
+            nxt = schedule.next_session_start(now, sched)     # D-202: the next session-window start re-checks
             why = "the week would end above the threshold" if not ok else "no room left"
             return dict(d, recheck_at=nxt, reason=f"HOLD: no run ({why}), next check at the session-window "
                                                   f"start {_b(nxt)}; {base}")
@@ -675,7 +580,7 @@ def decide(usage, now, params=None, rows=None, long_rows=None, msu=None, activit
     fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))
     setting, tsrc = afclaude_config.reserve_threshold_setting()
     d = decide_core(w.get("percent"), resets_at, now, msu, P, s.get("percent"), s.get("resets_at"),
-                    activity_known, ratio, afclaude_config.last_mile_setting(), afclaude_config.window(),
+                    activity_known, ratio, afclaude_config.last_mile_setting(), schedule.load(),
                     setting, fc)
     if setting != "auto":
         d["threshold_source"] = tsrc
@@ -695,6 +600,8 @@ NEXT_RUN_LABELS = {"now": "running now", "night": "night window", "last_stretch"
 
 def _bs(t):
     """Short Berlin time for one-line reasons: 'Thu 14:00'."""
+    if t is None:
+        return "none (no window on any day)"
     return t.astimezone(BERLIN).strftime("%a %H:%M")
 
 
@@ -719,16 +626,16 @@ def _no_usage(a, b):
     return 0.0
 
 
-START_DUE = timedelta(hours=1)   # the cron runs --window-start at :00 of each session-window start's hour
+START_DUE = schedule.CRON_STEP   # the cron runs --window-start every 30 min: a start is due that long
 
 
 def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None, threshold="auto",
-                  lm_setting="auto", win=None, current=None, session_pct=None, session_resets_at=None,
+                  lm_setting="auto", sched=None, current=None, session_pct=None, session_resets_at=None,
                   P=None, max_nights=8, active=None, deferred=None, slot_next=None):
     """When the next autonomous run will take place (pure): only what the runner will actually do
     (D-202). The runner checks the night gate only at each SESSION-WINDOW START inside the night
-    window (session_starts(): 23:00 and 04:00 by default), so this walks the upcoming session-window
-    starts until the weekly reset and evaluates the gate at each: predicted_end = w_start + run_cost
+    window (schedule.py: 23:00 and 04:00 by default; nights of different lengths or without a
+    window per window_days), so this walks the upcoming session-window starts until the weekly reset and evaluates the gate at each: predicted_end = w_start + run_cost
     + forecast(start, reset) <= threshold (the straight line without a forecast), as the real gate
     will at that time. The primary result assumes NO MORE USAGE (D-200): w_start = w now. The first
     start that passes is the next run; if none passes, the start of the last stretch before the reset
@@ -750,7 +657,7 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     -> {at, kind, label, reason, predicted_end, threshold, last_stretch_at,
         expected: {at, kind, label, reason, predicted_end, last_stretch_at}}; kind in NEXT_RUN_LABELS."""
     P = {**DEFAULTS, **(P or {})}
-    win = win or afclaude_config.window()
+    sched = sched or schedule.load()
     thr, _ = threshold_for(ratio, threshold)
     fc = forecast or _no_usage
     out = {"at": None, "kind": "unknown", "reason": None, "predicted_end": None, "threshold": thr,
@@ -769,7 +676,7 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     if weekly_pct is None or resets_at is None or resets_at <= now:
         return both(res("unknown", None, "weekly usage unknown or stale: no forecast of the next run"))
     w = float(weekly_pct)
-    after = next_session_start(resets_at - timedelta(seconds=1), win)
+    after = schedule.next_session_start(resets_at - timedelta(seconds=1), sched)
     if w >= 100:
         return both(res("after_reset", after, f"weekly limit used up until the reset {_bs(resets_at)}"))
     out["last_stretch_at"] = _last_stretch_start(w, resets_at, now, ratio, lm_setting, _no_usage)
@@ -799,7 +706,7 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
                                           else "activity unknown") + ")"
         return both(r)
 
-    s0 = latest_session_start(now, win) if cur.get("mode") == "night" else None
+    s0 = schedule.latest_session_start(now, sched) if cur.get("mode") == "night" else None
     if cur.get("mode") == "last_mile":
         if cur.get("go"):
             return go_now("last stretch")
@@ -808,7 +715,7 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
     elif s0 is not None:
         if cur.get("go") and now - s0 < START_DUE:
             return go_now(f"session-window start {_bs(s0)}, night gate passed")
-        dl = postpone_deadline(s0, win)
+        dl = schedule.postpone_deadline(s0, sched)
         pend = deferred if isinstance(deferred, datetime) else \
             (cur.get("recheck_at") if deferred is None and cur.get("postpone") else None)
         if pend is not None and pend < dl:
@@ -828,10 +735,9 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
         if lm is not None and now >= lm:
             return res("last_stretch", now, f"in the last stretch before the reset {_bs(resets_at)}",
                        last_stretch_at=lm)
-        first, s = None, next_session_start(now, win)
-        for _ in range(max_nights * len(session_starts(s, win))):
-            if s >= resets_at or (lm is not None and s >= lm):
-                break
+        first = None
+        until = min(resets_at, lm or resets_at, now + timedelta(days=max_nights))
+        for s, win in schedule.session_slots(now, until, sched):
             ws = w + pre(now, s)
             if ws >= 100:
                 break
@@ -843,7 +749,7 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
                 pred, line = ws + cost + fc(s, resets_at), thr
                 txt = f"predicted {pred:.1f}% {{}} {thr:.1f}%"
             else:
-                end = min(window_end(latest_window_start(s, win), win), resets_at)
+                end = min(win.end, resets_at)
                 line = thr * min(max((end - (resets_at - WEEK)) / WEEK, 0.0), 1.0)
                 pred = ws + cost
                 txt = f"straight line {pred:.1f}% {{}} {line:.1f}% (threshold {thr:.1f}% x elapsed)"
@@ -852,7 +758,6 @@ def next_run_core(weekly_pct, resets_at, now, ratio=DEFAULT_RATIO, forecast=None
             if pred <= line and cost > P["min_gap"]:
                 return res("night", s, txt.format("≤") + f" at {_bs(s)}", predicted_end=pred,
                            last_stretch_at=lm)
-            s = next_session_start(s, win)
         head = first[1].format(">") + f" until {_bs(lm or resets_at)}" if first else \
             "no session-window start before " + ("the last stretch" if lm else "the reset")
         pe = first[0] if first else None
@@ -881,7 +786,7 @@ def next_run(usage, now, decision=None, rows=None, fires=None, active=None, defe
     setting, _ = afclaude_config.reserve_threshold_setting()
     P, _ = load_params()
     d = next_run_core(w.get("percent"), w.get("resets_at"), now, ratio, fc, setting,
-                      afclaude_config.last_mile_setting(), afclaude_config.window(), decision,
+                      afclaude_config.last_mile_setting(), schedule.load(), decision,
                       s.get("percent"), s.get("resets_at"), P, active=active, deferred=deferred,
                       slot_next=slot_next)
     d["forecast_source"] = fsrc
@@ -945,7 +850,7 @@ def forecast_errors(rows, fires, now, path=None):
 MIN_BACKTEST_CLOSED = 7     # closed-horizon points (about a week of nights) before the error is "ok"
 
 
-def forecast_backtest(rows, fires, now, win=None, min_coverage=0.8):
+def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8):
     """Back-calculate the predictor's error from the usage data. At every past night
     session-window start t (the window start, + 5 h, ... inside the window) the profile fitted on
     the cycles closed before t (what the gate would have used) forecasts the user's use until
@@ -953,7 +858,7 @@ def forecast_backtest(rows, fires, now, win=None, min_coverage=0.8):
     use over the same span (user_intervals, the definition the fit uses). Spans the samples cover
     less than min_coverage are skipped. -> [{at, reset, end, closed, horizon_h, predicted, actual,
     error}], error = actual - predicted (> 0: the model under-predicted, the week ended higher)."""
-    win = win or afclaude_config.window()
+    sched = sched or schedule.load()
     rows = sorted((r for r in rows or () if _ts(_dict(r).get("at"))), key=lambda r: _ts(r["at"]))
     cycles = sorted({c for c in (_round_reset(_weekly(r).get("resets_at")) for r in rows) if c is not None})
     iv = user_intervals(rows, fires)
@@ -966,20 +871,15 @@ def forecast_backtest(rows, fires, now, win=None, min_coverage=0.8):
         if rates is None:
             continue
         cyc_iv = [x for x in iv if x[0] >= start and x[1] <= c + timedelta(minutes=5)]
-        ws = latest_window_start(start, win)
-        while ws < end:
-            k, we = ws, window_end(ws, win)
-            while k < we:
-                if start <= k and end - k >= step:
-                    span = [x for x in cyc_iv if x[0] >= k and x[1] <= end + timedelta(minutes=5)]
-                    hz = (end - k).total_seconds() / 3600
-                    if sum((x[1] - x[0]).total_seconds() for x in span) / 3600 >= min_coverage * hz:
-                        pred, act = forecast_user(rates, k, end), sum(x[2] for x in span)
-                        out.append({"at": k.astimezone(UTC).isoformat(), "reset": c.isoformat(),
-                                    "end": end.isoformat(), "closed": end == c, "horizon_h": round(hz, 1),
-                                    "predicted": pred, "actual": act, "error": act - pred})
-                k = (k.astimezone(UTC) + step).astimezone(BERLIN)
-            ws = _wall(ws.astimezone(BERLIN).date() + timedelta(days=1), win[0])
+        for k, _ in schedule.session_slots(start - timedelta(microseconds=1), end, sched):
+            if end - k >= step:
+                span = [x for x in cyc_iv if x[0] >= k and x[1] <= end + timedelta(minutes=5)]
+                hz = (end - k).total_seconds() / 3600
+                if sum((x[1] - x[0]).total_seconds() for x in span) / 3600 >= min_coverage * hz:
+                    pred, act = forecast_user(rates, k, end), sum(x[2] for x in span)
+                    out.append({"at": k.astimezone(UTC).isoformat(), "reset": c.isoformat(),
+                                "end": end.isoformat(), "closed": end == c, "horizon_h": round(hz, 1),
+                                "predicted": pred, "actual": act, "error": act - pred})
     return out
 
 
