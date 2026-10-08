@@ -92,8 +92,10 @@ def _num(x):
 
 
 def fire_kind(key, rec=None):
-    """keepalive's handled key (+ record) -> window-start | postponed-start | last-stretch | manual."""
+    """keepalive's handled key (+ record) -> window-start | postponed-start | last-stretch | fill-up | manual."""
     reason = str((rec or {}).get("reason") or "")
+    if key.startswith("fillup-"):
+        return "fill-up"      # D-212: the rest of a session window, shortly before its reset
     if key.startswith("last-mile-"):
         return "last-stretch"
     if key.startswith("manual-now-") or "manualtest" in key:

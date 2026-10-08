@@ -132,8 +132,16 @@ def session_message(name, afclaude=True, manager=True, **fields):
     if manager:
         parts.append(load_prompt("manager"))
         if afclaude:
-            parts.append(load_prompt("manager_afclaude"))
+            parts.append(load_prompt("manager_afclaude").format(session_stop_pct=session_stop_pct()))
     return " ".join(" ".join(parts).split())
+
+
+def session_stop_pct():
+    """The task-manager's clean session stop (the session_stop_pct setting, D-014), e.g. "95"."""
+    try:
+        return f"{float(afclaude_config.setting('session_stop_pct')):g}"
+    except Exception:   # noqa: BLE001 - a message must still go out
+        return "95"
 
 
 LIMIT_TEXT_RE = re.compile(r"hit your (?P<kind>[\w ]*?)\s*limit", re.I)
@@ -1039,7 +1047,7 @@ def run(args):
     log(f"keepalive start ({mode}) target={sid} windows {schedule.describe()} pid={os.getpid()}")
     st = load_state()
     last_line = None
-    next_eval = next_reading = datetime.min.replace(tzinfo=UTC)
+    next_eval = next_reading = next_fillup = datetime.min.replace(tzinfo=UTC)
     while True:
         if os.path.exists(STOP_FILE):
             log("STOP file present, exiting")
@@ -1065,6 +1073,12 @@ def run(args):
         # a postponed session-window start (D-018/D-202), also when the previous run ended at a
         # limit (D-204: "limit hit before 4am and the next run starts at 4am")
         deferred_window_start_pass(sid, now, st, args)
+        if now >= next_fillup:    # the fill-up run of an AFClaude session window (D-212)
+            next_fillup = now + FILLUP_EVERY
+            try:
+                fillup_pass(sid, now, args)
+            except Exception as e:   # noqa: BLE001 - a fill-up problem must not take the watcher down
+                log(f"fill-up pass failed: {type(e).__name__}: {e}")
         if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
             next_reading = now + RUN_READING_EVERY
             watch_run_usage(sid, now)
@@ -1154,7 +1168,8 @@ def last_mile_pass(sid, now, st, args):
     if not d["go"]:
         return max(d.get("recheck_at") or now + LAST_MILE_RECHECK, now + timedelta(seconds=POLL_SECONDS)) \
             if d.get("postpone") else now + LAST_MILE_RECHECK
-    handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"]},
+    handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"],
+                      "headroom": d.get("headroom")},
                 d["reason"], st, args)
     return None
 
@@ -1189,7 +1204,7 @@ def window_start_pass(sid, now, args):
         except Exception as e:   # noqa: BLE001 - the log is advisory
             log(f"forecast log failed: {type(e).__name__}: {e}")
     if d["go"]:
-        stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
+        stall = {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom")}
         fired = handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
         if fired == "db_paused" and not args.now:
             recheck_at = now + DB_PAUSE_RECHECK
@@ -1292,7 +1307,7 @@ def deferred_window_start_pass(sid, now, st, args):
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
     note_window_usage(key, u is not None, now, final=not again)
     if d["go"]:
-        fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
+        fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom")},
                             "window start (postponed), " + d["reason"], st, args)
         if fired == "db_paused":
             recheck_at = now + DB_PAUSE_RECHECK
@@ -1396,7 +1411,8 @@ def handle_fire(sid, stall, reason, st, args):
         alert(f"keep-alive did NOT continue {sid[:8]}: preflight failed", "; ".join(problems))
         return
     budget = stall.get("budget") or budget_headroom(read_usage_cache(), datetime.now(UTC))[1]
-    msg = session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE)
+    msg = session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
+                          **(stall.get("fields") or {}))
     path = transcript_path(sid)
     # the last recorded cwd can be a directory that has since been renamed/deleted
     cwd = next((c for c in ((last_message(path) or {}).get("cwd"), HERE) if c and os.path.isdir(c)), HERE)
@@ -1412,7 +1428,7 @@ def handle_fire(sid, stall, reason, st, args):
     st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
-              "session": sid, "usage": at_fire}
+              "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
     reply = verify_reply(path, sent_at) if rc == 0 else None
     live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
     result["env"] = [process_env_flags(a["pid"]) for a in live]
@@ -1429,6 +1445,186 @@ def handle_fire(sid, stall, reason, st, args):
     st["handled"][key] = result
     save_state(st)
     progress_note(f"fired continue for {sid[:8]} via {plan}: {result.get('result')} ({reason})")
+
+
+# ---------------------------------------------------------------- fill-up run (D-212)
+# After a run ended early (the task-manager stops cleanly at session_stop_pct, D-014), continue it
+# once more shortly before the session reset: start = reset - (100 - session %) / rate x
+# fillup_factor (fillup.py). D-202 lets runs begin only at session-window starts; the fill-up is the
+# owner's explicit exception (D-212): it continues a run's own session window, once per window.
+
+FILLUP_FILE = os.path.join(STATE_DIR, "keepalive_fillup.json")   # {"plan": the current plan (quickview),
+                                                                  #  "test": a --plan-fillup-test entry}
+FILLUP_EVERY = timedelta(seconds=60)
+_FILLUP_LINE = None
+
+
+def load_fillup():
+    try:
+        with open(FILLUP_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_fillup(d):
+    tmp = FILLUP_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(d, fh, indent=1, default=str)
+    os.replace(tmp, FILLUP_FILE)
+
+
+def _fillup_log(line):
+    global _FILLUP_LINE
+    if line != _FILLUP_LINE:
+        log(line)
+        _FILLUP_LINE = line
+
+
+def _fillup_rows():
+    try:
+        import run_metrics
+        return run_metrics.read_rows()
+    except Exception:   # noqa: BLE001 - no run data: the default rate
+        return []
+
+
+def _fillup_ratio():
+    try:
+        import pacing
+        return float(pacing.ratio_info()[0])
+    except Exception:   # noqa: BLE001
+        return 0.2
+
+
+def _limit_hit_in(sid, reset):
+    """The session stopped on a limit notice inside the session window ending at `reset`."""
+    path = transcript_path(sid)
+    stall = stall_info(last_message(path)) if path else None
+    t = (stall or {}).get("timestamp")
+    return bool(stall and t and reset - afclaude_config.SESSION_LENGTH <= t < reset)
+
+
+def _fillup_user(now, last_stretch, s):
+    """D-018 yield -> (active, recheck_at): unknown sampler data counts as active."""
+    if last_stretch and not s["pacing_last_mile_yield"]:
+        return False, None
+    import pacing
+    msu = pacing.minutes_since_user(now)
+    if msu is None:
+        return True, now + timedelta(minutes=15)
+    idle = float(s["pacing_idle_min"])
+    return (msu < idle), now + timedelta(minutes=max(idle - msu, 1.0))
+
+
+def fillup_decision(sid, now, usage=None):
+    """The fill-up decision for the current session window (fillup.decide with the live inputs)."""
+    import fillup
+    s = afclaude_config.settings("fillup_enabled", "fillup_factor", "automation_paused",
+                                 "pacing_idle_min", "pacing_last_mile_yield")
+    u = usage if usage is not None else (read_usage_cache() or {})
+    sess, w = u.get("session") or {}, u.get("weekly") or {}
+    reset = sess.get("resets_at")
+    st = load_state()
+    probe = (reset - timedelta(minutes=1)) if reset else now
+    last_stretch = bool(reset) and last_mile_left(w.get("resets_at"), probe, w.get("percent")) is not None
+    active, recheck = (False, None)
+    if s["fillup_enabled"] and reset and reset > now:
+        active, recheck = _fillup_user(now, last_stretch, s)
+    return fillup.decide(
+        now=now, session_pct=sess.get("percent"), session_reset=reset, weekly_pct=w.get("percent"),
+        handled=st.get("handled") or {}, rows=_fillup_rows(), ratio=_fillup_ratio(),
+        enabled=bool(s["fillup_enabled"]), factor=float(s["fillup_factor"]), paused=bool(s["automation_paused"]),
+        run_active=run_active(sid, now, st) is not None, limit_hit=bool(reset) and _limit_hit_in(sid, reset),
+        in_night=bool(reset) and schedule.in_window(probe), in_last_stretch=last_stretch,
+        next_start=schedule.next_session_start(now), user_active=active, user_recheck=recheck,
+        budget_fallback=lambda: budget_eval(u, now).get("headroom"))
+
+
+def _fillup_text(d):
+    return (f"fill-up of the session window resetting {berlin(d['reset'])}: ~{d['remaining']:.0f}% left, "
+            f"rate {d['rate']:.1f} %/h ({d['rate_src']}), {d['time_min']:.1f} min x {d['factor']:g} -> start "
+            f"{berlin(d['start'])}, weekly cost ~{d['cost']:.1f}% (ratio {d['ratio']:.3g})")
+
+
+def _fire_fillup(sid, now, d, args, test=False):
+    what = "TEST fill-up (--plan-fillup-test)" if test else "fill-up run (D-212)"
+    stall = {"uuid": d["key"], "timestamp": now, "prompt": "fillup", "headroom": d.get("cost"),
+             "budget": (f"budget for this run: the rest of this session window (~{float(d['remaining']):.0f}% "
+                        f"session" + (f", ~{d['cost']:.1f}% weekly)" if d.get("cost") is not None else ")")),
+             "fields": {"remaining": f"{float(d['remaining']):.0f}", "reset": d["reset"].astimezone(BERLIN).strftime("%H:%M %Z")}}
+    log(f"{what}: FIRE {d['key']}")
+    return handle_fire(sid, stall, f"{what}, session window resets {berlin(d['reset'])}", load_state(), args)
+
+
+def fillup_test_pass(sid, now, args, test):
+    import fillup
+    s = afclaude_config.settings("automation_paused")
+    st = load_state()
+    d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {}, paused=bool(s["automation_paused"]))
+    _fillup_log(f"fill-up TEST: {d['status']}: {d['reason']} (start {berlin(d['start'])}, key {d['key']})")
+    if d["status"] == "fire":
+        _fire_fillup(sid, now, d, args, test=True)
+        d = fillup.decide_test(now=now, test=test, handled=load_state().get("handled") or {}, paused=False)
+    if d["status"] in ("done", "expired"):
+        f = load_fillup()
+        f.pop("test", None)
+        save_fillup(f)
+        progress_note(f"fill-up TEST {d['key']}: {d['reason']}")
+
+
+def fillup_pass(sid, now, args):
+    """Once per watcher minute: plan / fire the fill-up of the current session window (D-212).
+    A --plan-fillup-test entry for this session takes precedence. Never raises for a missing input."""
+    test = load_fillup().get("test")
+    if isinstance(test, dict) and test.get("session") == sid:
+        return fillup_test_pass(sid, now, args, test)
+    d = fillup_decision(sid, now)
+    f = load_fillup()
+    plan = {k: (v.astimezone(UTC).isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
+    if f.get("plan") != plan:
+        f["plan"] = plan
+        save_fillup(f)
+    _fillup_log(f"fill-up: {d['status']}: {d['reason']}" + (f"; {_fillup_text(d)}" if "start" in d else ""))
+    if d["status"] != "fire":
+        return
+    u = fresh_usage(now, force=True)   # the plan used the cache: decide again on fresh numbers
+    if u is None:
+        return
+    d = fillup_decision(sid, now, u)
+    if d["status"] == "fire":
+        _fire_fillup(sid, now, d, args)
+
+
+def plan_fillup_test(sid, remaining, args):
+    """--plan-fillup-test: plan ONE fill-up for this session at session reset - remaining / rate x
+    fillup_factor, bypassing the run / window / budget conditions (still preflight, dedup,
+    automation_paused, db_paused). The running watcher picks it up from FILLUP_FILE."""
+    import fillup
+    now = datetime.now(UTC)
+    u = fresh_usage(now, force=True) or read_usage_cache() or {}
+    reset = (u.get("session") or {}).get("resets_at")
+    if not reset or reset <= now:
+        sys.exit("no live session window (session resets_at unknown or passed)")
+    factor = float(afclaude_config.setting("fillup_factor"))
+    p = fillup.plan(reset, 100.0 - float(remaining), _fillup_rows(), factor, _fillup_ratio())
+    entry = {"session": sid, "key": fillup.test_key(reset), "reset": reset.astimezone(UTC).isoformat(),
+             "start": p["start"].astimezone(UTC).isoformat(), "remaining": float(remaining),
+             "rate": p["rate"], "rate_src": p["rate_src"], "factor": factor, "cost": p["cost"],
+             "created_at": now.isoformat(), "test": True}
+    print(f"TEST fill-up for {sid[:8]}: session reset {berlin(reset)}, remaining {float(remaining):g}%, rate "
+          f"{p['rate']:.1f} %/h ({p['rate_src']}), {p['time_min']:.2f} min x {factor:g} -> fire at {berlin(p['start'])}")
+    if not args.arm:
+        print("dry-run: not scheduled (pass --arm)")
+        return
+    f = load_fillup()
+    f["test"] = entry
+    save_fillup(f)
+    log(f"fill-up TEST scheduled: {entry}")
+    progress_note(f"fill-up TEST scheduled for {sid[:8]} at {berlin(p['start'])} (reset {berlin(reset)}, "
+                  f"~{float(remaining):g}% left); the running watcher fires it")
+    print(f"scheduled in {FILLUP_FILE}; the running watcher fires it at {berlin(p['start'])}")
 
 
 def load_backlog():
@@ -1504,6 +1700,10 @@ def main():
     ap.add_argument("--work-on", metavar="PROJECT",
                     help="start a BACKLOG.md project right now in a new tmux session (list number or title substring); "
                          "needs --arm to actually start")
+    ap.add_argument("--plan-fillup-test", action="store_true",
+                    help="schedule ONE test fill-up run (D-212) for --session at session reset - remaining / rate "
+                         "x fillup_factor; the running watcher fires it (needs --arm to schedule)")
+    ap.add_argument("--remaining", type=float, default=3.0, help="with --plan-fillup-test: session %% left to fill")
     ap.add_argument("--take-over-idle", action="store_true",
                     help="if an idle interactive process (e.g. an open terminal) holds the session, SIGTERM it and resume in tmux")
     ap.add_argument("--model", default=LAUNCH["model"], help="model to relaunch with (tmux resume)")
@@ -1517,6 +1717,10 @@ def main():
     IGNORE_WINDOW = args.now
     if args.work_on:
         return work_on_project(args.work_on, args)
+    if args.plan_fillup_test:
+        if not args.session:
+            sys.exit("--plan-fillup-test needs --session")
+        return plan_fillup_test(args.session, args.remaining, args)
     if args.last_mile:
         if not args.session:
             sys.exit("--last-mile needs --session")

@@ -526,6 +526,7 @@ class SettingActions(Base):
                           "reserve_threshold": "auto", "last_mile_hours": "auto", "pacing_idle_min": 60.0,
                           "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": True,
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
+                          "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "automation_paused": False, "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0})
 
