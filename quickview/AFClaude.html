@@ -79,6 +79,7 @@ button.chip.in_progress { background: rgba(245,158,11,.18); border-color: rgba(2
 button.chip.blocked { background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.5); color: #ef4444; }
 button.chip.cur { box-shadow: 0 0 0 2px #a855f7; color: #fff; }
 button.chip.sel { border-color: #a855f7; }
+button.chip.preview { outline: 1px solid #ec4899; outline-offset: 2px; }
 .ph-detail { font-size: 13px; margin-top: 8px; }
 .ph-detail .steps, .stages { list-style: none; }
 .stages { font-size: 13px; margin-top: 6px; border-top: 1px dashed rgba(255,255,255,.15); padding-top: 6px; }
@@ -325,10 +326,18 @@ button.chip.sel { border-color: #a855f7; }
     var out = [];
     if (ph.length) {
       out.push('<div class="ph-head"><span class="mut">Dashboard phases</span><span class="mut">' + done + "/" + ph.length + " done</span></div>");
+      // D-211: the phase whose steps include the preview_from key gets a thin pink outline
+      // (distinct from the purple "current" ring) -- owner preview possible from there on.
+      var previewPhase = s.preview_from && ph.filter(function (p) {
+        return p.steps.some(function (x) { return x.key === s.preview_from; });
+      })[0];
       out.push('<div class="strip">' + ph.map(function (p) {
+        var isPreview = previewPhase && p.n === previewPhase.n;
         var tip = "Phase " + p.n + " · " + (ST_TEXT[p.status] || p.status) + " · " +
-          p.steps.map(function (x) { return x.key + ": " + x.title; }).join(" | ");
+          p.steps.map(function (x) { return x.key + ": " + x.title; }).join(" | ") +
+          (isPreview ? " · owner preview possible from here (D-211)" : "");
         return '<button type="button" class="chip ' + esc(p.status) + (p.current ? " cur" : "") + (p === sel ? " sel" : "") +
+          (isPreview ? " preview" : "") +
           '" data-n="' + p.n + '" title="' + esc(tip) + '" aria-label="' + esc(tip) + '">' + p.n +
           (p.total > 1 ? "<small>" + p.done + "/" + p.total + "</small>" : "") + "</button>";
       }).join("") + "</div>");

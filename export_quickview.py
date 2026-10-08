@@ -8,7 +8,9 @@ serves at /afclaude/:
                 the session fill time of AFClaude's runs, run_metrics.summary,
                 and the reserve threshold and the model's accuracy,
                 pacing.threshold_info), progress (from GOALS.md, plus the
-                project's stages from the task store as a phase strip), latest keep-alive
+                project's stages from the task store as a phase strip, and
+                preview_from marking the step from which a non-blocking owner
+                preview of the dashboard UI is possible, D-211), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
@@ -42,6 +44,10 @@ DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
 SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manager_session()
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
+# D-211: the step key (as build_stages() keys steps, e.g. "6a") from which a non-blocking owner
+# preview build of the dashboard UI first becomes possible (docs/dashboard_design.md §10.9). A
+# constant for now; swap for a task-store marker if that step ever moves without a doc edit.
+PREVIEW_FROM = os.environ.get("QUICKVIEW_PREVIEW_FROM", "6a")
 UTC = timezone.utc
 RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # run_metrics.py rows (the sampler writes them)
 
@@ -516,6 +522,7 @@ def main():
         "keepalive": keepalive_and_usage(now),
         "goals": parse_goals(read(os.path.join(HERE, "GOALS.md"))),
         "stages": stages(),
+        "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),
         "cron": cron_entries(),

@@ -68,6 +68,45 @@ class BuildStages(unittest.TestCase):
                 store.DB_PATH, qv.STAGES_PROJECT = old_path, old_proj
 
 
+class PreviewMarker(unittest.TestCase):
+    """D-211: status.json carries preview_from (the step key from which a non-blocking owner
+    preview build is possible); the page outlines the chip of the phase containing that step."""
+
+    def test_preview_from_key_matches_a_real_phase_step(self):
+        out = qv.build_stages([
+            T(1, "Dashboard 5e: migration", "done"),
+            T(2, "Dashboard 6a: skeleton + local auth"),
+            T(3, "Dashboard 6b: passkeys + oidc"),
+            T(4, "Dashboard 6c: read views"),
+            T(5, "Dashboard 7a: work writes"),
+        ])
+        ph = {p["n"]: p for p in out["phases"]}
+        keys = [s["key"] for s in ph[6]["steps"]]
+        self.assertIn(qv.PREVIEW_FROM, keys)   # the configured marker is an actual 6-step
+
+    def test_env_override(self):
+        old = os.environ.get("QUICKVIEW_PREVIEW_FROM")
+        try:
+            os.environ["QUICKVIEW_PREVIEW_FROM"] = "7a"
+            import importlib
+            reloaded = importlib.reload(qv)
+            self.assertEqual(reloaded.PREVIEW_FROM, "7a")
+        finally:
+            if old is None:
+                os.environ.pop("QUICKVIEW_PREVIEW_FROM", None)
+            else:
+                os.environ["QUICKVIEW_PREVIEW_FROM"] = old
+            importlib.reload(qv)   # restore the module-level default for later tests
+
+    def test_page_has_the_preview_outline_and_marker(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        self.assertIn("s.preview_from", page)
+        self.assertIn("chip.preview", page)
+        self.assertIn("owner preview possible from here (D-211)", page)
+        self.assertIn("#ec4899", page)   # the pink outline color, distinct from the purple "cur" ring
+
+
 class WindowInfo(unittest.TestCase):
     """The 23:00-09:00 window spans midnight: inside it, the next window is the following
     evening's; outside, this evening's."""
