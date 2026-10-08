@@ -3,6 +3,12 @@
 # session (a few cents): new -> send-keys continue -> kill -> resume. Checks that
 # every reply lands in the SAME transcript (no fork) and that the process has the
 # hook bypass env. Alerts via notify.py on failure. Exit 0 = PASS.
+# NOT a unit test: it starts a real Claude session and writes ~/.claude.json (trust entry).
+# Run it only on purpose: AFCLAUDE_E2E=1 ./test_e2e_tmux.sh
+if [ "${AFCLAUDE_E2E:-}" != "1" ]; then
+    echo "test_e2e_tmux.sh is a REAL end-to-end test (starts a Claude session, edits ~/.claude.json); set AFCLAUDE_E2E=1 to run it" >&2
+    exit 2
+fi
 set -uo pipefail
 DIR="$(dirname "$(readlink -f "$0")")"
 CWD="$DIR/probe"; mkdir -p "$CWD"
