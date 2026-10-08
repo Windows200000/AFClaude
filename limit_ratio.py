@@ -11,13 +11,24 @@ weekly cycle (both resets_at unchanged, mod clock jitter), computes:
       windows_per_week           = 100 / (100 * ratio)   -- full session
                                     windows that fit in one weekly budget
       windows_left_this_week     = (100 - weekly_pct_now) / (100 * ratio)
-  - an attribution of that ratio's weekly % between AFClaude ("own":
-    autonomous/keep-alive sessions) and the user ("other"), using
-    output(+thinking)- and cache-weighted token deltas already split by
-    usage_sampler's activity.own/activity.other. Intervals where only one
-    side was active are a clean measurement of that side's %-per-token rate;
-    those rates are applied to every interval in the current weekly cycle to
-    estimate each side's share of this week's weekly % so far.
+  - an attribution of this week's weekly % between AFClaude and the user,
+    BY TIME (estimate_time_split, the primary `attribution.week_share`): the
+    weekly-% rise while an autonomous AFClaude run was going (a keep-alive /
+    dispatcher / usage-review fire until that run ended: data/afclaude_runs.jsonl,
+    else pacing.autonomous_spans) is AFClaude's; every other rise is the
+    user's -- including the owner's interactive chats with the task-manager
+    session (D-018: the owner's input to AFClaude is the owner's own use) and
+    rises no local transcript explains (other devices, claude.ai; D-138 gap 3).
+    Inside a run, a parallel token split against non-AFClaude sessions moves
+    that part to the user.
+  - the old token split (`attribution.week_share_tokens`, secondary signal):
+    output(+thinking)- and cache-weighted token deltas split by
+    usage_sampler's activity.own/activity.other. That split is by SESSION
+    (AFClaude cwd/name = "own"), not by who drove it, and it cannot see other
+    devices, so it calls everything the owner does in the AFClaude session
+    "AFClaude". Intervals where only one side was active are a clean
+    measurement of that side's %-per-token rate; those rates are applied to
+    every interval in the current weekly cycle.
 
 `resets_at` jitters by a few hundred ms between fetches even when the
 underlying reset hasn't moved (see usage_sampler.track_cycle), so windows are
@@ -592,10 +603,13 @@ def estimate_side_rates(pairs):
 
 
 def estimate_weekly_share(pairs, rates, current_weekly_resets):
-    """AFClaude ("own") vs user ("other") share of this weekly cycle's
-    accumulated weekly %, estimated by applying each side's measured
+    """AFClaude-SESSION ("own") vs other-session ("other") share of this weekly
+    cycle's accumulated weekly %, estimated by applying each side's measured
     %-per-token rate to every interval in the current cycle and normalizing.
-    Requires both sides to have a usable clean rate (see estimate_side_rates)."""
+    Requires both sides to have a usable clean rate (see estimate_side_rates).
+    Secondary signal only (`week_share_tokens`): "own" includes the owner's
+    interactive turns in AFClaude sessions, and usage on other devices is
+    invisible to it; the AFClaude vs user split is estimate_time_split()."""
     own_rate = rates.get("own", {}).get("rate")
     other_rate = rates.get("other", {}).get("rate")
     if own_rate is None or other_rate is None:
@@ -611,22 +625,159 @@ def estimate_weekly_share(pairs, rates, current_weekly_resets):
     if cycle_pairs:
         observed_delta = round(sum(p["d_weekly"] for p in cycle_pairs), 2)
     return {
-        "status": "ok", "n_pairs": len(cycle_pairs),
+        "status": "ok", "method": "tokens", "n_pairs": len(cycle_pairs),
         "own_share": attributed_own / total, "other_share": attributed_other / total,
         "observed_weekly_pct_delta": observed_delta,
-        "note": "share of the weekly % change covered by sampled pairs this cycle; "
-                "may not cover the full week if sampling started mid-cycle",
+        "note": "token split by session (AFClaude sessions incl. the owner's own turns in them vs other "
+                "sessions on this host; other devices invisible); covers sampled pairs only",
     }
+
+
+# ------------------------------------------------------------------ time-based split (primary)
+
+WEEK = timedelta(days=7)
+RUN_END_GRACE = timedelta(minutes=10)   # the meter lags the run's last turn a little
+FIRE_COVER = timedelta(minutes=2)       # a fire this close to a run row's span belongs to that run
+
+
+def combine_spans(run_rows=(), fallback=(), now=None):
+    """Autonomous AFClaude periods [(start, end)], merged and sorted.
+    run_rows: run_metrics rows (data/afclaude_runs.jsonl): start..end, an ongoing run until `now`.
+    fallback: [(fire, end)] from pacing.autonomous_spans; used only for fires no run row covers
+    (a fire run_metrics hasn't written yet, a usage-review or dispatcher run)."""
+    spans = []
+    for r in run_rows or []:
+        if not isinstance(r, dict):
+            continue
+        a, b = _parse_ts(r.get("start")), _parse_ts(r.get("end"))
+        if a is None:
+            continue
+        if r.get("ongoing") or b is None:
+            b = max(b or a, now or a)
+        spans.append((a, max(a, b)))
+    rows_spans = list(spans)
+    for a, b in fallback or []:
+        a, b = _parse_ts(a), _parse_ts(b)
+        if a is None or b is None or (now is not None and a > now):
+            continue
+        if any(x - FIRE_COVER <= a <= y + FIRE_COVER for x, y in rows_spans):
+            continue
+        spans.append((a, max(a, b)))
+    spans.sort()
+    out = []
+    for a, b in spans:
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _overlap(t0, t1, spans):
+    """Seconds of (t0, t1] inside any span (spans merged, non-overlapping)."""
+    tot = 0.0
+    for a, b in spans:
+        lo, hi = max(t0, a), min(t1, b)
+        if hi > lo:
+            tot += (hi - lo).total_seconds()
+    return tot
+
+
+def estimate_time_split(rows, spans, current_weekly_resets, now=None):
+    """AFClaude vs user share of this weekly cycle's weekly %, by TIME.
+
+    Walks the cycle's usable (non-stale) weekly readings from the reset (the meter is 0 there):
+    each rise between two readings is AFClaude's for the part of the interval that lies inside
+    an autonomous run (`spans`, extended by RUN_END_GRACE for the meter lag), the user's for the
+    rest. Inside a run, the interval's token split moves the share of non-AFClaude-session tokens
+    to the user (the owner working in parallel elsewhere). Stale readings are skipped, so a rise
+    across a stale gap is still counted (split by the gap's overlap with runs). `user_unseen_pct`
+    is the user's rise in intervals with no transcript tokens at all on this host (other devices,
+    claude.ai, or a meter lagging an earlier interval)."""
+    if current_weekly_resets is None:
+        return {"status": "insufficient_data", "method": "time", "reason": "no current weekly sample"}
+    if spans is None:
+        return {"status": "insufficient_data", "method": "time", "reason": "AFClaude run spans unavailable"}
+    now = now or datetime.now(UTC)
+    start = current_weekly_resets - WEEK
+    grace = [(a, b + RUN_END_GRACE) for a, b in spans]
+    merged = combine_spans(fallback=grace)
+    prev_t, prev_w = start, 0.0
+    tok_o = tok_u = 0.0
+    own = user = unseen = 0.0
+    n = 0
+    seq = sorted(((_parse_ts(r.get("at")), r) for r in rows if isinstance(r, dict) and r.get("at")),
+                 key=lambda x: x[0])
+    for t, r in seq:
+        if t <= start or t > now + timedelta(minutes=1):
+            continue
+        act = r.get("activity") or {}
+        tok_o += weighted_tokens((act.get("own") or {}).get("tokens"))
+        tok_u += weighted_tokens((act.get("other") or {}).get("tokens"))
+        w = usage_stale.row_usage(r).get("weekly") or {}
+        if w.get("percent") is None or _round_reset(w.get("resets_at")) != current_weekly_resets:
+            continue
+        wp = float(w["percent"])
+        dw = max(wp - prev_w, 0.0)
+        if dw > 0 and t > prev_t:
+            frac = min(1.0, _overlap(prev_t, t, merged) / (t - prev_t).total_seconds())
+            auto, man = dw * frac, dw * (1 - frac)
+            uf = tok_u / (tok_o + tok_u) if tok_o + tok_u > 0 else 0.0
+            own += auto * (1 - uf)
+            user += auto * uf + man
+            if tok_o + tok_u == 0:
+                unseen += man
+        prev_w, prev_t = max(prev_w, wp), t
+        tok_o = tok_u = 0.0
+        n += 1
+    total = own + user
+    in_cycle = [(max(a, start), min(b, now)) for a, b in spans if b > start and a < now]
+    out = {"method": "time", "n_readings": n, "weekly_pct": round(prev_w, 1),
+           "own_pct": round(own, 2), "user_pct": round(user, 2), "user_unseen_pct": round(unseen, 2),
+           "runs_in_cycle": len(in_cycle),
+           "run_hours": round(sum((b - a).total_seconds() for a, b in in_cycle) / 3600, 2),
+           "note": "weekly % risen during AFClaude's autonomous runs vs everything else (the owner's "
+                   "chats with the task-manager and other devices count as user usage)"}
+    if total <= 0:
+        out.update(status="insufficient_data", reason="no weekly % rise this cycle yet")
+        return out
+    out.update(status="ok", own_share=own / total, other_share=user / total)
+    return out
+
+
+def load_autonomous_spans(rows, now=None, runs_path=None):
+    """The autonomous AFClaude periods from the live files: run_metrics rows plus pacing's fire
+    spans for fires without a row. None if neither source can be read (the caller then reports
+    the time split as unavailable rather than calling everything user usage)."""
+    now = now or datetime.now(UTC)
+    run_rows = fallback = None
+    try:
+        import run_metrics
+        run_rows = run_metrics.read_rows(runs_path)
+    except Exception:   # noqa: BLE001 - advisory
+        run_rows = None
+    try:
+        import pacing
+        srt = sorted((r for r in rows if isinstance(r, dict) and _parse_ts(r.get("at"))),
+                     key=lambda r: _parse_ts(r["at"]))
+        fallback = pacing.autonomous_spans(srt, pacing.fire_times())
+    except Exception:   # noqa: BLE001 - advisory
+        fallback = None
+    if run_rows is None and fallback is None:
+        return None
+    return combine_spans(run_rows or [], fallback or [], now)
 
 
 # ------------------------------------------------------------------ snapshot
 
-def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
+def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None, spans=None):
     """Full snapshot from a list of already-parsed sample rows (oldest
     first). Pure function, easy to unit test with synthetic rows and to call
     from usage_sampler.py with in-memory rows (no extra file I/O there).
     `windows`: stored per-session-window records (data/session_windows.jsonl);
-    merged with the windows derivable from `rows` (stored ones win)."""
+    merged with the windows derivable from `rows` (stored ones win).
+    `spans`: autonomous AFClaude run periods [(start, end)] (load_autonomous_spans);
+    None = unknown, the AFClaude vs user split is then reported as unavailable."""
     now = now or datetime.now(UTC)
     pairs = build_pairs(rows)
     ratio_est = estimate_ratio(pairs, now=now, trimmed_days=trimmed_days)
@@ -642,8 +793,9 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
             break
 
     rates = estimate_side_rates(pairs)
-    share = (estimate_weekly_share(pairs, rates, weekly_resets_now)
-             if weekly_resets_now is not None else {"status": "insufficient_data", "reason": "no current weekly sample"})
+    share_tok = (estimate_weekly_share(pairs, rates, weekly_resets_now)
+                 if weekly_resets_now is not None else {"status": "insufficient_data", "reason": "no current weekly sample"})
+    share = estimate_time_split(rows, spans, weekly_resets_now, now=now)
 
     wins = merge_windows(windows, build_windows(rows, now=now))
     snap = {
@@ -652,7 +804,7 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
         "windows_per_week": windows_per_week(ratio),
         "windows_left_this_week": windows_left_this_week(ratio, weekly_pct_now),
         "weekly_pct_now": weekly_pct_now,
-        "attribution": {"rates": rates, "week_share": share},
+        "attribution": {"rates": rates, "week_share": share, "week_share_tokens": share_tok},
         "ratio_windows": estimate_window_ratio(wins, pairs=pairs, now=now, recent_days=trimmed_days),
     }
     pref = preferred_ratio(snap)
@@ -662,9 +814,12 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None):
     return snap
 
 
-def compute_from_file(path=SAMPLES, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows_path=SESSION_WINDOWS):
-    return compute(load_samples(path), now=now, trimmed_days=trimmed_days,
-                   windows=load_windows(windows_path) if windows_path else None)
+def compute_from_file(path=SAMPLES, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows_path=SESSION_WINDOWS,
+                      runs_path=None):
+    rows = load_samples(path)
+    return compute(rows, now=now, trimmed_days=trimmed_days,
+                   windows=load_windows(windows_path) if windows_path else None,
+                   spans=load_autonomous_spans(rows, now=now, runs_path=runs_path))
 
 
 # ------------------------------------------------------------------ CLI
@@ -713,12 +868,20 @@ def human_summary(snap):
     lines.append(f"User (other) rate: {_fmt_ratio(rates['other']['rate'])} session-%/weighted-token (n={rates['other']['n']})")
     share = snap["attribution"]["week_share"]
     if share["status"] != "ok":
-        reason = share.get("missing_side_rate") or share.get("reason") or "?"
-        lines.append(f"This week's weekly % share: insufficient data ({reason})")
+        lines.append(f"This week's weekly %, AFClaude runs vs user: insufficient data ({share.get('reason') or '?'})")
     else:
-        lines.append(f"This week's weekly % share so far: AFClaude {_fmt_share(share['own_share'])} / "
-                     f"user {_fmt_share(share['other_share'])} (n_pairs={share['n_pairs']}, "
-                     f"observed weekly % delta in sample {share['observed_weekly_pct_delta']})")
+        lines.append(f"This week's weekly %, AFClaude runs vs user (by time): AFClaude {_fmt_share(share['own_share'])} "
+                     f"({share['own_pct']:g} pts in {share['runs_in_cycle']} run(s), {share['run_hours']:g} h) / "
+                     f"user {_fmt_share(share['other_share'])} ({share['user_pct']:g} pts, of which "
+                     f"{share['user_unseen_pct']:g} with no local tokens: other devices / claude.ai)")
+    tok = snap["attribution"].get("week_share_tokens") or {}
+    if tok.get("status") != "ok":
+        reason = tok.get("missing_side_rate") or tok.get("reason") or "?"
+        lines.append(f"  token split by session: insufficient data ({reason})")
+    else:
+        lines.append(f"  token split by session (secondary): AFClaude sessions {_fmt_share(tok['own_share'])} / "
+                     f"other sessions {_fmt_share(tok['other_share'])} (n_pairs={tok['n_pairs']}; the owner's turns "
+                     f"in AFClaude sessions count as AFClaude here)")
     return "\n".join(lines)
 
 
@@ -729,6 +892,7 @@ def main():
     ap.add_argument("--windows", default=SESSION_WINDOWS, help="per-session-window file (never pruned)")
     ap.add_argument("--backfill-windows", action="store_true",
                     help="rebuild --windows from --samples (keeps stored windows the samples no longer cover)")
+    ap.add_argument("--runs", default=None, help="AFClaude runs file (default: run_metrics.RUNS_FILE)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     if args.backfill_windows:
@@ -742,7 +906,8 @@ def main():
                   f" [{_fmt_ratio(w.get('ratio_lo'))}..{_fmt_ratio(w.get('ratio_hi'))}]"
                   f"  cov={w['coverage_frac']:.0%} {','.join(w['flags'])}")
         return
-    snap = compute_from_file(args.samples, trimmed_days=args.trimmed_days, windows_path=args.windows)
+    snap = compute_from_file(args.samples, trimmed_days=args.trimmed_days, windows_path=args.windows,
+                             runs_path=args.runs)
     if args.json:
         print(json.dumps(snap, indent=1, default=str))
     else:

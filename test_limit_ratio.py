@@ -194,7 +194,113 @@ class Attribution(unittest.TestCase):
         self.assertIn("other", share["missing_side_rate"])
 
 
+class TimeSplit(unittest.TestCase):
+    """AFClaude vs user by time: weekly % risen during autonomous runs is AFClaude's, all else the user's."""
+    WR = lr._round_reset(WEEK_RESET2)            # cycle 01.10. 17:00 .. 08.10. 17:00 UTC
+    START = WR - timedelta(days=7)
+
+    def r(self, h, wp, own=0, other=0, stale=False):
+        x = row(self.START + timedelta(hours=h), 0, wp, week_reset=WEEK_RESET2,
+                own=own_tok(out=own) if own else None, other=own_tok(out=other) if other else None)
+        if stale:
+            x["usage"]["stale"] = True
+        return x
+
+    def split(self, rows, spans, now_h=200):
+        return lr.estimate_time_split(rows, spans, self.WR, now=self.START + timedelta(hours=now_h))
+
+    def span(self, h0, h1):
+        return (self.START + timedelta(hours=h0), self.START + timedelta(hours=h1))
+
+    def test_owner_chat_in_afclaude_session_without_a_run_is_user_usage(self):
+        # all tokens in the AFClaude session (activity.own), no autonomous run: 100% user (D-018)
+        rows = [self.r(1, 5, own=1000), self.r(2, 12, own=2000), self.r(3, 20, own=500)]
+        s = self.split(rows, [])
+        self.assertEqual(s["status"], "ok")
+        self.assertEqual(s["method"], "time")
+        self.assertAlmostEqual(s["own_share"], 0.0)
+        self.assertAlmostEqual(s["user_pct"], 20.0)       # incl. the rise from 0 at the reset
+        # the token split by session would have called it 100% AFClaude
+        self.assertEqual(s["user_unseen_pct"], 0.0)
+
+    def test_rise_during_a_run_is_afclaude(self):
+        rows = [self.r(1, 10, other=100), self.r(2, 10), self.r(3, 25, own=3000), self.r(4, 30, other=100)]
+        s = self.split(rows, [self.span(2, 3)])
+        self.assertAlmostEqual(s["own_pct"], 15.0)
+        self.assertAlmostEqual(s["user_pct"], 15.0)
+        self.assertAlmostEqual(s["own_share"], 0.5)
+        self.assertEqual(s["runs_in_cycle"], 1)
+
+    def test_partial_overlap_is_proportional(self):
+        rows = [self.r(1, 10), self.r(2, 20, own=1000)]
+        # run covers the first half of (1h, 2h], minus the end grace: 1:00..1:20 + 10 min grace = 1:30
+        s = self.split(rows, [self.span(1, 1 + 20 / 60)])
+        self.assertAlmostEqual(s["own_pct"], 5.0)
+        self.assertAlmostEqual(s["user_pct"], 15.0)
+
+    def test_parallel_user_tokens_during_a_run_go_to_the_user(self):
+        rows = [self.r(1, 10), self.r(2, 20, own=3000, other=1000)]
+        s = self.split(rows, [self.span(1, 3)])
+        self.assertAlmostEqual(s["own_pct"], 7.5)
+        self.assertAlmostEqual(s["user_pct"], 12.5)
+
+    def test_rise_across_stale_readings_and_without_tokens_is_user(self):
+        rows = [self.r(1, 10, other=50), self.r(5, 10, stale=True), self.r(30, 99, stale=True),
+                self.r(40, 18), self.r(41, 19)]
+        s = self.split(rows, [])
+        self.assertAlmostEqual(s["user_pct"], 19.0)       # the stale gap's +8 still counted
+        self.assertAlmostEqual(s["user_unseen_pct"], 9.0)  # 10->18 and 18->19: no tokens on this host
+        self.assertEqual(s["weekly_pct"], 19.0)
+
+    def test_stale_row_tokens_still_count_for_the_interval(self):
+        rows = [self.r(1, 10, other=10), self.r(2, 10, other=500, stale=True), self.r(3, 14)]
+        s = self.split(rows, [])
+        self.assertEqual(s["user_unseen_pct"], 0.0)
+
+    def test_previous_cycle_rows_and_future_rows_ignored(self):
+        old = row(self.START - timedelta(hours=1), 0, 95, week_reset=WEEK_RESET)
+        rows = [old, self.r(1, 4), self.r(300, 50)]
+        s = self.split(rows, [], now_h=10)
+        self.assertAlmostEqual(s["user_pct"], 4.0)
+
+    def test_unknown_spans_or_no_rise(self):
+        self.assertEqual(self.split([self.r(1, 5)], None)["status"], "insufficient_data")
+        self.assertEqual(self.split([self.r(1, 0)], [])["status"], "insufficient_data")
+        self.assertEqual(lr.estimate_time_split([], [], None)["status"], "insufficient_data")
+
+
+class CombineSpans(unittest.TestCase):
+    def test_runs_fallback_and_merge(self):
+        now = T0 + timedelta(hours=10)
+        runs = [{"start": T0.isoformat(), "end": (T0 + timedelta(hours=1)).isoformat(), "ongoing": False},
+                {"start": (T0 + timedelta(hours=8)).isoformat(), "end": (T0 + timedelta(hours=8)).isoformat(),
+                 "ongoing": True}]
+        fallback = [(T0 + timedelta(minutes=1), T0 + timedelta(hours=10)),      # the 2nd fire of run 1: covered
+                    (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),   # a usage-review run
+                    (T0 + timedelta(hours=11), T0 + timedelta(hours=12))]     # after now: ignored
+        got = lr.combine_spans(runs, fallback, now)
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=1)),
+                               (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),
+                               (T0 + timedelta(hours=8), now)])          # ongoing: until now
+
+    def test_overlapping_spans_merge(self):
+        got = lr.combine_spans([], [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=1), T0 + timedelta(hours=3))])
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=3))])
+
+
 class ComputeSnapshot(unittest.TestCase):
+    def test_compute_reports_time_split_and_keeps_token_split(self):
+        rows = make_series(lr.MIN_PAIRS + 5, step_session=2.0, step_weekly=0.2, own_out=1000)
+        snap = lr.compute(rows, now=T0 + timedelta(days=1), spans=[])
+        att = snap["attribution"]
+        self.assertEqual(att["week_share"]["method"], "time")
+        self.assertEqual(att["week_share"]["status"], "ok")
+        self.assertAlmostEqual(att["week_share"]["other_share"], 1.0)   # no runs: all user
+        self.assertIn("week_share_tokens", att)
+        self.assertIn("AFClaude runs vs user", lr.human_summary(snap))
+        snap = lr.compute(rows, now=T0 + timedelta(days=1))              # spans unknown
+        self.assertEqual(snap["attribution"]["week_share"]["status"], "insufficient_data")
+
     def test_compute_end_to_end_insufficient(self):
         rows = make_series(3)
         snap = lr.compute(rows, now=T0 + timedelta(days=1))

@@ -262,10 +262,20 @@ button.chip.sel { border-color: #a855f7; }
     } else if (th.error) {
       out.push(tile("Reserve threshold", "–", '<div class="mut">' + esc(th.error) + "</div>"));
     }
-    if (lim.share_status === "ok") {
-      out.push(tile("AFClaude vs user (week)",
+    if (lim.share_status === "ok" && lim.share_method === "time") {
+      out.push(tile("AFClaude runs vs you (week)",
         Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",
-        '<div class="mut">AFClaude / user share of this week’s weekly % so far</div>'));
+        '<div class="mut">weekly % used during AFClaude’s autonomous runs (' + lim.own_pct_week + " pts, " +
+          lim.runs_week + " run(s), " + lim.run_hours_week + " h) / everything else (" + lim.user_pct_week +
+          " pts, incl. your chats with the task-manager)</div>" +
+        (lim.user_unseen_pct_week ? '<div class="mut">' + lim.user_unseen_pct_week +
+          " pts with no tokens on this host (other devices / claude.ai)</div>" : "") +
+        (lim.afc_session_token_share_week != null ? '<div class="mut">tokens in AFClaude sessions: ' +
+          Math.round(lim.afc_session_token_share_week * 100) + "% (incl. your own turns there)</div>" : "")));
+    } else if (lim.share_status === "ok") {
+      out.push(tile("AFClaude sessions vs other (week)",
+        Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",
+        '<div class="mut">old token split by session: your chats in AFClaude sessions count as AFClaude, other devices are not seen</div>'));
     } else {
       out.push(tile("AFClaude vs user (week)", "–", '<div class="mut">insufficient data</div>'));
     }

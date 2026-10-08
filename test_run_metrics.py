@@ -356,7 +356,8 @@ class WatcherReadings(unittest.TestCase):
 
 class Hooks(unittest.TestCase):
     def test_handle_fire_records_session_and_usage(self):
-        cache = {"fetched_at": F, "session": {"percent": 3.0, "resets_at": None},
+        # handle_fire stamps the fire with the real clock: the cache must be fresh against it
+        cache = {"fetched_at": datetime.now(UTC), "session": {"percent": 3.0, "resets_at": None},
                  "weekly": {"percent": 70.0, "resets_at": WRESET}}
         names = ("STATE_FILE", "PROGRESS_FILE", "PROJECTS_DIR", "preflight", "fire", "verify_reply", "agent_entries",
                  "read_usage_cache", "log", "budget_headroom")
@@ -387,7 +388,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(rec["usage"]["session"], {"percent": 3.0, "resets_at": None})
         self.assertEqual(rec["usage"]["weekly"]["resets_at"], WRESET.isoformat())
         f = rm.fires_from_states([st])[0]
-        r = rm.compute_run(rm.group_fires([f])[0], [], [], [], now=F + timedelta(minutes=1))
+        r = rm.compute_run(rm.group_fires([f])[0], [], [], [], now=f["at"] + timedelta(minutes=1))
         self.assertEqual((r["session_start_pct"], r["weekly_start_pct"]), (3.0, 70.0))
 
     def test_sampler_hook_never_sinks_the_sample(self):
