@@ -98,7 +98,7 @@ class Base(unittest.TestCase):
             fh.write("Continue ({reason}). Progress: {progress}. Literal {{braces}}.\n")
         with open(os.path.join(actions.PROMPTS_DIR, "manager.md"), "w") as fh:
             fh.write("Act as a project manager.\n")
-        self.conn = store.connect(self.db)
+        self.conn = store.connect(self.db, create=True)
 
     def tearDown(self):
         store._utcnow, actions.OWN_LIST, actions.PROMPTS_DIR, afclaude_config.CONFIG_FILE = self._saved
@@ -857,10 +857,11 @@ class MigrationV4(unittest.TestCase):
 
     def test_fresh_db_is_v4_without_migration_mark(self):
         with tempfile.TemporaryDirectory() as d:
-            conn = store.connect(os.path.join(d, "new.db"))
+            conn = store.connect(os.path.join(d, "new.db"), create=True)
             try:
                 self.assertEqual(store.get_meta(conn, "schema_version"), "4")
                 self.assertIsNone(store.get_meta(conn, "migrated_v4_at"))
+                self.assertIsNotNone(store.get_meta(conn, "install_id"))
                 self.assertFalse([f for f in os.listdir(d) if f.endswith(".bak")])
             finally:
                 conn.close()

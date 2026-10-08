@@ -56,7 +56,10 @@ class FileCase(unittest.TestCase):
             return json.load(fh)
 
     def db(self):
-        return store.connect(store.DB_PATH)
+        # like a real setup's explicit init: a test that wants a database manipulates one into
+        # existence itself, same as `python3 store.py init` would (tests that instead check the
+        # "no database yet" behavior, e.g. test_unavailable_db_logs_once_..., never call this).
+        return store.connect(store.DB_PATH, create=True)
 
     def saved_settings(self):
         conn = self.db()
@@ -75,8 +78,14 @@ class FileCase(unittest.TestCase):
 
 
 class Import(FileCase):
+    """The one-time import assumes a real install's own database already exists (it predates
+    only the settings table, not the whole DB): pre-create it, like setup would have."""
     IDENTITY = {"_comment": "local", "manager_session": SID, "trust_root": "/tmp/x",
                 "dashboard": {"base_path": "/p/"}}
+
+    def setUp(self):
+        super().setUp()
+        store.connect(store.DB_PATH, create=True).close()
 
     def full_files(self):
         self.write(ac.CONFIG_FILE, dict(self.IDENTITY, window_start="22:00", window_hours=10, last_mile_hours=3,
@@ -172,6 +181,7 @@ class Import(FileCase):
 
     def test_a_failed_import_leaves_the_file(self):
         self.write(ac.CONFIG_FILE, {"usage_model": "linear"})
+        os.remove(store.DB_PATH)
         os.makedirs(store.DB_PATH)                                     # the DB path is a directory
         self.assertEqual(ac.setting("usage_model"), "pacing")          # code default, no crash
         self.assertEqual(self.read(ac.CONFIG_FILE), {"usage_model": "linear"})
@@ -222,12 +232,14 @@ class Accessor(FileCase):
         self.assertEqual(ac.window(), (dtime(23, 0), dtime(9, 0)))
         self.assertTrue(any("unreadable (DatabaseError" in ln for ln in self.logs), self.logs)
         os.unlink(store.DB_PATH)
+        store.connect(store.DB_PATH, create=True).close()    # restored: a deliberate act, not automatic
         testenv.set_setting("usage_model", "linear", db=store.DB_PATH)
         self.assertEqual(ac.setting("usage_model"), "linear")
         self.assertEqual(ac._LOGGED, set())                            # healthy again: a new problem logs again
 
     def test_a_newer_schema_is_still_read(self):
         """The schema guard opens a newer DB read-only: the runners keep reading its settings."""
+        store.connect(store.DB_PATH, create=True).close()
         testenv.set_setting("usage_model", "linear", db=store.DB_PATH)
         conn = self.db()
         store.set_meta(conn, "schema_version", store.SCHEMA_VERSION + 1)

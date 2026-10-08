@@ -52,6 +52,8 @@ class Env(unittest.TestCase):
                           CLAUDE_CODE_SESSION_ID=CALLER)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
         os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # the tests act as the owner's session
+        store.connect(self.db, create=True).close()    # like a real install's setup: the DB already
+                                                        # exists before the MCP server ever connects
         os.chdir(self.work)
 
     def tearDown(self):
@@ -350,6 +352,8 @@ class Stdio(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "AFCLAUDE"))}
         env.update(AFCLAUDE_DB=self.db, AFCLAUDE_PROJECTS_DIR=os.path.join(t, "transcripts"),
                    CLAUDE_CODE_SESSION_ID=CALLER)
+        store.connect(self.db, create=True).close()    # like a real install's setup: the DB already
+                                                        # exists before the MCP server ever connects
         self.params = StdioServerParameters(command=sys.executable, args=[os.path.join(HERE, "mcp_server.py")],
                                             env=env, cwd=self.work)
 

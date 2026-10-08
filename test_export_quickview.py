@@ -52,7 +52,7 @@ class BuildStages(unittest.TestCase):
             old_path, old_proj = store.DB_PATH, qv.STAGES_PROJECT
             try:
                 store.DB_PATH = db
-                conn = store.connect(db)
+                conn = store.connect(db, create=True)
                 store.add_project(conn, "P")
                 store.add_task(conn, "Dashboard 1: a", project="P")
                 store.add_task(conn, "Other", project="P")

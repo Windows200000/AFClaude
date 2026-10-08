@@ -82,7 +82,7 @@ class Base(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "db", "t.db")
         self._orig_now = store._utcnow
         store._utcnow = Clock()
-        self.conn = store.connect(self.db)
+        self.conn = store.connect(self.db, create=True)
 
     def tearDown(self):
         store._utcnow = self._orig_now
@@ -647,7 +647,7 @@ class Migration(unittest.TestCase):
     def test_columns_migration_applies_to_new_tables(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "t.db")
-            store.connect(path).close()
+            store.connect(path, create=True).close()
             orig = store.COLUMNS["tasks"]
             store.COLUMNS["tasks"] = orig + [("due_hint", "TEXT")]
             try:
@@ -668,7 +668,7 @@ class SchemaGuard(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "t.db")
-        conn = store.connect(self.db)
+        conn = store.connect(self.db, create=True)
         store.add_task(conn, "abc")
         conn.close()
 

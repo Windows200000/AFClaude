@@ -32,7 +32,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.db = os.path.join(self.dir, "afclaude.db")
-        c = store.connect(self.db)
+        c = store.connect(self.db, create=True)   # the explicit act a real install's setup performs
         store.add_task(c, "one")
         c.close()
         self.alerts, self.sleeps = [], []
@@ -259,6 +259,76 @@ class Persistent(Base):
         self.assertEqual(len(self.events("failed")), 1)
 
 
+class MissingDB(unittest.TestCase):
+    """Creating a database is an explicit act (D-171, D-187): connect() never does it as a
+    side effect of a missing file, only create=True (the init path) does; and health() tells
+    a database that came back empty after really holding data from one that is simply new."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.db = os.path.join(self.dir, "afclaude.db")
+
+    def test_connect_refuses_a_missing_file_and_creates_nothing(self):
+        with self.assertRaises(store.DBUnavailable) as cm:
+            store.connect(self.db)
+        self.assertEqual(cm.exception.kind, "missing")
+        self.assertFalse(os.path.exists(self.db))
+        self.assertEqual(os.listdir(self.dir), [])             # not even an empty file was left behind
+        self.assertEqual(store.health(self.db).kind, "missing")
+
+    def test_create_true_is_the_explicit_init_path(self):
+        conn = store.connect(self.db, create=True)
+        conn.close()
+        self.assertTrue(os.path.isfile(self.db))
+        self.assertIsNone(store.health(self.db))
+        raw = sqlite3.connect(self.db)
+        self.assertIsNotNone(raw.execute("SELECT value FROM meta WHERE key='install_id'").fetchone())
+        raw.close()
+        store.connect(self.db).close()                         # the file now exists: ordinary connects work
+
+    def test_init_cli_creates_it(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = store.main(["init", "--db", self.db])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(self.db))
+        self.assertEqual(json.loads(out.getvalue())["created"], True)
+        self.assertIsNone(store.health(self.db))
+        out2 = io.StringIO()
+        with contextlib.redirect_stdout(out2):                  # a directory that already has one: used as is
+            self.assertEqual(store.main(["init", "--db", self.db]), 0)
+        self.assertEqual(json.loads(out2.getvalue())["created"], False)
+
+    def test_recreated_empty_is_flagged_even_though_the_file_exists(self):
+        conn = store.connect(self.db, create=True)
+        store.add_task(conn, "real work")
+        conn.close()
+        self.assertIsNone(store.health(self.db))
+        # the data volume loses just the DB file; a schema backup from before survives, and
+        # whatever remounts it leaves a bare empty file at the same path (no store.py init: no
+        # install marker, like a stray placeholder from a bad mount would be)
+        open(self.db + ".v3-20260101T000000Z.bak", "w").close()
+        os.unlink(self.db)
+        open(self.db, "w").close()
+        problem = store.health(self.db)
+        self.assertIsNotNone(problem)
+        self.assertEqual(problem.kind, "replaced")
+        self.assertIn("evidence of a previous install", str(problem))
+
+    def test_samples_jsonl_also_counts_as_evidence(self):
+        with open(os.path.join(self.dir, "samples.jsonl"), "w"):
+            pass
+        open(self.db, "w").close()
+        self.assertEqual(store.health(self.db).kind, "replaced")
+
+    def test_a_genuinely_fresh_empty_db_is_healthy(self):
+        """No .bak, no samples.jsonl: nothing suggests a previous install, so an empty,
+        markerless database (e.g. one a bare `sqlite3 path` would leave) is accepted."""
+        open(self.db, "w").close()
+        self.assertIsNone(store.health(self.db))
+
+
 class CLI(Base):
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -341,7 +411,7 @@ class Runners(Base):
             self.assertEqual(self.dp.main([]), 0)                       # a dry run: checks, never alerts
         self.assertEqual(len(self.alerts), 1)
         self.assertEqual(sum("pass skipped" in m for m in self.logs), 2)   # armed: once per problem
-        c = store.connect(os.path.join(self.dir, "fresh.db"))
+        c = store.connect(os.path.join(self.dir, "fresh.db"), create=True)
         c.close()
         os.replace(os.path.join(self.dir, "fresh.db"), self.db)
         with mock.patch.object(self.dp, "run_pass", return_value={"continue": [], "cleanup": [], "skip": []}) as rp:

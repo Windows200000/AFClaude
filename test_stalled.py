@@ -53,7 +53,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.proj = os.path.join(self.tmp.name, "projects")
         os.makedirs(os.path.join(self.proj, "-proj"))
-        self.conn = store.connect(os.path.join(self.tmp.name, "db", "t.db"))
+        self.conn = store.connect(os.path.join(self.tmp.name, "db", "t.db"), create=True)
         self.own_list = os.path.join(self.tmp.name, "own_sessions.txt")
 
     def tearDown(self):
@@ -290,7 +290,7 @@ class RealHost(unittest.TestCase):
         if not os.path.isdir(self.REAL):
             self.skipTest("no ~/.claude/projects")
         self.tmp = tempfile.TemporaryDirectory()
-        self.conn = store.connect(os.path.join(self.tmp.name, "real.db"))
+        self.conn = store.connect(os.path.join(self.tmp.name, "real.db"), create=True)
         stalled.scan(self.conn, self.REAL, os.path.join(self.tmp.name, "none.txt"))
 
     def tearDown(self):

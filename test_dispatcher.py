@@ -142,7 +142,7 @@ class Base(unittest.TestCase):
         dp.LOCK_FILE, dp.CONFIG_FILE = os.path.join(data, ".lock"), os.path.join(data, "cfg.json")
         dp.keepalive_targets = lambda: set()
         self.own = stalled.OWN_LIST = os.path.join(d, "own_sessions.txt")
-        self.conn = store.connect(os.path.join(d, "t.db"))
+        self.conn = store.connect(os.path.join(d, "t.db"), create=True)
         self.cfg = dp.load_config(os.path.join(d, "none.json"), {"keepalive_sessions": [], "take_over_idle": False})
         self.st = dp.load_state()
 

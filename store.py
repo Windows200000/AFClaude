@@ -57,6 +57,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -346,12 +347,27 @@ def parse_iso(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
+def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection:
     """Open the database (WAL, foreign keys on) and bring its schema up to date (init), on
     the DB error path (§7.8): a transient error is retried, a persistent one is a DBError.
     A database this process can't write to (read-only file or file system) still opens,
-    read-only (PRAGMA query_only): reads go on, every write is a DBError (read_only)."""
+    read-only (PRAGMA query_only): reads go on, every write is a DBError (read_only).
+
+    Creating a new database is an explicit act, never a side effect of an ordinary connect
+    (D-171, D-187): a missing data volume must stop writes and escalate, not quietly start
+    empty and pass every later health check. So when the file doesn't exist, connect() raises
+    DBUnavailable (kind "missing") unless the caller passes create=True -- the explicit
+    init/setup path (`python3 store.py init`) and tests (testenv.py), which stand in for a
+    real first install. Every other caller (the runners, tasks.py, the MCP server,
+    export_quickview.py) keeps the default: on a live install the database already exists, so
+    this is a no-op change for them, and a lost or mis-mounted data directory is reported
+    instead of silently recreated."""
     db = path or DB_PATH
+    if not create and not os.path.isfile(db):
+        raise DBUnavailable(f"the database {db} does not exist: nothing creates it implicitly "
+                            "(a lost or mis-mounted data directory must not come back as a fresh, "
+                            "empty one); create it explicitly with `python3 store.py init` or "
+                            "restore/mount the real one", "missing")
     try:
         os.makedirs(os.path.dirname(os.path.abspath(db)), exist_ok=True)
     except OSError as e:
@@ -400,6 +416,9 @@ def init(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
         if before is not None and before < 4 and get_meta(conn, "migrated_v4_at") is None:
             set_meta(conn, "migrated_v4_at", now_iso())
+        if before is None:   # a brand-new database (no meta table yet): mark it as one install's own
+            set_meta(conn, "install_id", uuid.uuid4().hex)
+            set_meta(conn, "installed_at", now_iso())
         # raise the stored version, never lower it (an older checkout must not downgrade the mark)
         conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
@@ -1655,6 +1674,15 @@ def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: in
 # and reach the caller as they are (an IntegrityError as a ValueError). Persistent ones (disk
 # full, read-only, corrupt, schema newer than the code or needing a migration, DB missing)
 # raise DBError: nothing is written.
+#
+# A missing database is persistent too, by design (D-171, D-187): connect() never creates the
+# file as a side effect (kind "missing", raised unless the caller passes create=True, which
+# only the explicit `python3 store.py init` / first-install path and the tests use); a lost or
+# mis-mounted data volume must stop writes and escalate, not quietly start over empty and pass
+# every later health check. init() also stamps a one-time meta.install_id the moment a database
+# is truly new, so health() can tell that from a database that came back empty after really
+# holding data (kind "replaced": no install_id, no rows, but the data directory still has a
+# schema .bak or PRIOR_INSTALL_FILES left over from before).
 # Escalation can't depend on the DB: report_db_error() records a failed action (actor, action,
 # payload hash and payload, time) in the fallback file ALERTS.fallback.md next to the DB (the
 # data volume; "never lose the write": it can be replayed or dropped, and is imported into the
@@ -1757,11 +1785,49 @@ def retrying(fn: Callable[[], _T], conn: sqlite3.Connection | None = None) -> _T
                                 "transient" if cls == "transient" else "persistent") from e
 
 
+PRIOR_INSTALL_FILES = ("samples.jsonl",)   # a plain name in the data dir; a schema .bak is matched by prefix
+
+
+def _prior_install_evidence(path: str) -> str | None:
+    """A file in the data directory that only a previous install would have left behind (a
+    `<db>.*.bak` schema backup, or one of PRIOR_INSTALL_FILES, e.g. the usage sampler's own
+    history) -> its name, or None. Used to tell a freshly restored/mounted data directory
+    (no such files) from one where the database itself went missing or was replaced while
+    everything else survived."""
+    d = os.path.dirname(path)
+    base = os.path.basename(path)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    baks = sorted(n for n in names if n.startswith(base + ".") and n.endswith(".bak"))
+    if baks:
+        return baks[0]
+    return next((n for n in PRIOR_INSTALL_FILES if n in names), None)
+
+
+def _looks_freshly_created(conn: sqlite3.Connection) -> bool:
+    """No install marker (meta.install_id, stamped once by init() the moment a database is
+    created, §init) and no real data in the tables a working install would have written to:
+    this connection's database could be the current process's own first-ever init, or it
+    could be a stand-in that quietly took the real one's place."""
+    has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    if has_meta and get_meta(conn, "install_id") is not None:
+        return False
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return not any(conn.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone()
+                   for t in ("sessions", "tasks", "projects", "settings") if t in tables)
+
+
 def health(path: str | None = None) -> DBError | None:
     """Can this code write to the database? None = healthy, else the problem (persistent).
     Never creates or writes the database: missing; the file or its directory not writable
     (read-only file or file system); less than MIN_FREE_BYTES free; unreadable; PRAGMA
-    quick_check failing (corruption); the schema guard (newer schema, migration needed)."""
+    quick_check failing (corruption); the schema guard (newer schema, migration needed);
+    "replaced" (D-171): no install marker, no real data, yet the data directory has evidence
+    of a previous install (a .bak backup or one of PRIOR_INSTALL_FILES) -- the database file
+    itself looks like it was lost or swapped out and came back empty (a mis-mounted or
+    restored-too-early data volume), so it is reported instead of accepted as healthy."""
     path = os.path.abspath(path or DB_PATH)
     if not os.path.isfile(path):
         return DBUnavailable(f"the database {path} is missing", "missing")
@@ -1785,7 +1851,17 @@ def health(path: str | None = None) -> DBError | None:
             if bad != ["ok"]:
                 return DBUnavailable(f"the database {path} is corrupt (PRAGMA quick_check: "
                                      f"{'; '.join(bad)[:300]})", "corrupt")
-            return schema_problem(conn)
+            problem = schema_problem(conn)
+            if problem is not None:
+                return problem
+            if _looks_freshly_created(conn):
+                evidence = _prior_install_evidence(path)
+                if evidence:
+                    return DBUnavailable(
+                        f"the database {path} has no install marker and no data, but the data "
+                        f"directory has {evidence} (evidence of a previous install): it looks like "
+                        "the database was lost or replaced and silently recreated empty", "replaced")
+            return None
         finally:
             conn.close()
     try:
@@ -1969,15 +2045,29 @@ def db_gate(component: str, db_path: str | None = None) -> DBError | None:
         return DBUnavailable(f"the database health check failed: {type(e).__name__}: {e}", "error")
 
 
-# ---------------------------------------------------------------- CLI: the explicit migrate step
+# ---------------------------------------------------------------- CLI: the explicit migrate/init steps
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="AFClaude store maintenance.")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init", help="create a new database (the explicit act connect() itself never "
+                                    "performs: a first install, or a deliberate reset of a lost one)")
+    i.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     m = sub.add_parser("migrate", help="back up the database, then run the migrations this code needs "
                                        "(the non-additive ones only run here)")
     m.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     args = ap.parse_args(argv)
+    if args.cmd == "init":
+        db = args.db or DB_PATH
+        existed = os.path.isfile(db)
+        try:
+            connect(db, create=True).close()
+        except DBError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(json.dumps({"db": os.path.abspath(db), "schema_version": SCHEMA_VERSION,
+                          "created": not existed}, ensure_ascii=False))
+        return 0
     try:
         r = migrate(args.db)
     except (SchemaMismatch, NotFound) as e:
