@@ -9,6 +9,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -154,6 +155,59 @@ class Transient(Base):
         self.assertEqual(self.alerts, [])                                # one failure: no alert yet
 
 
+class _FakeCursor:
+    def fetchone(self):
+        return None            # no "meta" table: schema_problem() reads this as a fresh/healthy DB
+
+    def fetchall(self):
+        return []
+
+
+class _FakeConn:
+    """Enough of sqlite3.Connection's surface for store.transaction(): a real Connection's
+    commit/rollback can't be monkeypatched (read-only C attributes), so this fakes them."""
+    def __init__(self):
+        self.in_transaction = False
+        self.log = []
+        self.fail_commits = 0
+
+    def execute(self, sql, params=()):
+        self.log.append(sql)
+        if sql == "BEGIN IMMEDIATE":
+            self.in_transaction = True
+        return _FakeCursor()
+
+    def commit(self):
+        if self.fail_commits > 0:
+            self.fail_commits -= 1
+            raise sqlite3.OperationalError("simulated commit failure")
+        self.in_transaction = False
+
+    def rollback(self):
+        self.in_transaction = False
+
+
+class TransactionCommitFailure(unittest.TestCase):
+    """store.py ~814: commit() used to run outside transaction()'s try/except, so a commit that
+    raised left the BEGIN IMMEDIATE transaction open (never rolled back); retrying()'s next
+    attempt on the same connection would then see conn.in_transaction=True and run as a
+    SAVEPOINT nested inside that still-open, uncommitted transaction instead of a fresh
+    BEGIN IMMEDIATE, so a later successful retry's RELEASE never actually committed anything.
+    The commit now runs inside the try, so a failed commit is rolled back and a retry starts
+    clean."""
+    def test_a_failed_commit_is_rolled_back_so_a_retry_starts_a_fresh_transaction(self):
+        conn = _FakeConn()
+        conn.fail_commits = 1
+        with self.assertRaises(sqlite3.OperationalError):
+            with store.transaction(conn):
+                pass
+        self.assertFalse(conn.in_transaction)      # rolled back, not left open (store.py ~814)
+        with store.transaction(conn):              # a retry: its own fresh BEGIN IMMEDIATE
+            pass
+        self.assertNotIn("SAVEPOINT afclaude_tx", conn.log)    # never nested in the stale transaction
+        self.assertEqual(conn.log.count("BEGIN IMMEDIATE"), 2)
+
+
 class Persistent(Base):
     def test_read_only_file(self):
         self.read_only()
@@ -259,6 +313,27 @@ class Persistent(Base):
         self.assertEqual(len(self.events("failed")), 1)
 
 
+class MissingRecheck(Base):
+    """health(): kind "missing" (and "unable to open", classified the same way) gets one
+    re-check after a short wait before being reported, so a one-off open failure (a momentary
+    mount hiccup) doesn't by itself page the owner (D-171 addendum: only if trying again
+    doesn't fix it)."""
+    def test_a_one_off_missing_file_recovers_before_the_recheck(self):
+        os.unlink(self.db)
+
+        def fixed_by_the_recheck(delay):
+            self.sleeps.append(delay)
+            store.connect(self.db, create=True).close()    # "the mount reappears"
+        with mock.patch.object(store, "_sleep", fixed_by_the_recheck):
+            self.assertIsNone(store.health(self.db))
+        self.assertEqual(self.sleeps, [store.MISSING_RECHECK_DELAY])
+
+    def test_a_genuinely_missing_file_is_still_reported_after_the_recheck(self):
+        p = store.health(os.path.join(self.dir, "nope.db"))
+        self.assertEqual(p.kind, "missing")
+        self.assertEqual(self.sleeps, [store.MISSING_RECHECK_DELAY])   # one re-check, then reported
+
+
 class MissingDB(unittest.TestCase):
     """Creating a database is an explicit act (D-171, D-187): connect() never does it as a
     side effect of a missing file, only create=True (the init path) does; and health() tells
@@ -356,6 +431,77 @@ class CLI(Base):
         self.assertIn("error: database corrupt (persistent)", err)
         self.assertIn("not saved: nothing was changed by this call", err)
         self.assertEqual(self.events("failed")[0]["action"], "cli:list")
+
+
+class SeparateAlertEpisodes(Base):
+    """store.py ~2021/2039: an interactive request failure (report_db_error, e.g. an MCP read)
+    and a runner pause (db_gate) must not share one alert episode -- otherwise a request-failure
+    episode could make db_gate wrongly announce "automation resumes" for a pause that never
+    happened, or suppress a real runner-pause alert because a request episode was already open."""
+    def test_healthy_db_gate_does_not_resume_for_an_open_request_episode(self):
+        store._alert(self.fallback, "a request failed twice", "body", "mcp:abc", scope="request")
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIsNone(store.db_gate("test"))                 # the database itself is healthy
+        self.assertEqual(len(self.alerts), 1)                    # no "automation resumes" alert
+        self.assertNotIn("recovered", [e["event"] for e in self.events()])
+
+    def test_runner_pause_alert_is_not_suppressed_by_an_open_request_episode(self):
+        self.read_only()
+        conn = store.connect(self.db)
+        try:
+            for _ in range(2):                                    # opens a "request" episode
+                with self.assertRaises(store.DBError):
+                    self.add(conn, actor="mcp:abc", via="mcp")
+        finally:
+            conn.close()
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("failed again", self.alerts[0][0])
+        # a real runner pause, same broken database: must still alert (a different scope)
+        problem = store.db_gate("test")
+        self.assertIsNotNone(problem)
+        self.assertEqual(len(self.alerts), 2)
+        self.assertIn("automation paused", self.alerts[1][0])
+        # healthy again: db_gate closes its own (runner) episode with its own resume alert
+        os.chmod(self.db, 0o644)
+        self.assertIsNone(store.db_gate("test"))
+        self.assertEqual(len(self.alerts), 3)
+        self.assertIn("healthy again", self.alerts[2][0])
+
+
+class SparePathHardening(Base):
+    """store.py ~1891 _spare_path: the spare copy (used when the data volume itself can't be
+    written) now lives in a per-user directory (not a bare predictable name in shared /tmp),
+    created 0700, and is opened O_NOFOLLOW so a symlink planted at that name is refused."""
+    def test_spare_dir_is_per_user_and_0700(self):
+        d = os.path.dirname(store._spare_path(self.fallback))
+        self.assertEqual(os.path.basename(d), f"afclaude-{os.getuid()}")
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_spare_dir_tightens_a_loosened_permission(self):
+        d = os.path.dirname(store._spare_path(self.fallback))
+        os.chmod(d, 0o755)
+        self.assertEqual(store._spare_dir(), d)
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_spare_write_refuses_a_planted_symlink(self):
+        """The data volume can't be written (read-only dir): the record falls to the spare
+        copy; a symlink already sitting at that predictable name must be refused, not written
+        through (O_NOFOLLOW), so an attacker who can plant one in the shared temp dir can't
+        redirect the write."""
+        spare = store._spare_path(self.fallback)
+        target = os.path.join(self.dir, "not-this-file.md")
+        os.symlink(target, spare)
+        try:
+            os.chmod(self.dir, 0o555)
+            try:
+                store.report_db_error(store.DBUnavailable("simulated", "locked"), actor="cli",
+                                      action="task.add", write=False, db_path=self.db)
+            finally:
+                os.chmod(self.dir, 0o755)
+            self.assertFalse(os.path.exists(target))          # never followed or written through
+            self.assertTrue(os.path.islink(spare))             # the symlink itself untouched
+        finally:
+            os.unlink(spare)
 
 
 class Runners(Base):

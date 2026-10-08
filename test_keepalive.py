@@ -609,6 +609,80 @@ class BudgetWiring(unittest.TestCase):
         self.assertEqual(fired, [])
         self.assertEqual(ka.load_deferred(), {})
 
+    # ---- review fix: a DB pause at a window start must be postponed, not silently dropped
+    # (nothing else makes a --window-start cron run due again before the next session-window
+    # start, unlike a stall or last-mile-slot continue, which the watcher re-decides every tick)
+
+    def test_window_start_db_pause_is_postponed_like_a_budget_hold(self):
+        start = self.NIGHT + timedelta(seconds=5)
+        calls = []
+
+        def hf(sid, stall, reason, st, args):
+            calls.append(stall["uuid"])
+            return "db_paused"
+        olds = (ka.budget_eval, ka.fresh_usage, ka.handle_fire)
+        ka.budget_eval = lambda u, now: {"go": True, "postpone": False, "recheck_at": None,
+                                         "reason": "CONTINUE: test", "text": "budget t"}
+        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.handle_fire = hf
+        try:
+            ka.window_start_pass(SID, start, Args())
+            self.assertEqual(calls, [schedule.start_key(start)])
+            ent = ka.load_deferred()[schedule.start_key(start)]
+            self.assertEqual(ka.parse_ts(ent["recheck_at"]), start + ka.DB_PAUSE_RECHECK)
+            self.assertIn("database problem", self.progress())
+        finally:
+            ka.budget_eval, ka.fresh_usage, ka.handle_fire = olds
+
+    def test_window_start_db_pause_at_the_last_start_is_not_retried(self):
+        """D-202: the night's last session-window start is never postponed past the window end
+        -- a DB pause there is reported, not deferred (there is no later start to catch it)."""
+        start = self.S2 + timedelta(seconds=5)
+        olds = (ka.budget_eval, ka.fresh_usage, ka.handle_fire)
+        ka.budget_eval = lambda u, now: {"go": True, "postpone": False, "recheck_at": None,
+                                         "reason": "CONTINUE: test", "text": "budget t"}
+        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.handle_fire = lambda sid, stall, reason, st, args: "db_paused"
+        try:
+            ka.window_start_pass(SID, start, Args())
+            self.assertEqual(ka.load_deferred(), {})
+            self.assertIn("not retried before the window ends", self.progress())
+        finally:
+            ka.budget_eval, ka.fresh_usage, ka.handle_fire = olds
+
+    def test_deferred_window_start_db_pause_is_retried_not_dropped(self):
+        """The watcher's postponed-start retry (deferred_window_start_pass) must not lose the
+        start when the fire itself hits a DB pause: it must keep (re-postpone) the deferred
+        entry instead of popping it before knowing whether handle_fire actually fired."""
+        start = self.NIGHT + timedelta(seconds=5)
+        key = schedule.start_key(start)
+        ka.defer_window_start(key, SID, start, "r", self.S2)
+        st = {"handled": {}, "fires": {}}
+        calls = []
+
+        def hf(sid, stall, reason, st, args):
+            calls.append(stall["uuid"])
+            if len(calls) == 1:
+                return "db_paused"
+            st["handled"][stall["uuid"]] = {"result": "test"}
+            return None
+        olds = (ka.budget_eval, ka.fresh_usage, ka.handle_fire)
+        ka.budget_eval = lambda u, now: {"go": True, "postpone": False, "recheck_at": None,
+                                         "reason": "CONTINUE: test", "text": "budget t"}
+        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.handle_fire = hf
+        try:
+            nxt = ka.deferred_window_start_pass(SID, start, st, Args())
+            self.assertEqual(nxt, start + ka.DB_PAUSE_RECHECK)
+            self.assertEqual(ka.parse_ts(ka.load_deferred()[key]["recheck_at"]), nxt)
+            self.assertEqual(len(calls), 1)
+            # the database is healthy again at the watcher's next recheck: same key fires
+            self.assertIsNone(ka.deferred_window_start_pass(SID, nxt, st, Args()))
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(ka.load_deferred(), {})
+            self.assertIn(key, st["handled"])
+        finally:
+            ka.budget_eval, ka.fresh_usage, ka.handle_fire = olds
 
     # ---- D-202: the gate at each session-window start (23:00, 04:00), postponed starts end by 09:00
 

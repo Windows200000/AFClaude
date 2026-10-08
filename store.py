@@ -54,6 +54,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -808,10 +809,10 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         try:
             check_writable(conn)
             yield conn
+            conn.commit()
         except BaseException:
             conn.rollback()
             raise
-        conn.commit()
 
 
 def _enum(value: object, allowed: Sequence[str], what: str) -> str:
@@ -1698,6 +1699,10 @@ def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: in
 BUSY_TIMEOUT = 5.0
 RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 MIN_FREE_BYTES = 4 * 1024 * 1024                         # less free space = disk full (health())
+MISSING_RECHECK_DELAY = 0.2   # health(): one re-check after this short wait before reporting
+                              # kind "missing"/"unable to open" (owner D-171 addendum: escalate
+                              # only if trying again doesn't fix it) -- a one-off open failure
+                              # (e.g. a momentary mount hiccup) must not by itself trigger an alert
 FALLBACK_NAME = "ALERTS.fallback.md"
 FALLBACK_MARK = "<!-- afclaude-fallback "
 FALLBACK_HEADER = ("# AFClaude: database failures recorded outside the database (§7.8)\n\n"
@@ -1827,10 +1832,16 @@ def health(path: str | None = None) -> DBError | None:
     "replaced" (D-171): no install marker, no real data, yet the data directory has evidence
     of a previous install (a .bak backup or one of PRIOR_INSTALL_FILES) -- the database file
     itself looks like it was lost or swapped out and came back empty (a mis-mounted or
-    restored-too-early data volume), so it is reported instead of accepted as healthy."""
+    restored-too-early data volume), so it is reported instead of accepted as healthy.
+    "missing" (the file isn't there) or "unable to open" (SQLITE_CANTOPEN while connecting)
+    gets one re-check after MISSING_RECHECK_DELAY before being reported: a one-off open
+    failure (e.g. a momentary mount hiccup) must not by itself page the owner (D-171 addendum,
+    "only if trying again doesn't fix it")."""
     path = os.path.abspath(path or DB_PATH)
     if not os.path.isfile(path):
-        return DBUnavailable(f"the database {path} is missing", "missing")
+        _sleep(MISSING_RECHECK_DELAY)
+        if not os.path.isfile(path):
+            return DBUnavailable(f"the database {path} is missing", "missing")
     d = os.path.dirname(path)
     if not (os.access(path, os.W_OK) and os.access(d, os.W_OK)):
         return DBUnavailable(f"the database {path} is read-only (the file or its file system is not writable)",
@@ -1864,12 +1875,19 @@ def health(path: str | None = None) -> DBError | None:
             return None
         finally:
             conn.close()
-    try:
-        return retrying(check)
-    except DBError as e:
-        return _detached(e)
-    except ValueError as e:
-        return DBUnavailable(str(e), "error")
+
+    def run() -> DBError | None:
+        try:
+            return retrying(check)
+        except DBError as e:
+            return _detached(e)
+        except ValueError as e:
+            return DBUnavailable(str(e), "error")
+    result = run()
+    if result is not None and result.kind == "missing":
+        _sleep(MISSING_RECHECK_DELAY)
+        result = run()
+    return result
 
 
 def _detached(e: DBError) -> DBError:
@@ -1888,30 +1906,72 @@ def fallback_path(db_path: str | None = None) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(db_path or DB_PATH)), FALLBACK_NAME)
 
 
+def _spare_dir() -> str:
+    """A per-user directory for the spare fallback copy (store.py ~1891: not a bare predictable
+    name directly in a shared /tmp): tempfile.gettempdir()/afclaude-<uid>/, created 0700 and
+    verified to be a plain directory owned by us alone before any file under it is touched."""
+    uid = os.getuid()
+    d = os.path.join(tempfile.gettempdir(), f"afclaude-{uid}")
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"refusing to use {d}: not a plain directory")
+    if st.st_uid != uid:
+        raise OSError(f"refusing to use {d}: owned by uid {st.st_uid}, not us ({uid})")
+    if stat.S_IMODE(st.st_mode) & 0o077:         # umask may have loosened a freshly created dir
+        os.chmod(d, 0o700)
+    return d
+
+
 def _spare_path(path: str) -> str:
-    """Where records go when the data volume itself can't be written (read-only, full)."""
-    return os.path.join(tempfile.gettempdir(),
-                        f"afclaude-{hashlib.sha256(path.encode()).hexdigest()[:12]}-{FALLBACK_NAME}")
+    """Where records go when the data volume itself can't be written (read-only, full): named
+    by a hash of the real path, under the per-user spare directory (_spare_dir)."""
+    return os.path.join(_spare_dir(), f"{hashlib.sha256(path.encode()).hexdigest()[:12]}-{FALLBACK_NAME}")
+
+
+def _spare_or_none(path: str) -> str | None:
+    """_spare_path(path), or None if the per-user spare directory can't be safely used."""
+    try:
+        return _spare_path(path)
+    except OSError:
+        return None
+
+
+def _open_spare(p: str, mode: str) -> Any:
+    """Open the spare fallback copy (a predictable name under a shared /tmp): O_NOFOLLOW
+    refuses a symlink planted at that path rather than following it, and a freshly created
+    file is 0600 (store.py ~1891)."""
+    flags = os.O_NOFOLLOW | (os.O_RDONLY if mode == "r" else os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    fd = os.open(p, flags, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8")
 
 
 def fallback_events(path: str) -> list[Row]:
     """The records of a fallback file (and its spare copy), oldest first."""
     out: list[Row] = []
-    for p in (path, _spare_path(path)):
+    candidates: list[tuple[str, bool]] = [(path, False)]
+    spare = _spare_or_none(path)
+    if spare is not None:
+        candidates.append((spare, True))
+    for p, is_spare in candidates:
         try:
-            with open(p, encoding="utf-8") as fh:
-                for line in fh:
-                    i = line.find(FALLBACK_MARK)
-                    if i < 0:
-                        continue
-                    try:
-                        rec = json.loads(line[i + len(FALLBACK_MARK):].rsplit("-->", 1)[0])
-                    except ValueError:
-                        continue
-                    if isinstance(rec, dict):
-                        out.append(rec)
+            fh = _open_spare(p, "r") if is_spare else open(p, encoding="utf-8")
         except OSError:
             continue
+        with fh:
+            for line in fh:
+                i = line.find(FALLBACK_MARK)
+                if i < 0:
+                    continue
+                try:
+                    rec = json.loads(line[i + len(FALLBACK_MARK):].rsplit("-->", 1)[0])
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
     return sorted(out, key=lambda r: str(r.get("time", "")))
 
 
@@ -1921,11 +1981,19 @@ def _append_record(path: str, headline: str, rec: Mapping[str, Any]) -> str | No
     (then it goes to stderr, the runner's log)."""
     js = json.dumps(rec, ensure_ascii=False, sort_keys=True, default=str).replace("-->", "--\\u003e")
     text = f"- **{rec.get('time')}** {' '.join(headline.split())}\n  {FALLBACK_MARK}{js} -->\n"
-    for p in (path, _spare_path(path)):
+    candidates: list[tuple[str, bool]] = [(path, False)]
+    spare = _spare_or_none(path)
+    if spare is not None:
+        candidates.append((spare, True))
+    for p, is_spare in candidates:
         try:
             new = not os.path.exists(p)
-            with open(p, "a", encoding="utf-8") as fh:
-                fh.write((FALLBACK_HEADER if new else "") + text)
+            if is_spare:
+                with _open_spare(p, "a") as fh:
+                    fh.write((FALLBACK_HEADER if new else "") + text)
+            else:
+                with open(p, "a", encoding="utf-8") as fh:
+                    fh.write((FALLBACK_HEADER if new else "") + text)
             return p
         except OSError:
             continue
@@ -1933,10 +2001,18 @@ def _append_record(path: str, headline: str, rec: Mapping[str, Any]) -> str | No
     return None
 
 
-def _open_alert(events: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    """The alert that opened the current episode; None = no open episode."""
+def _open_alert(events: Sequence[Mapping[str, Any]], scope: str) -> Mapping[str, Any] | None:
+    """The alert that opened the current episode within `scope` ("runner": db_gate's
+    before-a-start pause/resume alerts; "request": report_db_error's failed-request alerts,
+    store.py ~2021/2039); None = no open episode. Events of the other scope are ignored, so an
+    interactive request failure can't open or close a runner-pause episode, and vice versa --
+    one real episode can no longer suppress or wrongly "resume" the other. An event recorded
+    before scopes existed has no "scope" field and is treated as "request" (report_db_error's
+    longstanding behavior, the older and more common of the two)."""
     opened: Mapping[str, Any] | None = None
     for e in events:
+        if e.get("event") not in ("alert", "recovered") or e.get("scope", "request") != scope:
+            continue
         if e.get("event") == "alert" and opened is None:
             opened = e
         elif e.get("event") == "recovered":
@@ -1956,13 +2032,14 @@ def _notify(subject: str, body: str) -> str:
         return f"notify failed: {type(e).__name__}: {e}"
 
 
-def _alert(path: str, subject: str, body: str, who: str) -> str:
-    """Alert the owner once per episode (the first alert opens it). -> what happened."""
-    opened = _open_alert(fallback_events(path))
+def _alert(path: str, subject: str, body: str, who: str, scope: str) -> str:
+    """Alert the owner once per episode within `scope` ("runner" or "request", see
+    _open_alert) -- the first alert in that scope opens it. -> what happened."""
+    opened = _open_alert(fallback_events(path), scope)
     if opened is not None:
         return f"the owner was already alerted at {opened.get('time')} (one alert per episode)"
     _append_record(path, f"ALERT ({who}): {subject}",
-                   {"event": "alert", "time": now_iso(), "who": who, "subject": subject})
+                   {"event": "alert", "time": now_iso(), "who": who, "subject": subject, "scope": scope})
     _notify(subject, body)
     return "the owner has been alerted (notify.py)"
 
@@ -1994,9 +2071,9 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
         if repeat:
             err.escalation = _alert(path, f"AFClaude DB error ({err.kind}): {action} failed again",
                                     f"{actor}: {action} failed twice: {err}\nRecorded in {where or 'stderr'}; "
-                                    "the database needs the owner's intervention.", actor)
+                                    "the database needs the owner's intervention.", actor, scope="request")
         else:
-            opened = _open_alert(events)
+            opened = _open_alert(events, "request")
             err.escalation = (f"the owner was already alerted at {opened.get('time')}" if opened is not None else
                               "not escalated yet: if a retry of the same request fails too, the owner is alerted")
     except Exception as e:   # noqa: BLE001 - the escalation must never hide the error itself
@@ -2027,10 +2104,10 @@ def db_gate(component: str, db_path: str | None = None) -> DBError | None:
         problem = health(path)
         fb = fallback_path(path)
         if problem is None:
-            opened = _open_alert(fallback_events(fb))
+            opened = _open_alert(fallback_events(fb), "runner")
             if opened is not None:
                 _append_record(fb, f"RECOVERED ({component}): the database is healthy again; automation resumes",
-                               {"event": "recovered", "time": now_iso(), "who": component})
+                               {"event": "recovered", "time": now_iso(), "who": component, "scope": "runner"})
                 _notify("AFClaude DB healthy again: automation resumes",
                         f"{component}: {path} passed its health check (problem since {opened.get('time')}: "
                         f"{opened.get('subject')}). Actions that failed meanwhile are recorded in {fb} "
@@ -2039,7 +2116,7 @@ def db_gate(component: str, db_path: str | None = None) -> DBError | None:
         problem.escalation = _alert(fb, f"AFClaude DB problem ({problem.kind}): automation paused",
                                     f"{component}: {problem}\nNo autonomous starts until the database is healthy "
                                     "again; AFClaude resumes on its own then (another alert says so). Failed "
-                                    f"actions are recorded in {fb}.", component)
+                                    f"actions are recorded in {fb}.", component, scope="runner")
         return problem
     except Exception as e:   # noqa: BLE001 - a broken check pauses, it never crashes the runner
         return DBUnavailable(f"the database health check failed: {type(e).__name__}: {e}", "error")

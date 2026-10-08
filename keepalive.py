@@ -1161,13 +1161,19 @@ def last_mile_pass(sid, now, st, args):
 
 # ---------------------------------------------------------------- window start
 
+DB_PAUSE_RECHECK = timedelta(minutes=5)   # a DB pause at a window start: recheck this soon,
+                                           # but never past schedule.postpone_deadline (D-202)
+
+
 def window_start_pass(sid, now, args):
     """The session-window-start continue (no stall needed), one decision per session-window start
     of the night (D-202: 23:00 and 04:00): FIRE, a final HOLD, or a POSTPONE (e.g. the user was
     active) that the watcher re-decides at its recheck time (deferred_window_start_pass), but only
     while that is before the night's next session-window start: a later recheck (also any at the
     last start, the run would end after the window end) is skipped; the next session-window start
-    decides again. -> the decision dict."""
+    decides again. A FIRE dropped for a DB pause (handle_fire -> db_paused) is postponed the same
+    way (db_paused's docstring): nothing else makes this start due again before then. -> the
+    decision dict."""
     u = fresh_usage(now, force=True)
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
@@ -1184,7 +1190,16 @@ def window_start_pass(sid, now, args):
             log(f"forecast log failed: {type(e).__name__}: {e}")
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"]}
-        handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+        fired = handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+        if fired == "db_paused" and not args.now:
+            recheck_at = now + DB_PAUSE_RECHECK
+            if recheck_at < deadline:
+                defer_window_start(key, sid, recheck_at, d["reason"], deadline)
+                progress_note(f"window-start {berlin(now)}: database problem, postponed to "
+                              f"{berlin(recheck_at)} to retry once it's healthy again (D-202)")
+            else:
+                progress_note(f"window-start {berlin(now)}: database problem at the night's last "
+                              "session-window start, not retried before the window ends (D-202)")
     elif defer:
         defer_window_start(key, sid, d["recheck_at"], d["reason"], deadline)
         progress_note(f"window-start {berlin(now)}: postponed to {berlin(d['recheck_at'])}, {d['reason']}")
@@ -1246,7 +1261,9 @@ def deferred_window_start_pass(sid, now, st, args):
     """Watcher side of a postponed session-window start: at its recheck time, decide again and
     fire under the same window-start key, postpone again, or drop it (a final HOLD, or the
     recheck would reach the night's next session-window start or the window end: that start
-    decides itself, D-202). -> the next recheck time or None."""
+    decides itself, D-202). A FIRE dropped for a DB pause (handle_fire -> db_paused) is
+    postponed again the same way, instead of being dropped with the entry already removed.
+    -> the next recheck time or None."""
     defs = load_deferred()
     if not defs:
         return None
@@ -1275,10 +1292,22 @@ def deferred_window_start_pass(sid, now, st, args):
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
     note_window_usage(key, u is not None, now, final=not again)
     if d["go"]:
+        fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
+                            "window start (postponed), " + d["reason"], st, args)
+        if fired == "db_paused":
+            recheck_at = now + DB_PAUSE_RECHECK
+            if recheck_at < deadline:
+                ent["recheck_at"] = recheck_at.astimezone(UTC).isoformat()
+                ent["reason"] = d["reason"]
+                save_deferred(defs)
+                return recheck_at
+            defs.pop(key, None)
+            save_deferred(defs)
+            progress_note(f"window-start (postponed) {berlin(now)}: database problem at the night's last "
+                          "session-window start, not retried before the window ends (D-202)")
+            return None
         defs.pop(key, None)
         save_deferred(defs)
-        handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"]},
-                    "window start (postponed), " + d["reason"], st, args)
         return None
     if again:
         ent["recheck_at"] = d["recheck_at"].astimezone(UTC).isoformat()
@@ -1321,9 +1350,14 @@ _DB_PAUSE = None   # the database problem the starts are paused for (logged once
 
 def db_paused(what):
     """A broken AFClaude database pauses every autonomous start (docs/dashboard_design.md §7.8,
-    D-171): store.db_gate checks it (alerting the owner once per episode) and the start is not
-    marked handled, so the next check (the watcher's next tick, the next slot or session-window
-    start) starts it on its own once the database is healthy again. -> True = don't start."""
+    D-171): store.db_gate checks it (alerting the owner once per episode) and handle_fire does
+    not mark the start handled. A stall or last-mile-slot continue is decided again every
+    watcher tick, so that alone is enough for it to retry once the database is healthy again.
+    A session-window start is different: window_start_pass only runs once, when the cron's
+    --window-start call finds it due (schedule.due_session_start, within CRON_STEP of the
+    start) -- nothing else makes it due again, so handle_fire reports "db_paused" and its
+    caller (window_start_pass, deferred_window_start_pass) must postpone it explicitly
+    (defer_window_start) for the watcher to retry it. -> True = don't start."""
     global _DB_PAUSE
     import store
     problem = store.db_gate("keepalive")
@@ -1341,15 +1375,18 @@ def db_paused(what):
 
 
 def handle_fire(sid, stall, reason, st, args):
+    """-> None (already handled, fire cap reached, or it fired/was handled below), or the
+    string "db_paused" (dropped without marking handled; a window-start caller must postpone
+    it itself, see db_paused's docstring)."""
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
-        return
+        return None
     night = schedule.night(datetime.now(UTC))
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
         log(f"fire cap reached for window ending {night}; not firing")
-        return
+        return None
     if db_paused(f"{sid[:8]} ({reason})"):
-        return
+        return "db_paused"
     ok, problems, plan = preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
