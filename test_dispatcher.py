@@ -13,34 +13,30 @@ from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import dispatcher as dp  # noqa: E402
 import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
-import afclaude_config  # noqa: E402
 import pacing as budget  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
-_OLD_CFG = afclaude_config.CONFIG_FILE
 
 
-_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES)
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.FIRE_FILES)
 
 
 def setUpModule():
     # these tests use linear-rule usage numbers; BudgetModel below checks the budget model.
-    # Hermetic: no real samples / user model (the last mile's ratio is the default).
-    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
-    with open(afclaude_config.CONFIG_FILE, "w") as fh:
-        json.dump({"usage_model": "linear"}, fh)
+    # Hermetic: no real samples (the last mile's ratio is the default).
+    testenv.setcfg(usage_model="linear")
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
-    budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
     budget.FIRE_FILES = []
 
 
 def tearDownModule():
-    afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES = _OLD_BUDGET
+    testenv.clear_settings()
+    budget.SAMPLES_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 UTC = timezone.utc
@@ -373,19 +369,61 @@ class NoStarts(Base):
         self.assertEqual(self.resume_calls(), [])
 
 
+class Settings(Base):
+    """The tunables are DB settings (D-146): load_config reads them on every pass; the file
+    keeps only session ids, and a tunable left in a --config file is ignored (logged)."""
+    def tearDown(self):
+        testenv.setcfg(usage_model="linear")
+        super().tearDown()
+
+    def test_defaults_and_db_values(self):
+        cfg = dp.load_config(os.path.join(self.d, "none.json"))
+        self.assertEqual({k: cfg[k] for k in dp.SETTING_KEYS},
+                         {"idle_cleanup_hours": 2.0, "finished_grace_minutes": 10.0, "verify_minutes": 15.0,
+                          "take_over_idle": True})
+        testenv.setcfg(usage_model="linear", cleanup_idle_hours=1, cleanup_finished_grace_minutes=3,
+                       stall_verify_minutes=7, stall_take_over_idle=False)
+        cfg = dp.load_config(os.path.join(self.d, "none.json"))
+        self.assertEqual({k: cfg[k] for k in dp.SETTING_KEYS},
+                         {"idle_cleanup_hours": 1.0, "finished_grace_minutes": 3.0, "verify_minutes": 7.0,
+                          "take_over_idle": False})
+        self.assertEqual(dp.load_config(os.path.join(self.d, "none.json"), {"verify_minutes": 2})["verify_minutes"],
+                         2)                                          # an explicit override (tests) still wins
+
+    def test_file_keeps_only_session_ids(self):
+        p = os.path.join(self.d, "custom.json")
+        with open(p, "w") as fh:
+            json.dump({"exclude_sessions": [sid(9)], "verify_minutes": 1, "_comment": "x"}, fh)
+        cfg = dp.load_config(p)
+        self.assertEqual((cfg["exclude_sessions"], cfg["verify_minutes"]), ([sid(9)], 15.0))
+        self.assertTrue(any("['verify_minutes'] ignored" in ln for ln in self.logs), self.logs)
+
+    def test_verify_minutes_from_the_db(self):
+        """The pass uses the DB value: a continue without a reply alerts after stall_verify_minutes."""
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        testenv.setcfg(usage_model="linear", stall_verify_minutes=5)
+        self.cfg = dp.load_config(os.path.join(self.d, "none.json"), {"keepalive_sessions": [],
+                                                                       "take_over_idle": False})
+        self.run_pass()
+        self.assertEqual(self.resumed_sessions(), [sid(1)])
+        self.alerts.clear()
+        self.run_pass(now=NOW + timedelta(minutes=6))
+        self.assertTrue(any("did not reply within 5" in a for a in self.alerts), self.alerts)
+
+
 class NoGate(Base):
     """D-206 with the budget model: an active owner, a week above the threshold, a full session
     window: none of them stops an approved stall (the windows and pacing are only for AFClaude)."""
     def setUp(self):
         super().setUp()
-        with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump({"usage_model": "pacing"}, fh)
+        testenv.setcfg(usage_model="pacing")
         self._bm = budget.minutes_since_user
 
     def tearDown(self):
         budget.minutes_since_user = self._bm
-        with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump({"usage_model": "linear"}, fh)
+        testenv.setcfg(usage_model="linear")
         super().tearDown()
 
     def test_active_owner_does_not_postpone(self):

@@ -212,11 +212,11 @@ What moves from files (each with a one-time importer that checks row counts, the
 
 ### 7.4 Settings registry (D-146, D-075)
 - `actions.SETTINGS` is the single source for key, type, default, validation, explanation, "important" flag, section and required role. Effective value = DB row, else the code default; env never overrides a setting.
-- One-time import of the file tunables in phase 2a, then they are removed from the files; `afclaude_config.py` shrinks to bootstrap identity.
+- One-time import of the file tunables in phase 2a, then they are removed from the files; `afclaude_config.py` shrinks to bootstrap identity. Built (2a): `afclaude_config.setting()` is the runners' one accessor (DB > code default; the DB unreadable → code defaults, logged); the import runs on first use through `setting.import` (actor `runner:import`), also for the pacing keys of `data/user_model.json`; `window_start`/`window_hours` became `window_days`; `session_usage_stop` was dropped (D-205/D-206). The runners still use Berlin time and one daily window until `schedule.py` (2b) reads `window_tz`, `session_hours` and the per-weekday windows; `automation_paused` is read by the resident runner (3a).
 - Sections and keys (flat names as built):
   - **Schedule:** `window_days`, `window_tz`, `session_hours`.
-  - **Budget:** `reserve_threshold`, `last_mile_hours`, `session_usage_stop`, `usage_model`, the pacing model parameters, the linear fallback's `projection_threshold` and `cutoff_after_window_hours`.
-  - **Automation:** `automation_paused`, job intervals, concurrency cap, `handoff_before_reset_min`, `handoff_session_pct`, the `continue_now` safety options, `proposal_alert_hours` (default 24: oldest unreviewed agent proposal older than this raises an alert, §7.9).
+  - **Budget:** `reserve_threshold`, `last_mile_hours`, `usage_model`, the pacing model parameters (`pacing_idle_min`, `pacing_min_gap`, `pacing_session_cap`, `pacing_last_mile_yield`), the linear fallback's `projection_threshold` and `cutoff_after_window_hours`.
+  - **Automation:** `automation_paused`, the dispatcher's `stall_take_over_idle`, `stall_verify_minutes`, `cleanup_finished_grace_minutes`, `cleanup_idle_hours` (built, 2a), job intervals, concurrency cap, `handoff_before_reset_min`, `handoff_session_pct`, the `continue_now` safety options, `proposal_alert_hours` (default 24: oldest unreviewed agent proposal older than this raises an alert, §7.9).
   - **Sessions:** model/effort/permission mode per session kind (overridable per project).
   - **Auth & sessions:** §9.5, OIDC config and the group map (§9.4).
   - **Host:** working root, config dir mode (separate / shared, §10.4), bridge user, host-check interval, tested Claude Code version, owner-session continuation on/off.

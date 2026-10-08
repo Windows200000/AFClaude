@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, time as dtime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the code defaults, not a local data/afclaude.json
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import afclaude_config  # noqa: E402
 import pacing as pm  # noqa: E402
 
@@ -436,15 +436,11 @@ class Accuracy(unittest.TestCase):
         self.assertEqual(ti["now"]["threshold"], 85.0)
         self.assertAlmostEqual(ti["now"]["slack"], 85.0 - d["predicted_end"], places=1)
         self.assertTrue(pm.threshold_lines(ti))
-        old = afclaude_config.CONFIG_FILE
-        with tempfile.TemporaryDirectory() as tmp:
-            afclaude_config.CONFIG_FILE = os.path.join(tmp, "c.json")
-            try:
-                with open(afclaude_config.CONFIG_FILE, "w") as fh:
-                    json.dump({"reserve_threshold": 90}, fh)
-                t = pm.threshold_info(rows, [], now)["threshold"]
-            finally:
-                afclaude_config.CONFIG_FILE = old
+        testenv.setcfg(reserve_threshold=90)
+        try:
+            t = pm.threshold_info(rows, [], now)["threshold"]
+        finally:
+            testenv.clear_settings()
         self.assertEqual((t["active"], t["source"], t["dynamic_default"], t["override"]), (90.0, "override", 85.0, 90.0))
         ti = pm.threshold_info([], [], now)                           # no data at all: still a valid shape
         self.assertEqual(ti["model_error"]["status"], "insufficient_data")
@@ -677,60 +673,54 @@ class OneNumber(unittest.TestCase):
 
 
 class Params(unittest.TestCase):
-    def test_parse(self):
-        self.assertEqual(pm.parse_params({"pacing": {"forecast_margin": 1.5, "last_mile_yield": False}}),
-                         {"last_mile_yield": False})                # the retired margin is ignored
-        self.assertNotIn("forecast_margin", pm.DEFAULTS)
-        self.assertEqual(pm.parse_params({"envelope_weekly_pct_by_hours": {"1": 2}, "idle_min": 30}),
-                         {"idle_min": 30.0})
-        for bad in ({"idle_min": -1}, {"last_mile_yield": "no"}):
-            with self.assertRaises(ValueError):
-                pm.parse_params(bad)
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "um.json")
-            self.assertEqual(pm.load_params(p)[1], "defaults")
-            with open(p, "w") as fh:
-                fh.write("{")
-            self.assertIn("ignored", pm.load_params(p)[1])
+    """The yield / guard parameters are DB settings (pacing_*; they were data/user_model.json
+    overrides until phase 2a)."""
+    def tearDown(self):
+        testenv.clear_settings()
+
+    def test_defaults_agree_with_the_registry(self):
+        import actions
+        self.assertNotIn("forecast_margin", pm.DEFAULTS)            # retired: the threshold is the only spare
+        self.assertEqual({k: actions.SETTINGS["pacing_" + k].default() for k in pm.DEFAULTS}, pm.DEFAULTS)
+        self.assertEqual(pm.load_params(), (pm.DEFAULTS, "settings"))
+
+    def test_db_values_are_used(self):
+        testenv.setcfg(pacing_idle_min=30, pacing_last_mile_yield=False, pacing_session_cap=70)
+        P, src = pm.load_params()
+        self.assertEqual((P["idle_min"], P["last_mile_yield"], P["session_cap"], P["min_gap"], src),
+                         (30.0, False, 70.0, 1.0, "settings"))
+        u = {"weekly": {"percent": 15, "resets_at": R}, "session": {"percent": 0, "resets_at": None}}
+        d = pm.decide(u, SUN, rows=[row(SUN, 15)], fires=[], msu=45.0, activity_known=True)
+        self.assertFalse(d["user_active"])                          # 45 min idle >= the setting's 30
+        testenv.put_raw("pacing_idle_min", -5)                      # an invalid row: the code default
+        self.assertEqual(pm.load_params()[0]["idle_min"], 60.0)
 
 
 class Config(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.old = afclaude_config.CONFIG_FILE
-        afclaude_config.CONFIG_FILE = os.path.join(self.tmp.name, "afclaude.json")
-
+    """The settings pacing reads through afclaude_config (DB value, else the code default; a
+    saved value that fails its check counts as the default)."""
     def tearDown(self):
-        afclaude_config.CONFIG_FILE = self.old
-        self.tmp.cleanup()
-
-    def setcfg(self, **kw):
-        with open(afclaude_config.CONFIG_FILE, "w") as fh:
-            json.dump(kw, fh)
+        testenv.clear_settings()
 
     def test_last_mile_setting(self):
         self.assertEqual(afclaude_config.last_mile_setting(), "auto")
-        self.setcfg(last_mile_hours=3)
+        testenv.setcfg(last_mile_hours=3)
         self.assertEqual(afclaude_config.last_mile_setting(), 3.0)
-        self.setcfg(last_mile_hours=0)
+        testenv.setcfg(last_mile_hours=0)
         self.assertEqual(afclaude_config.last_mile_setting(), 0.0)
-        for bad in ("soon", True, None):
-            self.setcfg(last_mile_hours=bad)
+        for bad in ("soon", True, -1):
+            testenv.put_raw("last_mile_hours", bad)
             self.assertEqual(afclaude_config.last_mile_setting(), "auto", bad)
 
     def test_reserve_threshold_setting(self):
         rt = afclaude_config.reserve_threshold_setting
         self.assertEqual(rt(), ("auto", "dynamic"))
-        self.setcfg(reserve_threshold=88)
+        testenv.setcfg(reserve_threshold=88)
         self.assertEqual(rt(), (88.0, "override"))
-        self.setcfg(reserve_threshold="auto", week_target=92)            # explicit auto wins
+        testenv.setcfg(reserve_threshold="auto")
         self.assertEqual(rt(), ("auto", "dynamic"))
-        self.setcfg(week_target=92)                                       # backward compatibility
-        self.assertEqual(rt(), (92.0, "override (legacy week_target)"))
         for bad in (40, 100, "90", True):
-            self.setcfg(reserve_threshold=bad)
-            self.assertEqual(rt(), ("auto", "dynamic"), bad)
-            self.setcfg(week_target=bad)
+            testenv.put_raw("reserve_threshold", bad)
             self.assertEqual(rt(), ("auto", "dynamic"), bad)
 
     def test_decide_honours_the_override(self):
@@ -740,20 +730,16 @@ class Config(unittest.TestCase):
         d = pm.decide(u, SUN, **args)
         self.assertEqual((d["threshold"], d["threshold_source"]), (80.0, d["threshold_source"]))   # ratio 0.2
         self.assertIn("dynamic", d["threshold_source"])
-        self.setcfg(reserve_threshold=95)
+        testenv.setcfg(reserve_threshold=95)
         d = pm.decide(u, SUN, **args)
         self.assertEqual((d["threshold"], d["threshold_source"]), (95.0, "override"))
-        self.setcfg(week_target=85)
-        d = pm.decide(u, SUN, **args)
-        self.assertEqual((d["threshold"], d["threshold_source"]), (85.0, "override (legacy week_target)"))
-        self.assertIn("legacy week_target", d["reason"])
 
     def test_usage_model_switch(self):
         self.assertEqual(afclaude_config.usage_model(), "pacing")
-        self.setcfg(usage_model="linear")
+        testenv.setcfg(usage_model="linear")
         self.assertEqual(afclaude_config.usage_model(), "linear")
         for old in ("reserve", "budget", "nonsense"):
-            self.setcfg(usage_model=old)
+            testenv.put_raw("usage_model", old)
             self.assertEqual(afclaude_config.usage_model(), "pacing")
 
 

@@ -10,7 +10,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the code defaults, not a local data/afclaude.json
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import keepalive as ka  # noqa: E402
 
 UTC = timezone.utc
@@ -25,23 +25,21 @@ WEEK_RESET = Z("2026-10-01T16:59:59Z")   # real value from /usage at 00:01 Berli
 import afclaude_config  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
-_OLD_CFG = afclaude_config.CONFIG_FILE
 
 
 import pacing as budget  # noqa: E402
 
-_OLD_FILES = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES,
-              ka.USAGE_STATE_FILE, ka.alert)
+_OLD_FILES = (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert)
+
+
+setcfg = testenv.setcfg     # the DB settings for a test: the code defaults, then kw
 
 
 def setUpModule():
     # the budget tests below pin the linear rule; BudgetWiring tests the budget model.
     # Hermetic: no real samples (the last mile's ratio = the default), no real deferral file.
-    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
-    with open(afclaude_config.CONFIG_FILE, "w") as fh:
-        json.dump({"usage_model": "linear"}, fh)
+    setcfg(usage_model="linear")
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
-    budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
     ka.DEFER_FILE = os.path.join(_CFG_DIR.name, "deferred.json")
     budget.FIRE_FILES = []
     # window-start usage bookkeeping (note_window_usage): a temp state file, never ALERTS.md / a push
@@ -50,9 +48,8 @@ def setUpModule():
 
 
 def tearDownModule():
-    afclaude_config.CONFIG_FILE = _OLD_CFG
-    (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, ka.DEFER_FILE, budget.FIRE_FILES,
-     ka.USAGE_STATE_FILE, ka.alert) = _OLD_FILES
+    testenv.clear_settings()
+    (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert) = _OLD_FILES
     _CFG_DIR.cleanup()
 
 
@@ -266,49 +263,77 @@ class Window(unittest.TestCase):
 
 
 class WindowConfig(unittest.TestCase):
-    """The window comes from data/afclaude.json (window_start, window_hours); the default
-    is the owner's weekly window 23:00-09:00 (dashboard design §4.2.1)."""
-
-    def setUp(self):
-        import afclaude_config
-        self.ac = afclaude_config
-        self.tmp = tempfile.TemporaryDirectory()
-        self._old = afclaude_config.CONFIG_FILE
-        afclaude_config.CONFIG_FILE = os.path.join(self.tmp.name, "afclaude.json")
+    """The window comes from the window_days setting in the DB (afclaude_config.window); the
+    default is the owner's weekly window 23:00 x 2 session windows = 23:00-09:00 (design §6)."""
 
     def tearDown(self):
-        self.ac.CONFIG_FILE = self._old
+        setcfg(usage_model="linear")
         ka.reload_window()
-        self.tmp.cleanup()
 
-    def setcfg(self, **kw):
-        with open(self.ac.CONFIG_FILE, "w") as fh:
-            json.dump(kw, fh)
+    @staticmethod
+    def days(start, n, **per_day):
+        d = {day: {"start": start, "n": n, "group": "weekly"} for day in ("mon", "tue", "wed", "thu", "fri",
+                                                                          "sat", "sun")}
+        d.update(per_day)
+        return d
 
     def test_default(self):
         from datetime import time
-        self.assertEqual(self.ac.DEFAULTS["window_start"], "23:00")
-        self.assertEqual(self.ac.DEFAULTS["window_hours"], 10)
-        self.assertEqual(self.ac.window(), (time(23, 0), time(9, 0)))
+        self.assertEqual(afclaude_config.window(), (time(23, 0), time(9, 0)))
         ka.reload_window()
         self.assertEqual((ka.WINDOW_START, ka.WINDOW_END), (time(23, 0), time(9, 0)))
 
-    def test_override_and_invalid(self):
+    def test_db_value_is_read(self):
         from datetime import time
-        self.setcfg(window_start="00:00", window_hours=8)       # the old window, same-day
-        self.assertEqual(self.ac.window(), (time(0, 0), time(8, 0)))
+        setcfg(window_days=self.days("00:00", 1))                  # a same-day window of one session
+        self.assertEqual(afclaude_config.window(), (time(0, 0), time(5, 0)))
         ka.reload_window()
         self.assertTrue(ka.in_window(Z("2026-09-25T22:00:00Z")))    # 00:00 CEST
         self.assertFalse(ka.in_window(Z("2026-09-25T21:00:00Z")))   # 23:00 CEST
-        self.assertFalse(ka.in_window(Z("2026-09-26T06:00:00Z")))   # 08:00 CEST
+        self.assertFalse(ka.in_window(Z("2026-09-26T03:00:00Z")))   # 05:00 CEST
         self.assertEqual(ka.next_window_start(Z("2026-09-26T10:00:00Z")), Z("2026-09-26T22:00:00Z"))
-        self.setcfg(window_start="22:30", window_hours=5)
-        self.assertEqual(self.ac.window(), (time(22, 30), time(3, 30)))
-        for bad in ({"window_start": "25:00"}, {"window_start": "x"}, {"window_hours": 0},
-                    {"window_hours": 24}, {"window_hours": "ten"}):
-            with self.subTest(bad=bad):
-                self.setcfg(**bad)
-                self.assertEqual(self.ac.window(), (time(23, 0), time(9, 0)))
+        setcfg(window_days=self.days("22:30", 1), session_hours=4)  # n x session_hours
+        self.assertEqual(afclaude_config.window(), (time(22, 30), time(2, 30)))
+
+    def test_per_day_window_current_or_next(self):
+        """Until schedule.py (2b) the runners know one daily window: the one `now` is in, else
+        the next to start. All nights off: an empty window (never inside)."""
+        from datetime import time
+        setcfg(window_days=self.days("23:00", 2, sat={"start": "20:00", "n": 1, "group": "g1"}, sun=None))
+        sat_2130 = Z("2026-10-03T19:30:00Z")                        # Sat 21:30 CEST: inside Sat's window
+        self.assertEqual(afclaude_config.window(sat_2130), (time(20, 0), time(1, 0)))
+        sat_1200 = Z("2026-10-03T10:00:00Z")                        # Sat noon: Sat's window is next
+        self.assertEqual(afclaude_config.window(sat_1200), (time(20, 0), time(1, 0)))
+        fri_0300 = Z("2026-10-02T01:00:00Z")                        # Fri 03:00: inside Thu's window
+        self.assertEqual(afclaude_config.window(fri_0300), (time(23, 0), time(9, 0)))
+        sun_1200 = Z("2026-10-04T10:00:00Z")                        # Sun off: Mon's window is next
+        self.assertEqual(afclaude_config.window(sun_1200), (time(23, 0), time(9, 0)))
+        ka.reload_window(sat_2130)
+        self.assertTrue(ka.in_window(sat_2130))
+        setcfg(window_days={d: None for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")})
+        ka.reload_window()
+        self.assertEqual((ka.WINDOW_START, ka.WINDOW_END), (time(0, 0), time(0, 0)))
+        self.assertFalse(any(ka.in_window(Z("2026-10-03T00:00:00Z") + timedelta(minutes=30 * i))
+                             for i in range(48)))
+
+    def test_db_unavailable_falls_back_to_the_defaults(self):
+        from datetime import time
+        import store
+        setcfg(window_days=self.days("00:00", 1))
+        old = store.DB_PATH
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "garbage.db")
+            with open(bad, "w") as fh:
+                fh.write("not a database " * 100)
+            for path in (os.path.join(d, "missing.db"), d, bad):     # no DB; a directory; not a DB
+                store.DB_PATH = path
+                try:
+                    self.assertEqual(afclaude_config.window(), (time(23, 0), time(9, 0)), path)
+                    self.assertEqual(afclaude_config.usage_model(), "pacing")
+                    self.assertEqual(afclaude_config.last_mile_setting(), "auto")
+                finally:
+                    store.DB_PATH = old
+        self.assertEqual(afclaude_config.window(), (time(0, 0), time(5, 0)))   # the DB again
 
 
 class Budget(unittest.TestCase):
@@ -482,11 +507,7 @@ class BudgetWiring(unittest.TestCase):
         import pacing as budget
         self.bm = budget
         self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = os.path.join(self.tmp.name, "afclaude.json")
-        self._old = (afclaude_config.CONFIG_FILE, budget.USER_MODEL_FILE, budget.SAMPLES_FILE, budget.decide,
-                     ka.DEFER_FILE, ka.STATE_FILE, ka.PROGRESS_FILE)
-        afclaude_config.CONFIG_FILE = self.cfg
-        budget.USER_MODEL_FILE = os.path.join(self.tmp.name, "user_model.json")
+        self._old = (budget.SAMPLES_FILE, budget.decide, ka.DEFER_FILE, ka.STATE_FILE, ka.PROGRESS_FILE)
         budget.SAMPLES_FILE = os.path.join(self.tmp.name, "samples.jsonl")
         ka.DEFER_FILE = os.path.join(self.tmp.name, "deferred.json")
         ka.STATE_FILE = os.path.join(self.tmp.name, "state.json")
@@ -494,13 +515,12 @@ class BudgetWiring(unittest.TestCase):
         self.setcfg()
 
     def tearDown(self):
-        (afclaude_config.CONFIG_FILE, self.bm.USER_MODEL_FILE, self.bm.SAMPLES_FILE, self.bm.decide,
-         ka.DEFER_FILE, ka.STATE_FILE, ka.PROGRESS_FILE) = self._old
+        (self.bm.SAMPLES_FILE, self.bm.decide, ka.DEFER_FILE, ka.STATE_FILE, ka.PROGRESS_FILE) = self._old
+        setcfg(usage_model="linear")
         self.tmp.cleanup()
 
     def setcfg(self, **kw):
-        with open(self.cfg, "w") as fh:
-            json.dump(kw, fh)
+        setcfg(**kw)
 
     def samples(self, now, prompt_minutes_ago=None, week=15.0, own_prompt_minutes_ago=None, minutes=300):
         """Sampler rows every 15 min up to `now` (weekly `week`%); one prompt in a non-AFClaude
@@ -517,11 +537,17 @@ class BudgetWiring(unittest.TestCase):
         return usage(week, self.R, sess, sess_reset)
 
     def test_config_switch(self):
+        import store
         self.assertEqual(afclaude_config.usage_model(), "pacing")       # default
         self.setcfg(usage_model="linear")
         self.assertEqual(afclaude_config.usage_model(), "linear")
-        for v in ("reserve", "budget", "nonsense"):                     # retired names
-            self.setcfg(usage_model=v)
+        for v in ("reserve", "budget", "nonsense"):                     # retired names: refused, and a
+            with self.assertRaisesRegex(ValueError, "pacing|linear"):    # row written around actions.py
+                testenv.set_setting("usage_model", v)                   # is ignored (the default)
+            conn = store.connect()
+            store.put_setting(conn, "usage_model", v)
+            conn.commit()
+            conn.close()
             self.assertEqual(afclaude_config.usage_model(), "pacing")
 
     def test_one_headroom_number_everywhere(self):
@@ -979,21 +1005,14 @@ class LastMile(unittest.TestCase):
     R = Z("2026-10-01T16:59:59Z")
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.cfg = os.path.join(self.tmp.name, "afclaude.json")
-        import afclaude_config
         self.ac = afclaude_config
-        self._old = afclaude_config.CONFIG_FILE
-        afclaude_config.CONFIG_FILE = self.cfg
         self.setcfg()
 
     def tearDown(self):
-        self.ac.CONFIG_FILE = self._old
-        self.tmp.cleanup()
+        setcfg(usage_model="linear")
 
     def setcfg(self, **kw):
-        with open(self.cfg, "w") as fh:
-            json.dump({"usage_model": "linear", **kw}, fh)
+        setcfg(usage_model="linear", **kw)
 
     def test_default_is_auto(self):
         self.assertEqual(self.ac.last_mile_setting(), "auto")

@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
+import testenv  # noqa: F401  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import usage_sampler as us
 
 UTC = timezone.utc

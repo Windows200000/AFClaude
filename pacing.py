@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Weekly budget model "pacing" (stdlib only): a forecast-driven night gate, the original linear
-rule as its fallback. The default of keepalive.budget_eval() (data/afclaude.json "usage_model": "pacing").
+rule as its fallback. The default of keepalive.budget_eval() (the usage_model setting: "pacing").
 
 Goal: use the weekly limit with autonomous night work in FULL session windows, but only while the
 week is predicted to end at or below the reserve threshold; then fill the last stretch right
@@ -15,9 +15,9 @@ window to the end):
     RUN iff predicted_end <= threshold: budget for this run (headroom) = run_cost (one number:
     reason, --decide, the continue message, the quickview; ~ 1 session window). Otherwise no run
     (no partial runs); the next session window / night re-checks.
-    threshold     = data/afclaude.json reserve_threshold: "auto" (default) = one session window
+    threshold     = the reserve_threshold setting: "auto" (default) = one session window
                     left = 100 - full_session_cost from the measured ratio (dynamic_threshold), or a %
-                    override in 50..99 (a legacy week_target is honoured as the override).
+                    override in 50..99.
     The model has NO margin: the threshold is the only spare.
     No forecast (< MIN_FORECAST_HOURS of closed-week user data): the straight line: RUN iff
     w + run_cost <= threshold x the elapsed fraction of the week at tonight's window end.
@@ -62,7 +62,6 @@ UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
-USER_MODEL_FILE = os.path.join(DATA_DIR, "user_model.json")
 SAMPLES_FILE = os.path.join(DATA_DIR, "samples.jsonl")
 FORECAST_LOG = os.path.join(DATA_DIR, "forecast_log.jsonl")
 FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an autonomous run)
@@ -75,6 +74,7 @@ FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an a
 WEEK = timedelta(days=7)
 SESSION_H = afclaude_config.SESSION_LENGTH.total_seconds() / 3600
 LAST_MILE_MAX_SESSIONS = 2
+# the code defaults of the pacing_* settings (actions.SETTINGS; test_pacing checks they agree)
 DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": True}
 THRESHOLD_RANGE = (50.0, 99.0)
 LAST_MILE_SESSION_CAP = 100.0
@@ -93,37 +93,14 @@ LONG_BYTES = 10 * 1024 * 1024        # ratio, forecast: about the last 4-5 weeks
 
 # ------------------------------------------------------------------ params
 
-def parse_params(d):
-    """Optional overrides from user_model.json (top level or a "pacing" object). The retired
-    forecast_margin is ignored: the model has no margin, the threshold is the only spare."""
-    if not isinstance(d, dict):
-        raise ValueError("not an object")
-    src = d.get("pacing") if isinstance(d.get("pacing"), dict) else d
-    over = {}
-    for key, lo, hi in (("idle_min", 0, 1440), ("min_gap", 0, 50), ("session_cap", 1, 100)):
-        v = src.get(key)
-        if v is not None:
-            if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
-                raise ValueError(f"{key} out of range: {v!r}")
-            over[key] = float(v)
-    if src.get("last_mile_yield") is not None:
-        if not isinstance(src["last_mile_yield"], bool):
-            raise ValueError("last_mile_yield must be true or false")
-        over["last_mile_yield"] = src["last_mile_yield"]
-    return over
-
-
-def load_params(path=None):
-    """-> (params, source text). Never raises: a missing or invalid file means the defaults."""
-    P = dict(DEFAULTS)
+def load_params():
+    """-> (params, source text): the pacing settings pacing_idle_min, pacing_min_gap,
+    pacing_session_cap, pacing_last_mile_yield (DB settings, else the code defaults; they were
+    optional overrides in data/user_model.json until phase 2a imported them). Never raises."""
     try:
-        with open(path or USER_MODEL_FILE) as fh:
-            P.update(parse_params(json.load(fh)))
-    except FileNotFoundError:
-        return P, "defaults"
-    except Exception as e:   # noqa: BLE001
-        return P, f"defaults (user model ignored: {type(e).__name__})"
-    return P, "user model"
+        return {**DEFAULTS, **afclaude_config.pacing_params()}, "settings"
+    except Exception as e:   # noqa: BLE001 - the decision must not fail on its parameters
+        return dict(DEFAULTS), f"defaults (settings unreadable: {type(e).__name__})"
 
 
 # ------------------------------------------------------------------ samples

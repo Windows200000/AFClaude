@@ -479,6 +479,7 @@ def cron_berlin(sched):
 
 def main():
     now = datetime.now(UTC)
+    ka.reload_window(now)        # the window_days setting (DB) as of now
     os.makedirs(OUT, exist_ok=True)
     os.chmod(OUT, 0o755)
 

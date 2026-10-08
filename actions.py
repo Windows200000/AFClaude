@@ -31,9 +31,11 @@ project, or a caller that says so, e.g. CLAUDE_GUARD_DISABLE=1 in the MCP server
 may add tasks and projects through MCP like anyone (owner decision Q3: no approval
 step), but never decide sessions, change rules, settings, prompts or request runs.
 
-Settings (§4.1, §4.2.1) are typed here (SETTINGS): a key without a row (or reset
-to null) is its code default, so an empty table reproduces today's behaviour. The
-runners start reading them in phase 2; nothing reads them yet.
+Settings (§7.4, D-146) are typed here (SETTINGS): a key without a row (or reset
+to null) is its code default (D-169), so an empty table reproduces today's behaviour.
+The runners read them through afclaude_config.setting() (effective_setting); the file
+tunables of data/afclaude.json, data/dispatcher.json and the pacing keys of
+data/user_model.json are imported once (setting.import, actor runner:import).
 
 Types (mypy --strict, D-209): action parameters arrive as untrusted JSON values
 (perform() checks only their names), so the action functions take them as Any and
@@ -62,7 +64,7 @@ import store  # noqa: E402
 import afclaude_config  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
-ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|mcp(:[A-Za-z0-9._-]{1,64})?)$")
+ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 IDEMPOTENCY_TTL = timedelta(days=7)
 OWN_LIST = os.environ.get("AFCLAUDE_OWN_LIST", os.path.join(HERE, "data", "own_sessions.txt"))
@@ -86,7 +88,7 @@ class Forbidden(ValueError):
 
 
 class Ctx:
-    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive), via
+    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive | runner[:<job>]), via
     (cli | mcp | dashboard | runner), the idempotency key, and whether the caller
     knows it is an autonomous AFClaude session."""
     def __init__(self, actor: str, via: str, key: str | None = None, autonomous: bool = False) -> None:
@@ -455,12 +457,14 @@ def rule_remove(conn: sqlite3.Connection, ctx: Ctx, rule_id: Any, version: Any =
     return Result({"removed": rule_id}, rule_id, dict(r), None, changed=True)
 
 
-# ---------------------------------------------------------------- settings (§4.1, §4.2.1)
+# ---------------------------------------------------------------- settings (§7.4, D-146, D-075)
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 WEEK_MIN = 7 * 24 * 60
 GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
+SESSION_HOURS = afclaude_config.SESSION_LENGTH.total_seconds() / 3600   # 5: one session-limit window
+SECTIONS = ("schedule", "budget", "automation")
 
 
 SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, conn) -> normalized value
@@ -469,7 +473,7 @@ SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, co
 def _number(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Connection]], float]:
     def check(v: Any, conn: sqlite3.Connection | None = None) -> float:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
-            raise ValueError(f"must be a number in {lo}..{hi}, got {v!r}")
+            raise ValueError(f"must be a number in {lo:g}..{hi:g}, got {v!r}")
         return float(v)
     return check
 
@@ -478,6 +482,15 @@ def _bool(v: Any, conn: sqlite3.Connection | None = None) -> bool:
     if not isinstance(v, bool):
         raise ValueError(f"must be true or false, got {v!r}")
     return v
+
+
+def _choice(options: tuple[str, ...]) -> Callable[[Any, Optional[sqlite3.Connection]], str]:
+    def check(v: Any, conn: sqlite3.Connection | None = None) -> str:
+        s = v.strip().lower() if isinstance(v, str) else None
+        if s is None or s not in options:
+            raise ValueError(f"must be one of {'|'.join(options)}, got {v!r}")
+        return s
+    return check
 
 
 def _tz(v: Any, conn: sqlite3.Connection | None = None) -> str:
@@ -497,28 +510,6 @@ def _hhmm(v: Any) -> str:
     return f"{int(m[1]):02d}:{m[2]}"
 
 
-def _default_window_days() -> dict[str, Any]:
-    """Owner decision 29.09.2026: every day 23:00 + 2 session windows, one weekly link
-    group. Taken from the local window_start / window_hours (afclaude_config, branch
-    `window`) when set, so both describe the same window."""
-    sh = _default_session_hours()
-    start = afclaude_config.get("window_start", "23:00")
-    try:
-        start = _hhmm(start)
-        n = max(1, int(round(float(afclaude_config.get("window_hours", 2 * sh)) / sh)))
-    except (TypeError, ValueError):
-        start, n = "23:00", 2
-    return {d: {"start": start, "n": n, "group": "weekly"} for d in DAYS}
-
-
-def _default_session_hours() -> float:
-    return afclaude_config.SESSION_LENGTH.total_seconds() / 3600
-
-
-def _default_last_mile_hours() -> str | float:
-    return afclaude_config.last_mile_setting()
-
-
 def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Connection]], str | float]:
     """"auto" or a number in lo..hi (last_mile_hours: hours; reserve_threshold: weekly %)."""
     num = _number(lo, hi)
@@ -529,7 +520,7 @@ def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Conn
         try:
             return num(v, conn)
         except ValueError:
-            raise ValueError(f'must be "auto" or a number in {lo}..{hi}, got {v!r}') from None
+            raise ValueError(f'must be "auto" or a number in {lo:g}..{hi:g}, got {v!r}') from None
     return check
 
 
@@ -540,11 +531,12 @@ def _fmt_min(m: int) -> str:
 
 def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Validate + normalize {mon..sun: {start, n, group} | null}: start on the 30-min
-    grid, 1 <= n with n x session_hours <= 24 h, identical windows within a link group,
-    no overlap between any two days' windows (the week wraps around)."""
+    grid, 1 <= n whole session windows (D-148) with n x session_hours <= 24 h, identical
+    windows within a link group, no overlap between any two days' windows (the week
+    wraps around)."""
     if not isinstance(v, dict) or set(v) != set(DAYS):
         raise ValueError(f"window_days needs exactly the keys {', '.join(DAYS)}")
-    sh = get_setting(conn, "session_hours") if conn is not None else _default_session_hours()
+    sh = get_setting(conn, "session_hours") if conn is not None else SESSION_HOURS
     out: dict[str, Any] = {}
     groups: dict[str, tuple[str, str, int]] = {}
     for d in DAYS:
@@ -583,30 +575,101 @@ def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, An
 
 
 class Setting:
-    def __init__(self, default: Callable[[], Any], check: SettingCheck, doc: str) -> None:
-        self.default, self.check, self.doc = default, check, doc
+    """One registry entry (§7.4): the code default (D-169: shipped with the code, never read
+    from a file), the check (validates and normalizes a value; a ValueError says why), a
+    one-line explanation (D-075), its section, the type the UI renders, whether it belongs to
+    the few important settings shown up front (D-075), and the range / choices of a number or
+    an enum. Every setting is owner-only to change (setting.set, actions with owner_only)."""
+    def __init__(self, default: Any, check: SettingCheck, doc: str, *, section: str, kind: str,
+                 important: bool = False, bounds: tuple[float, float] | None = None,
+                 choices: tuple[str, ...] | None = None) -> None:
+        if section not in SECTIONS:
+            raise ValueError(f"unknown section {section!r}")
+        self._default = default
+        self.check, self.doc, self.section, self.kind = check, doc, section, kind
+        self.important, self.bounds, self.choices = important, bounds, choices
+
+    def default(self) -> Any:
+        """The code default (a fresh copy: callers may change it)."""
+        return copy.deepcopy(self._default)
+
+    def describe(self) -> dict[str, Any]:
+        """The static part for the UI (§8: the settings page is rendered from the registry)."""
+        d: dict[str, Any] = {"section": self.section, "type": self.kind, "important": self.important,
+                             "doc": self.doc}
+        if self.bounds is not None:
+            d["min"], d["max"] = self.bounds
+        if self.choices is not None:
+            d["choices"] = list(self.choices)
+        return d
 
 
-SETTINGS = {
-    "window_days": Setting(_default_window_days, _window_days,
-                           "per-weekday automation windows {mon..sun: {start, n, group} | null} (§4.2.1)"),
-    "window_tz": Setting(lambda: "Europe/Berlin", _tz, "time zone of the window starts"),
-    "session_hours": Setting(_default_session_hours, _number(1, 24), "length of one session-limit window"),
-    "last_mile_hours": Setting(_default_last_mile_hours, _hours_or_auto(0, 168),
-                               'last stretch before the weekly reset (filled to 100%): "auto" = '
-                               'min(ceil(session windows of quota left), 2) x session_hours, or hours (0 = off)'),
-    "reserve_threshold": Setting(afclaude_config.reserve_threshold_value, _hours_or_auto(50, 99),
-                                 'pacing night gate: a night runs a full session window only if the week is '
-                                 'predicted to end <= this weekly %; "auto" = one session window left '
-                                 '(100 - the measured full-session cost), or a % (the UI shows '
-                                 'pacing.threshold_info() next to it)'),
-    "projection_threshold": Setting(lambda: 90.0, _number(1, 100), "linear rule: projected weekly %"),
-    "cutoff_after_window_hours": Setting(lambda: 2.0, _number(0, 24),
-                                         "budget rule: a weekly reset this long after the window end still "
-                                         "continues (11:00 after a 09:00 end)"),
-    "session_usage_stop": Setting(lambda: 85.0, _number(1, 100), "dispatcher: no new starts at/above this "
-                                                                  "session % (dispatcher.json's default)"),
-    "automation_paused": Setting(lambda: False, _bool, "every runner holds new starts/continues"),
+def _num(default: float, lo: float, hi: float, doc: str, section: str, important: bool = False) -> Setting:
+    return Setting(float(default), _number(lo, hi), doc, section=section, kind="number", important=important,
+                   bounds=(lo, hi))
+
+
+def _auto_or_num(lo: float, hi: float, doc: str, section: str, important: bool = False) -> Setting:
+    return Setting("auto", _hours_or_auto(lo, hi), doc, section=section, kind="auto|number",
+                   important=important, bounds=(lo, hi))
+
+
+def _flag(default: bool, doc: str, section: str, important: bool = False) -> Setting:
+    return Setting(default, _bool, doc, section=section, kind="bool", important=important)
+
+
+USAGE_MODELS = ("pacing", "linear")
+
+# Everything the dashboard can change (D-146): the runners read these (afclaude_config.setting()),
+# DB value > code default; data/afclaude.json keeps only machine identity. Names are flat (§7.4).
+SETTINGS: dict[str, Setting] = {
+    # --- schedule (§6, D-148): windows are whole session windows; runners: afclaude_config.window()
+    "window_days": Setting({d: {"start": "23:00", "n": 2, "group": "weekly"} for d in DAYS}, _window_days,
+                           "Automation window per weekday {mon..sun: {start, n, group} | null}: AFClaude works "
+                           "from start for n whole session windows (default every night 23:00 x 2 = until "
+                           "09:00); null = no window that night; linked days change together",
+                           section="schedule", kind="window_days", important=True),
+    "window_tz": Setting("Europe/Berlin", _tz, "Time zone of the window start times (set from the browser "
+                                               "on the first login, D-148)", section="schedule", kind="tz"),
+    "session_hours": _num(SESSION_HOURS, 1, 24, "Length of one Claude session-limit window in hours (a "
+                          "window is n of these)", "schedule"),
+    # --- budget (pacing.py night gate, keepalive.py linear rule)
+    "usage_model": Setting("pacing", _choice(USAGE_MODELS),
+                           'Weekly budget model: "pacing" (forecast-driven night gate) or "linear" (the '
+                           'original projection rule, also pacing\'s fallback on an error)',
+                           section="budget", kind="enum", choices=USAGE_MODELS),
+    "reserve_threshold": _auto_or_num(50, 99, 'Night gate: a night runs a full session window only if the '
+                                      'week is then predicted to end at or below this weekly %; "auto" = one '
+                                      'session window left (100 - the measured full-session cost, D-141)',
+                                      "budget", important=True),
+    "last_mile_hours": _auto_or_num(0, 168, 'Last stretch before the weekly reset that fills the week to '
+                                    '100%: "auto" = min(ceil(session windows of quota left), 2) x '
+                                    'session_hours, or hours (0 = off, D-015/D-020)', "budget", important=True),
+    "pacing_idle_min": _num(60, 0, 1440, "Yield to the user: after their last activity AFClaude waits this "
+                            "many minutes before it starts (a hold postpones to then)", "budget"),
+    "pacing_min_gap": _num(1, 0, 50, "Night gate: no run if the budget for it is at most this many weekly %",
+                           "budget"),
+    "pacing_session_cap": _num(85, 1, 100, "Session guard: no night start while the current session window "
+                               "is at or above this % (the last stretch uses 100%)", "budget"),
+    "pacing_last_mile_yield": _flag(True, "Also yield to an active user in the last stretch before the "
+                                    "weekly reset", "budget"),
+    "projection_threshold": _num(90, 1, 100, 'Linear model: continue while the end of the week is projected '
+                                 'below this weekly %', "budget"),
+    "cutoff_after_window_hours": _num(2, 0, 24, "Linear model: a weekly reset this many hours after the "
+                                      "window end still continues (11:00 after a 09:00 end)", "budget"),
+    # --- automation
+    "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
+                               "on); read by the resident runner (phase 3a)", "automation", important=True),
+    "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
+                                  "that holds an approved stalled session is stopped so it can be continued",
+                                  "automation"),
+    "stall_verify_minutes": _num(15, 1, 240, "Dispatcher: alert if a continued session shows no reply within "
+                                 "this many minutes", "automation"),
+    "cleanup_finished_grace_minutes": _num(10, 0, 1440, "Dispatcher: the tmux session of a finished task "
+                                           "(done/blocked/cancelled) is closed after it was idle this long",
+                                           "automation"),
+    "cleanup_idle_hours": _num(2, 0.25, 168, "Dispatcher: a tmux session it started is closed after it was "
+                               "idle this long after its last turn", "automation"),
 }
 
 
@@ -624,8 +687,24 @@ def get_setting(conn: sqlite3.Connection | None, key: str) -> Any:
     return copy.deepcopy(row["value"]) if row and row["value"] is not None else spec.default()
 
 
+def effective_setting(conn: sqlite3.Connection | None, key: str) -> tuple[Any, str]:
+    """What a runner uses (afclaude_config.setting): -> (value, source). The saved value is
+    checked again (a row written around actions.py, or by a newer version with other rules,
+    must not steer a runner): source "db"; no row = "default"; a saved value that fails the
+    check = the code default with source "invalid: <why>"."""
+    spec = _setting_spec(key)
+    row = store.get_setting_row(conn, key) if conn is not None else None
+    if not row or row["value"] is None:
+        return spec.default(), "default"
+    try:
+        return spec.check(copy.deepcopy(row["value"]), conn), "db"
+    except ValueError as e:
+        return spec.default(), f"invalid: {e}"
+
+
 def settings(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-    """{key: {value, default, source: db|default, version, updated_at, updated_by, doc}}."""
+    """{key: {value, default, source: db|default, version, updated_at, updated_by, section,
+    type, important, doc, (min, max | choices)}}."""
     rows = store.setting_rows(conn)
     out: dict[str, dict[str, Any]] = {}
     for k, spec in SETTINGS.items():
@@ -634,7 +713,7 @@ def settings(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         out[k] = {"value": r["value"] if r is not None and saved else spec.default(), "default": spec.default(),
                   "source": "db" if saved else "default", "version": r["version"] if r else 0,
                   "updated_at": r["updated_at"] if r else None, "updated_by": r["updated_by"] if r else None,
-                  "doc": spec.doc}
+                  **spec.describe()}
     return out
 
 
@@ -671,6 +750,50 @@ def setting_set(conn: sqlite3.Connection, ctx: Ctx, key: Any, value: Any, versio
 @action("setting.reset", "setting", owner_only=True)
 def setting_reset(conn: sqlite3.Connection, ctx: Ctx, key: Any, version: Any = None) -> Result:
     return _write_setting(conn, ctx, key, None, version)
+
+
+@action("setting.import", "setting", owner_only=True)
+def setting_import(conn: sqlite3.Connection, ctx: Ctx, source: Any, values: Any, notes: Any = None) -> Result:
+    """The one-time import of the file tunables (phase 2a, D-146; afclaude_config does it on
+    first use, actor runner:import). values {setting key: value} from the file `source`;
+    notes {file key: text} for what the file had but is not imported (obsolete, invalid,
+    renamed), kept in the audit row so nothing is lost silently. Per key: a value that fails
+    the check is not imported (noted); a key the DB already saved keeps its saved value (the
+    DB wins); a value equal to the code default is not saved (it stays the default and follows
+    later default changes). One transaction, one audit row (target = source).
+    -> {source, imported, kept, default, notes}."""
+    src = store._text(source, "source", required=True)
+    if not isinstance(values, dict):
+        raise ValueError("values must be an object {setting key: value}")
+    if notes is not None and (not isinstance(notes, dict)
+                              or not all(isinstance(k, str) and isinstance(t, str) for k, t in notes.items())):
+        raise ValueError("notes must be an object {file key: text}")
+    for k in values:
+        _setting_spec(k)
+    imported: dict[str, Any] = {}
+    kept: dict[str, Any] = {}
+    same: list[str] = []
+    out_notes: dict[str, str] = dict(notes or {})
+    for k, v in values.items():
+        spec = SETTINGS[k]
+        try:
+            v = spec.check(v, conn)
+        except ValueError as e:
+            out_notes[k] = f"not imported, invalid: {e}"
+            continue
+        row = store.get_setting_row(conn, k)
+        if row is not None and row["value"] is not None:
+            kept[k] = row["value"]
+        elif v == spec.default():
+            same.append(k)
+        else:
+            store.put_setting(conn, k, v, ctx.actor)
+            imported[k] = v
+    result = {"source": src, "imported": imported, "kept": kept, "default": same, "notes": out_notes}
+    changed = bool(imported or kept or same or out_notes)
+    before = {"settings": {k: None for k in imported}}
+    after = {"settings": imported, "kept": kept or None, "default": same or None, "notes": out_notes or None}
+    return Result(result, src, before, after, changed=changed)
 
 
 @action("automation.set", "setting", owner_only=True)

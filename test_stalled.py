@@ -10,6 +10,7 @@ import unittest
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402

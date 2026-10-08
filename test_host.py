@@ -14,34 +14,30 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import host  # noqa: E402
 import keepalive as ka  # noqa: E402
-import afclaude_config  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
-_OLD_CFG = afclaude_config.CONFIG_FILE
 
 
 import pacing as budget  # noqa: E402
 
-_OLD_BUDGET = (budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES)
+_OLD_BUDGET = (budget.SAMPLES_FILE, budget.FIRE_FILES)
 
 
 def setUpModule():
     # the last-mile test below is about the bridge; pin the linear budget rule and point the
     # budget model's files (the "auto" last mile reads the ratio) away from this host's
     # sampler data (the budget model is tested elsewhere)
-    afclaude_config.CONFIG_FILE = os.path.join(_CFG_DIR.name, "afclaude.json")
-    with open(afclaude_config.CONFIG_FILE, "w") as fh:
-        json.dump({"usage_model": "linear"}, fh)
+    testenv.setcfg(usage_model="linear")
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
-    budget.USER_MODEL_FILE = os.path.join(_CFG_DIR.name, "no_user_model.json")
     budget.FIRE_FILES = []
 
 
 def tearDownModule():
-    afclaude_config.CONFIG_FILE = _OLD_CFG
-    budget.SAMPLES_FILE, budget.USER_MODEL_FILE, budget.FIRE_FILES = _OLD_BUDGET
+    testenv.clear_settings()
+    budget.SAMPLES_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
 HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")

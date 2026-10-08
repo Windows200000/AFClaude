@@ -27,10 +27,11 @@ reserve threshold (default: one session window left), w + session cost + the use
 use until the weekly reset; re-checked per session window; the final <= 2 session windows
 before the weekly reset fill to 100%; AFClaude yields to an active user by POSTPONING to last
 activity + 60 min).
-data/afclaude.json "usage_model": "linear" selects the original linear rule, which is also
-the fallback if pacing.py fails:
-  projected end-of-week usage < 90%                          -> continue
-  else weekly reset <= 11:00 Berlin after the current window -> continue
+The setting usage_model = "linear" (DB settings, afclaude_config.setting) selects the original
+linear rule, which is also the fallback if pacing.py fails:
+  projected end-of-week usage < projection_threshold (90%)   -> continue
+  else weekly reset <= window end + cutoff_after_window_hours
+       (2 h: 11:00 Berlin after a 09:00 end)                  -> continue
   else                                                       -> hold back
 Forecast (my choice): linear extrapolation of the weekly % over the elapsed
 part of the week, with elapsed floored at 24h so an early-week burst doesn't
@@ -52,7 +53,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
@@ -77,12 +78,11 @@ STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
-# Automation window, Europe/Berlin wall clock: default 23:00-09:00 (spans midnight), from
-# data/afclaude.json window_start / window_hours (afclaude_config.window()). The watcher
-# re-reads it every loop iteration (reload_window), cron runs read it at start.
+# Automation window, Europe/Berlin wall clock: default 23:00-09:00 (spans midnight), from the
+# window_days setting in the DB (afclaude_config.window()). The watcher re-reads it every loop
+# iteration (reload_window), cron runs read it at start. The linear rule's projection threshold
+# (90%) and reset cutoff (window end + 2 h = 11:00) are settings too, read per decision.
 WINDOW_START, WINDOW_END = afclaude_config.window()   # END exclusive; END < START = spans midnight
-WEEKLY_CUTOFF = dtime(11, 0)        # "reset no later than 11:00 after the window" (on the window-end day)
-PROJECTION_THRESHOLD = 90.0         # percent
 WEEK = timedelta(days=7)
 MIN_ELAPSED = timedelta(hours=24)   # forecast floor
 
@@ -251,10 +251,11 @@ def parse_reset_text(text, ref):
 
 # ---------------------------------------------------------------- window
 
-def reload_window():
-    """Re-read the window from data/afclaude.json (the dashboard will edit it later)."""
+def reload_window(now=None):
+    """Re-read the window from the DB settings (window_days; the window `now` is in, else the
+    next one: afclaude_config.window)."""
     global WINDOW_START, WINDOW_END
-    WINDOW_START, WINDOW_END = afclaude_config.window()
+    WINDOW_START, WINDOW_END = afclaude_config.window(now)
 
 
 def in_window(now):
@@ -503,7 +504,7 @@ def project_weekly(pct, resets_at, now):
 
 
 def _budget_model():
-    """pacing.py (forecast-driven pacing) unless data/afclaude.json selects "linear"."""
+    """pacing.py (forecast-driven pacing) unless the usage_model setting is "linear"."""
     if afclaude_config.usage_model() == "linear":
         return None
     import pacing
@@ -584,7 +585,7 @@ def fallback_eval(usage, now):
 
 
 def last_mile_hours(weekly_pct, resets_at=None, now=None):
-    """Last-stretch length in hours: data/afclaude.json last_mile_hours, by default "auto" =
+    """Last-stretch length in hours: the last_mile_hours setting, by default "auto" =
     min(ceil(session windows of quota left), 2) x session length (pacing.py)."""
     setting = afclaude_config.last_mile_setting()
     if setting != "auto":
@@ -625,9 +626,15 @@ def fallback_budget_decision(usage, now):
     return d["go"], d["reason"]
 
 
+def linear_settings():
+    """The linear rule's settings: (projection threshold %, reset cutoff after the window end)."""
+    s = afclaude_config.settings("projection_threshold", "cutoff_after_window_hours")
+    return s["projection_threshold"], timedelta(hours=s["cutoff_after_window_hours"])
+
+
 def linear_budget_headroom(usage, now):
-    """Linear rule: how much more weekly % can be used before the projection reaches
-    PROJECTION_THRESHOLD (in the last mile: up to 100%). -> (extra | None, text)."""
+    """Linear rule: how much more weekly % can be used before the projection reaches the
+    projection_threshold setting (in the last mile: up to 100%). -> (extra | None, text)."""
     w = (usage or {}).get("weekly") or {}
     if w.get("percent") is None or not w.get("resets_at"):
         return None, "budget unknown"
@@ -637,13 +644,15 @@ def linear_budget_headroom(usage, now):
     else:
         elapsed = max(now - (reset - WEEK), MIN_ELAPSED)
         remaining = max(reset - now, timedelta(0))
-        extra = max(PROJECTION_THRESHOLD * elapsed / (elapsed + remaining) - pct, 0.0)
-        target = f"a projected {PROJECTION_THRESHOLD:.0f}%"
+        thr, _ = linear_settings()
+        extra = max(thr * elapsed / (elapsed + remaining) - pct, 0.0)
+        target = f"a projected {thr:.0f}%"
     return extra, f"budget for this run: about +{extra:.1f} weekly % (now {pct:.0f}%) before reaching {target}"
 
 
 def linear_budget_decision(usage, now):
-    """The linear rule (projection < 90%, 11:00 reset cutoff, last mile) -> (go, reason)."""
+    """The linear rule (projection < projection_threshold, the reset cutoff window end +
+    cutoff_after_window_hours, last mile) -> (go, reason)."""
     if not usage or "weekly" not in usage or not usage["weekly"]["resets_at"]:
         return False, "HOLD: weekly usage unknown (fail-safe)"
     w = usage["weekly"]
@@ -656,12 +665,13 @@ def linear_budget_decision(usage, now):
                       f"{int(left.total_seconds() % 3600 // 60):02d}m ({w['percent']:.0f}% used): using the remaining quota")
     proj = project_weekly(w["percent"], w["resets_at"], now)
     base = f"week {w['percent']:.0f}% used, projected {proj:.0f}% at reset {berlin(w['resets_at'])}"
-    if proj < PROJECTION_THRESHOLD:
-        return True, f"CONTINUE: {base} < {PROJECTION_THRESHOLD:.0f}%"
-    cutoff = datetime.combine(current_window_end(now).date(), WEEKLY_CUTOFF, tzinfo=BERLIN)
+    thr, after = linear_settings()
+    if proj < thr:
+        return True, f"CONTINUE: {base} < {thr:.0f}%"
+    cutoff = current_window_end(now) + after
     if w["resets_at"] <= cutoff:
-        return True, f"CONTINUE: {base} >= {PROJECTION_THRESHOLD:.0f}%, but weekly reset <= {berlin(cutoff)}"
-    return False, f"HOLD: {base} >= {PROJECTION_THRESHOLD:.0f}% and weekly reset after {berlin(cutoff)}"
+        return True, f"CONTINUE: {base} >= {thr:.0f}%, but weekly reset <= {berlin(cutoff)}"
+    return False, f"HOLD: {base} >= {thr:.0f}% and weekly reset after {berlin(cutoff)}"
 
 
 # ---------------------------------------------------------------- session / firing
@@ -1109,7 +1119,7 @@ def run(args):
             return
         now = datetime.now(UTC)
         if now >= next_eval:
-            reload_window()
+            reload_window(now)
             # Detection + logging only: a limit hit ends the run, the watcher never continues the
             # session at the reset (D-204). Runs begin only at starts: the session-window starts
             # (cron --window-start, a postponed one below) and the last-stretch slot starts.
@@ -1520,6 +1530,8 @@ def main():
     args = ap.parse_args()
     LAUNCH.update(model=args.model, effort=args.effort, name=args.name)
     global TAKE_OVER_IDLE, IGNORE_WINDOW
+    afclaude_config.LOG = log            # a settings problem (DB unreadable) lands in this log
+    reload_window()
     TAKE_OVER_IDLE = args.take_over_idle
     IGNORE_WINDOW = args.now
     if args.work_on:

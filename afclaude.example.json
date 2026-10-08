@@ -4,13 +4,7 @@
   "manager_session": "<manager-session-uuid>",
   "trust_root": "/path/to/your/workspace",
 
-  "last_mile_hours": "auto",
-  "reserve_threshold": "auto",
-  "usage_model": "pacing",
-  "window_start": "23:00",
-  "window_hours": 10,
-
-  "_settings_comment": "Window, budget and pause are tunables in the DB settings table (actions.SETTINGS, edited through actions.py / the dashboard). last_mile_hours above is only their local default.",
+  "_settings_comment": "This file holds only machine identity (D-146). Every tunable (window, budget, pacing, dispatcher timings) is a setting in the DB settings table (actions.SETTINGS: code defaults, set with actions.py / the dashboard; `python3 afclaude_config.py` lists them). Tunables still found here are imported into the DB once and removed from this file.",
 
   "dashboard": {
     "_comment": "Read from dashboard phase 4 on (docs/dashboard_design.md §6, §7.3).",

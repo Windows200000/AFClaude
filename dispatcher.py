@@ -34,9 +34,11 @@ Default is DRY-RUN: it decides and logs what it WOULD do and changes nothing
 (no stalled.py scan, no DB writes besides store.connect()'s schema check, no
 state, no ka_resume, no tmux kill). It reads the DB as the last scan left it
 (export_quickview.py scans every 3 min).
---arm acts. State: data/dispatcher_state.json, log: data/dispatcher.log,
-config (optional JSON, keys as in DEFAULTS): data/dispatcher.json. Failures go
-through keepalive.alert().
+--arm acts. State: data/dispatcher_state.json, log: data/dispatcher.log. Tunables are DB
+settings (D-146; afclaude_config.setting): stall_take_over_idle, stall_verify_minutes,
+cleanup_finished_grace_minutes, cleanup_idle_hours. data/dispatcher.json (optional) keeps only
+session ids (keepalive_sessions, exclude_sessions); its old tunables were imported into the DB
+once. Failures go through keepalive.alert().
 
     dispatcher.py [--arm] [--once] [--no-scan] [--json]
 """
@@ -57,7 +59,7 @@ import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fir
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
-import afclaude_config  # noqa: E402  (local machine-specific values: the task-manager session)
+import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
 
 UTC = timezone.utc
 DATA_DIR = os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data"))
@@ -70,13 +72,17 @@ CONFIG_FILE = os.path.join(DATA_DIR, "dispatcher.json")
 MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
 TMUX_RE = re.compile(r"ka-[0-9a-f]{8}")
 
+# data/dispatcher.json: session ids only (machine identity, D-146)
 DEFAULTS = {
-    "idle_cleanup_hours": 2.0,      # idle after an end_turn this long -> kill its tmux
-    "finished_grace_minutes": 10,   # task done/blocked: idle this long -> kill its tmux
-    "verify_minutes": 15,           # no real reply this long after a continue -> alert
-    "take_over_idle": True,         # preflight: SIGTERM an idle interactive holder of an approved session
     "keepalive_sessions": [MANAGER_SESSION],   # the task-manager: started by keepalive.py, never by the dispatcher
     "exclude_sessions": [],         # never continued, never cleaned up
+}
+# cfg key -> DB setting (actions.SETTINGS), read on every pass
+SETTING_KEYS = {
+    "idle_cleanup_hours": "cleanup_idle_hours",               # idle after an end_turn this long -> kill its tmux
+    "finished_grace_minutes": "cleanup_finished_grace_minutes",   # task done/blocked: idle this long -> kill
+    "verify_minutes": "stall_verify_minutes",                 # no real reply this long after a continue -> alert
+    "take_over_idle": "stall_take_over_idle",                 # preflight: SIGTERM an idle interactive holder
 }
 FINISHED_TASK = ("done", "blocked", "cancelled")
 
@@ -110,14 +116,22 @@ def log(msg):
 
 
 def load_config(path=None, overrides=None):
+    """The pass's config: the session ids of data/dispatcher.json (or `path`), the tunables from
+    the DB settings (afclaude_config.settings: DB value, else the code default), then `overrides`."""
+    s = afclaude_config.settings(*SETTING_KEYS.values())   # first: it imports the file's old tunables once
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
         with open(path or CONFIG_FILE) as fh:
-            cfg.update(json.load(fh))
+            f = json.load(fh)
+        cfg.update({k: v for k, v in f.items() if k in DEFAULTS})
+        left = sorted(k for k in f if k not in DEFAULTS and not k.startswith("_"))
+        if left:
+            log(f"config {path or CONFIG_FILE}: {left} ignored (tunables are DB settings now, D-146)")
     except FileNotFoundError:
         pass
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, AttributeError) as e:
         log(f"config {path or CONFIG_FILE} unreadable ({e}); using defaults")
+    cfg.update({k: s[name] for k, name in SETTING_KEYS.items()})
     for k, v in (overrides or {}).items():
         if v is not None:
             cfg[k] = v
@@ -575,6 +589,7 @@ def main(argv=None):
         print("another dispatcher.py pass holds the lock; exiting")
         return 0
     ka.log = log            # keepalive's own log lines (usage refresh, alerts) go to dispatcher.log too
+    afclaude_config.LOG = log   # settings problems (and the one-time import) too
     cfg = load_config(args.config)
     now = datetime.now(UTC)
     conn = store.connect()

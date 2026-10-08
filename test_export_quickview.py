@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ["AFCLAUDE_CONFIG"] = os.devnull   # hermetic: the default window
+import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import export_quickview as qv  # noqa: E402
 import store  # noqa: E402
 
@@ -208,9 +208,8 @@ class NextRunBlock(unittest.TestCase):
         reset = datetime(2026, 10, 8, 17, 0, tzinfo=Z)
         win = (dtime(23, 0), dtime(9, 0))
         tmp = tempfile.TemporaryDirectory()
-        olds = (pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state)
+        olds = (pacing.SAMPLES_FILE, pacing.FIRE_FILES, qv.runner_state)
         pacing.SAMPLES_FILE = os.path.join(tmp.name, "samples.jsonl")
-        pacing.USER_MODEL_FILE = os.path.join(tmp.name, "user_model.json")
         pacing.FIRE_FILES = []
         qv.runner_state = lambda now: {"active": None, "deferred": False}
         try:
@@ -228,7 +227,7 @@ class NextRunBlock(unittest.TestCase):
             d = pacing.decide_core(10.0, reset, now, 600.0, None, None, None, True, 0.2, "auto", win)
             self.assertEqual(qv.next_run_block(u, now, d)["kind"], "now")   # a run is going
         finally:
-            pacing.SAMPLES_FILE, pacing.USER_MODEL_FILE, pacing.FIRE_FILES, qv.runner_state = olds
+            pacing.SAMPLES_FILE, pacing.FIRE_FILES, qv.runner_state = olds
             tmp.cleanup()
 
     def test_page_shows_the_next_run_not_the_rule(self):
