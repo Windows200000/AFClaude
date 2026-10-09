@@ -299,5 +299,87 @@ class NextRunBlock(unittest.TestCase):
         self.assertNotIn("Budget rule", page)
 
 
+class FillupBlock(unittest.TestCase):
+    """D-212: the page shows the next planned fill-up (Berlin time, remaining %, weekly cost) or
+    "none: <reason>", from the watcher's plan in keepalive_fillup.json."""
+
+    def setUp(self):
+        import json
+        from datetime import timezone
+        self.json, self.UTC = json, timezone.utc
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = (qv.ka.FILLUP_FILE, qv.SELF_SESSION)
+        qv.ka.FILLUP_FILE = os.path.join(self.tmp.name, "fillup.json")
+        qv.SELF_SESSION = "s" * 36
+        self.now = datetime(2026, 10, 9, 23, 0, tzinfo=self.UTC)
+
+    def tearDown(self):
+        qv.ka.FILLUP_FILE, qv.SELF_SESSION = self.old
+        self.tmp.cleanup()
+
+    def write(self, d):
+        with open(qv.ka.FILLUP_FILE, "w") as fh:
+            self.json.dump(d, fh)
+
+    def plan(self, **kw):
+        p = {"key": "fillup-2026-10-10T02:00:00+00:00", "reset": "2026-10-10T02:00:00.341664+00:00",
+             "remaining": 5.0, "rate": 66.3, "factor": 1.1, "start": "2026-10-10T01:55:01.400000+00:00",
+             "cost": 0.7704, "status": "wait", "reason": "planned", "recheck_at": "2026-10-10T01:55:01.400000+00:00"}
+        p.update(kw)
+        return p
+
+    def test_planned(self):
+        self.write({"plan": self.plan()})
+        b = qv.fillup_block(self.now)
+        self.assertTrue(b["planned"])
+        self.assertEqual(b["at_berlin"], "Sat 10.10. 03:55 CEST")
+        self.assertEqual((b["remaining"], b["cost"], b["test"]), (5.0, 0.8, False))
+        self.assertEqual(b["reset_berlin"], "Sat 10.10. 04:00 CEST")
+        self.json.dumps(b)                                         # status.json-safe
+
+    def test_none_with_reason(self):
+        self.assertEqual(qv.fillup_block(self.now)["planned"], False)            # no file yet
+        self.write({"plan": self.plan(status="skip", reason="the session-window start at 04:00 continues "
+                                                            "this window anyway")})
+        b = qv.fillup_block(self.now)
+        self.assertEqual(b, {"planned": False, "reason": "the session-window start at 04:00 continues this "
+                                                         "window anyway"})
+        self.write({"plan": {"status": "none", "reason": "no live session window"}})
+        self.assertEqual(qv.fillup_block(self.now)["reason"], "no live session window")
+        self.write({"plan": self.plan()})                                        # a stale plan
+        self.assertIn("ended", qv.fillup_block(datetime(2026, 10, 10, 3, 0, tzinfo=self.UTC))["reason"])
+
+    def test_disabled(self):
+        self.write({"plan": self.plan()})
+        testenv.set_setting("fillup_enabled", False)
+        try:
+            self.assertEqual(qv.fillup_block(self.now), {"planned": False, "reason": "fillup_enabled is off"})
+        finally:
+            testenv.set_setting("fillup_enabled", None)
+
+    def test_test_entry_of_this_session(self):
+        t = {"session": "s" * 36, "key": "fillup-test-x", "reset": "2026-10-10T02:00:00+00:00",
+             "start": "2026-10-10T01:57:01+00:00", "remaining": 3.0, "cost": 0.46}
+        self.write({"plan": self.plan(status="none", reason="no AFClaude run in this session window"), "test": t})
+        b = qv.fillup_block(self.now)
+        self.assertTrue(b["planned"] and b["test"])
+        self.assertEqual(b["at_berlin"], "Sat 10.10. 03:57 CEST")
+        self.write({"test": dict(t, session="o" * 36)})                         # another session's: ignored
+        self.assertFalse(qv.fillup_block(self.now)["planned"])
+
+    def test_broken_file(self):
+        with open(qv.ka.FILLUP_FILE, "w") as fh:
+            fh.write("{not json")
+        self.assertFalse(qv.fillup_block(self.now)["planned"])
+        self.write({"plan": self.plan(start="garbage")})
+        self.assertFalse(qv.fillup_block(self.now)["planned"])
+
+    def test_page_renders_the_tile(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        for needle in ("fillupTile(k.fillup", "Next fill-up", "weekly cost", "f.reason"):
+            self.assertIn(needle, page)
+
+
 if __name__ == "__main__":
     unittest.main()

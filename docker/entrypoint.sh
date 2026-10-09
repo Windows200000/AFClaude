@@ -12,8 +12,10 @@ mkdir -p "${KEEPALIVE_STATE_DIR:?}" "$D/data/at_spool"
 case "${AFCLAUDE_SCHEDULER:-off}" in
   on)
     echo "afclaude: scheduler ON ($(date -u +%FT%TZ))"
-    # the host crontab's "@reboot sleep 90; ... start_keepalive.sh" line
-    ( sleep 30; [ -e "$D/PAUSED" ] || "$D/docker/start_watcher.sh" ) &
+    # The watcher starts right away (the host crontab's "@reboot ... start_keepalive.sh" line), not
+    # only at the next :07/:22/:37/:52 watchdog: retried until it runs (the bridge may need a
+    # moment after a rebuild), never while PAUSED exists, never a second one (start_watcher.sh).
+    "$D/docker/start_watcher.sh" --boot &
     exec /usr/local/bin/supercronic -passthrough-logs "${AFCLAUDE_CRONTAB:-$D/docker/crontab}"
     ;;
   off)
