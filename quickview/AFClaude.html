@@ -209,6 +209,17 @@ button.chip.preview { outline: 1px solid #ec4899; outline-offset: 2px; }
       " over " + (f.n_rated || 0) + " of " + f.n + " runs</div>");
     return tile("Session fill time", v, lines.join(""));
   }
+  // D-212: the next planned fill-up run (the watcher's plan in keepalive_fillup.json)
+  function fillupTile(f, w) {
+    if (!f) return tile("Next fill-up", "–");
+    if (!f.planned) return tile("Next fill-up", "none", '<div class="mut">' + esc(f.reason || "?") + "</div>");
+    var lines = ['<div class="mut">~' + (f.remaining != null ? f.remaining : "?") + "% of the session window left" +
+      (f.cost != null ? " · weekly cost ~" + f.cost + "%" : "") + "</div>",
+      '<div class="mut">session reset ' + esc(f.reset_berlin || "?") + "</div>"];
+    if (f.reason && f.reason !== "planned") lines.push('<div class="mut">' + esc(f.reason) + "</div>");
+    if (w && w.running === false) lines.push('<div class="mut">the watcher is not running: nothing fires it</div>');
+    return tile(f.test ? "Next fill-up (TEST)" : "Next fill-up", esc(f.at_berlin || "?"), lines.join(""));
+  }
   function renderUsage(s) {
     var k = s.keepalive || {}, out = [];
     if (k.usage_error) out.push(tile("Usage", "–", '<div class="mut">' + esc(k.usage_error) + "</div>"));
@@ -228,6 +239,7 @@ button.chip.preview { outline: 1px solid #ec4899; outline-offset: 2px; }
         (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "") + exTxt));
     }
     out.push(fillTile(k.fill));
+    out.push(fillupTile(k.fillup, k.watcher));
     var lim = k.limits || {};
     if (lim.ratio_pref != null && lim.ratio_pref_source === "windows") {
       out.push(tile("Session→week ratio", lim.ratio_pref + (lim.ratio_spread != null ? " ± " + lim.ratio_spread : ""),

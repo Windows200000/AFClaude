@@ -6,6 +6,7 @@ serves at /afclaude/:
 
   status.json   keepalive+usage (incl. when the next run takes place, pacing.next_run,
                 the session fill time of AFClaude's runs, run_metrics.summary,
+                the next planned fill-up run, D-212, from keepalive_fillup.json,
                 and the reserve threshold and the model's accuracy,
                 pacing.threshold_info), progress (from GOALS.md, plus the
                 project's stages from the task store as a phase strip, and
@@ -425,6 +426,7 @@ def keepalive_and_usage(now):
     rev = usage_review()
     out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
     out["fill"] = fill_block()
+    out["fillup"] = fillup_block(now)
     if not u:
         out["usage_error"] = "no usage cache in ~/.claude.json"
         out["next_run"] = next_run_block(None, now)
@@ -450,6 +452,51 @@ def fill_block():
         return run_metrics.summary(run_metrics.read_rows(RUNS_FILE))
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+FILLUP_PLANNED = ("wait", "hold", "fire")   # fillup.decide statuses with a start ahead
+
+
+def _r1(x):
+    return round(float(x), 1) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _ts(x):
+    try:
+        return ka.parse_ts(x) if isinstance(x, str) else None
+    except ValueError:
+        return None
+
+
+def fillup_block(now):
+    """The next planned fill-up run (D-212), from the watcher's plan in keepalive_fillup.json
+    (fillup.decide, rewritten by the watcher every minute) or a --plan-fillup-test entry of this
+    session: {"planned": True, "at_berlin", "remaining" (session %), "cost" (weekly %),
+    "reset_berlin", "status", "reason", "test"} or {"planned": False, "reason"}. Read-only."""
+    try:
+        f = ka.load_fillup()
+        t = f.get("test")
+        if isinstance(t, dict) and t.get("session") == SELF_SESSION:
+            start, reset = _ts(t.get("start")), _ts(t.get("reset"))
+            if start and reset and reset > now:
+                return {"planned": True, "test": True, "at_berlin": bstr(start), "remaining": _r1(t.get("remaining")),
+                        "cost": _r1(t.get("cost")), "reset_berlin": bstr(reset), "status": "wait",
+                        "reason": "TEST fill-up (--plan-fillup-test)"}
+        if not afclaude_config.setting("fillup_enabled"):
+            return {"planned": False, "reason": "fillup_enabled is off"}
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"planned": False, "reason": f"{type(e).__name__}: {e}"}
+    p = f.get("plan")
+    if not isinstance(p, dict):
+        return {"planned": False, "reason": "no plan yet (the watcher writes it every minute)"}
+    reset, start = _ts(p.get("reset")), _ts(p.get("start"))
+    if reset is not None and reset <= now:
+        return {"planned": False, "reason": "that session window has ended (no newer plan from the watcher)"}
+    if p.get("status") in FILLUP_PLANNED and start is not None:
+        return {"planned": True, "test": False, "at_berlin": bstr(start), "remaining": _r1(p.get("remaining")),
+                "cost": _r1(p.get("cost")), "reset_berlin": bstr(reset), "status": p.get("status"),
+                "reason": p.get("reason")}
+    return {"planned": False, "reason": str(p.get("reason") or p.get("status") or "unknown")}
 
 
 def usage_review():

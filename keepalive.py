@@ -1036,6 +1036,45 @@ def note_limit_hit(sid, stall, st, now):
     return True
 
 
+WAKE_SLACK = timedelta(seconds=1)     # wake this long after a due time (resets_at jitters by ms)
+MIN_SLEEP = 0.5                       # seconds; never a busy loop
+LM_BOUNDARY_EVERY = timedelta(minutes=5)   # re-read the next last-stretch slot start this often
+
+
+def _now():
+    return datetime.now(UTC)
+
+
+_sleep = time.sleep   # run()'s clock and sleep: tests replace both
+
+
+def sleep_seconds(now, *due):
+    """The watcher's sleep: POLL_SECONDS, or less to wake at the earliest due time after `now`
+    (a planned fill-up start, a last-stretch slot start, a postponed window start's recheck),
+    so a start fires at its time, not up to a poll / fill-up interval late."""
+    s = float(POLL_SECONDS)
+    for d in due:
+        if d is not None and d > now:
+            s = min(s, (d - now).total_seconds())
+    return max(s, MIN_SLEEP)
+
+
+def last_mile_next_start(now, usage=None):
+    """The next time after `now` at which the last stretch opens or a new last-stretch slot
+    starts (weekly reset - k x session length, last_mile_slot), or None. From the usage cache."""
+    w = ((usage if usage is not None else read_usage_cache()) or {}).get("weekly") or {}
+    reset = w.get("resets_at")
+    if not reset:
+        return None
+    lm = timedelta(hours=last_mile_hours(w.get("percent"), reset, now))
+    if lm <= timedelta(0):
+        return None
+    sl = afclaude_config.SESSION_LENGTH
+    cands = [reset - lm] + [reset - k * sl for k in range(1, int(lm / sl) + 1) if k * sl < lm]
+    future = [c for c in cands if c > now]
+    return min(future) if future else None
+
+
 def run(args):
     lock = open(LOCK_FILE, "w")
     try:
@@ -1047,12 +1086,20 @@ def run(args):
     log(f"keepalive start ({mode}) target={sid} windows {schedule.describe()} pid={os.getpid()}")
     st = load_state()
     last_line = None
-    next_eval = next_reading = next_fillup = datetime.min.replace(tzinfo=UTC)
+    next_eval = next_reading = next_fillup = lm_checked = datetime.min.replace(tzinfo=UTC)
+    lm_start = None
     while True:
         if os.path.exists(STOP_FILE):
             log("STOP file present, exiting")
             return
-        now = datetime.now(UTC)
+        now = _now()
+        if now >= lm_checked + LM_BOUNDARY_EVERY or (lm_start is not None and now >= lm_start):
+            lm_checked = now
+            try:     # wake at the next last-stretch slot start, not up to a poll (or a HOLD recheck) late
+                lm_start = last_mile_next_start(now)
+            except Exception as e:   # noqa: BLE001 - advisory: the regular poll still finds the slot
+                lm_start = None
+                log(f"last-stretch slot time failed: {type(e).__name__}: {e}")
         if now >= next_eval:
             # Detection + logging only: a limit hit ends the run, the watcher never continues the
             # session at the reset (D-204). Runs begin only at starts: the session-window starts
@@ -1070,13 +1117,17 @@ def run(args):
             next_lm = last_mile_pass(sid, now, st, args)
             if next_lm:
                 next_eval = max(next_eval, next_lm)
+        if lm_start is not None and lm_start + WAKE_SLACK < next_eval:
+            next_eval = lm_start + WAKE_SLACK      # a new slot's start is not held by the last one's HOLD
         # a postponed session-window start (D-018/D-202), also when the previous run ended at a
         # limit (D-204: "limit hit before 4am and the next run starts at 4am")
-        deferred_window_start_pass(sid, now, st, args)
+        deferred_due = deferred_window_start_pass(sid, now, st, args)
         if now >= next_fillup:    # the fill-up run of an AFClaude session window (D-212)
             next_fillup = now + FILLUP_EVERY
             try:
-                fillup_pass(sid, now, args)
+                due = fillup_pass(sid, now, args)
+                if isinstance(due, datetime):     # its planned start (or recheck): wake right then
+                    next_fillup = max(min(next_fillup, due + WAKE_SLACK), now + timedelta(seconds=MIN_SLEEP))
             except Exception as e:   # noqa: BLE001 - a fill-up problem must not take the watcher down
                 log(f"fill-up pass failed: {type(e).__name__}: {e}")
         if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
@@ -1084,7 +1135,8 @@ def run(args):
             watch_run_usage(sid, now)
         if args.once:
             return
-        time.sleep(POLL_SECONDS)
+        _sleep(sleep_seconds(_now(), next_eval, next_fillup, next_reading,
+                             deferred_due + WAKE_SLACK if isinstance(deferred_due, datetime) else None))
 
 
 LAST_MILE_RECHECK = timedelta(minutes=15)
@@ -1456,6 +1508,8 @@ def handle_fire(sid, stall, reason, st, args):
 FILLUP_FILE = os.path.join(STATE_DIR, "keepalive_fillup.json")   # {"plan": the current plan (quickview),
                                                                   #  "test": a --plan-fillup-test entry}
 FILLUP_EVERY = timedelta(seconds=60)
+FILLUP_PREFETCH = timedelta(minutes=2)   # refresh the usage this long before a planned start ...
+FILLUP_FRESH = timedelta(minutes=3)      # ... so the start fires at once on numbers at most this old
 _FILLUP_LINE = None
 
 
@@ -1559,6 +1613,7 @@ def _fire_fillup(sid, now, d, args, test=False):
 
 
 def fillup_test_pass(sid, now, args, test):
+    """-> the time to look again (its start while planned, a re-check while held), or None."""
     import fillup
     s = afclaude_config.settings("automation_paused")
     st = load_state()
@@ -1572,29 +1627,44 @@ def fillup_test_pass(sid, now, args, test):
         f.pop("test", None)
         save_fillup(f)
         progress_note(f"fill-up TEST {d['key']}: {d['reason']}")
+    return d.get("recheck_at")
+
+
+def _usage_young(u, now):
+    f = (u or {}).get("fetched_at")
+    return isinstance(f, datetime) and timedelta(0) <= now - f <= FILLUP_FRESH
 
 
 def fillup_pass(sid, now, args):
     """Once per watcher minute: plan / fire the fill-up of the current session window (D-212).
-    A --plan-fillup-test entry for this session takes precedence. Never raises for a missing input."""
+    A --plan-fillup-test entry for this session takes precedence. Never raises for a missing input.
+    The fire decides on usage at most FILLUP_FRESH old: within FILLUP_PREFETCH of the planned start
+    the usage is refreshed ahead, so the run fires AT its start (the watcher wakes then, run()),
+    not after a /usage call. -> the time to look again (the planned start, a re-check), or None."""
     test = load_fillup().get("test")
     if isinstance(test, dict) and test.get("session") == sid:
         return fillup_test_pass(sid, now, args, test)
-    d = fillup_decision(sid, now)
+    u = read_usage_cache() or {}
+    d = fillup_decision(sid, now, u)
+    planned = d["status"] == "wait" and d.get("recheck_at") is not None and d.get("recheck_at") == d.get("start")
+    if (d["status"] == "fire" or (planned and d["start"] - now <= FILLUP_PREFETCH)) and not _usage_young(u, now):
+        fu = fresh_usage(now, force=True)   # the plan used the cache: decide on fresh numbers
+        if fu is None:
+            if d["status"] == "fire":
+                return None                  # no fresh numbers: not fired, the next pass tries again
+        else:
+            u = fu
+            d = fillup_decision(sid, now, u)
     f = load_fillup()
     plan = {k: (v.astimezone(UTC).isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
     if f.get("plan") != plan:
         f["plan"] = plan
         save_fillup(f)
     _fillup_log(f"fill-up: {d['status']}: {d['reason']}" + (f"; {_fillup_text(d)}" if "start" in d else ""))
-    if d["status"] != "fire":
-        return
-    u = fresh_usage(now, force=True)   # the plan used the cache: decide again on fresh numbers
-    if u is None:
-        return
-    d = fillup_decision(sid, now, u)
     if d["status"] == "fire":
         _fire_fillup(sid, now, d, args)
+        return None
+    return d.get("recheck_at")
 
 
 def plan_fillup_test(sid, remaining, args):

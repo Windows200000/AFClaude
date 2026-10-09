@@ -190,6 +190,166 @@ class FirePath(unittest.TestCase):
         self.assertNotIn("test", ka.load_fillup())      # done: the entry is removed
 
 
+class Clock:
+    """run()'s clock: _sleep advances it (no real waiting)."""
+    def __init__(self, t):
+        self.t = t
+        self.sleeps = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += timedelta(seconds=s)
+
+
+class ExactTiming(unittest.TestCase):
+    """Follow-up 1: the watcher wakes at a planned fill-up start / a last-stretch slot start
+    instead of up to a fill-up interval (60 s) or a poll (30 s) late (live test: fired 37 s late)."""
+    SID = "f" * 8 + "-0000-0000-0000-" + "0" * 12
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        names = ("STATE_FILE", "FILLUP_FILE", "LOCK_FILE", "STOP_FILE", "PROGRESS_FILE", "read_usage_cache",
+                 "fresh_usage", "handle_fire", "run_active", "_fillup_user", "_limit_hit_in", "stall_status",
+                 "last_mile_pass", "deferred_window_start_pass", "watch_run_usage", "last_mile_next_start",
+                 "log", "_now", "_sleep")
+        self.old = {n: getattr(ka, n) for n in names}
+        d = self.tmp.name
+        ka.STATE_FILE, ka.FILLUP_FILE = os.path.join(d, "state.json"), os.path.join(d, "fillup.json")
+        ka.LOCK_FILE, ka.STOP_FILE = os.path.join(d, "ka.lock"), os.path.join(d, "STOP")
+        ka.PROGRESS_FILE = os.path.join(d, "PROGRESS.md")
+        ka.save_state({"handled": handled(), "fires": {}})
+        self.usage = {"session": {"percent": 95.0, "resets_at": RESET},
+                      "weekly": {"percent": 53.0, "resets_at": RESET + timedelta(days=3)},
+                      "fetched_at": RESET - timedelta(minutes=30)}
+        self.refreshes = []
+
+        def fresh(now, force=False):
+            self.refreshes.append(now)
+            self.usage = dict(self.usage, fetched_at=now)
+            return self.usage
+        ka.read_usage_cache = lambda: self.usage
+        ka.fresh_usage = fresh
+        ka.run_active = lambda sid, now, st=None: None
+        ka._fillup_user = lambda now, ls, s: (False, None)
+        ka._limit_hit_in = lambda sid, reset: False
+        ka.stall_status = lambda sid, now: ("NO_STALL", "x", None)
+        ka.last_mile_pass = lambda sid, now, st, args: None
+        ka.deferred_window_start_pass = lambda sid, now, st, args: None
+        ka.watch_run_usage = lambda sid, now: None
+        ka.last_mile_next_start = lambda now, usage=None: None
+        ka.log = lambda msg: None
+        self.fired = []
+
+        def fake_fire(sid, stall, reason, st, args):
+            self.fired.append((self.clock.t, stall["uuid"]))
+            st["handled"][stall["uuid"]] = {"at": self.clock.t.isoformat(), "result": "continued-in-place"}
+            ka.save_state(st)
+            open(ka.STOP_FILE, "w").close()          # done: let run() return
+        ka.handle_fire = fake_fire
+        import schedule
+        self.old_nss = schedule.next_session_start
+        schedule.next_session_start = lambda now, cfg=None: None
+
+    def tearDown(self):
+        import schedule
+        schedule.next_session_start = self.old_nss
+        for n, v in self.old.items():
+            setattr(ka, n, v)
+        self.tmp.cleanup()
+
+    def run_loop(self, t0, until):
+        self.clock = Clock(t0)
+        ka._now = self.clock.now
+
+        def sleep(s):
+            self.clock.sleep(s)
+            if self.clock.t > until:
+                open(ka.STOP_FILE, "w").close()
+        ka._sleep = sleep
+
+        class A:
+            session, arm, once, now = self.SID, True, False, False
+        ka.run(A())
+
+    def test_sleep_seconds(self):
+        now = RESET
+        self.assertEqual(ka.sleep_seconds(now), ka.POLL_SECONDS)
+        self.assertEqual(ka.sleep_seconds(now, now + timedelta(seconds=7), None, now + timedelta(minutes=5)), 7)
+        self.assertEqual(ka.sleep_seconds(now, now - timedelta(seconds=7)), ka.POLL_SECONDS)   # past: ignored
+        self.assertEqual(ka.sleep_seconds(now, now + timedelta(milliseconds=10)), ka.MIN_SLEEP)
+
+    def test_fillup_pass_returns_the_planned_start(self):
+        start = RESET - timedelta(minutes=5.5)          # 5% at 60 %/h x 1.1
+        due = ka.fillup_pass(self.SID, RESET - timedelta(minutes=30), None)
+        self.assertEqual(due, start)
+        self.assertEqual(self.refreshes, [])            # far from the start: the cache is enough
+
+    def test_usage_refreshed_ahead_then_fires_at_start_without_waiting_for_usage(self):
+        start = RESET - timedelta(minutes=5.5)
+        ka.fillup_pass(self.SID, start - timedelta(seconds=90), None)     # inside FILLUP_PREFETCH
+        self.assertEqual(self.refreshes, [start - timedelta(seconds=90)])
+        ka.fresh_usage = lambda now, force=False: self.fail("no /usage call at the start: numbers are fresh")
+        self.clock = Clock(start)
+        ka.fillup_pass(self.SID, start, None)
+        self.assertEqual([k for _, k in self.fired], [fillup.key(RESET)])
+
+    def test_stale_usage_at_the_start_is_refreshed_first(self):
+        start = RESET - timedelta(minutes=5.5)
+        self.clock = Clock(start)
+        ka.fillup_pass(self.SID, start, None)
+        self.assertEqual(self.refreshes, [start])
+        self.assertEqual(len(self.fired), 1)
+
+    def test_watcher_fires_the_fillup_at_its_start(self):
+        start = RESET - timedelta(minutes=5.5)
+        self.run_loop(start - timedelta(minutes=7, seconds=13), until=RESET)
+        self.assertEqual(len(self.fired), 1, self.fired)
+        late = (self.fired[0][0] - start).total_seconds()
+        self.assertTrue(0 <= late <= 2, late)           # was up to FILLUP_EVERY (60 s) late
+
+    def test_watcher_fires_a_test_fillup_at_its_start(self):
+        start = RESET - timedelta(minutes=3, seconds=1)
+        ka.save_fillup({"test": {"session": self.SID, "key": fillup.test_key(RESET), "start": start.isoformat(),
+                                 "reset": RESET.isoformat(), "remaining": 3.0}})
+        self.run_loop(start - timedelta(minutes=35, seconds=49), until=RESET)
+        self.assertEqual([k for _, k in self.fired], [fillup.test_key(RESET)])
+        late = (self.fired[0][0] - start).total_seconds()
+        self.assertTrue(0 <= late <= 2, late)           # the live test: 37 s late
+
+    def test_watcher_wakes_at_a_last_stretch_slot_start(self):
+        slot = RESET + timedelta(hours=1)
+        calls = []
+        ka.last_mile_pass = lambda sid, now, st, args: calls.append(now) or now + timedelta(minutes=15)  # a HOLD
+        ka.last_mile_next_start = lambda now, usage=None: slot if now < slot else None
+        old_fp, ka.fillup_pass = ka.fillup_pass, lambda sid, now, args: None
+        try:
+            self.run_loop(slot - timedelta(minutes=4, seconds=47), until=slot + timedelta(seconds=40))
+        finally:
+            ka.fillup_pass = old_fp
+        after = [c for c in calls if c >= slot]
+        self.assertTrue(after, calls)
+        self.assertLessEqual((after[0] - slot).total_seconds(), 2)   # not at the HOLD's 15-min recheck
+
+    def test_last_mile_next_start(self):
+        old = ka.last_mile_hours
+        ka.last_mile_hours = lambda pct, reset=None, now=None: 10.0
+        try:
+            u = {"weekly": {"percent": 80.0, "resets_at": RESET}}
+            nxt = self.old["last_mile_next_start"]
+            self.assertEqual(nxt(RESET - timedelta(hours=12), u), RESET - timedelta(hours=10))   # opens
+            self.assertEqual(nxt(RESET - timedelta(hours=9), u), RESET - timedelta(hours=5))     # slot 1
+            self.assertIsNone(nxt(RESET - timedelta(hours=1), u))
+            self.assertIsNone(nxt(RESET, {"weekly": {}}))
+            ka.last_mile_hours = lambda pct, reset=None, now=None: 7.0
+            self.assertEqual(nxt(RESET - timedelta(hours=8), u), RESET - timedelta(hours=7))
+            self.assertEqual(nxt(RESET - timedelta(hours=6), u), RESET - timedelta(hours=5))
+        finally:
+            ka.last_mile_hours = old
+
+
 class StopSetting(unittest.TestCase):
     def test_manager_prompt_reads_setting(self):
         testenv.set_setting("session_stop_pct", 90)
