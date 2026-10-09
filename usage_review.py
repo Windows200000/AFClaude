@@ -5,8 +5,9 @@ ONE run that tests hypotheses on data/ (samples, Haiku judgements, weekly cycles
 keep-alive decisions), then sorts every finding into universal (goes into the code,
 public) or user-specific (data/user_model.json, local only). It starts a NEW
 Opus 5.5 session at MEDIUM effort (tmux, Remote-Control visible, via ka_resume.sh)
-with prompts/usage_review.md + guard_respect.md + manager.md, and runs without user
-input. The results are surfaced via PROGRESS.md, a push, and an "unread review"
+with prompts/usage_review.md + stage_eta_review.md (the rare stage-ETA review, D-213:
+it tunes the stages' session estimates only) + guard_respect.md + manager.md, and runs
+without user input. The results are surfaced via PROGRESS.md, a push, and an "unread review"
 memory entry that the user's next conversation picks up.
 
 Schedule: at `next_run_at` in the state file. The first run is Thu 2026-10-01 17:00
@@ -68,6 +69,7 @@ def run(st, now):
     since = st["runs"][-1]["at"][:10] if st["runs"] else "2026-09-26"
     d = local.date().isoformat()
     parts = [ka.load_prompt("usage_review").format(date=d, since=since),
+             ka.load_prompt("stage_eta_review").format(date=d),
              ka.load_prompt("guard_respect"), ka.load_prompt("manager")]
     msg = " ".join(" ".join(parts).split())
     sid = str(uuid.uuid4())

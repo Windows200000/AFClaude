@@ -98,6 +98,7 @@ def task_brief(t: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"id": t["id"], "title": t["title"], "status": t["status"], "priority": t["priority"],
                     "project": t["project"], "stage": t["stage_seq"],
                     "kind": t["kind"] if t["kind"] != "task" else None,
+                    "estimated_sessions": t.get("estimated_sessions"),
                     "question": t["blocked_question"] if t["status"] == "blocked" else None,
                     "updated": bt(t["updated_at"])})
 
@@ -284,19 +285,24 @@ async def afclaude_get_task(id: int) -> str:
 
 @tool("Change an AFClaude task. Fields: title, description, priority, project (moves it to the end of that "
       "project), stage (position in its project, 1 = first). status: done (note = summary), cancelled (note = "
-      "reason), pending (reopen), in_progress, blocked (note = the question for the user). One call is atomic.")
+      "reason), pending (reopen), in_progress, blocked (note = the question for the user). estimated_sessions: "
+      "how many full session windows the stage still needs (the stage ETA, D-213). One call is atomic.")
 async def afclaude_update_task(id: int, title: Optional[str] = None, description: Optional[str] = None,
                                priority: Optional[Priority] = None, project: Optional[str] = None,
                                stage: Optional[int] = None,
                                status: Optional[Literal["pending", "in_progress", "blocked", "done",
                                                         "cancelled"]] = None,
-                               note: Optional[str] = None, ctx: Optional[Context] = None) -> str:
-    fields: dict[str, str | None] = {k: v for k, v in (("title", title), ("description", description),
-                                                       ("priority", priority)) if v is not None}
+                               note: Optional[str] = None, estimated_sessions: Optional[float] = None,
+                               ctx: Optional[Context] = None) -> str:
+    fields: dict[str, str | float | None] = {k: v for k, v in (("title", title), ("description", description),
+                                                               ("priority", priority)) if v is not None}
+    if estimated_sessions is not None:
+        fields["estimated_sessions"] = estimated_sessions
     if project is not None:
         fields["project"] = await resolve_dir_arg(ctx, project) if project.strip() else None
     if not fields and stage is None and status is None:
-        raise ValueError("nothing to change (give title/description/priority/project/stage/status)")
+        raise ValueError("nothing to change (give title/description/priority/project/stage/status/"
+                         "estimated_sessions)")
     conn = db()
     try:
         t = act(conn, "task.update", task_id=id, fields=fields or None, stage=stage, status=status, note=note,

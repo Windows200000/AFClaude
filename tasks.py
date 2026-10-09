@@ -7,7 +7,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py list [--all | --status S ...] [--project P] [--kind K]   (default: open tasks)
     tasks.py order [--project P] [--kind K]   the ready queue, in execution order
     tasks.py show ID                       task + its event history
-    tasks.py edit ID [--title T] [-d TEXT] [--project P] [--kind K]
+    tasks.py edit ID [--title T] [-d TEXT] [--project P] [--kind K] [--sessions N|""]
+                                           --sessions: estimated session windows the stage still
+                                           needs (stage ETA, D-213); "" clears it
     tasks.py prio ID high|medium|low       one stage's priority
     tasks.py move ID N                     stage N (1 = first) within its project
     tasks.py project add NAME [-d TEXT] [--path DIR] [--rank N]
@@ -289,8 +291,10 @@ def run(conn, args):
     elif c == "edit":
         f = {k: v for k, v in (("title", args.title), ("description", args.description),
                                ("project", project_ref(args.project)), ("kind", args.kind)) if v is not None}
+        if args.sessions is not None:
+            f["estimated_sessions"] = float(args.sessions) if args.sessions.strip() else None
         if not f:
-            raise ValueError("nothing to change (use --title/-d/--project/--kind)")
+            raise ValueError("nothing to change (use --title/-d/--project/--kind/--sessions)")
         task_out(args, act(conn, "task.edit", task_id=args.id, **f))
     elif c == "prio":
         task_out(args, act(conn, "task.priority", task_id=args.id, priority=args.priority))
@@ -403,6 +407,8 @@ def parser():
     p.add_argument("-d", "--description")
     p.add_argument("--project")
     p.add_argument("--kind", choices=store.TASK_KINDS)
+    p.add_argument("--sessions", metavar="N", help='estimated session windows this stage still needs '
+                   '(stage ETA, D-213); "" = clear (the default from history is used)')
     p = sub.add_parser("prio", parents=[js], help="set one stage's priority")
     p.add_argument("id", type=int)
     p.add_argument("priority", choices=store.PRIORITIES)

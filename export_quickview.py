@@ -10,7 +10,10 @@ serves at /afclaude/:
                 pacing.threshold_info), progress (from GOALS.md, plus the
                 project's stages from the task store as a phase strip, and
                 preview_from marking the step from which a non-blocking owner
-                preview of the dashboard UI is possible, D-211), latest keep-alive
+                preview of the dashboard UI is possible, D-211; each open stage and
+                phase with its cumulative ETA from stage_eta.py, D-213, which also
+                logs one prediction per day to data/stage_eta_log.jsonl for the
+                rare review), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
@@ -36,6 +39,7 @@ import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget eva
 import store  # noqa: E402  (read-only: pending_user_input)
 import limit_ratio  # noqa: E402  (reads the per-sample ratio snapshot; never recomputes here)
 import afclaude_config  # noqa: E402  (local machine-specific values)
+import stage_eta  # noqa: E402  (stage ETAs, D-213: read-only, plus its once-a-day prediction log)
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
@@ -143,9 +147,13 @@ def parse_goals(md):
 PHASE_RE = re.compile(r"^Dashboard\s+(\d+)([a-z]?)\s*:?\s*(.*)$", re.I)
 
 
-def _stage(t):
-    return {"id": t.get("id"), "seq": t.get("stage_seq"), "status": t.get("status"),
-            "priority": t.get("priority"), "title": (t.get("title") or "")[:140]}
+def _stage(t, eta=None):
+    out = {"id": t.get("id"), "seq": t.get("stage_seq"), "status": t.get("status"),
+           "priority": t.get("priority"), "title": (t.get("title") or "")[:140]}
+    e = stage_eta.group_eta(eta, [t.get("id")]) if eta else None
+    if e is not None:
+        out.update(eta=e["eta"], eta_days=e["eta_days"], eta_sessions=e["sessions"])
+    return out
 
 
 def _phase_status(steps):
@@ -160,7 +168,7 @@ def _phase_status(steps):
     return "pending"
 
 
-def build_stages(tasks):
+def build_stages(tasks, eta=None):
     """Split a project's stages (every status, in execution order) into the
     'Dashboard N[x]: ...' phases and the other stages.
 
@@ -168,37 +176,45 @@ def build_stages(tasks):
     are steps of phase 8). Cancelled steps are dropped from phases (they were
     superseded); a phase with only cancelled steps disappears. Exactly one
     phase (the first one not done) is marked current. others: everything else,
-    in stage order, cancelled ones included (the page greys them)."""
+    in stage order, cancelled ones included (the page greys them).
+
+    eta = a stage_eta.predict() result: every open stage gets its cumulative ETA (eta "~3 d" |
+    "<1 d" | "?", eta_days, eta_sessions), a phase the ETA of its last open step (D-213)."""
     groups, others = {}, []
     for t in tasks:
         m = PHASE_RE.match(t.get("title") or "")
         if not m:
-            others.append(_stage(t))
+            others.append(_stage(t, eta))
             continue
         if t.get("status") == "cancelled":
             continue
         n = int(m.group(1))
-        st = _stage(t)
+        st = _stage(t, eta)
         st["key"] = f"{n}{m.group(2).lower()}"
         st["title"] = (m.group(3) or t.get("title") or "")[:140]
         groups.setdefault(n, []).append(st)
     phases = []
     for n in sorted(groups):
         steps = sorted(groups[n], key=lambda s: (s["key"], s["seq"] or 0))
-        phases.append({"n": n, "status": _phase_status(steps), "current": False,
-                       "done": sum(s["status"] == "done" for s in steps), "total": len(steps),
-                       "steps": steps})
+        ph = {"n": n, "status": _phase_status(steps), "current": False,
+              "done": sum(s["status"] == "done" for s in steps), "total": len(steps), "steps": steps}
+        e = stage_eta.group_eta(eta, [s["id"] for s in steps]) if eta else None
+        if e is not None:
+            ph.update(eta=e["eta"], eta_days=e["eta_days"], eta_sessions=e["sessions"])
+        phases.append(ph)
     cur = next((p for p in phases if p["status"] != "done"), None)
     if cur:
         cur["current"] = True
     return {"phases": phases, "others": others}
 
 
-def stages():
+def stages(usage=None, now=None):
     conn = None
+    eta = None
     try:
         conn = store.connect()
-        out = build_stages(store.list_tasks(conn, project=STAGES_PROJECT))
+        eta = eta_result(conn, usage, now or datetime.now(UTC))
+        out = build_stages(store.list_tasks(conn, project=STAGES_PROJECT), eta if eta.get("stages") else None)
         out["error"] = None
     except Exception as e:  # noqa: BLE001 - never let a DB hiccup break the export
         out = {"phases": [], "others": [], "error": str(e)[:300]}
@@ -206,7 +222,33 @@ def stages():
         if conn is not None:
             conn.close()
     out["project"] = STAGES_PROJECT
+    out["eta"] = eta_summary(eta)
     return out
+
+
+def eta_result(conn, usage, now):
+    """stage_eta.gather() over every open stage (all projects: the execution order interleaves
+    them), logged once a day to data/stage_eta_log.jsonl for the stage-ETA review. Never raises."""
+    try:
+        res = stage_eta.gather(conn, usage, now, runs_path=RUNS_FILE)
+    except Exception as e:   # noqa: BLE001 - the page shows "?" and the error instead
+        return {"status": "unknown", "reason": f"{type(e).__name__}: {e}"[:300], "stages": [], "assumptions": {}}
+    try:
+        stage_eta.record(res, now=now)
+    except OSError:
+        pass
+    return res
+
+
+def eta_summary(eta):
+    """The ETA assumptions for the page (the tooltip), small aggregates only."""
+    if not eta:
+        return None
+    a = eta.get("assumptions") or {}
+    return {"status": eta.get("status"), "reason": eta.get("reason"), "text": stage_eta.assumptions_text(eta),
+            "sessions_per_day": a.get("sessions_per_day"), "gate_sessions_per_week": a.get("gate_sessions_per_week"),
+            "formula_sessions_per_week": a.get("formula_sessions_per_week"),
+            "estimate_sources": a.get("estimate_sources")}
 
 
 # ---------------------------------------------------------------- other sources
@@ -521,7 +563,7 @@ def main():
         "generated_berlin": bstr(now),
         "keepalive": keepalive_and_usage(now),
         "goals": parse_goals(read(os.path.join(HERE, "GOALS.md"))),
-        "stages": stages(),
+        "stages": stages(ka.read_usage_cache(), now),
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),

@@ -16,6 +16,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Later column (COLUMNS, no version bump): projects.manager_session
                (goal 5: a managed project's stages are worked by that session,
                not by per-task dispatcher sessions).
+               Later column (COLUMNS, no version bump): tasks.estimated_sessions
+               (D-213: how many full session windows the stage still needs, set by
+               the task-manager or the stage-ETA review; NULL = stage_eta.py's default).
   v4 (dashboard phase 1, docs/dashboard_design.md §4): settings, prompt_overrides,
                audit_log (append-only), idempotency_keys, run_log, driven_sessions,
                action_requests; a `version` column on projects, tasks,
@@ -317,7 +320,7 @@ COLUMNS = {
     "projects": [("manager_session", "TEXT"), VERSION_COL],
     "sessions": [],
     "limit_hits": [],
-    "tasks": [VERSION_COL],
+    "tasks": [VERSION_COL, ("estimated_sessions", "REAL")],   # D-213: stage_eta.py
     "task_events": [],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
@@ -763,7 +766,8 @@ PRIORITIES = ("high", "medium", "low")          # order = execution order
 DEFAULT_PRIORITY = "high"
 DECISIONS = ("continue", "ignore")
 RULE_SCOPES = ("session", "project")
-TASK_EDITABLE = ("title", "description", "project", "priority", "kind")
+TASK_EDITABLE = ("title", "description", "project", "priority", "kind", "estimated_sessions")
+ESTIMATE_MAX = 100.0          # estimated_sessions: full session windows a stage still needs (D-213)
 PROJECT_EDITABLE = ("name", "description", "path", "manager_session")
 
 _PRIO_SQL = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END"
@@ -856,6 +860,17 @@ def _clean_task_field(name: str, value: object) -> str | None:
             raise ValueError("kind 'question' is only for questions (ask_question), not an edit")
         return _enum(value, TASK_KINDS, "kind")
     return _text(value, name)
+
+
+def _estimate(value: object) -> float | None:
+    """estimated_sessions (D-213): a number of full session windows in 0..ESTIMATE_MAX, or
+    None (cleared: stage_eta.py uses its default from history / the fallback)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= ESTIMATE_MAX:
+        raise ValueError(f"estimated_sessions must be a number of session windows in 0..{ESTIMATE_MAX:g} "
+                         f"or null, got {value!r}")
+    return float(value)
 
 
 def _position(value: object, what: str) -> int:
@@ -1192,7 +1207,9 @@ def next_ready_task(conn: sqlite3.Connection, kind: object = None, project: obje
 
 
 def _update(conn: sqlite3.Connection, task_id: int, event: str, fields: Mapping[str, object]) -> Row:
-    clean = {k: _clean_task_field(k, v) for k, v in fields.items() if k != "project"}
+    clean: dict[str, str | float | None] = {
+        k: _estimate(v) if k == "estimated_sessions" else _clean_task_field(k, v)
+        for k, v in fields.items() if k != "project"}
     with transaction(conn):
         t = _task_row(conn, task_id)
         changes = {k: [t[k], v] for k, v in clean.items() if t[k] != v}
@@ -1219,7 +1236,7 @@ def _update(conn: sqlite3.Connection, task_id: int, event: str, fields: Mapping[
 
 
 def update_task(conn: sqlite3.Connection, task_id: int, **fields: object) -> Row:
-    """Change title/description/project/priority/kind. Logs one 'updated'
+    """Change title/description/project/priority/kind/estimated_sessions. Logs one 'updated'
     event with {field: [old, new]} (nothing is logged if nothing changed).
     A new project appends the task as that project's last stage."""
     bad = set(fields) - set(TASK_EDITABLE)
