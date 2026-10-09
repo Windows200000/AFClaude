@@ -132,7 +132,10 @@ class FirePath(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.old = (ka.STATE_FILE, ka.FILLUP_FILE, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire,
-                    ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE)
+                    ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE, ka.HANDOFF_FILE,
+                    ka.tmux_created)
+        ka.HANDOFF_FILE = os.path.join(self.tmp.name, "handoff.json")
+        ka.tmux_created = lambda sid: None       # no compaction save prompt here (test_compaction.py)
         ka.STATE_FILE = os.path.join(self.tmp.name, "state.json")
         ka.FILLUP_FILE = os.path.join(self.tmp.name, "fillup.json")
         ka.PROGRESS_FILE = os.path.join(self.tmp.name, "PROGRESS.md")
@@ -155,7 +158,8 @@ class FirePath(unittest.TestCase):
 
     def tearDown(self):
         (ka.STATE_FILE, ka.FILLUP_FILE, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire,
-         ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE) = self.old
+         ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE, ka.HANDOFF_FILE,
+         ka.tmux_created) = self.old
         self.tmp.cleanup()
 
     def test_fires_once_with_fillup_prompt(self):

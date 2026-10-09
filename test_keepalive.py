@@ -30,7 +30,8 @@ _CFG_DIR = tempfile.TemporaryDirectory()
 
 import pacing as budget  # noqa: E402
 
-_OLD_FILES = (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert)
+_OLD_FILES = (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert, ka.HANDOFF_FILE,
+              ka.tmux_created)
 
 
 setcfg = testenv.setcfg     # the DB settings for a test: the code defaults, then kw
@@ -47,11 +48,16 @@ def setUpModule():
     # window-start usage bookkeeping (note_window_usage): a temp state file, never ALERTS.md / a push
     ka.USAGE_STATE_FILE = os.path.join(_CFG_DIR.name, "usage_refresh_state.json")
     ka.alert = lambda subject, body="": None
+    # compaction (D-191): the fake tmux pane pids below are no real processes; no tmux start = never due
+    # (test_compaction.py tests it), and the save-prompt records go to a temp file
+    ka.HANDOFF_FILE = os.path.join(_CFG_DIR.name, "handoff.json")
+    ka.tmux_created = lambda sid: None
 
 
 def tearDownModule():
     testenv.clear_settings()
-    (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert) = _OLD_FILES
+    (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert, ka.HANDOFF_FILE,
+     ka.tmux_created) = _OLD_FILES
     _CFG_DIR.cleanup()
 
 

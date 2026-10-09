@@ -45,6 +45,7 @@ A task added through MCP counts exactly like one you add in the UI (today `tasks
 | `afclaude_decide_session` | continue, ignore or clear for one stalled session (id or prefix) |
 | `afclaude_rule` | standing continue/ignore rules: `list`, `add`, `rm` |
 | `afclaude_ask` | a question for you from a (task-manager) session: a blocked task of kind `question` in your inbox; your answer closes it |
+| `afclaude_handoff` | a session's compaction hand-off (D-144): summary, done, in progress, next steps, open question ids, notes; the keep-alive injects it after compacting that session at its next start |
 
 Every write goes through `actions.py` (one transaction, an `audit_log` row with actor `mcp:<session>`). A session AFClaude itself runs (`CLAUDE_GUARD_DISABLE=1`, `data/own_sessions.txt`, `driven_sessions`, a task-manager session) may add tasks and projects, but `afclaude_decide_session` and `afclaude_rule add/rm` refuse it: deciding sessions and rules stays with you.
 

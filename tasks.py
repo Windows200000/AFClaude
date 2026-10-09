@@ -27,6 +27,10 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py rule add session|project MATCH continue|ignore [--note N]
     tasks.py rule list | rule rm ID
     tasks.py inbox                         everything that needs the user's input
+    tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
+                                           BODY = JSON {summary, done, in_progress, next_steps,
+                                           open_question_ids, notes} ("-" = read it from stdin)
+    tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
 
 Tasks are the stages of a project; projects form a ranked list. Execution
 order: every high stage (by project rank, then stage), then every medium one,
@@ -265,6 +269,24 @@ def run_project(conn, args):
         print(f"project {p['name']}  rank {p['rank']}" + (f"  {p['path']}" if p["path"] else ""))
 
 
+def run_handoff(conn, args):
+    if args.handoff_cmd == "write":
+        body = sys.stdin.read() if args.body == "-" else args.body
+        sid = resolve_session(conn, args.session)
+        h = act(conn, "handoff.write", session_id=sid, body=body, project=project_ref(args.project))
+        return print(f"hand-off #{h['id']} saved for {h['session_id'][:8]}: HANDOFF SAVED")
+    sid = resolve_session(conn, args.session) if args.session else None
+    rows = store.list_handoffs(conn, sid, limit=20 if args.all else 1)
+    if args.json:
+        return dump(rows if args.all else (rows[0] if rows else None))
+    if not rows:
+        return print("no hand-off" + (f" for {sid[:8]}" if sid else ""))
+    for h in rows:
+        state = f"consumed {berlin(h['consumed_at'])} by {h['consumed_by_start']}" if h["consumed_at"] else "open"
+        print(f"#{h['id']}  {h['session_id'][:8]}  {berlin(h['created_at'])}  {state}")
+        print("   " + store.render_handoff(h))
+
+
 def run(conn, args):
     c = args.cmd
     if c == "add":
@@ -337,6 +359,8 @@ def run(conn, args):
                 match = os.path.abspath(os.path.expanduser(match))
             r = act(conn, "rule.add", scope=args.scope, match=match, decision=args.decision, note=args.note)
             dump(r) if args.json else print_rules([r])
+    elif c == "handoff":
+        run_handoff(conn, args)
     elif c == "inbox":
         maybe_scan(conn, args)
         box = store.pending_user_input(conn)
@@ -440,6 +464,16 @@ def parser():
     q = rs.add_parser("rm", parents=[js])
     q.add_argument("id", type=int)
     sub.add_parser("inbox", parents=[js, scan], help="blocked tasks + undecided stalled sessions")
+    p = sub.add_parser("handoff", help="compaction hand-offs (D-144)")
+    hs = p.add_subparsers(dest="handoff_cmd", required=True)
+    q = hs.add_parser("write", help="save a hand-off for your compacted self (prints HANDOFF SAVED)")
+    q.add_argument("--session", required=True, help="the writing session (full id or unique prefix)")
+    q.add_argument("--json", dest="body", required=True, metavar="BODY",
+                   help="JSON {summary, done, in_progress, next_steps, open_question_ids, notes}; - = stdin")
+    q.add_argument("--project", help="name or directory (default: the project the session manages)")
+    q = hs.add_parser("show", parents=[js], help="the latest hand-off")
+    q.add_argument("--session", help="only this session's (id or unique prefix)")
+    q.add_argument("--all", action="store_true", help="the recent ones, newest first")
     return ap
 
 

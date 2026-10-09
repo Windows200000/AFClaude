@@ -1,0 +1,1 @@
+This session was compacted at this start (D-144/D-191). The hand-off you saved before the compaction: {handoff} Check it against the latest Status line in {progress} (the newer one wins) and go on from there.

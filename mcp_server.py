@@ -466,5 +466,33 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
         conn.close()
 
 
+@tool("Write your compaction hand-off (D-144): when the AFClaude keep-alive asks you to save your work before "
+      "a compaction, record a SHORT structured note for your compacted self; it is injected into the continue "
+      "message after the compaction. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
+      "short items); open_question_ids (AFClaude task ids of open questions for the user); notes. session: your "
+      "full session id (default: this session's, when the client passes it). A newer hand-off replaces the "
+      "older one. Returns the stored hand-off's id.")
+async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_progress: Optional[list[str]] = None,
+                           next_steps: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
+                           notes: Optional[str] = None, session: Optional[str] = None,
+                           project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+    body: dict[str, Any] = {"summary": summary, "done": done or [], "in_progress": in_progress or [],
+                            "next_steps": next_steps or [], "open_question_ids": open_question_ids or [],
+                            "notes": notes}
+    project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        sid = (session or "").strip() or session_id_env()
+        if not sid:
+            raise ValueError("session is unknown here: pass your full session id as session")
+        if len(sid) != 36:
+            sid = cli.resolve_session(conn, sid)
+        h = act(conn, "handoff.write", session_id=sid, body=body, project=project)
+    finally:
+        conn.close()
+    return out(compact({"id": h["id"], "session_id": h["session_id"], "project_id": h["project_id"],
+                        "created": bt(h["created_at"]), "saved": "HANDOFF SAVED"}))
+
+
 if __name__ == "__main__":
     server.run("stdio")
