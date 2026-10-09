@@ -36,12 +36,13 @@ RUN pip install --no-cache-dir mcp==2.2.0
 # The code, owned by root: the manager cannot change what it runs.
 COPY . ${AFCLAUDE_DIR}
 # Local-only / live files are read from the host repo (mounted read-only at
-# /host/repo); PROGRESS.md and ALERTS.md are appended to through the bridge.
+# /host/repo, incl. the local backlog/ briefs); PROGRESS.md and ALERTS.md are appended to through the bridge.
 # data/ is a read-write mount of the host repo's data/.
 RUN set -eux; cd "${AFCLAUDE_DIR}"; \
     for f in PROGRESS.md ALERTS.md OPEN_QUESTIONS.md BACKLOG.md GOALS.md EXCEPTIONS.md README.md PAUSED; do \
       rm -f "$f"; ln -s "/host/repo/$f" "$f"; \
     done; \
+    rm -rf backlog; ln -s /host/repo/backlog backlog; \
     rm -rf data; mkdir -m 755 data; chown "${UID}:${GID}" data; \
     install -m 755 docker/at_shim.py /usr/local/bin/at; \
     install -m 755 docker/entrypoint.sh /usr/local/bin/afclaude-entrypoint; \
