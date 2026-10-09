@@ -125,6 +125,8 @@ class Tasks(Env):
         # update: fields + stage + status in one call
         u = run(ms.afclaude_update_task(a["id"], title="A1 renamed", priority="low", stage=2))
         self.assertEqual((u["title"], u["priority"], u["stage"]), ("A1 renamed", "low", 2))
+        u = run(ms.afclaude_update_task(a["id"], estimated_sessions=1.5))       # the stage ETA input (D-213)
+        self.assertEqual(u["estimated_sessions"], 1.5)
         u = run(ms.afclaude_update_task(b["id"], status="blocked", note="Which port?"))
         self.assertEqual((u["status"], u["question"]), ("blocked", "Which port?"))
         self.assertEqual([t["title"] for t in run(ms.afclaude_list_tasks(status="ready"))["tasks"]],
