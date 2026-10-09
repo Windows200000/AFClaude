@@ -32,6 +32,11 @@ Per run:
   - the AFClaude runs' fill-time rows (run_metrics.py, D-207): data/afclaude_runs.jsonl,
     recomputed until each run's row is final
 
+Every row also goes into the DB (dashboard phase 2c, telemetry.py: the dual-write; the files
+stay until they are retired): samples, the weekly series and the Haiku rows through the
+actions.py appenders, the weekly cycles and the user model (data/user_model.json, edited by
+the usage review) as records, synced after each run.
+
 Times in rows are UTC ISO plus Berlin-local convenience fields.
 """
 import argparse
@@ -50,6 +55,7 @@ import keepalive as ka  # noqa: E402  (usage cache parsing, scrubbed env)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
 import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ignore them)
+import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual-write)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -88,8 +94,13 @@ def dump(path, obj):
 
 
 def append(path, row):
+    """Append the row to its JSONL file and (the live files only) the same line to the DB."""
+    line = json.dumps(row, default=str)
     with open(path, "a") as fh:
-        fh.write(json.dumps(row, default=str) + "\n")
+        fh.write(line + "\n")
+    kind = telemetry.kind_for(path)
+    if kind is not None:
+        telemetry.record(kind, line, path, actor="runner:sampler")
 
 
 def local_fields(t):
@@ -336,6 +347,7 @@ def track_cycle(usage, t, tag):
                                                 "out": (r.stderr or r.stdout).strip()[-120:]})
         c["scheduled"] = ok
     dump(CYCLES, cycles)
+    telemetry.sync_file("usage.weekly_cycle", CYCLES, actor="runner:sampler")   # changed cycles -> DB
 
 
 # ------------------------------------------------------------------ haiku
@@ -665,6 +677,7 @@ def main():
     stale_alert(st, usage, t)
     if not args.no_haiku and args.tag == "cron":
         haiku_judgement(st, t)
+    telemetry.sync_file("usage.user_model", actor="runner:sampler")   # the review's edits -> DB (if changed)
     dump(STATE, st)
     print(f"{t.isoformat()} tag={args.tag} baseline={baseline} weekly={w.get('percent')} "
           f"session={(usage.get('session') or {}).get('percent')}")

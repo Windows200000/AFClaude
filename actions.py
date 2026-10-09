@@ -965,3 +965,221 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
         return Result(open_, open_["id"], open_, open_, changed=False)
     r = store.add_request(conn, ctx.actor, kind, target)
     return Result(r, r["id"], None, r)
+
+
+# ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)
+#
+# Append-only telemetry rows (usage samples, the weekly series, session windows, the forecast
+# log, Haiku judgements, usage reports, the watcher's run readings, the stage-ETA log) are
+# written through these registered appenders, not perform(): each row carries ts, actor, via
+# and recorded_at and is immutable by trigger (store.TELEMETRY_SCHEMA), so the row is its own
+# audit record and no audit_log row is written for it. The derived records that are recomputed
+# in place (a run's fill-time row until it is final, a weekly cycle, the user model) go through
+# put_record: an upsert carrying the same fields plus updated_at and a trigger-bumped version,
+# also without an audit row -- they are recomputable from the append-only rows (an
+# interpretation of §7.3 that gate 8a checks).
+#
+# Every row is the JSON line its producer writes to its file (the dual-write period: the
+# producers keep writing the files until they are retired, telemetry.py), stored as given, so
+# a reader gets byte-identical rows from either and the importer dedupes on its sha256.
+# Errors: ValueError (unknown kind, bad actor/via/account, not a JSON object, too big);
+# database errors take the DB error path's retry (store.retrying) and then raise a DBError
+# WITHOUT a fallback record: during the dual-write the file holds the row and
+# `python3 store.py import-telemetry` (idempotent) brings the DB up to date.
+
+TELEMETRY_LINE_MAX = 1024 * 1024
+
+
+def _ts_of(field: str) -> Callable[[Mapping[str, Any]], str]:
+    def get(row: Mapping[str, Any]) -> str:
+        return store.telemetry_ts(row.get(field))
+    return get
+
+
+def _flag_field(field: str) -> Callable[[Mapping[str, Any]], bool]:
+    def get(row: Mapping[str, Any]) -> bool:
+        return row.get(field) is True
+    return get
+
+
+def _never(row: Mapping[str, Any]) -> bool:
+    return False
+
+
+def _sample_stale(row: Mapping[str, Any]) -> bool:
+    """usage_stale.row_stale: the usage meters of this sampler row must not be used."""
+    import usage_stale
+    row_stale: Callable[[dict[str, Any]], object] = getattr(usage_stale, "row_stale")   # untyped module
+    return bool(row_stale(dict(row)))
+
+
+class Appender:
+    """A registered telemetry kind: its table, and how a row's ts, stale flag (append-only
+    kinds) or record key and final flag (record kinds) are derived from the row."""
+    def __init__(self, kind: str, table: str, ts: Callable[[Mapping[str, Any]], str],
+                 stale: Callable[[Mapping[str, Any]], bool] = _never,
+                 key: Callable[[Mapping[str, Any]], str] | None = None,
+                 final: Callable[[Mapping[str, Any]], bool] = _never) -> None:
+        self.kind, self.table, self.ts, self.stale, self.key, self.final = kind, table, ts, stale, key, final
+        self.record = key is not None
+        if table not in (store.TELEMETRY_DOCS if self.record else store.TELEMETRY_APPEND):
+            raise ValueError(f"{kind}: {table} is not a {'record' if self.record else 'append-only'} table")
+
+
+APPENDERS: dict[str, Appender] = {}
+
+
+def register_appender(a: Appender) -> Appender:
+    APPENDERS[a.kind] = a
+    return a
+
+
+def _field_key(field: str) -> Callable[[Mapping[str, Any]], str]:
+    def get(row: Mapping[str, Any]) -> str:
+        v = row.get(field)
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"the record has no {field}")
+        return v
+    return get
+
+
+def _model_key(row: Mapping[str, Any]) -> str:
+    return "model"
+
+
+def _fitted_ts(row: Mapping[str, Any]) -> str:
+    """The user model's time: when it was fitted (else its data end, else now)."""
+    for f in ("fitted_at", "user_data_to"):
+        if row.get(f):
+            return store.telemetry_ts(row.get(f))
+    return store.now_iso()
+
+
+for _a in (Appender("usage.sample", "usage_samples", _ts_of("at"), _sample_stale),
+           Appender("usage.series", "usage_weekly_series", _ts_of("at"), _flag_field("stale")),
+           Appender("usage.session_window", "usage_session_windows", _ts_of("window_end")),
+           Appender("usage.forecast", "forecast_log", _ts_of("at")),
+           Appender("usage.haiku", "haiku_judgements", _ts_of("at")),
+           Appender("usage.report", "usage_reports", _ts_of("at")),
+           Appender("usage.run_reading", "usage_run_readings", _ts_of("at"), _flag_field("stale")),
+           Appender("stage_eta.prediction", "stage_eta_log", _ts_of("at")),
+           Appender("usage.weekly_cycle", "weekly_cycles", _ts_of("reset_at"), key=_field_key("reset_at")),
+           Appender("usage.run", "usage_runs", _ts_of("start"), key=_field_key("run_id"),
+                    final=_flag_field("final")),
+           Appender("usage.user_model", "user_model", _fitted_ts, key=_model_key)):
+    register_appender(_a)
+
+
+def _appender(kind: object, record: bool) -> Appender:
+    a = APPENDERS.get(kind) if isinstance(kind, str) else None
+    if a is None:
+        raise ValueError(f"unknown telemetry kind {kind!r}")
+    if a.record != record:
+        raise ValueError(f"{a.kind} is {'a record' if a.record else 'an append-only'} kind: use "
+                         f"{'put_record' if a.record else 'append'}")
+    return a
+
+
+def _check_writer(actor: object, via: object, account_id: object) -> None:
+    if via not in VIAS:
+        raise ValueError(f"via must be one of {'|'.join(VIAS)}, got {via!r}")
+    if not isinstance(actor, str) or not ACTOR_RE.match(actor):
+        raise ValueError(f"bad actor {actor!r}")
+    if not isinstance(account_id, str) or not account_id:
+        raise ValueError(f"bad account_id {account_id!r}")
+
+
+def _parse_line(line: object) -> tuple[str, dict[str, Any]]:
+    """-> (the line without its trailing newline, the parsed object)."""
+    if not isinstance(line, str):
+        raise ValueError("a telemetry row is a JSON text line")
+    text = line.rstrip("\n")
+    if not text.strip() or "\n" in text:
+        raise ValueError("a telemetry row is one non-empty line")
+    if len(text) > TELEMETRY_LINE_MAX:
+        raise ValueError(f"a telemetry row is too big ({len(text)} > {TELEMETRY_LINE_MAX} characters)")
+    try:
+        row = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"a telemetry row is not JSON ({e})") from e
+    if not isinstance(row, dict):
+        raise ValueError("a telemetry row is a JSON object")
+    return text, row
+
+
+def _check_account(conn: sqlite3.Connection, account_id: str) -> None:
+    if conn.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone() is None:
+        raise ValueError(f"unknown account {account_id!r}")
+
+
+def append_many(conn: sqlite3.Connection, kind: str, lines: Iterable[object], *, actor: str, via: str,
+                account_id: str = store.DEFAULT_ACCOUNT) -> dict[str, int]:
+    """Append rows of an append-only kind in one transaction; rows already stored are skipped,
+    lines that aren't a JSON object are counted (never stored, never raised: the importer
+    reports them). -> {"inserted", "duplicate", "invalid"}."""
+    a = _appender(kind, record=False)
+    _check_writer(actor, via, account_id)
+    parsed: list[tuple[str, str, bool]] = []
+    invalid = 0
+    for line in lines:
+        try:
+            text, row = _parse_line(line)
+            parsed.append((text, a.ts(row), a.stale(row)))
+        except ValueError:
+            invalid += 1
+
+    def run() -> dict[str, int]:
+        with store.transaction(conn):
+            _check_account(conn, account_id)
+            n = sum(store.insert_telemetry(conn, a.table, text, ts, stale, actor, via, account_id)
+                    for text, ts, stale in parsed)
+        return {"inserted": n, "duplicate": len(parsed) - n, "invalid": invalid}
+    return store.retrying(run, conn)
+
+
+def append(conn: sqlite3.Connection, kind: str, line: object, *, actor: str, via: str,
+           account_id: str = store.DEFAULT_ACCOUNT) -> bool:
+    """Append one row (a JSON object line) of an append-only telemetry kind. -> stored (False:
+    the same row was stored before). A line that isn't a JSON object is a ValueError."""
+    _parse_line(line)
+    return append_many(conn, kind, [line], actor=actor, via=via, account_id=account_id)["inserted"] == 1
+
+
+def put_records(conn: sqlite3.Connection, kind: str, lines: Iterable[object], *, actor: str, via: str,
+                account_id: str = store.DEFAULT_ACCOUNT) -> dict[str, int]:
+    """Insert or update records of a record kind in one transaction (each line one record's
+    JSON object). -> {"inserted", "updated", "same", "invalid"}."""
+    a = _appender(kind, record=True)
+    _check_writer(actor, via, account_id)
+    keyfn = a.key
+    if keyfn is None:   # a record kind always has a key (Appender.record)
+        raise ValueError(f"{a.kind} has no record key")
+    parsed: list[tuple[str, str, str, bool]] = []
+    invalid = 0
+    for line in lines:
+        try:
+            text, row = _parse_line(line)
+            parsed.append((keyfn(row), text, a.ts(row), a.final(row)))
+        except ValueError:
+            invalid += 1
+
+    def run() -> dict[str, int]:
+        out = {"inserted": 0, "updated": 0, "same": 0, "invalid": invalid}
+        with store.transaction(conn):
+            _check_account(conn, account_id)
+            for key, text, ts, final in parsed:
+                out[store.put_telemetry_record(conn, a.table, key, text, ts, final, actor, via, account_id)] += 1
+        return out
+    return store.retrying(run, conn)
+
+
+def put_record(conn: sqlite3.Connection, kind: str, line: object, *, actor: str, via: str,
+               account_id: str = store.DEFAULT_ACCOUNT) -> str:
+    """Insert or update one record. -> 'inserted' | 'updated' | 'same'. A line that isn't a
+    JSON object, or a record without its key, is a ValueError."""
+    keyfn = _appender(kind, record=True).key
+    _, row = _parse_line(line)
+    if keyfn is not None:
+        keyfn(row)
+    r = put_records(conn, kind, [line], actor=actor, via=via, account_id=account_id)
+    return next(k for k in ("inserted", "updated", "same") if r[k])

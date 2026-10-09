@@ -42,7 +42,8 @@ point per pair). `ratio_windows` instead measures each completed 5-h window
 from its first to its last reading (rounding error of two readings only), see
 window_record() for baseline / weekly-reset split / saturation / partial
 rules; records are kept in the never-pruned data/session_windows.jsonl
-(appended by the sampler, rebuilt with --backfill-windows). `preferred_ratio`
+(appended by the sampler, rebuilt with --backfill-windows; both also write the DB
+table usage_session_windows, telemetry.py). `preferred_ratio`
 is that estimate once MIN_WINDOWS usable windows exist, else the old median
 (flagged). The old `ratio` fields are unchanged.
 
@@ -59,6 +60,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import usage_stale  # noqa: E402  (stale rows: their meters are ignored)
+import telemetry  # noqa: E402  (phase 2c: the live files' rows come from the DB once imported)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -122,22 +124,28 @@ def trimmed_mean(xs, frac=TRIM_FRAC):
 
 # ------------------------------------------------------------------ loading
 
-def load_samples(path=SAMPLES):
-    """Parsed rows from samples.jsonl, oldest first. Skips unreadable lines
-    (a row still being written by a concurrent cron run)."""
+def load_samples(path=SAMPLES, db=True):
+    """Parsed rows from samples.jsonl (or another JSONL file), oldest first. Skips unreadable
+    lines (a row still being written by a concurrent cron run). A live file's rows come from
+    the DB once imported (telemetry.lines); db=False reads the file itself (a writer checking
+    what its own file already holds)."""
     rows = []
     try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        if db:
+            src = telemetry.lines(path)
+        else:
+            with open(path) as fh:
+                src = list(fh)
     except OSError:
         return []
+    for line in src:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     return rows
 
 
@@ -416,8 +424,14 @@ def build_windows(rows, now=None, include_open=False):
     return out
 
 
-def load_windows(path=SESSION_WINDOWS):
-    return load_samples(path)
+def load_windows(path=SESSION_WINDOWS, db=True):
+    """The stored window records. Read from the DB (a live, imported file), one per window end:
+    the append-only table keeps every version a backfill wrote, the last one wins (as in the
+    rewritten file), sorted by window end like the file."""
+    rows = load_samples(path, db=db)
+    if not db or telemetry.kind_for(path) is None:
+        return rows
+    return merge_windows([r for r in rows if isinstance(r, dict)], [])
 
 
 def merge_windows(stored, derived):
@@ -436,7 +450,7 @@ def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
     """Append every completed window found in `rows` that the file doesn't
     have yet (called by the sampler on each run, so a window is recorded on
     the first run after it ends). Returns (all stored records, newly added)."""
-    stored = load_windows(path)
+    stored = load_windows(path, db=False)       # the writer's own file decides what is new
     have = {w.get("window_end") for w in stored}
     computed_at = (now or datetime.now(UTC)).isoformat()
     new = []
@@ -446,9 +460,11 @@ def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
         w = dict(w, source=source, computed_at=computed_at)
         new.append(w)
     if new:
+        lines = [json.dumps(w) for w in new]
         with open(path, "a") as fh:
-            for w in new:
-                fh.write(json.dumps(w) + "\n")
+            for line in lines:
+                fh.write(line + "\n")
+        telemetry.record("usage.session_window", lines, path, actor="runner:sampler")   # the live file only
     return stored + new, new
 
 
@@ -459,15 +475,18 @@ def backfill_windows(samples_path=SAMPLES, out_path=SESSION_WINDOWS, now=None):
     now_dt = now or datetime.now(UTC)
     derived = [dict(w, source="backfill", computed_at=now_dt.isoformat())
                for w in build_windows(load_samples(samples_path), now=now)]
-    stored = load_windows(out_path)
+    stored = load_windows(out_path, db=False)
     derived_keys = {w["window_end"] for w in derived}
     keep = [w for w in stored if w.get("window_end") not in derived_keys]
     allw = merge_windows(keep, derived)
     tmp = out_path + ".tmp"
+    lines = [json.dumps(w) for w in allw]
     with open(tmp, "w") as fh:
-        for w in allw:
-            fh.write(json.dumps(w) + "\n")
+        for line in lines:
+            fh.write(line + "\n")
     os.replace(tmp, out_path)
+    # the DB table is append-only: a recomputed window is a new row there (load_windows: the last wins)
+    telemetry.record("usage.session_window", lines, out_path, actor="cli", via="cli")
     return allw
 
 

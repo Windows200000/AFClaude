@@ -208,15 +208,20 @@ def _ts(s):
 
 
 def tail_rows(path=None, max_bytes=TAIL_BYTES):
+    """The rows of the end of samples.jsonl, oldest first: the live file's from the DB once
+    imported (phase 2c, telemetry.py: the same rows), else from the file."""
     path = path or SAMPLES_FILE
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(size - max_bytes, 0))
-        chunk = fh.read()
-    lines = chunk.split(b"\n")
-    if size > max_bytes:
-        lines = lines[1:]        # first line is cut
+    import telemetry
+    lines = telemetry.db_lines(path, max_bytes=max_bytes)
+    if lines is None:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(size - max_bytes, 0))
+            chunk = fh.read()
+        lines = chunk.split(b"\n")
+        if size > max_bytes:
+            lines = lines[1:]        # first line is cut
     rows = []
     for line in lines:
         try:

@@ -185,7 +185,7 @@ Hand-offs and compaction are **per tmux session** (one `driven_sessions` row). A
 |---|---|---|
 | work | `projects`, `tasks` (incl. `kind='question'`), `task_events`, `session_decisions`, `standing_rules` | built |
 | observation | `sessions`, `limit_hits`, `run_log`, `driven_sessions`, `action_requests` | built (runners write them from phase 3a) |
-| config | `settings`, `meta`, `installation` (id, epoch, restored_from), `accounts` | settings built; rest new |
+| config | `settings`, `meta`, `installation` (id, epoch, restored_from), `accounts` | settings, `accounts` (one row, 2c) built; rest new |
 | audit | `audit_log` (append-only), `idempotency_keys` | built |
 | prompts | `prompt_overrides` (system-wide, D-193) | built |
 | decisions | `decisions`, `decision_links`, `decisions_fts` | new (§7.6) |
@@ -194,7 +194,7 @@ Hand-offs and compaction are **per tmux session** (one `driven_sessions` row). A
 | messages | `chat_threads` (user, project, opened, last activity, closed), `chat_messages` (thread, author `user:<id>` or `task-manager:<session>`, text, ts, request id) | new (F14, D-178) |
 | docs | `docs` (whole documents: goals, exceptions, backlog), `doc_entries` (append logs: progress, alerts, reviews, drift) — per project | new |
 | auth | `users` (`kind` = `person` / `machine`), `grants`, `identities` (OIDC iss+sub), `credentials` (password, TOTP, WebAuthn), `recovery_codes`, `auth_sessions`, `remembered_devices`, `mds_cache`, `machine_tokens` (machine user, token hash, label, hostname at registration, last seen at / hostname / transport, created, revoked at), `machine_registrations` (one-time registration codes: hash, created by, expires, used at) | new (§9, §9.7) |
-| telemetry | `usage_samples`, `usage_weekly_series`, `usage_session_windows`, `forecast_log`, `haiku_judgements`, `weekly_cycles`, `usage_reports`, `user_model`, `usage_reviews` | new (replace the JSONL/JSON files) |
+| telemetry | `usage_samples`, `usage_weekly_series`, `usage_session_windows`, `forecast_log`, `haiku_judgements`, `weekly_cycles`, `usage_reports`, `user_model`, `usage_reviews`; also `usage_runs`, `usage_run_readings`, `stage_eta_log` | built in 2c except `usage_reviews` (dual-write with the files; `telemetry.py`) |
 | runner | `runner_state` (component, key, JSON), `scheduled_jobs` (the pre/post-reset samples), `status_snapshot`, `host_checks` (latest result per check, §10.5), `app_log` (retention setting) | new (replace the state files and logs) |
 | backup | `backups` (metadata of made bundles and exports, with their manifests) | new |
 
@@ -560,7 +560,7 @@ Each phase is one subagent in a worktree with a clear definition of done (tests 
 2. **Backend foundation**
    - **2a Settings in the DB (D-146):** every tunable into `SETTINGS` (afclaude.json, dispatcher.json), one-time import, runners and pacing read the DB, schema guard (A1), the DB error path and escalation (§7.8, D-171). **Type-checking gate (D-209):** `mypy --strict` for `actions.py`, `store.py` and the MCP server first, enforced in the tests and the pre-commit hook (pinned mypy, the strict module list in one config file); each later phase adds the security-relevant modules it creates or touches (5a auth, sessions, roles; 5b `docker/host_exec.py` and the remote MCP transport; 5c/5d backup, export, restore; 6a the API layer), so the full list of §4 is strict by 8a.
    - **2b `schedule.py` (D-148):** the only window code, pacing included; DST tests; `window_tz` plumbing.
-   - **2c Telemetry into the DB (D-161):** usage tables + importers; sampler, `limit_ratio`, `pacing`, `usage_review`, `usage_report` read/write the DB; `account_id`.
+   - **2c Telemetry into the DB (D-161):** usage tables + importers; sampler, `limit_ratio`, `pacing`, `usage_review`, `usage_report` read/write the DB; `account_id`. *Built (first step):* the tables (append-only rows immutable by trigger, written through registered `actions.py` appenders, each row the file's line with ts/actor/via/`account_id`/`stale`; derived records with a version), `python3 store.py import-telemetry` (idempotent, checks every row arrived, marks the kind imported, never touches a file), dual-write in every producer, and the readers on the DB once a kind is imported (the files as fallback). Left: retiring the files (the DB as the only copy, the appenders on the full §7.8 fallback path), the writers' own read-before-write checks and the weekly-cycle/user-model reads on the DB, `usage_reviews` (with 2d's review docs), a samples retention setting.
    - **2d Runner state + docs into the DB (D-161, D-181):** state files, own sessions, scheduled jobs, logs → DB; `docs`/`doc_entries`, with the AFClaude build-log export (§7.7) as the only file output.
 3. **Runners**
    - **3a Resident runner (§5.1):** daemon with the job table, stall-scan tick, status snapshot, wake socket, all runner writes via `actions.py` (D-154), `run_log`/`driven_sessions` filled.
