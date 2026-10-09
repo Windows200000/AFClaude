@@ -239,8 +239,8 @@ def fire_times(paths=None):
     out = []
     for p in (FIRE_STATE_FILES if paths is None else paths):
         try:
-            with open(p) as fh:
-                st = json.load(fh)
+            import runner_state
+            st = runner_state.read_json(p)   # the DB when it holds the live file's state
         except (OSError, ValueError):
             continue
         if not isinstance(st, dict):

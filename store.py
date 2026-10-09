@@ -32,7 +32,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Later tables (SCHEMA/TELEMETRY_SCHEMA, no version bump: purely additive, so
                a running older checkout keeps writing): accounts (one 'default' row, D-156)
                and the telemetry tables of dashboard phase 2c (D-161; telemetry.py, the
-               actions.py appenders, `python3 store.py import-telemetry`).
+               actions.py appenders, `python3 store.py import-telemetry`), and the
+               runner state of phase 2d (RUNNER_SCHEMA: runner_state, scheduled_jobs,
+               app_log; runner_state.py, `python3 store.py import-state`).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -369,6 +371,74 @@ BEGIN SELECT RAISE(ABORT, '{t} rows are never deleted'); END;
 TELEMETRY_SCHEMA = ("".join(_APPEND_DDL.format(t=t) for t in TELEMETRY_APPEND)
                     + "".join(_DOC_DDL.format(t=t) for t in TELEMETRY_DOCS))
 
+# ---- runner state (dashboard phase 2d, D-161, §7.2): the runners' state files, the at-shim's
+# spooled jobs and the log files in the DB (runner_state.py maps the files; actions.py writes).
+# runner_state: one row per top-level key of a state file, or per entry of a "split" part (a
+# map the runners update entry by entry, e.g. keepalive_state.json's handled dedup keys), so
+# concurrent writers merge per entry in one transaction instead of overwriting each other.
+# `path` is the JSON array of keys ([top] or [part, entry]), `payload` the value's JSON. Rows
+# are deleted only where the runner deletes the entry from its state (actions.state_save).
+# scheduled_jobs: the at-shim jobs (data/at_spool/*.json); a started job is marked, not deleted.
+# app_log: the log lines, append-only (immutable by trigger, ts/actor/via on each row).
+RUNNER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runner_state (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL DEFAULT 'default' REFERENCES accounts(id),
+    component  TEXT NOT NULL,            -- keepalive | keepalive.deferred | dispatcher | sampler | ...
+    path       TEXT NOT NULL,            -- JSON array: [top-level key] | [split part, entry key]
+    payload    TEXT NOT NULL,            -- the value's JSON
+    actor      TEXT NOT NULL,
+    via        TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account_id, component, path)
+);
+CREATE INDEX IF NOT EXISTS runner_state_component ON runner_state(account_id, component, id);
+CREATE TRIGGER IF NOT EXISTS runner_state_version AFTER UPDATE ON runner_state FOR EACH ROW
+WHEN NEW.version IS OLD.version
+BEGIN UPDATE runner_state SET version = OLD.version + 1 WHERE id = NEW.id; END;
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id         TEXT PRIMARY KEY,         -- the at-shim job id
+    run_at     TEXT NOT NULL,            -- normalised UTC
+    cmd        TEXT NOT NULL,
+    cwd        TEXT,
+    status     TEXT NOT NULL DEFAULT 'pending',   -- pending | started
+    payload    TEXT NOT NULL,            -- the spool file's JSON
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    actor      TEXT NOT NULL,
+    via        TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS scheduled_jobs_due ON scheduled_jobs(status, run_at);
+CREATE TRIGGER IF NOT EXISTS scheduled_jobs_version AFTER UPDATE ON scheduled_jobs FOR EACH ROW
+WHEN NEW.version IS OLD.version
+BEGIN UPDATE scheduled_jobs SET version = OLD.version + 1 WHERE id = NEW.id; END;
+CREATE TRIGGER IF NOT EXISTS scheduled_jobs_no_delete BEFORE DELETE ON scheduled_jobs
+BEGIN SELECT RAISE(ABORT, 'scheduled_jobs rows are marked started, not deleted'); END;
+
+CREATE TABLE IF NOT EXISTS app_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,           -- the line's own time (normalised UTC), else the previous line's
+    component   TEXT NOT NULL,           -- keepalive | dispatcher | sampler | watchdog | host_exec | at_shim
+    level       TEXT NOT NULL,           -- info | warn | error
+    line        TEXT NOT NULL,           -- the log line as written to the file
+    line_hash   TEXT NOT NULL,           -- sha256 of line (the importer counts copies by it)
+    actor       TEXT NOT NULL,
+    via         TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS app_log_ts ON app_log(component, ts, id);
+CREATE INDEX IF NOT EXISTS app_log_hash ON app_log(component, line_hash);
+CREATE TRIGGER IF NOT EXISTS app_log_no_update BEFORE UPDATE ON app_log
+BEGIN SELECT RAISE(ABORT, 'app_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS app_log_no_delete BEFORE DELETE ON app_log
+BEGIN SELECT RAISE(ABORT, 'app_log is append-only'); END;
+"""
+RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log")
+
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
 # read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
@@ -479,6 +549,7 @@ def init(conn: sqlite3.Connection) -> None:
     before = _stored_version(conn)
     conn.executescript(SCHEMA)
     conn.executescript(TELEMETRY_SCHEMA)
+    conn.executescript(RUNNER_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
                      (DEFAULT_ACCOUNT, "this installation's Claude account", now_iso()))
@@ -1855,6 +1926,104 @@ def telemetry_counts(conn: sqlite3.Connection, account_id: str | None = None) ->
     return out
 
 
+# ---------------------------------------------------------------- runner state (phase 2d, D-161)
+#
+# Written only through actions.state_save / app_log_append / app_log_sync / job_put / job_started /
+# own_session_add (§7.3); these are their storage helpers and the readers. runner_state.py maps
+# the files.
+
+def state_rows(conn: sqlite3.Connection, component: str, account_id: str = DEFAULT_ACCOUNT) -> dict[str, str]:
+    """path -> payload of a component's rows, in insertion order."""
+    rows = conn.execute("SELECT path, payload FROM runner_state WHERE account_id=? AND component=? ORDER BY id",
+                        (account_id, component))
+    return {str(r[0]): str(r[1]) for r in rows}
+
+
+def state_set(conn: sqlite3.Connection, component: str, path: str, payload: str, actor: str, via: str,
+              account_id: str = DEFAULT_ACCOUNT) -> str:
+    """Insert or update one row. -> 'inserted' | 'updated' | 'same'."""
+    old = conn.execute("SELECT payload FROM runner_state WHERE account_id=? AND component=? AND path=?",
+                       (account_id, component, path)).fetchone()
+    if old is None:
+        conn.execute("INSERT INTO runner_state(account_id, component, path, payload, actor, via, updated_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (account_id, component, path, payload, actor, via, now_iso()))
+        return "inserted"
+    if str(old[0]) == payload:
+        return "same"
+    conn.execute("UPDATE runner_state SET payload=?, actor=?, via=?, updated_at=? "
+                 "WHERE account_id=? AND component=? AND path=?",
+                 (payload, actor, via, now_iso(), account_id, component, path))
+    return "updated"
+
+
+def state_delete(conn: sqlite3.Connection, component: str, path: str, account_id: str = DEFAULT_ACCOUNT) -> bool:
+    cur = conn.execute("DELETE FROM runner_state WHERE account_id=? AND component=? AND path=?",
+                       (account_id, component, path))
+    return cur.rowcount > 0
+
+
+def runner_counts(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """Rows per runner_state component, per scheduled-job status and per app_log component."""
+    def grouped(sql: str) -> dict[str, int]:
+        return {str(r[0]): int(r[1]) for r in conn.execute(sql)}
+    return {"runner_state": grouped("SELECT component, COUNT(*) FROM runner_state GROUP BY component"),
+            "scheduled_jobs": grouped("SELECT status, COUNT(*) FROM scheduled_jobs GROUP BY status"),
+            "app_log": grouped("SELECT component, COUNT(*) FROM app_log GROUP BY component")}
+
+
+def insert_app_log(conn: sqlite3.Connection, ts: str, component: str, level: str, line: str, actor: str,
+                   via: str) -> None:
+    conn.execute("INSERT INTO app_log(ts, component, level, line, line_hash, actor, via, recorded_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (ts, component, level, line, hashlib.sha256(line.encode("utf-8")).hexdigest(), actor, via,
+                  now_iso()))
+
+
+def app_log_hash_counts(conn: sqlite3.Connection, component: str) -> dict[str, int]:
+    """line_hash -> how many copies of that line the component's log holds."""
+    rows = conn.execute("SELECT line_hash, COUNT(*) FROM app_log WHERE component=? GROUP BY line_hash", (component,))
+    return {str(r[0]): int(r[1]) for r in rows}
+
+
+def app_log_tail(conn: sqlite3.Connection, component: str, limit: int = 100) -> list[str]:
+    """The component's last `limit` lines, oldest first."""
+    rows = conn.execute("SELECT line FROM (SELECT line, ts, id FROM app_log WHERE component=? "
+                        "ORDER BY ts DESC, id DESC LIMIT ?) ORDER BY ts, id", (component, int(limit)))
+    return [str(r[0]) for r in rows]
+
+
+def get_job(conn: sqlite3.Connection, job_id: str) -> Row | None:
+    r = conn.execute("SELECT * FROM scheduled_jobs WHERE id=?", (job_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def put_job(conn: sqlite3.Connection, job_id: str, run_at: str, cmd: str, cwd: str | None, payload: str,
+            actor: str, via: str) -> str:
+    """Insert a spooled job or update its fields. -> 'inserted' | 'updated' | 'same'."""
+    old = get_job(conn, job_id)
+    if old is None:
+        conn.execute("INSERT INTO scheduled_jobs(id, run_at, cmd, cwd, payload, created_at, actor, via, updated_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (job_id, run_at, cmd, cwd, payload, now_iso(), actor, via, now_iso()))
+        return "inserted"
+    if (old["run_at"], old["cmd"], old["cwd"], old["payload"]) == (run_at, cmd, cwd, payload):
+        return "same"
+    conn.execute("UPDATE scheduled_jobs SET run_at=?, cmd=?, cwd=?, payload=?, actor=?, via=?, updated_at=? "
+                 "WHERE id=?", (run_at, cmd, cwd, payload, actor, via, now_iso(), job_id))
+    return "updated"
+
+
+def mark_job_started(conn: sqlite3.Connection, job_id: str, actor: str, via: str, at: str | None = None) -> bool:
+    cur = conn.execute("UPDATE scheduled_jobs SET status='started', started_at=?, actor=?, via=?, updated_at=? "
+                       "WHERE id=? AND status='pending'", (at or now_iso(), actor, via, now_iso(), job_id))
+    return cur.rowcount > 0
+
+
+def list_jobs(conn: sqlite3.Connection, status: str | None = None) -> list[Row]:
+    sql = "SELECT * FROM scheduled_jobs" + (" WHERE status=?" if status else "") + " ORDER BY run_at, id"
+    return [dict(r) for r in conn.execute(sql, (status,) if status else ())]
+
+
 # ---------------------------------------------------------------- the DB error path (§7.8, D-171)
 #
 # Every DB access goes through one error path: retrying() (connect() and actions.perform use
@@ -2326,7 +2495,18 @@ def main(argv: list[str] | None = None) -> int:
                                                  "(idempotent, the files are not changed; telemetry.py)")
     t.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     t.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
+    rs = sub.add_parser("import-state", help="import the runner state files, scheduled jobs, own sessions and "
+                                             "logs into the DB (idempotent, the files are not changed; "
+                                             "runner_state.py)")
+    rs.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    rs.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
     args = ap.parse_args(argv)
+    if args.cmd == "import-state":
+        import importlib
+        runner_state = importlib.import_module("runner_state")
+        argv3 = ["import"] + (["--db", args.db] if args.db else []) + \
+            (["--data-dir", args.data_dir] if args.data_dir else [])
+        return int(runner_state.main(argv3))
     if args.cmd == "import-telemetry":
         import importlib
         telemetry = importlib.import_module("telemetry")

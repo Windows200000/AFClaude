@@ -551,9 +551,9 @@ def fillup_block(now):
 
 def usage_review():
     try:
-        with open(os.path.join(HERE, "data", "usage_review_state.json")) as fh:
-            st = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+        import runner_state
+        st = runner_state.read_json(os.path.join(HERE, "data", "usage_review_state.json"))
+    except (OSError, ValueError):
         return None
     nxt = ka.parse_ts(st.get("next_run_at"))
     runs = st.get("runs") or []

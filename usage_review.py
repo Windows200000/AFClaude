@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402
+import runner_state  # noqa: E402  (phase 2d: the state also in the DB)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
@@ -40,6 +41,9 @@ MODEL, EFFORT = "claude-opus-5-5", "medium"
 
 
 def load():
+    got = runner_state.db_load("usage_review", STATE)
+    if got is not None:
+        return got
     try:
         with open(STATE) as fh:
             return json.load(fh)
@@ -51,6 +55,7 @@ def save(st):
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     with open(STATE, "w") as fh:
         json.dump(st, fh, indent=1)
+    runner_state.save("usage_review", st, STATE)
 
 
 def next_run_after(now):

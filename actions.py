@@ -1183,3 +1183,269 @@ def put_record(conn: sqlite3.Connection, kind: str, line: object, *, actor: str,
         keyfn(row)
     r = put_records(conn, kind, [line], actor=actor, via=via, account_id=account_id)
     return next(k for k in ("inserted", "updated", "same") if r[k])
+
+
+# ---------------------------------------------------------------- runner state (§7.2/§7.3, phase 2d, D-161)
+#
+# The runners' state files (runner_state.py maps them) are written through state_save: one
+# transaction per save, one audit_log row naming the changed paths (actor runner:<component>;
+# not the values: the sampler's offsets change every 15 min, and the rows carry actor, via,
+# updated_at and a trigger-bumped version). A state is stored as one row per top-level key, or
+# per entry of its "split" parts (the maps updated entry by entry), so two writers that loaded
+# the state, changed different entries and saved one after the other both keep their changes:
+# with the `base` the writer loaded (merge), only the paths it changed or removed since are
+# written; without one (the writer read the file or built a new state) its top-level values
+# replace the DB's but split-part entries are only upserted ('file' mode, see state_save). A
+# path is deleted only where the runner removed it from its state (or the importer replaces the
+# DB copy with the file), and only in a component whose file semantics delete (StateComponent.deletes).
+# The log lines go to app_log (append-only, rows immutable by trigger), the at-shim's jobs to
+# scheduled_jobs (audited), own_sessions.txt to driven_sessions (kind 'own', audited).
+
+class StateComponent:
+    """A runner state file: its actor, the parts stored entry by entry, and whether the runner
+    deletes from it (consumed deferrals, pruned dedup keys, a popped test entry)."""
+    def __init__(self, name: str, actor: str, split: tuple[str, ...] = (), deletes: bool = True) -> None:
+        if not ACTOR_RE.match(actor):
+            raise ValueError(f"bad actor {actor!r}")
+        self.name, self.actor, self.split, self.deletes = name, actor, split, deletes
+
+
+STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
+    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits")),
+    StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
+    StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
+    StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),
+    StateComponent("keepalive.handoff", "runner:keepalive"),
+    StateComponent("dispatcher", "runner:dispatcher", ("sessions", "handled", "starts", "alerted", "rc_held")),
+    StateComponent("sampler", "runner:sampler", ("offsets", "sessions")),
+    StateComponent("usage_review", "runner:usage_review", deletes=False),
+)}
+LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim")
+LOG_LEVELS = ("info", "warn", "error")
+STATE_MARK = "state_file:"          # meta: the state file as the last DB save saw it (mtime_ns:size)
+STATE_AUDIT_PATHS = 20              # changed paths named in a save's audit row
+
+
+def state_component(name: object) -> StateComponent:
+    c = STATE_COMPONENTS.get(name) if isinstance(name, str) else None
+    if c is None:
+        raise ValueError(f"unknown runner state component {name!r}")
+    return c
+
+
+def _state_json(value: object) -> str:
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def state_flatten(component: str, doc: object) -> dict[str, str]:
+    """A state (a JSON object) -> {path: payload}: path = JSON [key] or [split part, entry]."""
+    c = state_component(component)
+    if not isinstance(doc, Mapping):
+        raise ValueError(f"{component}: a state is a JSON object")
+    out: dict[str, str] = {}
+    for k, v in doc.items():
+        if not isinstance(k, str):
+            raise ValueError(f"{component}: state keys are text, got {k!r}")
+        if k in c.split and isinstance(v, Mapping):
+            for e, ev in v.items():
+                out[_state_json([k, str(e)])] = _state_json(ev)
+        else:
+            out[_state_json([k])] = _state_json(v)
+    return out
+
+
+def state_unflatten(component: str, rows: Mapping[str, str]) -> dict[str, Any]:
+    """{path: payload} (in row order) -> the state; the split parts are always there ({})."""
+    c = state_component(component)
+    doc: dict[str, Any] = {p: {} for p in c.split}
+    for path, payload in rows.items():
+        keys = json.loads(path)
+        value = json.loads(payload)
+        if len(keys) == 1:
+            doc[keys[0]] = value
+        else:
+            part = doc.get(keys[0])
+            if not isinstance(part, dict):
+                part = doc[keys[0]] = {}
+            part[keys[1]] = value
+    return doc
+
+
+STATE_MODES = ("merge", "file", "replace")
+STATE_MARKS_KEPT = 8                # recent file marks of DB saves (a writer's commit can land after the next one's)
+
+
+def state_save(conn: sqlite3.Connection, component: str, doc: object, *, base: Optional[Mapping[str, str]] = None,
+               mode: str = "merge", actor: str, via: str, account_id: str = store.DEFAULT_ACCOUNT,
+               file_mark: Optional[str] = None) -> dict[str, int]:
+    """Save a runner state in one transaction. mode:
+      merge   (a state loaded from the DB, `base` = the rows it was loaded from): write only the
+              paths this writer changed or removed since; other writers' changes stay;
+      file    (a state read from the file or built anew): the top-level values become the
+              given ones (removed ones deleted), the entries of the split parts are upserted
+              but never deleted (other writers' entries stay; a pruned entry goes with the next
+              merge save of a writer that removes it);
+      replace (the importer): the DB copy becomes exactly the given state.
+    file_mark: the state file's mark right after the runner wrote it (kept with the last few:
+    the readers use the DB copy only while the file carries one of them). A path removed in a
+    component that never deletes is a ValueError (nothing written).
+    -> {"inserted", "updated", "same", "deleted"}."""
+    c = state_component(component)
+    _check_writer(actor, via, account_id)
+    if mode not in STATE_MODES or (mode == "merge") != (base is not None):
+        raise ValueError(f"bad state save mode {mode!r} (merge needs the base, the others none)")
+    rows = state_flatten(component, doc)
+
+    def run() -> dict[str, int]:
+        out = {"inserted": 0, "updated": 0, "same": 0, "deleted": 0}
+        changed: list[str] = []
+        with store.transaction(conn):
+            _check_account(conn, account_id)
+            current = store.state_rows(conn, component, account_id)
+            if base is not None:
+                todo = {p: v for p, v in rows.items() if base.get(p) != v}
+                gone = [p for p in base if p not in rows and p in current]
+            else:
+                todo = {p: v for p, v in rows.items() if current.get(p) != v}
+                gone = [p for p in current if p not in rows and (mode == "replace" or len(json.loads(p)) == 1)]
+            if gone and not c.deletes:
+                raise ValueError(f"{component}: its runner never deletes, but {len(gone)} path(s) are gone "
+                                 f"({', '.join(gone[:3])})")
+            for p, v in todo.items():
+                r = store.state_set(conn, component, p, v, actor, via, account_id)
+                out[r] += 1
+                if r != "same":
+                    changed.append(p)
+            for p in gone:
+                if store.state_delete(conn, component, p, account_id):
+                    out["deleted"] += 1
+                    changed.append(p)
+            out["same"] += len(rows) - len(todo)
+            if changed:
+                store.add_audit(conn, actor, via, "runner_state.save", "runner_state", component, None,
+                                {"set": out["inserted"] + out["updated"], "deleted": out["deleted"],
+                                 "paths": changed[:STATE_AUDIT_PATHS]})
+            if file_mark is not None:
+                marks = [] if mode == "replace" else state_marks(conn, component)
+                store.set_meta(conn, STATE_MARK + component,
+                               json.dumps(([file_mark] + [m for m in marks if m != file_mark])[:STATE_MARKS_KEPT]))
+        return out
+    return store.retrying(run, conn)
+
+
+def state_marks(conn: sqlite3.Connection, component: str) -> list[str]:
+    """The file marks of the component's last DB saves, newest first."""
+    raw = store.get_meta(conn, STATE_MARK + component)
+    try:
+        marks = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    return [str(m) for m in marks] if isinstance(marks, list) else []
+
+
+def _log_line(component: object, ts: object, level: object, line: object) -> tuple[str, str, str]:
+    if component not in LOG_COMPONENTS:
+        raise ValueError(f"unknown log component {component!r}")
+    if level not in LOG_LEVELS:
+        raise ValueError(f"bad log level {level!r}")
+    if not isinstance(line, str) or "\n" in line or len(line) > TELEMETRY_LINE_MAX:
+        raise ValueError("a log row is one line of text")
+    return store.telemetry_ts(ts) or store.now_iso(), str(level), line
+
+
+def app_log_append(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,
+                   actor: str, via: str) -> int:
+    """Append log lines (ts, level, line) of one component in one transaction. -> rows added."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    rows = [_log_line(component, ts, level, line) for ts, level, line in entries]
+
+    def run() -> int:
+        with store.transaction(conn):
+            for ts, level, line in rows:
+                store.insert_app_log(conn, ts, component, level, line, actor, via)
+        return len(rows)
+    return store.retrying(run, conn) if rows else 0
+
+
+def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,
+                 actor: str, via: str) -> dict[str, int]:
+    """The importer's append: a log file's lines (in file order) whose copies the DB doesn't
+    hold yet. A line that occurs n times in the file and m < n times in the DB gets its last
+    n - m copies added, so running it again adds nothing and a line the dual-write stored is
+    not stored twice. -> {"inserted", "present"}."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    rows = [_log_line(component, ts, level, line) for ts, level, line in entries]
+
+    def run() -> dict[str, int]:
+        n = 0
+        with store.transaction(conn):
+            have = store.app_log_hash_counts(conn, component)
+            seen: dict[str, int] = {}
+            for ts, level, line in rows:
+                h = hashlib.sha256(line.encode("utf-8")).hexdigest()
+                seen[h] = seen.get(h, 0) + 1
+                if seen[h] > have.get(h, 0):
+                    store.insert_app_log(conn, ts, component, level, line, actor, via)
+                    n += 1
+        return {"inserted": n, "present": len(rows) - n}
+    return store.retrying(run, conn)
+
+
+def job_put(conn: sqlite3.Connection, job: object, *, actor: str, via: str) -> str:
+    """Store an at-shim job (its spool file's object: id, at, cmd, cwd). Audited.
+    -> 'inserted' | 'updated' | 'same'."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if not isinstance(job, Mapping):
+        raise ValueError("a job is a JSON object")
+    jid, at, cmd, cwd = job.get("id"), job.get("at"), job.get("cmd"), job.get("cwd")
+    if not isinstance(jid, str) or not re.match(r"^[A-Za-z0-9_-]{1,64}$", jid):
+        raise ValueError(f"bad job id {jid!r}")
+    if not isinstance(cmd, str) or not cmd or not isinstance(at, str):
+        raise ValueError(f"job {jid}: needs at and cmd")
+    job_id, run_at, command = jid, store.telemetry_ts(at), cmd
+    workdir = cwd if isinstance(cwd, str) else None
+    payload = _state_json(dict(job))
+
+    def run() -> str:
+        with store.transaction(conn):
+            before = store.get_job(conn, job_id)
+            r = store.put_job(conn, job_id, run_at, command, workdir, payload, actor, via)
+            if r != "same":
+                store.add_audit(conn, actor, via, "job.put", "scheduled_job", job_id,
+                                None if before is None else {"run_at": before["run_at"], "cmd": before["cmd"]},
+                                {"run_at": run_at, "cmd": command})
+        return r
+    return store.retrying(run, conn)
+
+
+def job_started(conn: sqlite3.Connection, job_id: str, *, actor: str, via: str, at: Optional[str] = None) -> bool:
+    """Mark a pending job started (the at-shim claimed and ran it). Audited. -> changed."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+
+    def run() -> bool:
+        with store.transaction(conn):
+            ok = store.mark_job_started(conn, job_id, actor, via, store.telemetry_ts(at) if at else None)
+            if ok:
+                store.add_audit(conn, actor, via, "job.started", "scheduled_job", job_id,
+                                {"status": "pending"}, {"status": "started"})
+        return ok
+    return store.retrying(run, conn)
+
+
+def own_session_add(conn: sqlite3.Connection, session_id: object, *, actor: str, via: str,
+                    started_at: Optional[str] = None) -> bool:
+    """A session id of data/own_sessions.txt into driven_sessions (kind 'own'), if it isn't
+    there yet. Audited. -> added."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if not isinstance(session_id, str) or not re.match(r"^[A-Za-z0-9-]{8,64}$", session_id):
+        raise ValueError(f"bad session id {session_id!r}")
+    sid = session_id
+
+    def run() -> bool:
+        with store.transaction(conn):
+            if store.get_driven_session(conn, sid) is not None:
+                return False
+            row = store.upsert_driven_session(conn, sid, kind="own", started_at=started_at or store.now_iso())
+            store.add_audit(conn, actor, via, "driven_session.add", "driven_session", sid, None, row)
+        return True
+    return store.retrying(run, conn)

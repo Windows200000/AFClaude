@@ -47,7 +47,19 @@ def spool(when, cmd):
         json.dump({"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd,
                    "cwd": os.getcwd()}, fh)
     os.replace(path + ".tmp", path)
+    _db("job_spooled", {"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd, "cwd": os.getcwd()})
     return jid
+
+
+def _db(fn, job):
+    """Dual-write (dashboard phase 2d): the job into the DB's scheduled_jobs too, only for the
+    live spool (runner_state.py). The spool file stays the job; this never fails the shim."""
+    try:
+        sys.path.insert(0, os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude"))
+        import runner_state
+        getattr(runner_state, fn)(job, SPOOL)
+    except Exception:   # noqa: BLE001
+        pass
 
 
 def jobs():
@@ -72,6 +84,7 @@ def run_due():
         except FileNotFoundError:
             continue
         print(f"{now.isoformat()} at-shim: running job {job['id']} (due {job['at']})", flush=True)
+        _db("job_claimed", job)
         cwd = job.get("cwd") if os.path.isdir(job.get("cwd") or "") else "/"
         subprocess.Popen(["/bin/sh", "-c", job["cmd"]], cwd=cwd, start_new_session=True,
                          stdin=subprocess.DEVNULL)
