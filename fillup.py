@@ -19,9 +19,12 @@ D-202 says runs begin only at session-window starts: the fill-up is the owner's 
 exception (D-212); it continues a run's own session window, it never opens a new one.
 
 Not when: fillup_enabled is false; automation_paused; the run reached the session limit (D-204);
-the reset is outside the night window and not in the last stretch; a session-window start before
-the reset continues this window anyway; the weekly cost exceeds what is left of the run's budget;
-the owner is active (D-018: wait for idle, but never past the reset); too close to the reset.
+the reset is outside the night window and not in the last stretch; a session-window start falls
+strictly before the reset by more than the fill-up duration (that start would itself use this
+same session window, so a separate fill-up is unneeded) -- a start at or after the reset opens a
+NEW session window and does not excuse the fill-up (D-219); the weekly cost exceeds what is left
+of the run's budget; the owner is active (D-018: wait for idle, but never past the reset); too
+close to the reset.
 
 decide() is pure; keepalive.fillup_pass() gathers its inputs and fires through handle_fire.
 """
@@ -167,7 +170,12 @@ def decide(*, now: datetime, session_pct: Optional[float], session_reset: Option
     if out["remaining"] < MIN_REMAINING:
         return res("skip", f"only {out['remaining']:.0f}% left in this session window")
     if next_start is not None and next_start < session_reset:
-        return res("skip", f"the session-window start at {next_start.isoformat()} continues this window anyway")
+        duration = timedelta(minutes=out["time_min"])
+        if session_reset - next_start > duration:
+            # that start happens early enough in THIS window that it would use up the
+            # remaining % itself; a start at/after the reset opens a new window instead
+            # and never excuses the fill-up (D-219).
+            return res("skip", f"the session-window start at {next_start.isoformat()} continues this window anyway")
     budget = run_budget(run[1])
     w0 = _weekly_at_fire(run[1])
     spent = (weekly_pct - w0) if budget is not None and weekly_pct is not None and w0 is not None else 0.0

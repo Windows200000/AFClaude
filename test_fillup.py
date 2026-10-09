@@ -84,10 +84,33 @@ class Decide(unittest.TestCase):
         for want, kw in cases.items():
             self.assertEqual(decide(**kw)["status"], want, kw)
         for kw in (dict(limit_hit=True), dict(session_pct=100.0), dict(in_night=False),
-                   dict(session_pct=99.5), dict(next_start=RESET - timedelta(minutes=1)),
+                   dict(session_pct=99.5), dict(next_start=RESET - timedelta(hours=2)),
                    dict(weekly_pct=55.0), dict(now=RESET - timedelta(seconds=30))):
             self.assertEqual(decide(**kw)["status"], "skip", kw)
         self.assertEqual(decide(in_night=False, in_last_stretch=True)["status"], "fire")
+
+    def test_next_start_skip_rule(self):
+        # base: remaining 5%, rate 60 %/h -> fill-up duration (unscaled) 5 min.
+        # a start strictly inside the window, well over 5 min before the reset: it would use
+        # up the window's own remaining % itself, so the fill-up is skipped.
+        self.assertEqual(decide(next_start=RESET - timedelta(hours=2))["status"], "skip")
+        # D-219: a start too close to the reset to fill up the window itself (less than the
+        # fill-up duration before it) does NOT excuse the fill-up.
+        self.assertEqual(decide(next_start=RESET - timedelta(minutes=1))["status"], "fire")
+        # a start that coincides with the reset opens a NEW session window, not a continuation
+        # of this one -- the fill-up of THIS window still applies (the 23:00 run / 04:00 reset
+        # case from D-219: "the 04:00 start" must not cancel the fill-up planned before 04:00).
+        self.assertEqual(decide(next_start=RESET)["status"], "fire")
+        # a start after the reset is even more clearly a new window.
+        self.assertEqual(decide(next_start=RESET + timedelta(minutes=30))["status"], "fire")
+
+    def test_fires_when_run_stopped_early_below_session_stop_pct(self):
+        # the task-manager can go idle and stop well short of session_stop_pct (D-014's 95%
+        # default); the fill-up must still cover whatever % is actually left, not just the
+        # last few points of a run that stopped exactly at session_stop_pct.
+        d = decide(now=RESET - timedelta(minutes=10), session_pct=66.0, weekly_pct=41.0)
+        self.assertEqual(d["status"], "fire", d)
+        self.assertAlmostEqual(d["remaining"], 34.0)
 
     def test_budget_fallback_when_unknown(self):
         h = {"window-start-x": {"at": FIRE_AT.isoformat(), "result": "continued-in-place", "reason": "?"}}
