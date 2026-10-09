@@ -506,8 +506,8 @@ def load_states(paths=None):
     out = []
     for p in paths or STATE_FILES:
         try:
-            with open(p) as fh:
-                out.append(json.load(fh))
+            import runner_state
+            out.append(runner_state.read_json(p))   # the DB when it holds the live file's state
         except (OSError, ValueError):
             continue
     return out

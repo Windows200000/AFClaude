@@ -59,6 +59,7 @@ import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fir
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
+import runner_state  # noqa: E402  (phase 2d: state + log also into the DB, dual-write)
 import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
 
 UTC = timezone.utc
@@ -110,6 +111,8 @@ def log(msg):
         written = True
     except OSError:
         pass
+    if written:
+        runner_state.log_lines("dispatcher", line, LOG_FILE)   # the live log only; never raises
     if not (written and is_log_file(sys.stdout)):
         print(line, flush=True)
     return written
@@ -139,11 +142,13 @@ def load_config(path=None, overrides=None):
 
 
 def load_state():
-    try:
-        with open(STATE_FILE) as fh:
-            st = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        st = {}
+    st = runner_state.db_load("dispatcher", STATE_FILE)   # the DB once imported and in sync, else the file
+    if st is None:
+        try:
+            with open(STATE_FILE) as fh:
+                st = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            st = {}
     for k in ("sessions", "handled", "starts", "alerted", "rc_held"):
         st.setdefault(k, {})
     return st
@@ -155,6 +160,7 @@ def save_state(st):
     with open(tmp, "w") as fh:
         json.dump(st, fh, indent=1, default=str)
     os.replace(tmp, STATE_FILE)
+    runner_state.save("dispatcher", st, STATE_FILE)
 
 
 def alert_once(st, key, subject, body=""):

@@ -56,6 +56,7 @@ import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside
 import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
 import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ignore them)
 import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual-write)
+import runner_state  # noqa: E402  (phase 2d: the sampler state and log lines too)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -639,7 +640,9 @@ def main():
     except Exception as e:   # noqa: BLE001 - never sinks the sample
         print(f"database check failed: {type(e).__name__}: {e}", file=sys.stderr)
     t = now_utc()
-    st = load(STATE, {})
+    st = runner_state.db_load("sampler", STATE)   # the DB once imported and in sync, else the file
+    if st is None:
+        st = load(STATE, {})
     baseline = not st.get("offsets")
     usage = usage_now(t)
     stale = bool(usage.get("stale"))
@@ -679,8 +682,11 @@ def main():
         haiku_judgement(st, t)
     telemetry.sync_file("usage.user_model", actor="runner:sampler")   # the review's edits -> DB (if changed)
     dump(STATE, st)
-    print(f"{t.isoformat()} tag={args.tag} baseline={baseline} weekly={w.get('percent')} "
-          f"session={(usage.get('session') or {}).get('percent')}")
+    runner_state.save("sampler", st, STATE)
+    line = (f"{t.isoformat()} tag={args.tag} baseline={baseline} weekly={w.get('percent')} "
+            f"session={(usage.get('session') or {}).get('percent')}")
+    print(line, flush=True)
+    runner_state.tee("sampler", line)   # stdout IS the live sampler.log (the cron redirect)
 
 
 if __name__ == "__main__":

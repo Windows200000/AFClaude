@@ -58,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import runner_state  # phase 2d: the state files and the log also go into the DB (dual-write)
 import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
@@ -161,7 +162,9 @@ def berlin(dt):
 
 
 def log(msg):
-    print(f"[{datetime.now(BERLIN).strftime('%Y-%m-%d %H:%M:%S %Z')}] {msg}", flush=True)
+    line = f"[{datetime.now(BERLIN).strftime('%Y-%m-%d %H:%M:%S %Z')}] {msg}"
+    print(line, flush=True)
+    runner_state.tee("keepalive", line)    # stdout IS the live keepalive.log: the line into app_log too
 
 
 def parse_ts(s):
@@ -316,6 +319,9 @@ LAST_REFRESH = {}   # the latest refresh_usage_checked() result (for log lines a
 
 
 def _load_usage_state():
+    got = runner_state.db_load("keepalive.usage_refresh", USAGE_STATE_FILE)
+    if got is not None:
+        return got
     try:
         with open(USAGE_STATE_FILE) as fh:
             d = json.load(fh)
@@ -332,6 +338,8 @@ def _save_usage_state(d):
         os.replace(tmp, USAGE_STATE_FILE)
     except OSError as e:
         log(f"usage state not saved: {e}")
+        return
+    runner_state.save("keepalive.usage_refresh", d, USAGE_STATE_FILE)
 
 
 def poke_auth(cwd=HERE, now=None):
@@ -913,6 +921,9 @@ def process_env_flags(pid):
 # ---------------------------------------------------------------- state
 
 def load_state():
+    got = runner_state.db_load("keepalive", STATE_FILE)   # the DB once imported and in sync, else the file
+    if got is not None:
+        return got
     try:
         with open(STATE_FILE) as fh:
             return json.load(fh)
@@ -925,6 +936,7 @@ def save_state(st):
     with open(tmp, "w") as fh:
         json.dump(st, fh, indent=1, default=str)
     os.replace(tmp, STATE_FILE)
+    runner_state.save("keepalive", st, STATE_FILE)   # one transaction, merged per entry (phase 2d)
 
 
 RUN_IDLE = timedelta(minutes=15)      # run_active(): the run's transcripts were written this recently
@@ -1285,6 +1297,9 @@ DEFER_FILE = os.path.join(STATE_DIR, "keepalive_deferred.json")
 
 
 def load_deferred():
+    got = runner_state.db_load("keepalive.deferred", DEFER_FILE)
+    if got is not None:
+        return got
     try:
         with open(DEFER_FILE) as fh:
             d = json.load(fh)
@@ -1298,6 +1313,7 @@ def save_deferred(d):
     with open(tmp, "w") as fh:
         json.dump(d, fh, indent=1, default=str)
     os.replace(tmp, DEFER_FILE)
+    runner_state.save("keepalive.deferred", d, DEFER_FILE)
 
 
 def defer_window_start(key, sid, recheck_at, reason, deadline=None):
@@ -1514,6 +1530,9 @@ _FILLUP_LINE = None
 
 
 def load_fillup():
+    got = runner_state.db_load("keepalive.fillup", FILLUP_FILE)
+    if got is not None:
+        return got
     try:
         with open(FILLUP_FILE) as fh:
             d = json.load(fh)
@@ -1527,6 +1546,7 @@ def save_fillup(d):
     with open(tmp, "w") as fh:
         json.dump(d, fh, indent=1, default=str)
     os.replace(tmp, FILLUP_FILE)
+    runner_state.save("keepalive.fillup", d, FILLUP_FILE)
 
 
 def _fillup_log(line):

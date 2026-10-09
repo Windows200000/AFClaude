@@ -57,6 +57,7 @@ from zoneinfo import ZoneInfo
 
 import afclaude_config
 import schedule
+import runner_state
 import telemetry
 import usage_stale
 
@@ -356,8 +357,7 @@ def fire_times(files=None):
     out = []
     for path, group, field in (FIRE_FILES if files is None else files):
         try:
-            with open(path) as fh:
-                st = json.load(fh)
+            st = runner_state.read_json(path)   # the DB when it holds the live file's state
         except (OSError, ValueError):
             continue
         g = st.get(group) if isinstance(st, dict) else None
