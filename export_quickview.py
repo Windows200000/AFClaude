@@ -302,7 +302,15 @@ def watcher_running():
 def tail_last_json(path, chunk=65536):
     """Last complete JSON object in a JSONL file, without reading the whole
     (potentially large, never-exported) file: grows the read window from the
-    end until a full line is found or the file start is reached."""
+    end until a full line is found or the file start is reached. A live file's rows come
+    from the DB once imported (phase 2c, telemetry.py)."""
+    import telemetry
+    got = telemetry.db_lines(path, max_bytes=chunk * 16)
+    for line in reversed(got or []):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
     try:
         size = os.path.getsize(path)
     except OSError:

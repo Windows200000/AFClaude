@@ -57,6 +57,7 @@ from zoneinfo import ZoneInfo
 
 import afclaude_config
 import schedule
+import telemetry
 import usage_stale
 
 UTC = timezone.utc
@@ -146,8 +147,20 @@ def _file_sig(path, st):
 
 
 def tail_rows(path=None, max_bytes=TAIL_BYTES):
-    """Rows of the end of samples.jsonl, oldest first (cached while the file is unchanged)."""
+    """Rows of the end of samples.jsonl, oldest first (cached while the file is unchanged).
+    The live file's rows come from the DB once imported (telemetry.py; the same rows, cached
+    while the table is unchanged), else from the file."""
     path = path or SAMPLES_FILE
+    sig = telemetry.signature(path)
+    if sig is not None:
+        hit = _TAIL_CACHE.get((path, max_bytes))
+        if hit and hit[0] == sig:
+            return hit[1]
+        got = telemetry.db_lines(path, max_bytes=max_bytes)
+        if got is not None:
+            rows = _parse_rows(got)
+            _TAIL_CACHE[(path, max_bytes)] = (sig, rows)
+            return rows
     st = os.stat(path)
     key = _file_sig(path, st)
     hit = _TAIL_CACHE.get((path, max_bytes))
@@ -159,6 +172,13 @@ def tail_rows(path=None, max_bytes=TAIL_BYTES):
     lines = chunk.split(b"\n")
     if st.st_size > max_bytes:
         lines = lines[1:]
+    rows = _parse_rows(lines)
+    _TAIL_CACHE[(path, max_bytes)] = (key, rows)
+    return rows
+
+
+def _parse_rows(lines):
+    """JSON lines -> the rows with a sample time, sorted by it."""
     rows = []
     for line in lines:
         try:
@@ -168,7 +188,6 @@ def tail_rows(path=None, max_bytes=TAIL_BYTES):
         if isinstance(r, dict) and _ts(r.get("at")):
             rows.append(r)
     rows.sort(key=lambda r: _ts(r["at"]))
-    _TAIL_CACHE[(path, max_bytes)] = (key, rows)
     return rows
 
 
@@ -819,8 +838,10 @@ def record_forecast(d, resets_at, path=None):
            "w0": d["w0"], "forecast_user": round(d["forecast"], 2), "run_cost": _r2(d.get("run_cost")),
            "predicted_end": _r2(d.get("predicted_end")), "threshold": _r2(d.get("threshold")),
            "go": d.get("go"), "target": _r2(d.get("target")), "logged_at": datetime.now(UTC).isoformat()}
+    line = json.dumps(rec)
     with open(path or FORECAST_LOG, "a") as fh:
-        fh.write(json.dumps(rec) + "\n")
+        fh.write(line + "\n")
+    telemetry.record("usage.forecast", line, path or FORECAST_LOG, actor="runner:pacing")   # live file only
     return True
 
 
@@ -828,8 +849,7 @@ def forecast_errors(rows, fires, now, path=None):
     """Score the logged forecasts of closed weeks against the user's real use from the logged
     time to the reset. -> list of {at, forecast, actual, error} (error = forecast - actual)."""
     try:
-        with open(path or FORECAST_LOG) as fh:
-            recs = [json.loads(x) for x in fh if x.strip()]
+        recs = [json.loads(x) for x in telemetry.lines(path or FORECAST_LOG) if x.strip()]
     except (OSError, ValueError):
         return []
     iv = user_intervals(sorted(rows, key=lambda r: _ts(r["at"])), fires)

@@ -37,6 +37,8 @@ predict() is pure (stages + Gate in, a JSON-ready dict out). gather() reads the 
 record() appends one prediction per day to data/stage_eta_log.jsonl, score() compares the logged
 predictions with when the stages were really done (the rare stage-ETA review, prompts/
 stage_eta_review.md, run by the monthly usage review: D-142 analogue, it tunes the estimates only).
+Phase 2c (telemetry.py): each logged prediction also goes into the DB table stage_eta_log
+(dual-write); --score reads the live log from the DB once it is imported.
 
     python3 stage_eta.py [--db PATH]            the current prediction (JSON)
     python3 stage_eta.py --score [--db PATH]    the logged predictions vs the real completions
@@ -56,6 +58,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, cast
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import schedule  # noqa: E402
+import telemetry  # noqa: E402
 
 UTC = timezone.utc
 WEEK = timedelta(days=7)
@@ -359,8 +362,10 @@ def record(result: Mapping[str, Any], path: Optional[str] = None, now: Optional[
            "stages": [{k: st.get(k) for k in ("id", "sessions", "source", "cum_sessions", "done_at", "eta_days")}
                       for st in result.get("stages", [])]}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = json.dumps(row, separators=(",", ":"))
     with open(path, "a") as fh:
-        fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+        fh.write(line + "\n")
+    telemetry.record("stage_eta.prediction", line, path, actor="runner:quickview")   # the live file only
     return True
 
 
@@ -483,8 +488,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.score:
             rows = []
             try:
-                with open(LOG_FILE) as fh:
-                    rows = [json.loads(ln) for ln in fh if ln.strip()]
+                rows = [json.loads(ln) for ln in telemetry.lines(LOG_FILE) if ln.strip()]
             except OSError:
                 pass
             done = {i: b for i, _, b in done_stages(conn)}

@@ -29,6 +29,10 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                gains the tables/columns/triggers in place (_backup_v3, init).
                Writes from the CLI, the MCP server and the dashboard go through
                actions.py (validation, audit row, idempotency, version checks).
+               Later tables (SCHEMA/TELEMETRY_SCHEMA, no version bump: purely additive, so
+               a running older checkout keeps writing): accounts (one 'default' row, D-156)
+               and the telemetry tables of dashboard phase 2c (D-161; telemetry.py, the
+               actions.py appenders, `python3 store.py import-telemetry`).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -299,7 +303,71 @@ CREATE TABLE IF NOT EXISTS action_requests (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS action_requests_one_open ON action_requests(kind, COALESCE(target, ''))
     WHERE status = 'open';
+
+-- the Claude accounts (D-156): one row ('default') now; telemetry rows carry account_id so the
+-- future account pool (§14) needs no migration
+CREATE TABLE IF NOT EXISTS accounts (
+    id         TEXT PRIMARY KEY,
+    label      TEXT,
+    created_at TEXT NOT NULL
+);
 """
+
+# ---- telemetry (dashboard phase 2c, D-161, §7.2/§7.3): the usage files' rows in the DB.
+# Append-only tables (TELEMETRY_APPEND): one row per file line, written only through the
+# registered actions.py appenders (actions.APPENDERS); each row carries ts, actor, via and
+# recorded_at and is immutable by trigger, so the row is its own audit record. `payload` is
+# the JSON line exactly as the producer wrote it to its file (byte-identical during the
+# dual-write period, so a reader gets the same rows from either), `row_key` its sha256 (the
+# importer and a dual-write dedupe on it). `stale` marks rows whose usage meters must not be
+# used (D-130: never drop data, mark it).
+# Record tables (TELEMETRY_DOCS): one row per derived record that is recomputed in place (a
+# run's fill-time row until it is final, a weekly cycle, the user model); they carry the same
+# ts/actor/via plus updated_at and a trigger-bumped version, and can't be deleted.
+TELEMETRY_APPEND = ("usage_samples", "usage_weekly_series", "usage_session_windows", "forecast_log",
+                    "haiku_judgements", "usage_reports", "usage_run_readings", "stage_eta_log")
+TELEMETRY_DOCS = ("weekly_cycles", "usage_runs", "user_model")
+DEFAULT_ACCOUNT = "default"
+_APPEND_DDL = """
+CREATE TABLE IF NOT EXISTS {t} (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  TEXT NOT NULL DEFAULT 'default' REFERENCES accounts(id),
+    ts          TEXT NOT NULL,           -- the row's own time, normalised UTC ISO (sorts as text)
+    stale       INTEGER NOT NULL DEFAULT 0,
+    row_key     TEXT NOT NULL,           -- sha256 of payload
+    actor       TEXT NOT NULL,
+    via         TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    payload     TEXT NOT NULL,           -- the JSON line as written to the file
+    UNIQUE (account_id, row_key)
+);
+CREATE INDEX IF NOT EXISTS {t}_ts ON {t}(account_id, ts, id);
+CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
+"""
+_DOC_DDL = """
+CREATE TABLE IF NOT EXISTS {t} (
+    account_id TEXT NOT NULL DEFAULT 'default' REFERENCES accounts(id),
+    doc_key    TEXT NOT NULL,            -- run_id | the cycle's reset | 'model'
+    ts         TEXT NOT NULL,            -- the record's own time (run start, reset), normalised
+    final      INTEGER NOT NULL DEFAULT 0,
+    actor      TEXT NOT NULL,
+    via        TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    payload    TEXT NOT NULL,            -- the record's JSON
+    version    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, doc_key)
+);
+CREATE INDEX IF NOT EXISTS {t}_ts ON {t}(account_id, ts);
+CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW WHEN NEW.version IS OLD.version
+BEGIN UPDATE {t} SET version = OLD.version + 1 WHERE account_id = NEW.account_id AND doc_key = NEW.doc_key; END;
+CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} rows are never deleted'); END;
+"""
+TELEMETRY_SCHEMA = ("".join(_APPEND_DDL.format(t=t) for t in TELEMETRY_APPEND)
+                    + "".join(_DOC_DDL.format(t=t) for t in TELEMETRY_DOCS))
 
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
 # read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
@@ -410,7 +478,10 @@ def init(conn: sqlite3.Connection) -> None:
         _backup_v3(conn)       # (a v2 database was just backed up by _migrate_v3)
     before = _stored_version(conn)
     conn.executescript(SCHEMA)
+    conn.executescript(TELEMETRY_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
+        conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
+                     (DEFAULT_ACCOUNT, "this installation's Claude account", now_iso()))
         for table, cols in COLUMNS.items():
             have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for name, decl in cols:
@@ -1684,6 +1755,106 @@ def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: in
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------- telemetry (phase 2c, D-161)
+#
+# Written only through actions.append / actions.append_many / actions.put_record (the
+# registered appenders, §7.3); these are their storage helpers and the readers.
+
+def telemetry_ts(value: object) -> str:
+    """A row's own time as sortable UTC ISO text (iso(), milliseconds); a value that isn't a
+    parsable time is kept as its text ('' for none), so nothing is dropped for it."""
+    if isinstance(value, datetime):
+        return iso(value) or ""
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return iso(dt) or value
+
+
+def _telemetry_table(table: str, kinds: Sequence[str]) -> str:
+    if table not in kinds:
+        raise ValueError(f"unknown telemetry table {table!r}")
+    return table
+
+
+def insert_telemetry(conn: sqlite3.Connection, table: str, payload: str, ts: str, stale: bool, actor: str,
+                     via: str, account_id: str = DEFAULT_ACCOUNT) -> bool:
+    """One append-only row; a payload already stored (same sha256) is skipped. -> inserted."""
+    t = _telemetry_table(table, TELEMETRY_APPEND)
+    key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    cur = conn.execute(f"INSERT OR IGNORE INTO {t}(account_id, ts, stale, row_key, actor, via, recorded_at, "
+                       "payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (account_id, ts, 1 if stale else 0, key, actor, via, now_iso(), payload))
+    return cur.rowcount > 0
+
+
+def put_telemetry_record(conn: sqlite3.Connection, table: str, doc_key: str, payload: str, ts: str, final: bool,
+                         actor: str, via: str, account_id: str = DEFAULT_ACCOUNT) -> str:
+    """Insert or update one derived record. -> 'inserted' | 'updated' | 'same' (unchanged)."""
+    t = _telemetry_table(table, TELEMETRY_DOCS)
+    old = conn.execute(f"SELECT payload, ts, final FROM {t} WHERE account_id=? AND doc_key=?",
+                       (account_id, doc_key)).fetchone()
+    if old is None:
+        conn.execute(f"INSERT INTO {t}(account_id, doc_key, ts, final, actor, via, updated_at, payload) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (account_id, doc_key, ts, 1 if final else 0, actor, via, now_iso(), payload))
+        return "inserted"
+    if (old["payload"], bool(old["final"])) == (payload, bool(final)):   # ts derives from the payload
+        return "same"
+    conn.execute(f"UPDATE {t} SET ts=?, final=?, actor=?, via=?, updated_at=?, payload=? "
+                 "WHERE account_id=? AND doc_key=?",
+                 (ts, 1 if final else 0, actor, via, now_iso(), payload, account_id, doc_key))
+    return "updated"
+
+
+def telemetry_payloads(conn: sqlite3.Connection, table: str, account_id: str = DEFAULT_ACCOUNT,
+                       max_bytes: int | None = None, since: str | None = None) -> list[str]:
+    """The payloads of an append-only or record table, oldest first (ts, then insertion).
+    max_bytes: only the newest rows whose payloads (one newline each, as in the file) end within
+    the last max_bytes bytes and start after its first byte -- what reading the end of the file
+    (seek, drop the first, partial line) gives; since: rows with ts >= since."""
+    t = _telemetry_table(table, TELEMETRY_APPEND + TELEMETRY_DOCS)
+    order = "ts, id" if table in TELEMETRY_APPEND else "ts, doc_key"
+    where, args = "account_id=?", [account_id]
+    if since is not None:
+        where += " AND ts >= ?"
+        args.append(since)
+    if max_bytes is None:
+        rows = conn.execute(f"SELECT payload FROM {t} WHERE {where} ORDER BY {order}", args)
+        return [str(r[0]) for r in rows]
+    desc = ", ".join(f"{c.strip()} DESC" for c in order.split(","))
+    rows = conn.execute(f"SELECT payload FROM (SELECT payload, {order}, SUM(length(CAST(payload AS BLOB)) + 1) "
+                        f"OVER (ORDER BY {desc}) AS cum FROM {t} WHERE {where}) WHERE cum < ? "
+                        f"ORDER BY {order}", args + [int(max_bytes)])
+    return [str(r[0]) for r in rows]
+
+
+def telemetry_signature(conn: sqlite3.Connection, table: str, account_id: str = DEFAULT_ACCOUNT) -> tuple[Any, ...]:
+    """A cheap change marker of a table (rows, last row/update) for the readers' caches."""
+    t = _telemetry_table(table, TELEMETRY_APPEND + TELEMETRY_DOCS)
+    if table in TELEMETRY_APPEND:
+        r = conn.execute(f"SELECT COUNT(*), MAX(id) FROM {t} WHERE account_id=?", (account_id,)).fetchone()
+    else:
+        r = conn.execute(f"SELECT COUNT(*), MAX(updated_at), SUM(version) FROM {t} WHERE account_id=?",
+                         (account_id,)).fetchone()
+    return tuple(r)
+
+
+def telemetry_counts(conn: sqlite3.Connection, account_id: str | None = None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for t in TELEMETRY_APPEND + TELEMETRY_DOCS:
+        if account_id is None:
+            out[t] = int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+        else:
+            out[t] = int(conn.execute(f"SELECT COUNT(*) FROM {t} WHERE account_id=?", (account_id,)).fetchone()[0])
+    return out
+
+
 # ---------------------------------------------------------------- the DB error path (§7.8, D-171)
 #
 # Every DB access goes through one error path: retrying() (connect() and actions.perform use
@@ -2151,7 +2322,17 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("migrate", help="back up the database, then run the migrations this code needs "
                                        "(the non-additive ones only run here)")
     m.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    t = sub.add_parser("import-telemetry", help="import the data/ usage telemetry files into the DB "
+                                                 "(idempotent, the files are not changed; telemetry.py)")
+    t.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    t.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
     args = ap.parse_args(argv)
+    if args.cmd == "import-telemetry":
+        import importlib
+        telemetry = importlib.import_module("telemetry")
+        argv2 = ["import"] + (["--db", args.db] if args.db else []) + \
+            (["--data-dir", args.data_dir] if args.data_dir else [])
+        return int(telemetry.main(argv2))
     if args.cmd == "init":
         db = args.db or DB_PATH
         existed = os.path.isfile(db)

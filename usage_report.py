@@ -49,6 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache, PROJECTS_DIR, berlin/parse_ts helpers)
 import afclaude_config  # noqa: E402  (local machine-specific values: the manager session)
+import telemetry  # noqa: E402  (phase 2c: --record also writes the DB table usage_reports)
 
 UTC = timezone.utc
 BERLIN = ka.BERLIN
@@ -252,23 +253,27 @@ def record(session_id, rows, main_row, tot, usage):
         "total": {"turns": tot["turns"], "tokens": tot["tokens"]},
         "usage": serialize_usage(usage),
     }
+    line = json.dumps(row)
     with open(REPORTS_FILE, "a") as fh:
-        fh.write(json.dumps(row) + "\n")
+        fh.write(line + "\n")
+    telemetry.record("usage.report", line, REPORTS_FILE, actor="cli", via="cli")   # phase 2c dual-write
     return row
 
 
 def last_recorded_ts(session_id):
-    if not os.path.exists(REPORTS_FILE):
+    """The time of the session's last recorded report (the DB once imported, else the file)."""
+    try:
+        src = telemetry.lines(REPORTS_FILE)
+    except OSError:
         return None
     last = None
-    with open(REPORTS_FILE) as fh:
-        for line in fh:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("session") == session_id and row.get("at"):
-                last = row["at"]
+    for line in src:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("session") == session_id and row.get("at"):
+            last = row["at"]
     return parse_ts(last) if last else None
 
 

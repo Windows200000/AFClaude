@@ -22,6 +22,10 @@ compute_run() is pure (fire + readings + activity -> row), so phase 2c can move 
 (D-161). update() recomputes the rows that are not final yet and rewrites the small runs file
 atomically (a final row is never recomputed, D-130); the first update() after deployment
 backfills every run in the keepalive state. Called by usage_sampler.py after each sample.
+Phase 2c (telemetry.py, the dual-write): the rows also go into the DB table usage_runs (a
+record per run), the watcher's readings into usage_run_readings; read_rows() and
+load_readings() read the live files' rows from the DB once they are imported; update() still
+decides from its own file which rows are final.
 CLI: `python3 run_metrics.py [--out PATH] [--print]` (default: update data/afclaude_runs.jsonl).
 """
 import argparse
@@ -34,6 +38,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import telemetry
 import usage_stale
 
 UTC = timezone.utc
@@ -446,23 +451,22 @@ def load_readings(lo, hi, samples_path=None, watch_path=None):
     for path, fn in ((samples_path or SAMPLES_FILE, reading_from_sample),
                      (watch_path or RUN_USAGE_FILE, reading_from_watch)):
         try:
-            fh = open(path, errors="replace")
+            src = telemetry.lines(path, since=lo)    # the DB once imported (rows from lo on), else the file
         except OSError:
             continue
-        with fh:
-            for line in fh:
-                m = _AT_RE.match(line)
-                if m:
-                    t = ts(m.group(1))
-                    if t is not None and not lo <= t <= hi:
-                        continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
+        for line in src:
+            m = _AT_RE.match(line)
+            if m:
+                t = ts(m.group(1))
+                if t is not None and not lo <= t <= hi:
                     continue
-                t = ts(row.get("at")) if isinstance(row, dict) else None
-                if t is not None and lo <= t <= hi:
-                    out.append(fn(row))
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            t = ts(row.get("at")) if isinstance(row, dict) else None
+            if t is not None and lo <= t <= hi:
+                out.append(fn(row))
     return merge_readings(out)
 
 
@@ -509,19 +513,25 @@ def load_states(paths=None):
     return out
 
 
-def read_rows(path=None):
+def read_rows(path=None, db=True):
+    """The run rows, oldest first: the live file's from the DB once imported (telemetry.py),
+    else the file's; db=False: the file itself (update(), the writer, decides from it)."""
     rows = []
     try:
-        with open(path or RUNS_FILE) as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        continue
+        if db:
+            src = telemetry.lines(path or RUNS_FILE)
+        else:
+            with open(path or RUNS_FILE) as fh:
+                src = list(fh)
     except OSError:
-        pass
+        return rows
+    for line in src:
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
     return rows
 
 
@@ -533,6 +543,7 @@ def write_rows(rows, path=None):
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
     os.replace(tmp, path)
+    telemetry.sync_file("usage.run", path, actor="runner:run_metrics")   # the changed rows -> DB (live file only)
 
 
 def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_path=None,
@@ -548,7 +559,7 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
         except Exception:   # noqa: BLE001 - the fire records carry the session from now on
             session = None
     runs = group_fires(fires_from_states(load_states(state_paths), session))
-    rows = {r.get("run_id"): r for r in read_rows(out_path) if isinstance(r, dict)}
+    rows = {r.get("run_id"): r for r in read_rows(out_path, db=False) if isinstance(r, dict)}
     todo = [i for i, r in enumerate(runs) if not (rows.get(r["run_id"]) or {}).get("final")]
     if not todo:
         return [rows[r["run_id"]] for r in runs if r["run_id"] in rows]
@@ -600,8 +611,10 @@ def watch_sample(session_id, now, st=None, path=None):
            "stale": usage_stale.is_stale(u.get("fetched_at"), now)}
     path = path or RUN_USAGE_FILE
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = json.dumps(row)
     with open(path, "a") as fh:
-        fh.write(json.dumps(row) + "\n")
+        fh.write(line + "\n")
+    telemetry.record("usage.run_reading", line, path, actor="keepalive")   # the live file only
     return row
 
 
