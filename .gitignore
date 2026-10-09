@@ -41,3 +41,6 @@ __pycache__/
 *.pyc
 DECISIONS.md
 .mypy_cache/
+
+# agent worktrees (local); .claude/settings.json is tracked (AFClaude permissions, D-217)
+.claude/worktrees/

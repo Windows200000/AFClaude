@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash tools/test_compact_live.sh:*)"
+    ]
+  }
+}
