@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Offline tests for the compaction of long-running sessions (D-144, D-191, D-214; design §5.5):
-the D-191 rule, the save prompt at the end of a session window (timing, the fill-up merge, dedup),
-and the compact-then-continue sequence at the next start with the hand-off injected and consumed.
-A fake tmux (fire / preflight / pane start times) and a fake transcript; no real Claude, no tmux."""
+the D-191/D-218 rule (the conversation's first transcript entry before the session window), the save
+prompt at the end of a session window (timing, the fill-up merge, dedup), and the compact-then-continue
+sequence at the next start with the hand-off injected and consumed.
+A fake tmux (fire / preflight) and a fake transcript; no real Claude, no tmux."""
 import json
 import os
 import sys
@@ -42,7 +43,7 @@ def assistant(ts, stop="end_turn", text="ok", content=None):
 class Env(unittest.TestCase):
     """Temp state files, transcripts root and PROGRESS.md; the keep-alive's host calls faked."""
     NAMES = ("PROJECTS_DIR", "STATE_FILE", "PROGRESS_FILE", "FILLUP_FILE", "HANDOFF_FILE", "DEFER_FILE",
-             "USAGE_STATE_FILE", "alert", "fire", "preflight", "tmux_created", "read_usage_cache", "db_paused",
+             "USAGE_STATE_FILE", "alert", "fire", "preflight", "conversation_started", "read_usage_cache", "db_paused",
              "agent_entries", "_limit_hit_in", "fresh_usage", "budget_eval", "COMPACT_TIMEOUT",
              "COMPACT_IDLE_WAIT", "COMPACT_POLL", "_fire_usage")
 
@@ -63,8 +64,8 @@ class Env(unittest.TestCase):
         ka._fire_usage = lambda: None
         ka.COMPACT_POLL = 0
         self.alerts, self.sent = [], []
-        self.created = NIGHT - timedelta(hours=10)          # the tmux session is old: D-191 applies
-        ka.tmux_created = lambda sid: self.created
+        self.first = NIGHT - timedelta(hours=10)            # the conversation is old: D-191/D-218 apply
+        ka.conversation_started = lambda sid, path=None: self.first
         self.usage = {"session": {"percent": 50.0, "resets_at": RESET}, "weekly": {"percent": 40.0,
                       "resets_at": RESET + timedelta(days=3)}, "fetched_at": RESET - timedelta(minutes=3)}
         ka.read_usage_cache = lambda: self.usage
@@ -150,48 +151,57 @@ class DryRun:
 # ---------------------------------------------------------------- the D-191 rule
 
 class Rule(unittest.TestCase):
-    def test_existed_in_the_previous_window(self):
+    def test_ran_before_the_window(self):
         ws = S2                                          # this session window began at 04:00
-        self.assertTrue(ka.compaction_rule(NIGHT + timedelta(minutes=10), ws))     # 23:10: existed before
+        self.assertTrue(ka.compaction_rule(NIGHT + timedelta(minutes=10), ws))     # 23:10: ran before
         self.assertTrue(ka.compaction_rule(NIGHT - timedelta(days=1), ws))
-        self.assertFalse(ka.compaction_rule(S2 + timedelta(seconds=5), ws))         # started in this window
-        self.assertFalse(ka.compaction_rule(S2 - timedelta(minutes=10), ws))        # a late start: tolerance
+        self.assertFalse(ka.compaction_rule(S2 + timedelta(seconds=5), ws))         # began in this window
+        self.assertFalse(ka.compaction_rule(S2 - timedelta(minutes=10), ws))        # an early start: tolerance
         self.assertFalse(ka.compaction_rule(None, ws))
 
     def test_first_compaction_after_one_to_two_session_lengths(self):
-        """A tmux session created at the 23:00 start: not compacted at 04:00 (it ran < 1 session
+        """A conversation begun at the 23:00 start: not compacted at 04:00 (it ran < 1 session
         length), compacted at the next night's 23:00, and from then on at every start."""
-        created = NIGHT + timedelta(seconds=5)
-        old = ka.tmux_created
-        ka.tmux_created = lambda sid: created
+        first = NIGHT + timedelta(seconds=5)
+        old = ka.conversation_started
+        ka.conversation_started = lambda sid, path=None: first
         try:
             self.assertFalse(ka.compaction_plan(SID, S2)["due"])
             self.assertTrue(ka.compaction_plan(SID, NIGHT + timedelta(days=1))["due"])
             self.assertTrue(ka.compaction_plan(SID, S2 + timedelta(days=1))["due"])
             testenv.set_setting("compaction_enabled", False)
             self.assertEqual(ka.compaction_plan(SID, NIGHT + timedelta(days=1)),
-                             {"due": False, "why": "compaction_enabled is off", "created": None})
+                             {"due": False, "why": "compaction_enabled is off", "first_activity": None})
         finally:
-            ka.tmux_created = old
+            ka.conversation_started = old
             testenv.clear_settings()
 
-    def test_tmux_created_from_the_pane_process_start(self):
-        """The pane pid's start (ticks since boot + btime) is the tmux session's creation time."""
+    def test_conversation_started_reads_the_first_transcript_entry(self):
+        """The first timestamped user/assistant entry; metadata lines without one (summary, snapshots)
+        and a half-written last line are skipped; no transcript = unknown (None) = no compaction."""
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "stat"), "w") as fh:
-                fh.write("cpu  1 2 3\nbtime 1790000000\nprocesses 5\n")
-            os.makedirs(os.path.join(d, "300"))
-            ticks = 3600 * os.sysconf("SC_CLK_TCK")
-            with open(os.path.join(d, "300", "stat"), "w") as fh:
-                fh.write("300 (claude) " + " ".join(["S", "1"] + ["0"] * 17 + [str(ticks)]) + " 0 0\n")
-            old = (ka.PROC_DIR, ka.tmux_pids)
-            ka.PROC_DIR, ka.tmux_pids = d, (lambda sid: {300, 999})        # 999: gone
+            path = os.path.join(d, f"{SID}.jsonl")
+            with open(path, "w") as fh:
+                fh.write(json.dumps({"type": "summary", "summary": "x"}) + "\n")
+                fh.write(json.dumps({"type": "file-history-snapshot", "snapshot": {}}) + "\n")
+                fh.write(json.dumps(entry("system", NIGHT - timedelta(hours=3), subtype="x")) + "\n")
+                fh.write(json.dumps(entry("user", NIGHT - timedelta(hours=2), message={"content": "hi"})) + "\n")
+                fh.write(json.dumps(assistant(NIGHT)) + "\n")
+                fh.write('{"type": "user", "timest')
+            self.assertEqual(ka.conversation_started(SID, path), NIGHT - timedelta(hours=2))
+            with open(path, "w") as fh:
+                fh.write(json.dumps({"type": "user", "timestamp": "2026-10-05T19:00:00"}) + "\n")  # naive: UTC
+            self.assertEqual(ka.conversation_started(SID, path), datetime(2026, 10, 5, 19, 0, tzinfo=UTC))
+            with open(path, "w") as fh:
+                fh.write(json.dumps({"type": "summary"}) + "\n")
+            self.assertIsNone(ka.conversation_started(SID, path))
+            self.assertIsNone(ka.conversation_started(SID, os.path.join(d, "gone.jsonl")))
+            old = ka.PROJECTS_DIR
+            ka.PROJECTS_DIR = d
             try:
-                self.assertEqual(ka.tmux_created(SID), datetime.fromtimestamp(1790000000 + 3600, UTC))
-                ka.tmux_pids = lambda sid: set()
-                self.assertIsNone(ka.tmux_created(SID))                      # no tmux session
+                self.assertIsNone(ka.conversation_started("00000000-0000-4000-8000-000000000000"))
             finally:
-                ka.PROC_DIR, ka.tmux_pids = old
+                ka.PROJECTS_DIR = old
 
 
 # ---------------------------------------------------------------- the save prompt (session end)
@@ -230,12 +240,12 @@ class SavePrompt(Env):
         self.assertEqual(ka.handoff_save_pass(SID, RESET + L - timedelta(minutes=91), Armed()), "wait")
         self.assertEqual(ka.handoff_save_pass(SID, RESET + L - timedelta(minutes=89), Armed()), "sent")
 
-    def test_not_due_when_the_tmux_session_started_in_this_window(self):
-        self.created = NIGHT + timedelta(seconds=5)          # D-191: started in this session window
+    def test_not_due_when_the_conversation_began_in_this_window(self):
+        self.first = NIGHT + timedelta(seconds=5)            # D-191/D-218: begun in this session window
         self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "not-due")
         self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=9), Armed()), "done")
         self.assertEqual(self.sent, [])
-        self.assertIn("D-191", ka.load_handoff_state()["saves"][ka.save_key(RESET)]["why"])
+        self.assertIn("D-218", ka.load_handoff_state()["saves"][ka.save_key(RESET)]["why"])
 
     def test_no_prompt_without_a_run_paused_limit_or_off(self):
         ka.save_state({"handled": {}, "fires": {}})
@@ -298,7 +308,7 @@ class SavePrompt(Env):
         self.assertLess(msg.index("HANDOFF SAVED"), msg.index("Guard hooks"))
 
     def test_fillup_without_compaction_has_no_save_text(self):
-        self.created = NIGHT + timedelta(seconds=5)
+        self.first = NIGHT + timedelta(seconds=5)
         seen = []
         old = ka.handle_fire
         ka.handle_fire = lambda sid, stall, reason, st, args: seen.append(stall)
@@ -373,8 +383,8 @@ class CompactAtStart(Env):
         self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"]), ("compacted", None))
 
     def test_not_due_continues_normally(self):
-        """D-191: a tmux session created at the previous start is not compacted; the hand-off stays."""
-        self.created = NIGHT + timedelta(days=1) - L + timedelta(seconds=5)
+        """D-191/D-218: a conversation begun at the previous start is not compacted; the hand-off stays."""
+        self.first = NIGHT + timedelta(days=1) - L + timedelta(seconds=5)
         self.handoff()
         rec = self.start()
         self.assertEqual(len(self.sent), 1)
@@ -382,9 +392,9 @@ class CompactAtStart(Env):
         self.assertFalse(rec["compaction"]["due"])
         self.assertIsNotNone(self.latest())
 
-    def test_no_compaction_for_a_fresh_resume_or_a_fillup(self):
-        """A resume into a new tmux session is a new tmux session (D-191: per tmux session); the
-        fill-up continues the same session window and never compacts."""
+    def test_no_compaction_at_a_resume_start_or_a_fillup(self):
+        """A start that has to resume (no live tmux session) is not compacted at that start (nothing to
+        type /compact into first); the fill-up continues the same session window and never compacts."""
         ka.preflight = lambda sid: (True, [], "resume")
         rec = self.start()
         self.assertEqual([p for p, _ in self.sent], ["resume"])
@@ -395,6 +405,27 @@ class CompactAtStart(Env):
                              "fields": {"remaining": "5", "reset": "04:00"}}, "fill-up", ka.load_state(), Armed())
         self.assertEqual(len(self.sent), 1)
         self.assertFalse(self.sent[0][1].startswith("/compact"))
+
+    def test_the_transcript_decides_and_a_resume_keeps_the_age(self):
+        """D-218: the real transcript reader decides (no stub). The conversation began a night ago and
+        was resumed into a new tmux session at the previous start (`claude --resume` appends to the same
+        transcript): the save prompt is due and the next start into that tmux session compacts it."""
+        ka.conversation_started = self.old["conversation_started"]
+        self.write([entry("user", NIGHT - timedelta(days=1), message={"role": "user", "content": "old"}),
+                    assistant(NIGHT - timedelta(days=1) + timedelta(seconds=9)),
+                    entry("user", NIGHT + timedelta(seconds=30), message={"role": "user", "content": "resumed"}),
+                    assistant(NIGHT + timedelta(seconds=40), text="HANDOFF SAVED")])
+        self.make_old()
+        self.assertEqual(ka.save_due(SID, RESET)[0], True)
+        rec = self.start(at=S2)
+        self.assertTrue(rec["compaction"]["due"])
+        self.assertTrue(self.sent[0][1].startswith("/compact "))
+        self.assertIn("conversation since", rec["compaction"]["why"])
+        # a conversation begun at 23:00 is not compacted at 04:00, and its save prompt is not due
+        self.write([entry("user", NIGHT + timedelta(seconds=30), message={"role": "user", "content": "go"}),
+                    assistant(NIGHT + timedelta(seconds=40))])
+        self.assertEqual(ka.save_due(SID, RESET)[0], False)
+        self.assertFalse(ka.compaction_plan(SID, S2)["due"])
 
     def test_timeout_continues_anyway(self):
         self.compacts = False
@@ -478,7 +509,7 @@ class CompactAtStart(Env):
         rec = self.start(args=DryRun())
         self.assertEqual(self.sent, [])
         self.assertEqual((rec["result"], rec["compaction"]["due"]), ("dry-run", True))
-        self.assertIn("after compacting it (D-191)", self.progress())
+        self.assertIn("after compacting it (D-191/D-218)", self.progress())
 
     def test_window_start_and_last_mile_pass_the_nominal_start(self):
         """window_start_pass gives handle_fire the session-window start (23:00 sharp, not the cron's

@@ -1497,7 +1497,7 @@ def handle_fire(sid, stall, reason, st, args):
     path = transcript_path(sid)
     cwd = session_cwd(path)
     # a start (window-start, postponed start, last-stretch slot) into our live tmux session compacts
-    # it first if D-191 says so (D-144); the fill-up and stall continues never do
+    # it first if D-191/D-218 say so (D-144); the fill-up and stall continues never do
     comp = compaction_plan(sid, stall["start_at"]) if stall.get("start_at") and plan == "send-keys" else None
     if not args.arm:
         log(f"WOULD FIRE (dry-run): plan={plan} cwd={cwd} ka_resume.sh --session {sid} {LAUNCH} {msg!r}"
@@ -1507,7 +1507,7 @@ def handle_fire(sid, stall, reason, st, args):
             st["handled"][key]["compaction"] = {"due": comp["due"], "why": comp["why"]}
         save_state(st)
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})"
-                      + (" after compacting it (D-191)" if comp and comp["due"] else ""))
+                      + (" after compacting it (D-191/D-218)" if comp and comp["due"] else ""))
         return
     handoff = None
     if comp and comp["due"]:
@@ -1768,9 +1768,11 @@ def plan_fillup_test(sid, remaining, args):
 
 # ---------------------------------------------------------------- compaction (D-144, D-191, D-214)
 # Minimal version of design §5.5, built in today's keep-alive (D-214; phase 3c's runner reuses it).
-# Per tmux session (D-191): at the end of a session window, a session is due for compaction if its
-# tmux session already existed during the previous session window (so the first compaction comes
-# after 1 to 2 session lengths). Then:
+# The trigger is algorithmic (D-191, D-218): at the end of a session window, a session is due for
+# compaction if its conversation already ran before that session window began, i.e. the first
+# entry of its transcript (~/.claude/projects/<cwd>/<id>.jsonl, which a --resume keeps appending
+# to) is older than the window's start. So the first compaction comes after 1 to 2 session lengths,
+# and a resume into a new tmux session keeps the conversation's age. Then:
 #   1. near the end of that session window (handoff_before_reset_min before the session reset, or
 #      once the session is at session_stop_pct; with a fill-up planned, inside the fill-up message)
 #      the watcher types the save prompt (prompts/session_end_save.md) into the session: commit,
@@ -1781,8 +1783,8 @@ def plan_fillup_test(sid, remaining, args):
 #      with the latest unconsumed hand-off inserted (prompts/compact_resume*.md) and consumes it.
 
 HANDOFF_FILE = os.path.join(STATE_DIR, "keepalive_handoff.json")   # {"saves": {save key: record}}
-COMPACT_TOLERANCE = timedelta(minutes=15)   # a tmux session started this little before the window
-                                            # start (a late start, clock skew) counts as started in it
+COMPACT_TOLERANCE = timedelta(minutes=15)   # a conversation begun this little before the window
+                                            # start (an early start, clock skew) counts as begun in it
 COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction, then continue anyway
 COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
@@ -1792,39 +1794,34 @@ TASKS_PY = os.path.join(HERE, "tasks.py")
 _SAVE_LINE = None
 
 
-def compaction_rule(created, window_start):
-    """D-191: compact iff the tmux session already existed during the previous session window,
-    i.e. it was created before the current session window began (`window_start`), with
-    COMPACT_TOLERANCE of slack. created None (no tmux session / unknown) = no."""
-    return created is not None and window_start is not None and created < window_start - COMPACT_TOLERANCE
+def compaction_rule(first_activity, window_start):
+    """D-191/D-218: compact iff the conversation already ran before the session window that began at
+    `window_start` (its first transcript entry is older, with COMPACT_TOLERANCE of slack), i.e. it
+    has run longer than that session window. first_activity None (no transcript / unknown) = no."""
+    return (first_activity is not None and window_start is not None
+            and first_activity < window_start - COMPACT_TOLERANCE)
 
 
-def _boot_time():
-    with open(os.path.join(PROC_DIR, "stat")) as fh:
-        for line in fh:
-            if line.startswith("btime "):
-                return int(line.split()[1])
-    raise ValueError("no btime in /proc/stat")
-
-
-def proc_start_time(pid):
-    """Wall-clock start of a process (its start ticks since boot + the boot time; the container
-    shares the host's kernel, so /proc/stat's btime is the host's there too) or None."""
-    try:
-        ticks = int(proc_starttime(pid))
-        return datetime.fromtimestamp(_boot_time() + ticks / os.sysconf("SC_CLK_TCK"), UTC)
-    except (TypeError, ValueError, OSError):
+def conversation_started(session_id, path=None):
+    """When the Claude session's conversation began: the timestamp of the first user/assistant entry
+    of its transcript (only the head of the file is read). A `claude --resume` appends to the same
+    file, so a resume into a new tmux session keeps the age. None if there is no transcript or no
+    timestamped entry (unknown = no compaction, the safe side)."""
+    path = path or transcript_path(session_id)
+    if not path:
         return None
-
-
-def tmux_created(session_id):
-    """When our tmux session ka-<id8> was created: the start of its pane process (ka_resume.sh
-    execs claude in it, so that is the session's start). None if there is none or it is unknown."""
     try:
-        starts = [t for t in (proc_start_time(p) for p in tmux_pids(session_id)) if t]
-    except Exception:   # noqa: BLE001 - unknown = no compaction (the safe side)
+        for e in iter_entries(path):
+            if e.get("type") in ("user", "assistant"):
+                try:
+                    ts = parse_ts(e.get("timestamp"))
+                except (AttributeError, ValueError):
+                    ts = None
+                if ts:
+                    return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+    except OSError:
         return None
-    return min(starts) if starts else None
+    return None
 
 
 def _compaction_settings():
@@ -1833,21 +1830,23 @@ def _compaction_settings():
 
 
 def compaction_plan(sid, start_at):
-    """At a start: is this session due for compaction (D-191, judged at the end of the session window
-    before `start_at`)? -> dict(due, why, created)."""
+    """At a start: is this session due for compaction (D-191/D-218, judged at the end of the session
+    window before `start_at`: did the conversation already run before that window began)?
+    -> dict(due, why, first_activity)."""
     try:
         if not _compaction_settings()["compaction_enabled"]:
-            return {"due": False, "why": "compaction_enabled is off", "created": None}
+            return {"due": False, "why": "compaction_enabled is off", "first_activity": None}
     except Exception as e:   # noqa: BLE001
-        return {"due": False, "why": f"settings unreadable ({type(e).__name__})", "created": None}
-    created = tmux_created(sid)
-    if created is None:
-        return {"due": False, "why": "tmux session start unknown: no compaction", "created": None}
-    due = compaction_rule(created, start_at - afclaude_config.SESSION_LENGTH)
-    return {"due": due, "created": created,
-            "why": (f"tmux session since {berlin(created)}, before the previous session window: compact (D-191)"
-                    if due else f"tmux session since {berlin(created)}, inside the previous session window: "
-                                "no compaction yet (D-191)")}
+        return {"due": False, "why": f"settings unreadable ({type(e).__name__})", "first_activity": None}
+    first = conversation_started(sid)
+    if first is None:
+        return {"due": False, "why": "conversation start unknown (no transcript): no compaction",
+                "first_activity": None}
+    due = compaction_rule(first, start_at - afclaude_config.SESSION_LENGTH)
+    return {"due": due, "first_activity": first,
+            "why": (f"conversation since {berlin(first)}, before the previous session window: compact (D-191/D-218)"
+                    if due else f"conversation since {berlin(first)}, inside the previous session window: "
+                                "no compaction yet (D-191/D-218)")}
 
 
 def session_cwd(path):
@@ -1900,7 +1899,7 @@ def compact_session(sid, cwd, path):
     while not session_idle(path):
         if time.time() >= deadline:
             log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT}; not compacted at this start")
-            progress_note(f"compaction of {sid[:8]} skipped: the session was still mid-turn (D-191 applies again "
+            progress_note(f"compaction of {sid[:8]} skipped: the session was still mid-turn (D-191/D-218 apply again "
                           "at the next start)")
             return {"status": "busy"}
         time.sleep(COMPACT_POLL)
@@ -1995,18 +1994,19 @@ def save_text(sid, reset):
 
 def save_due(sid, reset):
     """Does the save prompt apply to the session window ending at `reset`? Compaction on, not
-    sent for this window yet, and D-191: the tmux session existed before this window began
-    (so the next start compacts it). -> (bool, why)."""
+    sent for this window yet, and D-191/D-218: the conversation already ran before this window
+    began (so the next start compacts it). -> (bool, why)."""
     if not _compaction_settings()["compaction_enabled"]:
         return False, "compaction_enabled is off"
     if save_key(reset) in (load_handoff_state().get("saves") or {}):
         return False, "already handled for this session window"
-    created = tmux_created(sid)
-    if created is None:
-        return False, "no live tmux session"
-    if not compaction_rule(created, reset - afclaude_config.SESSION_LENGTH):
-        return False, f"tmux session since {berlin(created)}, inside this session window: no compaction next (D-191)"
-    return True, f"tmux session since {berlin(created)}: compaction at the next start (D-191)"
+    first = conversation_started(sid)
+    if first is None:
+        return False, "conversation start unknown (no transcript)"
+    if not compaction_rule(first, reset - afclaude_config.SESSION_LENGTH):
+        return False, (f"conversation since {berlin(first)}, inside this session window: no compaction next "
+                       "(D-191/D-218)")
+    return True, f"conversation since {berlin(first)}: compaction at the next start (D-191/D-218)"
 
 
 def fillup_planned(reset):

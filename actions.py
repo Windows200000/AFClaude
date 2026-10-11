@@ -676,8 +676,8 @@ SETTINGS: dict[str, Setting] = {
                           "rate x this factor (D-212)", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
-    "compaction_enabled": _flag(True, "Compaction (D-144/D-191): a task-manager whose tmux session already "
-                                "existed during the previous session window is asked to save a hand-off near "
+    "compaction_enabled": _flag(True, "Compaction (D-144/D-191/D-218): a task-manager whose conversation "
+                                "(transcript) already ran before the current session window is asked to save a hand-off near "
                                 "the end of its session window and is compacted (/compact) at the next start, "
                                 "which then injects the hand-off", "automation"),
     "handoff_before_reset_min": _num(20, 1, 120, "Compaction: the save prompt goes out this many minutes before "
