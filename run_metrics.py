@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """How long an AFClaude run takes to fill the session limit (D-207).
 
-One row per AFClaude run in data/afclaude_runs.jsonl. A run is a real fire recorded by
+One row per AFClaude run in the DB (usage_runs; telemetry.py, D-161). A run is a real fire recorded by
 keepalive.py (keepalive_state.json `handled` entries with a result in keepalive.RUN_RESULTS:
 a session-window start, a postponed start, a last-stretch slot, or a manual start); fires a few
 minutes apart are one run (FIRE_MERGE: the double last-stretch fire of 01.10.2026).
@@ -26,7 +26,7 @@ Phase 2c (telemetry.py, the dual-write): the rows also go into the DB table usag
 record per run), the watcher's readings into usage_run_readings; read_rows() and
 load_readings() read the live files' rows from the DB once they are imported; update() still
 decides from its own file which rows are final.
-CLI: `python3 run_metrics.py [--out PATH] [--print]` (default: update data/afclaude_runs.jsonl).
+CLI: `python3 run_metrics.py [--out PATH] [--print]` (default: update the DB's run rows; --out: a side file).
 """
 import argparse
 import glob
@@ -451,7 +451,7 @@ def load_readings(lo, hi, samples_path=None, watch_path=None):
     for path, fn in ((samples_path or SAMPLES_FILE, reading_from_sample),
                      (watch_path or RUN_USAGE_FILE, reading_from_watch)):
         try:
-            src = telemetry.lines(path, since=lo)    # the DB once imported (rows from lo on), else the file
+            src = telemetry.lines(path, since=lo)    # the DB (rows from lo on); a side path: the file
         except OSError:
             continue
         for line in src:
@@ -507,43 +507,22 @@ def load_states(paths=None):
     for p in paths or STATE_FILES:
         try:
             import runner_state
-            out.append(runner_state.read_json(p))   # the DB when it holds the live file's state
+            out.append(runner_state.read_json(p))   # the DB for a live state path
         except (OSError, ValueError):
             continue
     return out
 
 
-def read_rows(path=None, db=True):
-    """The run rows, oldest first: the live file's from the DB once imported (telemetry.py),
-    else the file's; db=False: the file itself (update(), the writer, decides from it)."""
-    rows = []
-    try:
-        if db:
-            src = telemetry.lines(path or RUNS_FILE)
-        else:
-            with open(path or RUNS_FILE) as fh:
-                src = list(fh)
-    except OSError:
-        return rows
-    for line in src:
-        line = line.strip()
-        if line:
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-    return rows
+def read_rows(path=None):
+    """The run rows, oldest first: the DB for the live path (telemetry.py, D-161), else the
+    side file."""
+    return telemetry.read_records("usage.run", path or RUNS_FILE)
 
 
 def write_rows(rows, path=None):
-    path = path or RUNS_FILE
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        for r in rows:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
-    telemetry.sync_file("usage.run", path, actor="runner:run_metrics")   # the changed rows -> DB (live file only)
+    """The run rows: the changed ones into the DB for the live path (a DB failure: the fallback
+    file, §7.8), else the side file rewritten."""
+    return telemetry.write_records("usage.run", rows, path or RUNS_FILE, actor="runner:run_metrics")
 
 
 def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_path=None,
@@ -559,7 +538,7 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
         except Exception:   # noqa: BLE001 - the fire records carry the session from now on
             session = None
     runs = group_fires(fires_from_states(load_states(state_paths), session))
-    rows = {r.get("run_id"): r for r in read_rows(out_path, db=False) if isinstance(r, dict)}
+    rows = {r.get("run_id"): r for r in read_rows(out_path) if isinstance(r, dict)}
     todo = [i for i, r in enumerate(runs) if not (rows.get(r["run_id"]) or {}).get("final")]
     if not todo:
         return [rows[r["run_id"]] for r in runs if r["run_id"] in rows]
@@ -594,7 +573,7 @@ def watch_sample(session_id, now, st=None, path=None):
     """The watcher's extra usage reading while a run is active (every RUN_SAMPLE_EVERY): reuse the
     ~/.claude.json cache if it is younger than RUN_SAMPLE_REFRESH (the sampler or a start just
     refreshed it), else one `claude -p /usage` (a local command, no model call; the shared retry
-    of keepalive.refresh_usage_checked). Appends one row to data/run_usage.jsonl. -> the row or None."""
+    of keepalive.refresh_usage_checked). Appends one row to the run readings (the DB). -> the row or None."""
     import keepalive as ka
     fire = ka.run_active(session_id, now, st)
     if fire is None:
@@ -609,12 +588,7 @@ def watch_sample(session_id, now, st=None, path=None):
            "session_pct": s.get("percent"), "session_resets_at": iso(s.get("resets_at")),
            "weekly_pct": w.get("percent"), "weekly_resets_at": iso(w.get("resets_at")),
            "stale": usage_stale.is_stale(u.get("fetched_at"), now)}
-    path = path or RUN_USAGE_FILE
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    line = json.dumps(row)
-    with open(path, "a") as fh:
-        fh.write(line + "\n")
-    telemetry.record("usage.run_reading", line, path, actor="keepalive")   # the live file only
+    telemetry.record("usage.run_reading", json.dumps(row), path or RUN_USAGE_FILE, actor="keepalive")   # the DB
     return row
 
 
@@ -631,7 +605,7 @@ def fire_usage(u):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--out", help="runs file (default data/afclaude_runs.jsonl)")
+    ap.add_argument("--out", help="a side runs file (default: the DB)")
     ap.add_argument("--print", action="store_true", help="print the rows and the summary")
     a = ap.parse_args()
     rows = update(out_path=a.out)

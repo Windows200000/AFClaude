@@ -148,9 +148,9 @@ def _file_sig(path, st):
 
 
 def tail_rows(path=None, max_bytes=TAIL_BYTES):
-    """Rows of the end of samples.jsonl, oldest first (cached while the file is unchanged).
-    The live file's rows come from the DB once imported (telemetry.py; the same rows, cached
-    while the table is unchanged), else from the file."""
+    """Rows of the end of the samples, oldest first: the DB for the live path (telemetry.py,
+    D-161; cached while the table is unchanged), else the end of the side file (cached while the
+    file is unchanged)."""
     path = path or SAMPLES_FILE
     sig = telemetry.signature(path)
     if sig is not None:
@@ -357,7 +357,7 @@ def fire_times(files=None):
     out = []
     for path, group, field in (FIRE_FILES if files is None else files):
         try:
-            st = runner_state.read_json(path)   # the DB when it holds the live file's state
+            st = runner_state.read_json(path)   # the DB for a live state path
         except (OSError, ValueError):
             continue
         g = st.get(group) if isinstance(st, dict) else None
@@ -838,11 +838,8 @@ def record_forecast(d, resets_at, path=None):
            "w0": d["w0"], "forecast_user": round(d["forecast"], 2), "run_cost": _r2(d.get("run_cost")),
            "predicted_end": _r2(d.get("predicted_end")), "threshold": _r2(d.get("threshold")),
            "go": d.get("go"), "target": _r2(d.get("target")), "logged_at": datetime.now(UTC).isoformat()}
-    line = json.dumps(rec)
-    with open(path or FORECAST_LOG, "a") as fh:
-        fh.write(line + "\n")
-    telemetry.record("usage.forecast", line, path or FORECAST_LOG, actor="runner:pacing")   # live file only
-    return True
+    # the DB for the live path (a DB failure: the fallback file, §7.8), else a side file
+    return telemetry.record("usage.forecast", json.dumps(rec), path or FORECAST_LOG, actor="runner:pacing")
 
 
 def forecast_errors(rows, fires, now, path=None):

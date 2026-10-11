@@ -556,7 +556,8 @@ class Runners(Base):
                 self.assertEqual(self.dp.main(["--arm", "--no-scan"]), 0)
             self.assertEqual(self.dp.main([]), 0)                       # a dry run: checks, never alerts
         self.assertEqual(len(self.alerts), 1)
-        self.assertEqual(sum("pass skipped" in m for m in self.logs), 2)   # armed: once per problem
+        self.assertEqual(sum("pass skipped" in m for m in self.logs), 3)   # every paused pass (no state saved
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "dispatcher_state.json")))   # on a broken DB)
         c = store.connect(os.path.join(self.dir, "fresh.db"), create=True)
         c.close()
         os.replace(os.path.join(self.dir, "fresh.db"), self.db)

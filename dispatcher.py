@@ -34,7 +34,7 @@ Default is DRY-RUN: it decides and logs what it WOULD do and changes nothing
 (no stalled.py scan, no DB writes besides store.connect()'s schema check, no
 state, no ka_resume, no tmux kill). It reads the DB as the last scan left it
 (export_quickview.py scans every 3 min).
---arm acts. State: data/dispatcher_state.json, log: data/dispatcher.log. Tunables are DB
+--arm acts. State: the DB (runner_state "dispatcher"), log: data/dispatcher.log. Tunables are DB
 settings (D-146; afclaude_config.setting): stall_take_over_idle, stall_verify_minutes,
 cleanup_finished_grace_minutes, cleanup_idle_hours. data/dispatcher.json (optional) keeps only
 session ids (keepalive_sessions, exclude_sessions); its old tunables were imported into the DB
@@ -59,7 +59,7 @@ import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fir
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
-import runner_state  # noqa: E402  (phase 2d: state + log also into the DB, dual-write)
+import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161; the log dual-written)
 import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
 
 UTC = timezone.utc
@@ -142,24 +142,13 @@ def load_config(path=None, overrides=None):
 
 
 def load_state():
-    st = runner_state.db_load("dispatcher", STATE_FILE)   # the DB once imported and in sync, else the file
-    if st is None:
-        try:
-            with open(STATE_FILE) as fh:
-                st = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            st = {}
+    st = runner_state.load("dispatcher", STATE_FILE)   # the DB (D-161)
     for k in ("sessions", "handled", "starts", "alerted", "rc_held"):
         st.setdefault(k, {})
     return st
 
 
 def save_state(st):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(st, fh, indent=1, default=str)
-    os.replace(tmp, STATE_FILE)
     runner_state.save("dispatcher", st, STATE_FILE)
 
 
@@ -583,19 +572,18 @@ def db_paused(arm):
     """A broken AFClaude database pauses the pass (no continues, no clean-ups, no scan; design
     §7.8, D-171). Armed: store.db_gate (the owner is alerted once per episode; the first pass
     that finds it healthy again says that automation resumes); a dry run only checks. Logged
-    when the problem first shows up. -> True = skip this pass."""
+    on every paused pass (the state is in the DB, D-161, so there is no "already logged" marker
+    while it is broken); the recovery is logged when this pass's check closes the runners'
+    paused episode (the fallback file). -> True = skip this pass."""
+    paused_since = store.runner_pause_open() if arm else None   # the fallback file: works without the DB
     problem = store.db_gate("dispatcher") if arm else store.health()
-    st = load_state() if arm else {}
-    seen = st.get("db_problem")
-    now_seen = f"{problem.kind}: {problem}" if problem is not None else None
-    if problem is not None and (now_seen != seen or not arm):
+    if problem is None and arm and getattr(load_state(), "unavailable", False):
+        problem = store.DBUnavailable("the dispatcher state could not be read from the database", "error")
+    if problem is not None:
         tail = f"; {problem.escalation}" if arm and problem.escalation else ""
-        log(f"pass skipped (paused): database problem ({now_seen}){tail}")
-    elif problem is None and seen:
+        log(f"pass skipped (paused): database problem ({problem.kind}: {problem}){tail}")
+    elif paused_since:
         log("database healthy again: passes resume")
-    if arm and now_seen != seen:
-        st["db_problem"] = now_seen
-        save_state(st)
     return problem is not None
 
 

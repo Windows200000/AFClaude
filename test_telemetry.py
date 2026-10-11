@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Offline tests for the telemetry in the DB (dashboard phase 2c, D-161, telemetry.py): the
 tables (accounts, append-only rows immutable by trigger, records with a version), the
-actions.py appenders (validation, dedupe, stale marks), the importer (counts, idempotency,
-the import mark, files untouched), the readers' DB-vs-file parity (before the import: the
-file; after: the same rows from the DB) and the producers' dual-write (only for the live
-files next to the DB; a DB failure never sinks the producer). Each test uses its own temp DB
-and data dir; never touches the live data/."""
+actions.py appenders (validation, dedupe, stale marks), the importer of the legacy files
+(counts, idempotency, the import mark, files untouched, imported kinds retired, --catch-up),
+the readers (a never-imported legacy file until the first write imports it, then the DB; an
+unreadable DB gives no rows, never the file), the producers writing the DB only (no file;
+side paths are files), DB failures (the rows in the fallback file, the producer goes on) and
+the CLI (rows, user-model get|set). Each test uses its own temp DB and data dir; never touches
+the live data/."""
 import json
 import os
 import shutil
@@ -215,26 +217,31 @@ class Importer(Base):
                                         "usage_runs": 2, "user_model": 1})
         self.assertEqual(self.conn.execute("SELECT SUM(stale) FROM usage_samples").fetchone()[0], 1)
         self.assertEqual(self.conn.execute("SELECT stale FROM usage_run_readings").fetchone()[0], 1)
-        r2 = telemetry.import_all()
-        for k in r2["kinds"]:
-            self.assertEqual(k.get("inserted"), 0, k["table"])
-            self.assertFalse(k.get("updated"), k["table"])
+        r2 = telemetry.import_all()                                     # imported kinds are retired
+        self.assertEqual({k["status"] for k in r2["kinds"]}, {telemetry.RETIRED})
         self.assertEqual(r2["counts"], r1["counts"])
+        r3 = telemetry.import_all(catch_up=True)                        # append-only again: nothing new
+        for k in r3["kinds"]:
+            if k["table"] in store.TELEMETRY_DOCS:
+                self.assertEqual(k["status"], telemetry.RETIRED, k["table"])
+            else:
+                self.assertEqual((k["status"], k["inserted"]), ("ok", 0), k["table"])
+        self.assertEqual(r3["counts"], r1["counts"])
         self.assertEqual(self.snapshot(), before)                       # never changes a file
         mark = json.loads(store.get_meta(self.conn, telemetry.MARK + "usage_samples"))
         self.assertEqual((mark["file_rows"], mark["db_rows"]), (40, 40))
 
-    def test_import_picks_up_new_rows_and_changed_records(self):
+    def test_catch_up_adds_rows_and_never_reverts_records(self):
         self.fixtures()
         telemetry.import_all()
         with open(self.path("samples.jsonl"), "a") as fh:
             fh.write("\n" + json.dumps(sample(50)) + "\n")
-        self.write_lines("afclaude_runs.jsonl", [{"run_id": "a", "start": "2026-10-05T02:00:00+00:00", "final": True},
-                                                 {"run_id": "b", "start": "2026-10-06T02:00:00+00:00", "final": True}],
-                         ensure_ascii=False)
-        by = {k["table"]: k for k in telemetry.import_all()["kinds"]}
+        run_metrics.write_rows([{"run_id": "a", "start": "2026-10-05T02:00:00+00:00", "final": True, "n": 2}],
+                               self.path("afclaude_runs.jsonl"))         # a newer record in the DB
+        by = {k["table"]: k for k in telemetry.import_all(catch_up=True)["kinds"]}
         self.assertEqual((by["usage_samples"]["inserted"], by["usage_samples"]["db_rows"]), (1, 41))
-        self.assertEqual((by["usage_runs"]["updated"], by["usage_runs"]["same"]), (1, 1))
+        self.assertEqual(by["usage_runs"]["status"], telemetry.RETIRED)
+        self.assertEqual(telemetry.read_records("usage.run", self.path("afclaude_runs.jsonl"))[0]["n"], 2)
 
     def test_missing_file_is_reported_not_marked(self):
         r = telemetry.import_all(kinds=["usage.forecast"])
@@ -257,14 +264,16 @@ class Readers(Base):
         super().setUp()
         self.lines = self.write_lines("samples.jsonl", [sample(i) for i in range(300)])
 
-    def test_file_until_imported_then_db(self):
+    def test_legacy_file_until_imported_then_db(self):
         p = self.path("samples.jsonl")
-        self.assertIsNone(telemetry.db_lines(p))                        # not imported: the file
+        self.assertIsNone(telemetry.db_lines(p))                        # never imported: the legacy file
         actions.append(self.conn, "usage.sample", self.lines[0], actor="runner:sampler", via="runner")
-        self.assertIsNone(telemetry.db_lines(p))                        # a dual-written row alone: still the file
-        telemetry.import_all(kinds=["usage.sample"])
-        self.assertEqual(telemetry.db_lines(p), self.lines)
-        other = os.path.join(tempfile.mkdtemp(dir=self.dir), "samples.jsonl")   # not the live file
+        self.assertIsNone(telemetry.db_lines(p))                        # a row written around telemetry.py: still
+        before = _read(p)
+        self.assertTrue(telemetry.record("usage.sample", json.dumps(sample(300)), p))   # the first write imports
+        self.assertEqual(telemetry.db_lines(p), self.lines + [json.dumps(sample(300))])
+        self.assertEqual(_read(p), before)                              # the legacy file is never written
+        other = os.path.join(tempfile.mkdtemp(dir=self.dir), "samples.jsonl")   # not the live path: a side file
         shutil.copy(p, other)
         self.assertIsNone(telemetry.db_lines(other))
 
@@ -281,7 +290,6 @@ class Readers(Base):
                 self.assertEqual(telemetry.db_lines(p, max_bytes=mb),
                                  [json.dumps(r) for r in pacing.tail_rows(alt, mb)])
         self.assertEqual(limit_ratio.load_samples(p), limit_ratio.load_samples(alt))
-        self.assertEqual(limit_ratio.load_samples(p), limit_ratio.load_samples(p, db=False))
         since = T0 + timedelta(hours=50)
         got = [json.loads(x)["at"] for x in telemetry.lines(p, since=since)]
         self.assertEqual(got[0], since.isoformat())
@@ -315,39 +323,51 @@ class Readers(Base):
         self.assertEqual(len(got), 4)
         self.assertEqual(got[1]["ratio"], 0.99)
 
-    def test_unreadable_db_falls_back_to_the_file(self):
+    def test_unreadable_db_gives_no_rows_never_the_file(self):
         p = self.path("samples.jsonl")
         telemetry.import_all(kinds=["usage.sample"])
+        self.assertEqual(len(pacing.tail_rows(p, 10 ** 7)), 300)
         self.conn.close()
         with open(store.DB_PATH, "r+b") as fh:                          # a broken DB file
             fh.write(b"garbage" * 100)
-        self.assertIsNone(telemetry.db_lines(p))
-        self.assertEqual(len(limit_ratio.load_samples(p)), 300)
+        self.assertEqual(telemetry.db_lines(p), [])
+        self.assertEqual(limit_ratio.load_samples(p), [])
+        self.assertEqual(pacing.tail_rows(p, 10 ** 7), [])              # not the cached rows either
+        self.assertEqual(telemetry.read_records("usage.run"), [])
         self.conn = sqlite3.connect(":memory:")
 
 
-class DualWrite(Base):
-    def test_sampler_append_writes_the_live_file_and_the_db(self):
+class Writes(Base):
+    def files(self):
+        return sorted(n for n in os.listdir(self.dir) if not n.startswith("afclaude.db"))
+
+    def test_sampler_append_writes_the_db_only(self):
         live = self.path("samples.jsonl")
         row = sample(1)
-        row["when"] = T0                                               # a datetime: default=str in both copies
-        usage_sampler.append(live, row)
-        line = _read(live).rstrip("\n")
-        self.assertEqual(self.conn.execute("SELECT payload FROM usage_samples").fetchone()[0], line)
+        row["when"] = T0                                               # a datetime: default=str
+        self.assertTrue(usage_sampler.append(live, row))
+        self.assertEqual(self.conn.execute("SELECT payload FROM usage_samples").fetchone()[0],
+                         json.dumps(row, default=str))
         usage_sampler.append(self.path("haiku.jsonl"), {"at": row["at"], "skipped": "x"})
         self.assertEqual(self.count("haiku_judgements"), 1)
+        self.assertEqual(self.files(), [])                              # no file
         other = os.path.join(tempfile.mkdtemp(dir=self.dir), "samples.jsonl")
-        usage_sampler.append(other, sample(2))                           # not the live file: no DB row
+        usage_sampler.append(other, sample(2))                           # a side path: its file, no DB row
         self.assertEqual(self.count("usage_samples"), 1)
+        self.assertEqual(len(_read(other).splitlines()), 1)
 
     def test_producers(self):
         rows = [sample(i) for i in range(0, 60)]
-        limit_ratio.append_new_windows(rows, path=self.path("session_windows.jsonl"), now=T0 + timedelta(days=1))
-        n = len(_read(self.path("session_windows.jsonl")).splitlines())
-        self.assertGreater(n, 0)
-        self.assertEqual(self.count("usage_session_windows"), n)
+        _, new = limit_ratio.append_new_windows(rows, path=self.path("session_windows.jsonl"), now=T0 + timedelta(days=1))
+        self.assertGreater(len(new), 0)
+        self.assertEqual(self.count("usage_session_windows"), len(new))
+        _, again = limit_ratio.append_new_windows(rows, path=self.path("session_windows.jsonl"),
+                                                  now=T0 + timedelta(days=1))
+        self.assertEqual(again, [])                                     # the writer's check reads the DB
+        self.assertEqual(len(limit_ratio.backfill_windows(self.path("samples.jsonl"),
+                                                          self.path("session_windows.jsonl"))), len(new))
         d = {"t0": T0, "w0": 5.0, "forecast": 12.345, "go": True}
-        pacing.record_forecast(d, T0 + timedelta(days=3), path=self.path("forecast_log.jsonl"))
+        self.assertTrue(pacing.record_forecast(d, T0 + timedelta(days=3), path=self.path("forecast_log.jsonl")))
         self.assertEqual(self.count("forecast_log"), 1)
         run_metrics.write_rows([{"run_id": "a", "start": "2026-10-05T02:00:00+00:00", "note": "ü"}],
                                self.path("afclaude_runs.jsonl"))
@@ -355,29 +375,89 @@ class DualWrite(Base):
                                self.path("afclaude_runs.jsonl"))
         r = dict(self.conn.execute("SELECT * FROM usage_runs").fetchone())
         self.assertEqual((r["final"], r["version"]), (1, 1))
-        self.assertEqual(r["payload"], _read(self.path("afclaude_runs.jsonl")).rstrip("\n"))
+        self.assertEqual(r["payload"], json.dumps({"run_id": "a", "start": "2026-10-05T02:00:00+00:00", "note": "ü",
+                                                   "final": True}, ensure_ascii=False))
+        self.assertEqual(run_metrics.read_rows(self.path("afclaude_runs.jsonl"))[0]["final"], True)
         res = {"status": "ok", "assumptions": {}, "stages": []}
         self.assertTrue(stage_eta.record(res, path=self.path("stage_eta_log.jsonl"), now=T0))
+        self.assertFalse(stage_eta.record(res, path=self.path("stage_eta_log.jsonl"), now=T0))   # once a day (DB)
         self.assertEqual(self.count("stage_eta_log"), 1)
-        with open(self.path("weekly_cycles.json"), "w") as fh:
-            json.dump({"2026-10-08T17:00:00+00:00": {"reset_at": "2026-10-08T17:00:00+00:00", "samples": 1}}, fh)
-        self.assertTrue(telemetry.sync_file("usage.weekly_cycle"))
-        self.assertTrue(telemetry.sync_file("usage.weekly_cycle"))
+        cycles = {"2026-10-08T17:00:00+00:00": {"reset_at": "2026-10-08T17:00:00+00:00", "samples": 1}}
+        self.assertTrue(telemetry.write_cycles(cycles))
+        self.assertTrue(telemetry.write_cycles(telemetry.read_cycles()))
         self.assertEqual(self.conn.execute("SELECT version FROM weekly_cycles").fetchone()[0], 0)   # unchanged
-        # after an import the readers see the dual-written rows too
-        telemetry.import_all()
-        self.assertEqual(len(limit_ratio.load_windows(self.path("session_windows.jsonl"))), n)
+        self.assertEqual(telemetry.read_cycles(self.path("weekly_cycles.json")), cycles)
+        self.assertEqual(self.files(), [])                              # no producer wrote a file
+        for t in ("usage_session_windows", "forecast_log", "usage_runs", "stage_eta_log", "weekly_cycles"):
+            self.assertIsNotNone(store.get_meta(self.conn, telemetry.MARK + t), t)   # marked by the first write
 
-    def test_db_failure_never_sinks_the_producer(self):
+    def test_first_write_imports_a_never_imported_legacy_file(self):
+        old = self.write_lines("forecast_log.jsonl", [{"at": "2026-10-04T02:00:00+00:00", "forecast_user": 1.0}])
+        self.assertEqual(telemetry.lines(self.path("forecast_log.jsonl")), old)   # read-only legacy
+        pacing.record_forecast({"t0": T0, "w0": 1.0, "forecast": 2.0}, T0 + timedelta(days=1),
+                               path=self.path("forecast_log.jsonl"))
+        got = telemetry.lines(self.path("forecast_log.jsonl"))
+        self.assertEqual((len(got), got[0]), (2, old[0]))
+        self.assertEqual(_read(self.path("forecast_log.jsonl")), old[0] + "\n")   # untouched
+        mark = json.loads(store.get_meta(self.conn, telemetry.MARK + "forecast_log"))
+        self.assertEqual(mark["file_rows"], 1)
+
+    def test_db_failure_records_the_rows_and_never_sinks_the_producer(self):
         self.conn.close()
         os.remove(store.DB_PATH)                                         # no DB: connect() refuses to create one
         live = self.path("forecast_log.jsonl")
-        self.assertTrue(pacing.record_forecast({"t0": T0, "w0": 1.0, "forecast": 2.0}, T0 + timedelta(days=1),
-                                               path=live))
-        self.assertEqual(len(_read(live).splitlines()), 1)                  # the file has the row
+        self.assertFalse(pacing.record_forecast({"t0": T0, "w0": 1.0, "forecast": 2.0}, T0 + timedelta(days=1),
+                                                path=live))
+        self.assertFalse(os.path.exists(live))                          # no file instead
         self.assertFalse(os.path.exists(store.DB_PATH))
-        self.assertFalse(telemetry.record("usage.forecast", _read(live), live))
+        self.assertFalse(run_metrics.write_rows([{"run_id": "a", "start": "2026-10-05T02:00:00+00:00"}],
+                                                self.path("afclaude_runs.jsonl")))
+        failed = [e for e in store.fallback_events(store.fallback_path()) if e.get("event") == "failed"]
+        self.assertEqual([(e["action"], e["params"]["kind"]) for e in failed],
+                         [("telemetry.append", "usage.forecast"), ("telemetry.put", "usage.run")])
+        self.assertEqual(json.loads(failed[0]["params"]["lines"][0])["forecast_user"], 2.0)   # kept for a replay
+        self.assertEqual(telemetry.lines(live), [])
         self.conn = sqlite3.connect(":memory:")
+
+
+class Cli(Base):
+    def run_cli(self, *argv, stdin=None):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            if stdin is not None:
+                from unittest import mock
+                with mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+                    rc = telemetry.main(list(argv))
+            else:
+                rc = telemetry.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_rows(self):
+        for i in range(5):
+            telemetry.record("usage.sample", json.dumps(sample(i)))
+        rc, out, _ = self.run_cli("rows", "usage.sample", "--last", "2")
+        self.assertEqual((rc, [json.loads(x)["at"] for x in out.splitlines()]), (0, [sample(3)["at"], sample(4)["at"]]))
+
+    def test_user_model_get_set(self):
+        import usage_model
+        self.assertEqual(self.run_cli("user-model", "get")[0], 1)       # none yet
+        doc = {"schema": "afclaude.user_model/1", "weeks_of_data": 5,
+               "envelope_weekly_pct_by_hours": {"1": 3, "168": 40}}
+        rc, out, err = self.run_cli("user-model", "set", stdin=json.dumps(doc))
+        self.assertEqual((rc, json.loads(out)["status"]), (0, "inserted"), err)
+        self.assertEqual(json.loads(self.run_cli("user-model", "get")[1]), doc)
+        self.assertEqual(telemetry.read_user_model(), doc)
+        P, env, src = usage_model.load_params(self.path("user_model.json"))   # the live path: the DB
+        self.assertIn("5 closed weeks", src)
+        doc2 = dict(doc, weeks_of_data=6)
+        self.assertEqual(self.run_cli("user-model", "set", stdin=json.dumps(doc2))[0], 0)
+        audit = store.audit_log(self.conn, target_type="user_model")
+        self.assertEqual([a["action"] for a in audit], ["user_model.set"] * 2)
+        self.assertEqual((audit[0]["before"]["doc"]["weeks_of_data"], audit[0]["after"]["doc"]["weeks_of_data"]), (5, 6))
+        self.assertEqual(self.run_cli("user-model", "set", stdin="[1]")[0], 1)   # not an object
+        self.assertFalse(os.path.exists(self.path("user_model.json")))
 
 
 if __name__ == "__main__":

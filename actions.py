@@ -256,15 +256,14 @@ def _check_version(row: Mapping[str, Any] | None, version: object, what: str) ->
 # ---------------------------------------------------------------- autonomous writers
 
 def _own_list() -> set[str]:
-    try:
-        with open(OWN_LIST) as fh:
-            return {ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")}
-    except OSError:
-        return set()
+    """The own-session list: the DB (driven_sessions kind 'own', D-161) for the live
+    data/own_sessions.txt, else that side file."""
+    import runner_state
+    return runner_state.own_sessions(OWN_LIST)
 
 
 def autonomous_sessions(conn: sqlite3.Connection) -> set[str]:
-    """Session ids AFClaude drives: driven_sessions, data/own_sessions.txt, the
+    """Session ids AFClaude drives: driven_sessions (incl. the own sessions), the
     manager session (data/afclaude.json) and every managed project's manager_session."""
     ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions")}
     ids |= {r[0] for r in conn.execute("SELECT manager_session FROM projects WHERE manager_session IS NOT NULL")}
@@ -1041,15 +1040,14 @@ def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_k
 # in place (a run's fill-time row until it is final, a weekly cycle, the user model) go through
 # put_record: an upsert carrying the same fields plus updated_at and a trigger-bumped version,
 # also without an audit row -- they are recomputable from the append-only rows (an
-# interpretation of §7.3 that gate 8a checks).
+# interpretation of §7.3 that gate 8a checks). The user model, which the usage review writes,
+# is the exception: user_model.set is an audited action (its history).
 #
-# Every row is the JSON line its producer writes to its file (the dual-write period: the
-# producers keep writing the files until they are retired, telemetry.py), stored as given, so
-# a reader gets byte-identical rows from either and the importer dedupes on its sha256.
+# Every row is the JSON line its producer used to write to its (now retired, D-161) file,
+# stored as given; the importer of the legacy files dedupes on its sha256.
 # Errors: ValueError (unknown kind, bad actor/via/account, not a JSON object, too big);
-# database errors take the DB error path's retry (store.retrying) and then raise a DBError
-# WITHOUT a fallback record: during the dual-write the file holds the row and
-# `python3 store.py import-telemetry` (idempotent) brings the DB up to date.
+# database errors take the DB error path's retry (store.retrying) and then raise a DBError;
+# the producers' door, telemetry.py, records the failed rows in the fallback file (§7.8).
 
 TELEMETRY_LINE_MAX = 1024 * 1024
 
@@ -1247,6 +1245,22 @@ def put_record(conn: sqlite3.Connection, kind: str, line: object, *, actor: str,
         keyfn(row)
     r = put_records(conn, kind, [line], actor=actor, via=via, account_id=account_id)
     return next(k for k in ("inserted", "updated", "same") if r[k])
+
+
+@action("user_model.set", "user_model")
+def user_model_set(conn: sqlite3.Connection, ctx: Ctx, doc: Any) -> Result:
+    """Replace the user model (the usage review's user-specific predictor parameters; the DB is
+    its only copy, D-161: `python3 telemetry.py user-model set`). Unlike the runners' records it
+    is audited, with the old and the new document: the audit log is its history."""
+    if not isinstance(doc, Mapping):
+        raise ValueError("the user model is a JSON object")
+    a = _appender("usage.user_model", record=True)
+    old = conn.execute(f"SELECT payload FROM {a.table} WHERE account_id=? AND doc_key='model'",
+                       (store.DEFAULT_ACCOUNT,)).fetchone()
+    before = json.loads(old[0]) if old is not None else None
+    line = json.dumps(dict(doc), ensure_ascii=False)
+    r = put_record(conn, "usage.user_model", line, actor=ctx.actor, via=ctx.via)
+    return Result({"status": r, "doc": dict(doc)}, "model", {"doc": before}, {"doc": dict(doc)}, changed=r != "same")
 
 
 # ---------------------------------------------------------------- runner state (§7.2/§7.3, phase 2d, D-161)

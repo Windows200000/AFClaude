@@ -55,6 +55,11 @@ class FileCase(unittest.TestCase):
         with open(path) as fh:
             return json.load(fh)
 
+    def user_model(self):
+        """The user model: its DB record (D-161; the legacy file is imported, never written)."""
+        import telemetry
+        return telemetry.read_user_model(ac.USER_MODEL_FILE)
+
     def db(self):
         # like a real setup's explicit init: a test that wants a database manipulates one into
         # existence itself, same as `python3 store.py init` would (tests that instead check the
@@ -110,11 +115,12 @@ class Import(FileCase):
         self.assertEqual(res[2]["default"], ["pacing_session_cap"])
         self.assertIn("obsolete", res[1]["notes"]["max_concurrent"])
         self.assertIn("obsolete", res[1]["notes"]["session_usage_stop"])
-        # the files keep only machine identity (and the user model its predictor data)
+        # the files keep only machine identity (and the user model, in the DB, its predictor data)
         self.assertEqual(self.read(ac.CONFIG_FILE), self.IDENTITY)
         self.assertEqual(self.read(ac.DISPATCHER_CONFIG_FILE), {"keepalive_sessions": [SID], "exclude_sessions": []})
-        self.assertEqual(self.read(ac.USER_MODEL_FILE), {"schema": "afclaude.user_model/1",
-                                                         "envelope_weekly_pct_by_hours": {"1": 9}})
+        self.assertEqual(self.user_model(), {"schema": "afclaude.user_model/1",
+                                             "envelope_weekly_pct_by_hours": {"1": 9}})
+        self.assertEqual(self.read(ac.USER_MODEL_FILE)["idle_min"], 45)    # the legacy file: frozen, never written
         self.assertEqual(ac.manager_session(), SID)
         # one audit row per file, by the runner (D-154), nothing lost: notes and defaults too
         rows = self.imports()
@@ -125,6 +131,8 @@ class Import(FileCase):
         self.assertEqual(rows[0]["after"]["settings"]["last_mile_hours"], 3.0)
         self.assertIn("max_concurrent", rows[1]["after"]["notes"])
         self.assertEqual(rows[2]["after"]["settings"], {"pacing_idle_min": 45.0})
+        um = [r for r in store.audit_log(self.db(), target_type="user_model")]
+        self.assertEqual([(r["action"], r["actor"]) for r in um], [("user_model.set", "runner:import")])
         self.assertTrue(any("imported from data/afclaude.json" in ln for ln in self.logs), self.logs)
 
     def test_idempotent_and_the_db_wins(self):
@@ -132,7 +140,9 @@ class Import(FileCase):
         ac.import_file_settings()
         n = len(self.imports())
         before = {p: self.read(p) for p in (ac.CONFIG_FILE, ac.DISPATCHER_CONFIG_FILE, ac.USER_MODEL_FILE)}
+        model = self.user_model()
         self.assertEqual(ac.import_file_settings(), [])               # nothing left to import
+        self.assertEqual(self.user_model(), model)
         self.assertEqual(len(self.imports()), n)
         self.assertEqual({p: self.read(p) for p in before}, before)   # files untouched
         # a tunable that shows up again (e.g. an old copy of the file) never overrides the DB
@@ -168,7 +178,7 @@ class Import(FileCase):
         # as pacing.py read it: the "pacing" object wins; the shadowed top-level key is dropped
         self.assertEqual(res[1]["imported"], {"pacing_idle_min": 20.0, "pacing_last_mile_yield": False})
         self.assertIn("ignored before", res[1]["notes"]["idle_min"])
-        self.assertEqual(self.read(ac.USER_MODEL_FILE), {"pacing": {"forecast_margin": 1.25}})
+        self.assertEqual(self.user_model(), {"pacing": {"forecast_margin": 1.25}})
 
     def test_first_use_imports(self):
         self.write(ac.CONFIG_FILE, {"manager_session": SID, "usage_model": "linear", "last_mile_hours": 0})

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Minimal `at` for the manager container (installed as /usr/local/bin/at).
 
-usage_sampler.py schedules its pre-/post-weekly-reset samples with
-`at -t [[CC]YY]MMDDhhmm` and the command on stdin (TZ from the environment). The
-container has no atd, so jobs are spooled as JSON in $AFCLAUDE_AT_SPOOL
-(default <data>/at_spool, persistent) and the crontab runs `at --run-due` every
-minute, which starts every due job with /bin/sh and removes it.
+usage_sampler.py schedules its pre-/post-weekly-reset samples (and usage_review.py its one-off
+reviews) with `at -t [[CC]YY]MMDDhhmm` and the command on stdin (TZ from the environment). The
+container has no atd, so jobs are stored in the AFClaude DB's scheduled_jobs (D-161: the DB is
+their only copy, runner_state.py) and the crontab runs `at --run-due` every minute, which
+claims every due pending job (marks it started, so it never runs twice) and starts it with
+/bin/sh. A job that can't be stored (a broken DB) is recorded in data/ALERTS.fallback.md
+(§7.8) and `at` exits 1.
 
-  at -t 202610011656 < cmd      spool a job (prints "job <id> at <UTC time>" on stderr)
-  at --run-due                  run and remove the due jobs
-  at -l                         list spooled jobs
+The old spool dir ($AFCLAUDE_AT_SPOOL, default <data>/at_spool) is a read-only legacy: its
+files are never written or deleted any more; `--run-due` adds a spooled job the DB doesn't
+know yet (one an older shim copy spooled without its DB write) to the DB and runs it from there.
+
+  at -t 202610011656 < cmd      schedule a job (prints "job <id> at <UTC time>" on stderr)
+  at --run-due                  run the due jobs
+  at -l                         list the pending jobs
 """
-import json
 import os
 import subprocess
 import sys
@@ -19,9 +24,12 @@ import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-SPOOL = os.environ.get("AFCLAUDE_AT_SPOOL",
-                       os.path.join(os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude"),
-                                    "data", "at_spool"))
+AFCLAUDE_DIR = os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude")
+sys.path.insert(0, AFCLAUDE_DIR)
+import runner_state  # noqa: E402
+import store  # noqa: E402
+
+SPOOL = os.environ.get("AFCLAUDE_AT_SPOOL", os.path.join(AFCLAUDE_DIR, "data", "at_spool"))   # legacy, read-only
 
 
 def parse_t(value, tz):
@@ -40,62 +48,63 @@ def parse_t(value, tz):
 
 
 def spool(when, cmd):
-    os.makedirs(SPOOL, exist_ok=True)
+    """Store the job in the DB. -> its id, or None (not stored: recorded in the fallback file)."""
     jid = uuid.uuid4().hex[:12]
-    path = os.path.join(SPOOL, f"{jid}.json")
-    with open(path + ".tmp", "w") as fh:
-        json.dump({"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd,
-                   "cwd": os.getcwd()}, fh)
-    os.replace(path + ".tmp", path)
-    _db("job_spooled", {"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd, "cwd": os.getcwd()})
-    return jid
+    job = {"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd, "cwd": os.getcwd()}
+    return jid if runner_state.job_add(job) else None
 
 
-def _db(fn, job):
-    """Dual-write (dashboard phase 2d): the job into the DB's scheduled_jobs too, only for the
-    live spool (runner_state.py). The spool file stays the job; this never fails the shim."""
+def _adopt_legacy(known):
+    """Spool files of an older shim copy whose job the DB doesn't know: into the DB (pending)."""
+    for job in runner_state.legacy_jobs(SPOOL):
+        if str(job.get("id")) not in known:
+            runner_state.job_add(job)
+
+
+def jobs(status="pending"):
+    return runner_state.jobs(status)
+
+
+def _due(job, now):
     try:
-        sys.path.insert(0, os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude"))
-        import runner_state
-        getattr(runner_state, fn)(job, SPOOL)
-    except Exception:   # noqa: BLE001
-        pass
-
-
-def jobs():
-    out = []
-    for name in sorted(os.listdir(SPOOL)) if os.path.isdir(SPOOL) else []:
-        if name.endswith(".json"):
-            try:
-                with open(os.path.join(SPOOL, name)) as fh:
-                    out.append((os.path.join(SPOOL, name), json.load(fh)))
-            except (OSError, ValueError):
-                continue
-    return out
+        t = store.parse_iso(job["run_at"])
+    except ValueError:
+        return False
+    return t is not None and (t if t.tzinfo else t.replace(tzinfo=timezone.utc)) <= now
 
 
 def run_due():
     now = datetime.now(timezone.utc)
-    for path, job in jobs():
-        if datetime.fromisoformat(job["at"]) > now:
-            continue
+    try:
+        _adopt_legacy({j["id"] for j in runner_state.jobs()})
+        due = [j for j in jobs("pending") if _due(j, now)]
+    except store.DBError as e:
+        print(f"{now.isoformat()} at-shim: database problem ({e.kind}): {e}; no job started", flush=True)
+        return 1
+    for job in due:
         try:
-            os.remove(path)          # claim it first: never run a job twice
-        except FileNotFoundError:
+            if not runner_state.job_claim(job["id"]):     # claim it first: never run a job twice
+                continue
+        except store.DBError as e:
+            print(f"{now.isoformat()} at-shim: job {job['id']} not claimed ({e.kind}): {e}", flush=True)
             continue
-        print(f"{now.isoformat()} at-shim: running job {job['id']} (due {job['at']})", flush=True)
-        _db("job_claimed", job)
+        print(f"{now.isoformat()} at-shim: running job {job['id']} (due {job['run_at']})", flush=True)
         cwd = job.get("cwd") if os.path.isdir(job.get("cwd") or "") else "/"
         subprocess.Popen(["/bin/sh", "-c", job["cmd"]], cwd=cwd, start_new_session=True,
                          stdin=subprocess.DEVNULL)
+    return 0
 
 
 def main(argv):
     if argv == ["--run-due"]:
         return run_due()
     if argv == ["-l"]:
-        for _, job in jobs():
-            print(f"{job['id']}\t{job['at']}\t{job['cmd'].strip()[:100]}")
+        try:
+            for job in jobs("pending"):
+                print(f"{job['id']}\t{job['run_at']}\t{job['cmd'].strip()[:100]}")
+        except store.DBError as e:
+            print(f"at: database problem ({e.kind}): {e}", file=sys.stderr)
+            return 1
         return 0
     if len(argv) == 2 and argv[0] == "-t":
         tzname = os.environ.get("TZ") or "UTC"
@@ -105,6 +114,10 @@ def main(argv):
             print(f"at: {e}", file=sys.stderr)
             return 1
         jid = spool(when, sys.stdin.read())
+        if jid is None:
+            print("at: the job could not be stored (database problem; recorded in data/ALERTS.fallback.md)",
+                  file=sys.stderr)
+            return 1
         print(f"job {jid} at {when.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC", file=sys.stderr)
         return 0
     print("usage: at -t [[CC]YY]MMDDhhmm < cmd | at --run-due | at -l", file=sys.stderr)

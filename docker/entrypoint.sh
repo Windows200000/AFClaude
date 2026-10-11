@@ -8,7 +8,7 @@ D="${AFCLAUDE_DIR:?}"
 # Strict host key checking against the host's own public host key (mounted read-only).
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
-mkdir -p "${KEEPALIVE_STATE_DIR:?}" "$D/data/at_spool"
+mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
 case "${AFCLAUDE_SCHEDULER:-off}" in
   on)
     echo "afclaude: scheduler ON ($(date -u +%FT%TZ))"

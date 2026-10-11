@@ -34,7 +34,7 @@ owner's formula as written: (100 - the user's forecast week) / the weekly % of o
 
 predict() is pure (stages + Gate in, a JSON-ready dict out). gather() reads the live inputs
 (the task store, pacing's ratio/forecast/threshold, the schedule settings, the run history).
-record() appends one prediction per day to data/stage_eta_log.jsonl, score() compares the logged
+record() appends one prediction per day to the DB (stage_eta_log; telemetry.py), score() compares the logged
 predictions with when the stages were really done (the rare stage-ETA review, prompts/
 stage_eta_review.md, run by the monthly usage review: D-142 analogue, it tunes the estimates only).
 Phase 2c (telemetry.py): each logged prediction also goes into the DB table stage_eta_log
@@ -338,16 +338,16 @@ def assumptions_text(result: Mapping[str, Any]) -> str:
 # ------------------------------------------------------------------ log + score (the rare review)
 
 def record(result: Mapping[str, Any], path: Optional[str] = None, now: Optional[datetime] = None) -> bool:
-    """Append the prediction to data/stage_eta_log.jsonl, at most once per UTC day. -> written."""
+    """Append the prediction to the stage-ETA log (the DB for the live path, D-161), at most once
+    per UTC day. -> written."""
     path = path or LOG_FILE
     now = now or datetime.now(UTC)
     day = now.astimezone(UTC).date().isoformat()
     last = None
-    try:
-        with open(path) as fh:
-            for ln in fh:
-                if ln.strip():
-                    last = ln
+    try:   # the DB for the live path (telemetry.lines: rows from today on), else the side file
+        for ln in telemetry.lines(path, since=day):
+            if ln.strip():
+                last = ln
     except OSError:
         pass
     if last is not None:
@@ -361,12 +361,8 @@ def record(result: Mapping[str, Any], path: Optional[str] = None, now: Optional[
            "default_sessions": a.get("default_sessions"),
            "stages": [{k: st.get(k) for k in ("id", "sessions", "source", "cum_sessions", "done_at", "eta_days")}
                       for st in result.get("stages", [])]}
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     line = json.dumps(row, separators=(",", ":"))
-    with open(path, "a") as fh:
-        fh.write(line + "\n")
-    telemetry.record("stage_eta.prediction", line, path, actor="runner:quickview")   # the live file only
-    return True
+    return telemetry.record("stage_eta.prediction", line, path, actor="runner:quickview")   # the DB (live path)
 
 
 def _ts(x: object) -> Optional[datetime]:

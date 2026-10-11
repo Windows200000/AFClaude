@@ -4,7 +4,7 @@ Usage data collector for AFClaude (run from cron every 15 min).
 
 Goal: collect enough data to later build a model of expected usage, so the
 keep-alive/dispatcher can aim at ~100% weekly usage without getting in the way
-of normal work. Everything goes to data/ as JSONL, one row per run.
+of normal work. Everything goes into the DB (formerly data/*.jsonl), one row per run.
 
 Per run:
   - fresh /usage (`claude -p --no-session-persistence /usage`, local command,
@@ -32,10 +32,9 @@ Per run:
   - the AFClaude runs' fill-time rows (run_metrics.py, D-207): data/afclaude_runs.jsonl,
     recomputed until each run's row is final
 
-Every row also goes into the DB (dashboard phase 2c, telemetry.py: the dual-write; the files
-stay until they are retired): samples, the weekly series and the Haiku rows through the
-actions.py appenders, the weekly cycles and the user model (data/user_model.json, edited by
-the usage review) as records, synced after each run.
+Everything goes into the DB only (dashboard phase 2c/2d, D-161; telemetry.py, runner_state.py;
+the old data/ files are frozen legacy copies): samples, the weekly series and the Haiku rows
+through the actions.py appenders, the weekly cycles as records, the sampler state per entry.
 
 Times in rows are UTC ISO plus Berlin-local convenience fields.
 """
@@ -65,7 +64,7 @@ STATE = os.path.join(DATA, "sampler_state.json")
 SAMPLES = os.path.join(DATA, "samples.jsonl")
 HAIKU_LOG = os.path.join(DATA, "haiku.jsonl")
 CYCLES = os.path.join(DATA, "weekly_cycles.json")
-OWN_LIST = os.path.join(DATA, "own_sessions.txt")   # extra UUIDs to exclude, one per line
+OWN_LIST = os.path.join(DATA, "own_sessions.txt")   # names the own-session list: the DB (runner_state.own_sessions; `runner_state.py own add`)
 PROJECTS = os.path.expanduser("~/.claude/projects")
 
 HAIKU_EVERY = timedelta(minutes=55)
@@ -79,29 +78,15 @@ def now_utc():
     return datetime.now(UTC)
 
 
-def load(path, default):
-    try:
-        with open(path) as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
-def dump(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=1, default=str)
-    os.replace(tmp, path)
-
-
 def append(path, row):
-    """Append the row to its JSONL file and (the live files only) the same line to the DB."""
+    """Store the row: path names its kind (samples, weekly series, Haiku); the live path is the
+    DB only (telemetry.record; a DB failure goes to the fallback file, §7.8), another path a
+    side file."""
     line = json.dumps(row, default=str)
-    with open(path, "a") as fh:
-        fh.write(line + "\n")
-    kind = telemetry.kind_for(path)
-    if kind is not None:
-        telemetry.record(kind, line, path, actor="runner:sampler")
+    kind = telemetry.BY_FILE.get(os.path.basename(path))
+    if kind is None:
+        raise ValueError(f"not a telemetry path: {path}")
+    return telemetry.record(kind, line, path, actor="runner:sampler")
 
 
 def local_fields(t):
@@ -267,9 +252,7 @@ def scan(st, baseline):
                         gaps[:] = gaps[-3:]
         if a["last_ts"]:
             meta["last_activity"] = a["last_ts"]
-    own_extra = set()
-    if os.path.exists(OWN_LIST):
-        own_extra = {l.strip() for l in open(OWN_LIST) if l.strip()}
+    own_extra = runner_state.own_sessions(OWN_LIST)   # the DB (driven_sessions kind 'own', D-161)
     for sid, meta in sessions.items():
         meta["own"] = (sid in own_extra
                        or any(mk in (meta.get("cwd") or "") for mk in OWN_CWD_MARKERS)
@@ -316,7 +299,7 @@ def track_cycle(usage, t, tag):
     w = usage.get("weekly") or {}
     if not w.get("resets_at"):
         return
-    cycles = load(CYCLES, {})
+    cycles = telemetry.read_cycles(CYCLES)   # the DB (D-161)
     # resets_at jitters by milliseconds between fetches -> round to the minute
     r0 = w["resets_at"] + timedelta(seconds=30)
     key = r0.replace(second=0, microsecond=0).isoformat()
@@ -347,8 +330,7 @@ def track_cycle(usage, t, tag):
             c.setdefault("at_jobs", []).append({label: when.isoformat(), "rc": r.returncode,
                                                 "out": (r.stderr or r.stdout).strip()[-120:]})
         c["scheduled"] = ok
-    dump(CYCLES, cycles)
-    telemetry.sync_file("usage.weekly_cycle", CYCLES, actor="runner:sampler")   # changed cycles -> DB
+    telemetry.write_cycles(cycles, CYCLES)   # the changed cycles -> the DB
 
 
 # ------------------------------------------------------------------ haiku
@@ -551,10 +533,10 @@ SESSION_WINDOWS = os.path.join(DATA, "session_windows.jsonl")  # one row per com
 
 def ratio_snapshot(rows, t, windows_path=None):
     """limit_ratio snapshot for this row. First appends every session window
-    that has completed by `t` and isn't in data/session_windows.jsonl yet (so a
-    window is recorded on the first run after it ends; a missed run catches
-    up), then computes with the stored windows. A failure in the window file
-    never sinks the sample: the snapshot is then built from `rows` alone."""
+    that has completed by `t` and isn't stored yet (the DB; so a window is
+    recorded on the first run after it ends; a missed run catches up), then
+    computes with the stored windows. A failure in the window store never
+    sinks the sample: the snapshot is then built from `rows` alone."""
     windows_path = windows_path or SESSION_WINDOWS
     stored = None
     try:
@@ -640,9 +622,7 @@ def main():
     except Exception as e:   # noqa: BLE001 - never sinks the sample
         print(f"database check failed: {type(e).__name__}: {e}", file=sys.stderr)
     t = now_utc()
-    st = runner_state.db_load("sampler", STATE)   # the DB once imported and in sync, else the file
-    if st is None:
-        st = load(STATE, {})
+    st = runner_state.load("sampler", STATE)   # the DB (D-161)
     baseline = not st.get("offsets")
     usage = usage_now(t)
     stale = bool(usage.get("stale"))
@@ -680,8 +660,6 @@ def main():
     stale_alert(st, usage, t)
     if not args.no_haiku and args.tag == "cron":
         haiku_judgement(st, t)
-    telemetry.sync_file("usage.user_model", actor="runner:sampler")   # the review's edits -> DB (if changed)
-    dump(STATE, st)
     runner_state.save("sampler", st, STATE)
     line = (f"{t.isoformat()} tag={args.tag} baseline={baseline} weekly={w.get('percent')} "
             f"session={(usage.get('session') or {}).get('percent')}")

@@ -14,7 +14,7 @@ main session itself) has consumed, so the manager can watch the session cap.
 --fresh        run the local /usage command first (keepalive.fresh_usage;
                no model call) instead of trusting the possibly-stale
                ~/.claude.json cache.
---record       append a JSON row to data/usage_reports.jsonl (gitignored) so
+--record       append a JSON row to the usage reports (the DB, D-161) so
                --last has something to diff against next time.
 
 Data sources (read-only, never written to except --record's own file):
@@ -243,7 +243,6 @@ def serialize_usage(usage):
 
 
 def record(session_id, rows, main_row, tot, usage):
-    os.makedirs(DATA, exist_ok=True)
     row = {
         "at": now_utc().isoformat(),
         "session": session_id,
@@ -253,15 +252,12 @@ def record(session_id, rows, main_row, tot, usage):
         "total": {"turns": tot["turns"], "tokens": tot["tokens"]},
         "usage": serialize_usage(usage),
     }
-    line = json.dumps(row)
-    with open(REPORTS_FILE, "a") as fh:
-        fh.write(line + "\n")
-    telemetry.record("usage.report", line, REPORTS_FILE, actor="cli", via="cli")   # phase 2c dual-write
+    telemetry.record("usage.report", json.dumps(row), REPORTS_FILE, actor="cli", via="cli")   # the DB (D-161)
     return row
 
 
 def last_recorded_ts(session_id):
-    """The time of the session's last recorded report (the DB once imported, else the file)."""
+    """The time of the session's last recorded report (the DB)."""
     try:
         src = telemetry.lines(REPORTS_FILE)
     except OSError:
@@ -362,7 +358,7 @@ def main(argv=None):
                                                           "previous --record'ed report")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--fresh", action="store_true", help="run /usage locally first (no model call)")
-    ap.add_argument("--record", action="store_true", help="append a row to data/usage_reports.jsonl")
+    ap.add_argument("--record", action="store_true", help="append a row to the usage reports (the DB)")
     args = ap.parse_args(argv)
 
     session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or DEFAULT_SESSION

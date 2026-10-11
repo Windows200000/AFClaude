@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """How fast a session limit converts into weekly limit, and who's spending it.
 
-Reads data/samples.jsonl (usage_sampler.py, every 15 min) and, between
+Reads the usage samples (the DB, usage_samples; usage_sampler.py, every 15 min) and, between
 consecutive samples that fall in the same 5-hour session window AND the same
 weekly cycle (both resets_at unchanged, mod clock jitter), computes:
 
@@ -14,7 +14,7 @@ weekly cycle (both resets_at unchanged, mod clock jitter), computes:
   - an attribution of this week's weekly % between AFClaude and the user,
     BY TIME (estimate_time_split, the primary `attribution.week_share`): the
     weekly-% rise while an autonomous AFClaude run was going (a keep-alive /
-    dispatcher / usage-review fire until that run ended: data/afclaude_runs.jsonl,
+    dispatcher / usage-review fire until that run ended: the run rows (run_metrics.py),
     else pacing.autonomous_spans) is AFClaude's; every other rise is the
     user's -- including the owner's interactive chats with the task-manager
     session (D-018: the owner's input to AFClaude is the owner's own use) and
@@ -41,9 +41,9 @@ biased low because both meters are integer percent (weekly mostly moves 0-1
 point per pair). `ratio_windows` instead measures each completed 5-h window
 from its first to its last reading (rounding error of two readings only), see
 window_record() for baseline / weekly-reset split / saturation / partial
-rules; records are kept in the never-pruned data/session_windows.jsonl
-(appended by the sampler, rebuilt with --backfill-windows; both also write the DB
-table usage_session_windows, telemetry.py). `preferred_ratio`
+rules; records are kept in the never-pruned DB table usage_session_windows
+(appended by the sampler, recomputed with --backfill-windows; telemetry.py, D-161: the DB
+is the only copy, data/session_windows.jsonl is a frozen legacy file). `preferred_ratio`
 is that estimate once MIN_WINDOWS usable windows exist, else the old median
 (flagged). The old `ratio` fields are unchanged.
 
@@ -60,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import usage_stale  # noqa: E402  (stale rows: their meters are ignored)
-import telemetry  # noqa: E402  (phase 2c: the live files' rows come from the DB once imported)
+import telemetry  # noqa: E402  (phase 2c: the telemetry is in the DB only, D-161)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -124,18 +124,12 @@ def trimmed_mean(xs, frac=TRIM_FRAC):
 
 # ------------------------------------------------------------------ loading
 
-def load_samples(path=SAMPLES, db=True):
-    """Parsed rows from samples.jsonl (or another JSONL file), oldest first. Skips unreadable
-    lines (a row still being written by a concurrent cron run). A live file's rows come from
-    the DB once imported (telemetry.lines); db=False reads the file itself (a writer checking
-    what its own file already holds)."""
+def load_samples(path=SAMPLES):
+    """Parsed rows of a telemetry path (the samples, or another JSONL kind), oldest first: the
+    DB for the live path (telemetry.lines), else the side file. Skips unreadable lines."""
     rows = []
     try:
-        if db:
-            src = telemetry.lines(path)
-        else:
-            with open(path) as fh:
-                src = list(fh)
+        src = telemetry.lines(path)
     except OSError:
         return []
     for line in src:
@@ -424,13 +418,10 @@ def build_windows(rows, now=None, include_open=False):
     return out
 
 
-def load_windows(path=SESSION_WINDOWS, db=True):
-    """The stored window records. Read from the DB (a live, imported file), one per window end:
-    the append-only table keeps every version a backfill wrote, the last one wins (as in the
-    rewritten file), sorted by window end like the file."""
-    rows = load_samples(path, db=db)
-    if not db or telemetry.kind_for(path) is None:
-        return rows
+def load_windows(path=SESSION_WINDOWS):
+    """The stored window records, one per window end: the append-only table (or a side file)
+    keeps every version a backfill wrote, the last one wins, sorted by window end."""
+    rows = load_samples(path)
     return merge_windows([r for r in rows if isinstance(r, dict)], [])
 
 
@@ -447,10 +438,10 @@ def merge_windows(stored, derived):
 
 
 def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
-    """Append every completed window found in `rows` that the file doesn't
-    have yet (called by the sampler on each run, so a window is recorded on
+    """Append every completed window found in `rows` that the store (the DB for the live
+    path) doesn't have yet (called by the sampler on each run, so a window is recorded on
     the first run after it ends). Returns (all stored records, newly added)."""
-    stored = load_windows(path, db=False)       # the writer's own file decides what is new
+    stored = load_windows(path)
     have = {w.get("window_end") for w in stored}
     computed_at = (now or datetime.now(UTC)).isoformat()
     new = []
@@ -460,33 +451,27 @@ def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
         w = dict(w, source=source, computed_at=computed_at)
         new.append(w)
     if new:
-        lines = [json.dumps(w) for w in new]
-        with open(path, "a") as fh:
-            for line in lines:
-                fh.write(line + "\n")
-        telemetry.record("usage.session_window", lines, path, actor="runner:sampler")   # the live file only
+        telemetry.record("usage.session_window", [json.dumps(w) for w in new], path, actor="runner:sampler")
     return stored + new, new
 
 
 def backfill_windows(samples_path=SAMPLES, out_path=SESSION_WINDOWS, now=None):
-    """Rebuild out_path from samples: every window derivable from the samples
-    is recomputed; stored windows the samples no longer cover (pruned) are kept,
-    since the file is never pruned. Atomic replace. Returns the records."""
+    """Recompute the session windows from the samples: every window derivable from the
+    samples is recomputed; stored windows the samples no longer cover (pruned) are kept. The
+    store is append-only (the DB table for the live path, else a side file): a recomputed
+    window is a new row (load_windows: the last one wins), an unchanged one is not stored
+    again. Returns the records."""
     now_dt = now or datetime.now(UTC)
     derived = [dict(w, source="backfill", computed_at=now_dt.isoformat())
                for w in build_windows(load_samples(samples_path), now=now)]
-    stored = load_windows(out_path, db=False)
+    stored = load_windows(out_path)
     derived_keys = {w["window_end"] for w in derived}
     keep = [w for w in stored if w.get("window_end") not in derived_keys]
     allw = merge_windows(keep, derived)
-    tmp = out_path + ".tmp"
-    lines = [json.dumps(w) for w in allw]
-    with open(tmp, "w") as fh:
-        for line in lines:
-            fh.write(line + "\n")
-    os.replace(tmp, out_path)
-    # the DB table is append-only: a recomputed window is a new row there (load_windows: the last wins)
-    telemetry.record("usage.session_window", lines, out_path, actor="cli", via="cli")
+    have = {json.dumps(w, sort_keys=True) for w in stored}
+    telemetry.record("usage.session_window",
+                     [json.dumps(w) for w in allw if json.dumps(w, sort_keys=True) not in have],
+                     out_path, actor="cli", via="cli")
     return allw
 
 
@@ -908,9 +893,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--samples", default=SAMPLES)
     ap.add_argument("--trimmed-days", type=int, default=DEFAULT_TRIMMED_DAYS)
-    ap.add_argument("--windows", default=SESSION_WINDOWS, help="per-session-window file (never pruned)")
+    ap.add_argument("--windows", default=SESSION_WINDOWS,
+                    help="per-session-window store (default: the DB; another path: a side file)")
     ap.add_argument("--backfill-windows", action="store_true",
-                    help="rebuild --windows from --samples (keeps stored windows the samples no longer cover)")
+                    help="recompute --windows from --samples (keeps stored windows the samples no longer cover)")
     ap.add_argument("--runs", default=None, help="AFClaude runs file (default: run_metrics.RUNS_FILE)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()

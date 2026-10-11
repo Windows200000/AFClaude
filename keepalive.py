@@ -58,7 +58,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
-import runner_state  # phase 2d: the state files and the log also go into the DB (dual-write)
+import runner_state  # phase 2d: the state lives in the DB only (D-161); the log is dual-written
 import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
@@ -75,7 +75,7 @@ SESSIONS_DIR = os.environ.get("KEEPALIVE_SESSIONS_DIR", os.path.expanduser("~/.c
 PROC_DIR = os.environ.get("KEEPALIVE_PROC_DIR", "/proc")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR", HERE)
-STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")
+STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")   # names the state; the DB holds it (D-161)
 LOCK_FILE = os.path.join(STATE_DIR, "keepalive.lock")
 STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
@@ -321,27 +321,12 @@ LAST_REFRESH = {}   # the latest refresh_usage_checked() result (for log lines a
 
 
 def _load_usage_state():
-    got = runner_state.db_load("keepalive.usage_refresh", USAGE_STATE_FILE)
-    if got is not None:
-        return got
-    try:
-        with open(USAGE_STATE_FILE) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return runner_state.load("keepalive.usage_refresh", USAGE_STATE_FILE)   # the DB (D-161)
 
 
 def _save_usage_state(d):
-    try:
-        tmp = USAGE_STATE_FILE + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(d, fh, indent=1, default=str)
-        os.replace(tmp, USAGE_STATE_FILE)
-    except OSError as e:
-        log(f"usage state not saved: {e}")
-        return
-    runner_state.save("keepalive.usage_refresh", d, USAGE_STATE_FILE)
+    if not runner_state.save("keepalive.usage_refresh", d, USAGE_STATE_FILE):
+        log("usage state not saved (recorded in data/ALERTS.fallback.md)")
 
 
 def poke_auth(cwd=HERE, now=None):
@@ -923,21 +908,10 @@ def process_env_flags(pid):
 # ---------------------------------------------------------------- state
 
 def load_state():
-    got = runner_state.db_load("keepalive", STATE_FILE)   # the DB once imported and in sync, else the file
-    if got is not None:
-        return got
-    try:
-        with open(STATE_FILE) as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"handled": {}, "fires": {}}
+    return runner_state.load("keepalive", STATE_FILE, {"handled": {}, "fires": {}})   # the DB (D-161)
 
 
 def save_state(st):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(st, fh, indent=1, default=str)
-    os.replace(tmp, STATE_FILE)
     runner_state.save("keepalive", st, STATE_FILE)   # one transaction, merged per entry (phase 2d)
 
 
@@ -1306,22 +1280,10 @@ DEFER_FILE = os.path.join(STATE_DIR, "keepalive_deferred.json")
 
 
 def load_deferred():
-    got = runner_state.db_load("keepalive.deferred", DEFER_FILE)
-    if got is not None:
-        return got
-    try:
-        with open(DEFER_FILE) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return runner_state.load("keepalive.deferred", DEFER_FILE)   # the DB (D-161)
 
 
 def save_deferred(d):
-    tmp = DEFER_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(d, fh, indent=1, default=str)
-    os.replace(tmp, DEFER_FILE)
     runner_state.save("keepalive.deferred", d, DEFER_FILE)
 
 
@@ -1430,7 +1392,7 @@ def _fire_usage():
 
 def watch_run_usage(sid, now):
     """While a run is going: one extra usage reading per run_metrics.RUN_SAMPLE_EVERY into
-    data/run_usage.jsonl (D-207, the fill-time measurement). Never fails the watcher."""
+    the run readings in the DB (D-207, the fill-time measurement). Never fails the watcher."""
     try:
         import run_metrics
         run_metrics.watch_sample(sid, now)
@@ -1454,6 +1416,10 @@ def db_paused(what):
     global _DB_PAUSE
     import store
     problem = store.db_gate("keepalive")
+    why = runner_state.load_failed()
+    if problem is None and why:   # its state couldn't be read (health passed): never start on a default
+        problem = store.DBUnavailable(f"the runner state could not be read ({why})", "error")
+        problem.escalation = "retried on the next check"
     if problem is None:
         if _DB_PAUSE is not None:
             log("database healthy again: autonomous starts resume")
@@ -1474,6 +1440,9 @@ def handle_fire(sid, stall, reason, st, args):
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
         return None
+    if getattr(st, "unavailable", False):   # the state is only a default (DB unreadable): decide again later
+        log(f"PAUSED, not starting {sid[:8]} ({reason}): the keepalive state could not be read from the database")
+        return "db_paused"
     night = schedule.night(datetime.now(UTC))
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
         log(f"fire cap reached for window ending {night}; not firing")
@@ -1564,22 +1533,10 @@ _FILLUP_LINE = None
 
 
 def load_fillup():
-    got = runner_state.db_load("keepalive.fillup", FILLUP_FILE)
-    if got is not None:
-        return got
-    try:
-        with open(FILLUP_FILE) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return runner_state.load("keepalive.fillup", FILLUP_FILE)   # the DB (D-161)
 
 
 def save_fillup(d):
-    tmp = FILLUP_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(d, fh, indent=1, default=str)
-    os.replace(tmp, FILLUP_FILE)
     runner_state.save("keepalive.fillup", d, FILLUP_FILE)
 
 
@@ -1739,7 +1696,7 @@ def fillup_pass(sid, now, args):
 def plan_fillup_test(sid, remaining, args):
     """--plan-fillup-test: plan ONE fill-up for this session at session reset - remaining / rate x
     fillup_factor, bypassing the run / window / budget conditions (still preflight, dedup,
-    automation_paused, db_paused). The running watcher picks it up from FILLUP_FILE."""
+    automation_paused, db_paused). The running watcher picks it up from the DB (keepalive.fillup)."""
     import fillup
     now = datetime.now(UTC)
     u = fresh_usage(now, force=True) or read_usage_cache() or {}
@@ -1763,7 +1720,7 @@ def plan_fillup_test(sid, remaining, args):
     log(f"fill-up TEST scheduled: {entry}")
     progress_note(f"fill-up TEST scheduled for {sid[:8]} at {berlin(p['start'])} (reset {berlin(reset)}, "
                   f"~{float(remaining):g}% left); the running watcher fires it")
-    print(f"scheduled in {FILLUP_FILE}; the running watcher fires it at {berlin(p['start'])}")
+    print(f"scheduled (DB: keepalive.fillup); the running watcher fires it at {berlin(p['start'])}")
 
 
 # ---------------------------------------------------------------- compaction (D-144, D-191, D-214)
@@ -1961,12 +1918,7 @@ def consume_handoff(h, start_key):
 
 
 def load_handoff_state():
-    try:
-        with open(HANDOFF_FILE) as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return runner_state.load("keepalive.handoff", HANDOFF_FILE)   # the DB (D-161)
 
 
 def save_key(reset):
@@ -1981,10 +1933,7 @@ def note_save(key, rec):
     saves[key] = rec
     for k in sorted(saves, key=lambda k: str(saves[k].get("at")))[:-20]:   # keep the last 20
         saves.pop(k, None)
-    tmp = HANDOFF_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(d, fh, indent=1, default=str)
-    os.replace(tmp, HANDOFF_FILE)
+    runner_state.save("keepalive.handoff", d, HANDOFF_FILE)
 
 
 def save_text(sid, reset):

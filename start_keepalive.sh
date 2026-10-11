@@ -3,7 +3,7 @@
 #   ./start_keepalive.sh <FULL-session-uuid>          # dry-run (decides + logs only)
 #   ./start_keepalive.sh <FULL-session-uuid> --arm    # really fires `claude --bg --resume`
 # Stop a running watcher:  touch STOP   (it exits within 30s; then rm STOP)
-# Log: keepalive.log   State: keepalive_state.json
+# Log: keepalive.log   State: the DB (runner_state "keepalive"; keepalive_state.json is a frozen legacy copy)
 set -euo pipefail
 DIR=/mnt/BlockVolume/Claude/work/AFClaude
 SID="${1:?usage: $0 <full-session-uuid> [--arm]}"; shift

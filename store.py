@@ -2403,7 +2403,9 @@ def retrying(fn: Callable[[], _T], conn: sqlite3.Connection | None = None) -> _T
                                 "transient" if cls == "transient" else "persistent") from e
 
 
-PRIOR_INSTALL_FILES = ("samples.jsonl",)   # a plain name in the data dir; a schema .bak is matched by prefix
+# plain names in the data dir (a schema .bak is matched by prefix): the sampler's legacy history (frozen since
+# the files were retired, D-161) and its cron log (still written)
+PRIOR_INSTALL_FILES = ("samples.jsonl", "sampler.log")
 
 
 def _prior_install_evidence(path: str) -> str | None:
@@ -2658,10 +2660,15 @@ def _alert(path: str, subject: str, body: str, who: str, scope: str) -> str:
 
 
 def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[str, Any] | None = None,
-                    write: bool = True, db_path: str | None = None, payload_sha: str | None = None) -> DBError:
+                    write: bool = True, db_path: str | None = None, payload_sha: str | None = None,
+                    payload_max: int = PAYLOAD_MAX, runner: bool = False) -> DBError:
     """The escalation of a failed DB action (§7.8): record it in the fallback file (a write with
     its payload, so nothing is lost), and alert the owner when the same request by the same
     actor already failed in this episode (its retry failed too, D-171), once per episode.
+    payload_max: the biggest payload kept for a replay (the runners' telemetry rows and state
+    saves keep more: the DB is their only copy). runner: a runner's own write (telemetry rows,
+    state saves, jobs; their payloads differ every time): "the same request" is the same action
+    by the same actor, and no alert while db_gate's pause episode is open (it alerted already).
     Sets err.not_saved and err.escalation (the hand-back). Never raises. -> err"""
     try:
         path = fallback_path(db_path)
@@ -2670,18 +2677,23 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
         sha = payload_sha or hashlib.sha256(payload.encode()).hexdigest()
         events = fallback_events(path)
         since = max((i for i, e in enumerate(events) if e.get("event") == "recovered"), default=-1)
-        repeat = any(e.get("event") == "failed" and e.get("payload_sha256") == sha and e.get("actor") == actor
+        repeat = any(e.get("event") == "failed" and e.get("actor") == actor
+                     and (e.get("action") == action if runner else e.get("payload_sha256") == sha)
                      for e in events[since + 1:])
+        paused = _open_alert(events, "runner") if runner else None
         rec: Row = {"event": "failed", "time": now_iso(), "actor": actor, "action": action, "write": write,
                     "payload_sha256": sha, "error_class": err.error_class, "kind": err.kind,
                     "message": str(err)[:500]}
-        rec["params"] = dict(params or {}) if len(payload) <= PAYLOAD_MAX else None   # None: too big
+        rec["params"] = dict(params or {}) if len(payload) <= payload_max else None   # None: too big
         where = _append_record(path, f"failed {'write' if write else 'read'}: {action} by {actor} "
                                      f"({err.kind}: {str(err)[:200]})", rec)
         err.not_saved = ("nothing was changed by this call" if not write else
                          f"{action} was not applied; recorded in {where} (payload sha256 {sha[:12]}) for a replay"
                          if where else f"{action} was not applied")
-        if repeat:
+        if paused is not None:
+            err.escalation = (f"the runners are paused (store.db_gate) and the owner was alerted at "
+                              f"{paused.get('time')}")
+        elif repeat:
             err.escalation = _alert(path, f"AFClaude DB error ({err.kind}): {action} failed again",
                                     f"{actor}: {action} failed twice: {err}\nRecorded in {where or 'stderr'}; "
                                     "the database needs the owner's intervention.", actor, scope="request")
@@ -2706,6 +2718,16 @@ def handback_text(err: DBError) -> str:
     h = handback(err)
     return (f"error: database {h['kind']} ({h['error_class']}): {h['message']}\n"
             f"not saved: {h['not_saved']}\nescalation: {h['escalation']}\nnext step: {h['next_step']}")
+
+
+def runner_pause_open(db_path: str | None = None) -> str | None:
+    """The time of the alert that paused the runners (db_gate), if that episode is still open
+    (the fallback file, so it works while the DB is broken); None otherwise. Never raises."""
+    try:
+        opened = _open_alert(fallback_events(fallback_path(db_path)), "runner")
+    except Exception:   # noqa: BLE001 - a status read
+        return None
+    return None if opened is None else str(opened.get("time"))
 
 
 def db_gate(component: str, db_path: str | None = None) -> DBError | None:
@@ -2746,13 +2768,16 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("migrate", help="back up the database, then run the migrations this code needs "
                                        "(the non-additive ones only run here)")
     m.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
-    t = sub.add_parser("import-telemetry", help="import the data/ usage telemetry files into the DB "
-                                                 "(idempotent, the files are not changed; telemetry.py)")
+    t = sub.add_parser("import-telemetry", help="import the legacy data/ usage telemetry files of the kinds not "
+                                                 "imported yet into the DB (idempotent, the files are not changed; "
+                                                 "telemetry.py)")
     t.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     t.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
-    rs = sub.add_parser("import-state", help="import the runner state files, scheduled jobs, own sessions and "
-                                             "logs into the DB (idempotent, the files are not changed; "
-                                             "runner_state.py)")
+    t.add_argument("--catch-up", action="store_true", help="re-import the append-only kinds already imported "
+                                                           "(rows the DB has are skipped)")
+    rs = sub.add_parser("import-state", help="import the legacy runner state files, scheduled jobs and own "
+                                             "sessions not imported yet, and sync the logs into the DB "
+                                             "(idempotent, the files are not changed; runner_state.py)")
     rs.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     rs.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
     pl = sub.add_parser("prune-logs", help="delete app_log rows past their retention (log_retention_days / "
@@ -2793,7 +2818,7 @@ def main(argv: list[str] | None = None) -> int:
         import importlib
         telemetry = importlib.import_module("telemetry")
         argv2 = ["import"] + (["--db", args.db] if args.db else []) + \
-            (["--data-dir", args.data_dir] if args.data_dir else [])
+            (["--data-dir", args.data_dir] if args.data_dir else []) + (["--catch-up"] if args.catch_up else [])
         return int(telemetry.main(argv2))
     if args.cmd == "init":
         db = args.db or DB_PATH

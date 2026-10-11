@@ -13,14 +13,14 @@ serves at /afclaude/:
                 preview_from marking the step from which a non-blocking owner
                 preview of the dashboard UI is possible, D-211; each open stage and
                 phase with its cumulative ETA from stage_eta.py, D-213, which also
-                logs one prediction per day to data/stage_eta_log.jsonl for the
+                logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
                 README, design doc, prompts/*.md
 
-Never exports data/samples.jsonl or data/haiku.jsonl (raw usage/message
+Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
 ~/.claude.json cache that the sampler keeps fresh. All times Europe/Berlin.
 Run from cron every few minutes (via flock); each file is replaced atomically.
@@ -54,7 +54,7 @@ STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.
 PREVIEW_FROM = os.environ.get("QUICKVIEW_PREVIEW_FROM", "6a")
 UTC = timezone.utc
-RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # run_metrics.py rows (the sampler writes them)
+RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # names run_metrics.py's rows: the DB (D-161)
 
 DOCS = [  # (published name, source, title)
     ("PROGRESS.md", os.path.join(HERE, "PROGRESS.md"), "Progress log"),
@@ -229,7 +229,7 @@ def stages(usage=None, now=None):
 
 def eta_result(conn, usage, now):
     """stage_eta.gather() over every open stage (all projects: the execution order interleaves
-    them), logged once a day to data/stage_eta_log.jsonl for the stage-ETA review. Never raises."""
+    them), logged once a day (the DB, stage_eta_log) for the stage-ETA review. Never raises."""
     try:
         res = stage_eta.gather(conn, usage, now, runs_path=RUNS_FILE)
     except Exception as e:   # noqa: BLE001 - the page shows "?" and the error instead
@@ -302,15 +302,18 @@ def watcher_running():
 def tail_last_json(path, chunk=65536):
     """Last complete JSON object in a JSONL file, without reading the whole
     (potentially large, never-exported) file: grows the read window from the
-    end until a full line is found or the file start is reached. A live file's rows come
-    from the DB once imported (phase 2c, telemetry.py)."""
+    end until a full line is found or the file start is reached. The live path's rows come
+    from the DB (phase 2c, telemetry.py, D-161: the DB is the only copy; an unreadable DB
+    gives None, never the frozen legacy file)."""
     import telemetry
     got = telemetry.db_lines(path, max_bytes=chunk * 16)
-    for line in reversed(got or []):
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    if got is not None:
+        for line in reversed(got):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        return None
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -337,8 +340,8 @@ def tail_last_json(path, chunk=65536):
 
 def limits_block():
     """Compact version of the limit_ratio.py snapshot usage_sampler.py already
-    stored on the latest data/samples.jsonl row (no recompute, no raw rows
-    exported -- consistent with samples.jsonl never being exported directly)."""
+    stored on the latest usage sample (the DB; no recompute, no raw rows
+    exported -- consistent with the samples never being exported directly)."""
     row = tail_last_json(os.path.join(HERE, "data", "samples.jsonl"))
     return limits_from_snapshot((row or {}).get("limit_ratio"))
 
@@ -496,7 +499,7 @@ def keepalive_and_usage(now):
 
 def fill_block():
     """How long AFClaude's runs take to fill the session limit (D-207, run_metrics.summary over
-    data/afclaude_runs.jsonl, which the sampler keeps): the last run and the median."""
+    the run rows in the DB, which the sampler keeps): the last run and the median."""
     try:
         import run_metrics
         return run_metrics.summary(run_metrics.read_rows(RUNS_FILE))
