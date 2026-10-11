@@ -527,6 +527,7 @@ class SettingActions(Base):
                           "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": True,
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
+                          "compaction_enabled": True, "handoff_before_reset_min": 20.0,
                           "automation_paused": False, "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0})
 
@@ -760,6 +761,8 @@ class EveryAction(Base):
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
             ("request.add", {"kind": "continue_now", "target": SID}),
+            ("handoff.write", {"session_id": SID, "body": {"summary": "s"}}),
+            ("handoff.consume", {"handoff_id": 1, "start_key": "window-start-2026-10-09"}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):
@@ -767,6 +770,83 @@ class EveryAction(Base):
             rows = self.audit()
             self.assertEqual(len(rows), i, name)
             self.assertEqual((rows[-1]["action"], rows[-1]["request_id"]), (name, f"every-{i:04d}"))
+
+
+# ---------------------------------------------------------------- compaction hand-offs (D-144, D-155)
+
+class Handoffs(Base):
+    BODY = {"summary": "Phase 2 merged; compaction in review.", "done": ["merged p2"], "in_progress": "review",
+            "next_steps": ["merge compaction", "live test"], "open_question_ids": [7], "notes": "see D-214"}
+
+    def test_table_is_additive_without_a_version_bump(self):
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(handoffs)")}
+        self.assertEqual(cols, {"id", "session_id", "project_id", "created_at", "created_by", "body", "consumed_at",
+                                "consumed_by_start"})
+        self.assertEqual(store.SCHEMA_VERSION, 4)     # an older running watcher must not see a "newer" DB
+
+    def test_write_validates_normalizes_and_audits(self):
+        h = self.do("handoff.write", session_id=SID, body=self.BODY)
+        self.assertEqual(h["body"]["in_progress"], ["review"])          # a single string is one item
+        self.assertEqual((h["session_id"], h["consumed_at"], h["created_by"]), (SID, None, "cli"))
+        self.assertEqual(self.audit()[-1]["action"], "handoff.write")
+        h2 = self.do("handoff.write", session_id=SID, body=json.dumps({"summary": "later"}))   # JSON text too
+        self.assertEqual(h2["body"], {"summary": "later", "done": [], "in_progress": [], "next_steps": [],
+                                      "open_question_ids": [], "notes": None})
+        for bad, msg in (({"done": ["x"]}, "summary is required"), ({"summary": "s", "colour": 1}, "unknown"),
+                         ({"summary": "s", "done": [1]}, "must be a string"),
+                         ({"summary": "s", "open_question_ids": ["7"]}, "must be an integer"),
+                         ({"summary": "x" * 2001}, "too long"), ("not json", "not valid JSON"),
+                         ({"summary": "s", "next_steps": ["x"] * 31}, "too many")):
+            with self.assertRaisesRegex(ValueError, msg):
+                self.do("handoff.write", session_id=SID, body=bad)
+        with self.assertRaisesRegex(ValueError, "full session UUID"):
+            self.do("handoff.write", session_id="abc123", body={"summary": "s"})
+        self.assertEqual(self.count("handoffs"), 2)
+
+    def test_project_defaults_to_the_managed_one(self):
+        p = self.do("project.add", name="AFClaude")
+        self.do("project.edit", project="AFClaude", manager_session=SID)
+        self.assertEqual(self.do("handoff.write", session_id=SID, body={"summary": "s"})["project_id"], p["id"])
+        self.assertIsNone(self.do("handoff.write", session_id=SID2, body={"summary": "s"})["project_id"])
+        with self.assertRaises(store.NotFound):
+            self.do("handoff.write", session_id=SID2, body={"summary": "s"}, project="nope")
+
+    def test_latest_unconsumed_and_consume_supersedes_older(self):
+        a = self.do("handoff.write", session_id=SID, body={"summary": "a"})
+        b = self.do("handoff.write", session_id=SID, body={"summary": "b"})
+        other = self.do("handoff.write", session_id=SID2, body={"summary": "other"})
+        self.assertEqual(store.latest_handoff(self.conn, SID)["id"], b["id"])
+        r = self.do("handoff.consume", actor="keepalive", via="runner", handoff_id=b["id"],
+                    start_key="window-start-2026-10-09")
+        self.assertEqual(r["consumed_by_start"], "window-start-2026-10-09")
+        self.assertIsNone(store.latest_handoff(self.conn, SID))                # a (older) is superseded too
+        self.assertEqual(store.get_handoff(self.conn, a["id"])["consumed_by_start"], "window-start-2026-10-09")
+        self.assertIsNone(store.get_handoff(self.conn, other["id"])["consumed_at"])   # other sessions untouched
+        self.assertEqual(store.latest_handoff(self.conn, SID, unconsumed=False)["id"], b["id"])
+        with self.assertRaisesRegex(store.InvalidTransition, "already consumed"):
+            self.do("handoff.consume", actor="keepalive", via="runner", handoff_id=b["id"], start_key="k2")
+        row = self.audit(target_type="handoff")[-1]
+        self.assertEqual((row["actor"], row["via"], row["action"]), ("keepalive", "runner", "handoff.consume"))
+        self.assertEqual(set(row["after"]), {"consumed_at", "consumed_by_start"})
+
+    def test_mcp_writes_only_its_own_and_never_consumes(self):
+        """D-185: an autonomous session (the task-manager, an agent) may write its own hand-off
+        directly; not another session's, and consuming is the runner's."""
+        h = self.do("handoff.write", actor="mcp:" + SID, via="mcp", autonomous=True, session_id=SID,
+                    body={"summary": "mine"})
+        self.assertEqual(h["created_by"], "mcp:" + SID)
+        with self.assertRaisesRegex(actions.Forbidden, "only its own"):
+            self.do("handoff.write", actor="mcp:" + SID, via="mcp", session_id=SID2, body={"summary": "x"})
+        with self.assertRaisesRegex(actions.Forbidden, "runner"):
+            self.do("handoff.consume", actor="mcp:" + SID, via="mcp", handoff_id=h["id"], start_key="k")
+
+    def test_render_is_one_line(self):
+        h = self.do("handoff.write", session_id=SID, body=dict(self.BODY, notes="two\nlines"))
+        text = store.render_handoff(h)
+        self.assertNotIn("\n", text)
+        for part in ("Summary: Phase 2 merged", "Done: (1) merged p2", "Next steps: (1) merge compaction (2) live",
+                     "Open questions (AFClaude tasks): #7", "Notes: two lines"):
+            self.assertIn(part, text)
 
 
 # ---------------------------------------------------------------- v3 -> v4

@@ -6,6 +6,10 @@ Every prompt AFClaude sends lives here, so the dashboard can show and edit them 
 |---|---|---|
 | `continue.md` | continue message for a resumed AFClaude session: the task-manager at a session-window start or last-stretch slot start (keepalive.py), an approved stalled session in the AFClaude repo (dispatcher.py) | `{reason}`, `{progress}` |
 | `fillup.md` | the fill-up run (D-212): continue message for the task-manager shortly before the session reset of a session window whose run stopped early (keepalive.py fillup_pass) | `{reason}`, `{progress}`, `{remaining}`, `{reset}` |
+| `session_end_save.md` | the save prompt before a compaction (D-144/D-191, design §5.5): typed into the task-manager near the end of its session window when it will be compacted at the next start (keepalive.py handoff_save_pass), or appended to the fill-up message when a fill-up is planned for that window | `{reset}`, `{session}`, `{tasks}` |
+| `compact.md` | the instruction after `/compact` at the start that compacts the task-manager (keepalive.py compact_session) | — |
+| `compact_resume.md` | inserted into the continue message after a compaction: the session's latest hand-off from the DB (`handoffs`, rendered by store.render_handoff) | `{handoff}`, `{progress}` |
+| `compact_resume_none.md` | the same when there is no hand-off (none saved, or the DB could not be read) | `{why}`, `{progress}` |
 | `project_start.md` | first message of a new project session (`--work-on`) | `{title}`, `{desc}`, `{slug}` |
 | `continue_foreign.md` | neutral continue message for an approved stalled session that is not an AFClaude session (dispatcher.py; the user's own sessions get only this + `guard_respect.md`, and resume on their own model). (`{context}` is empty since D-205: task sessions and task-managers are never continued at a limit reset, D-204) | `{reason}`, `{context}` |
 | `task_start.md` | first message of a task session; unused since D-205 (the dispatcher starts no task sessions, a project's task-manager works its tasks), kept for design phase 3b | `{id}`, `{title}`, `{project}`, `{description}`, `{qa}` |

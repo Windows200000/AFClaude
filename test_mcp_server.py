@@ -29,7 +29,7 @@ SID2 = "00000000-0000-4000-8000-000000000002"
 CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
-                  "afclaude_rule", "afclaude_ask"}
+                  "afclaude_rule", "afclaude_ask", "afclaude_handoff"}
 
 
 def run(coro):
@@ -340,6 +340,31 @@ class DBErrors(Env):
         e = self.error(ms.afclaude_list_tasks())
         self.assertEqual((e["error_class"], e["kind"]), ("persistent", "corrupt"))
         self.assertEqual(e["not_saved"], "nothing was changed by this call")
+
+
+class Handoff(Env):
+    def test_handoff_tool(self):
+        """afclaude_handoff (D-144): the calling session's own hand-off, structured, in the DB."""
+        r = run(ms.afclaude_handoff("where it stands", done=["a"], next_steps=["b", "c"], open_question_ids=[4]))
+        self.assertEqual((r["session_id"], r["saved"]), (CALLER, "HANDOFF SAVED"))
+        c = self.conn()
+        try:
+            h = store.latest_handoff(c, CALLER)
+            audit = store.audit_log(c, target_type="handoff")[0]
+        finally:
+            c.close()
+        self.assertEqual(h["id"], r["id"])
+        self.assertEqual(h["body"]["next_steps"], ["b", "c"])
+        self.assertEqual((audit["actor"], audit["via"]), (f"mcp:{CALLER}", "mcp"))
+        with self.assertRaisesRegex(ToolError, "only its own"):          # not another session's
+            asyncio.run(ms.afclaude_handoff("x", session=SID))
+        with self.assertRaisesRegex(ToolError, "summary must not be empty"):
+            asyncio.run(ms.afclaude_handoff("  "))
+        os.environ.pop("CLAUDE_CODE_SESSION_ID")                           # no id from the client:
+        with self.assertRaisesRegex(ToolError, "pass your full session id"):
+            asyncio.run(ms.afclaude_handoff("x"))
+        r = run(ms.afclaude_handoff("explicit", session=SID))                # ... then it names itself
+        self.assertEqual(r["session_id"], SID)
 
 
 class Stdio(unittest.TestCase):

@@ -35,6 +35,11 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                actions.py appenders, `python3 store.py import-telemetry`), and the
                runner state of phase 2d (RUNNER_SCHEMA: runner_state, scheduled_jobs,
                app_log; runner_state.py, `python3 store.py import-state`).
+               The handoffs table (compaction hand-offs, D-144/D-155, design §5.5)
+               is additive the same way: no version bump, which would make every
+               process still running older code (the keep-alive watcher) see the
+               database as newer than itself, read-only, and pause all autonomous
+               starts until it is restarted.
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -62,6 +67,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -313,6 +319,21 @@ CREATE TABLE IF NOT EXISTS accounts (
     label      TEXT,
     created_at TEXT NOT NULL
 );
+
+-- compaction hand-offs (D-144, D-155, D-191; design §5.5): what a long-running session writes for
+-- itself before the keep-alive compacts it; the next start injects the latest unconsumed one into
+-- its continue message and marks it consumed. Additive, no schema_version bump (see the module doc).
+CREATE TABLE IF NOT EXISTS handoffs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id        TEXT NOT NULL,
+    project_id        INTEGER REFERENCES projects(id),
+    created_at        TEXT NOT NULL,
+    created_by        TEXT,                -- the writing actor (mcp:<session>, cli, ...)
+    body              TEXT NOT NULL,       -- JSON: summary, done, in_progress, next_steps, open_question_ids, notes
+    consumed_at       TEXT,
+    consumed_by_start TEXT                 -- the start's dedup key (window-start-..., last-mile-...)
+);
+CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id, id);
 """
 
 # ---- telemetry (dashboard phase 2c, D-161, §7.2/§7.3): the usage files' rows in the DB.
@@ -2022,6 +2043,167 @@ def mark_job_started(conn: sqlite3.Connection, job_id: str, actor: str, via: str
 def list_jobs(conn: sqlite3.Connection, status: str | None = None) -> list[Row]:
     sql = "SELECT * FROM scheduled_jobs" + (" WHERE status=?" if status else "") + " ORDER BY run_at, id"
     return [dict(r) for r in conn.execute(sql, (status,) if status else ())]
+
+
+# ---- compaction hand-offs (D-144, D-155, D-191; design §5.5)
+#
+# A long-running session (the task-manager) writes a short, structured hand-off for its
+# compacted self (MCP afclaude_handoff or `tasks.py handoff write`, through actions.py); the
+# keep-alive injects the latest unconsumed one into the continue message after the compaction
+# and consumes it. One open hand-off per session counts: a newer one supersedes the older ones
+# (consume_handoff closes them too).
+
+HANDOFF_LISTS = ("done", "in_progress", "next_steps")
+HANDOFF_KEYS = ("summary",) + HANDOFF_LISTS + ("open_question_ids", "notes")
+HANDOFF_MAX = 8192             # characters of the whole body as JSON
+HANDOFF_TEXT_MAX = 2000        # summary, notes
+HANDOFF_ITEM_MAX = 500         # one list item
+HANDOFF_ITEMS_MAX = 30         # items per list (open_question_ids: 50)
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _session_id(value: object) -> str:
+    sid = _text(value, "session_id", required=True)
+    if not SESSION_ID_RE.match(sid):
+        raise ValueError(f"session_id must be a full session UUID, got {sid!r}")
+    return sid
+
+
+def _str_list(value: object, what: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError(f"{what} must be a list of strings, got {type(value).__name__}")
+    if len(value) > HANDOFF_ITEMS_MAX:
+        raise ValueError(f"{what} has too many items ({len(value)} > {HANDOFF_ITEMS_MAX}); keep it short")
+    out: list[str] = []
+    for x in value:
+        t = _text(x, f"an item of {what}")
+        if t is None:
+            continue
+        if len(t) > HANDOFF_ITEM_MAX:
+            raise ValueError(f"an item of {what} is too long ({len(t)} > {HANDOFF_ITEM_MAX} characters)")
+        out.append(t)
+    return out
+
+
+def handoff_body(value: object) -> dict[str, Any]:
+    """Validate + normalize a hand-off body (a dict or its JSON text): summary (required),
+    done / in_progress / next_steps (lists of short strings; a single string is one item),
+    open_question_ids (task ids), notes. Unknown keys and an oversized body are a ValueError."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as e:
+            raise ValueError(f"the hand-off is not valid JSON: {e}") from None
+    if not isinstance(value, dict):
+        raise ValueError(f"the hand-off must be a JSON object, got {type(value).__name__}")
+    unknown = sorted(set(value) - set(HANDOFF_KEYS))
+    if unknown:
+        raise ValueError(f"unknown hand-off field(s) {unknown} (known: {', '.join(HANDOFF_KEYS)})")
+    summary = _text(value.get("summary"), "summary", required=True)
+    notes = _text(value.get("notes"), "notes")
+    for what, t in (("summary", summary), ("notes", notes)):
+        if t is not None and len(t) > HANDOFF_TEXT_MAX:
+            raise ValueError(f"{what} is too long ({len(t)} > {HANDOFF_TEXT_MAX} characters)")
+    ids_raw = value.get("open_question_ids")
+    if ids_raw is None:
+        ids_raw = []
+    if not isinstance(ids_raw, list) or len(ids_raw) > 50:
+        raise ValueError("open_question_ids must be a list of at most 50 task ids")
+    ids = [_position(x, "an open question id") for x in ids_raw]
+    body: dict[str, Any] = {"summary": summary}
+    for k in HANDOFF_LISTS:
+        body[k] = _str_list(value.get(k), k)
+    body["open_question_ids"] = ids
+    body["notes"] = notes
+    if len(json.dumps(body, ensure_ascii=False)) > HANDOFF_MAX:
+        raise ValueError(f"the hand-off is too long (> {HANDOFF_MAX} characters as JSON); keep it short")
+    return body
+
+
+def _handoff_dict(r: sqlite3.Row) -> Row:
+    return dict(r, body=json.loads(r["body"]))
+
+
+def get_handoff(conn: sqlite3.Connection, handoff_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM handoffs WHERE id=?", (handoff_id,)).fetchone()
+    return _handoff_dict(r) if r else None
+
+
+def add_handoff(conn: sqlite3.Connection, session_id: object, body: object, project: object = None,
+                created_by: str | None = None) -> Row:
+    """A new hand-off for the session. project: a name, path or id (unknown = NotFound); default
+    the project this session is the task-manager of (projects.manager_session), else none."""
+    sid = _session_id(session_id)
+    clean = handoff_body(body)
+    if project is not None:
+        project_id: int | None = _project_row(conn, project)["id"]
+    else:
+        r = conn.execute("SELECT id FROM projects WHERE manager_session=? ORDER BY rank LIMIT 1", (sid,)).fetchone()
+        project_id = r["id"] if r else None
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO handoffs(session_id, project_id, created_at, created_by, body) "
+                           "VALUES (?, ?, ?, ?, ?)",
+                           (sid, project_id, now_iso(), created_by, json.dumps(clean, ensure_ascii=False)))
+        h = get_handoff(conn, _rowid(cur))
+    assert h is not None
+    return h
+
+
+def latest_handoff(conn: sqlite3.Connection, session_id: str, unconsumed: bool = True) -> Row | None:
+    """The session's newest hand-off (only an unconsumed one if `unconsumed`), or None."""
+    sql = "SELECT * FROM handoffs WHERE session_id=?" + (" AND consumed_at IS NULL" if unconsumed else "")
+    r = conn.execute(sql + " ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+    return _handoff_dict(r) if r else None
+
+
+def list_handoffs(conn: sqlite3.Connection, session_id: str | None = None, limit: int = 20) -> list[Row]:
+    """Newest first."""
+    if session_id is None:
+        rows = conn.execute(f"SELECT * FROM handoffs ORDER BY id DESC LIMIT {int(limit)}")
+    else:
+        rows = conn.execute(f"SELECT * FROM handoffs WHERE session_id=? ORDER BY id DESC LIMIT {int(limit)}",
+                            (session_id,))
+    return [_handoff_dict(r) for r in rows]
+
+
+def consume_handoff(conn: sqlite3.Connection, handoff_id: object, start_key: object) -> Row:
+    """Mark the hand-off consumed by the start `start_key` (its dedup key), together with every
+    older unconsumed hand-off of the same session (superseded by it). Already consumed:
+    InvalidTransition."""
+    hid = _position(handoff_id, "handoff id")
+    key = _text(start_key, "start_key", required=True)
+    with transaction(conn):
+        h = get_handoff(conn, hid)
+        if h is None:
+            raise NotFound(f"no hand-off #{hid}")
+        if h["consumed_at"] is not None:
+            raise InvalidTransition(f"hand-off #{hid} was already consumed ({h['consumed_by_start']})")
+        conn.execute("UPDATE handoffs SET consumed_at=?, consumed_by_start=? "
+                     "WHERE session_id=? AND id<=? AND consumed_at IS NULL", (now_iso(), key, h["session_id"], hid))
+        out = get_handoff(conn, hid)
+    assert out is not None
+    return out
+
+
+def render_handoff(h: Mapping[str, Any]) -> str:
+    """A hand-off as one line of text (the continue message is typed with tmux send-keys)."""
+    b = h.get("body") or {}
+    parts = [f"Hand-off #{h.get('id')} (written {h.get('created_at')})."]
+    parts.append(f"Summary: {b.get('summary')}")
+    for k, label in (("done", "Done"), ("in_progress", "In progress"), ("next_steps", "Next steps")):
+        items = b.get(k) or []
+        if items:
+            parts.append(f"{label}: " + " ".join(f"({i}) {x}" for i, x in enumerate(items, 1)))
+    ids = b.get("open_question_ids") or []
+    if ids:
+        parts.append("Open questions (AFClaude tasks): " + ", ".join(f"#{i}" for i in ids))
+    if b.get("notes"):
+        parts.append(f"Notes: {b['notes']}")
+    return " ".join(" ".join(p.split()) for p in parts)
 
 
 # ---------------------------------------------------------------- the DB error path (§7.8, D-171)

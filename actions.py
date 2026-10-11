@@ -675,6 +675,15 @@ SETTINGS: dict[str, Setting] = {
     "fillup_factor": _num(1.10, 1.0, 3.0, "Fill-up start = session reset - (100 - session %) / measured fill "
                           "rate x this factor (D-212)", "budget"),
     # --- automation
+    # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
+    "compaction_enabled": _flag(True, "Compaction (D-144/D-191/D-218): a task-manager whose conversation "
+                                "(transcript) already ran before the current session window is asked to save a hand-off near "
+                                "the end of its session window and is compacted (/compact) at the next start, "
+                                "which then injects the hand-off", "automation"),
+    "handoff_before_reset_min": _num(20, 1, 120, "Compaction: the save prompt goes out this many minutes before "
+                                     "the session reset (or once the session is at session_stop_pct, whichever "
+                                     "comes first); with a fill-up run it is part of the fill-up message",
+                                     "automation"),
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
                                "on); read by the resident runner (phase 3a)", "automation", important=True),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
@@ -965,6 +974,30 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
         return Result(open_, open_["id"], open_, open_, changed=False)
     r = store.add_request(conn, ctx.actor, kind, target)
     return Result(r, r["id"], None, r)
+
+
+# ---------------------------------------------------------------- compaction hand-offs (§5.5)
+
+@action("handoff.write", "handoff")
+def handoff_write(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, body: Any, project: Any = None) -> Result:
+    """A session's hand-off for its compacted self (D-144/D-155): validated by store.handoff_body.
+    Any session may write its own, an autonomous one included (D-185: an agent's direct write);
+    through MCP a session that names itself may not write another session's."""
+    if ctx.session is not None and isinstance(session_id, str) and session_id.strip() != ctx.session:
+        raise Forbidden(f"a session writes only its own hand-off (this is {ctx.session}, not {session_id})")
+    h = store.add_handoff(conn, session_id, body, project, created_by=ctx.actor)
+    return Result(h, h["id"], None, h)
+
+
+@action("handoff.consume", "handoff")
+def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_key: Any) -> Result:
+    """The runner injected the hand-off into the continue message of the start `start_key`:
+    mark it (and the older unconsumed ones of the session) consumed. Not for MCP callers."""
+    if ctx.via == "mcp":
+        raise Forbidden("hand-offs are consumed by the runner, not through MCP")
+    before = store.get_handoff(conn, store._position(handoff_id, "handoff id"))
+    after = store.consume_handoff(conn, handoff_id, start_key)
+    return Result(after, after["id"], before, after)
 
 
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)
