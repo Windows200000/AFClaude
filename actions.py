@@ -59,7 +59,7 @@ import sqlite3
 import string
 import sys
 from collections.abc import Iterable, Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, TypeVar
 from zoneinfo import ZoneInfo
 
@@ -490,7 +490,7 @@ DAYS = schedule.DAYS
 GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
 SESSION_HOURS = afclaude_config.SESSION_LENGTH.total_seconds() / 3600   # 5: one session-limit window
-SECTIONS = ("schedule", "budget", "automation")
+SECTIONS = ("schedule", "budget", "automation", "storage")
 
 
 SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, conn) -> normalized value
@@ -579,6 +579,24 @@ def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, An
         if (g[1], g[2]) != (out[d]["start"], n):
             raise ValueError(f"{d} and {g[0]} are linked (group {w['group']}) but have different windows")
     schedule.check_overlap(out, sh)
+    return out
+
+
+def _log_retention_overrides(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, float]:
+    """{component: days}, overriding log_retention_days for that one app_log component (D-130:
+    this narrows only app_log's own retention, never telemetry or usage data); 1..3650 days,
+    components from LOG_COMPONENTS (checked by name, not import order: LOG_COMPONENTS is defined
+    later in this module, but by the time a setting is actually checked the module is fully
+    loaded). A component not listed here uses log_retention_days."""
+    if not isinstance(v, dict):
+        raise ValueError("must be an object {component: days}")
+    out: dict[str, float] = {}
+    for k, days in v.items():
+        if not isinstance(k, str) or k not in LOG_COMPONENTS:
+            raise ValueError(f"unknown log component {k!r} (known: {', '.join(LOG_COMPONENTS)})")
+        if isinstance(days, bool) or not isinstance(days, (int, float)) or not 1 <= days <= 3650:
+            raise ValueError(f"{k}: must be a number of days in 1..3650, got {days!r}")
+        out[k] = float(days)
     return out
 
 
@@ -696,6 +714,19 @@ SETTINGS: dict[str, Setting] = {
                                            "automation"),
     "cleanup_idle_hours": _num(2, 0.25, 168, "Dispatcher: a tmux session it started is closed after it was "
                                "idle this long after its last turn", "automation"),
+    # --- app_log retention (phase 2d part 2, D-161: everything in the DB; D-130: never drop
+    # usage/telemetry data -- this prunes only the app_log lines). A daily cron run of
+    # `python3 store.py prune-logs` deletes rows older than the retention through actions.log_prune
+    # (audited, actor runner:retention); the no-delete trigger only opens for that one transaction
+    # (store.app_log_prune_gate). Log FILES are untouched (retired separately, later).
+    "log_retention_days": _num(30, 1, 3650, "How many days of app_log lines (keepalive, dispatcher, "
+                               "sampler, watchdog, host_exec, at_shim) to keep before the daily prune "
+                               "deletes them; a component in log_retention_overrides uses that instead",
+                               "storage"),
+    "log_retention_overrides": Setting({}, _log_retention_overrides, 'Per-component days overriding '
+                               'log_retention_days (e.g. {"host_exec": 14} for the noisiest log); a '
+                               'component not listed here uses log_retention_days', section="storage",
+                               kind="component_days"),
 }
 
 
@@ -1422,6 +1453,48 @@ def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tup
                     n += 1
         return {"inserted": n, "present": len(rows) - n}
     return store.retrying(run, conn)
+
+
+def _iso(dt: datetime) -> str:
+    s = store.iso(dt)
+    assert s is not None      # store.iso only returns None for a None input; dt here never is
+    return s
+
+
+def _log_cutoffs(conn: sqlite3.Connection) -> dict[str, str]:
+    """Each log component's cutoff (ISO ts; rows with ts before this are due for deletion):
+    log_retention_days, or log_retention_overrides[component] when that component is listed
+    (D-130: this is purely app_log's own retention, independent of telemetry/usage data)."""
+    default_days = get_setting(conn, "log_retention_days")
+    overrides = get_setting(conn, "log_retention_overrides")
+    now = store._utcnow()
+    return {c: _iso(now - timedelta(days=overrides.get(c, default_days))) for c in LOG_COMPONENTS}
+
+
+def log_prune_preview(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The dry-run: what a `log.prune` action would delete right now, per log_retention_days /
+    log_retention_overrides. Read-only (no gate, no transaction, not an audited action)."""
+    cutoffs = _log_cutoffs(conn)
+    counts = store.app_log_prune_counts(conn, cutoffs)
+    return {"cutoffs": cutoffs, "would_delete": counts, "total": sum(counts.values())}
+
+
+def _check_batch_size(v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 100_000:
+        raise ValueError(f"batch_size must be an integer in 1..100000, got {v!r}")
+    return v
+
+
+@action("log.prune", "app_log")
+def log_prune(conn: sqlite3.Connection, ctx: Ctx, batch_size: Any = 1000) -> Result:
+    """The daily retention prune (D-161/D-130; cron, `python3 store.py prune-logs`): delete
+    app_log rows past log_retention_days / log_retention_overrides, in batches, through the one
+    gated path (store.prune_app_log). Always writes one audit row with the counts, even when
+    nothing was due (so the daily run leaves a trail either way)."""
+    cutoffs = _log_cutoffs(conn)
+    deleted = store.prune_app_log(conn, cutoffs, batch_size=_check_batch_size(batch_size))
+    after = {"deleted": deleted, "total": sum(deleted.values()), "cutoffs": cutoffs, "batch_size": batch_size}
+    return Result(after, "app_log", None, after, changed=True)
 
 
 def job_put(conn: sqlite3.Connection, job: object, *, actor: str, via: str) -> str:
