@@ -239,3 +239,4 @@ NEXT: (1) log retention setting + relax the app_log delete trigger for retention
 
 ## Status 11.10. 23:00 (night run, gate passed 77.1% ≤ 84.5%; budget one session window, stop at 95%)
 Nights 10.10. 04:00, 23:00 and 11.10. 04:00 held (forecast). The 10.10. fill-up was skipped by its budget rule (the run had spent −0.6% more weekly than its estimate). Resumed the 3 stopped subagents (compaction, log retention, one-off ETA review for Thu 15.10. 16:00).
+- 23:10: merged compaction (hand-offs table, save prompt, /compact + resume, transcript-based trigger D-218, repo .claude/settings.json with AFClaude's permissions D-217, tools/test_compact_live.sh) and eta-review-once (usage_review.py --only stage-eta --at; scheduled job 8a6ad98a74ef for Thu 15.10. 16:00 Berlin). Container rebuilt, watcher up. Live /compact test running (allowed by the repo permission rule). Log retention still running. Session 24% at 23:06.
