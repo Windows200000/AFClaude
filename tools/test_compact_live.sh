@@ -66,20 +66,28 @@ print("\n".join(hits))
 PY
 }
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
-# reply_after <path> <iso time>: prints the text of the first finished assistant reply after that time
+# reply_after <path> <iso time>: prints the text blocks of the latest finished assistant
+# message after that time, or nothing if none has a text block yet. A single assistant turn
+# can be split across several jsonl entries (e.g. a thinking-only entry followed by a
+# separate text entry, both with stop_reason end_turn); thinking-only entries are skipped
+# and the caller (wait_reply) keeps polling until a text block shows up.
 reply_after() {
   py "$1" "$2" <<'PY'
 import sys
 import keepalive as ka
 path, since = sys.argv[1], ka.parse_ts(sys.argv[2])
+found = ""
 for e in ka.iter_entries(path):
     if e.get("type") != "assistant" or e.get("isSidechain"):
         continue
     ts = ka.parse_ts(e.get("timestamp"))
     m = e.get("message") or {}
     if ts and ts >= since and m.get("stop_reason") in ("end_turn", "stop_sequence", "max_tokens"):
-        print(" ".join(ka.message_text(e).split())[:200] or "(empty)")
-        break
+        text = " ".join(ka.message_text(e).split())
+        if text:
+            found = text
+if found:
+    print(found[:200])
 PY
 }
 send() {   # the keep-alive's way (ka_resume.sh): literal text, 1 s, Enter
