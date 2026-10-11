@@ -7,7 +7,9 @@ the concurrent read-modify-write of keepalive_state.json (two writers in one pro
 several processes), the fallback to the file (a file changed outside the DB, a broken DB) and
 the dual-writes (dispatcher log, at-shim jobs). Each test uses its own temp DB and data dir;
 never touches the live data/."""
+import contextlib
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -16,7 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402,F401  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
@@ -143,6 +145,76 @@ class Schema(Base):
         audit = store.audit_log(self.conn, target_type="runner_state")
         self.assertEqual(len(audit), 2)
         self.assertEqual(audit[0]["actor"], "runner:keepalive")
+
+    def test_app_log_retention_gate_and_batches(self):
+        """store.prune_app_log (phase 2d part 2, D-161/D-130): the no-delete trigger still blocks
+        an ordinary DELETE/UPDATE on app_log (before, during and after a prune); the gated path
+        deletes only what's due, in several batches when there's more than one batch's worth, and
+        always closes the gate again (even nothing-to-do and an error inside the loop)."""
+        now = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+        old = store.iso(now - timedelta(days=40))
+        fresh = store.iso(now - timedelta(days=1))
+        entries = [(old, "info", f"line {i}") for i in range(25)] + [(fresh, "info", "keep me")]
+        actions.app_log_append(self.conn, "host_exec", entries, actor="runner:host_exec", via="runner")
+        self.assertEqual(self.gate(), 0)
+        for sql in ("DELETE FROM app_log", "UPDATE app_log SET line='x'"):
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.conn.execute(sql)
+        cutoffs = {"host_exec": store.iso(now - timedelta(days=30))}
+        deleted = store.prune_app_log(self.conn, cutoffs, batch_size=7)       # 25 rows, 7 at a time: 4 batches
+        self.assertEqual(deleted, {"host_exec": 25})
+        self.assertEqual(self.gate(), 0)                                     # closed again after the loop
+        rows = self.conn.execute("SELECT line FROM app_log WHERE component='host_exec'").fetchall()
+        self.assertEqual([r[0] for r in rows], ["keep me"])
+        for sql in ("DELETE FROM app_log", "UPDATE app_log SET line='x'"):   # still blocked afterwards
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.conn.execute(sql)
+        self.assertEqual(store.prune_app_log(self.conn, cutoffs), {})        # nothing due: no-op, still closes
+
+    def test_app_log_prune_counts_is_read_only(self):
+        now = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+        actions.app_log_append(self.conn, "sampler",
+                               [(store.iso(now - timedelta(days=d)), "info", f"{d}d") for d in (1, 40, 45)],
+                               actor="runner:sampler", via="runner")
+        cutoffs = {"sampler": store.iso(now - timedelta(days=30))}
+        self.assertEqual(store.app_log_prune_counts(self.conn, cutoffs), {"sampler": 2})
+        self.assertEqual(self.count("app_log"), 3)                           # the count changed nothing
+        self.assertEqual(self.gate(), 0)
+
+    def test_prune_logs_cli_dry_run_and_real(self):
+        now = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+        actions.app_log_append(self.conn, "at_shim",
+                               [(store.iso(now - timedelta(days=d)), "info", f"{d}d") for d in (1, 40)],
+                               actor="runner:at_shim", via="runner")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = store.main(["prune-logs", "--db", store.DB_PATH, "--dry-run"])
+        self.assertEqual(rc, 0)
+        preview = json.loads(out.getvalue())
+        self.assertEqual(preview["would_delete"].get("at_shim"), 1)
+        self.assertEqual(self.count("app_log"), 2)                           # the dry-run changed nothing
+
+        out2 = io.StringIO()
+        with contextlib.redirect_stdout(out2):
+            rc = store.main(["prune-logs", "--db", store.DB_PATH, "--batch-size", "1"])
+        self.assertEqual(rc, 0)
+        result = json.loads(out2.getvalue())
+        self.assertEqual(result["deleted"].get("at_shim"), 1)
+        self.assertEqual(self.count("app_log"), 1)
+        rows = store.audit_log(self.conn, target_type="app_log")
+        self.assertEqual(rows[0]["actor"], "runner:retention")
+        self.assertEqual(rows[0]["via"], "runner")
+
+        out3 = io.StringIO()
+        with contextlib.redirect_stdout(out3):
+            rc = store.main(["prune-logs", "--db", store.DB_PATH, "--batch-size", "0"])    # invalid: a clean error
+        self.assertNotEqual(rc, 0)
+
+    def gate(self):
+        return self.conn.execute("SELECT allowed FROM app_log_prune_gate WHERE id=1").fetchone()[0]
+
+    def count(self, table):
+        return self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
     def test_validation(self):
         for bad in ({"component": "nope"}, {"actor": "evil person"}, {"via": "web"}):

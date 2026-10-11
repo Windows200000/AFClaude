@@ -528,7 +528,8 @@ class SettingActions(Base):
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "automation_paused": False, "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
-                          "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0})
+                          "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
+                          "log_retention_days": 30.0, "log_retention_overrides": {}})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -738,6 +739,68 @@ class RequestActions(Base):
             self.do("request.add", kind="deploy")
 
 
+class LogRetention(Base):
+    """app_log retention (phase 2d part 2, D-161/D-130): log_retention_days /
+    log_retention_overrides, the dry-run preview and the audited log.prune action. The gated
+    DELETE path itself (batching, the trigger) is covered at the store.py level in
+    test_runner_state.py; this is the settings/action layer on top of it."""
+    def seed(self, component, days_old, now=datetime(2026, 10, 1, 0, 0, tzinfo=UTC)):
+        entries = [(store.iso(now - timedelta(days=d)), "info", f"{component} {d}d old") for d in days_old]
+        actions.app_log_append(self.conn, component, entries, actor=f"runner:{component}", via="runner")
+
+    def test_retention_math_default_and_per_component_override(self):
+        self.seed("host_exec", [1, 10, 13, 15, 20, 40])
+        self.seed("keepalive", [1, 20, 40])
+        self.do("setting.set", key="log_retention_overrides", value={"host_exec": 14})
+        preview = actions.log_prune_preview(self.conn)
+        self.assertEqual(preview["would_delete"], {"host_exec": 3, "keepalive": 1})   # host_exec: 15/20/40d; keepalive (30d default): 40d
+        self.assertEqual(preview["total"], 4)
+        self.assertEqual(self.count("app_log"), 9)                            # the dry-run changed nothing
+        self.assertNotIn("sampler", preview["would_delete"])                  # nothing seeded, nothing due
+
+    def test_dry_run_changes_nothing_and_is_not_audited(self):
+        self.seed("sampler", [40, 40])
+        n_audit, n_rows = self.count("audit_log"), self.count("app_log")
+        for _ in range(2):
+            preview = actions.log_prune_preview(self.conn)
+        self.assertEqual(preview["would_delete"], {"sampler": 2})
+        self.assertEqual(self.count("audit_log"), n_audit)
+        self.assertEqual(self.count("app_log"), n_rows)
+
+    def test_log_prune_deletes_through_the_gate_and_is_always_audited(self):
+        self.seed("host_exec", [1, 40])
+        self.seed("watchdog", [40, 45])
+        r = self.do("log.prune", actor="owner", via="dashboard")
+        self.assertEqual(r["deleted"], {"host_exec": 1, "watchdog": 2})
+        self.assertEqual(r["total"], 3)
+        self.assertEqual(self.count("app_log"), 1)                            # only the 1d-old host_exec line
+        rows = self.audit(target_type="app_log")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["action"], rows[0]["after"]["deleted"]), ("log.prune", r["deleted"]))
+        n = self.count("audit_log")
+        self.do("log.prune")                                                  # nothing due: still one audit row
+        self.assertEqual(self.count("audit_log"), n + 1)
+        self.assertEqual(self.audit(target_type="app_log")[-1]["after"]["deleted"], {})
+
+    def test_setting_validation(self):
+        for key, value, msg in (("log_retention_days", 0, "1..3650"), ("log_retention_days", 3651, "1..3650"),
+                                ("log_retention_days", "30", "number"),
+                                ("log_retention_overrides", ["x"], "must be an object"),
+                                ("log_retention_overrides", {"nope": 10}, "unknown log component"),
+                                ("log_retention_overrides", {"host_exec": 0}, "1..3650"),
+                                ("log_retention_overrides", {"host_exec": "14"}, "1..3650")):
+            with self.assertRaisesRegex(ValueError, msg, msg=key):
+                self.do("setting.set", key=key, value=value)
+        r = self.do("setting.set", key="log_retention_overrides", value={"host_exec": 14, "sampler": 7})
+        self.assertEqual(r["value"], {"host_exec": 14.0, "sampler": 7.0})
+
+    def test_batch_size_validation(self):
+        with self.assertRaisesRegex(ValueError, "1..100000"):
+            self.do("log.prune", batch_size=0)
+        with self.assertRaisesRegex(ValueError, "1..100000"):
+            self.do("log.prune", batch_size=True)
+
+
 class EveryAction(Base):
     def test_every_registered_action_writes_one_audit_row(self):
         self.stall(SID)
@@ -760,6 +823,7 @@ class EveryAction(Base):
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
             ("request.add", {"kind": "continue_now", "target": SID}),
+            ("log.prune", {}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):

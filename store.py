@@ -434,8 +434,23 @@ CREATE INDEX IF NOT EXISTS app_log_ts ON app_log(component, ts, id);
 CREATE INDEX IF NOT EXISTS app_log_hash ON app_log(component, line_hash);
 CREATE TRIGGER IF NOT EXISTS app_log_no_update BEFORE UPDATE ON app_log
 BEGIN SELECT RAISE(ABORT, 'app_log is append-only'); END;
-CREATE TRIGGER IF NOT EXISTS app_log_no_delete BEFORE DELETE ON app_log
-BEGIN SELECT RAISE(ABORT, 'app_log is append-only'); END;
+
+-- Retention (phase 2d part 2, D-161/D-130): app_log rows may be deleted ONLY by
+-- prune_app_log(), through the gate row below -- never by hand, and UPDATE stays fully
+-- blocked (trigger above). A trigger on app_log can't reference a TEMP table ("trigger ...
+-- cannot reference objects in database temp"), so the gate is one row of a real table; it is
+-- opened and closed inside the SAME transaction as the deletes (BEGIN IMMEDIATE holds SQLite's
+-- one write lock for its duration, and a crash mid-prune rolls the whole transaction -- gate
+-- included -- back), so no other writer can ever see it open.
+CREATE TABLE IF NOT EXISTS app_log_prune_gate (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    allowed INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO app_log_prune_gate(id, allowed) VALUES (1, 0);
+DROP TRIGGER IF EXISTS app_log_no_delete;
+CREATE TRIGGER IF NOT EXISTS app_log_guarded_delete BEFORE DELETE ON app_log
+WHEN (SELECT allowed FROM app_log_prune_gate WHERE id = 1) = 0
+BEGIN SELECT RAISE(ABORT, 'app_log deletes only through store.prune_app_log (retention)'); END;
 """
 RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log")
 
@@ -1992,6 +2007,64 @@ def app_log_tail(conn: sqlite3.Connection, component: str, limit: int = 100) -> 
     return [str(r[0]) for r in rows]
 
 
+def app_log_prune_counts(conn: sqlite3.Connection, cutoffs: Mapping[str, str]) -> dict[str, int]:
+    """Read-only: how many rows prune_app_log(conn, cutoffs) would delete, per component (only
+    components with at least one row due; D-130 -- this is app_log's own lines, never telemetry
+    or usage data). No gate, no transaction, nothing changes (the dry-run path)."""
+    out: dict[str, int] = {}
+    for component, cutoff in cutoffs.items():
+        n = conn.execute("SELECT COUNT(*) FROM app_log WHERE component=? AND ts<?",
+                         (component, cutoff)).fetchone()[0]
+        if n:
+            out[component] = int(n)
+    return out
+
+
+def prune_app_log(conn: sqlite3.Connection, cutoffs: Mapping[str, str], *, batch_size: int = 1000) -> dict[str, int]:
+    """Delete app_log rows with ts < their component's cutoff (ISO, exclusive), in batches of at
+    most `batch_size` rows per DELETE so one prune never holds the write lock on one huge
+    statement. The append-only trigger (app_log_guarded_delete) blocks every DELETE on app_log
+    except the ones made here, through app_log_prune_gate -- opened and closed in THIS
+    transaction only (see the trigger's comment in RUNNER_SCHEMA): no other connection can ever
+    see the gate open, and a crash mid-prune rolls it (and any partial deletes) back shut with
+    everything else. -> {component: rows deleted}, only components that lost at least one row.
+
+    Deleting rows frees pages to SQLite's internal freelist, not back to the OS: the file itself
+    doesn't shrink unless the database runs in incremental-auto_vacuum mode (PRAGMA
+    incremental_vacuum, attempted below, a no-op in the default mode this database still uses)
+    or is VACUUMed (a one-time, full-file rewrite under an exclusive lock -- an explicit,
+    separate step for the owner to run by hand, not done automatically here)."""
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
+
+    def run() -> dict[str, int]:
+        deleted: dict[str, int] = {}
+        with transaction(conn):
+            conn.execute("UPDATE app_log_prune_gate SET allowed=1 WHERE id=1")
+            try:
+                for component, cutoff in cutoffs.items():
+                    total = 0
+                    while True:
+                        cur = conn.execute(
+                            "DELETE FROM app_log WHERE id IN (SELECT id FROM app_log WHERE component=? "
+                            "AND ts<? ORDER BY id LIMIT ?)", (component, cutoff, batch_size))
+                        total += cur.rowcount
+                        if cur.rowcount < batch_size:
+                            break
+                    if total:
+                        deleted[component] = total
+            finally:
+                conn.execute("UPDATE app_log_prune_gate SET allowed=0 WHERE id=1")
+        return deleted
+    out = retrying(run, conn)
+    if any(out.values()):
+        try:
+            conn.execute("PRAGMA incremental_vacuum")
+        except sqlite3.Error:
+            pass
+    return out
+
+
 def get_job(conn: sqlite3.Connection, job_id: str) -> Row | None:
     r = conn.execute("SELECT * FROM scheduled_jobs WHERE id=?", (job_id,)).fetchone()
     return dict(r) if r else None
@@ -2500,7 +2573,34 @@ def main(argv: list[str] | None = None) -> int:
                                              "runner_state.py)")
     rs.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     rs.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
+    pl = sub.add_parser("prune-logs", help="delete app_log rows past their retention (log_retention_days / "
+                                           "log_retention_overrides, actions.SETTINGS); batched and audited "
+                                           "(actor runner:retention); meant to run once a day from cron")
+    pl.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    pl.add_argument("--dry-run", action="store_true", help="count what is due, change nothing")
+    pl.add_argument("--batch-size", type=int, default=1000, help="rows per DELETE statement (default 1000)")
     args = ap.parse_args(argv)
+    if args.cmd == "prune-logs":
+        import importlib
+        actions = importlib.import_module("actions")
+        try:
+            conn = connect(args.db)
+        except DBError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        try:
+            if args.dry_run:
+                print(json.dumps(actions.log_prune_preview(conn), ensure_ascii=False))
+                return 0
+            out = actions.perform(conn, "log.prune", {"batch_size": args.batch_size},
+                                  actor="runner:retention", via="runner")
+            print(json.dumps(out, ensure_ascii=False))
+            return 0
+        except (DBError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
     if args.cmd == "import-state":
         import importlib
         runner_state = importlib.import_module("runner_state")
