@@ -494,5 +494,54 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
                         "created": bt(h["created_at"]), "saved": "HANDOFF SAVED"}))
 
 
+@tool("A project's docs in the AFClaude DB (D-161): progress, exceptions, alerts (logs: entries are appended), "
+      "goals and review:<name> (whole documents, each change a new version). action: list (the project's docs); "
+      "show (name; a log shows its newest `entries` entries, default 10, a document its whole text); append "
+      "(name, text: one entry for a log, a newline is added if missing); set (name, text: the whole new text, "
+      "optional version = the one you read). project: name or directory, default the calling session's. "
+      "For now the files (PROGRESS.md, GOALS.md, ...) are still the source and are imported into the DB; "
+      "write through this tool only when your instructions say so.")
+async def afclaude_doc(action: Literal["list", "show", "append", "set"], name: Optional[str] = None,
+                       text: Optional[str] = None, project: Optional[str] = None, entries: int = 10,
+                       version: Optional[int] = None, ctx: Optional[Context] = None) -> str:
+    if project is None or not project.strip():
+        project, _ = await caller_dir(ctx)
+        if project is None:
+            raise ValueError("the calling session's project is unknown here: pass project")
+    else:
+        project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        p = store.get_project(conn, project)
+        if p is None:
+            raise store.NotFound(f"no project {project!r}")
+        if action == "list":
+            return out({"project": p["name"], "docs": [
+                compact({"name": d["name"], "kind": d["kind"], "entries": d["entries"], "version": d["version"],
+                         "updated": bt(d["updated_at"]), "updated_by": d["updated_by"]})
+                for d in store.list_docs(conn, p["id"])]})
+        if not name:
+            raise ValueError(f"{action} needs name")
+        if action == "show":
+            doc = store.get_doc(conn, p["id"], name)
+            if doc is None:
+                raise store.NotFound(f"no doc {name!r} for {p['name']}")
+            base = {"project": p["name"], "name": name, "kind": doc["kind"], "version": doc["version"]}
+            if doc["kind"] == "log":
+                rows = store.doc_entries(conn, doc["id"], max(1, min(int(entries), 200)))
+                return out(dict(base, entries=[compact({"id": e["id"], "op": e["op"], "at": bt(e["ts"]),
+                                                        "by": e["author"], "text": e["body"]}) for e in rows]))
+            return out(dict(base, text=store.doc_render(conn, doc["id"])))
+        if text is None:
+            raise ValueError(f"{action} needs text")
+        if action == "append":
+            r = act(conn, "doc.append", project=p["name"], name=name, text=text if text.endswith("\n") else text + "\n")
+        else:
+            r = act(conn, "doc.set", project=p["name"], name=name, text=text, version=version)
+        return out(compact(r))
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     server.run("stdio")

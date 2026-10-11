@@ -78,7 +78,8 @@ PROMPTS_DIR = os.path.join(HERE, "prompts")
 PROMPT_MAX = 16 * 1024
 # §6.3 size limits, for writes from the dashboard (the CLI and MCP keep their old behaviour)
 DASHBOARD_LIMITS = {"title": 200, "name": 200, "answer": 8192, "question": 8192, "description": 16384,
-                    "note": 2000, "reason": 2000, "summary": 8192, "path": 1024, "match": 1024}
+                    "note": 2000, "reason": 2000, "summary": 8192, "path": 1024, "match": 1024,
+                    "text": 65536}
 
 
 class Conflict(store.InvalidTransition):
@@ -1029,6 +1030,128 @@ def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_k
     before = store.get_handoff(conn, store._position(handoff_id, "handoff id"))
     after = store.consume_handoff(conn, handoff_id, start_key)
     return Result(after, after["id"], before, after)
+
+
+# ---------------------------------------------------------------- project docs (phase 2d part 2, §7.2, §7.7)
+#
+# PROGRESS / GOALS / EXCEPTIONS / ALERTS / review reports per project (store.DOCS_SCHEMA; the files are
+# mapped by project_docs.py). The entries are append-only; the audit row names the entry (id, op,
+# size, sha256), not its text, which is in doc_entries already. D-185/D-182: a project's docs are
+# written by its task-manager (agents propose); the roles that enforce this come with phase 5a,
+# until then any CLI/MCP caller may write (like tasks).
+
+def _doc_ref(conn: sqlite3.Connection, project: Any, name: Any) -> tuple[store.Row, str]:
+    p = store._project_row(conn, project)
+    store.doc_kind(name)
+    return p, str(name)
+
+
+def _doc_state(conn: sqlite3.Connection, doc: store.Row | None) -> dict[str, Any] | None:
+    if doc is None:
+        return None
+    text = store.doc_render(conn, doc["id"])
+    return {"chars": len(text), "sha256": store.sha256_text(text), "last_entry": store.doc_last_entry(conn, doc["id"])}
+
+
+def _doc_result(doc: store.Row, project: store.Row, **extra: Any) -> dict[str, Any]:
+    return dict({"project": project["name"], "name": doc["name"], "kind": doc["kind"]}, **extra)
+
+
+@action("doc.append", "doc")
+def doc_append(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: Any) -> Result:
+    """Append an entry to a log doc (progress, exceptions, alerts), exactly as given: the caller
+    adds the trailing newline (tasks.py and the MCP tool do)."""
+    p, n = _doc_ref(conn, project, name)
+    if store.doc_kind(n) != "log":
+        raise ValueError(f"{n} is a whole document, not a log: use doc.set")
+    body = store.doc_text(text)
+    doc = store.ensure_doc(conn, p["id"], n, ctx.actor)
+    eid = store.add_doc_entry(conn, doc["id"], "append", body, ctx.actor, ctx.via)
+    after = {"entry": eid, "op": "append", "chars": len(body), "sha256": store.sha256_text(body)}
+    return Result(_doc_result(doc, p, entry=eid), f"{p['name']}/{n}", None, after, changed=True)
+
+
+@action("doc.set", "doc")
+def doc_set(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: Any, version: Any = None) -> Result:
+    """Replace a doc's whole text (goals, a review; for a log a full rewrite): one 'replace' entry,
+    the earlier versions stay as history. The same text again is a no-op."""
+    p, n = _doc_ref(conn, project, name)
+    body = store.doc_text(text, allow_empty=True)
+    doc = store.get_doc(conn, p["id"], n)
+    _check_version(doc, version, f"doc {p['name']}/{n}")
+    before = _doc_state(conn, doc)
+    if doc is not None and store.doc_render(conn, doc["id"]) == body:
+        return Result(_doc_result(doc, p, entry=None, unchanged=True), f"{p['name']}/{n}", before, before,
+                      changed=False)
+    doc = doc if doc is not None else store.ensure_doc(conn, p["id"], n, ctx.actor)
+    eid = store.add_doc_entry(conn, doc["id"], "replace", body, ctx.actor, ctx.via)
+    after = {"entry": eid, "op": "replace", "chars": len(body), "sha256": store.sha256_text(body)}
+    return Result(_doc_result(doc, p, entry=eid), f"{p['name']}/{n}", before, after, changed=True)
+
+
+def doc_sync_plan(kind: str, chunks: list[str], text: str) -> tuple[int, list[str]] | None:
+    """How to make a doc whose current entries are `chunks` read `text`: None = it already does;
+    else (keep, new): keep the first `keep` entries, then add `new` (keep == len(chunks): plain
+    appends; less: the first of `new` is a 'replace' entry with that keep). A log keeps the longest
+    run of whole entries the text starts with and cuts the rest of the text into entries
+    (store.split_chunks); a body doc is replaced as a whole."""
+    if "".join(chunks) == text:
+        return None
+    if kind == "body":
+        return 0, [text]
+    keep, pos = 0, 0
+    while keep < len(chunks) and text.startswith(chunks[keep], pos):
+        pos += len(chunks[keep])
+        keep += 1
+    new = store.split_chunks(text[pos:])
+    if keep < len(chunks) and not new:
+        new = [""]          # the text ends where an entry began: a replace with an empty body cuts the rest
+    return keep, new
+
+
+@action("doc.sync", "doc")
+def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: Any, force: Any = False) -> Result:
+    """The dual-write importer for one doc (project_docs.py): make the DB read like the file `text`
+    while the files are still edited by hand, idempotently, and record the sync mark.
+      - the file reads like the DB: in sync (the mark is moved to it);
+      - the file is unchanged since the last sync but the DB moved on (doc.append/doc.set): the
+        DB is ahead, nothing is imported (the export writes it out);
+      - the file changed: its new text is imported (appends; an in-place edit of a log is one
+        'replace' entry keeping the unchanged entries, plus the changed tail);
+      - both changed and the import would drop DB text written since the last sync: Conflict,
+        nothing written, unless force (the file wins; the dropped entries stay in the history)."""
+    p, n = _doc_ref(conn, project, name)
+    body = store.doc_text(text, allow_empty=True)
+    kind = store.doc_kind(n)
+    doc = store.ensure_doc(conn, p["id"], n, ctx.actor)
+    chunks = store.doc_chunks(conn, doc["id"])
+    last = store.doc_last_entry(conn, doc["id"])
+    sha = store.sha256_text(body)
+    before = {"chars": len("".join(chunks)), "entries": len(chunks), "last_entry": last}
+    target = f"{p['name']}/{n}"
+    plan = doc_sync_plan(kind, chunks, body)
+    if plan is None:
+        store.set_doc_mark(conn, doc["id"], sha, last)
+        return Result(_doc_result(doc, p, outcome="in_sync", appended=0), target, before, before, changed=False)
+    if doc["file_sha256"] == sha:
+        return Result(_doc_result(doc, p, outcome="db_ahead", appended=0), target, before, before, changed=False)
+    keep, new = plan
+    db_moved = last > (doc["file_entry"] or 0) if doc["file_sha256"] is not None else last > 0
+    if db_moved and keep < len(chunks) and not _bool(force):
+        raise Conflict(f"doc {target}: the file and the DB both changed since the last sync, and importing the "
+                       f"file would drop DB text written since then (entries after #{doc['file_entry'] or 0}); "
+                       "export or merge by hand, or import with force (the file wins)")
+    first = True
+    for chunk in new:
+        replace = first and (kind == "body" or keep < len(chunks))     # a body doc changes by replace only
+        last = store.add_doc_entry(conn, doc["id"], "replace" if replace else "append", chunk, ctx.actor, ctx.via,
+                                   keep=keep if replace else 0)
+        first = False
+    store.set_doc_mark(conn, doc["id"], sha, last)
+    after = {"chars": len(body), "entries": keep + len(new), "last_entry": last,
+             "kept": keep, "added": len(new), "replaced": keep < len(chunks)}
+    return Result(_doc_result(doc, p, outcome="imported", appended=len(new), kept=keep,
+                              replaced=keep < len(chunks)), target, before, after, changed=True)
 
 
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)

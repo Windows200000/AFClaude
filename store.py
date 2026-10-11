@@ -34,7 +34,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                and the telemetry tables of dashboard phase 2c (D-161; telemetry.py, the
                actions.py appenders, `python3 store.py import-telemetry`), and the
                runner state of phase 2d (RUNNER_SCHEMA: runner_state, scheduled_jobs,
-               app_log; runner_state.py, `python3 store.py import-state`).
+               app_log; runner_state.py, `python3 store.py import-state`), and the
+               project docs of phase 2d part 2 (DOCS_SCHEMA: docs, doc_entries;
+               project_docs.py, `python3 store.py import-docs`).
                The handoffs table (compaction hand-offs, D-144/D-155, design §5.5)
                is additive the same way: no version bump, which would make every
                process still running older code (the keep-alive watcher) see the
@@ -475,6 +477,59 @@ BEGIN SELECT RAISE(ABORT, 'app_log deletes only through store.prune_app_log (ret
 """
 RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log")
 
+# ---- project docs (dashboard phase 2d part 2, D-161, D-152, D-181; §7.2, §7.7): PROGRESS, GOALS,
+# EXCEPTIONS, ALERTS and the review reports per project (project_docs.py maps the files; actions.py
+# writes: doc.append / doc.set / doc.sync). One table of documents and ONE append-only table of
+# their entries, for both kinds:
+#   kind 'log'  (progress, exceptions, alerts): the text is the concatenation of its entries; a
+#               writer appends ('append'). An in-place edit of the file (dual-write period) is a
+#               'replace' entry: keep the first `keep` entries of the current version, then this body
+#               (the changed tail follows as appends), so history stays append-only and small.
+#   kind 'body' (goals, review:<name>): every change is one 'replace' (keep 0) holding the whole new
+#               body: the current version is the newest one, the earlier ones are its history.
+# The current text (doc_render) is byte-identical to the file it came from, so the public build log
+# (PROGRESS.md, GOALS.md, EXCEPTIONS.md) can be regenerated from the DB with no diff (§7.7).
+# docs.file_sha256/file_entry: the dual-write sync mark (the file as the last import or export saw
+# or wrote it, and the newest entry id then), so the importer can tell "the file changed" from "the
+# DB moved on" and never drops a DB entry silently (project_docs.py, actions.doc_sync).
+DOCS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS docs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,           -- progress | goals | exceptions | alerts | review:<name>
+    kind        TEXT NOT NULL CHECK (kind IN ('log', 'body')),
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT NOT NULL,
+    file_sha256 TEXT,                    -- sync mark: sha256 of the file at the last import/export
+    file_entry  INTEGER,                 -- sync mark: the newest doc_entries.id at that time
+    version     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (project_id, name)
+);
+CREATE TRIGGER IF NOT EXISTS docs_version AFTER UPDATE ON docs FOR EACH ROW WHEN NEW.version IS OLD.version
+BEGIN UPDATE docs SET version = OLD.version + 1 WHERE id = NEW.id; END;
+CREATE TRIGGER IF NOT EXISTS docs_no_delete BEFORE DELETE ON docs
+BEGIN SELECT RAISE(ABORT, 'docs are never deleted'); END;
+
+CREATE TABLE IF NOT EXISTS doc_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id      INTEGER NOT NULL REFERENCES docs(id),
+    op          TEXT NOT NULL CHECK (op IN ('append', 'replace')),
+    keep        INTEGER NOT NULL DEFAULT 0 CHECK (keep >= 0),   -- replace: current entries kept before body
+    ts          TEXT NOT NULL,
+    author      TEXT NOT NULL,           -- the actor (cli, mcp:<session>, runner:import, ...)
+    via         TEXT NOT NULL,
+    body        TEXT NOT NULL,           -- the exact text (no newline added or stripped)
+    body_sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS doc_entries_doc ON doc_entries(doc_id, id);
+CREATE TRIGGER IF NOT EXISTS doc_entries_no_update BEFORE UPDATE ON doc_entries
+BEGIN SELECT RAISE(ABORT, 'doc_entries is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS doc_entries_no_delete BEFORE DELETE ON doc_entries
+BEGIN SELECT RAISE(ABORT, 'doc_entries is append-only'); END;
+"""
+
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
 # read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
@@ -586,6 +641,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.executescript(TELEMETRY_SCHEMA)
     conn.executescript(RUNNER_SCHEMA)
+    conn.executescript(DOCS_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
                      (DEFAULT_ACCOUNT, "this installation's Claude account", now_iso()))
@@ -2279,6 +2335,145 @@ def render_handoff(h: Mapping[str, Any]) -> str:
     return " ".join(" ".join(p.split()) for p in parts)
 
 
+# ---------------------------------------------------------------- project docs (phase 2d part 2)
+#
+# DOCS_SCHEMA above: docs + the append-only doc_entries. These are the reads and the raw writes;
+# actions.py (doc.append, doc.set, doc.sync) is the only caller of the writes.
+
+DOC_KINDS = ("log", "body")
+DOC_OPS = ("append", "replace")
+DOC_NAMES = {"progress": "log", "exceptions": "log", "alerts": "log", "goals": "body"}
+DOC_REVIEW_RE = re.compile(r"^review:[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")   # data/reviews/<name>.md: 'body'
+DOC_BODY_MAX = 4 * 1024 * 1024        # characters of one entry (PROGRESS.md is ~70 KB today)
+# Where an imported text is cut into entries (presentation only: the entries' concatenation is the
+# text, byte for byte): before a heading, a top-level list item or a table row.
+DOC_CHUNK_RE = re.compile(r"^(?:#{1,6} |- |\* |\| )")
+
+
+def doc_kind(name: object) -> str:
+    """The kind of a doc name ('log' | 'body'); ValueError for an unknown name."""
+    if isinstance(name, str) and name in DOC_NAMES:
+        return DOC_NAMES[name]
+    if isinstance(name, str) and DOC_REVIEW_RE.match(name):
+        return "body"
+    raise ValueError(f"doc name must be one of {'|'.join(DOC_NAMES)} or review:<name>, got {name!r}")
+
+
+def doc_text(value: object, what: str = "text", allow_empty: bool = False) -> str:
+    """A doc body exactly as given (nothing stripped): a string without NUL, at most DOC_BODY_MAX."""
+    if not isinstance(value, str):
+        raise ValueError(f"{what} must be a string, got {type(value).__name__}")
+    if "\0" in value:
+        raise ValueError(f"{what} must not contain NUL characters")
+    if len(value) > DOC_BODY_MAX:
+        raise ValueError(f"{what} is too long ({len(value)} > {DOC_BODY_MAX} characters)")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{what} must not be empty")
+    return value
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def split_chunks(text: str) -> list[str]:
+    """Cut a text into entries at DOC_CHUNK_RE line starts; "".join(result) == text."""
+    out: list[str] = []
+    cur = ""
+    for line in text.splitlines(keepends=True):
+        if cur and DOC_CHUNK_RE.match(line):
+            out.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        out.append(cur)
+    return out
+
+
+def get_doc(conn: sqlite3.Connection, project_id: int, name: str) -> Row | None:
+    r = conn.execute("SELECT * FROM docs WHERE project_id=? AND name=?", (project_id, name)).fetchone()
+    return dict(r) if r else None
+
+
+def ensure_doc(conn: sqlite3.Connection, project_id: int, name: str, actor: str) -> Row:
+    """The doc (created empty if missing; its kind follows from the name)."""
+    d = get_doc(conn, project_id, name)
+    if d is not None:
+        return d
+    now = now_iso()
+    conn.execute("INSERT INTO docs(project_id, name, kind, created_at, created_by, updated_at, updated_by) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, name, doc_kind(name), now, actor, now, actor))
+    d = get_doc(conn, project_id, name)
+    assert d is not None
+    return d
+
+
+def doc_chunks(conn: sqlite3.Connection, doc_id: int) -> list[str]:
+    """The current version as its entries' bodies, in order (append: add one; replace: keep the
+    first `keep`, then add its body)."""
+    chunks: list[str] = []
+    for r in conn.execute("SELECT op, keep, body FROM doc_entries WHERE doc_id=? ORDER BY id", (doc_id,)):
+        if r["op"] == "replace":
+            del chunks[int(r["keep"]):]
+        chunks.append(r["body"])
+    return chunks
+
+
+def doc_render(conn: sqlite3.Connection, doc_id: int) -> str:
+    """The doc's current text (byte-identical to the file it was imported from)."""
+    return "".join(doc_chunks(conn, doc_id))
+
+
+def doc_last_entry(conn: sqlite3.Connection, doc_id: int) -> int:
+    """The newest entry id of the doc (0: none)."""
+    return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM doc_entries WHERE doc_id=?", (doc_id,)).fetchone()[0])
+
+
+def add_doc_entry(conn: sqlite3.Connection, doc_id: int, op: str, body: str, actor: str, via: str,
+                  keep: int = 0) -> int:
+    """Append one entry (and touch the doc's updated_at/by). -> its id. Run inside a transaction."""
+    _enum(op, DOC_OPS, "op")
+    if op == "append" and keep:
+        raise ValueError("keep applies to a replace only")
+    now = now_iso()
+    cur = conn.execute("INSERT INTO doc_entries(doc_id, op, keep, ts, author, via, body, body_sha256) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (doc_id, op, keep, now, actor, via, body, sha256_text(body)))
+    conn.execute("UPDATE docs SET updated_at=?, updated_by=? WHERE id=?", (now, actor, doc_id))
+    return _rowid(cur)
+
+
+def set_doc_mark(conn: sqlite3.Connection, doc_id: int, file_sha256: str, entry: int) -> bool:
+    """Record the dual-write sync mark (only if it changed). -> whether it changed."""
+    cur = conn.execute("UPDATE docs SET file_sha256=?, file_entry=? WHERE id=? AND "
+                       "(file_sha256 IS NOT ? OR file_entry IS NOT ?)", (file_sha256, entry, doc_id, file_sha256, entry))
+    return cur.rowcount > 0
+
+
+def list_docs(conn: sqlite3.Connection, project_id: int | None = None) -> list[Row]:
+    """Docs (of one project, or all) with their entry counts, by project and name."""
+    sql = ("SELECT d.*, p.name AS project, (SELECT COUNT(*) FROM doc_entries e WHERE e.doc_id = d.id) AS entries "
+           "FROM docs d JOIN projects p ON p.id = d.project_id")
+    if project_id is None:
+        rows = conn.execute(sql + " ORDER BY p.name, d.name")
+    else:
+        rows = conn.execute(sql + " WHERE d.project_id=? ORDER BY d.name", (project_id,))
+    return [dict(r) for r in rows]
+
+
+def doc_entries(conn: sqlite3.Connection, doc_id: int, limit: int = 20) -> list[Row]:
+    """The doc's newest entries (all ops), oldest first."""
+    rows = conn.execute("SELECT * FROM (SELECT * FROM doc_entries WHERE doc_id=? ORDER BY id DESC LIMIT ?) "
+                        "ORDER BY id", (doc_id, int(limit)))
+    return [dict(r) for r in rows]
+
+
+def doc_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Entries per doc, as 'project/name'."""
+    return {f"{r[0]}/{r[1]}": int(r[2]) for r in conn.execute(
+        "SELECT p.name, d.name, COUNT(e.id) FROM docs d JOIN projects p ON p.id = d.project_id "
+        "LEFT JOIN doc_entries e ON e.doc_id = d.id GROUP BY d.id ORDER BY p.name, d.name")}
+
+
 # ---------------------------------------------------------------- the DB error path (§7.8, D-171)
 #
 # Every DB access goes through one error path: retrying() (connect() and actions.perform use
@@ -2755,6 +2950,12 @@ def main(argv: list[str] | None = None) -> int:
                                              "runner_state.py)")
     rs.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     rs.add_argument("--data-dir", default=None, help="the files' directory (default: the database's)")
+    dc = sub.add_parser("import-docs", help="import the project docs (PROGRESS.md, GOALS.md, EXCEPTIONS.md, "
+                                            "ALERTS.md, data/reviews/*.md) into the DB (idempotent, the files "
+                                            "are not changed; project_docs.py)")
+    dc.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    dc.add_argument("--repo", default=None, help="the project's directory holding the files (default: this repo)")
+    dc.add_argument("--reviews-dir", default=None, help="the review reports (default: <the database's dir>/reviews)")
     pl = sub.add_parser("prune-logs", help="delete app_log rows past their retention (log_retention_days / "
                                            "log_retention_overrides, actions.SETTINGS); batched and audited "
                                            "(actor runner:retention); meant to run once a day from cron")
@@ -2783,6 +2984,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         finally:
             conn.close()
+    if args.cmd == "import-docs":
+        import importlib
+        project_docs = importlib.import_module("project_docs")
+        argv4 = ["import"] + (["--db", args.db] if args.db else []) + \
+            (["--repo", args.repo] if args.repo else []) + \
+            (["--reviews-dir", args.reviews_dir] if args.reviews_dir else [])
+        return int(project_docs.main(argv4))
     if args.cmd == "import-state":
         import importlib
         runner_state = importlib.import_module("runner_state")
