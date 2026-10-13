@@ -24,7 +24,7 @@ import actions  # noqa: E402
 
 DB = os.environ["AFCLAUDE_DB"]
 store.DB_PATH = DB
-store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes ALERTS.md
+store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes the alerts doc
 store.connect(DB, create=True).close()   # explicit, like a real install's setup: an empty DB, no
                                           # "no database" log line from the settings reads
 
@@ -65,5 +65,27 @@ def clear_settings(db=None):
     try:
         with store.transaction(conn):
             conn.execute("DELETE FROM settings")
+    finally:
+        conn.close()
+
+
+def notes_project(directory, db=None):
+    """A project whose directory is `directory` (created once): the runners' notes for it
+    (keepalive.progress_note, notify.py; the DB, design §7.7) land in its progress doc."""
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        if store.get_project(conn, directory) is None:
+            store.add_project(conn, "notes-" + os.path.basename(os.path.normpath(directory)), None, directory)
+    finally:
+        conn.close()
+
+
+def notes(directory, name="progress", db=None):
+    """The text of the doc `name` (default progress) of the project of `directory` ("" if none)."""
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        p = store.get_project(conn, directory)
+        d = store.get_doc(conn, p["id"], name) if p is not None else None
+        return store.doc_render(conn, d["id"]) if d is not None else ""
     finally:
         conn.close()

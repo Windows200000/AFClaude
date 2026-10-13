@@ -70,6 +70,34 @@ class BuildStages(unittest.TestCase):
                 store.DB_PATH, qv.STAGES_PROJECT = old_path, old_proj
 
 
+class DocsFromTheDb(unittest.TestCase):
+    """PROGRESS/GOALS/ALERTS/EXCEPTIONS come from the project docs in the DB (design §7.7: the
+    runners' notes and the alerts are only there); the file only when the DB has no such doc."""
+    def test_db_text_wins_file_is_the_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_here = qv.HERE
+            qv.HERE = d
+            try:
+                testenv.notes_project(d)
+                src = os.path.join(d, "PROGRESS.md")
+                with open(src, "w") as fh:
+                    fh.write("- from the file\n")
+                text, at = qv.doc_source("PROGRESS.md", src)
+                self.assertEqual(text, "- from the file\n")                 # no doc yet: the file
+                conn = store.connect()
+                try:
+                    actions.perform(conn, "doc.append", {"project": "notes-" + os.path.basename(d), "name": "alerts",
+                                                         "text": "- **x** alert\n"}, actor="runner:notify", via="runner")
+                finally:
+                    conn.close()
+                text, at = qv.doc_source("ALERTS.md", os.path.join(d, "ALERTS.md"))
+                self.assertEqual(text, "- **x** alert\n")                    # no file at all: the DB
+                self.assertIsNotNone(at)
+                self.assertEqual(qv.doc_source("README.md", os.path.join(d, "README.md")), (None, None))
+            finally:
+                qv.HERE = old_here
+
+
 class PreviewMarker(unittest.TestCase):
     """D-211: status.json carries preview_from (the step key from which a non-blocking owner
     preview build is possible); the page outlines the chip of the phase containing that step."""

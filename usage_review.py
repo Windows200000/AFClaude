@@ -7,8 +7,17 @@ public) or user-specific (the user model in the DB, local only). It starts a NEW
 Opus 5.5 session at MEDIUM effort (tmux, Remote-Control visible, via ka_resume.sh)
 with prompts/usage_review.md + stage_eta_review.md (the rare stage-ETA review, D-213:
 it tunes the stages' session estimates only) + guard_respect.md + manager.md, and runs
-without user input. The results are surfaced via PROGRESS.md, a push, and an "unread review"
-memory entry that the user's next conversation picks up.
+without user input. The report is the review doc review:<date> in the DB (`tasks.py doc set`,
+design §7.7; the old data/reviews/<date>.md files are legacy, still imported); the results are
+surfaced via the progress doc, a push, and an "unread review" memory entry that the user's next
+conversation picks up.
+
+usage_reviews (the review docs' structured part, D-161, design §7.2): every launch is a record
+in the DB (telemetry kind usage.review, keyed by the session id): which reviews, one-off or
+monthly, when, the report doc, and its status (started -> finished / no_report, or
+launch_failed / timed_out); the hourly cron run (track_reviews) marks a started review
+finished once its report doc exists and its session went idle, or no_report after
+REVIEW_REPORT_DEADLINE.
 
 Schedule: at `next_run_at` in its state (the DB, runner_state "usage_review"). The first run is Thu 2026-10-01 17:00
 Berlin, 2 h before that week's reset, so it spends quota that would expire anyway.
@@ -39,7 +48,7 @@ Chained one-off (--only usage,stage-eta, D-228): the owner asked for an extra us
 the already-scheduled one-off ETA review right after it, at the same time. The ETA review only
 needs the usage review's RESULT (the forecast it fits), not its working context, so this does
 NOT run them in one session: it fires the one-off usage review, waits (bounded, see
-USAGE_DONE_TIMEOUT below) for it to reliably finish -- its report data/reviews/<date>.md written
+USAGE_DONE_TIMEOUT below) for it to reliably finish -- its report doc review:<date> written
 AND its session gone idle (session_idle(); D-224's explicit stop-marker CLI does not exist yet,
 so this is the strongest signal available) -- then fires a SEPARATE fresh session for the one-off
 ETA review, whose brief (prompts/stage_eta_review_once_after_usage.md) points at the finished
@@ -65,6 +74,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
+import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
+import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
@@ -82,6 +93,9 @@ ONLY_ORDER = ("usage", "stage-eta")
 AT_TIME_FMT = "%Y-%m-%d %H:%M"
 USAGE_DONE_TIMEOUT = timedelta(hours=6)    # D-228 chain: how long to wait for the usage review
 USAGE_DONE_POLL = timedelta(minutes=5)     # before giving up (alert) and never firing the ETA leg
+REVIEW_REPORT_DEADLINE = timedelta(hours=24)   # a started review without its report doc by then: no_report
+REVIEWS_DIR = os.path.join(HERE, "data", "reviews")   # legacy report files (before the §7.7 switch)
+ACTOR = "runner:usage_review"
 
 
 def load():
@@ -112,6 +126,62 @@ def db_problem():
     return problem
 
 
+def report_doc(now):
+    """The review doc of a review started at `now`: review:<Berlin date>."""
+    return f"review:{now.astimezone(ka.BERLIN).date().isoformat()}"
+
+
+def report_ready(report):
+    """The report doc `report` (review:<date>) exists in the DB, or (a review that still wrote the
+    legacy file) data/reviews/<date>.md does. A DB read error counts as not ready."""
+    try:
+        if project_docs.doc_text(report) is not None:
+            return True
+    except Exception as e:  # noqa: BLE001 - a status check; the next poll retries
+        ka.log(f"usage review: the report doc {report} could not be read ({type(e).__name__}: {e})")
+    return os.path.exists(os.path.join(REVIEWS_DIR, report.split(":", 1)[-1] + ".md"))
+
+
+def record_review(sid, reviews, now, ok, rc, one_off, **extra):
+    """The usage_reviews record of a launch (telemetry kind usage.review, the DB; never raises)."""
+    rec = {"review_id": sid, "session": sid, "reviews": list(reviews), "one_off": one_off,
+           "date": now.astimezone(ka.BERLIN).date().isoformat(), "started_at": now.isoformat(),
+           "report_doc": report_doc(now), "status": "started" if ok else "launch_failed", "rc": rc,
+           "final": not ok}
+    rec.update(extra)
+    telemetry.write_records("usage.review", [rec], actor=ACTOR)
+    return rec
+
+
+def finish_review(sid, status, now):
+    """Mark the record of review session `sid` final with `status` (finished / no_report /
+    timed_out). -> the record, None if there is none."""
+    for rec in telemetry.read_records("usage.review"):
+        if rec.get("review_id") == sid:
+            rec.update(status=status, final=True, finished_at=now.isoformat())
+            telemetry.write_records("usage.review", [rec], actor=ACTOR)
+            return rec
+    return None
+
+
+def track_reviews(now):
+    """The hourly check of the started reviews: finished once the report doc exists and the session
+    went idle; no_report once REVIEW_REPORT_DEADLINE passed without one. -> the records changed."""
+    changed = []
+    for rec in telemetry.read_records("usage.review"):
+        if rec.get("final") or rec.get("status") != "started":
+            continue
+        try:
+            started = datetime.fromisoformat(rec["started_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if report_ready(rec.get("report_doc") or report_doc(started)) and session_idle(rec["review_id"], now):
+            changed.append(finish_review(rec["review_id"], "finished", now))
+        elif now - started >= REVIEW_REPORT_DEADLINE:
+            changed.append(finish_review(rec["review_id"], "no_report", now))
+    return [c for c in changed if c]
+
+
 def next_run_after(now):
     """2 h before the first weekly reset >= MIN_GAP_DAYS from now."""
     u = ka.read_usage_cache() or {}
@@ -136,6 +206,7 @@ def run(st, now):
     rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude usage review {d}")
     ok = rc == 0 and out.strip().startswith("started")
     st["runs"].append({"at": now.isoformat(), "session": sid, "rc": rc, "out": out.strip(), "err": err.strip()[-300:]})
+    record_review(sid, ("usage", "stage-eta"), now, ok, rc, False)
     if ok:
         st["next_run_at"] = next_run_after(now).isoformat()
         ka.log(f"usage review started: {sid}")
@@ -166,6 +237,7 @@ def run_once(st, now, which, extra=None):
     ok = rc == 0 and out.strip().startswith("started")
     st.setdefault("one_off_runs", []).append(
         {"at": now.isoformat(), "only": which, "session": sid, "rc": rc, "out": out.strip(), "err": err.strip()[-300:]})
+    record_review(sid, (which,), now, ok, rc, True)
     if ok:
         ka.log(f"one-off {which} review started: {sid}")
         ka.progress_note(f"one-off {which} review started: session {sid} (Opus medium, tmux ka-{sid[:8]})")
@@ -237,11 +309,11 @@ def session_idle(sid, now, idle=None):
 
 
 def usage_review_finished(sid, report, now):
-    """The one-off usage review session `sid` has reliably finished (D-228): its report
-    deliverable exists AND the session itself has gone idle (session_idle()) -- both together,
-    since either alone is weaker (the report could be mid-write; the session could just be slow
-    to start). -> bool."""
-    return os.path.exists(report) and session_idle(sid, now)
+    """The one-off usage review session `sid` has reliably finished (D-228): its report doc
+    (review:<date>, report_ready()) exists AND the session itself has gone idle (session_idle())
+    -- both together, since either alone is weaker (the report could be mid-write; the session
+    could just be slow to start). -> bool."""
+    return report_ready(report) and session_idle(sid, now)
 
 
 def wait_for_usage_review(sid, report, start, timeout=USAGE_DONE_TIMEOUT, poll=USAGE_DONE_POLL,
@@ -278,14 +350,17 @@ def run_usage_then_eta(st, now, wait_fn=None):
         return False
     sid = st["one_off_runs"][-1]["session"]
     save(st)
-    d = now.astimezone(ka.BERLIN).date().isoformat()
-    report = os.path.join(HERE, "data", "reviews", f"{d}.md")
+    report = report_doc(now)
     if not wait_fn(sid, report, now):
+        found = report_ready(report)
+        finish_review(sid, "timed_out" if not found else "finished", datetime.now(UTC))
         ka.alert("one-off usage review (D-228 chain) did not finish in time for the ETA review",
-                 f"session {sid}; waited {USAGE_DONE_TIMEOUT}; report "
-                 f"{'found' if os.path.exists(report) else 'missing'}; the ETA review was not launched")
+                 f"session {sid}; waited {USAGE_DONE_TIMEOUT}; report doc {report} "
+                 f"{'found' if found else 'missing'}; the ETA review was not launched")
         return False
-    extra = ka.load_prompt("stage_eta_review_once_after_usage").format(report=report)
+    finish_review(sid, "finished", datetime.now(UTC))
+    extra = ka.load_prompt("stage_eta_review_once_after_usage").format(
+        report=f"the review doc {report} in the AFClaude DB (`python3 tasks.py doc show {report}`)")
     ok = run_once(st, datetime.now(UTC), "stage-eta", extra=extra)
     save(st)
     return ok
@@ -314,6 +389,8 @@ def main():
         return
     if getattr(st, "unavailable", False) or db_problem():
         return   # a broken DB (or its state unreadable): start nothing (design §7.8); the next cron run retries
+    for rec in track_reviews(now):
+        ka.log(f"usage review {rec['review_id'][:8]} ({'+'.join(rec.get('reviews') or [])}): {rec['status']}")
     if args.only:
         if args.only == ",".join(ONLY_ORDER):   # "usage,stage-eta": the D-228 chain
             run_usage_then_eta(st, now)

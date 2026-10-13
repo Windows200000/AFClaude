@@ -13,7 +13,7 @@ Per run:
     keepalive.refresh_usage_checked retries after one tiny token-refresh request;
     a cache still older than usage_stale.USAGE_STALE_AFTER gives a row marked
     usage.stale = true (kept, but ignored by pacing.py / limit_ratio.py), and
-    after STALE_ALERT_AFTER of that, one ALERTS.md entry per episode
+    after STALE_ALERT_AFTER of that, one alert (notify.py) per episode
   - incremental scan of all transcripts (subagents included) since the last run:
     tokens by model (input / cache write / cache read / output / thinking),
     assistant turns, human prompts, limit hits, active sessions, split into
@@ -552,11 +552,11 @@ def ratio_snapshot(rows, t, windows_path=None):
 
 # ------------------------------------------------------------------ stale-usage alert
 
-STALE_ALERT_AFTER = timedelta(hours=3)   # the cache stale this long -> one ALERTS.md entry
+STALE_ALERT_AFTER = timedelta(hours=3)   # the cache stale this long -> one alert (notify.py)
 
 
 def stale_alert(st, usage, t, notify_fn=None):
-    """One alert (ALERTS.md, D-049) per stale episode once the usage cache has been stale for
+    """One alert (notify.py, D-049) per stale episode once the usage cache has been stale for
     more than STALE_ALERT_AFTER; the episode is keyed by the frozen fetch time, so the 15-min
     runs don't repeat it. A fresh sample ends the episode. -> True if it alerted."""
     if not usage.get("stale"):

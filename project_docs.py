@@ -14,23 +14,36 @@ module maps the files onto them, imports them and writes the public build log ba
   (BACKLOG.md stays a file until gate 8d, D-065/D-173; OPEN_QUESTIONS.md and DECISIONS.md move in
   phase 4b, D-151/D-158.)
 
-Dual-write (now): the task-manager keeps editing the files as before, notify.py / keepalive.py keep
-appending to PROGRESS.md and ALERTS.md, and the importer keeps the DB in sync:
-    python3 project_docs.py import          (= python3 store.py import-docs; idempotent, files untouched)
-It reads every file and runs doc.sync for it (actor runner:import): an unchanged file is a no-op, an
-appended one adds its new entries, an in-place edit is one 'replace' entry keeping the unchanged
-entries. Afterwards the DB's text of each doc is checked against the file, byte for byte.
+The DB is the source (the §7.7 switch, built): the writers go through actions.py, audited:
+  - the task-manager and the review sessions: `python3 tasks.py doc append progress "…"`,
+    `tasks.py doc set goals -`, `tasks.py doc set review:<date> -` (MCP afclaude_doc);
+  - the runners' notes: notify.py's alerts (alerts + a progress line) and keepalive.py's progress
+    notes call append_note() below (doc.append, actor runner:*); they no longer write the files.
+Hand edits of PROGRESS.md / GOALS.md / EXCEPTIONS.md stay possible (the owner and the task-manager
+edit them directly): the importer takes them in, on a schedule (docker/crontab, every 10 min,
+`import --cron`) and as the first step of every export:
+    python3 project_docs.py import [--cron]     (= python3 store.py import-docs; idempotent, files untouched)
+It reads every file and runs doc.sync for it (actor runner:import): an unchanged file is a no-op
+(or "DB ahead" when the DB moved on), an appended one adds its new entries, an in-place edit is
+one 'replace' entry keeping the unchanged entries; when the file and the DB both changed since
+the last sync (a hand edit while a runner appended a note), the two are merged against the
+file's text at the last sync (actions.merge3; "merged", the DB is then ahead of the file), and
+only edits of the same lines are a conflict (nothing imported; `--cron` alerts once per episode;
+`--force`: the file wins, the dropped entries stay in the history). Afterwards the DB's text of
+each doc that is in sync is checked against the file, byte for byte.
 
 The export (D-181, §7.7) is the ONLY file output: the AFClaude repo's public build log, PROGRESS.md,
 GOALS.md and EXCEPTIONS.md, regenerated from the DB into the repo (byte-identical to the format the
-files have today, so the git diff is just what changed). The task-manager runs it before it commits:
+files have, so the git diff is just what changed). The task-manager runs it before each commit
+that includes them:
     python3 project_docs.py export [--check]        (or: python3 tasks.py doc export)
-It first imports the files (dual-write: a hand edit since the last sync must not be overwritten; a
+It first imports the files (a hand edit since the last sync is merged in, never overwritten; a
 conflict stops that file), then writes each doc whose DB text differs from its file, after the
 public-repo check (tools/check_public.py's line checks) found nothing in it; --check only reports.
-During the dual-write period the export changes nothing (the files are the source); after the switch
-(the task-manager writes through `tasks.py doc append|set` / MCP afclaude_doc, design §7.7) it is how
-the files are produced. ALERTS.md and the reviews are never exported (no local exports, D-181).
+ALERTS.md and the reviews are never written (no local exports, D-181): the alerts are read with
+`tasks.py doc show alerts` / MCP afclaude_doc / the quickview; a legacy ALERTS.md or
+data/reviews/*.md is still imported (unchanged files are no-ops). data/ALERTS.fallback.md stays a
+file: the DB-broken path (§7.8, D-171).
 
     python3 project_docs.py status          docs, entries, sync marks
 (tasks.py doc list|show|append|set|import|export is the same for the task-manager, MCP afclaude_doc.)
@@ -56,6 +69,8 @@ FILES = (("progress", "PROGRESS.md"), ("goals", "GOALS.md"), ("exceptions", "EXC
          ("alerts", "ALERTS.md"))
 BUILD_LOG = ("progress", "goals", "exceptions")      # the public build log: the only docs written out (D-181)
 IMPORT_ACTOR = "runner:import"
+CONFLICT_MARK = "docs_conflict_alerted:"      # meta key prefix (+ project/name): the --cron alert's episode
+NOTE_PAYLOAD_MAX = 64 * 1024                 # characters of a note kept in the fallback file
 
 
 def reviews_dir_default(db_path: Optional[str] = None) -> str:
@@ -118,8 +133,8 @@ def import_all(db_path: Optional[str] = None, repo: Optional[str] = None, review
     try:
         p = resolve_project(conn, project, repo)
         docs: dict[str, Any] = {}
-        totals = {"files": 0, "imported": 0, "in_sync": 0, "db_ahead": 0, "conflict": 0, "missing": 0,
-                  "entries_added": 0, "unverified": 0}
+        totals = {"files": 0, "imported": 0, "merged": 0, "in_sync": 0, "db_ahead": 0, "conflict": 0,
+                  "missing": 0, "entries_added": 0, "unverified": 0}
         for name, path in doc_files(repo, rdir):
             try:
                 store.doc_kind(name)
@@ -150,6 +165,97 @@ def import_all(db_path: Optional[str] = None, repo: Optional[str] = None, review
                            if k.split("/", 1)[0] == p["name"]}}
     finally:
         conn.close()
+
+
+def append_note(name: str, text: str, actor: str, repo: Optional[str] = None,
+                db_path: Optional[str] = None) -> bool:
+    """A runner's note (notify.py's alerts and their progress line, keepalive.py's progress notes):
+    one doc.append entry (audited, via runner) in the log doc `name` of the project whose
+    directory is `repo` (default: this repo), exactly as given. No file is written (§7.7: the
+    export writes the build log; ALERTS.md is never written). Never raises: a database failure
+    takes the §7.8 path (actions.perform / store.report_db_error: recorded in
+    data/ALERTS.fallback.md for a replay, escalated when it fails again), a project the DB
+    doesn't know is recorded there too. -> stored."""
+    where = os.path.abspath(repo or HERE)
+    try:
+        conn = store.connect(db_path)
+        try:
+            p = resolve_project(conn, None, where)
+            actions.perform(conn, "doc.append", {"project": p["name"], "name": name, "text": text},
+                            actor=actor, via="runner")
+        finally:
+            conn.close()
+        return True
+    except (store.NotFound, ValueError) as e:
+        store.fallback_note(f"note not stored in the DB ({actor}, {name}): {e}",
+                            {"event": "note", "actor": actor, "doc": name, "repo": where, "error": str(e)[:500],
+                             "text": text[:NOTE_PAYLOAD_MAX]}, db_path)
+    except Exception as e:   # noqa: BLE001 - a note never takes a runner down
+        err = store.as_db_error(e)
+        if err.escalation is None:          # not reported yet (perform reports its own failures)
+            store.report_db_error(err, actor=actor, action="doc.append",
+                                  params={"repo": where, "name": name, "text": text},
+                                  payload_max=NOTE_PAYLOAD_MAX, db_path=db_path, runner=True)
+    try:
+        sys.stderr.write(f"project_docs: the {name} note was not stored in the DB ({actor}): {text[:300]}\n")
+    except Exception:   # noqa: BLE001
+        pass
+    return False
+
+
+def doc_text(name: str, repo: Optional[str] = None, db_path: Optional[str] = None) -> Optional[str]:
+    """The current text of the doc `name` of the project of `repo` (default: this repo) in the DB;
+    None if there is no such project or doc. Database errors raise (the caller decides)."""
+    conn = store.connect(db_path)
+    try:
+        p = store.get_project(conn, os.path.abspath(repo or HERE))
+        return _current(conn, p["id"], name) if p is not None else None
+    finally:
+        conn.close()
+
+
+def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
+                reviews_dir: Optional[str] = None, project: Optional[str] = None) -> tuple[int, str]:
+    """The scheduled import (docker/crontab): import_all, then a one-line summary (only when
+    something happened; an all-quiet run prints nothing, so the log stays small). A conflict
+    alerts the owner once per episode per doc (notify.py; the episode ends when the doc imports
+    cleanly again). -> (exit code, the line or "")."""
+    r = import_all(db_path, repo, reviews_dir, project)
+    t = r["totals"]
+    conflicts = {n: d.get("error", "") for n, d in r["docs"].items() if d["outcome"] == "conflict"}
+    conn = store.connect(db_path)
+    try:
+        for name, d in r["docs"].items():
+            key = f"{CONFLICT_MARK}{r['project']}/{name}"
+            alerted = store.get_meta(conn, key)
+            if name in conflicts and not alerted:
+                _alert(f"docs import: conflict in {r['project']}/{name}",
+                       f"{d['file']}: {conflicts[name]}\nThe hand edits of this file are not in the DB until "
+                       "it is merged by hand (tasks.py doc show / export --check) or imported with --force.")
+                with store.transaction(conn):
+                    store.set_meta(conn, key, store.now_iso())
+            elif name not in conflicts and alerted:
+                with store.transaction(conn):
+                    store.set_meta(conn, key, "")
+    finally:
+        conn.close()
+    busy = {k: v for k, v in t.items() if v and k not in ("files", "in_sync", "db_ahead", "missing")}
+    line = ""
+    if busy:
+        parts = [f"{n}: {d['outcome']}" + (f" +{d['appended']}" if d.get("appended") else "")
+                 for n, d in r["docs"].items() if d["outcome"] in ("imported", "merged", "conflict")
+                 or d.get("verified") is False]
+        line = f"{store.now_iso()} docs import {r['project']}: " + ", ".join(parts)
+    return (1 if t["conflict"] or t["unverified"] else 0), line
+
+
+def _alert(subject: str, body: str) -> None:
+    """notify.py (a push, and the alert in the DB), never raising."""
+    try:
+        notify = importlib.import_module("notify")
+        getattr(notify, "notify")(subject, body)
+    except Exception as e:   # noqa: BLE001 - an alert must never take the import down
+        sys.stderr.write(f"project_docs: alert failed: {type(e).__name__}: {e}\n")
 
 
 def public_findings(label: str, text: str) -> list[str]:
@@ -264,11 +370,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         q.add_argument("--project", default=None, help="project name (default: the project of --repo)")
     i.add_argument("--reviews-dir", default=None, help="review reports (default: <the database's dir>/reviews)")
     i.add_argument("--force", action="store_true", help="on a conflict the file wins (DB entries stay as history)")
+    i.add_argument("--cron", action="store_true",
+                   help="the scheduled run: a one-line summary only when something changed, alert on a conflict")
     e.add_argument("--check", action="store_true", help="report what would be written, write nothing")
     s = sub.add_parser("status", help="docs with their entry counts")
     s.add_argument("--db", default=None)
     args = ap.parse_args(argv)
     try:
+        if args.cmd == "import" and args.cron:
+            code, line = cron_import(args.db, args.repo, args.reviews_dir, args.project)
+            if line:
+                print(line)
+            return code
         if args.cmd == "import":
             r = import_all(args.db, args.repo, args.reviews_dir, args.project, force=args.force)
             print(json.dumps(r, indent=1, ensure_ascii=False))

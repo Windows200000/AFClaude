@@ -36,7 +36,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
                                            (a newline is added if TEXT doesn't end with one)
     tasks.py doc set NAME TEXT|- [--project P] [--version N]   replace goals / review:<name> (or rewrite a log)
-    tasks.py doc import [--repo DIR] [--project P] [--force]   sync the doc files into the DB (dual-write)
+    tasks.py doc import [--repo DIR] [--project P] [--force]   take hand edits of the files into the DB (also every 10 min)
     tasks.py doc export [--repo DIR] [--project P] [--check]   regenerate PROGRESS.md, GOALS.md,
                                            EXCEPTIONS.md from the DB (D-181; run before committing)
 
@@ -360,7 +360,7 @@ def run_doc(conn, args):
             return None
         text = store.doc_render(conn, doc["id"])
         if args.json:
-            return dump(dict(doc, text=text))
+            return dump(dict({k: v for k, v in doc.items() if k != "file_text"}, text=text))
         sys.stdout.write(text)
         return None
     text = sys.stdin.read() if args.text == "-" else args.text

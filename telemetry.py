@@ -71,7 +71,9 @@ FILES: dict[str, tuple[str, str]] = {
     "usage.weekly_cycle": ("weekly_cycles.json", "cycles"),
     "usage.run": ("afclaude_runs.jsonl", "records"),
     "usage.user_model": ("user_model.json", "doc"),
+    "usage.review": ("usage_reviews.jsonl", "records"),     # never a file: born in the DB (usage_review.py)
 }
+DB_ONLY = ("usage.review",)           # kinds that never had a legacy file: the importer skips them
 BY_FILE = {name: kind for kind, (name, _) in FILES.items()}
 MARK = "telemetry_imported:"          # meta key prefix: the kind is DB-owned (JSON stats)
 CHUNK = 500                           # rows per import transaction
@@ -490,7 +492,7 @@ def import_all(db_path: Optional[str] = None, data_dir: Optional[str] = None,
     conn = store.connect(db)
     try:
         out = []
-        for k in (kinds or FILES):
+        for k in (kinds or [k for k in FILES if k not in DB_ONLY]):
             path = os.path.join(ddir, FILES[k][0])
             mark = store.get_meta(conn, MARK + actions.APPENDERS[k].table)
             if mark is not None and not (catch_up and not actions.APPENDERS[k].record):

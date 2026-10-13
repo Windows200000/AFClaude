@@ -354,11 +354,12 @@ CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id, id);
 # importer and a dual-write dedupe on it). `stale` marks rows whose usage meters must not be
 # used (D-130: never drop data, mark it).
 # Record tables (TELEMETRY_DOCS): one row per derived record that is recomputed in place (a
-# run's fill-time row until it is final, a weekly cycle, the user model); they carry the same
-# ts/actor/via plus updated_at and a trigger-bumped version, and can't be deleted.
+# run's fill-time row until it is final, a weekly cycle, the user model, a usage review's launch
+# record until it is final); they carry the same ts/actor/via plus updated_at and a trigger-bumped
+# version, and can't be deleted.
 TELEMETRY_APPEND = ("usage_samples", "usage_weekly_series", "usage_session_windows", "forecast_log",
                     "haiku_judgements", "usage_reports", "usage_run_readings", "stage_eta_log")
-TELEMETRY_DOCS = ("weekly_cycles", "usage_runs", "user_model")
+TELEMETRY_DOCS = ("weekly_cycles", "usage_runs", "user_model", "usage_reviews")
 DEFAULT_ACCOUNT = "default"
 _APPEND_DDL = """
 CREATE TABLE IF NOT EXISTS {t} (
@@ -382,7 +383,7 @@ BEGIN SELECT RAISE(ABORT, '{t} is append-only'); END;
 _DOC_DDL = """
 CREATE TABLE IF NOT EXISTS {t} (
     account_id TEXT NOT NULL DEFAULT 'default' REFERENCES accounts(id),
-    doc_key    TEXT NOT NULL,            -- run_id | the cycle's reset | 'model'
+    doc_key    TEXT NOT NULL,            -- run_id | the cycle's reset | 'model' | a review's session
     ts         TEXT NOT NULL,            -- the record's own time (run start, reset), normalised
     final      INTEGER NOT NULL DEFAULT 0,
     actor      TEXT NOT NULL,
@@ -586,6 +587,9 @@ COLUMNS = {
     # override (no row) / no prompt_defaults row yet for that name; else 0 (matches) or 1 (the
     # default moved on since this override was made).
     "prompt_overrides": [("base_outdated", "INTEGER")],
+    # §7.7 switch: the file's text at the sync mark, the base of the 3-way merge when the file
+    # (hand edits) and the DB (doc.append/doc.set) both changed since (actions.doc_sync).
+    "docs": [("file_text", "TEXT")],
 }
 
 SESSION_FIELDS = (
@@ -2484,11 +2488,12 @@ def ensure_doc(conn: sqlite3.Connection, project_id: int, name: str, actor: str)
     return d
 
 
-def doc_chunks(conn: sqlite3.Connection, doc_id: int) -> list[str]:
+def doc_chunks(conn: sqlite3.Connection, doc_id: int, upto: int | None = None) -> list[str]:
     """The current version as its entries' bodies, in order (append: add one; replace: keep the
-    first `keep`, then add its body)."""
+    first `keep`, then add its body); upto: the version as of that entry id (its entries up to it)."""
     chunks: list[str] = []
-    for r in conn.execute("SELECT op, keep, body FROM doc_entries WHERE doc_id=? ORDER BY id", (doc_id,)):
+    for r in conn.execute("SELECT op, keep, body FROM doc_entries WHERE doc_id=? AND id <= ? ORDER BY id",
+                          (doc_id, upto if upto is not None else 2 ** 62)):
         if r["op"] == "replace":
             del chunks[int(r["keep"]):]
         chunks.append(r["body"])
@@ -2518,10 +2523,13 @@ def add_doc_entry(conn: sqlite3.Connection, doc_id: int, op: str, body: str, act
     return _rowid(cur)
 
 
-def set_doc_mark(conn: sqlite3.Connection, doc_id: int, file_sha256: str, entry: int) -> bool:
-    """Record the dual-write sync mark (only if it changed). -> whether it changed."""
-    cur = conn.execute("UPDATE docs SET file_sha256=?, file_entry=? WHERE id=? AND "
-                       "(file_sha256 IS NOT ? OR file_entry IS NOT ?)", (file_sha256, entry, doc_id, file_sha256, entry))
+def set_doc_mark(conn: sqlite3.Connection, doc_id: int, file_text: str, entry: int) -> bool:
+    """Record the sync mark: the file's text (and its sha256) as the import/export saw or wrote
+    it, and the newest entry id then (only if it changed). -> whether it changed."""
+    sha = sha256_text(file_text)
+    cur = conn.execute("UPDATE docs SET file_sha256=?, file_entry=?, file_text=? WHERE id=? AND "
+                       "(file_sha256 IS NOT ? OR file_entry IS NOT ? OR file_text IS NULL)",
+                       (sha, entry, file_text, doc_id, sha, entry))
     return cur.rowcount > 0
 
 
@@ -2533,7 +2541,7 @@ def list_docs(conn: sqlite3.Connection, project_id: int | None = None) -> list[R
         rows = conn.execute(sql + " ORDER BY p.name, d.name")
     else:
         rows = conn.execute(sql + " WHERE d.project_id=? ORDER BY d.name", (project_id,))
-    return [dict(r) for r in rows]
+    return [{k: r[k] for k in r.keys() if k != "file_text"} for r in rows]   # the merge base stays internal
 
 
 def doc_entries(conn: sqlite3.Connection, doc_id: int, limit: int = 20) -> list[Row]:
@@ -2887,6 +2895,16 @@ def _append_record(path: str, headline: str, rec: Mapping[str, Any]) -> str | No
     return None
 
 
+def fallback_note(headline: str, rec: Mapping[str, Any], db_path: str | None = None) -> str | None:
+    """Record something that could not be written to the DB in the fallback file (§7.8), e.g. a
+    runner's note for a project the DB doesn't know (project_docs.append_note). -> the file it
+    went to, None (then it went to stderr). Never raises."""
+    try:
+        return _append_record(fallback_path(db_path), headline, dict(rec, time=rec.get("time") or now_iso()))
+    except Exception:   # noqa: BLE001 - the fallback path must never take its caller down
+        return None
+
+
 def _open_alert(events: Sequence[Mapping[str, Any]], scope: str) -> Mapping[str, Any] | None:
     """The alert that opened the current episode within `scope` ("runner": db_gate's
     before-a-start pause/resume alerts; "request": report_db_error's failed-request alerts,
@@ -2907,7 +2925,7 @@ def _open_alert(events: Sequence[Mapping[str, Any]], scope: str) -> Mapping[str,
 
 
 def _notify(subject: str, body: str) -> str:
-    """notify.py (ALERTS.md, PROGRESS.md, a push), never raising."""
+    """notify.py (a push; the alert in the DB, or this fallback file while the DB is broken), never raising."""
     try:
         fn = NOTIFY
         if fn is None:

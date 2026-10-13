@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the project docs in the DB (dashboard phase 2d part 2): the docs/doc_entries tables,
-the actions (doc.append, doc.set, doc.sync), the importer's idempotency, the byte-identical
-export round trip of the public build log (PROGRESS.md, GOALS.md, EXCEPTIONS.md, the repo's own
-committed files), the public-repo check on the exported files, and the CLI (tasks.py doc).
+the actions (doc.append, doc.set, doc.sync with its 3-way merge of hand edits and runner notes),
+the importer's idempotency, the byte-identical export round trip of the public build log
+(PROGRESS.md, GOALS.md, EXCEPTIONS.md, the repo's own committed files), the public-repo check on
+the exported files, the CLI (tasks.py doc), the runners' notes (append_note, notify.py, keepalive's
+progress_note: into the DB, no file written) and the scheduled import (import --cron).
 
     python3 -m unittest test_project_docs
 """
@@ -184,7 +186,7 @@ class Actions(Env):
         self.assertEqual([(e["op"], e["keep"], e["body"]) for e in self.entries("goals")],
                          [("replace", 0, "a\n"), ("replace", 0, "b\n")])
 
-    def test_sync_db_ahead_and_conflict(self):
+    def test_sync_db_ahead_merge_and_conflict(self):
         self.sync("progress", "- 1\n")
         self.act("doc.append", project="P", name="progress", text="- 2 via cli\n")
         # the file did not change since the sync: the DB is ahead, nothing is imported
@@ -193,14 +195,54 @@ class Actions(Env):
         # the file grew with the DB text in it: plain append, no conflict
         self.assertEqual(self.sync("progress", "- 1\n- 2 via cli\n- 3\n")["outcome"], "imported")
         self.act("doc.append", project="P", name="progress", text="- 4 via cli\n")
-        # both changed and the file would drop DB text: refused, nothing written
+        # both changed, different lines (an in-place edit of the file, an append in the DB): merged
+        r = self.sync("progress", "- 1\n- 2 via cli\n- 3 edited\n")
+        self.assertEqual((r["outcome"], r["replaced"]), ("merged", True))
+        self.assertEqual(self.render("progress"), "- 1\n- 2 via cli\n- 3 edited\n- 4 via cli\n")
+        self.assertEqual(self.sync("progress", "- 1\n- 2 via cli\n- 3 edited\n")["outcome"], "db_ahead")
+        # both changed the same line (a rewrite through doc.set vs a hand edit): refused, nothing written
+        self.act("doc.set", project="P", name="progress", text="- 1 db\n- 2 via cli\n- 3 edited\n- 4 via cli\n")
         with self.assertRaises(actions.Conflict):
-            self.sync("progress", "- 1\n- 2 via cli\n- 3 edited\n")
-        self.assertEqual(self.render("progress"), "- 1\n- 2 via cli\n- 3\n- 4 via cli\n")
-        r = self.sync("progress", "- 1\n- 2 via cli\n- 3 edited\n", force=True)    # the file wins
+            self.sync("progress", "- 1 file\n- 2 via cli\n- 3 edited\n")
+        self.assertEqual(self.render("progress"), "- 1 db\n- 2 via cli\n- 3 edited\n- 4 via cli\n")
+        r = self.sync("progress", "- 1 file\n- 2 via cli\n- 3 edited\n", force=True)    # the file wins
         self.assertTrue(r["replaced"])
-        self.assertEqual(self.render("progress"), "- 1\n- 2 via cli\n- 3 edited\n")
+        self.assertEqual(self.render("progress"), "- 1 file\n- 2 via cli\n- 3 edited\n")
         self.assertIn("- 4 via cli\n", [e["body"] for e in self.entries("progress")])   # kept as history
+
+    def test_hand_appends_and_runner_notes_merge(self):
+        """The switch's everyday case: the task-manager appends to PROGRESS.md by hand while the
+        runners append notes to the DB; each import merges, nothing is lost, nothing conflicts."""
+        base = "# Log\n\n- 1\n"
+        self.sync("progress", base)
+        self.act("doc.append", actor="runner:notify", via="runner", project="P", name="progress", text="- [ALERT] a\n")
+        f1 = base + "- 2 by hand\n"
+        self.assertEqual(self.sync("progress", f1)["outcome"], "merged")
+        self.assertEqual(self.render("progress"), base + "- [ALERT] a\n- 2 by hand\n")
+        self.act("doc.append", actor="runner:keepalive", via="runner", project="P", name="progress", text="- note\n")
+        f2 = f1 + "- 3 by hand\n"                   # the file still has no runner lines (no export yet)
+        self.assertEqual(self.sync("progress", f2)["outcome"], "merged")
+        self.assertEqual(self.render("progress"), base + "- [ALERT] a\n- 2 by hand\n- note\n- 3 by hand\n")
+        f3 = f2.replace("- 1\n", "- 1 (done)\n")      # and an in-place edit of an old line
+        self.assertEqual(self.sync("progress", f3)["outcome"], "merged")
+        self.assertEqual(self.render("progress"), "# Log\n\n- 1 (done)\n- [ALERT] a\n- 2 by hand\n- note\n- 3 by hand\n")
+        # a mark from before file_text existed: the base is the DB's text as of the mark's entry
+        self.sync("goals", "a\nb\n")
+        with self.conn() as c:
+            c.execute("UPDATE docs SET file_text=NULL WHERE name='goals'")
+            c.commit()
+        self.act("doc.set", project="P", name="goals", text="a\nb\nc (db)\n")
+        self.assertEqual(self.sync("goals", "a (file)\nb\n")["outcome"], "merged")
+        self.assertEqual(self.render("goals"), "a (file)\nb\nc (db)\n")
+
+    def test_merge3(self):
+        m = actions.merge3
+        self.assertEqual(m("a\n", "a\nx\n", "a\ny\n"), "a\nx\ny\n")              # both appended: ours first
+        self.assertEqual(m("a\nb\n", "a\nb\nx\n", "A\nb\n"), "A\nb\nx\n")         # edit + append
+        self.assertEqual(m("a\nb\n", "a\nB\n", "a\nB\n"), "a\nB\n")               # the same change once
+        self.assertIsNone(m("a\nb\n", "a\nB1\n", "a\nB2\n"))                   # the same line, differently
+        self.assertEqual(m("", "x\n", "y\n"), "x\ny\n")
+        self.assertEqual(m("a\nb\nc\n", "a\nc\n", "a\nb\nc\nd\n"), "a\nc\nd\n")  # a deletion + an append
 
 
 class Importer(Env):
@@ -271,20 +313,30 @@ class Importer(Env):
         self.assertEqual(self.read("PROGRESS.md").decode(), orig)          # --check writes nothing
         pd.export(self.db, self.repo)
         self.assertEqual(self.read("PROGRESS.md").decode(), orig + "- 23:59 via the CLI\n")
-        # dual-write: a hand edit of the file since the last sync is imported first, not overwritten
+        # a hand edit of the file since the last sync is imported first, not overwritten
         edited = orig.replace("progress log", "progress log (edited)", 1) + "- 23:59 via the CLI\n- by hand\n"
         self.write("PROGRESS.md", edited)
         x = pd.export(self.db, self.repo)
         self.assertEqual((x["files"]["PROGRESS.md"]["sync"], x["files"]["PROGRESS.md"]["result"]),
                          ("imported", "unchanged"))
         self.assertEqual(self.render("progress"), edited)
-        # both changed: the export refuses that file and leaves it alone
-        self.act("doc.append", project="P", name="progress", text="- db only\n")
-        self.write("PROGRESS.md", orig)
+        # both changed (a runner note in the DB, a hand edit in the file): merged, then written out
+        self.act("doc.append", actor="runner:notify", via="runner", project="P", name="progress", text="- db only\n")
+        self.write("PROGRESS.md", edited + "- by hand 2\n")
+        x = pd.export(self.db, self.repo)
+        self.assertTrue(x["ok"], x)
+        self.assertEqual((x["files"]["PROGRESS.md"]["sync"], x["files"]["PROGRESS.md"]["result"]),
+                         ("merged", "written"))
+        self.assertEqual(self.read("PROGRESS.md").decode(), edited + "- db only\n- by hand 2\n")
+        self.assertEqual(self.run_import()["docs"]["progress"]["outcome"], "in_sync")
+        # both changed the same line: the export refuses that file and leaves it alone
+        merged = self.read("PROGRESS.md").decode()
+        self.act("doc.set", project="P", name="progress", text=merged.replace("- by hand 2\n", "- db rewrite\n"))
+        self.write("PROGRESS.md", merged.replace("- by hand 2\n", "- file rewrite\n"))
         x = pd.export(self.db, self.repo)
         self.assertFalse(x["ok"])
         self.assertEqual(x["files"]["PROGRESS.md"]["result"], "conflict")
-        self.assertEqual(self.read("PROGRESS.md").decode(), orig)
+        self.assertEqual(self.read("PROGRESS.md").decode(), merged.replace("- by hand 2\n", "- file rewrite\n"))
 
     def test_public_check_on_exported_files(self):
         self.run_import()
@@ -300,6 +352,105 @@ class Importer(Env):
         self.assertEqual(g["result"], "refused: public-repo check")
         self.assertTrue(any("denylist" in f for f in g["findings"]))
         self.assertEqual(self.read("GOALS.md"), before)          # not written
+
+
+class Notes(Env):
+    """The runners' notes (§7.7 switch): append_note() writes the DB only, never a file; a project
+    the DB doesn't know or a broken DB goes to the fallback file (§7.8); notify.py and
+    keepalive.progress_note() use it."""
+    def fallback(self):
+        try:
+            with open(os.path.join(self.tmp, "data", store.FALLBACK_NAME), encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def test_append_note_into_the_db(self):
+        self.assertTrue(pd.append_note("alerts", "- **x** y\n", "runner:notify", repo=self.repo, db_path=self.db))
+        self.assertEqual(self.render("alerts"), "- **x** y\n")
+        self.assertEqual([(e["author"], e["via"]) for e in self.entries("alerts")], [("runner:notify", "runner")])
+        self.assertEqual(os.listdir(self.repo), [])                                 # no file written
+        self.assertEqual(pd.doc_text("alerts", self.repo, self.db), "- **x** y\n")
+        self.assertIsNone(pd.doc_text("goals", self.repo, self.db))
+
+    def test_append_note_unknown_project_and_broken_db(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(pd.append_note("progress", "- lost?\n", "runner:keepalive",
+                                            repo=os.path.join(self.tmp, "elsewhere"), db_path=self.db))
+        self.assertIn("- lost?", self.fallback())
+        os.remove(self.db)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(pd.append_note("progress", "- db gone\n", "runner:keepalive", repo=self.repo,
+                                            db_path=self.db))
+        self.assertIn("doc.append", self.fallback())
+
+    def test_notify_and_keepalive_notes(self):
+        import notify
+        import keepalive as ka
+        saved = (notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE)
+        notify.push = lambda text: "test push"
+        pd.HERE, store.DB_PATH = self.repo, self.db
+        ka.PROGRESS_FILE = os.path.join(self.repo, "PROGRESS.md")
+        try:
+            self.assertEqual(notify.notify("disk full", "details"), "test push")
+            ka.progress_note("window-start: not resumed")
+        finally:
+            notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE = saved
+        self.assertRegex(self.render("alerts"), r"^- \*\*\d{4}-\d\d-\d\d \d\d:\d\d\*\* disk full\n  details\n  _\(push: test push\)_\n$")
+        prog = self.render("progress")
+        self.assertIn("[ALERT] disk full (details in the alerts doc)\n", prog)
+        self.assertIn("[keepalive.py] window-start: not resumed\n", prog)
+        self.assertEqual({e["author"] for e in self.entries("progress")}, {"runner:notify", "runner:keepalive"})
+        self.assertEqual(os.listdir(self.repo), [])                                 # ALERTS.md / PROGRESS.md untouched
+
+
+class CronImport(Env):
+    """import --cron (docker/crontab): quiet when nothing happened, one line otherwise; a conflict
+    alerts once per episode and doc."""
+    def setUp(self):
+        super().setUp()
+        self.alerts = []
+        self.saved_alert = pd._alert
+        pd._alert = lambda subject, body: self.alerts.append(subject)
+
+    def tearDown(self):
+        pd._alert = self.saved_alert
+        super().tearDown()
+
+    def cron(self):
+        return pd.cron_import(self.db, self.repo, self.reviews)
+
+    def test_quiet_import_merge_and_conflict_alert(self):
+        self.write("PROGRESS.md", "- 1\n")
+        code, line = self.cron()
+        self.assertEqual(code, 0)
+        self.assertIn("progress: imported +1", line)
+        self.assertEqual(self.cron(), (0, ""))                                       # nothing new: silent
+        self.act("doc.append", actor="runner:notify", via="runner", project="P", name="progress", text="- n\n")
+        self.assertEqual(self.cron(), (0, ""))                                       # DB ahead: silent
+        self.write("PROGRESS.md", "- 1\n- 2\n")
+        self.assertIn("progress: merged +1", self.cron()[1])
+        self.act("doc.set", project="P", name="progress", text="- 1 db\n- n\n- 2\n")
+        self.write("PROGRESS.md", "- 1 file\n- 2\n")
+        code, line = self.cron()
+        self.assertEqual(code, 1)
+        self.assertIn("progress: conflict", line)
+        self.cron()
+        self.assertEqual(self.alerts, ["docs import: conflict in P/progress"])      # once per episode
+        self.write("PROGRESS.md", "- 1 db\n- n\n- 2\n")                             # resolved by hand
+        self.assertEqual(self.cron()[0], 0)
+        self.write("PROGRESS.md", "- 1 db\n- n\n- 2 x\n")
+        self.act("doc.set", project="P", name="progress", text="- 1 db\n- n\n- 2 y\n")
+        self.cron()
+        self.assertEqual(len(self.alerts), 2)                                        # a new episode alerts again
+
+    def test_cli_flag(self):
+        self.write("GOALS.md", "# G\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pd.main(["import", "--cron", "--db", self.db, "--repo", self.repo,
+                                      "--reviews-dir", self.reviews]), 0)
+        self.assertIn("goals: imported", out.getvalue())
 
 
 class Cli(Env):
