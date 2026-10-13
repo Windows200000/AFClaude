@@ -28,7 +28,7 @@ The migration keeps the live system running (dual-write, as telemetry.py):
     file carries the mark of one of the last DB saves; a file changed outside the DB (a runner
     on older code such as the long-running watcher until its restart, a failed DB write, a hand
     edit) or any DB problem -> None, and the caller reads the file as before. read_json() is the
-    same for read-only readers of a state file.
+    same for read-only readers of a state file, own_sessions() for own_sessions.txt (stalled.py).
   - Concurrency (actions.state_save, one transaction per save): a state loaded from the DB is a
     StateDoc that remembers the rows it came from; its save writes only what this writer
     changed or removed since (merge), so the watcher and the cron run, saving one after the
@@ -242,7 +242,51 @@ def save(component: str, doc: Any, path: Optional[str] = None, actor: Optional[s
         return False
 
 
-_BRACKET_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (CEST|CET|UTC)\]")
+# ---------------------------------------------------------------- own sessions
+
+def _side_ids(path: str) -> set[str]:
+    try:
+        with open(path) as fh:
+            return {ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")}
+    except OSError:
+        return set()
+
+
+def own_sessions(path: Optional[str] = None) -> set[str]:
+    """The session ids listed as AFClaude's own, for a read-only reader (stalled.py): the DB
+    (driven_sessions kind 'own') when `path` is the live data/own_sessions.txt (None = that
+    one), the list was imported and the file hasn't changed since the import (db_load's rule);
+    else (not imported, changed outside the DB, any DB problem, a side file) the file. Never
+    raises (no file: an empty set)."""
+    live = os.path.join(data_dir(), OWN_FILE)
+    fpath = path or live
+    if not _same(fpath, live):
+        return _side_ids(fpath)
+    try:
+        conn = _read_conn()
+    except sqlite3.Error as e:
+        _log(f"database unreadable ({type(e).__name__}: {e}); reading the files")
+        return _side_ids(fpath)
+    if conn is None:
+        return _side_ids(fpath)
+    try:
+        mark = store.get_meta(conn, MARK + "own_sessions")
+        if mark is None:
+            return _side_ids(fpath)
+        at = store.parse_iso(json.loads(mark).get("at"))
+        if at is not None and os.path.isfile(fpath) and os.path.getmtime(fpath) > at.timestamp():
+            _log(f"own sessions: {fpath} changed outside the DB; reading the file until "
+                 "`python3 store.py import-state`")
+            return _side_ids(fpath)
+        return {str(r[0]) for r in conn.execute("SELECT session_id FROM driven_sessions WHERE kind='own'")}
+    except (sqlite3.Error, ValueError, AttributeError, OSError) as e:
+        _log(f"own sessions unreadable ({type(e).__name__}: {e}); reading {fpath}")
+        return _side_ids(fpath)
+    finally:
+        conn.close()
+
+
+_BRACKET_TS =re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (CEST|CET|UTC)\]")
 _ISO_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?)")
 _ERROR = re.compile(r"\b(ERROR|Error|Traceback|FAILED|failed|exception)\b")
 _WARN = re.compile(r"\b(ALERT|WARN|WARNING|warning|DENY|unreadable|skipped)\b")

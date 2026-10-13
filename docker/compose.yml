@@ -1,5 +1,7 @@
 # AFClaude manager container. Machine-specific values: docker/.env (gitignored),
-# see docker/env.example. Start: `docker compose -f docker/compose.yml up -d --build`.
+# see docker/env.example. Start (from the repo root; the hash is baked into the image as
+# its code version, not set in docker/.env where it would go stale):
+#   AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) docker compose -f docker/compose.yml up -d --build
 # No docker socket, no privileges, no published ports.
 name: afclaude
 services:
@@ -9,6 +11,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         AFCLAUDE_DIR: ${AFCLAUDE_DIR:?set in docker/.env}
+        AFCLAUDE_CODE_VERSION: ${AFCLAUDE_CODE_VERSION:-}   # git commit, from the Start line
     image: afclaude-manager:latest
     container_name: afclaude
     restart: unless-stopped

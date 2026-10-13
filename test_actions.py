@@ -716,6 +716,37 @@ class PromptActions(Base):
         self.assertEqual(self.do("prompt.set", name="manager.md", body="Be brief.")["body"], "Be brief.")
 
 
+class CodeVersion(unittest.TestCase):
+    """_code_version: the env override, then the CODE_VERSION file the image build bakes in
+    (the container has no .git), then git."""
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        saved = (actions.CODE_VERSION_FILE, os.environ.pop("AFCLAUDE_CODE_VERSION", None))
+        self.addCleanup(self._restore, saved)
+        actions.CODE_VERSION_FILE = os.path.join(d.name, "CODE_VERSION")
+
+    @staticmethod
+    def _restore(saved):
+        actions.CODE_VERSION_FILE, env = saved
+        os.environ.pop("AFCLAUDE_CODE_VERSION", None)
+        if env is not None:
+            os.environ["AFCLAUDE_CODE_VERSION"] = env
+
+    def test_order(self):
+        with open(actions.CODE_VERSION_FILE, "w") as fh:
+            fh.write("deadbee\n")
+        self.assertEqual(actions._code_version(), "deadbee")             # the baked file
+        os.environ["AFCLAUDE_CODE_VERSION"] = "override"
+        self.assertEqual(actions._code_version(), "override")            # the env var wins
+        del os.environ["AFCLAUDE_CODE_VERSION"]
+        with open(actions.CODE_VERSION_FILE, "w") as fh:
+            fh.write("\n")                                                # empty: next source
+        got = actions._code_version()
+        self.assertNotEqual(got, "")
+        self.assertTrue(got is None or got.isalnum())                    # git (or unknown)
+
+
 class PromptDefaultsSync(Base):
     """D-227: prompts/*.md imported into prompt_defaults on every deploy (`python3 store.py
     import-prompts [--dry-run]`, actor runner:deploy). Base.setUp's PROMPTS_DIR already has
