@@ -9,5 +9,24 @@
       "Bash(claude agents:*)",
       "mcp__afclaude"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/keepalive.py\" --session-rules manager",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/keepalive.py\" --session-rules afclaude",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }

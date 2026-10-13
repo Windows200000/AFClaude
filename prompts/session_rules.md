@@ -1,0 +1,1 @@
+[AFClaude standing rules, part {part} of 2: {what}. Loaded by the repo's SessionStart hook at session start, on resume and after every compaction (D-225); they hold for the whole session. Keep-alive continue messages only point at them instead of repeating them.]

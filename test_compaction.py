@@ -366,14 +366,31 @@ class CompactAtStart(Env):
         self.assertNotIn("\n", compact)
         self.assertTrue(cont.startswith("[keep-alive] A new run starts"))
         for part in ("compacted at this start", f"Hand-off #{h['id']}", "Summary: Phase 2 merged.",
-                     "Next steps: (1) merge compaction", "#12", "Guard hooks"):
+                     "Next steps: (1) merge compaction", "#12", "SessionStart hook"):
             self.assertIn(part, cont)
-        self.assertLess(cont.index("Hand-off #"), cont.index("Guard hooks"))
+        # the session runs in the repo (session_cwd falls back to HERE): the rules come from the
+        # SessionStart hook after the compaction, the message only points at them (D-225)
+        self.assertLess(cont.index("Hand-off #"), cont.index("SessionStart hook"))
+        self.assertNotIn("TASK-MANAGER", cont)
+        self.assertNotIn("Guard hooks", cont)
         self.assertEqual(rec["result"], "continued-in-place")
         self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"],
                           rec["compaction"]["handoff_consumed"]), ("compacted", h["id"], True))
         self.assertIsNone(self.latest())                                     # consumed ...
         self.assertEqual(self.latest(unconsumed=False)["consumed_by_start"], self.KEY)   # ... by this start
+
+    def test_session_outside_the_repo_gets_the_rules_inline(self):
+        """No SessionStart hook outside the repo's root: the continue carries the full rules (D-225)."""
+        old = ka.session_cwd
+        ka.session_cwd = lambda path: self.tmp.name
+        try:
+            self.start()
+        finally:
+            ka.session_cwd = old
+        cont = self.sent[1][1]
+        for part in ("Guard hooks", "TASK-MANAGER", "usage_report.py", "AFK rules (unattended runs)", "--run-stopped"):
+            self.assertIn(part, cont)
+        self.assertNotIn("SessionStart hook;", cont)
 
     def test_no_handoff_says_so(self):
         rec = self.start()

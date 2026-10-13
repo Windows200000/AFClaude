@@ -1389,5 +1389,110 @@ class DryRunLoop(unittest.TestCase):
             self.assertEqual(state["handled"]["stall-1"]["result"], "dry-run")
 
 
+class SessionRules(unittest.TestCase):
+    """D-225: the standing rules come from the repo's SessionStart hook (.claude/settings.json,
+    keepalive.py --session-rules); continue messages to a session in the repo only point at them."""
+    REASON = "window start, CONTINUE: test; budget for this run: +14%"
+    FULL = ("TASK-MANAGER", "usage_report.py", "Guard hooks", "AFK rules (unattended runs)", "OPEN_QUESTIONS.md")
+
+    def tearDown(self):
+        testenv.set_setting("session_stop_pct", None)
+
+    def test_continue_messages_point_at_the_rules(self):
+        for name, extra in (("continue", {}), ("last_mile", {}), ("fillup", {"remaining": "5", "reset": "04:00"})):
+            m = ka.session_message(name, reason=self.REASON, progress="P.md", hooked=True, **extra)
+            self.assertIn("budget for this run: +14%", m)
+            self.assertIn("Re-read P.md and pick up from its latest Status line", m)
+            self.assertIn("standing task-manager rules", m)
+            self.assertIn("SessionStart hook", m)
+            for part in self.FULL:
+                self.assertNotIn(part, m)
+            self.assertNotIn("\n", m)
+            self.assertNotIn("{", m)
+            self.assertLess(len(m), 1200)
+        fill = ka.session_message("fillup", reason="r", progress="P.md", hooked=True, remaining="5", reset="04:00")
+        for part in ("D-212", "D-204", "keepalive.py --run-stopped", "(D-224)", "remaining ~5%"):
+            self.assertIn(part, fill)                              # the fill-up specifics stay in the message
+
+    def test_outside_the_repo_the_rules_stay_inline(self):
+        m = ka.session_message("continue", reason="r", progress="P.md")
+        for part in self.FULL:
+            self.assertIn(part, m)
+        self.assertNotIn("SessionStart hook;", m)
+        neutral = ka.session_message("continue_foreign", manager=False, hooked=True, reason="r", context="")
+        self.assertIn("Guard hooks", neutral)                       # the user's own sessions: unchanged
+        self.assertNotIn("TASK-MANAGER", neutral)
+
+    def test_rules_hooked_only_in_the_repo_root(self):
+        self.assertTrue(ka.rules_hooked(ka.HERE))
+        self.assertTrue(ka.rules_hooked(ka.HERE + "/"))
+        self.assertFalse(ka.rules_hooked(os.path.join(ka.HERE, "prompts")))
+        self.assertFalse(ka.rules_hooked(os.path.dirname(ka.HERE)))
+        self.assertFalse(ka.rules_hooked(None))
+        self.assertFalse(ka.rules_hooked(""))
+
+    def test_parts_hold_all_rules_filled_and_under_the_cap(self):
+        testenv.set_setting("session_stop_pct", 90)
+        manager, afclaude = ka.standing_rules("manager"), ka.standing_rules("afclaude")
+        self.assertIn("TASK-MANAGER", manager)
+        self.assertIn("part 1 of 2", manager)
+        self.assertIn("part 2 of 2", afclaude)
+        for part in ("≥90%", "D-204", "D-212", "D-219", "keepalive.py --run-stopped", "D-224", "Guard hooks",
+                     "AFK rules", "CLAUDE_GUARD_DISABLE=1", "EXCEPTIONS.md", "Europe/Berlin"):
+            self.assertIn(part, afclaude)
+        for text in (manager, afclaude):
+            self.assertNotRegex(text, r"\{\w+\}")                    # every variable filled
+            self.assertLess(len(text), ka.HOOK_CONTEXT_CAP)          # Claude Code's per-hook cap
+        with self.assertRaises(ValueError):
+            ka.standing_rules("nope")
+
+    def test_hook_output(self):
+        out = ka.session_rules_hook("manager", {"cwd": ka.HERE, "source": "compact"})
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        self.assertIn("TASK-MANAGER", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(ka.session_rules_hook("manager", {"cwd": os.path.dirname(ka.HERE)}))
+        old = ka.standing_rules
+        ka.standing_rules = lambda part: 1 / 0
+        try:
+            text = ka.session_rules_hook("afclaude", {"cwd": ka.HERE})["hookSpecificOutput"]["additionalContext"]
+        finally:
+            ka.standing_rules = old
+        self.assertIn("could not be built", text)                    # never a failed hook
+        self.assertIn("manager_afclaude.md", text)
+
+    def test_cli(self):
+        """The hook command itself: valid JSON with the filled rules in the repo, nothing elsewhere,
+        exit 0 even for unreadable input."""
+        testenv.set_setting("session_stop_pct", 90)
+        cmd = [sys.executable, os.path.join(ka.HERE, "keepalive.py"), "--session-rules"]
+        for part, want in (("manager", "TASK-MANAGER"), ("afclaude", "≥90%")):
+            r = subprocess.run(cmd + [part], input=json.dumps({"cwd": ka.HERE, "source": "startup"}),
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            out = json.loads(r.stdout)
+            self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn(want, out["hookSpecificOutput"]["additionalContext"])
+        r = subprocess.run(cmd + ["manager"], input=json.dumps({"cwd": os.path.dirname(ka.HERE)}),
+                           capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        r = subprocess.run(cmd + ["afclaude"], input="not json", capture_output=True, text=True, cwd=ka.HERE,
+                           env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("AFK rules", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
+
+    def test_settings_register_the_hook(self):
+        with open(os.path.join(ka.HERE, ".claude", "settings.json")) as fh:
+            hooks = json.load(fh)["hooks"]["SessionStart"]
+        parts = []
+        for group in hooks:
+            matched = {m.strip() for m in group["matcher"].replace(",", "|").split("|")}
+            self.assertLessEqual({"startup", "resume", "compact", "clear"}, matched)
+            for h in group["hooks"]:
+                self.assertEqual(h["type"], "command")
+                self.assertIn("keepalive.py", h["command"])
+                parts.append(h["command"].split("--session-rules")[1].split()[0])
+        self.assertEqual(sorted(parts), sorted(ka.RULES_PARTS))      # one hook per part
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

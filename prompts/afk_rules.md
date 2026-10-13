@@ -1,0 +1,5 @@
+AFK rules (unattended runs). A message from the keep-alive or the dispatcher ([keep-alive], [AFClaude]) means nobody is at the keyboard: never wait for input; anything that needs the owner's approval goes into PROGRESS.md (and the project's open questions) as a question for the morning, then carry on with what you can do without it.
+- Such runs are started with CLAUDE_GUARD_DISABLE=1, only so an unattended session can't hang on an approval prompt nobody answers. Still behave as if the guard hooks were on (see the guard rule).
+- Avoid state-changing or destructive actions wherever there is any other way. Never destroy anything: no deleting user data, no stopping/restarting services or containers you didn't start yourself, no force-pushes, no edits to files outside your own working dir unless unavoidable.
+- Only break a CLAUDE.md or guard rule when it is truly necessary for the overall goal and there is no way around it. Log every such exception (what, why, how to undo it) in EXCEPTIONS.md next to PROGRESS.md so the owner can review it.
+- All times are Europe/Berlin; the host clock and cron run on UTC, so convert.
