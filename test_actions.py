@@ -5,6 +5,7 @@
     python3 -m unittest test_actions
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -715,6 +716,99 @@ class PromptActions(Base):
         self.assertEqual(self.do("prompt.set", name="manager.md", body="Be brief.")["body"], "Be brief.")
 
 
+class PromptDefaultsSync(Base):
+    """D-227: prompts/*.md imported into prompt_defaults on every deploy (`python3 store.py
+    import-prompts [--dry-run]`, actor runner:deploy). Base.setUp's PROMPTS_DIR already has
+    continue.md and manager.md; these tests add/edit files in it directly."""
+    def setUp(self):
+        super().setUp()
+        self._saved_code_version = actions._code_version
+        actions._code_version = lambda: "abc1234"   # deterministic, no real git/subprocess call
+
+    def tearDown(self):
+        actions._code_version = self._saved_code_version
+        super().tearDown()
+
+    def sha(self, name):
+        with open(os.path.join(actions.PROMPTS_DIR, name), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def test_dry_run_reports_without_writing(self):
+        preview = actions.prompt_defaults_preview(self.conn)
+        self.assertEqual(preview["files"], ["continue.md", "manager.md"])
+        self.assertEqual(sorted(c["name"] for c in preview["changed"]), ["continue.md", "manager.md"])
+        self.assertTrue(all(c["change"] == "new" for c in preview["changed"]))
+        self.assertEqual(preview["code_version"], "abc1234")
+        self.assertEqual(store.list_prompt_defaults(self.conn), [])   # nothing written
+        self.assertEqual(self.count("audit_log"), 0)
+
+    def test_first_import(self):
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(sorted(c["name"] for c in r["changed"]), ["continue.md", "manager.md"])
+        self.assertEqual(r["total_files"], 2)
+        self.assertEqual(r["code_version"], "abc1234")
+        rows = {row["name"]: row for row in store.list_prompt_defaults(self.conn)}
+        self.assertEqual(set(rows), {"continue.md", "manager.md"})
+        cont = rows["continue.md"]
+        with open(os.path.join(actions.PROMPTS_DIR, "continue.md")) as fh:
+            body = fh.read()
+        self.assertEqual(cont["body"], body)
+        self.assertEqual(cont["sha256"], self.sha("continue.md"))
+        self.assertIsNone(cont["previous_sha256"])
+        self.assertEqual(cont["code_version"], "abc1234")
+        self.assertIsNotNone(cont["deployed_at"])
+        audit_rows = self.audit(target_type="prompt_defaults")
+        self.assertEqual(len(audit_rows), 1)
+        self.assertEqual(audit_rows[0]["action"], "prompt.defaults_sync")
+
+    def test_idempotent_second_run_writes_nothing(self):
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        before = store.list_prompt_defaults(self.conn)
+        n_audit = self.count("audit_log")
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(r["changed"], [])
+        self.assertEqual(store.list_prompt_defaults(self.conn), before)   # byte-identical rows
+        self.assertEqual(self.count("audit_log"), n_audit)                # no audit row: no-op
+
+    def test_a_changed_file_updates_and_records_the_previous_sha(self):
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        old_sha = self.sha("continue.md")
+        old_deployed_at = store.get_prompt_default(self.conn, "continue.md")["deployed_at"]
+        with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
+            fh.write("Continue differently ({reason}). Progress: {progress}.\n")
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual([c["name"] for c in r["changed"]], ["continue.md"])
+        self.assertEqual(r["changed"][0]["previous_sha256"], old_sha)
+        new = store.get_prompt_default(self.conn, "continue.md")
+        self.assertEqual(new["sha256"], self.sha("continue.md"))
+        self.assertNotEqual(new["sha256"], old_sha)
+        self.assertEqual(new["previous_sha256"], old_sha)
+        self.assertNotEqual(new["deployed_at"], old_deployed_at)
+        # manager.md was untouched: still a no-op, not re-listed as changed
+        self.assertEqual(self.count("audit_log"), 2)                      # one per sync that changed something
+
+    def test_readme_is_skipped(self):
+        with open(os.path.join(actions.PROMPTS_DIR, "README.md"), "w") as fh:
+            fh.write("# Prompts\nNot a prompt default.\n")
+        preview = actions.prompt_defaults_preview(self.conn)
+        self.assertEqual(preview["files"], ["continue.md", "manager.md"])
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(sorted(c["name"] for c in r["changed"]), ["continue.md", "manager.md"])
+        self.assertIsNone(store.get_prompt_default(self.conn, "README.md"))
+
+    def test_marks_an_override_s_base_outdated_against_the_current_default(self):
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.do("prompt.set", actor="owner", via="dashboard", name="continue.md",
+                body="Go on ({reason}); {progress}.")
+        self.assertIsNone(store.get_prompt_override(self.conn, "continue.md")["base_outdated"])
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # default unchanged: still matches
+        self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)
+        with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
+            fh.write("Continue now ({reason}). Progress: {progress}.\n")
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # the default moved on
+        self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 1)
+
+
 class RequestActions(Base):
     def test_one_open_request_per_kind_and_target(self):
         self.stall(SID)
@@ -823,6 +917,7 @@ class EveryAction(Base):
             ("setting.import", {"source": "data/dispatcher.json", "values": {"cleanup_idle_hours": 3}}),
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
+            ("prompt.defaults_sync", {}),
             ("request.add", {"kind": "continue_now", "target": SID}),
             ("handoff.write", {"session_id": SID, "body": {"summary": "s"}}),
             ("handoff.consume", {"handoff_id": 1, "start_key": "window-start-2026-10-09"}),

@@ -57,6 +57,7 @@ import os
 import re
 import sqlite3
 import string
+import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
@@ -983,6 +984,88 @@ def prompt_reset(conn: sqlite3.Connection, ctx: Ctx, name: Any, version: Any = N
         return Result(row, name, None, None, changed=False)
     r = store.reset_prompt_override(conn, name, ctx.actor)
     return Result(r, name, {"body": row["body"]}, {"body": None})
+
+
+# ---------------------------------------------------------------- prompt defaults (D-227)
+
+def _code_version() -> str | None:
+    """git commit or image build id, best-effort (D-227: never an error, just unknown). Checks
+    AFCLAUDE_CODE_VERSION first (an operator or a future build step may set it, e.g. to the
+    image build id baked into docker/compose.yml), else the repo's own git commit, when there
+    is one -- the image build context excludes .git (.dockerignore), so this is usually None
+    inside the container and a short hash on the host/dev checkout."""
+    env = os.environ.get("AFCLAUDE_CODE_VERSION")
+    if env:
+        return env
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE, capture_output=True,
+                             text=True, timeout=5, check=True)
+        sha = out.stdout.strip()
+        return sha or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _prompt_default_files() -> dict[str, tuple[str, str]]:
+    """{name: (body, sha256)} for every prompts/*.md except README.md, the code's current
+    defaults (D-169: defaults ship with the code; the DB only ever records them)."""
+    out: dict[str, tuple[str, str]] = {}
+    try:
+        names = os.listdir(PROMPTS_DIR)
+    except OSError:
+        return out
+    for fname in sorted(names):
+        if fname == "README.md" or not PROMPT_NAME_RE.match(fname):
+            continue
+        path = os.path.join(PROMPTS_DIR, fname)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as fh:
+            body = fh.read()
+        out[fname] = (body, hashlib.sha256(body.encode()).hexdigest())
+    return out
+
+
+def prompt_defaults_preview(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The dry-run: what `prompt.defaults_sync` would import right now. Read-only (no gate, no
+    transaction, not an audited action; mirrors log_prune_preview)."""
+    files = _prompt_default_files()
+    changed = []
+    for name, (_body, sha) in files.items():
+        cur = store.get_prompt_default(conn, name)
+        if cur is None:
+            changed.append({"name": name, "change": "new", "sha256": sha})
+        elif cur["sha256"] != sha:
+            changed.append({"name": name, "change": "updated", "sha256": sha,
+                            "previous_sha256": cur["sha256"]})
+    return {"files": sorted(files), "changed": changed, "code_version": _code_version()}
+
+
+@action("prompt.defaults_sync", "prompt_defaults")
+def prompt_defaults_sync(conn: sqlite3.Connection, ctx: Ctx) -> Result:
+    """Import prompts/*.md (except README.md) into prompt_defaults -- the code's current
+    defaults, which still ship as files (D-169); the DB holds the owner's edits
+    (prompt_overrides, D-193/D-197). Meant to run at every deploy (`python3 store.py
+    import-prompts`, docker/entrypoint.sh, actor runner:deploy), so it must stay idempotent: a
+    file whose sha256 already matches writes nothing (store.put_prompt_default). Where an
+    override exists, also refreshes prompt_overrides.base_outdated: whether its base_sha256 (the
+    default it was edited against) still matches the current default's sha256, so a reader can
+    flag a stale edit without re-reading the file (no-op, defensive, if that column is somehow
+    missing: store.mark_override_base_outdated). No audit row when nothing changed (is_noop)."""
+    code_version = _code_version()
+    files = _prompt_default_files()
+    changed = []
+    for name, (body, sha) in files.items():
+        row, did_change = store.put_prompt_default(conn, name, body, sha, code_version)
+        if did_change:
+            changed.append({"name": name, "sha256": sha, "previous_sha256": row.get("previous_sha256")})
+    defaults_sha = {name: sha for name, (_b, sha) in files.items()}
+    for o in store.list_prompt_overrides(conn):
+        default_sha = defaults_sha.get(o["name"])
+        outdated = None if default_sha is None or o["base_sha256"] is None else o["base_sha256"] != default_sha
+        store.mark_override_base_outdated(conn, o["name"], outdated)
+    after = {"changed": changed, "total_files": len(files), "code_version": code_version}
+    return Result(after, "prompt_defaults", None, after, changed=bool(changed))
 
 
 # ---------------------------------------------------------------- execution requests (§4.6)

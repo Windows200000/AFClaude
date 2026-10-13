@@ -42,6 +42,13 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                process still running older code (the keep-alive watcher) see the
                database as newer than itself, read-only, and pause all autonomous
                starts until it is restarted.
+               prompt_defaults (D-227, additive the same way): the code's current prompts/*.md
+               (except README.md) imported on every deploy (`python3 store.py import-prompts`,
+               docker/entrypoint.sh, after the DB is reachable; the audited action is
+               actions.prompt_defaults_sync, actor runner:deploy). Readers still read the files
+               for now (D-169; the prompts.py loader is phase 3); prompt_overrides.base_outdated
+               (COLUMNS) is refreshed by the same sync, flagging an override whose base_sha256 no
+               longer matches the current default.
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -530,6 +537,27 @@ CREATE TRIGGER IF NOT EXISTS doc_entries_no_delete BEFORE DELETE ON doc_entries
 BEGIN SELECT RAISE(ABORT, 'doc_entries is append-only'); END;
 """
 
+# ---- prompt defaults (D-227): the code's current prompts/*.md imported into the DB, every
+# deploy (`python3 store.py import-prompts`, run by docker/entrypoint.sh after the DB volume is
+# mounted; the action is actions.prompt_defaults_sync, actor runner:deploy). Defaults still ship
+# as files (D-169) and readers still read the files for now (the prompts.py loader is phase 3);
+# this table exists so the DB always has a record of what is currently deployed, for later
+# phases and so an override's `base_sha256` (prompt_overrides) can be checked against the
+# current default without re-reading the file. One row per prompt name (the latest default
+# only); `previous_sha256` is what it replaced (NULL the first time a name is seen). Additive,
+# no schema_version bump (same treatment as accounts/handoffs/telemetry/runner-state/docs: a
+# still-running older checkout must not see the DB as newer than itself).
+PROMPT_DEFAULTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prompt_defaults (
+    name            TEXT PRIMARY KEY,     -- file name under prompts/, e.g. continue.md
+    body            TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    deployed_at     TEXT NOT NULL,        -- when this body was imported (changed, not every sync)
+    code_version    TEXT,                 -- git commit or image build id, when known
+    previous_sha256 TEXT                  -- the sha256 this replaced (NULL the first time)
+);
+"""
+
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
 # read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
@@ -553,6 +581,11 @@ COLUMNS = {
     "task_events": [],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
+    # D-227: base_sha256 vs the current prompt_defaults.sha256, refreshed by prompt.defaults_sync
+    # on every import -- NULL until the first sync after this column exists, or when there's no
+    # override (no row) / no prompt_defaults row yet for that name; else 0 (matches) or 1 (the
+    # default moved on since this override was made).
+    "prompt_overrides": [("base_outdated", "INTEGER")],
 }
 
 SESSION_FIELDS = (
@@ -642,6 +675,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(TELEMETRY_SCHEMA)
     conn.executescript(RUNNER_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
+    conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
                      (DEFAULT_ACCOUNT, "this installation's Claude account", now_iso()))
@@ -1800,6 +1834,48 @@ def reset_prompt_override(conn: sqlite3.Connection, name: str, updated_by: str |
     conn.execute("UPDATE prompt_overrides SET body=NULL, base_sha256=NULL, updated_at=?, updated_by=? "
                  "WHERE name=?", (now_iso(), updated_by, name))
     return get_prompt_override(conn, name)
+
+
+def get_prompt_default(conn: sqlite3.Connection, name: str) -> Row | None:
+    r = conn.execute("SELECT * FROM prompt_defaults WHERE name=?", (name,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_prompt_defaults(conn: sqlite3.Connection) -> list[Row]:
+    return [dict(r) for r in conn.execute("SELECT * FROM prompt_defaults ORDER BY name")]
+
+
+def put_prompt_default(conn: sqlite3.Connection, name: str, body: str, sha256: str,
+                       code_version: str | None) -> tuple[Row, bool]:
+    """Upsert prompts/<name>'s current default text (D-227). Idempotent: when the stored
+    sha256 already matches, this writes nothing (an unchanged file is a no-op on every deploy)
+    and returns the existing row with False. Otherwise inserts/updates with deployed_at = now
+    and previous_sha256 = what it replaced (NULL the first time this name is seen).
+    -> (the row after, True if it was inserted or changed)."""
+    cur = get_prompt_default(conn, name)
+    if cur is not None and cur["sha256"] == sha256:
+        return cur, False
+    previous = cur["sha256"] if cur is not None else None
+    conn.execute(
+        "INSERT INTO prompt_defaults(name, body, sha256, deployed_at, code_version, previous_sha256) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body, "
+        "sha256=excluded.sha256, deployed_at=excluded.deployed_at, code_version=excluded.code_version, "
+        "previous_sha256=excluded.previous_sha256", (name, body, sha256, now_iso(), code_version, previous))
+    row = get_prompt_default(conn, name)
+    assert row is not None     # just written, in the same connection
+    return row, True
+
+
+def mark_override_base_outdated(conn: sqlite3.Connection, name: str, outdated: bool | None) -> None:
+    """Set prompt_overrides.base_outdated for `name`, only if that column exists (it is added
+    additively by COLUMNS on connect(), but this stays defensive: a caller against an older-
+    shaped connection must not crash a deploy over a cosmetic flag). No-op if there's no
+    override row for `name` (nothing to flag)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(prompt_overrides)")}
+    if "base_outdated" not in cols:
+        return
+    conn.execute("UPDATE prompt_overrides SET base_outdated=? WHERE name=?",
+                 (None if outdated is None else int(outdated), name))
 
 
 def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,
@@ -2962,7 +3038,33 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     pl.add_argument("--dry-run", action="store_true", help="count what is due, change nothing")
     pl.add_argument("--batch-size", type=int, default=1000, help="rows per DELETE statement (default 1000)")
+    pp = sub.add_parser("import-prompts", help="import prompts/*.md (except README.md) into prompt_defaults, "
+                                               "the code's current defaults (D-227; idempotent, the files are "
+                                               "not changed); run at every container start/deploy "
+                                               "(docker/entrypoint.sh), audited as prompt.defaults_sync")
+    pp.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    pp.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
     args = ap.parse_args(argv)
+    if args.cmd == "import-prompts":
+        import importlib
+        actions = importlib.import_module("actions")
+        try:
+            conn = connect(args.db)
+        except DBError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        try:
+            if args.dry_run:
+                print(json.dumps(actions.prompt_defaults_preview(conn), ensure_ascii=False))
+                return 0
+            out = actions.perform(conn, "prompt.defaults_sync", {}, actor="runner:deploy", via="runner")
+            print(json.dumps(out, ensure_ascii=False))
+            return 0
+        except (DBError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
     if args.cmd == "prune-logs":
         import importlib
         actions = importlib.import_module("actions")
