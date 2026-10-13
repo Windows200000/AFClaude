@@ -6,7 +6,7 @@ write path in actions.py (state_save, app_log_append / app_log_sync, job_put / j
 own_session_add); this module maps the data/ files onto them:
 
   file (data/)                          component / table
-  keepalive/keepalive_state.json        runner_state 'keepalive' (handled, fires, limit_hits per entry)
+  keepalive/keepalive_state.json        runner_state 'keepalive' (handled, fires, limit_hits, run_stops per entry)
   keepalive/keepalive_deferred.json     runner_state 'keepalive.deferred' (one row per postponed start)
   keepalive/keepalive_fillup.json       runner_state 'keepalive.fillup'
   keepalive/usage_refresh_state.json    runner_state 'keepalive.usage_refresh' (window_start per entry)

@@ -4,6 +4,7 @@
       "Bash(bash tools/test_compact_live.sh:*)",
       "Bash(python3 tasks.py:*)",
       "Bash(python3 keepalive.py --decide:*)",
+      "Bash(python3 keepalive.py --run-stopped:*)",
       "Bash(python3 usage_report.py:*)",
       "Bash(claude agents:*)",
       "mcp__afclaude"
