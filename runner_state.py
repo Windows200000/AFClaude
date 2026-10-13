@@ -28,7 +28,7 @@ The migration keeps the live system running (dual-write, as telemetry.py):
     file carries the mark of one of the last DB saves; a file changed outside the DB (a runner
     on older code such as the long-running watcher until its restart, a failed DB write, a hand
     edit) or any DB problem -> None, and the caller reads the file as before. read_json() is the
-    same for read-only readers of a state file, own_sessions() for own_sessions.txt (stalled.py).
+    same for read-only readers of a state file.
   - Concurrency (actions.state_save, one transaction per save): a state loaded from the DB is a
     StateDoc that remembers the rows it came from; its save writes only what this writer
     changed or removed since (merge), so the watcher and the cron run, saving one after the
