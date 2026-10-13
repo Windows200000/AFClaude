@@ -50,6 +50,7 @@ the setting checks, _check_version) or use them only as lookup keys.
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import inspect
 import json
@@ -1201,17 +1202,61 @@ def doc_sync_plan(kind: str, chunks: list[str], text: str) -> tuple[int, list[st
     return keep, new
 
 
+def merge3(base: str, ours: str, theirs: str) -> str | None:
+    """Line-based 3-way merge of two texts that both changed from `base`: `ours` (the DB) and
+    `theirs` (the file, hand-edited). Each side's changes are applied where they touch different
+    lines of base; where both insert at the same place, ours goes first (a log: the runners'
+    notes, then the hand-appended lines); the same change on both sides counts once.
+    -> the merged text, None if both changed the same lines differently (a conflict)."""
+    a = base.splitlines(keepends=True)
+
+    def hunks(side: int, text: str) -> list[tuple[int, int, int, list[str]]]:
+        b = text.splitlines(keepends=True)
+        return [(i1, i2, side, b[j1:j2]) for tag, i1, i2, j1, j2
+                in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if tag != "equal"]
+
+    out: list[str] = []
+    pos = 0
+    prev: tuple[int, int, list[str]] | None = None
+    for i1, i2, _side, lines in sorted(hunks(0, ours) + hunks(1, theirs), key=lambda h: (h[0], h[1], h[2])):
+        if prev is not None and (i1, i2, lines) == prev:
+            continue                      # both sides made the same change
+        if i1 < pos:
+            return None                   # overlaps the other side's change
+        out.extend(a[pos:i1])
+        out.extend(lines)
+        pos, prev = i2, (i1, i2, lines)
+    out.extend(a[pos:])
+    return "".join(out)
+
+
+def _sync_base(conn: sqlite3.Connection, doc: store.Row) -> str | None:
+    """The file's text at the last sync mark (the merge base): stored with the mark, or (a mark
+    from before file_text existed) the DB's text as of the mark's entry if it hashes the same."""
+    if doc.get("file_sha256") is None:
+        return None
+    if doc.get("file_text") is not None:
+        return str(doc["file_text"])
+    text = "".join(store.doc_chunks(conn, doc["id"], upto=int(doc["file_entry"] or 0)))
+    return text if store.sha256_text(text) == doc["file_sha256"] else None
+
+
 @action("doc.sync", "doc")
 def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: Any, force: Any = False) -> Result:
-    """The dual-write importer for one doc (project_docs.py): make the DB read like the file `text`
-    while the files are still edited by hand, idempotently, and record the sync mark.
+    """The importer for one doc (project_docs.py: the scheduled import, the export's first step):
+    make the DB take in the file `text` (hand edits), idempotently, and record the sync mark
+    (the file's text and the newest entry then).
       - the file reads like the DB: in sync (the mark is moved to it);
       - the file is unchanged since the last sync but the DB moved on (doc.append/doc.set): the
         DB is ahead, nothing is imported (the export writes it out);
-      - the file changed: its new text is imported (appends; an in-place edit of a log is one
-        'replace' entry keeping the unchanged entries, plus the changed tail);
-      - both changed and the import would drop DB text written since the last sync: Conflict,
-        nothing written, unless force (the file wins; the dropped entries stay in the history)."""
+      - the file changed, the DB didn't: its new text is imported (appends; an in-place edit of a
+        log is one 'replace' entry keeping the unchanged entries, plus the changed tail);
+      - both changed: a 3-way merge against the file's text at the mark (merge3: the runners'
+        notes and the hand edits touch different lines, e.g. both appended) is imported, and the
+        DB is then ahead of the file ('merged'; the export writes the merged text out);
+      - both changed the same lines and the import would drop DB text written since the last
+        sync: Conflict, nothing written, unless force (the file wins; the dropped entries stay
+        in the history)."""
     p, n = _doc_ref(conn, project, name)
     body = store.doc_text(text, allow_empty=True)
     kind = store.doc_kind(n)
@@ -1223,26 +1268,39 @@ def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: 
     target = f"{p['name']}/{n}"
     plan = doc_sync_plan(kind, chunks, body)
     if plan is None:
-        store.set_doc_mark(conn, doc["id"], sha, last)
+        store.set_doc_mark(conn, doc["id"], body, last)
         return Result(_doc_result(doc, p, outcome="in_sync", appended=0), target, before, before, changed=False)
     if doc["file_sha256"] == sha:
         return Result(_doc_result(doc, p, outcome="db_ahead", appended=0), target, before, before, changed=False)
     keep, new = plan
-    db_moved = last > (doc["file_entry"] or 0) if doc["file_sha256"] is not None else last > 0
+    base = _sync_base(conn, doc)
+    # the DB has text the file at the mark didn't (a note, a doc.set, or an earlier merge not yet exported)
+    db_moved = ("".join(chunks) != base if base is not None else
+                last > (doc["file_entry"] or 0) if doc["file_sha256"] is not None else last > 0)
+    outcome = "imported"
     if db_moved and keep < len(chunks) and not _bool(force):
-        raise Conflict(f"doc {target}: the file and the DB both changed since the last sync, and importing the "
-                       f"file would drop DB text written since then (entries after #{doc['file_entry'] or 0}); "
-                       "export or merge by hand, or import with force (the file wins)")
+        merged = merge3(base, "".join(chunks), body) if base is not None else None
+        if merged is None:
+            raise Conflict(f"doc {target}: the file and the DB both changed the same part since the last sync "
+                           f"(DB entries after #{doc['file_entry'] or 0}); export or merge by hand, or import "
+                           "with force (the file wins)")
+        outcome = "merged"
+        merged_plan = doc_sync_plan(kind, chunks, merged)
+        if merged_plan is None:          # the file's change is in the DB already
+            store.set_doc_mark(conn, doc["id"], body, last)
+            return Result(_doc_result(doc, p, outcome=outcome, appended=0, kept=len(chunks), replaced=False),
+                          target, before, before, changed=True)
+        keep, new = merged_plan
     first = True
     for chunk in new:
         replace = first and (kind == "body" or keep < len(chunks))     # a body doc changes by replace only
         last = store.add_doc_entry(conn, doc["id"], "replace" if replace else "append", chunk, ctx.actor, ctx.via,
                                    keep=keep if replace else 0)
         first = False
-    store.set_doc_mark(conn, doc["id"], sha, last)
-    after = {"chars": len(body), "entries": keep + len(new), "last_entry": last,
-             "kept": keep, "added": len(new), "replaced": keep < len(chunks)}
-    return Result(_doc_result(doc, p, outcome="imported", appended=len(new), kept=keep,
+    store.set_doc_mark(conn, doc["id"], body, last)
+    after = {"chars": len(store.doc_render(conn, doc["id"])), "entries": keep + len(new), "last_entry": last,
+             "kept": keep, "added": len(new), "replaced": keep < len(chunks), "merged": outcome == "merged"}
+    return Result(_doc_result(doc, p, outcome=outcome, appended=len(new), kept=keep,
                               replaced=keep < len(chunks)), target, before, after, changed=True)
 
 
@@ -1344,7 +1402,10 @@ for _a in (Appender("usage.sample", "usage_samples", _ts_of("at"), _sample_stale
            Appender("usage.weekly_cycle", "weekly_cycles", _ts_of("reset_at"), key=_field_key("reset_at")),
            Appender("usage.run", "usage_runs", _ts_of("start"), key=_field_key("run_id"),
                     final=_flag_field("final")),
-           Appender("usage.user_model", "user_model", _fitted_ts, key=_model_key)):
+           Appender("usage.user_model", "user_model", _fitted_ts, key=_model_key),
+           # usage_reviews (§7.2): one record per review launch (usage_review.py), final once done
+           Appender("usage.review", "usage_reviews", _ts_of("started_at"), key=_field_key("review_id"),
+                    final=_flag_field("final"))):
     register_appender(_a)
 
 

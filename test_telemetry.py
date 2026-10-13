@@ -209,12 +209,15 @@ class Importer(Base):
         self.assertEqual(by["haiku_judgements"]["inserted"], 1)
         self.assertEqual(by["haiku_judgements"]["duplicate"], 1)
         for t in store.TELEMETRY_APPEND + store.TELEMETRY_DOCS:
+            if t == "usage_reviews":                                    # born in the DB: no legacy file
+                self.assertNotIn(t, by)
+                continue
             self.assertEqual(by[t]["status"], "ok", t)
             self.assertEqual(by[t]["missing"], 0, t)
         self.assertEqual(r1["counts"], {"usage_samples": 40, "usage_weekly_series": 5, "usage_session_windows": 3,
                                         "forecast_log": 1, "haiku_judgements": 1, "usage_reports": 1,
                                         "usage_run_readings": 1, "stage_eta_log": 1, "weekly_cycles": 1,
-                                        "usage_runs": 2, "user_model": 1})
+                                        "usage_runs": 2, "user_model": 1, "usage_reviews": 0})
         self.assertEqual(self.conn.execute("SELECT SUM(stale) FROM usage_samples").fetchone()[0], 1)
         self.assertEqual(self.conn.execute("SELECT stale FROM usage_run_readings").fetchone()[0], 1)
         r2 = telemetry.import_all()                                     # imported kinds are retired

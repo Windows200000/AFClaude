@@ -299,6 +299,7 @@ class BudgetWiring(unittest.TestCase):
         ka.DEFER_FILE = os.path.join(self.tmp.name, "deferred.json")
         ka.STATE_FILE = os.path.join(self.tmp.name, "state.json")
         ka.PROGRESS_FILE = os.path.join(self.tmp.name, "PROGRESS.md")
+        testenv.notes_project(self.tmp.name)         # the progress notes go to its doc in the DB (§7.7)
         self.setcfg()
 
     def tearDown(self):
@@ -722,11 +723,7 @@ class BudgetWiring(unittest.TestCase):
         ka.budget_eval, ka.fresh_usage, ka.handle_fire = olds
 
     def progress(self):
-        try:
-            with open(ka.PROGRESS_FILE) as fh:
-                return fh.read()
-        except OSError:
-            return ""
+        return testenv.notes(os.path.dirname(ka.PROGRESS_FILE))
 
     def test_postponed_start_runs_only_until_the_next_session_window_start(self):
         """A 23:00 start postponed to 01:30 is deferred (deadline 04:00, the next start); one
@@ -1213,6 +1210,7 @@ class WatcherNoContinue(unittest.TestCase):
             ka.PROJECTS_DIR = d
             ka.STATE_FILE, ka.LOCK_FILE = os.path.join(d, "st.json"), os.path.join(d, "ka.lock")
             ka.STOP_FILE, ka.PROGRESS_FILE = os.path.join(d, "STOP"), os.path.join(d, "P.md")
+            testenv.notes_project(d)
             ka.DEFER_FILE = os.path.join(d, "deferred.json")
             ka.handle_fire = lambda *a, **k: calls.append("handle_fire")
             ka.fire = lambda *a, **k: calls.append("fire") or (0, "", "")
@@ -1232,8 +1230,7 @@ class WatcherNoContinue(unittest.TestCase):
                     setattr(ka, n, v)
             self.assertEqual(calls, ["last_mile_pass", "deferred"] * 2)     # never handle_fire / fire
             self.assertTrue(any(ln.startswith("LIMIT_HIT:") and "D-204" in ln for ln in logs), logs)
-            with open(os.path.join(d, "P.md")) as fh:
-                notes = fh.read()
+            notes = testenv.notes(d)
             self.assertEqual(notes.count("hit its session limit"), 1)
             self.assertIn("no continue at the limit reset (D-204)", notes)
             with open(os.path.join(d, "st.json")) as fh:

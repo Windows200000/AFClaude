@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Failure alerts for AFClaude.
 
-notify(subject, body) always appends to ALERTS.md (and PROGRESS.md), then tries a
-first-party Claude push notification via a tiny headless Haiku run (PushNotification
-tool only, dontAsk). Claude Code suppresses the push when it thinks the user is at
-a terminal ("Not sent — this terminal is active"), so the push is best-effort; the
-tool's answer is recorded next to the alert.
+notify(subject, body) tries a first-party Claude push notification via a tiny headless
+Haiku run (PushNotification tool only, dontAsk), then always records the alert in the
+project's docs in the DB (D-161, design §7.7): an entry in `alerts` and one line in
+`progress` (doc.append through actions.py, actor runner:notify; project_docs.append_note).
+ALERTS.md is no longer written (D-181: alerts are read with `tasks.py doc show alerts`,
+MCP afclaude_doc, the quickview); PROGRESS.md gets the line at the next export. When the
+DB itself is broken the alert goes to data/ALERTS.fallback.md (§7.8, D-171). Claude Code
+suppresses the push when it thinks the user is at a terminal ("Not sent — this terminal
+is active"), so the push is best-effort; the tool's answer is recorded next to the alert.
 
 CLI: notify.py "subject" "body"
 """
@@ -19,8 +23,8 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
-ALERTS = os.path.join(HERE, "ALERTS.md")
-PROGRESS = os.path.join(HERE, "PROGRESS.md")
+import project_docs  # noqa: E402  (the alert into the DB: doc.append)
+ACTOR = "runner:notify"
 BERLIN = ZoneInfo("Europe/Berlin")
 ENV = {"HOME": os.path.expanduser("~"), "USER": "opc", "PATH": "/home/opc/.local/bin:/usr/bin:/bin",
        "LANG": "C.UTF-8"}
@@ -51,8 +55,9 @@ def notify(subject, body="", do_push=True):
     now = datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
     os.makedirs(os.path.join(HERE, "data"), exist_ok=True)
     result = push(f"AFClaude: {subject}"[:180]) if do_push else "push skipped"
-    host.append_note(ALERTS, f"- **{now}** {subject}\n  {body.strip()[:1500]}\n  _(push: {result})_\n")
-    host.append_note(PROGRESS, f"- {now[11:]} [ALERT] {subject} (details in ALERTS.md)\n")
+    project_docs.append_note("alerts", f"- **{now}** {subject}\n  {body.strip()[:1500]}\n  _(push: {result})_\n",
+                             ACTOR)
+    project_docs.append_note("progress", f"- {now[11:]} [ALERT] {subject} (details in the alerts doc)\n", ACTOR)
     return result
 
 

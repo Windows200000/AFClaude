@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402,F401  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import keepalive as ka  # noqa: E402
 import usage_review as ur  # noqa: E402
+import actions  # noqa: E402
+import store  # noqa: E402
+import telemetry  # noqa: E402
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
@@ -234,35 +237,111 @@ class SessionIdle(unittest.TestCase):
         self.assertFalse(ur.session_idle("sid", NOW))
 
 
+def this_project():
+    """The test DB's project for this repo (usage_review's report docs live there)."""
+    conn = store.connect()
+    try:
+        p = store.get_project(conn, ur.HERE)
+        if p is None:
+            store.add_project(conn, "AFC-test", None, ur.HERE)
+            p = store.get_project(conn, ur.HERE)
+        return p["name"]
+    finally:
+        conn.close()
+
+
+def set_doc(name, text):
+    conn = store.connect()
+    try:
+        actions.perform(conn, "doc.set", {"project": this_project(), "name": name, "text": text},
+                        actor="cli", via="cli")
+    finally:
+        conn.close()
+
+
 class UsageReviewFinished(unittest.TestCase):
     """usage_review_finished() needs BOTH signals: the report could still be mid-write while the
-    session looks idle, or the session could be slow to start even once a stale report exists."""
+    session looks idle, or the session could be slow to start even once a stale report exists.
+    The report is the review doc review:<date> in the DB (design §7.7), or a legacy file."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved_idle = ur.session_idle
+        self.saved = (ur.session_idle, ur.REVIEWS_DIR)
+        ur.REVIEWS_DIR = self.tmp.name
+        this_project()
 
     def tearDown(self):
-        ur.session_idle = self.saved_idle
+        ur.session_idle, ur.REVIEWS_DIR = self.saved
         self.tmp.cleanup()
 
     def test_false_without_the_report_even_if_idle(self):
         ur.session_idle = lambda sid, now, idle=None: True
-        report = os.path.join(self.tmp.name, "report.md")
-        self.assertFalse(ur.usage_review_finished("sid", report, NOW))
+        self.assertFalse(ur.usage_review_finished("sid", "review:2026-01-01", NOW))
 
     def test_false_while_not_idle_even_with_the_report(self):
         ur.session_idle = lambda sid, now, idle=None: False
-        report = os.path.join(self.tmp.name, "report.md")
-        with open(report, "w") as fh:
-            fh.write("findings")
-        self.assertFalse(ur.usage_review_finished("sid", report, NOW))
+        set_doc("review:2026-01-02", "findings\n")
+        self.assertFalse(ur.usage_review_finished("sid", "review:2026-01-02", NOW))
 
     def test_true_once_both_hold(self):
         ur.session_idle = lambda sid, now, idle=None: True
-        report = os.path.join(self.tmp.name, "report.md")
-        with open(report, "w") as fh:
+        set_doc("review:2026-01-03", "findings\n")
+        self.assertTrue(ur.usage_review_finished("sid", "review:2026-01-03", NOW))
+
+    def test_a_legacy_report_file_counts_too(self):
+        ur.session_idle = lambda sid, now, idle=None: True
+        with open(os.path.join(self.tmp.name, "2026-01-04.md"), "w") as fh:
             fh.write("findings")
-        self.assertTrue(ur.usage_review_finished("sid", report, NOW))
+        self.assertTrue(ur.usage_review_finished("sid", "review:2026-01-04", NOW))
+        self.assertEqual(ur.report_doc(NOW), "review:2026-10-09")
+
+
+class UsageReviewRecords(Base):
+    """usage_reviews (§7.2): a record per launch (kind usage.review, keyed by the session), marked
+    final by the hourly track_reviews() once the report doc exists and the session is idle, or
+    no_report after REVIEW_REPORT_DEADLINE; a failed launch is final at once."""
+    def setUp(self):
+        super().setUp()
+        self.saved_idle = ur.session_idle
+        this_project()
+
+    def tearDown(self):
+        ur.session_idle = self.saved_idle
+        super().tearDown()
+
+    def rec(self, sid):
+        return {r["review_id"]: r for r in telemetry.read_records("usage.review")}.get(sid)
+
+    def test_launch_records_and_tracking(self):
+        st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
+        when = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        self.assertTrue(ur.run_once(st, when, "stage-eta"))
+        sid = self.fires[-1][0]
+        r = self.rec(sid)
+        self.assertEqual((r["status"], r["final"], r["one_off"], r["reviews"], r["report_doc"]),
+                         ("started", False, True, ["stage-eta"], "review:2026-07-01"))
+        ur.session_idle = lambda s, now, idle=None: True
+        self.assertEqual(ur.track_reviews(when + timedelta(hours=1)), [])      # no report yet
+        set_doc("review:2026-07-01", "# Review\n")
+        done = ur.track_reviews(when + timedelta(hours=2))
+        self.assertEqual([(d["review_id"], d["status"]) for d in done], [(sid, "finished")])
+        self.assertTrue(self.rec(sid)["final"])
+        self.assertEqual(ur.track_reviews(when + timedelta(hours=3)), [])      # final: left alone
+
+    def test_no_report_and_launch_failure(self):
+        st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
+        when = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+        ur.run(st, when)
+        sid = self.fires[-1][0]
+        self.assertEqual(self.rec(sid)["reviews"], ["usage", "stage-eta"])
+        self.assertFalse(self.rec(sid)["one_off"])
+        ur.session_idle = lambda s, now, idle=None: False
+        self.assertEqual(ur.track_reviews(when + timedelta(hours=23)), [])
+        done = ur.track_reviews(when + ur.REVIEW_REPORT_DEADLINE)
+        self.assertEqual([d["status"] for d in done if d["review_id"] == sid], ["no_report"])
+        ka.fire = lambda *a, **k: (1, "", "boom")
+        ur.run_once(st, when, "usage")
+        failed = [r for r in telemetry.read_records("usage.review") if r.get("rc") == 1 and r["date"] == "2026-06-01"]
+        self.assertEqual([(r["status"], r["final"]) for r in failed], [("launch_failed", True)])
 
 
 class WaitForUsageReview(unittest.TestCase):
@@ -338,8 +417,8 @@ class ChainUsageEta(Base):
         self.assertNotIn("periodic usage-model review", msg2)
         self.assertIn("Schedule the eta review at end of this week", msg2)
         d = NOW.astimezone(ka.BERLIN).date().isoformat()
-        report = os.path.join(ur.HERE, "data", "reviews", f"{d}.md")
-        self.assertIn(report, msg2)
+        report = f"review:{d}"
+        self.assertIn(f"the review doc {report} in the AFClaude DB", msg2)
         self.assertIn("telemetry.py user-model get", msg2)
         # waited on the usage session specifically, before firing the ETA leg
         self.assertEqual(waited, [(sid1, report, NOW)])

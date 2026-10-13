@@ -474,7 +474,7 @@ def fresh_usage(now, force=False):
 
 def note_window_usage(key, ok, now, final=False):
     """Window-start usage bookkeeping: count failed (unknown / stale) usage checks in a row per
-    window-start key; after USAGE_ALERT_AFTER of them append ONE alert to ALERTS.md (D-048 /
+    window-start key; after USAGE_ALERT_AFTER of them send ONE alert (notify.py; D-048 /
     D-049), not one every 15 min; at once if `final` (no recheck follows tonight). A good check
     resets the count. The fail-safe itself is unchanged: unknown usage never starts work.
     -> True if it alerted."""
@@ -1045,7 +1045,12 @@ def mark_run_stopped(session_id, now, path=None):
 
 
 def progress_note(line):
-    host.append_note(PROGRESS_FILE, f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n")
+    """A note in the progress doc of the project whose directory holds PROGRESS_FILE, in the DB
+    (doc.append, actor runner:keepalive; design §7.7): the file gets it at the next export. Never
+    raises (a DB failure: data/ALERTS.fallback.md, §7.8)."""
+    import project_docs
+    project_docs.append_note("progress", f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n",
+                             "runner:keepalive", repo=os.path.dirname(os.path.abspath(PROGRESS_FILE)))
 
 
 # ---------------------------------------------------------------- main loop
@@ -2307,7 +2312,7 @@ def main():
 
 
 def alert(subject, body=""):
-    """Failure alert (ALERTS.md + PROGRESS.md + best-effort push). Never raises."""
+    """Failure alert (notify.py: the alerts + progress docs in the DB, a best-effort push). Never raises."""
     log(f"ALERT: {subject}")
     try:
         from notify import notify

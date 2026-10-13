@@ -18,7 +18,9 @@ serves at /afclaude/:
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
-                README, design doc, prompts/*.md
+                README, design doc, prompts/*.md; PROGRESS, GOALS, ALERTS and EXCEPTIONS
+                (and the goal list) come from the project docs in the DB (design §7.7:
+                the runners' notes and alerts are only there), the file if the DB has none
 
 Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
@@ -68,6 +70,8 @@ DOCS = [  # (published name, source, title)
     ("README.md", os.path.join(HERE, "README.md"), "README"),
     ("design-task-manager.md", DESIGN_DOC, "Design doc: task manager / MCP plan"),
 ]
+# published name -> the project doc it shows (the DB's text; the file only if the DB has none)
+DB_DOCS = {"PROGRESS.md": "progress", "GOALS.md": "goals", "ALERTS.md": "alerts", "EXCEPTIONS.md": "exceptions"}
 EXCLUDE_DIRS = ("data", "run", "probe", ".git", ".venv", "prompts", "node_modules", "__pycache__")
 
 
@@ -97,6 +101,34 @@ def read(path):
             return fh.read()
     except OSError:
         return None
+
+
+def db_doc(name):
+    """(text, updated_at as datetime) of this repo's project doc `name` in the DB; (None, None) if
+    there is none or the DB can't be read (the caller falls back to the file)."""
+    try:
+        conn = store.connect()
+        try:
+            p = store.get_project(conn, HERE)
+            d = store.get_doc(conn, p["id"], name) if p is not None else None
+            if d is None:
+                return None, None
+            return store.doc_render(conn, d["id"]), datetime.fromisoformat(d["updated_at"].replace("Z", "+00:00"))
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - a status page: show the file instead
+        return None, None
+
+
+def doc_source(name, src):
+    """(text, modified datetime) of a published doc: the DB's for DB_DOCS, else (or if the DB has
+    none) the file's; (None, None) if neither exists."""
+    if name in DB_DOCS:
+        text, at = db_doc(DB_DOCS[name])
+        if text is not None:
+            return text, at
+    text = read(src)
+    return (text, datetime.fromtimestamp(os.path.getmtime(src), UTC)) if text is not None else (None, None)
 
 
 def strip_frontmatter(text):
@@ -672,12 +704,12 @@ def main():
 
     docs = []
     for name, src, title in all_docs():
-        text = strip_frontmatter(read(src))
+        text, modified = doc_source(name, src)
+        text = strip_frontmatter(text)
         if text is None:
             continue
         write_atomic(f"docs/{name}", text)
-        docs.append({"name": name, "title": title, "path": f"docs/{name}",
-                     "modified_berlin": bstr(datetime.fromtimestamp(os.path.getmtime(src), UTC))})
+        docs.append({"name": name, "title": title, "path": f"docs/{name}", "modified_berlin": bstr(modified)})
     prompts = []
     for src in sorted(glob.glob(os.path.join(HERE, "prompts", "*.md"))):
         name = os.path.basename(src)
@@ -688,7 +720,7 @@ def main():
         "generated_at": now.isoformat(),
         "generated_berlin": bstr(now),
         "keepalive": keepalive_and_usage(now),
-        "goals": parse_goals(read(os.path.join(HERE, "GOALS.md"))),
+        "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
         "stages": stages(ka.read_usage_cache(), now),
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
         "latest_decision": latest_decision(),

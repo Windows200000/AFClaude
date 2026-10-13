@@ -54,6 +54,7 @@ class Env(unittest.TestCase):
         self.old = {n: getattr(ka, n) for n in self.NAMES}
         ka.PROJECTS_DIR = d
         ka.STATE_FILE, ka.PROGRESS_FILE = os.path.join(d, "state.json"), os.path.join(d, "PROGRESS.md")
+        testenv.notes_project(d)                     # the progress notes go to its doc in the DB (§7.7)
         ka.FILLUP_FILE, ka.HANDOFF_FILE = os.path.join(d, "fillup.json"), os.path.join(d, "handoff.json")
         ka.DEFER_FILE, ka.USAGE_STATE_FILE = os.path.join(d, "deferred.json"), os.path.join(d, "usage.json")
         ka.alert = lambda subject, body="": self.alerts.append(subject)
@@ -133,11 +134,7 @@ class Env(unittest.TestCase):
             conn.close()
 
     def progress(self):
-        try:
-            with open(ka.PROGRESS_FILE) as fh:
-                return fh.read()
-        except OSError:
-            return ""
+        return testenv.notes(self.tmp.name)
 
 
 class Armed:
