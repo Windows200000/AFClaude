@@ -445,6 +445,65 @@ class Fallback(Base):
         self.assertFalse(rs.log_lines("dispatcher", "x", os.path.join(self.dir, "elsewhere.log")))
 
 
+class OwnSessions(Base):
+    """own_sessions(): the DB for the live list once imported, the file otherwise (stalled.py)."""
+    SID = "a954f3c8-e15e-41dd-9b25-b2f8b1a88a06"
+    DB_ONLY = "11111111-2222-4333-8444-555555555555"
+
+    def setUp(self):
+        super().setUp()
+        self.fill()
+        self.live = self.p("own_sessions.txt")
+
+    def test_not_imported_reads_the_file(self):
+        self.assertEqual(rs.own_sessions(self.live), {self.SID})
+        self.assertEqual(rs.own_sessions(), {self.SID})                      # None = the live one
+
+    def test_imported_reads_the_db(self):
+        rs.import_all()
+        os.utime(self.live, (0, 0))                                          # unchanged since the import
+        actions.own_session_add(self.conn, self.DB_ONLY, actor="runner:import", via="runner")
+        self.assertEqual(rs.own_sessions(self.live), {self.SID, self.DB_ONLY})
+        os.remove(self.live)                                                 # the file is not needed
+        self.assertEqual(rs.own_sessions(self.live), {self.SID, self.DB_ONLY})
+
+    def test_file_changed_after_the_import_or_broken_db_reads_the_file(self):
+        rs.import_all()
+        actions.own_session_add(self.conn, self.DB_ONLY, actor="runner:import", via="runner")
+        future = datetime.now(timezone.utc).timestamp() + 60
+        os.utime(self.live, (future, future))                                # a hand edit after the import
+        self.assertEqual(rs.own_sessions(self.live), {self.SID})
+        os.utime(self.live, (0, 0))
+        self.conn.close()
+        with open(store.DB_PATH, "wb") as fh:
+            fh.write(b"this is not a database" * 100)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(store.DB_PATH + suffix):
+                os.remove(store.DB_PATH + suffix)
+        self.assertEqual(rs.own_sessions(self.live), {self.SID})
+        self.conn = store.connect(os.path.join(self.dir, "other.db"), create=True)
+
+    def test_side_file_never_touches_the_db(self):
+        rs.import_all()
+        side = os.path.join(self.dir, "elsewhere", "own.txt")
+        write(side, "# x\n" + self.DB_ONLY + "\n")
+        self.assertEqual(rs.own_sessions(side), {self.DB_ONLY})
+        self.assertEqual(rs.own_sessions(os.path.join(self.dir, "missing.txt")), set())
+
+    def test_stalled_scan_flags_a_db_only_own_session(self):
+        import stalled
+        rs.import_all()
+        os.utime(self.live, (0, 0))
+        actions.own_session_add(self.conn, self.DB_ONLY, actor="runner:import", via="runner")
+        store.upsert_session(self.conn, self.DB_ONLY, path="/nowhere.jsonl", cwd="/somewhere")
+        self.conn.commit()
+        proj = os.path.join(self.dir, "projects")
+        os.makedirs(proj)
+        stalled.scan(self.conn, proj, self.live)
+        own = self.conn.execute("SELECT own FROM sessions WHERE session_id=?", (self.DB_ONLY,)).fetchone()[0]
+        self.assertEqual(own, 1)
+
+
 class DualWrite(Base):
     def test_dispatcher_log_and_state(self):
         self.fill()

@@ -211,13 +211,10 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
             upd["last_scanned_offset"] = off
         store.upsert_session(conn, sid, **upd)
         known[sid] = dict(row, **upd, session_id=sid)
-    # own flag for every session (own_sessions.txt can change without any transcript changing)
-    own_extra = set()
-    try:
-        with open(own_list) as fh:
-            own_extra = {ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")}
-    except OSError:
-        pass
+    # own flag for every session (the own list can change without any transcript changing):
+    # the DB (driven_sessions kind 'own', D-161) for the live list, else the side file
+    import runner_state
+    own_extra = runner_state.own_sessions(own_list)
     for sid, r in known.items():
         own = int(is_own(sid, r.get("cwd"), r.get("title"), own_extra))
         if own != r.get("own"):

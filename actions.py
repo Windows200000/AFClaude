@@ -988,15 +988,25 @@ def prompt_reset(conn: sqlite3.Connection, ctx: Ctx, name: Any, version: Any = N
 
 # ---------------------------------------------------------------- prompt defaults (D-227)
 
+CODE_VERSION_FILE = os.path.join(HERE, "CODE_VERSION")   # baked into the image (docker/Dockerfile)
+
+
 def _code_version() -> str | None:
     """git commit or image build id, best-effort (D-227: never an error, just unknown). Checks
-    AFCLAUDE_CODE_VERSION first (an operator or a future build step may set it, e.g. to the
-    image build id baked into docker/compose.yml), else the repo's own git commit, when there
-    is one -- the image build context excludes .git (.dockerignore), so this is usually None
-    inside the container and a short hash on the host/dev checkout."""
+    AFCLAUDE_CODE_VERSION first (an operator override), then CODE_VERSION next to the code:
+    the image has no .git (.dockerignore), so the build writes the commit it was built from
+    there (build arg AFCLAUDE_CODE_VERSION via docker/compose.yml; a dev mount of a checkout
+    over the code hides the file), else the repo's own git commit (host / dev checkout)."""
     env = os.environ.get("AFCLAUDE_CODE_VERSION")
     if env:
         return env
+    try:
+        with open(CODE_VERSION_FILE) as fh:
+            baked = fh.read().strip()
+        if baked:
+            return baked
+    except OSError:
+        pass
     try:
         out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE, capture_output=True,
                              text=True, timeout=5, check=True)

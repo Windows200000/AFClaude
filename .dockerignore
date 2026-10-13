@@ -1,5 +1,6 @@
 # Only committed code goes into the image: no local-only, runtime or secret files.
 .git
+CODE_VERSION
 .venv
 __pycache__
 *.pyc
