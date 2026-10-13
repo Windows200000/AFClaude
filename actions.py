@@ -1235,8 +1235,8 @@ def _sync_base(conn: sqlite3.Connection, doc: store.Row) -> str | None:
     from before file_text existed) the DB's text as of the mark's entry if it hashes the same."""
     if doc.get("file_sha256") is None:
         return None
-    if doc.get("file_text") is not None:
-        return str(doc["file_text"])
+    if doc.get("file_text") is not None and store.sha256_text(str(doc["file_text"])) == doc["file_sha256"]:
+        return str(doc["file_text"])        # (an older writer moves the sha without the text: not trusted then)
     text = "".join(store.doc_chunks(conn, doc["id"], upto=int(doc["file_entry"] or 0)))
     return text if store.sha256_text(text) == doc["file_sha256"] else None
 
