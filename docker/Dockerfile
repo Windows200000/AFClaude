@@ -49,6 +49,12 @@ RUN set -eux; cd "${AFCLAUDE_DIR}"; \
     chmod 755 docker/entrypoint.sh docker/start_watcher.sh; \
     python3 -m compileall -q . >/dev/null || true
 
+# The commit the image is built from (the image has no .git): actions._code_version reads
+# CODE_VERSION. compose.yml passes it from the shell, see its Start line; empty -> no file.
+ARG AFCLAUDE_CODE_VERSION=
+RUN set -eu; cd "${AFCLAUDE_DIR}"; rm -f CODE_VERSION; \
+    if [ -n "${AFCLAUDE_CODE_VERSION}" ]; then printf '%s\n' "${AFCLAUDE_CODE_VERSION}" > CODE_VERSION; fi
+
 ENV AFCLAUDE_IN_CONTAINER=1 \
     AFCLAUDE_DIR=${AFCLAUDE_DIR} \
     AFCLAUDE_CRONTAB=${AFCLAUDE_DIR}/docker/crontab \

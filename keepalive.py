@@ -22,6 +22,10 @@ start (or the next last-stretch slot start) decides by its own check; that start
 find the previous run stopped at a limit and continue it (e.g. limit hit before 04:00, next
 run at 04:00). Approved stalled sessions of the owner are the dispatcher's job (D-206).
 
+A run ends at the earliest of (D-224, run_active()): the task-manager's clean stop (it runs
+`keepalive.py --run-stopped`), a limit hit, RUN_IDLE without a transcript write, and the end of
+its session window. The owner's own messages to the session never end a run.
+
 Budget rule: by default pacing.py (the original linear rule evolved into a night gate: a
 night runs a FULL session window only if the week is then predicted to end at or below the
 reserve threshold (default: one session window left), w + session cost + the user's forecast
@@ -907,30 +911,42 @@ def process_env_flags(pid):
 
 # ---------------------------------------------------------------- state
 
-def load_state():
-    return runner_state.load("keepalive", STATE_FILE, {"handled": {}, "fires": {}})   # the DB (D-161)
+def load_state(path=None):
+    """The keepalive state: the DB (D-161) for the live path (None = STATE_FILE), a side file
+    (tests) otherwise."""
+    return runner_state.load("keepalive", path or STATE_FILE, {"handled": {}, "fires": {}})
 
 
-def save_state(st):
-    runner_state.save("keepalive", st, STATE_FILE)   # one transaction, merged per entry (phase 2d)
+def save_state(st, path=None):
+    """-> stored (False: a DB failure, the save went to the fallback file, §7.8)."""
+    return runner_state.save("keepalive", st, path or STATE_FILE)   # one transaction, merged per entry (phase 2d)
 
 
 RUN_IDLE = timedelta(minutes=15)      # run_active(): the run's transcripts were written this recently
 RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # fires that started a run
 RUN_READING_EVERY = timedelta(minutes=5)  # = run_metrics.RUN_SAMPLE_EVERY: extra usage readings during a run
+RUN_STOPS_KEPT = 20                   # st["run_stops"]: the task-manager's last clean stops (--run-stopped)
 
 
 def run_active(session_id, now, st=None):
     """A keep-alive run is going right now (read-only; the quickview's next run, D-202): a real
-    fire for this session (a window-start, postponed start or last-stretch slot; not a dry-run or
-    a refused preflight) less than one session length ago, and the session's transcript or one of
-    its subagents' written within RUN_IDLE, and the session not stopped at a limit (D-204: a limit
-    hit ends the run). -> the fire time or None."""
+    fire for this session (a window-start, postponed start, last-stretch slot or fill-up; not a
+    dry-run or a refused preflight) less than one session length ago (the session window's end),
+    and since the latest such fire none of the run's other ends (D-224, the earliest wins): the
+    task-manager's clean stop (--run-stopped), a limit hit (D-204: the transcript's last entry is
+    a limit notice, or the watcher noted one), or RUN_IDLE without a write to the session's
+    transcript or one of its subagents'. After a stop the owner chatting with the session no
+    longer keeps the run going; a later fire starts a new run. -> the fire time or None."""
     st = st if st is not None else load_state()
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
              if isinstance(v, dict) and v.get("result") in RUN_RESULTS]
     fired = [t for t in fired if t and now - afclaude_config.SESSION_LENGTH <= t <= now]
     if not fired:
+        return None
+    fire = max(fired)
+    stops = [usage_stale.ts(t) for t, sid in (st.get("run_stops") or {}).items() if sid in (None, session_id)]
+    hits = [usage_stale.ts(t) for t in (st.get("limit_hits") or {}).values()]
+    if any(t and fire <= t <= now for t in stops + hits):
         return None
     path = transcript_path(session_id)
     if not path or stall_info(last_message(path)):
@@ -940,7 +956,22 @@ def run_active(session_id, now, st=None):
         last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
     except ValueError:
         return None
-    return max(fired) if now - datetime.fromtimestamp(last, UTC) <= RUN_IDLE else None
+    return fire if now - datetime.fromtimestamp(last, UTC) <= RUN_IDLE else None
+
+
+def mark_run_stopped(session_id, now, path=None):
+    """--run-stopped (D-224): the task-manager stopped cleanly, so its run is over at `now`, even
+    while the owner keeps chatting with the session (an owner prompt never ends a run). Merged
+    into the state as it is in the DB (one row per stop; the watcher's in-memory state may be
+    days old, as in note_limit_hit, and its saves never drop the stop); run_active() and
+    run_metrics ignore a stop older than the run's fire. `path`: a side file (tests). -> `now`,
+    None if it couldn't be stored (a DB failure: it is in data/ALERTS.fallback.md, §7.8)."""
+    disk = load_state(path)
+    stops = disk.setdefault("run_stops", {})
+    stops[now.isoformat()] = session_id
+    for k in sorted(stops)[:-RUN_STOPS_KEPT]:     # keep the last RUN_STOPS_KEPT
+        stops.pop(k, None)
+    return now if save_state(disk, path) else None
 
 
 def progress_note(line):
@@ -2113,6 +2144,9 @@ def main():
                     help="schedule ONE test fill-up run (D-212) for --session at session reset - remaining / rate "
                          "x fillup_factor; the running watcher fires it (needs --arm to schedule)")
     ap.add_argument("--remaining", type=float, default=3.0, help="with --plan-fillup-test: session %% left to fill")
+    ap.add_argument("--run-stopped", action="store_true",
+                    help="the task-manager stopped cleanly: its run is over now (D-224; the session: --session, "
+                         "else this Claude Code session, else the manager session)")
     ap.add_argument("--take-over-idle", action="store_true",
                     help="if an idle interactive process (e.g. an open terminal) holds the session, SIGTERM it and resume in tmux")
     ap.add_argument("--model", default=LAUNCH["model"], help="model to relaunch with (tmux resume)")
@@ -2124,6 +2158,15 @@ def main():
     afclaude_config.LOG = log            # a settings problem (DB unreadable) lands in this log
     TAKE_OVER_IDLE = args.take_over_idle
     IGNORE_WINDOW = args.now
+    if args.run_stopped:
+        # the task-manager runs this on the host, where STATE_DIR is the pre-container repo dir:
+        # the stop always goes into the live state, i.e. the DB (D-161), never a file there
+        sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or afclaude_config.manager_session()
+        t = mark_run_stopped(sid, datetime.now(UTC), runner_state.live_path("keepalive"))
+        if t is None:
+            sys.exit(f"run of {sid[:8]}: the stop could not be stored in the DB (kept in data/ALERTS.fallback.md)")
+        print(f"run of {sid[:8]} marked stopped at {berlin(t)}")
+        return
     if args.work_on:
         return work_on_project(args.work_on, args)
     if args.plan_fillup_test:

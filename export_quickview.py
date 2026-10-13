@@ -43,6 +43,8 @@ import afclaude_config  # noqa: E402  (local machine-specific values)
 import stage_eta  # noqa: E402  (stage ETAs, D-213: read-only, plus its once-a-day prediction log)
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
+USAGE_REVIEW_STATE_FILE = os.path.join(HERE, "data", "usage_review_state.json")
+AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # legacy (frozen): jobs the at-shim adopts
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
 # This manager's own session/tmux (data/afclaude.json manager_session, as usage_report.py).
@@ -476,8 +478,11 @@ def keepalive_and_usage(now):
     u = ka.read_usage_cache()
     out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
            **window_info(now)}
-    rev = usage_review()
-    out["next_usage_review_berlin"] = rev["next_run_berlin"] if rev else None
+    nr = next_review_block()
+    out["next_usage_review_berlin"] = nr["at_berlin"]
+    out["next_usage_review_which"] = nr["which"]
+    out["next_usage_review_label"] = nr["label"]
+    out["next_usage_review_secondary"] = nr["secondary"]
     out["fill"] = fill_block()
     out["fillup"] = fillup_block(now)
     if not u:
@@ -555,12 +560,75 @@ def fillup_block(now):
 def usage_review():
     try:
         import runner_state
-        st = runner_state.read_json(os.path.join(HERE, "data", "usage_review_state.json"))
+        st = runner_state.read_json(USAGE_REVIEW_STATE_FILE)
     except (OSError, ValueError):
         return None
     nxt = ka.parse_ts(st.get("next_run_at"))
     runs = st.get("runs") or []
-    return {"next_run_berlin": bstr(nxt), "runs": len(runs), "last_run": runs[-1] if runs else None}
+    return {"next_run_at": nxt, "next_run_berlin": bstr(nxt), "runs": len(runs),
+            "last_run": runs[-1] if runs else None}
+
+
+ONE_OFF_LABELS = {"usage": "usage", "stage-eta": "ETA"}    # usage_review.py's ONLY_PROMPTS keys
+
+
+def _review_label(which):
+    """'usage' -> 'usage'; 'stage-eta' -> 'ETA'; 'usage,stage-eta' (D-228 chain) -> 'usage + ETA'."""
+    return " + ".join(ONE_OFF_LABELS.get(w, w) for w in which.split(","))
+
+
+def one_off_reviews():
+    """Pending one-off usage/ETA reviews (owner's `usage_review.py --only ... --at ...`, D-220/
+    D-221/D-228): the at-shim's pending jobs in scheduled_jobs (the DB is their only copy,
+    D-161), plus a legacy spool file (data/at_spool, frozen) whose job the DB doesn't know yet:
+    the at-shim adopts it as pending on its next run (docker/at_shim.py). A DB that can't be
+    read: none. Earliest first. -> [{"at": datetime, "at_berlin", "which", "label"}, ...] (jobs
+    whose cmd isn't a usage_review.py --only call are ignored)."""
+    import runner_state
+    try:
+        every = runner_state.jobs()
+    except Exception:   # noqa: BLE001 - no DB, or a hiccup: no one-off shown (never a file)
+        return []
+    known = {str(r.get("id")) for r in every}
+    rows = [r for r in every if r.get("status") == "pending"]
+    rows += [{"run_at": j.get("at"), "cmd": j.get("cmd")} for j in runner_state.legacy_jobs(AT_SPOOL_DIR)
+             if str(j.get("id")) not in known and isinstance(j.get("cmd"), str)]
+    out = []
+    for r in rows:
+        m = re.search(r"usage_review\.py\s+--only\s+(\S+)", r.get("cmd") or "")
+        if not m:
+            continue
+        at = ka.parse_ts(r.get("run_at"))
+        if at is None:
+            continue
+        which = m.group(1)
+        out.append({"at": at, "at_berlin": bstr(at), "which": which, "label": _review_label(which)})
+    out.sort(key=lambda j: j["at"])
+    return out
+
+
+def next_review_block():
+    """The next usage review for the quickview tile (owner bug report: the monthly schedule
+    alone ignores a one-off review the owner asked for, which can land first). The EARLIEST of
+    the monthly schedule (usage_review_state.json's next_run_at) and any pending one-off job,
+    tagged which one it is; the other one (if any), as a secondary line. ->
+    {"at_berlin", "which": "monthly"|"one-off", "label": None|str, "secondary": None|
+     {"at_berlin", "which", "label"}} (all-None fields if nothing is scheduled at all)."""
+    cands = []
+    rev = usage_review()
+    if rev and rev["next_run_at"] is not None:
+        cands.append({"kind": "monthly", "at": rev["next_run_at"], "at_berlin": rev["next_run_berlin"], "label": None})
+    for o in one_off_reviews():
+        cands.append({"kind": "one-off", "at": o["at"], "at_berlin": o["at_berlin"], "label": o["label"]})
+    if not cands:
+        return {"at_berlin": None, "which": None, "label": None, "secondary": None}
+    cands.sort(key=lambda c: c["at"])
+    win = cands[0]
+    secondary = None
+    if len(cands) > 1:
+        nxt = cands[1]
+        secondary = {"at_berlin": nxt["at_berlin"], "which": nxt["kind"], "label": nxt["label"]}
+    return {"at_berlin": win["at_berlin"], "which": win["kind"], "label": win["label"], "secondary": secondary}
 
 
 def cron_entries():

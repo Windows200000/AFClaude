@@ -8,15 +8,17 @@ minutes apart are one run (FIRE_MERGE: the double last-stretch fire of 01.10.202
 
 Per run: start (the fire), kind, session % and weekly % at the start, the session-% trajectory,
 the time to 95% (the task-manager's stop, D-014) and to 100% / the limit notice, the run's end
-(a limit hit, D-204; the session idle after its last turn, keepalive.RUN_IDLE; the session
-window's end; or the next run), the session-%/hour rate, an extrapolated time to full when the
+(the earliest of: a limit hit, D-204; the task-manager's clean stop, keepalive.py --run-stopped,
+D-224; the session idle after its last turn, keepalive.RUN_IDLE; the session window's end; or
+the next run), the session-%/hour rate, an extrapolated time to full when the
 run ended before filling, the weekly delta and the AFClaude vs user token split while it ran.
 
 Sources (read-only):
   - the usage readings of data/samples.jsonl (the sampler, every 15 min) plus
     data/run_usage.jsonl (the watcher's extra readings every RUN_SAMPLE_EVERY while a run is
     active, watch_sample()); stale readings (usage_stale.py) are counted and skipped
-  - the run session's transcripts (main + subagents): entry times (idle end) and limit notices.
+  - the run session's transcripts (main + subagents): entry times (idle end) and limit notices
+  - the keepalive state's stop marks (run_stops: the task-manager's --run-stopped, D-224).
 
 compute_run() is pure (fire + readings + activity -> row), so phase 2c can move it into the DB
 (D-161). update() recomputes the rows that are not final yet and rewrites the small runs file
@@ -65,7 +67,7 @@ FINAL_AFTER = timedelta(minutes=30)     # a row is final this long after its end
 RESET_JUMP = timedelta(minutes=30)      # resets_at jitters by ms; a real reset moves it by hours
 MIN_SPAN = timedelta(minutes=10)        # shorter runs (or < MIN_DELTA %) give no rate
 MIN_DELTA = 1.0
-END_PRIO = {"limit": 0, "idle": 1, "next-run": 2, "window-end": 3}   # ties: the first named wins
+END_PRIO = {"limit": 0, "stopped": 1, "idle": 2, "next-run": 3, "window-end": 4}   # ties: the first named wins
 RUN_SAMPLE_EVERY = timedelta(minutes=5)  # = keepalive.RUN_READING_EVERY: the watcher's extra readings during a run
 RUN_SAMPLE_REFRESH = timedelta(minutes=4)  # refresh /usage (local command) only if the cache is older
 
@@ -216,7 +218,7 @@ def _cross(points, level):
 
 # ------------------------------------------------------------------ the pure part
 
-def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire=None):
+def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire=None, stops=()):
     """One run's metrics row (pure).
 
     run:        {run_id, at, kind, session, fires, usage?} (group_fires); usage = the cache at the fire
@@ -227,6 +229,8 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
     limit_hits: [(datetime, kind)] limit notices of the run session
     now:        the current time (an unfinished run ends "ongoing" at now)
     next_fire:  the next run's fire time (a run ends there at the latest)
+    stops:      datetimes of the task-manager's clean stops (keepalive.py --run-stopped, D-224): the
+                first one after the fire ends the run, even if the owner chats on afterwards
     """
     now = now or datetime.now(UTC)
     fire = run["at"]
@@ -286,6 +290,9 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
                  and ((r.get("session") or 0) >= 100 or (r.get("weekly") or 0) >= 100)), None)
     if full and not hit:
         cands.append((full["t"], "limit", "session" if (full.get("session") or 0) >= 100 else "weekly"))
+    stop = next((t for t in sorted(stops or ()) if fire <= t < min(window_end, cap)), None)
+    if stop:
+        cands.append((stop, "stopped", None))
     active_after = None
     if activity is not None:
         # a limit notice is the run's last activity (the limit, not the idleness, ends it)
@@ -316,7 +323,7 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
 
     # -- the trajectory inside the window (plus one trailing reading after an idle end)
     traj = [r for r in after if r["t"] <= end and _same_window(r, window_end)]
-    if reason in ("idle", "next-run"):
+    if reason in ("stopped", "idle", "next-run"):
         trail = next((r for r in after if end < r["t"] <= end + END_GRACE and r["t"] < window_end
                       and _same_window(r, window_end)), None)
         if trail:
@@ -546,12 +553,16 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
     hi = min(max(runs[i]["at"] for i in todo) + SESSION_LENGTH + END_GRACE + timedelta(hours=1), now)
     readings = load_readings(lo, hi, samples_path, watch_path)
     activity_fn = activity_fn or (lambda sid, a, b: session_activity(sid, a, b, projects_dir))
-    hits_state = []
+    hits_state, stops = [], []
     for st in load_states(state_paths):
         for v in (st.get("limit_hits") or {}).values():
             t = ts(v)
             if t:
                 hits_state.append((t, "unknown"))
+        for k, sid in (st.get("run_stops") or {}).items():
+            t = ts(k)
+            if t:
+                stops.append((t, sid))
     for i in todo:
         run = runs[i]
         nxt = runs[i + 1]["at"] if i + 1 < len(runs) else None
@@ -561,7 +572,8 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
                                      run["at"] + SESSION_LENGTH + RUN_IDLE)
         if not hits:   # the watcher's detection times (its own session only)
             hits = [h for h in hits_state if run["at"] <= h[0] <= run["at"] + SESSION_LENGTH]
-        rows[run["run_id"]] = compute_run(run, readings, acts, hits, now=now, next_fire=nxt)
+        own = [t for t, sid in stops if not run.get("session") or sid in (None, run["session"])]
+        rows[run["run_id"]] = compute_run(run, readings, acts, hits, now=now, next_fire=nxt, stops=own)
     ordered = [rows[r["run_id"]] for r in runs if r["run_id"] in rows]
     ordered += [r for k, r in rows.items() if k not in {x["run_id"] for x in runs}]   # never drop a row
     ordered.sort(key=lambda r: r.get("start") or "")

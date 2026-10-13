@@ -9,6 +9,15 @@ D="${AFCLAUDE_DIR:?}"
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
 mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
+# D-227: every deploy (`docker compose up -d --build`, i.e. every container start) imports
+# prompts/*.md into prompt_defaults, so the DB always has what is currently deployed (prompts
+# still ship as files, D-169; prompt_overrides holds the owner's edits). Now that data/ is
+# mounted, the DB is reachable if it exists at all; a first install has none yet (store.py init
+# is the explicit, separate first-install step), and any other DB problem is store.py's own
+# DB error path (logged + alerted via the fallback file). Either way this must never fail the
+# container start, so its exit status is never allowed to trip `set -e`.
+python3 "$D/store.py" import-prompts >>"$D/data/import_prompts.log" 2>&1 \
+  || echo "afclaude: prompt defaults import did not complete this start (see data/import_prompts.log)" >&2
 case "${AFCLAUDE_SCHEDULER:-off}" in
   on)
     echo "afclaude: scheduler ON ($(date -u +%FT%TZ))"

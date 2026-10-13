@@ -36,7 +36,8 @@ KA_STATE = {"handled": {"window-start-2026-10-01": {"at": "2026-10-01T21:00:00+0
                                                     "result": "continued-in-place"},
                         "last-mile-2026-10-02": {"at": "2026-10-02T12:00:00+00:00", "result": "dry-run"}},
             "fires": {"2026-10-01": 1},
-            "limit_hits": {"u1": "2026-10-01T23:00:00+00:00"}}
+            "limit_hits": {"u1": "2026-10-01T23:00:00+00:00"},
+            "run_stops": {"2026-10-02T01:00:00+00:00": "s"}}
 FILES = {
     "keepalive/keepalive_state.json": KA_STATE,
     "keepalive/keepalive_deferred.json": {"window-start-2026-10-03": {"session": "s", "recheck_at": "2026-10-03T22:00:00+00:00"}},
@@ -272,7 +273,7 @@ class Importer(Base):
         self.assertEqual(counts["app_log"], {"keepalive": 3, "dispatcher": 1, "sampler": 4, "watchdog": 1,
                                              "host_exec": 3})
         self.assertEqual(counts["scheduled_jobs"], {"pending": 2})
-        self.assertEqual(counts["runner_state"]["keepalive"], 4)
+        self.assertEqual(counts["runner_state"]["keepalive"], 5)
         self.assertEqual(snapshot(self.dir), before)                     # files untouched
         r2 = rs.import_all()                                             # again: the imported ones are retired
         self.assertEqual([s["status"] for s in r2["state"] if s["status"] != "no file"], [rs.RETIRED] * 7)
@@ -398,6 +399,23 @@ class Concurrency(Base):
         self.assertTrue({"k1", "k2"} <= self.handled_in_db())
         self.assertFilesUntouched()
 
+    def test_run_stop_survives_the_watchers_older_state(self):
+        """--run-stopped (D-224) merges into the state as it is: a watcher that loaded its state
+        before the stop and saves afterwards (merge or file mode) never drops it from the DB."""
+        a, plain = ka.load_state(), json.loads(json.dumps(KA_STATE))
+        t = datetime(2026, 10, 5, 23, 40, tzinfo=timezone.utc)
+        ka.mark_run_stopped("s1", t)
+        a["handled"]["k1"] = {"at": "x"}
+        ka.save_state(a)
+        plain["handled"]["k2"] = {"at": "y"}
+        ka.save_state(plain)
+        self.assertEqual(ka.load_state()["run_stops"][t.isoformat()], "s1")
+        paths = [json.loads(p) for p in store.state_rows(self.conn, "keepalive")]
+        self.assertIn(["run_stops", t.isoformat()], paths)                 # one row per stop
+        audit = self.conn.execute("SELECT after FROM audit_log WHERE action='runner_state.save' "
+                                  "ORDER BY id").fetchall()
+        self.assertTrue(any(t.isoformat() in r[0] for r in audit))
+
 
 def _worker(i, n):
     store.DB_PATH = store.DB_PATH   # inherited (fork)
@@ -482,7 +500,7 @@ class Failures(Base):
 
     def test_missing_db(self):
         os.remove(self.p("afclaude.db"))
-        self.assertEqual(ka.load_state(), {"handled": {}, "fires": {}, "limit_hits": {}})   # not the file
+        self.assertEqual(ka.load_state(), {"handled": {}, "fires": {}, "limit_hits": {}, "run_stops": {}})   # not the file
         self.assertEqual(rs.own_sessions(), set())
         with self.assertRaises(OSError):
             rs.read_json(ka.STATE_FILE)
@@ -498,6 +516,28 @@ class Failures(Base):
         self.assertEqual(rs.load("keepalive", other), {"handled": {"x": 1}})
         self.assertEqual(store.state_rows(store.connect(), "keepalive"), before)
         self.assertFalse(rs.log_lines("dispatcher", "x", os.path.join(self.dir, "elsewhere.log")))
+
+
+class OwnSessionsStalled(Base):
+    """stalled.py reads the own sessions through own_sessions(): the DB (driven_sessions kind 'own')."""
+    DB_ONLY = "11111111-2222-4333-8444-555555555555"
+
+    def setUp(self):
+        super().setUp()
+        self.fill()
+        self.live = self.p("own_sessions.txt")
+
+    def test_stalled_scan_flags_a_db_only_own_session(self):
+        import stalled
+        rs.import_all()
+        actions.own_session_add(self.conn, self.DB_ONLY, actor="runner:import", via="runner")
+        store.upsert_session(self.conn, self.DB_ONLY, path="/nowhere.jsonl", cwd="/somewhere")
+        self.conn.commit()
+        proj = os.path.join(self.dir, "projects")
+        os.makedirs(proj)
+        stalled.scan(self.conn, proj, self.live)
+        own = self.conn.execute("SELECT own FROM sessions WHERE session_id=?", (self.DB_ONLY,)).fetchone()[0]
+        self.assertEqual(own, 1)
 
 
 class Writes(Base):

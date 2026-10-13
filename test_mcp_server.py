@@ -29,7 +29,7 @@ SID2 = "00000000-0000-4000-8000-000000000002"
 CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
-                  "afclaude_rule", "afclaude_ask", "afclaude_handoff"}
+                  "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc"}
 
 
 def run(coro):
@@ -365,6 +365,41 @@ class Handoff(Env):
             asyncio.run(ms.afclaude_handoff("x"))
         r = run(ms.afclaude_handoff("explicit", session=SID))                # ... then it names itself
         self.assertEqual(r["session_id"], SID)
+
+
+class Docs(Env):
+    def test_doc_tool(self):
+        """afclaude_doc (phase 2d): list/show/append/set a project's docs through actions.py."""
+        c = self.conn()
+        try:
+            store.add_project(c, "Proj", None, self.work)
+        finally:
+            c.close()
+        r = run(ms.afclaude_doc("append", name="progress", text="- 10:00 first"))   # the caller's project
+        self.assertEqual((r["project"], r["name"], r["kind"]), ("Proj", "progress", "log"))
+        run(ms.afclaude_doc("append", name="progress", text="- 10:05 second\n", project="Proj"))
+        r = run(ms.afclaude_doc("show", name="progress", entries=1))
+        self.assertEqual([e["text"] for e in r["entries"]], ["- 10:05 second\n"])
+        r = run(ms.afclaude_doc("set", name="goals", text="# Goals\n1. [ ] x\n"))
+        r = run(ms.afclaude_doc("show", name="goals"))
+        self.assertEqual((r["text"], r["version"]), ("# Goals\n1. [ ] x\n", 1))   # created (0), written (1)
+        with self.assertRaisesRegex(ToolError, "changed since it was read"):
+            asyncio.run(ms.afclaude_doc("set", name="goals", text="other", version=5))
+        with self.assertRaisesRegex(ToolError, "not a log"):
+            asyncio.run(ms.afclaude_doc("append", name="goals", text="x"))
+        with self.assertRaisesRegex(ToolError, "doc name must be"):
+            asyncio.run(ms.afclaude_doc("append", name="backlog", text="x"))
+        r = run(ms.afclaude_doc("list"))
+        self.assertEqual({d["name"]: d["entries"] for d in r["docs"]}, {"goals": 1, "progress": 2})
+        c = self.conn()
+        try:
+            audit = store.audit_log(c, target_type="doc")
+            text = store.doc_render(c, store.get_doc(c, store.get_project(c, "Proj")["id"], "progress")["id"])
+        finally:
+            c.close()
+        self.assertEqual(text, "- 10:00 first\n- 10:05 second\n")
+        self.assertEqual({(a["actor"], a["action"]) for a in audit},
+                         {(f"mcp:{CALLER}", "doc.append"), (f"mcp:{CALLER}", "doc.set")})
 
 
 class Stdio(unittest.TestCase):

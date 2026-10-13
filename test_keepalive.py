@@ -1242,6 +1242,114 @@ class WatcherNoContinue(unittest.TestCase):
             self.assertEqual(st["handled"], {})
 
 
+class RunEnd(unittest.TestCase):
+    """D-224: a run ends at the earliest of the task-manager's clean stop (--run-stopped), RUN_IDLE,
+    a limit hit and the session window's end; the owner chatting on never keeps it going."""
+    NOW = Z("2026-10-06T02:30:00Z")
+    FIRE = NOW - timedelta(hours=1)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = ka.PROJECTS_DIR
+        ka.PROJECTS_DIR = self.tmp.name
+        write_transcript(self.tmp.name, SID, [USER, REPLY])
+        self.written(self.NOW - timedelta(minutes=1))           # fresh: the session is being written
+
+    def tearDown(self):
+        ka.PROJECTS_DIR = self.old
+        self.tmp.cleanup()
+
+    def written(self, t):
+        os.utime(ka.transcript_path(SID), (t.timestamp(), t.timestamp()))
+
+    def state(self, **kw):
+        return dict({"handled": {"window-start-2026-10-06-s2": {"at": self.FIRE.isoformat(),
+                                                                "result": "continued-in-place"}}}, **kw)
+
+    def test_a_fire_with_a_fresh_transcript_is_a_run(self):
+        self.assertEqual(ka.run_active(SID, self.NOW, self.state()), self.FIRE)
+
+    def test_a_stop_after_the_fire_ends_it_even_while_the_owner_chats(self):
+        stop = {(self.FIRE + timedelta(minutes=40)).isoformat(): SID}
+        self.assertIsNone(ka.run_active(SID, self.NOW, self.state(run_stops=stop)))
+        self.assertIsNone(ka.run_active(SID, self.NOW, self.state(run_stops={self.NOW.isoformat(): None})))
+
+    def test_a_stop_before_the_fire_or_of_another_session_is_ignored(self):
+        older = {(self.FIRE - timedelta(minutes=1)).isoformat(): SID}       # the previous run's stop
+        self.assertEqual(ka.run_active(SID, self.NOW, self.state(run_stops=older)), self.FIRE)
+        other = {(self.FIRE + timedelta(minutes=40)).isoformat(): "another-session"}
+        self.assertEqual(ka.run_active(SID, self.NOW, self.state(run_stops=other)), self.FIRE)
+
+    def test_idle_for_run_idle(self):
+        self.written(self.NOW - ka.RUN_IDLE)
+        self.assertEqual(ka.run_active(SID, self.NOW, self.state()), self.FIRE)
+        self.written(self.NOW - ka.RUN_IDLE - timedelta(seconds=1))
+        self.assertIsNone(ka.run_active(SID, self.NOW, self.state()))
+
+    def test_a_limit_hit_ends_it(self):
+        hit = {"limit_hits": {"stall-9": (self.FIRE + timedelta(minutes=50)).isoformat()}}
+        self.assertIsNone(ka.run_active(SID, self.NOW, self.state(**hit)))   # the owner chatted after it
+        old = {"limit_hits": {"stall-8": (self.FIRE - timedelta(hours=2)).isoformat()}}
+        self.assertEqual(ka.run_active(SID, self.NOW, self.state(**old)), self.FIRE)
+        write_transcript(self.tmp.name, SID, [USER, REPLY, STALL])         # the notice is the last entry
+        self.written(self.NOW - timedelta(minutes=1))
+        self.assertIsNone(ka.run_active(SID, self.NOW, self.state()))
+
+    def test_the_session_window_end_ends_it(self):
+        end = self.FIRE + afclaude_config.SESSION_LENGTH
+        self.written(end)                                                   # still working
+        self.assertEqual(ka.run_active(SID, end, self.state()), self.FIRE)
+        self.assertIsNone(ka.run_active(SID, end + timedelta(seconds=1), self.state()))
+
+    def test_a_new_fire_after_the_stop_starts_a_new_run(self):
+        st = self.state(run_stops={(self.FIRE + timedelta(minutes=40)).isoformat(): SID})
+        nxt = self.FIRE + timedelta(minutes=50)
+        st["handled"]["fillup-2026-10-06T04:00:00+00:00"] = {"at": nxt.isoformat(), "result": "continued-in-place"}
+        self.assertEqual(ka.run_active(SID, self.NOW, st), nxt)
+
+    def test_mark_run_stopped_merges_into_the_state_on_disk(self):
+        path = os.path.join(self.tmp.name, "keepalive_state.json")
+        ka.save_state(self.state(limit_hits={"u": "x"}), path)
+        for m in range(ka.RUN_STOPS_KEPT + 2):
+            ka.mark_run_stopped(SID, self.FIRE + timedelta(minutes=m), path)
+        st = ka.load_state(path)
+        self.assertEqual(set(st["handled"]), {"window-start-2026-10-06-s2"})   # the rest stays
+        self.assertEqual(st["limit_hits"], {"u": "x"})
+        self.assertEqual(len(st["run_stops"]), ka.RUN_STOPS_KEPT)                # the last ones only
+        self.assertEqual(max(st["run_stops"]), (self.FIRE + timedelta(minutes=ka.RUN_STOPS_KEPT + 1)).isoformat())
+        self.assertIsNone(ka.run_active(SID, self.NOW, st))
+
+    def test_cli(self):
+        """`keepalive.py --run-stopped` (the task-manager's last step, on the host) records this
+        Claude Code session's stop in the DB (D-161), never in a file of the state dir; a DB it
+        can't write fails the command and keeps the stop in the fallback file (§7.8)."""
+        import actions
+        import store
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "db", "afclaude.db")
+            env = {k: v for k, v in os.environ.items() if k != "KEEPALIVE_SESSION"}
+            env.update(KEEPALIVE_STATE_DIR=d, CLAUDE_CODE_SESSION_ID=SID, AFCLAUDE_DB=db)
+            cmd = [sys.executable, os.path.join(os.path.dirname(ka.__file__), "keepalive.py"), "--run-stopped"]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True)        # no DB yet
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("could not be stored", r.stderr)
+            self.assertFalse(os.path.exists(db))                                   # never created by a runner
+            os.makedirs(os.path.dirname(db))
+            store.connect(db, create=True).close()
+            for args in ([], ["--session", "s2"]):
+                r = subprocess.run(cmd + args, env=env, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("marked stopped", r.stdout)
+            conn = store.connect(db)
+            try:
+                st = actions.state_unflatten("keepalive", store.state_rows(conn, "keepalive"))
+            finally:
+                conn.close()
+            self.assertEqual(sorted(st["run_stops"].values()), sorted([SID, "s2"]))
+            self.assertFalse(os.path.exists(os.path.join(d, "keepalive_state.json")))       # no file
+            self.assertFalse(os.path.exists(os.path.join(d, "db", "keepalive", "keepalive_state.json")))
+
+
 class DryRunLoop(unittest.TestCase):
     """Full CLI pass in a sandbox: detection -> decision -> handle_fire in
     dry-run. `claude` is shadowed by a stub on PATH that records calls and

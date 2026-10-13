@@ -18,7 +18,7 @@ This changes your Claude Code config (`~/.claude.json`, user scope), so run it y
 claude mcp add --scope user afclaude -- /mnt/BlockVolume/Claude/work/AFClaude/.venv/bin/python /mnt/BlockVolume/Claude/work/AFClaude/mcp_server.py
 ```
 
-Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its 10 tools. Sessions that are already running only pick it up after a restart or `/mcp` reconnect.
+Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its 12 tools. Sessions that are already running only pick it up after a restart or `/mcp` reconnect.
 
 Remove it: `claude mcp remove --scope user afclaude`.
 
@@ -46,6 +46,7 @@ A task added through MCP counts exactly like one you add in the UI (today `tasks
 | `afclaude_rule` | standing continue/ignore rules: `list`, `add`, `rm` |
 | `afclaude_ask` | a question for you from a (task-manager) session: a blocked task of kind `question` in your inbox; your answer closes it |
 | `afclaude_handoff` | a session's compaction hand-off (D-144): summary, done, in progress, next steps, open question ids, notes; the keep-alive injects it after compacting that session at its next start |
+| `afclaude_doc` | a project's docs in the DB (phase 2d): `list`, `show`, `append` (progress, exceptions, alerts), `set` (goals, review:<name>); during the dual-write period the files stay the source (see `project_docs.py`) |
 
 Every write goes through `actions.py` (one transaction, an `audit_log` row with actor `mcp:<session>`). A session AFClaude itself runs (`CLAUDE_GUARD_DISABLE=1`, `driven_sessions` incl. the own sessions of `python3 runner_state.py own add`, a task-manager session) may add tasks and projects, but `afclaude_decide_session` and `afclaude_rule add/rm` refuse it: deciding sessions and rules stays with you.
 

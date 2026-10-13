@@ -31,6 +31,14 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            BODY = JSON {summary, done, in_progress, next_steps,
                                            open_question_ids, notes} ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
+    tasks.py doc list [--project P]        the project's docs in the DB (phase 2d, project_docs.py)
+    tasks.py doc show NAME [--project P] [--entries N]   a doc's text (--entries: its newest entries)
+    tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
+                                           (a newline is added if TEXT doesn't end with one)
+    tasks.py doc set NAME TEXT|- [--project P] [--version N]   replace goals / review:<name> (or rewrite a log)
+    tasks.py doc import [--repo DIR] [--project P] [--force]   sync the doc files into the DB (dual-write)
+    tasks.py doc export [--repo DIR] [--project P] [--check]   regenerate PROGRESS.md, GOALS.md,
+                                           EXCEPTIONS.md from the DB (D-181; run before committing)
 
 Tasks are the stages of a project; projects form a ranked list. Execution
 order: every high stage (by project rank, then stage), then every medium one,
@@ -287,6 +295,84 @@ def run_handoff(conn, args):
         print("   " + store.render_handoff(h))
 
 
+def doc_project(conn, p):
+    """--project for the doc commands: a name or directory, default this directory's project."""
+    ref = project_ref(p) if p else os.getcwd()
+    proj = store.get_project(conn, ref)
+    if proj is None:
+        raise store.NotFound(f"no project {p!r}" if p else f"no project for {ref} (pass --project)")
+    return proj
+
+
+def entry_text(text):
+    """An appended entry ends with a newline (the next one starts on its own line)."""
+    return text if text.endswith("\n") else text + "\n"
+
+
+def run_doc(conn, args):
+    import project_docs
+    dc = args.doc_cmd
+    if dc in ("import", "export"):
+        repo = os.path.abspath(args.repo) if args.repo else None
+        if dc == "import":
+            r = project_docs.import_all(args.db, repo, None, args.project, actor="cli", via="cli", force=args.force)
+            ok = not (r["totals"]["conflict"] or r["totals"]["unverified"])
+            if args.json:
+                dump(r)
+            else:
+                for name, d in r["docs"].items():
+                    extra = f"  +{d['appended']}" if d.get("appended") else ""
+                    print(f"{name:<12} {d['outcome']}{extra}" + (f"  {d['error']}" if d.get("error") else ""))
+        else:
+            r = project_docs.export(args.db, repo, args.project, check=args.check, actor="cli", via="cli")
+            ok = r["ok"]
+            if args.json:
+                dump(r)
+            else:
+                for fname, d in r["files"].items():
+                    print(f"{fname:<14} {d['result']}" + (f"  {d['error']}" if d.get("error") else ""))
+                    for f in d.get("findings", []):
+                        print(f"    {f}")
+        return 0 if ok else 1
+    proj = doc_project(conn, args.project)
+    if dc == "list":
+        rows = store.list_docs(conn, proj["id"])
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print(f"no docs for {proj['name']}")
+        for d in rows:
+            print(f"{d['name']:<12} {d['kind']:<4}  {d['entries']:>4} entries  v{d['version']}  "
+                  f"{berlin(d['updated_at'])}  {d['updated_by']}")
+        return None
+    if dc == "show":
+        doc = store.get_doc(conn, proj["id"], args.name)
+        if doc is None:
+            raise store.NotFound(f"no doc {args.name!r} for {proj['name']}")
+        if args.entries:
+            rows = store.doc_entries(conn, doc["id"], args.entries)
+            if args.json:
+                return dump(rows)
+            for e in rows:
+                keep = f" keep {e['keep']}" if e["op"] == "replace" else ""
+                print(f"#{e['id']}  {e['op']}{keep}  {berlin(e['ts'])}  {e['author']}")
+                print("   " + cut(e["body"], 200))
+            return None
+        text = store.doc_render(conn, doc["id"])
+        if args.json:
+            return dump(dict(doc, text=text))
+        sys.stdout.write(text)
+        return None
+    text = sys.stdin.read() if args.text == "-" else args.text
+    if dc == "append":
+        r = act(conn, "doc.append", project=proj["name"], name=args.name, text=entry_text(text))
+    else:
+        r = act(conn, "doc.set", project=proj["name"], name=args.name, text=text, version=args.version)
+    if args.json:
+        return dump(r)
+    return print(f"{r['project']}/{r['name']}: " + ("unchanged" if r.get("unchanged") else f"entry #{r['entry']} saved"))
+
+
 def run(conn, args):
     c = args.cmd
     if c == "add":
@@ -361,6 +447,8 @@ def run(conn, args):
             dump(r) if args.json else print_rules([r])
     elif c == "handoff":
         run_handoff(conn, args)
+    elif c == "doc":
+        return run_doc(conn, args) or 0
     elif c == "inbox":
         maybe_scan(conn, args)
         box = store.pending_user_input(conn)
@@ -474,6 +562,31 @@ def parser():
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")
     q.add_argument("--all", action="store_true", help="the recent ones, newest first")
+    p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
+    ds = p.add_subparsers(dest="doc_cmd", required=True)
+    q = ds.add_parser("list", parents=[js], help="the project's docs")
+    q.add_argument("--project", help="name or directory (default: this directory's project)")
+    q = ds.add_parser("show", parents=[js], help="a doc's current text")
+    q.add_argument("name")
+    q.add_argument("--project", help="name or directory (default: this directory's project)")
+    q.add_argument("--entries", type=int, default=0, metavar="N", help="its newest N entries instead")
+    q = ds.add_parser("append", parents=[js], help="add an entry to a log doc (progress|exceptions|alerts)")
+    q.add_argument("name")
+    q.add_argument("text", help="the entry (- = stdin)")
+    q.add_argument("--project", help="name or directory (default: this directory's project)")
+    q = ds.add_parser("set", parents=[js], help="replace a doc's whole text (goals, review:<name>)")
+    q.add_argument("name")
+    q.add_argument("text", help="the new text (- = stdin)")
+    q.add_argument("--project", help="name or directory (default: this directory's project)")
+    q.add_argument("--version", type=int, help="the doc version you read (a mismatch is refused)")
+    q = ds.add_parser("import", parents=[js], help="sync the doc files into the DB (idempotent)")
+    q.add_argument("--repo", help="the project's directory (default: this repo)")
+    q.add_argument("--project", help="project name (default: the project of --repo)")
+    q.add_argument("--force", action="store_true", help="on a conflict the file wins")
+    q = ds.add_parser("export", parents=[js], help="regenerate PROGRESS.md, GOALS.md, EXCEPTIONS.md (D-181)")
+    q.add_argument("--repo", help="the project's directory (default: this repo)")
+    q.add_argument("--project", help="project name (default: the project of --repo)")
+    q.add_argument("--check", action="store_true", help="report only, write nothing")
     return ap
 
 
