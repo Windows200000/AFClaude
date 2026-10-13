@@ -13,14 +13,14 @@ serves at /afclaude/:
                 preview_from marking the step from which a non-blocking owner
                 preview of the dashboard UI is possible, D-211; each open stage and
                 phase with its cumulative ETA from stage_eta.py, D-213, which also
-                logs one prediction per day to data/stage_eta_log.jsonl for the
+                logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
                 inbox), AFClaude cron entries
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
                 README, design doc, prompts/*.md
 
-Never exports data/samples.jsonl or data/haiku.jsonl (raw usage/message
+Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
 ~/.claude.json cache that the sampler keeps fresh. All times Europe/Berlin.
 Run from cron every few minutes (via flock); each file is replaced atomically.
@@ -44,7 +44,7 @@ import stage_eta  # noqa: E402  (stage ETAs, D-213: read-only, plus its once-a-d
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
 USAGE_REVIEW_STATE_FILE = os.path.join(HERE, "data", "usage_review_state.json")
-AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # one_off_reviews()'s spool-dir fallback
+AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # legacy (frozen): jobs the at-shim adopts
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
 # This manager's own session/tmux (data/afclaude.json manager_session, as usage_report.py).
@@ -56,7 +56,7 @@ STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.
 PREVIEW_FROM = os.environ.get("QUICKVIEW_PREVIEW_FROM", "6a")
 UTC = timezone.utc
-RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # run_metrics.py rows (the sampler writes them)
+RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # names run_metrics.py's rows: the DB (D-161)
 
 DOCS = [  # (published name, source, title)
     ("PROGRESS.md", os.path.join(HERE, "PROGRESS.md"), "Progress log"),
@@ -231,7 +231,7 @@ def stages(usage=None, now=None):
 
 def eta_result(conn, usage, now):
     """stage_eta.gather() over every open stage (all projects: the execution order interleaves
-    them), logged once a day to data/stage_eta_log.jsonl for the stage-ETA review. Never raises."""
+    them), logged once a day (the DB, stage_eta_log) for the stage-ETA review. Never raises."""
     try:
         res = stage_eta.gather(conn, usage, now, runs_path=RUNS_FILE)
     except Exception as e:   # noqa: BLE001 - the page shows "?" and the error instead
@@ -304,15 +304,18 @@ def watcher_running():
 def tail_last_json(path, chunk=65536):
     """Last complete JSON object in a JSONL file, without reading the whole
     (potentially large, never-exported) file: grows the read window from the
-    end until a full line is found or the file start is reached. A live file's rows come
-    from the DB once imported (phase 2c, telemetry.py)."""
+    end until a full line is found or the file start is reached. The live path's rows come
+    from the DB (phase 2c, telemetry.py, D-161: the DB is the only copy; an unreadable DB
+    gives None, never the frozen legacy file)."""
     import telemetry
     got = telemetry.db_lines(path, max_bytes=chunk * 16)
-    for line in reversed(got or []):
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    if got is not None:
+        for line in reversed(got):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        return None
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -339,8 +342,8 @@ def tail_last_json(path, chunk=65536):
 
 def limits_block():
     """Compact version of the limit_ratio.py snapshot usage_sampler.py already
-    stored on the latest data/samples.jsonl row (no recompute, no raw rows
-    exported -- consistent with samples.jsonl never being exported directly)."""
+    stored on the latest usage sample (the DB; no recompute, no raw rows
+    exported -- consistent with the samples never being exported directly)."""
     row = tail_last_json(os.path.join(HERE, "data", "samples.jsonl"))
     return limits_from_snapshot((row or {}).get("limit_ratio"))
 
@@ -501,7 +504,7 @@ def keepalive_and_usage(now):
 
 def fill_block():
     """How long AFClaude's runs take to fill the session limit (D-207, run_metrics.summary over
-    data/afclaude_runs.jsonl, which the sampler keeps): the last run and the median."""
+    the run rows in the DB, which the sampler keeps): the last run and the median."""
     try:
         import run_metrics
         return run_metrics.summary(run_metrics.read_rows(RUNS_FILE))
@@ -574,40 +577,22 @@ def _review_label(which):
     return " + ".join(ONE_OFF_LABELS.get(w, w) for w in which.split(","))
 
 
-def _spool_pending_jobs():
-    """Fallback for one_off_reviews() when the DB has no pending job rows (not yet imported, or
-    no DB at all): data/at_spool/*.json directly. The at-shim deletes a spool file once it runs
-    the job (runner_state.import_jobs' docstring), so every file still there is pending."""
-    out = []
-    for name in sorted(glob.glob(os.path.join(AT_SPOOL_DIR, "*.json"))):
-        try:
-            with open(name) as fh:
-                j = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if isinstance(j, dict) and isinstance(j.get("cmd"), str) and j.get("at"):
-            out.append({"run_at": j["at"], "cmd": j["cmd"]})
-    return out
-
-
 def one_off_reviews():
     """Pending one-off usage/ETA reviews (owner's `usage_review.py --only ... --at ...`, D-220/
-    D-221/D-228): spooled at-shim jobs, read from the scheduled_jobs table (runner_state.py's
-    mapping of data/at_spool/*.json), falling back to the spool dir itself when the DB has no
-    pending rows at all (not yet imported). Earliest first. -> [{"at": datetime, "at_berlin",
-    "which", "label"}, ...] (jobs whose cmd isn't a usage_review.py --only call are ignored)."""
-    conn = None
-    rows = []
+    D-221/D-228): the at-shim's pending jobs in scheduled_jobs (the DB is their only copy,
+    D-161), plus a legacy spool file (data/at_spool, frozen) whose job the DB doesn't know yet:
+    the at-shim adopts it as pending on its next run (docker/at_shim.py). A DB that can't be
+    read: none. Earliest first. -> [{"at": datetime, "at_berlin", "which", "label"}, ...] (jobs
+    whose cmd isn't a usage_review.py --only call are ignored)."""
+    import runner_state
     try:
-        conn = store.connect()
-        rows = store.list_jobs(conn, "pending")
-    except Exception:   # noqa: BLE001 - no DB yet, or a hiccup: fall back to the spool dir
-        rows = []
-    finally:
-        if conn is not None:
-            conn.close()
-    if not rows:
-        rows = _spool_pending_jobs()
+        every = runner_state.jobs()
+    except Exception:   # noqa: BLE001 - no DB, or a hiccup: no one-off shown (never a file)
+        return []
+    known = {str(r.get("id")) for r in every}
+    rows = [r for r in every if r.get("status") == "pending"]
+    rows += [{"run_at": j.get("at"), "cmd": j.get("cmd")} for j in runner_state.legacy_jobs(AT_SPOOL_DIR)
+             if str(j.get("id")) not in known and isinstance(j.get("cmd"), str)]
     out = []
     for r in rows:
         m = re.search(r"usage_review\.py\s+--only\s+(\S+)", r.get("cmd") or "")

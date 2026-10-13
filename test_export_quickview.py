@@ -476,19 +476,28 @@ class NextUsageReview(unittest.TestCase):
             conn.close()
         self.assertEqual(qv.one_off_reviews(), [])
 
-    def test_spool_fallback_when_db_has_no_pending_jobs(self):
-        """No jobs ever imported into the DB: fall back to the spool dir directly."""
+    def test_legacy_spool_job_the_db_doesnt_know_is_shown(self):
+        """A legacy spool file (frozen, D-161) whose job the DB doesn't know: the at-shim adopts
+        it as pending on its next run, so it is shown already."""
         self.spool_job("spooled1", "2026-10-15T14:00:00Z", "usage,stage-eta")
         out = qv.one_off_reviews()
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["label"], "usage + ETA")
 
-    def test_db_jobs_take_priority_over_spool(self):
+    def test_legacy_spool_job_known_to_the_db_follows_the_db(self):
+        """The spool dir is never written or cleaned any more: a job the DB knows (here: already
+        started) is the DB's, its frozen spool file never shows it again."""
         self.put_job("db-job", "2026-10-16T10:00:00Z", "usage")
-        self.spool_job("ignored", "2026-10-15T14:00:00Z", "stage-eta")   # not imported: ignored
+        self.put_job("ran-job", "2026-10-14T10:00:00Z", "stage-eta")
+        conn = store.connect()
+        try:
+            actions.job_started(conn, "ran-job", actor="runner:at", via="runner")
+        finally:
+            conn.close()
+        self.spool_job("ran-job", "2026-10-14T10:00:00Z", "stage-eta")
+        self.spool_job("db-job", "2026-10-13T10:00:00Z", "stage-eta")       # the DB's row wins
         out = qv.one_off_reviews()
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["which"], "usage")
+        self.assertEqual([(o["which"], o["at"].day) for o in out], [("usage", 16)])
 
     def test_nothing_scheduled(self):
         self.assertEqual(qv.next_review_block(),

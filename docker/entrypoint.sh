@@ -8,7 +8,7 @@ D="${AFCLAUDE_DIR:?}"
 # Strict host key checking against the host's own public host key (mounted read-only).
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
-mkdir -p "${KEEPALIVE_STATE_DIR:?}" "$D/data/at_spool"
+mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
 # D-227: every deploy (`docker compose up -d --build`, i.e. every container start) imports
 # prompts/*.md into prompt_defaults, so the DB always has what is currently deployed (prompts
 # still ship as files, D-169; prompt_overrides holds the owner's edits). Now that data/ is

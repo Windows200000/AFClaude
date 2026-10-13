@@ -953,6 +953,7 @@ class EveryAction(Base):
             ("handoff.write", {"session_id": SID, "body": {"summary": "s"}}),
             ("handoff.consume", {"handoff_id": 1, "start_key": "window-start-2026-10-09"}),
             ("log.prune", {}),
+            ("user_model.set", {"doc": {"schema": "afclaude.user_model/1", "weeks_of_data": 1}}),
             ("doc.append", {"project": "P", "name": "progress", "text": "- x\n"}),
             ("doc.set", {"project": "P", "name": "goals", "text": "g\n"}),
             ("doc.sync", {"project": "P", "name": "progress", "text": "- x\n- y\n"}),

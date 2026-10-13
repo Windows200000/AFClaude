@@ -175,15 +175,14 @@ def parse_user_model(d):
 def load_params(path=None):
     """-> (params, envelope, source text). Never raises: a missing or invalid file means
     the generic defaults."""
-    path = path or USER_MODEL_FILE
     P = dict(DEFAULTS)
-    try:
-        with open(path) as fh:
-            doc = json.load(fh)
-    except FileNotFoundError:
-        return P, dict(GENERIC_ENVELOPE), "generic envelope (no user model)"
+    try:   # the DB (D-161; telemetry.read_user_model) for the live path, else the side file `path`
+        import telemetry
+        doc = telemetry.read_user_model(path or USER_MODEL_FILE)
     except Exception as e:   # noqa: BLE001
         return P, dict(GENERIC_ENVELOPE), f"generic envelope (user model unreadable: {type(e).__name__})"
+    if doc is None:
+        return P, dict(GENERIC_ENVELOPE), "generic envelope (no user model)"
     try:
         user_env, weeks, over = parse_user_model(doc)
     except Exception as e:   # noqa: BLE001 - any bad file means the generic defaults
@@ -208,8 +207,8 @@ def _ts(s):
 
 
 def tail_rows(path=None, max_bytes=TAIL_BYTES):
-    """The rows of the end of samples.jsonl, oldest first: the live file's from the DB once
-    imported (phase 2c, telemetry.py: the same rows), else from the file."""
+    """The rows of the end of the samples, oldest first: the DB for the live path (telemetry.py,
+    D-161), else the end of the side file."""
     path = path or SAMPLES_FILE
     import telemetry
     lines = telemetry.db_lines(path, max_bytes=max_bytes)
@@ -240,7 +239,7 @@ def fire_times(paths=None):
     for p in (FIRE_STATE_FILES if paths is None else paths):
         try:
             import runner_state
-            st = runner_state.read_json(p)   # the DB when it holds the live file's state
+            st = runner_state.read_json(p)   # the DB for a live state path
         except (OSError, ValueError):
             continue
         if not isinstance(st, dict):

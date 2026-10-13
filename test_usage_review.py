@@ -340,7 +340,7 @@ class ChainUsageEta(Base):
         d = NOW.astimezone(ka.BERLIN).date().isoformat()
         report = os.path.join(ur.HERE, "data", "reviews", f"{d}.md")
         self.assertIn(report, msg2)
-        self.assertIn("data/user_model.json", msg2)
+        self.assertIn("telemetry.py user-model get", msg2)
         # waited on the usage session specifically, before firing the ETA leg
         self.assertEqual(waited, [(sid1, report, NOW)])
         # order: the usage one-off entry logged before the stage-eta one

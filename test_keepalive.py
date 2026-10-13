@@ -1320,26 +1320,34 @@ class RunEnd(unittest.TestCase):
         self.assertIsNone(ka.run_active(SID, self.NOW, st))
 
     def test_cli(self):
-        """`keepalive.py --run-stopped` (the task-manager's last step) records this Claude Code
-        session's stop; the state dir is the live one next to the DB when that exists."""
+        """`keepalive.py --run-stopped` (the task-manager's last step, on the host) records this
+        Claude Code session's stop in the DB (D-161), never in a file of the state dir; a DB it
+        can't write fails the command and keeps the stop in the fallback file (§7.8)."""
+        import actions
+        import store
         with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "db", "afclaude.db")
             env = {k: v for k, v in os.environ.items() if k != "KEEPALIVE_SESSION"}
-            env.update(KEEPALIVE_STATE_DIR=d, CLAUDE_CODE_SESSION_ID=SID,
-                       AFCLAUDE_DB=os.path.join(d, "db", "afclaude.db"))      # no live state there
+            env.update(KEEPALIVE_STATE_DIR=d, CLAUDE_CODE_SESSION_ID=SID, AFCLAUDE_DB=db)
             cmd = [sys.executable, os.path.join(os.path.dirname(ka.__file__), "keepalive.py"), "--run-stopped"]
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("marked stopped", r.stdout)
-            with open(os.path.join(d, "keepalive_state.json")) as fh:
-                self.assertEqual(list(json.load(fh)["run_stops"].values()), [SID])
-            live = os.path.join(d, "db", "keepalive", "keepalive_state.json")   # the host: the live one
-            os.makedirs(os.path.dirname(live))
-            with open(live, "w") as fh:
-                json.dump({"handled": {}, "fires": {}}, fh)
-            r = subprocess.run(cmd + ["--session", "s2"], env=env, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            with open(live) as fh:
-                self.assertEqual(list(json.load(fh)["run_stops"].values()), ["s2"])
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True)        # no DB yet
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("could not be stored", r.stderr)
+            self.assertFalse(os.path.exists(db))                                   # never created by a runner
+            os.makedirs(os.path.dirname(db))
+            store.connect(db, create=True).close()
+            for args in ([], ["--session", "s2"]):
+                r = subprocess.run(cmd + args, env=env, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("marked stopped", r.stdout)
+            conn = store.connect(db)
+            try:
+                st = actions.state_unflatten("keepalive", store.state_rows(conn, "keepalive"))
+            finally:
+                conn.close()
+            self.assertEqual(sorted(st["run_stops"].values()), sorted([SID, "s2"]))
+            self.assertFalse(os.path.exists(os.path.join(d, "keepalive_state.json")))       # no file
+            self.assertFalse(os.path.exists(os.path.join(d, "db", "keepalive", "keepalive_state.json")))
 
 
 class DryRunLoop(unittest.TestCase):

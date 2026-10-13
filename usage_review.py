@@ -3,14 +3,14 @@
 
 ONE run that tests hypotheses on data/ (samples, Haiku judgements, weekly cycles,
 keep-alive decisions), then sorts every finding into universal (goes into the code,
-public) or user-specific (data/user_model.json, local only). It starts a NEW
+public) or user-specific (the user model in the DB, local only). It starts a NEW
 Opus 5.5 session at MEDIUM effort (tmux, Remote-Control visible, via ka_resume.sh)
 with prompts/usage_review.md + stage_eta_review.md (the rare stage-ETA review, D-213:
 it tunes the stages' session estimates only) + guard_respect.md + manager.md, and runs
 without user input. The results are surfaced via PROGRESS.md, a push, and an "unread review"
 memory entry that the user's next conversation picks up.
 
-Schedule: at `next_run_at` in the state file. The first run is Thu 2026-10-01 17:00
+Schedule: at `next_run_at` in its state (the DB, runner_state "usage_review"). The first run is Thu 2026-10-01 17:00
 Berlin, 2 h before that week's reset, so it spends quota that would expire anyway.
 It deliberately IGNORES the weekly budget rule and the night window. Each later run
 is 2 h before the first weekly reset that is at least MIN_GAP_DAYS after the
@@ -43,8 +43,8 @@ USAGE_DONE_TIMEOUT below) for it to reliably finish -- its report data/reviews/<
 AND its session gone idle (session_idle(); D-224's explicit stop-marker CLI does not exist yet,
 so this is the strongest signal available) -- then fires a SEPARATE fresh session for the one-off
 ETA review, whose brief (prompts/stage_eta_review_once_after_usage.md) points at the finished
-review's report and data/user_model.json. If the usage review never finishes within the timeout,
-it alerts and never launches the ETA review. The order is fixed (usage first) regardless of how
+review's report and the user model (in the DB, `telemetry.py user-model get`). If the usage
+review never finishes within the timeout, it alerts and never launches the ETA review. The order is fixed (usage first) regardless of how
 the two names are given to --only. Each leg is logged under its own st["one_off_runs"] entry, as
 usual never touching the monthly schedule.
 
@@ -64,7 +64,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402
-import runner_state  # noqa: E402  (phase 2d: the state also in the DB)
+import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
@@ -85,21 +85,31 @@ USAGE_DONE_POLL = timedelta(minutes=5)     # before giving up (alert) and never 
 
 
 def load():
-    got = runner_state.db_load("usage_review", STATE)
-    if got is not None:
-        return got
+    st = runner_state.load("usage_review", STATE, {"next_run_at": FIRST_RUN.isoformat(), "runs": []})   # the DB
+    st.setdefault("next_run_at", FIRST_RUN.isoformat())
+    st.setdefault("runs", [])
+    return st
+
+
+def stored():
+    """The schedule has been saved before (the DB holds the component's rows)."""
     try:
-        with open(STATE) as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"next_run_at": FIRST_RUN.isoformat(), "runs": []}
+        return bool(runner_state.read_json(STATE))
+    except (OSError, ValueError):
+        return False
 
 
 def save(st):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    with open(STATE, "w") as fh:
-        json.dump(st, fh, indent=1)
     runner_state.save("usage_review", st, STATE)
+
+
+def db_problem():
+    """store.db_gate (alerts once per episode): a broken DB pauses the review's start. -> problem or None."""
+    import store
+    problem = store.db_gate("usage_review")
+    if problem is not None:
+        ka.log(f"usage review: PAUSED, database problem ({problem.kind}: {problem}); {problem.escalation}")
+    return problem
 
 
 def next_run_after(now):
@@ -302,6 +312,8 @@ def main():
     if args.at:
         print(json.dumps(schedule_once(args.only, args.at, now), indent=1))
         return
+    if getattr(st, "unavailable", False) or db_problem():
+        return   # a broken DB (or its state unreadable): start nothing (design §7.8); the next cron run retries
     if args.only:
         if args.only == ",".join(ONLY_ORDER):   # "usage,stage-eta": the D-228 chain
             run_usage_then_eta(st, now)
@@ -312,7 +324,7 @@ def main():
     if args.now or now >= datetime.fromisoformat(st["next_run_at"]):
         run(st, now)
         save(st)
-    elif not os.path.exists(STATE):
+    elif not stored():
         save(st)
 
 

@@ -53,15 +53,16 @@ def ts(s):
 
 
 def load_rows(path):
+    """The samples: the DB for the live path (telemetry.py, D-161), else the side file."""
+    import telemetry
     rows = []
-    with open(path) as fh:
-        for line in fh:
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(r, dict) and ts(r.get("at")):
-                rows.append(r)
+    for line in telemetry.lines(path):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and ts(r.get("at")):
+            rows.append(r)
     rows.sort(key=lambda r: ts(r["at"]))
     return rows
 
@@ -258,7 +259,7 @@ def main():
     ap.add_argument("--samples", default=os.path.join(HERE, "data", "samples.jsonl"))
     ap.add_argument("--data", default=os.path.join(HERE, "data"), help="for the recorded fires")
     ap.add_argument("--user-model", default=os.path.join(HERE, "data", "user_model.json"),
-                    help="the reserve model's envelope (comparison only)")
+                    help="the reserve model's envelope (comparison only; default: the DB's user model)")
     ap.add_argument("--reset", required=True, help="the weekly reset (ISO) of the cycle to replay")
     ap.add_argument("--user-until", required=True, help="observed demand counts as the user's up to here (ISO)")
     ap.add_argument("--raf", type=float, default=8.0, help="AFClaude burn rate, weekly %%/h")
@@ -289,8 +290,8 @@ def main():
         rates = [x * a.user_scale for x in rates]
     fc = (lambda x, y: pacing.forecast_user(rates, x, y)) if rates else None
     try:
-        with open(a.user_model) as fh:
-            user_env, weeks, _ = usage_model.parse_user_model(json.load(fh))
+        import telemetry
+        user_env, weeks, _ = usage_model.parse_user_model(telemetry.read_user_model(a.user_model))
         user_env = {h: v * a.user_scale for h, v in user_env.items()}
     except (OSError, ValueError):
         user_env = None

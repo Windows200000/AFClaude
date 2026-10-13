@@ -11,9 +11,9 @@ Machine identity stays in the local file data/afclaude.json (gitignored; or $AFC
 template afclaude.example.json): manager_session, trust_root, the dashboard block.
 
 One-time import (phase 2a): tunables still found in data/afclaude.json, data/dispatcher.json
-or (the pacing keys) data/user_model.json are imported into the DB on first use through
+or (the pacing keys) the user model are imported into the DB on first use through
 actions.py (action setting.import, audit actor runner:import, D-154) and then removed from
-the file; identity keys stay. Idempotent: a file without tunables is not touched, a key the
+the file (the user model: from its DB record, D-161; telemetry.py); identity keys stay. Idempotent: a file without tunables is not touched, a key the
 DB already has keeps the DB value. `python3 afclaude_config.py [import]` shows the effective
 settings (or runs the import now).
 """
@@ -277,6 +277,36 @@ def import_sources() -> list:
             (USER_MODEL_FILE, "data/user_model.json", _map_user_model, strip_pacing)]
 
 
+def _user_model_live(path: str) -> bool:
+    import telemetry
+    return telemetry.is_live("usage.user_model", path)
+
+
+def _read_source(path: str) -> Optional[dict]:
+    """A source's document, None if there is none: the user model from the DB (D-161; its legacy
+    file only while it was never imported), the local files as files."""
+    if path == USER_MODEL_FILE and _user_model_live(path):
+        import telemetry
+        return telemetry.read_user_model(path)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        d = json.load(fh)
+    if not isinstance(d, dict):
+        raise ValueError("not a JSON object")
+    return d
+
+
+def _write_source(path: str, d: dict) -> None:
+    """The stripped document back: the user model into the DB (user_model.set, audited), a file
+    as the file."""
+    if path == USER_MODEL_FILE and _user_model_live(path):
+        import telemetry
+        telemetry.set_user_model(d, actor="runner:import", via="runner")
+    else:
+        _write_json(path, d)
+
+
 def _write_json(path: str, d: dict) -> None:
     tmp = f"{path}.tmp-{os.getpid()}"
     with open(tmp, "w") as fh:
@@ -292,7 +322,11 @@ def import_file_settings() -> list:
     are logged and leave the file as it is (the next run tries again)."""
     results = []
     for path, label, mapper, strip in import_sources():
-        if not os.path.isfile(path) or not mapper(_read_json(path), SESSION_LENGTH.total_seconds() / 3600)[2]:
+        try:
+            doc = _read_source(path)
+        except (OSError, ValueError):
+            doc = None
+        if doc is None or not mapper(doc, SESSION_LENGTH.total_seconds() / 3600)[2]:
             continue
         try:
             results.append(_import_one(path, label, mapper, strip))
@@ -306,10 +340,9 @@ def _import_one(path: str, label: str, mapper: Callable, strip: Callable) -> dic
     import store
     with open(path + ".import.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)            # two runners starting at once import once
-        with open(path) as fh:
-            d = json.load(fh)
-        if not isinstance(d, dict):
-            raise ValueError("not a JSON object")
+        d = _read_source(path)
+        if d is None:
+            raise ValueError("gone")
         conn = store.connect()
         try:
             values, notes, consumed = mapper(d, actions.get_setting(conn, "session_hours"))
@@ -320,7 +353,7 @@ def _import_one(path: str, label: str, mapper: Callable, strip: Callable) -> dic
         finally:
             conn.close()
         strip(d, consumed)
-        _write_json(path, d)
+        _write_source(path, d)
     try:
         os.unlink(path + ".import.lock")
     except OSError:
