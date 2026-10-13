@@ -127,20 +127,90 @@ def load_prompt(name):
         return fh.read()
 
 
-def session_message(name, afclaude=True, manager=True, insert=None, **fields):
-    """One-line message for a session: <name>.md + guard_respect.md + manager.md
-    + manager_afclaude.md (the AFClaude-repo rules). afclaude=False leaves those
-    rules out for sessions working elsewhere; manager=False leaves out both
-    manager files (the user's own sessions get a neutral message). insert: text
-    that goes right after <name>.md (the hand-off after a compaction, the save
-    prompt in a fill-up message). One line because tmux send-keys would submit at
-    the first newline."""
-    parts = [load_prompt(name).format(**fields)] + ([insert] if insert else []) + [load_prompt("guard_respect")]
-    if manager:
-        parts.append(load_prompt("manager"))
+def session_message(name, afclaude=True, manager=True, insert=None, hooked=False, **fields):
+    """One-line message for a session: <name>.md + the standing rules. insert: text that goes
+    right after <name>.md (the hand-off after a compaction, the save prompt in a fill-up message).
+    hooked=True (a session started in this repo, rules_hooked(cwd)): the standing rules already
+    come from the repo's SessionStart hook (D-225), so only the one-line pointer
+    (rules_pointer.md) follows. Otherwise they are inline: guard_respect.md + manager.md +
+    manager_afclaude.md (the AFClaude-repo rules) + afk_rules.md; afclaude=False leaves out
+    manager_afclaude.md, manager=False leaves out all but guard_respect.md (the user's own
+    sessions get a neutral message). One line because tmux send-keys would submit at the first
+    newline."""
+    parts = [load_prompt(name).format(**fields)] + ([insert] if insert else [])
+    if hooked and manager:
+        parts.append(load_prompt("rules_pointer"))
+    elif manager:
+        parts += [load_prompt("guard_respect"), load_prompt("manager")]
         if afclaude:
             parts.append(load_prompt("manager_afclaude").format(session_stop_pct=session_stop_pct()))
+        parts.append(load_prompt("afk_rules"))
+    else:
+        parts.append(load_prompt("guard_respect"))
     return " ".join(" ".join(parts).split())
+
+
+# The standing rules the repo's SessionStart hook injects (.claude/settings.json, D-225), in two
+# parts, one hook each: Claude Code caps every hook's additionalContext at 10,000 characters
+# (anything longer is replaced by a file path and a 2,000-character preview).
+RULES_PARTS = {"manager": "the task-manager rules",
+               "afclaude": "the AFClaude-repo rules, the guard rule and the AFK rules"}
+HOOK_CONTEXT_CAP = 10000
+
+
+def rules_hooked(cwd):
+    """True when a session in cwd gets the standing rules from the SessionStart hook: only a
+    session started in this checkout's root (where .claude/settings.json is read; the
+    container runs the code under the same path as the host repo)."""
+    try:
+        return bool(cwd) and os.path.realpath(cwd) == os.path.realpath(HERE)
+    except (OSError, ValueError):
+        return False
+
+
+def standing_rules(part):
+    """One part of the standing rules (RULES_PARTS), with a header line; variables filled as
+    in session_message ({session_stop_pct}). Newlines kept: this is hook context, not tmux."""
+    if part == "manager":
+        body = [load_prompt("manager")]
+    elif part == "afclaude":
+        body = [load_prompt("manager_afclaude").format(session_stop_pct=session_stop_pct()),
+                load_prompt("guard_respect"), load_prompt("afk_rules")]
+    else:
+        raise ValueError(f"unknown standing-rules part {part!r} (one of {', '.join(RULES_PARTS)})")
+    head = load_prompt("session_rules").format(part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part])
+    return "\n\n".join(p.strip() for p in [head] + body)
+
+
+def session_rules_hook(part, hook_input, project_dir=None):
+    """The SessionStart hook's JSON (D-225) for one part of the standing rules, or None when the
+    session did not start in this repo's root (nothing is injected then). hook_input: the hook's
+    stdin JSON (its cwd). Never raises: if the rules can't be built, the context says where they
+    are instead."""
+    cwd = (hook_input or {}).get("cwd") or project_dir or os.getcwd()
+    if not rules_hooked(cwd):
+        return None
+    try:
+        text = standing_rules(part)
+    except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
+        text = (f"[AFClaude standing rules, part {part}: could not be built ({type(e).__name__}: {e}). "
+                f"Read {os.path.join(HERE, 'prompts')}/manager.md, manager_afclaude.md ({{session_stop_pct}} = "
+                f"the session_stop_pct setting, default 95), guard_respect.md and afk_rules.md now and follow them.]")
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+
+
+def print_session_rules(part):
+    """--session-rules: the hook command. Prints the hook JSON (nothing outside this repo's
+    root) and always exits 0, so a problem never shows up as a hook error at session start."""
+    try:
+        raw = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+        hook_input = json.loads(raw) if raw.strip() else {}
+    except (OSError, ValueError):
+        hook_input = {}
+    out = session_rules_hook(part, hook_input if isinstance(hook_input, dict) else {},
+                             os.environ.get("CLAUDE_PROJECT_DIR"))
+    if out is not None:
+        print(json.dumps(out))
 
 
 def session_stop_pct():
@@ -1490,12 +1560,14 @@ def handle_fire(sid, stall, reason, st, args):
         return
     budget = stall.get("budget") or budget_headroom(read_usage_cache(), datetime.now(UTC))[1]
 
-    def build(insert=None):
-        return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
-                               insert=insert, **(stall.get("fields") or {}))
-    msg = build(stall.get("insert"))
     path = transcript_path(sid)
     cwd = session_cwd(path)
+
+    def build(insert=None):
+        # a session in this repo has its standing rules from the SessionStart hook: only a pointer (D-225)
+        return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
+                               insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
+    msg = build(stall.get("insert"))
     # a start (window-start, postponed start, last-stretch slot) into our live tmux session compacts
     # it first if D-191/D-218 say so (D-144); the fill-up and stall continues never do
     comp = compaction_plan(sid, stall["start_at"]) if stall.get("start_at") and plan == "send-keys" else None
@@ -2100,7 +2172,7 @@ def work_on_project(sel, args):
         return
     sid = str(uuid.uuid4())
     slug = re.sub(r"[^a-z0-9]+", "-", p["title"].lower()).strip("-")
-    msg = session_message("project_start", title=p["title"], desc=p["desc"], slug=slug)
+    msg = session_message("project_start", title=p["title"], desc=p["desc"], slug=slug, hooked=rules_hooked(HERE))
     if not args.arm:
         log(f"WOULD START (dry-run): new session {sid} for {p['title']!r} cwd={HERE}")
         return
@@ -2147,12 +2219,18 @@ def main():
     ap.add_argument("--run-stopped", action="store_true",
                     help="the task-manager stopped cleanly: its run is over now (D-224; the session: --session, "
                          "else this Claude Code session, else the manager session)")
+    ap.add_argument("--session-rules", choices=list(RULES_PARTS), metavar="PART",
+                    help="the repo's SessionStart hook (D-225): print one part of the standing rules "
+                         f"({' / '.join(RULES_PARTS)}) as hook JSON for a session started in this repo; "
+                         "reads the hook input from stdin")
     ap.add_argument("--take-over-idle", action="store_true",
                     help="if an idle interactive process (e.g. an open terminal) holds the session, SIGTERM it and resume in tmux")
     ap.add_argument("--model", default=LAUNCH["model"], help="model to relaunch with (tmux resume)")
     ap.add_argument("--effort", default=LAUNCH["effort"], help="effort to relaunch with")
     ap.add_argument("--name", default=LAUNCH["name"], help="Remote Control display name")
     args = ap.parse_args()
+    if args.session_rules:
+        return print_session_rules(args.session_rules)
     LAUNCH.update(model=args.model, effort=args.effort, name=args.name)
     global TAKE_OVER_IDLE, IGNORE_WINDOW
     afclaude_config.LOG = log            # a settings problem (DB unreadable) lands in this log
