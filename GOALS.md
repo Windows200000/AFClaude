@@ -15,6 +15,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 7. [~] Dashboard: phase 1 done; design v2 (§13 plan: 2a–2d, 3a–3c, 4a–4b, 5a–5e, 6a–6c, 7a–7b, gates 8a–8d; tasks #32–#50, #25–#28). Phases 2a + 2b merged 08.10. (a6e4eaa); NEXT: 2c (telemetry into the DB).
 8. [x] Pre-public scrub: history squashed into one commit after an audit, with a pre-commit/pre-push guard (`tools/check_public.py`), 29.09.; host-specific values into config still to do
 9. [ ] Usage optimisation (after everything else): use the full limits using the measured session/weekly ratios, AFClaude vs user share
+9b. [ ] Use the monthly extra (API-billed) usage of Team plans too, capped by a buffer or a fixed limit (e.g. $200) (D-231, after the dashboard)
 10. [ ] Shared review + experience store across AFClaude users (usage-limit experience, prediction functions); consider the design
 
 11. [ ] Investigate hooking into `claude rc` server mode (more convenient for the user; server sessions don't expire, unlike per-session Remote Control)
