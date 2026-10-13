@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline tests for export_quickview.py's phase strip (build_stages / stages)."""
+import json
 import os
 import sys
 import tempfile
@@ -8,6 +9,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
+import actions  # noqa: E402
 import export_quickview as qv  # noqa: E402
 import store  # noqa: E402
 
@@ -378,6 +380,124 @@ class FillupBlock(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()
         for needle in ("fillupTile(k.fillup", "Next fill-up", "weekly cost", "f.reason"):
+            self.assertIn(needle, page)
+
+
+class NextUsageReview(unittest.TestCase):
+    """Owner bug report: the dashboard's "next usage review" tile showed only the monthly
+    schedule (usage_review_state.json's next_run_at), ignoring a one-off review (owner's
+    `usage_review.py --only ... --at ...`) spooled as a pending at-shim job that lands earlier."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = (qv.USAGE_REVIEW_STATE_FILE, qv.AT_SPOOL_DIR)
+        qv.USAGE_REVIEW_STATE_FILE = os.path.join(self.tmp.name, "usage_review_state.json")
+        qv.AT_SPOOL_DIR = os.path.join(self.tmp.name, "at_spool")
+
+    def tearDown(self):
+        qv.USAGE_REVIEW_STATE_FILE, qv.AT_SPOOL_DIR = self.old
+        self.tmp.cleanup()
+        # scheduled_jobs rows are marked started, never deleted (store.py's no-delete trigger);
+        # mark every pending row started so the next test starts with none pending.
+        conn = store.connect()
+        try:
+            for row in store.list_jobs(conn, "pending"):
+                actions.job_started(conn, row["id"], actor="runner:at", via="runner")
+        finally:
+            conn.close()
+
+    def write_state(self, next_run_at):
+        with open(qv.USAGE_REVIEW_STATE_FILE, "w") as fh:
+            json.dump({"next_run_at": next_run_at, "runs": []}, fh)
+
+    def put_job(self, job_id, at, which):
+        cmd = f"cd x && python3 usage_review.py --only {which} --now >> keepalive.log 2>&1\n"
+        conn = store.connect()
+        try:
+            actions.job_put(conn, {"id": job_id, "at": at, "cmd": cmd, "cwd": "/"},
+                            actor="runner:at", via="runner")
+        finally:
+            conn.close()
+
+    def spool_job(self, job_id, at, which):
+        os.makedirs(qv.AT_SPOOL_DIR, exist_ok=True)
+        cmd = f"cd x && python3 usage_review.py --only {which} --now >> keepalive.log 2>&1\n"
+        with open(os.path.join(qv.AT_SPOOL_DIR, f"{job_id}.json"), "w") as fh:
+            json.dump({"id": job_id, "at": at, "cmd": cmd, "cwd": "/"}, fh)
+
+    def test_monthly_only(self):
+        self.write_state("2026-10-29T08:00:00Z")
+        out = qv.next_review_block()
+        self.assertEqual(out["which"], "monthly")
+        self.assertTrue(out["at_berlin"].startswith("Thu 29.10."))
+        self.assertIsNone(out["label"])
+        self.assertIsNone(out["secondary"])
+
+    def test_one_off_before_monthly_wins_and_shows_monthly_as_secondary(self):
+        """The owner's example: a one-off usage+ETA review on 15.10., monthly review on 29.10."""
+        self.write_state("2026-10-29T08:00:00Z")
+        self.put_job("44dc54fd2635", "2026-10-15T14:00:00Z", "usage,stage-eta")
+        out = qv.next_review_block()
+        self.assertEqual(out["which"], "one-off")
+        self.assertTrue(out["at_berlin"].startswith("Thu 15.10."))
+        self.assertEqual(out["label"], "usage + ETA")
+        self.assertEqual(out["secondary"]["which"], "monthly")
+        self.assertTrue(out["secondary"]["at_berlin"].startswith("Thu 29.10."))
+
+    def test_one_off_after_monthly_shows_monthly_as_primary(self):
+        self.write_state("2026-10-15T08:00:00Z")
+        self.put_job("abc123", "2026-10-29T14:00:00Z", "stage-eta")
+        out = qv.next_review_block()
+        self.assertEqual(out["which"], "monthly")
+        self.assertEqual(out["secondary"], {"at_berlin": out["secondary"]["at_berlin"], "which": "one-off",
+                                            "label": "ETA"})
+        self.assertTrue(out["secondary"]["at_berlin"].startswith("Thu 29.10."))
+
+    def test_solo_one_off_label(self):
+        self.put_job("x1", "2026-10-15T14:00:00Z", "usage")
+        out = qv.one_off_reviews()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["label"], "usage")
+        self.assertEqual(out[0]["which"], "usage")
+
+    def test_earliest_of_several_one_offs(self):
+        self.put_job("later", "2026-10-20T10:00:00Z", "usage")
+        self.put_job("earlier", "2026-10-16T10:00:00Z", "stage-eta")
+        out = qv.one_off_reviews()
+        self.assertEqual([o["label"] for o in out], ["ETA", "usage"])
+
+    def test_non_review_jobs_ignored(self):
+        conn = store.connect()
+        try:
+            actions.job_put(conn, {"id": "weekly-reset", "at": "2026-10-14T00:00:00Z",
+                                   "cmd": "cd x && python3 usage_sampler.py --now\n", "cwd": "/"},
+                            actor="runner:at", via="runner")
+        finally:
+            conn.close()
+        self.assertEqual(qv.one_off_reviews(), [])
+
+    def test_spool_fallback_when_db_has_no_pending_jobs(self):
+        """No jobs ever imported into the DB: fall back to the spool dir directly."""
+        self.spool_job("spooled1", "2026-10-15T14:00:00Z", "usage,stage-eta")
+        out = qv.one_off_reviews()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["label"], "usage + ETA")
+
+    def test_db_jobs_take_priority_over_spool(self):
+        self.put_job("db-job", "2026-10-16T10:00:00Z", "usage")
+        self.spool_job("ignored", "2026-10-15T14:00:00Z", "stage-eta")   # not imported: ignored
+        out = qv.one_off_reviews()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["which"], "usage")
+
+    def test_nothing_scheduled(self):
+        self.assertEqual(qv.next_review_block(),
+                         {"at_berlin": None, "which": None, "label": None, "secondary": None})
+
+    def test_page_renders_the_one_off_tagging(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        for needle in ("next_usage_review_label", "next_usage_review_secondary", "Next usage review"):
             self.assertIn(needle, page)
 
 
