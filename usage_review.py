@@ -212,7 +212,8 @@ def session_idle(sid, now, idle=None):
     uses for a run IT dispatched, adapted for a session usage_review.py fired directly (ka.fire()):
     such a session never gets a st["handled"] entry of its own, so run_active() itself cannot see
     it. False (never idle) if the transcript cannot be found yet (not started, or still starting
-    up). This stands in for the explicit stop-marker CLI that D-224 plans but has not built yet."""
+    up). The task-manager's explicit stop (keepalive.py --run-stopped, D-224) ends only keep-alive
+    runs; a review session doesn't run it."""
     idle = idle if idle is not None else ka.RUN_IDLE
     path = ka.transcript_path(sid)
     if not path:

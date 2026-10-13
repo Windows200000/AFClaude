@@ -34,7 +34,8 @@ KA_STATE = {"handled": {"window-start-2026-10-01": {"at": "2026-10-01T21:00:00+0
                                                     "result": "continued-in-place"},
                         "last-mile-2026-10-02": {"at": "2026-10-02T12:00:00+00:00", "result": "dry-run"}},
             "fires": {"2026-10-01": 1},
-            "limit_hits": {"u1": "2026-10-01T23:00:00+00:00"}}
+            "limit_hits": {"u1": "2026-10-01T23:00:00+00:00"},
+            "run_stops": {"2026-10-02T01:00:00+00:00": "s"}}
 FILES = {
     "keepalive/keepalive_state.json": KA_STATE,
     "keepalive/keepalive_deferred.json": {"window-start-2026-10-03": {"session": "s", "recheck_at": "2026-10-03T22:00:00+00:00"}},
@@ -269,7 +270,7 @@ class Importer(Base):
         self.assertEqual(counts["app_log"], {"keepalive": 3, "dispatcher": 1, "sampler": 4, "watchdog": 1,
                                              "host_exec": 3})
         self.assertEqual(counts["scheduled_jobs"], {"pending": 2})
-        self.assertEqual(counts["runner_state"]["keepalive"], 4)
+        self.assertEqual(counts["runner_state"]["keepalive"], 5)
         self.assertEqual(snapshot(self.dir), before)                     # files untouched
         r2 = rs.import_all()                                             # again: nothing new
         self.assertEqual([s["status"] for s in r2["state"] if s["status"] != "no file"], ["in sync"] * 7)
@@ -391,6 +392,23 @@ class Concurrency(Base):
         plain["handled"]["k2"] = {"at": "y"}
         ka.save_state(plain)
         self.assertTrue({"k1", "k2"} <= self.handled_in_db())
+
+    def test_run_stop_survives_the_watchers_older_state(self):
+        """--run-stopped (D-224) merges into the state as it is: a watcher that loaded its state
+        before the stop and saves afterwards (merge or file mode) never drops it from the DB."""
+        a, plain = ka.load_state(), json.loads(json.dumps(KA_STATE))
+        t = datetime(2026, 10, 5, 23, 40, tzinfo=timezone.utc)
+        ka.mark_run_stopped("s1", t)
+        a["handled"]["k1"] = {"at": "x"}
+        ka.save_state(a)
+        plain["handled"]["k2"] = {"at": "y"}
+        ka.save_state(plain)
+        self.assertEqual(ka.load_state()["run_stops"][t.isoformat()], "s1")
+        paths = [json.loads(p) for p in store.state_rows(self.conn, "keepalive")]
+        self.assertIn(["run_stops", t.isoformat()], paths)                 # one row per stop
+        audit = self.conn.execute("SELECT after FROM audit_log WHERE action='runner_state.save' "
+                                  "ORDER BY id").fetchall()
+        self.assertTrue(any(t.isoformat() in r[0] for r in audit))
 
 
 def _worker(i, n):

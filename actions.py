@@ -1491,7 +1491,7 @@ class StateComponent:
 
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
-    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits")),
+    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),

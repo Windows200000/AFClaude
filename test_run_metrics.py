@@ -155,6 +155,21 @@ class ComputeRun(unittest.TestCase):
         r = rm.compute_run(run(), [rd(-2, 0, 50)], every(0, 300), [], now=M(400), next_fire=M(100))
         self.assertEqual((r["end_reason"], r["end"]), ("next-run", M(100).isoformat()))
 
+    def test_clean_stop_ends_the_run_while_the_owner_chats_on(self):
+        """D-224: the task-manager's --run-stopped at 60 min ends the run there, although the
+        session is written until 120 min (the owner chatting); a stop before the fire is the
+        previous run's; the reading right after the stop still counts (the meter lags)."""
+        reads = [rd(-2, 0, 50), rd(30, 40, 55), rd(55, 80, 60), rd(70, 85, 61), rd(110, 90, 63)]
+        r = rm.compute_run(run(), reads, every(0, 120), [], now=M(200), stops=[M(-30), M(60)])
+        self.assertEqual((r["end_reason"], r["end"], r["ongoing"]), ("stopped", M(60).isoformat(), False))
+        self.assertEqual(r["session_end_pct"], 85)                            # not the owner's 90
+        r = rm.compute_run(run(), reads, every(0, 120), [], now=M(50), stops=[M(60)])
+        self.assertTrue(r["ongoing"])                                          # not stopped yet
+        r = rm.compute_run(run(), reads, every(0, 120), [], now=M(200), stops=[M(-30)])
+        self.assertEqual((r["end_reason"], r["end"]), ("idle", M(120).isoformat()))
+        r = rm.compute_run(run(), reads, every(0, 40), [], now=M(200), stops=[M(60)])
+        self.assertEqual((r["end_reason"], r["end"]), ("idle", M(40).isoformat()))   # the earliest end wins
+
 
 class FiresAndReadings(unittest.TestCase):
     def test_fire_kind(self):
@@ -276,6 +291,16 @@ class Update(unittest.TestCase):
         self.assertEqual(rows2, rows)                         # final: not recomputed, file not rewritten
         self.assertEqual(calls, [])
         self.assertEqual(os.path.getmtime(self.out), mtime)
+
+    def test_stop_marks_from_the_state(self):
+        """The keepalive state's run_stops (--run-stopped, D-224) end the run of their session."""
+        with open(self.state) as fh:
+            st = json.load(fh)
+        st["run_stops"] = {M(40).isoformat(): "another-session", M(50).isoformat(): SID}
+        with open(self.state, "w") as fh:
+            json.dump(st, fh)
+        r = self.up(M(200))[0]
+        self.assertEqual((r["end_reason"], r["end"]), ("stopped", M(50).isoformat()))
 
     def test_rows_are_never_dropped(self):
         _write(self.out, [{"run_id": "old-run", "start": "2026-09-01T00:00:00+00:00", "final": True}])
