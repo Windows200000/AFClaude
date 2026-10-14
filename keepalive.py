@@ -129,7 +129,7 @@ def load_prompt(name):
 
 def session_message(name, afclaude=True, manager=True, insert=None, hooked=False, **fields):
     """One-line message for a session: <name>.md + the standing rules. insert: text that goes
-    right after <name>.md (the hand-off after a compaction, the save prompt in a fill-up message).
+    right after <name>.md (the hand-off after a compaction).
     hooked=True (a session started in this repo, rules_hooked(cwd)): the standing rules already
     come from the repo's SessionStart hook (D-225), so only the one-line pointer
     (rules_pointer.md) follows. Otherwise they are inline: guard_respect.md + manager.md +
@@ -1224,10 +1224,6 @@ def run(args):
                     next_fillup = max(min(next_fillup, due + WAKE_SLACK), now + timedelta(seconds=MIN_SLEEP))
             except Exception as e:   # noqa: BLE001 - a fill-up problem must not take the watcher down
                 log(f"fill-up pass failed: {type(e).__name__}: {e}")
-            try:                  # the save prompt before a compaction (D-144/D-191)
-                handoff_save_pass(sid, now, args)
-            except Exception as e:   # noqa: BLE001 - nor a save-prompt problem
-                log(f"save-prompt pass failed: {type(e).__name__}: {e}")
         if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
             next_reading = now + RUN_READING_EVERY
             watch_run_usage(sid, now)
@@ -1584,17 +1580,28 @@ def handle_fire(sid, stall, reason, st, args):
             st["handled"][key]["compaction"] = {"due": comp["due"], "why": comp["why"]}
         save_state(st)
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})"
-                      + (" after compacting it (D-191/D-218)" if comp and comp["due"] else ""))
+                      + (" after a save prompt and compacting it (D-191/D-218/D-233)" if comp and comp["due"] else ""))
         return
     handoff = None
     if comp and comp["due"]:
+        # D-233: the hand-off is written right before the compaction, so it covers everything since
+        # the last one (also the owner's interactive chats)
         try:
-            comp.update(compact_session(sid, cwd, path))
+            save = save_before_compaction(sid, cwd, path)
+        except Exception as e:   # noqa: BLE001 - a save problem never stops the start; compact anyway
+            log(f"save before the compaction of {sid[:8]} failed: {type(e).__name__}: {e}")
+            save = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
+        comp["save"] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in save.items()}
+        if save["status"] not in ("saved", "busy"):
+            log(f"WARNING: no new hand-off from {sid[:8]} before the compaction ({save['status']}); compacting anyway")
+        try:
+            comp.update(compaction_busy(sid, "before the save prompt") if save["status"] == "busy"
+                        else compact_session(sid, cwd, path))
         except Exception as e:   # noqa: BLE001 - a compaction problem never stops the start itself
             log(f"compaction of {sid[:8]} failed: {type(e).__name__}: {e}; continuing without it")
             comp.update(status="error", error=f"{type(e).__name__}: {e}"[:200])
         if comp["status"] in ("compacted", "timeout"):
-            insert, handoff = compact_resume_text(sid)
+            insert, handoff = compact_resume_text(sid, save)
             msg = build(" ".join(x for x in (stall.get("insert"), insert) if x))
             comp["handoff_id"] = handoff["id"] if handoff else None
     sent_at = datetime.now(UTC)
@@ -1727,23 +1734,8 @@ def _fire_fillup(sid, now, d, args, test=False):
              "budget": (f"budget for this run: the rest of this session window (~{float(d['remaining']):.0f}% "
                         f"session" + (f", ~{d['cost']:.1f}% weekly)" if d.get("cost") is not None else ")")),
              "fields": {"remaining": f"{float(d['remaining']):.0f}", "reset": d["reset"].astimezone(BERLIN).strftime("%H:%M %Z")}}
-    save = None
-    if not test:             # the save prompt rides on the fill-up message (D-212 runs until the reset)
-        try:
-            ok, _why = save_due(sid, d["reset"])
-            save = save_text(sid, d["reset"]) if ok else None
-        except Exception as e:   # noqa: BLE001 - the save prompt must not stop the fill-up
-            log(f"save prompt check failed: {type(e).__name__}: {e}")
-        if save:
-            stall["insert"] = save
-    log(f"{what}: FIRE {d['key']}" + (" (with the compaction save prompt, D-144)" if save else ""))
-    res = handle_fire(sid, stall, f"{what}, session window resets {berlin(d['reset'])}", load_state(), args)
-    if save:
-        rec = (load_state().get("handled") or {}).get(d["key"]) or {}
-        if rec.get("result") in RUN_RESULTS + ("dry-run",):
-            note_save(save_key(d["reset"]), {"at": now.isoformat(), "result": "merged-into-fillup",
-                                             "fillup": d["key"], "fillup_result": rec.get("result")})
-    return res
+    log(f"{what}: FIRE {d['key']}")
+    return handle_fire(sid, stall, f"{what}, session window resets {berlin(d['reset'])}", load_state(), args)
 
 
 def fillup_test_pass(sid, now, args, test):
@@ -1831,32 +1823,35 @@ def plan_fillup_test(sid, remaining, args):
     print(f"scheduled (DB: keepalive.fillup); the running watcher fires it at {berlin(p['start'])}")
 
 
-# ---------------------------------------------------------------- compaction (D-144, D-191, D-214)
+# ---------------------------------------------------------------- compaction (D-144, D-191, D-214, D-233)
 # Minimal version of design §5.5, built in today's keep-alive (D-214; phase 3c's runner reuses it).
-# The trigger is algorithmic (D-191, D-218): at the end of a session window, a session is due for
-# compaction if its conversation already ran before that session window began, i.e. the first
-# entry of its transcript (~/.claude/projects/<cwd>/<id>.jsonl, which a --resume keeps appending
-# to) is older than the window's start. So the first compaction comes after 1 to 2 session lengths,
-# and a resume into a new tmux session keeps the conversation's age. Then:
-#   1. near the end of that session window (handoff_before_reset_min before the session reset, or
-#      once the session is at session_stop_pct; with a fill-up planned, inside the fill-up message)
-#      the watcher types the save prompt (prompts/session_end_save.md) into the session: commit,
-#      write a structured hand-off to the DB (afclaude_handoff / tasks.py handoff write);
-#   2. the next start that continues it in its live tmux session (window-start, postponed start,
-#      last-stretch slot) first sends `/compact <prompts/compact.md>`, waits for the compaction in
-#      the transcript (a compact_boundary / isCompactSummary entry), then sends the continue message
-#      with the latest unconsumed hand-off inserted (prompts/compact_resume*.md) and consumes it.
+# The trigger is algorithmic (D-191, D-218): at a start, a session is due for compaction if its
+# conversation already ran before the session window that ended at this start began, i.e. the
+# first entry of its transcript (~/.claude/projects/<cwd>/<id>.jsonl, which a --resume keeps
+# appending to) is older than that window's start. So the first compaction comes after 1 to 2
+# session lengths, and a resume into a new tmux session keeps the conversation's age. A start that
+# continues the session in its live tmux session (window-start, postponed start, last-stretch slot;
+# never a fill-up) then, once the session's turn has ended:
+#   1. types the save prompt (prompts/session_end_save.md) and waits for the session's NEW hand-off
+#      in the DB (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is
+#      written directly before the compaction (D-233), so it also holds the owner's interactive
+#      chats since the last run (there is no end-of-window save prompt any more);
+#   2. sends `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
+#      compact_boundary / isCompactSummary entry);
+#   3. sends the continue message with that hand-off inserted (prompts/compact_resume.md) and
+#      consumes it. Without a new hand-off (timeout, no reply, send failure) it still compacts (the
+#      session must go on), but never injects an older hand-off silently: one written before the
+#      session's last activity goes in with the stale label (compact_resume_stale.md), and a
+#      WARNING goes to the log and the progress doc.
 
-HANDOFF_FILE = os.path.join(STATE_DIR, "keepalive_handoff.json")   # {"saves": {save key: record}}
 COMPACT_TOLERANCE = timedelta(minutes=15)   # a conversation begun this little before the window
                                             # start (an early start, clock skew) counts as begun in it
 COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction, then continue anyway
 COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
 COMPACT_POLL = 10                           # seconds
-SAVE_MIN_LEFT = timedelta(minutes=1)        # no save prompt this close to the session reset
+SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt
 TASKS_PY = os.path.join(HERE, "tasks.py")
-_SAVE_LINE = None
 
 
 def compaction_rule(first_activity, window_start):
@@ -1890,8 +1885,7 @@ def conversation_started(session_id, path=None):
 
 
 def _compaction_settings():
-    return afclaude_config.settings("compaction_enabled", "handoff_before_reset_min", "session_stop_pct",
-                                    "automation_paused")
+    return afclaude_config.settings("compaction_enabled")
 
 
 def compaction_plan(sid, start_at):
@@ -1956,18 +1950,30 @@ def compact_command():
     return "/compact " + " ".join(load_prompt("compact").split())
 
 
+def wait_idle(path):
+    """Wait up to COMPACT_IDLE_WAIT for the session to finish its turn. -> True (idle) / False."""
+    deadline = time.time() + COMPACT_IDLE_WAIT.total_seconds()
+    while not session_idle(path):
+        if time.time() >= deadline:
+            return False
+        time.sleep(COMPACT_POLL)
+    return True
+
+
+def compaction_busy(sid, what):
+    """The session was still mid-turn after COMPACT_IDLE_WAIT: no compaction at this start."""
+    log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT} ({what}); not compacted at this start")
+    progress_note(f"compaction of {sid[:8]} skipped: the session was still mid-turn (D-191/D-218 apply again "
+                  "at the next start)")
+    return {"status": "busy"}
+
+
 def compact_session(sid, cwd, path):
     """Send /compact into our live tmux session and wait until the transcript shows it finished.
     -> dict status: compacted | timeout (continue anyway) | busy (still mid-turn after
     COMPACT_IDLE_WAIT: not compacted this time) | send-failed."""
-    deadline = time.time() + COMPACT_IDLE_WAIT.total_seconds()
-    while not session_idle(path):
-        if time.time() >= deadline:
-            log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT}; not compacted at this start")
-            progress_note(f"compaction of {sid[:8]} skipped: the session was still mid-turn (D-191/D-218 apply again "
-                          "at the next start)")
-            return {"status": "busy"}
-        time.sleep(COMPACT_POLL)
+    if not wait_idle(path):
+        return compaction_busy(sid, "before /compact")
     since = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, compact_command(), "send-keys")
     log(f"compaction: sent /compact to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
@@ -1988,11 +1994,117 @@ def compact_session(sid, cwd, path):
         time.sleep(COMPACT_POLL)
 
 
-def compact_resume_text(sid):
-    """The text inserted into the continue message after a compaction: the session's latest
-    unconsumed hand-off (DB), or the no-hand-off note. A DB problem never stops the continue.
-    -> (text, hand-off row or None)."""
+def _entry_ts(e, key="timestamp"):
+    try:
+        ts = parse_ts((e or {}).get(key))
+    except (AttributeError, ValueError):
+        return None
+    return ts.replace(tzinfo=UTC) if ts and not ts.tzinfo else ts
+
+
+def last_activity(path):
+    """When the session was last active: the timestamp of its transcript's last user/assistant
+    entry (interactive chats included). Read before the save prompt, so the save turn itself never
+    counts. None if unknown."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return _entry_ts(last_message(path))
+    except OSError:
+        return None
+
+
+def replied_since(path, since):
+    """The session answered a message typed at `since` and finished that turn (idle again)."""
+    last = last_message(path) if path and os.path.exists(path) else None
+    ts = _entry_ts(last)
+    return bool(last and last.get("type") == "assistant" and ts and ts >= since - timedelta(seconds=5)
+                and session_idle(path))
+
+
+def newest_handoff_id(sid):
+    """The id of the session's newest hand-off, consumed or not (0: none). A DB problem raises."""
     import store
+    conn = store.connect()
+    try:
+        h = store.latest_handoff(conn, sid, unconsumed=False)
+    finally:
+        conn.close()
+    return h["id"] if h else 0
+
+
+def save_text(sid):
+    return " ".join(load_prompt("session_end_save").format(session=sid, tasks=TASKS_PY).split())
+
+
+SAVE_WHY = {   # why there is no new hand-off: the continue message and the warning say it
+    "timeout": f"none arrived within {SAVE_TIMEOUT.total_seconds() / 60:g} min of the save prompt",
+    "no-handoff": "the session answered the save prompt without writing one",
+    "send-failed": "the save prompt could not be sent",
+    "db-error": "the hand-offs could not be read, so no save prompt was sent",
+    "error": "the save step failed",
+}
+
+
+def save_before_compaction(sid, cwd, path):
+    """D-233: the hand-off is written directly before the compaction. Wait until the session's turn
+    ended (else busy: no save and no compaction at this start), type the save prompt, then wait for
+    a new hand-off row of the session (up to SAVE_TIMEOUT; given up early once the session answered
+    and went idle without one). -> dict status: saved (+ handoff_id) | busy | db-error |
+    send-failed | no-handoff | timeout, active (the session's last activity before the save
+    prompt, for the stale label), sent_at."""
+    out = {"active": last_activity(path)}
+    if not wait_idle(path):
+        return dict(out, status="busy")
+    try:
+        before = newest_handoff_id(sid)
+    except Exception as e:   # noqa: BLE001 - no save; the compaction still goes on (the stale label applies)
+        log(f"compaction: {sid[:8]}'s hand-offs unreadable ({type(e).__name__}: {e}); no save prompt")
+        return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
+    since = datetime.now(UTC)
+    rc, o, err = fire(sid, cwd, save_text(sid), "send-keys")
+    log(f"compaction: sent the save prompt to {sid[:8]} rc={rc} stdout={o.strip()!r} stderr={err.strip()!r}")
+    out["sent_at"] = since
+    if rc != 0:
+        alert(f"keep-alive could not send the save prompt to {sid[:8]}", f"rc={rc} {err.strip()[:300]}")
+        return dict(out, status="send-failed", rc=rc)
+    deadline = time.time() + SAVE_TIMEOUT.total_seconds()
+    db_error = None
+    while True:
+        done = replied_since(path, since)   # before the DB read: the row is written before the reply
+        try:
+            newest = newest_handoff_id(sid)
+        except Exception as e:   # noqa: BLE001 - keep waiting; logged once
+            newest = before
+            if db_error is None:
+                db_error = f"{type(e).__name__}: {e}"
+                log(f"compaction: {sid[:8]}'s hand-offs unreadable while waiting for the save ({db_error})")
+        if newest > before:
+            log(f"compaction: {sid[:8]} saved hand-off #{newest} right before the compaction (D-233)")
+            return dict(out, status="saved", handoff_id=newest)
+        if done:
+            return dict(out, status="no-handoff")
+        if time.time() >= deadline:
+            return dict(out, status="timeout")
+        time.sleep(COMPACT_POLL)
+
+
+def _handoff_warning(line):
+    log(f"WARNING: {line}")
+    progress_note(f"WARNING: {line}")
+
+
+def compact_resume_text(sid, save=None):
+    """The text inserted into the continue message after a compaction -> (text, hand-off row or
+    None). The session's latest unconsumed hand-off, normally the one the save right before this
+    compaction wrote (`save`: save_before_compaction's result; compact_resume.md). Without a new
+    one, an older hand-off written before the session's last activity goes in with the stale label
+    (compact_resume_stale.md) and a WARNING (log + progress note), never silently; none at all:
+    compact_resume_none.md (+ the warning). A DB problem never stops the continue."""
+    import store
+    save = save or {}
+    status = save.get("status")
+    why = SAVE_WHY.get(status, f"save step: {status}")
     try:
         conn = store.connect()
         try:
@@ -2003,9 +2115,24 @@ def compact_resume_text(sid):
         log(f"hand-off not read: {type(e).__name__}: {e}")
         return load_prompt("compact_resume_none").format(
             why=f"it could not be read: database problem, {type(e).__name__}", progress=PROGRESS_FILE), None
+    if status == "saved" and h is not None and h["id"] >= int(save.get("handoff_id") or 0):
+        return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
     if h is None:
-        return load_prompt("compact_resume_none").format(why="none was saved", progress=PROGRESS_FILE), None
-    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
+        if status != "saved":
+            _handoff_warning(f"{sid[:8]} compacted without a hand-off: {why}")
+        return load_prompt("compact_resume_none").format(
+            why="none was saved" + (f": {why}" if status != "saved" else ""), progress=PROGRESS_FILE), None
+    active, written = save.get("active"), _entry_ts(h, "created_at")
+    if active is not None and written is not None and written >= active:
+        log(f"compaction: no new hand-off from {sid[:8]} ({why}), but #{h['id']} (written {berlin(written)}) "
+            f"is newer than the session's last activity ({berlin(active)}): injected as is")
+        return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
+    w = berlin(written) if written else str(h.get("created_at"))
+    a = berlin(active) if active else "an unknown time"
+    _handoff_warning(f"{sid[:8]} compacted without a fresh hand-off ({why}): injected the older hand-off "
+                     f"#{h['id']} labelled stale (written {w}, the session was active until {a})")
+    return load_prompt("compact_resume_stale").format(
+        why=why, written=w, active=a, handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
 
 
 def consume_handoff(h, start_key):
@@ -2023,125 +2150,6 @@ def consume_handoff(h, start_key):
     except Exception as e:   # noqa: BLE001 - it was sent; a later start would only repeat it
         log(f"hand-off #{h.get('id')} not marked consumed: {type(e).__name__}: {e}")
         return False
-
-
-def load_handoff_state():
-    return runner_state.load("keepalive.handoff", HANDOFF_FILE)   # the DB (D-161)
-
-
-def save_key(reset):
-    """Dedup key of the save prompt: one per session window (per session reset)."""
-    import fillup
-    return "handoff-save-" + fillup.round_reset(reset).isoformat()
-
-
-def note_save(key, rec):
-    d = load_handoff_state()
-    saves = d.setdefault("saves", {})
-    saves[key] = rec
-    for k in sorted(saves, key=lambda k: str(saves[k].get("at")))[:-20]:   # keep the last 20
-        saves.pop(k, None)
-    runner_state.save("keepalive.handoff", d, HANDOFF_FILE)
-
-
-def save_text(sid, reset):
-    return " ".join(load_prompt("session_end_save").format(
-        reset=reset.astimezone(BERLIN).strftime("%H:%M %Z"), session=sid, tasks=TASKS_PY).split())
-
-
-def save_due(sid, reset):
-    """Does the save prompt apply to the session window ending at `reset`? Compaction on, not
-    sent for this window yet, and D-191/D-218: the conversation already ran before this window
-    began (so the next start compacts it). -> (bool, why)."""
-    if not _compaction_settings()["compaction_enabled"]:
-        return False, "compaction_enabled is off"
-    if save_key(reset) in (load_handoff_state().get("saves") or {}):
-        return False, "already handled for this session window"
-    first = conversation_started(sid)
-    if first is None:
-        return False, "conversation start unknown (no transcript)"
-    if not compaction_rule(first, reset - afclaude_config.SESSION_LENGTH):
-        return False, (f"conversation since {berlin(first)}, inside this session window: no compaction next "
-                       "(D-191/D-218)")
-    return True, f"conversation since {berlin(first)}: compaction at the next start (D-191/D-218)"
-
-
-def fillup_planned(reset):
-    """A fill-up (D-212) is planned for the session window ending at `reset` (the watcher's current
-    plan, fillup_pass): then the save prompt goes into the fill-up message instead."""
-    import fillup
-    p = load_fillup().get("plan") or {}
-    return p.get("key") == fillup.key(reset) and p.get("status") in ("wait", "hold", "fire")
-
-
-def _save_log(line):
-    global _SAVE_LINE
-    if line != _SAVE_LINE:
-        log(line)
-        _SAVE_LINE = line
-
-
-def handoff_save_pass(sid, now, args):
-    """Once per watcher minute: the save prompt before a compaction (D-144/D-191), once per session
-    window (dedup key handoff-save-<reset>), only into a live tmux session of ours that will be
-    compacted at the next start, only in a session window an AFClaude run used. Due at the session
-    reset - handoff_before_reset_min, or once the session is at session_stop_pct, whichever comes
-    first; while a fill-up is planned for the window, the fill-up message carries it instead
-    (_fire_fillup). -> a short status (tests, logs)."""
-    import fillup
-    s = _compaction_settings()
-    if not s["compaction_enabled"]:
-        return "off"
-    sess = (read_usage_cache() or {}).get("session") or {}
-    reset, pct = sess.get("resets_at"), sess.get("percent")
-    if not reset or reset <= now:
-        return "no session window"
-    key = save_key(reset)
-    if key in (load_handoff_state().get("saves") or {}):
-        return "done"
-    if fillup.window_run(load_state().get("handled") or {}, reset) is None:
-        return "no run in this session window"
-    stop = float(s["session_stop_pct"])
-    if now < reset - timedelta(minutes=float(s["handoff_before_reset_min"])) and (pct is None or float(pct) < stop):
-        return "wait"
-    if reset - now < SAVE_MIN_LEFT:
-        note_save(key, {"at": now.isoformat(), "result": "skipped", "why": "too close to the session reset"})
-        return "skipped"
-    if _limit_hit_in(sid, reset):
-        note_save(key, {"at": now.isoformat(), "result": "skipped", "why": "the run hit the session limit"})
-        return "skipped"
-    if s["automation_paused"]:
-        _save_log("save prompt: held (automation_paused)")
-        return "hold"
-    ok, why = save_due(sid, reset)
-    if not ok:
-        note_save(key, {"at": now.isoformat(), "result": "not-due", "why": why})
-        log(f"save prompt for the session window resetting {berlin(reset)}: not sent, {why}")
-        return "not-due"
-    if fillup_planned(reset):
-        _save_log(f"save prompt for the session window resetting {berlin(reset)}: goes with the planned fill-up")
-        return "with-fillup"
-    ok, problems, plan = preflight(sid)
-    if not ok or plan != "send-keys":
-        why = "; ".join(problems) if not ok else f"plan {plan} (not our live tmux session)"
-        note_save(key, {"at": now.isoformat(), "result": "skipped", "why": why})
-        log(f"save prompt for {sid[:8]}: not sent, {why}")
-        return "skipped"
-    msg = save_text(sid, reset)
-    if not args.arm:
-        log(f"WOULD SEND (dry-run) the save prompt to {sid[:8]} ({why}): {msg!r}")
-        note_save(key, {"at": now.isoformat(), "result": "dry-run", "why": why})
-        progress_note(f"DRY-RUN would have sent the compaction save prompt to {sid[:8]} ({why})")
-        return "dry-run"
-    rc, out, err = fire(sid, session_cwd(transcript_path(sid)), msg, "send-keys")
-    note_save(key, {"at": now.isoformat(), "result": "sent" if rc == 0 else "send-failed", "rc": rc, "why": why,
-                    "trigger": "session %" if pct is not None and float(pct) >= stop else "time"})
-    log(f"save prompt sent to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
-    if rc != 0:
-        alert(f"keep-alive could not send the save prompt to {sid[:8]}", f"rc={rc} {err.strip()[:300]}")
-    progress_note(f"sent the compaction save prompt to {sid[:8]} (session window resets {berlin(reset)}; {why})"
-                  if rc == 0 else f"save prompt to {sid[:8]} FAILED rc={rc}")
-    return "sent" if rc == 0 else "send-failed"
 
 
 def load_backlog():

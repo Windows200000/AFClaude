@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Offline tests for the compaction of long-running sessions (D-144, D-191, D-214; design §5.5):
-the D-191/D-218 rule (the conversation's first transcript entry before the session window), the save
-prompt at the end of a session window (timing, the fill-up merge, dedup), and the compact-then-continue
-sequence at the next start with the hand-off injected and consumed.
+"""Offline tests for the compaction of long-running sessions (D-144, D-191, D-214, D-233; design
+§5.5): the D-191/D-218 rule (the conversation's first transcript entry before the session window),
+and the save-then-compact-then-continue sequence at a start: the save prompt right before the
+/compact (D-233), the new hand-off injected and consumed, and the fallbacks (no new hand-off: an
+older one goes in labelled stale, with a warning; a busy session; DB and send failures).
 A fake tmux (fire / preflight) and a fake transcript; no real Claude, no tmux."""
 import json
 import os
@@ -26,6 +27,7 @@ L = timedelta(hours=5)
 NIGHT = datetime(2026, 10, 5, 21, 0, tzinfo=UTC)        # Mon 23:00 Berlin (CEST): the night's first start
 S2 = NIGHT + L                                          # 04:00 Berlin: the second session-window start
 RESET = S2                                              # the 23:00 run's session window resets at 04:00
+SAVE = "[keep-alive] Save your work now"
 
 
 def entry(kind, ts, **kw):
@@ -42,10 +44,10 @@ def assistant(ts, stop="end_turn", text="ok", content=None):
 
 class Env(unittest.TestCase):
     """Temp state files, transcripts root and PROGRESS.md; the keep-alive's host calls faked."""
-    NAMES = ("PROJECTS_DIR", "STATE_FILE", "PROGRESS_FILE", "FILLUP_FILE", "HANDOFF_FILE", "DEFER_FILE",
+    NAMES = ("PROJECTS_DIR", "STATE_FILE", "PROGRESS_FILE", "FILLUP_FILE", "DEFER_FILE",
              "USAGE_STATE_FILE", "alert", "fire", "preflight", "conversation_started", "read_usage_cache", "db_paused",
              "agent_entries", "_limit_hit_in", "fresh_usage", "budget_eval", "COMPACT_TIMEOUT",
-             "COMPACT_IDLE_WAIT", "COMPACT_POLL", "_fire_usage")
+             "COMPACT_IDLE_WAIT", "COMPACT_POLL", "SAVE_TIMEOUT", "_fire_usage")
 
     def setUp(self):
         testenv.clear_settings()
@@ -55,7 +57,7 @@ class Env(unittest.TestCase):
         ka.PROJECTS_DIR = d
         ka.STATE_FILE, ka.PROGRESS_FILE = os.path.join(d, "state.json"), os.path.join(d, "PROGRESS.md")
         testenv.notes_project(d)                     # the progress notes go to its doc in the DB (§7.7)
-        ka.FILLUP_FILE, ka.HANDOFF_FILE = os.path.join(d, "fillup.json"), os.path.join(d, "handoff.json")
+        ka.FILLUP_FILE = os.path.join(d, "fillup.json")
         ka.DEFER_FILE, ka.USAGE_STATE_FILE = os.path.join(d, "deferred.json"), os.path.join(d, "usage.json")
         ka.alert = lambda subject, body="": self.alerts.append(subject)
         ka.preflight = lambda sid: (True, [], "send-keys")
@@ -71,12 +73,14 @@ class Env(unittest.TestCase):
                       "resets_at": RESET + timedelta(days=3)}, "fetched_at": RESET - timedelta(minutes=3)}
         ka.read_usage_cache = lambda: self.usage
         self.compacts = True                                # the fake session compacts on /compact
+        self.saves = "write"                                # ... and answers the save prompt (see fake_fire)
+        self.save_summary = "Fresh state at the start."
         ka.fire = self.fake_fire
         self.proj = os.path.join(d, "-proj")
         os.makedirs(self.proj)
         self.path = os.path.join(self.proj, f"{SID}.jsonl")
         self.write([entry("user", NIGHT - timedelta(hours=1), message={"role": "user", "content": "go"}),
-                    assistant(NIGHT - timedelta(minutes=50), text="HANDOFF SAVED")])
+                    assistant(NIGHT - timedelta(minutes=50), text="done for now")])
         self.make_old()
 
     def tearDown(self):
@@ -103,7 +107,10 @@ class Env(unittest.TestCase):
 
     def fake_fire(self, sid, cwd, message, plan, new=False, **kw):
         """ka_resume.sh into a live tmux session: the message is typed; the fake Claude compacts on
-        /compact (a compact_boundary + summary in the same transcript) and answers anything else."""
+        /compact (a compact_boundary + summary in the same transcript), answers the save prompt as
+        self.saves says (write: a hand-off into the DB, then "HANDOFF SAVED"; silent: a reply
+        without one; hang: still working on it; ignore: nothing reaches the transcript) and answers
+        anything else. The transcript is then quiet (old mtime), so the session reads as idle."""
         self.sent.append((plan, message))
         now = datetime.now(UTC)
         if message.startswith("/compact "):
@@ -112,17 +119,32 @@ class Env(unittest.TestCase):
                                   compactMetadata={"trigger": "manual"}),
                             entry("user", now, isCompactSummary=True,
                                   message={"role": "user", "content": "This session is being continued ..."})], "a")
+        elif message.startswith(SAVE):
+            if self.saves == "ignore":
+                return 0, "sent-keys ka-abcdef01", ""
+            self.write([entry("user", now, message={"role": "user", "content": message})], "a")
+            if self.saves == "write":
+                self.handoff(self.save_summary, next_steps=["go on"])
+            if self.saves in ("write", "silent"):
+                self.write([assistant(now + timedelta(seconds=1), text="HANDOFF SAVED")], "a")
         else:
             self.write([entry("user", now, message={"role": "user", "content": message}),
                         assistant(now + timedelta(seconds=1))], "a")
+        self.make_old()
         return 0, "sent-keys ka-abcdef01", ""
 
     # ---- helpers
-    def handoff(self, summary="state", **body):
+    def handoff(self, summary="state", at=None, **body):
         conn = store.connect()
         try:
-            return actions.perform(conn, "handoff.write", {"session_id": SID, "body": dict(summary=summary, **body)},
-                                   actor="cli", via="cli")
+            h = actions.perform(conn, "handoff.write", {"session_id": SID, "body": dict(summary=summary, **body)},
+                                actor="cli", via="cli")
+            if at is not None:                               # an older hand-off (written at `at`)
+                with store.transaction(conn):
+                    conn.execute("UPDATE handoffs SET created_at=? WHERE id=?",
+                                 (at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"), h["id"]))
+                h = store.get_handoff(conn, h["id"])
+            return h
         finally:
             conn.close()
 
@@ -201,111 +223,13 @@ class Rule(unittest.TestCase):
                 ka.PROJECTS_DIR = old
 
 
-# ---------------------------------------------------------------- the save prompt (session end)
+# ---------------------------------------------------------------- no end-of-window save (D-233)
 
-class SavePrompt(Env):
-    def setUp(self):
-        super().setUp()
-        ka.save_state({"handled": {"window-start-2026-10-06": {"at": (NIGHT + timedelta(seconds=40)).isoformat(),
-                                                               "result": "continued-in-place"}}, "fires": {}})
-
-    def test_due_before_the_reset_once_per_window(self):
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=30), Armed()), "wait")
-        self.assertEqual(self.sent, [])
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=19), Armed()), "sent")
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=18), Armed()), "done")   # dedup
-        self.assertEqual(len(self.sent), 1)
-        plan, msg = self.sent[0]
-        self.assertEqual(plan, "send-keys")
-        self.assertNotIn("\n", msg)
-        for part in ("COMPACT", "afclaude_handoff", f'session "{SID}"', "tasks.py handoff write --session", SID,
-                     "HANDOFF SAVED", "04:00 CEST"):
-            self.assertIn(part, msg)
-        rec = ka.load_handoff_state()["saves"][ka.save_key(RESET)]
-        self.assertEqual((rec["result"], rec["trigger"]), ("sent", "time"))
-        self.assertIn("sent the compaction save prompt", self.progress())
-
-    def test_session_stop_pct_triggers_it_earlier(self):
-        self.usage["session"]["percent"] = 95.0             # = session_stop_pct (default 95)
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(hours=1), Armed()), "sent")
-        self.assertEqual(ka.load_handoff_state()["saves"][ka.save_key(RESET)]["trigger"], "session %")
-        testenv.set_setting("handoff_before_reset_min", 90)
-        self.usage["session"]["resets_at"] = RESET + L      # the next window: time-triggered at reset - 90 min
-        ka.save_state({"handled": {"window-start-2026-10-06-s2": {"at": (S2 + timedelta(seconds=30)).isoformat(),
-                                                                  "result": "continued-in-place"}}, "fires": {}})
-        self.usage["session"]["percent"] = 10.0
-        self.assertEqual(ka.handoff_save_pass(SID, RESET + L - timedelta(minutes=91), Armed()), "wait")
-        self.assertEqual(ka.handoff_save_pass(SID, RESET + L - timedelta(minutes=89), Armed()), "sent")
-
-    def test_not_due_when_the_conversation_began_in_this_window(self):
-        self.first = NIGHT + timedelta(seconds=5)            # D-191/D-218: begun in this session window
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "not-due")
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=9), Armed()), "done")
-        self.assertEqual(self.sent, [])
-        self.assertIn("D-218", ka.load_handoff_state()["saves"][ka.save_key(RESET)]["why"])
-
-    def test_no_prompt_without_a_run_paused_limit_or_off(self):
-        ka.save_state({"handled": {}, "fires": {}})
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()),
-                         "no run in this session window")
-        ka.save_state({"handled": {"window-start-2026-10-06": {"at": (NIGHT + timedelta(seconds=40)).isoformat(),
-                                                               "result": "continued-in-place"}}, "fires": {}})
-        testenv.set_setting("automation_paused", True)
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "hold")
-        testenv.set_setting("automation_paused", False)
-        testenv.set_setting("compaction_enabled", False)
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "off")
-        testenv.set_setting("compaction_enabled", True)
-        ka._limit_hit_in = lambda sid, reset: True          # D-204: the run ended at the limit
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "skipped")
-        self.assertEqual(self.sent, [])
-
-    def test_only_into_our_live_tmux_session(self):
-        ka.preflight = lambda sid: (True, [], "resume")      # no tmux session: never start one for this
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "skipped")
-        self.assertEqual(self.sent, [])
-
-    def test_dry_run_only_logs(self):
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), DryRun()), "dry-run")
-        self.assertEqual(self.sent, [])
-        self.assertIn("DRY-RUN would have sent the compaction save prompt", self.progress())
-
-    def test_planned_fillup_carries_it(self):
-        """A fill-up planned for this window (D-212): the save prompt is not sent separately; it goes
-        into the fill-up message, once. If the fill-up is dropped, it is sent on its own."""
-        fk = fillup.key(RESET)
-        ka.save_fillup({"plan": {"key": fk, "status": "wait", "reason": "planned"}})
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=10), Armed()), "with-fillup")
-        self.assertEqual(self.sent, [])
-        ka.save_fillup({"plan": {"key": fk, "status": "skip", "reason": "the owner is active"}})
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=5), Armed()), "sent")
-
-    def test_fillup_message_merge_and_dedup(self):
-        seen = []
-
-        def fake_handle_fire(sid, stall, reason, st, args):
-            seen.append(stall)
-            st["handled"][stall["uuid"]] = {"at": datetime.now(UTC).isoformat(), "result": "continued-in-place"}
-            ka.save_state(st)
-        old = ka.handle_fire
-        ka.handle_fire = fake_handle_fire
-        try:
-            d = {"key": fillup.key(RESET), "reset": RESET, "remaining": 5.0, "cost": 0.7}
-            ka._fire_fillup(SID, RESET - timedelta(minutes=6), d, Armed())
-        finally:
-            ka.handle_fire = old
-        self.assertEqual(seen[0]["prompt"], "fillup")
-        self.assertIn("HANDOFF SAVED", seen[0]["insert"])
-        self.assertEqual(ka.load_handoff_state()["saves"][ka.save_key(RESET)]["result"], "merged-into-fillup")
-        self.assertEqual(ka.handoff_save_pass(SID, RESET - timedelta(minutes=5), Armed()), "done")
-        self.assertEqual(self.sent, [])
-        msg = ka.session_message("fillup", insert=seen[0]["insert"], reason="r", progress="P.md", remaining="5",
-                                 reset="04:00")
-        self.assertLess(msg.index("Fill-up run"), msg.index("HANDOFF SAVED"))
-        self.assertLess(msg.index("HANDOFF SAVED"), msg.index("Guard hooks"))
-
-    def test_fillup_without_compaction_has_no_save_text(self):
-        self.first = NIGHT + timedelta(seconds=5)
+class NoWindowEndSave(Env):
+    def test_the_watcher_and_the_fillup_send_no_save_prompt(self):
+        """D-233: the hand-off is made right before the compaction only. The watcher has no
+        end-of-window save pass any more, and a fill-up message carries no save prompt."""
+        self.assertFalse(hasattr(ka, "handoff_save_pass"))
         seen = []
         old = ka.handle_fire
         ka.handle_fire = lambda sid, stall, reason, st, args: seen.append(stall)
@@ -315,33 +239,24 @@ class SavePrompt(Env):
         finally:
             ka.handle_fire = old
         self.assertNotIn("insert", seen[0])
-        self.assertNotIn("saves", ka.load_handoff_state())
-
-    def test_watcher_survives_a_failing_save_pass(self):
-        """A broken settings read / DB problem in the save pass never takes the watcher down."""
+        self.assertNotIn("HANDOFF", json.dumps(seen[0], default=str))
         names = ("LOCK_FILE", "STOP_FILE", "last_mile_pass", "deferred_window_start_pass", "fillup_pass",
-                 "watch_run_usage", "handoff_save_pass", "log")
-        old = {n: getattr(ka, n) for n in names}
-        logs = []
+                 "watch_run_usage")
+        old_w = {n: getattr(ka, n) for n in names}
         ka.LOCK_FILE, ka.STOP_FILE = os.path.join(self.tmp.name, "ka.lock"), os.path.join(self.tmp.name, "STOP")
         ka.last_mile_pass = lambda *a: None
         ka.deferred_window_start_pass = lambda *a: None
         ka.fillup_pass = lambda *a: None
         ka.watch_run_usage = lambda *a: None
-
-        def boom(*a):
-            raise store.DBUnavailable("the database is missing", "missing")
-        ka.handoff_save_pass = boom
-        ka.log = logs.append
         try:
             ka.run(types.SimpleNamespace(session=SID, arm=True, once=True, now=False))
         finally:
-            for n, v in old.items():
+            for n, v in old_w.items():
                 setattr(ka, n, v)
-        self.assertTrue(any(ln.startswith("save-prompt pass failed: DBUnavailable") for ln in logs), logs)
+        self.assertEqual(self.sent, [])
 
 
-# ---------------------------------------------------------------- compact + resume at the next start
+# ---------------------------------------------------------------- save + compact + resume at a start
 
 class CompactAtStart(Env):
     KEY = "window-start-2026-10-07"
@@ -354,27 +269,139 @@ class CompactAtStart(Env):
         ka.handle_fire(SID, stall, "window start, CONTINUE: test", ka.load_state(), args)
         return ka.load_state()["handled"][self.KEY]
 
-    def test_compact_then_continue_with_the_handoff(self):
-        h = self.handoff("Phase 2 merged.", next_steps=["merge compaction"], open_question_ids=[12])
+    def test_save_then_compact_then_continue_with_the_fresh_handoff(self):
+        old = self.handoff("Phase 1 state.", at=NIGHT - timedelta(days=3))
+        self.save_summary = "Phase 2 merged."
         rec = self.start()
-        self.assertEqual([p for p, _ in self.sent], ["send-keys", "send-keys"])
-        compact, cont = self.sent[0][1], self.sent[1][1]
+        self.assertEqual([p for p, _ in self.sent], ["send-keys"] * 3)
+        save, compact, cont = (m for _, m in self.sent)
+        self.assertTrue(save.startswith(SAVE))
+        self.assertNotIn("\n", save)
+        for part in ("COMPACTS", "right after your reply", "afclaude_handoff", f'session "{SID}"',
+                     "tasks.py handoff write --session", "HANDOFF SAVED", "D-233"):
+            self.assertIn(part, save)
         self.assertTrue(compact.startswith("/compact Keep what the task-manager needs"))
         self.assertNotIn("\n", compact)
         self.assertTrue(cont.startswith("[keep-alive] A new run starts"))
-        for part in ("compacted at this start", f"Hand-off #{h['id']}", "Summary: Phase 2 merged.",
-                     "Next steps: (1) merge compaction", "#12", "SessionStart hook"):
+        new = self.latest(unconsumed=False)
+        for part in ("compacted at this start", f"Hand-off #{new['id']}", "Summary: Phase 2 merged.",
+                     "Next steps: (1) go on", "SessionStart hook"):
             self.assertIn(part, cont)
+        self.assertNotIn("Phase 1 state.", cont)
+        self.assertNotIn("STALE", cont)
         # the session runs in the repo (session_cwd falls back to HERE): the rules come from the
         # SessionStart hook after the compaction, the message only points at them (D-225)
         self.assertLess(cont.index("Hand-off #"), cont.index("SessionStart hook"))
         self.assertNotIn("TASK-MANAGER", cont)
         self.assertNotIn("Guard hooks", cont)
         self.assertEqual(rec["result"], "continued-in-place")
-        self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"],
-                          rec["compaction"]["handoff_consumed"]), ("compacted", h["id"], True))
-        self.assertIsNone(self.latest())                                     # consumed ...
-        self.assertEqual(self.latest(unconsumed=False)["consumed_by_start"], self.KEY)   # ... by this start
+        c = rec["compaction"]
+        self.assertEqual((c["save"]["status"], c["save"]["handoff_id"], c["status"], c["handoff_id"],
+                          c["handoff_consumed"]), ("saved", new["id"], "compacted", new["id"], True))
+        self.assertIsNone(self.latest())                                     # consumed, the older one too
+        self.assertEqual(new["consumed_by_start"], self.KEY)
+        self.assertGreater(new["id"], old["id"])
+        self.assertNotIn("WARNING", self.progress())
+
+    def test_interactive_only_window_gets_a_fresh_handoff(self):
+        """The 13.10. bug: no keep-alive run in the window before the start, only the owner's chats
+        after an old hand-off. The start still saves first, so the hand-off injected after the
+        compaction is the fresh one, never the old one."""
+        self.handoff("Old hand-off from three days ago.", at=NIGHT - timedelta(days=2))
+        day = NIGHT + timedelta(hours=14)
+        self.write([entry("user", day, message={"role": "user", "content": "owner: new decision D-x"}),
+                    assistant(day + timedelta(minutes=1), text="noted"),
+                    entry("user", day + timedelta(hours=3), message={"role": "user", "content": "owner: and this"}),
+                    assistant(day + timedelta(hours=3, minutes=1), text="done")], "a")
+        self.make_old()
+        ka.save_state({"handled": {}, "fires": {}})
+        self.save_summary = "Includes the owner's chats."
+        rec = self.start()
+        self.assertTrue(self.sent[0][1].startswith(SAVE))
+        cont = self.sent[2][1]
+        self.assertIn("Summary: Includes the owner's chats.", cont)
+        self.assertNotIn("Old hand-off", cont)
+        self.assertEqual(rec["compaction"]["save"]["status"], "saved")
+        self.assertEqual(rec["compaction"]["save"]["active"], (day + timedelta(hours=3, minutes=1)).isoformat())
+
+    def test_save_timeout_still_compacts_and_labels_the_old_handoff_stale(self):
+        """The save prompt got no hand-off (here: it never reached the session): it compacts anyway,
+        and the older hand-off goes in with the stale label, plus a WARNING in the log and the
+        progress doc."""
+        ka.SAVE_TIMEOUT = timedelta(0)
+        self.saves = "ignore"
+        old = self.handoff("Old state.", at=NIGHT - timedelta(days=2))
+        logs = []
+        old_log = ka.log
+        ka.log = logs.append
+        try:
+            rec = self.start()
+        finally:
+            ka.log = old_log
+        self.assertEqual(len(self.sent), 3)
+        self.assertTrue(self.sent[1][1].startswith("/compact "))
+        cont = self.sent[2][1]
+        for part in ("STALE", "hand-off written 2026-10-03 23:00:00 CEST",
+                     "the session was active until 2026-10-05 22:10:00 CEST",
+                     "and the decision store are newer, trust them first", f"Hand-off #{old['id']}",
+                     "Summary: Old state.", "none arrived within"):
+            self.assertIn(part, cont)
+        c = rec["compaction"]
+        self.assertEqual((c["save"]["status"], c["status"], c["handoff_id"], c["handoff_consumed"]),
+                         ("timeout", "compacted", old["id"], True))
+        self.assertTrue(any(ln.startswith("WARNING:") and "labelled stale" in ln for ln in logs), logs)
+        self.assertIn("WARNING:", self.progress())
+        self.assertIn("labelled stale", self.progress())
+
+    def test_older_handoff_newer_than_the_activity_is_not_stale(self):
+        """No new hand-off, but the latest one was written after the session's last activity: it is
+        injected as is. The save turn's own transcript entries don't count as activity."""
+        self.saves = "silent"                                  # it answered, but wrote none
+        self.handoff("Written after the last chat.", at=NIGHT - timedelta(minutes=20))
+        rec = self.start()
+        cont = self.sent[2][1]
+        self.assertIn("Summary: Written after the last chat.", cont)
+        self.assertNotIn("STALE", cont)
+        self.assertEqual(rec["compaction"]["save"]["status"], "no-handoff")
+        self.assertNotIn("WARNING", self.progress())
+
+    def test_no_handoff_at_all_says_so(self):
+        self.saves = "silent"
+        rec = self.start()
+        cont = self.sent[2][1]
+        self.assertIn("no hand-off from before the compaction (none was saved: the session answered the save "
+                      "prompt without writing one)", cont)
+        self.assertIn("PROGRESS.md", cont)
+        self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"]), ("compacted", None))
+        self.assertIn("WARNING:", self.progress())
+
+    def test_save_prompt_send_failure_still_compacts(self):
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            if message.startswith(SAVE):
+                self.sent.append((plan, message))
+                return 1, "", "no tmux session"
+            return self.fake_fire(sid, cwd, message, plan)
+        ka.fire = fire
+        self.handoff("Old state.", at=NIGHT - timedelta(days=2))
+        rec = self.start()
+        self.assertEqual(len(self.sent), 3)
+        self.assertIn("STALE", self.sent[2][1])
+        self.assertIn("the save prompt could not be sent", self.sent[2][1])
+        self.assertEqual(rec["compaction"]["save"]["status"], "send-failed")
+        self.assertTrue(any("save prompt" in a for a in self.alerts), self.alerts)
+
+    def test_save_still_running_after_the_timeout_is_not_compacted(self):
+        """The session is still working on the save at the timeout: /compact would hit a busy session,
+        so this start does not compact (as for any busy session); the old hand-off stays."""
+        ka.SAVE_TIMEOUT = timedelta(0)
+        ka.COMPACT_IDLE_WAIT = timedelta(0)
+        self.saves = "hang"
+        old = self.handoff("Old state.", at=NIGHT - timedelta(days=2))
+        rec = self.start()
+        self.assertEqual(len(self.sent), 2)                                   # the save, the continue
+        self.assertNotIn("compacted at this start", self.sent[1][1])
+        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("timeout", "busy"))
+        self.assertEqual(self.latest()["id"], old["id"])
 
     def test_session_outside_the_repo_gets_the_rules_inline(self):
         """No SessionStart hook outside the repo's root: the continue carries the full rules (D-225)."""
@@ -384,20 +411,13 @@ class CompactAtStart(Env):
             self.start()
         finally:
             ka.session_cwd = old
-        cont = self.sent[1][1]
+        cont = self.sent[2][1]
         for part in ("Guard hooks", "TASK-MANAGER", "usage_report.py", "AFK rules (unattended runs)", "--run-stopped"):
             self.assertIn(part, cont)
         self.assertNotIn("SessionStart hook;", cont)
 
-    def test_no_handoff_says_so(self):
-        rec = self.start()
-        cont = self.sent[1][1]
-        self.assertIn("no hand-off from before the compaction (none was saved)", cont)
-        self.assertIn("PROGRESS.md", cont)
-        self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"]), ("compacted", None))
-
     def test_not_due_continues_normally(self):
-        """D-191/D-218: a conversation begun at the previous start is not compacted; the hand-off stays."""
+        """D-191/D-218: a conversation begun at the previous start is neither saved nor compacted."""
         self.first = NIGHT + timedelta(days=1) - L + timedelta(seconds=5)
         self.handoff()
         rec = self.start()
@@ -418,49 +438,48 @@ class CompactAtStart(Env):
         ka.handle_fire(SID, {"uuid": "fillup-x", "timestamp": RESET, "prompt": "fillup", "budget": "b",
                              "fields": {"remaining": "5", "reset": "04:00"}}, "fill-up", ka.load_state(), Armed())
         self.assertEqual(len(self.sent), 1)
-        self.assertFalse(self.sent[0][1].startswith("/compact"))
+        self.assertFalse(self.sent[0][1].startswith(("/compact", SAVE)))
 
     def test_the_transcript_decides_and_a_resume_keeps_the_age(self):
         """D-218: the real transcript reader decides (no stub). The conversation began a night ago and
         was resumed into a new tmux session at the previous start (`claude --resume` appends to the same
-        transcript): the save prompt is due and the next start into that tmux session compacts it."""
+        transcript): the next start into that tmux session saves and compacts it."""
         ka.conversation_started = self.old["conversation_started"]
         self.write([entry("user", NIGHT - timedelta(days=1), message={"role": "user", "content": "old"}),
                     assistant(NIGHT - timedelta(days=1) + timedelta(seconds=9)),
                     entry("user", NIGHT + timedelta(seconds=30), message={"role": "user", "content": "resumed"}),
-                    assistant(NIGHT + timedelta(seconds=40), text="HANDOFF SAVED")])
+                    assistant(NIGHT + timedelta(seconds=40), text="ok")])
         self.make_old()
-        self.assertEqual(ka.save_due(SID, RESET)[0], True)
         rec = self.start(at=S2)
         self.assertTrue(rec["compaction"]["due"])
-        self.assertTrue(self.sent[0][1].startswith("/compact "))
+        self.assertTrue(self.sent[0][1].startswith(SAVE))
+        self.assertTrue(self.sent[1][1].startswith("/compact "))
         self.assertIn("conversation since", rec["compaction"]["why"])
-        # a conversation begun at 23:00 is not compacted at 04:00, and its save prompt is not due
+        # a conversation begun at 23:00 is not compacted at 04:00
         self.write([entry("user", NIGHT + timedelta(seconds=30), message={"role": "user", "content": "go"}),
                     assistant(NIGHT + timedelta(seconds=40))])
-        self.assertEqual(ka.save_due(SID, RESET)[0], False)
         self.assertFalse(ka.compaction_plan(SID, S2)["due"])
 
-    def test_timeout_continues_anyway(self):
+    def test_compaction_marker_timeout_continues_anyway(self):
         self.compacts = False
         ka.COMPACT_TIMEOUT = timedelta(0)
-        h = self.handoff()
         rec = self.start()
-        self.assertEqual(len(self.sent), 2)
-        self.assertIn(f"Hand-off #{h['id']}", self.sent[1][1])
+        self.assertEqual(len(self.sent), 3)
+        h = self.latest(unconsumed=False)
+        self.assertIn(f"Hand-off #{h['id']}", self.sent[2][1])
         self.assertEqual(rec["compaction"]["status"], "timeout")
         self.assertIn("no compaction marker", self.progress())
 
-    def test_busy_session_is_not_compacted_this_time(self):
+    def test_busy_session_is_neither_saved_nor_compacted_this_time(self):
         self.write([assistant(datetime.now(UTC), stop="tool_use",
                               content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}])], "a")
         self.make_old()
         ka.COMPACT_IDLE_WAIT = timedelta(0)
         self.handoff()
         rec = self.start()
-        self.assertEqual(len(self.sent), 1)                                   # no /compact
+        self.assertEqual(len(self.sent), 1)                                   # no save prompt, no /compact
         self.assertNotIn("compacted at this start", self.sent[0][1])
-        self.assertEqual(rec["compaction"]["status"], "busy")
+        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("busy", "busy"))
         self.assertIsNotNone(self.latest())                                   # kept for the next start
         self.assertIn("still mid-turn", self.progress())
 
@@ -476,6 +495,11 @@ class CompactAtStart(Env):
         self.assertTrue(ka.session_idle(self.path))
         self.assertTrue(ka.session_idle(None))
 
+    def test_last_activity(self):
+        self.assertEqual(ka.last_activity(self.path), NIGHT - timedelta(minutes=50))
+        self.assertIsNone(ka.last_activity(None))
+        self.assertIsNone(ka.last_activity(os.path.join(self.tmp.name, "gone.jsonl")))
+
     def test_db_error_never_stops_the_continue(self):
         h = self.handoff()
         old = store.connect
@@ -487,9 +511,10 @@ class CompactAtStart(Env):
             rec = self.start()
         finally:
             store.connect = old
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.sent), 2)                                   # no save prompt: /compact, continue
+        self.assertTrue(self.sent[0][1].startswith("/compact "))
         self.assertIn("database problem, DBUnavailable", self.sent[1][1])
-        self.assertEqual(rec["result"], "continued-in-place")
+        self.assertEqual((rec["result"], rec["compaction"]["save"]["status"]), ("continued-in-place", "db-error"))
         self.assertEqual(self.latest()["id"], h["id"])                        # not consumed
 
     def test_a_failing_compaction_never_stops_the_start(self):
@@ -498,15 +523,27 @@ class CompactAtStart(Env):
                 raise OSError("host bridge down")
             return self.fake_fire(sid, cwd, message, plan)
         ka.fire = fire
-        self.handoff()
         rec = self.start()
-        self.assertEqual(len(self.sent), 1)
-        self.assertNotIn("compacted at this start", self.sent[0][1])
+        self.assertEqual(len(self.sent), 2)                                   # the save, the continue
+        self.assertNotIn("compacted at this start", self.sent[1][1])
         self.assertEqual((rec["result"], rec["compaction"]["status"]), ("continued-in-place", "error"))
-        self.assertIsNotNone(self.latest())
+        self.assertIsNotNone(self.latest())                                   # the saved one waits
+
+    def test_a_failing_save_step_still_compacts(self):
+        old = ka.save_before_compaction
+
+        def boom(*a):
+            raise RuntimeError("unexpected")
+        ka.save_before_compaction = boom
+        try:
+            rec = self.start()
+        finally:
+            ka.save_before_compaction = old
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("none was saved: the save step failed", self.sent[1][1])
+        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("error", "compacted"))
 
     def test_consume_failure_is_logged_only(self):
-        self.handoff()
         old = store.consume_handoff
 
         def broken(*a, **k):
@@ -523,7 +560,7 @@ class CompactAtStart(Env):
         rec = self.start(args=DryRun())
         self.assertEqual(self.sent, [])
         self.assertEqual((rec["result"], rec["compaction"]["due"]), ("dry-run", True))
-        self.assertIn("after compacting it (D-191/D-218)", self.progress())
+        self.assertIn("after a save prompt and compacting it (D-191/D-218/D-233)", self.progress())
 
     def test_window_start_and_last_mile_pass_the_nominal_start(self):
         """window_start_pass gives handle_fire the session-window start (23:00 sharp, not the cron's

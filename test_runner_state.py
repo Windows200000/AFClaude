@@ -90,7 +90,7 @@ class Base(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="afclaude-runner-state-")
         self.addCleanup(shutil.rmtree, self.dir, True)
         old = (store.DB_PATH, ka.STATE_FILE, ka.DEFER_FILE, ka.FILLUP_FILE, ka.USAGE_STATE_FILE,
-               dp.STATE_FILE, dp.LOG_FILE, dp.DATA_DIR, ka.HANDOFF_FILE)
+               dp.STATE_FILE, dp.LOG_FILE, dp.DATA_DIR)
         self.addCleanup(self._restore, old)
         store.DB_PATH = os.path.join(self.dir, "afclaude.db")
         store.connect(store.DB_PATH, create=True).close()
@@ -101,14 +101,13 @@ class Base(unittest.TestCase):
         ka.STATE_FILE, ka.DEFER_FILE = os.path.join(kd, "keepalive_state.json"), os.path.join(kd, "keepalive_deferred.json")
         ka.FILLUP_FILE, ka.USAGE_STATE_FILE = (os.path.join(kd, "keepalive_fillup.json"),
                                                os.path.join(kd, "usage_refresh_state.json"))
-        ka.HANDOFF_FILE = os.path.join(kd, "keepalive_handoff.json")
         dp.DATA_DIR = self.dir
         dp.STATE_FILE, dp.LOG_FILE = os.path.join(self.dir, "dispatcher_state.json"), os.path.join(self.dir, "dispatcher.log")
 
     @staticmethod
     def _restore(old):
         (store.DB_PATH, ka.STATE_FILE, ka.DEFER_FILE, ka.FILLUP_FILE, ka.USAGE_STATE_FILE,
-         dp.STATE_FILE, dp.LOG_FILE, dp.DATA_DIR, ka.HANDOFF_FILE) = old
+         dp.STATE_FILE, dp.LOG_FILE, dp.DATA_DIR) = old
 
     def p(self, rel):
         return os.path.join(self.dir, rel)
@@ -263,7 +262,7 @@ class Importer(Base):
         self.fill()
         before = snapshot(self.dir)
         r = rs.import_all()
-        self.assertEqual([s["status"] for s in r["state"]], ["ok"] * 4 + ["no file"] + ["ok"] * 3)
+        self.assertEqual([s["status"] for s in r["state"]], ["ok"] * 7)
         self.assertEqual(r["own_sessions"]["status"], "ok")
         self.assertEqual(r["scheduled_jobs"]["status"], "ok")
         self.assertEqual({s["component"]: s["status"] for s in r["logs"]},
@@ -562,11 +561,11 @@ class Writes(Base):
                          {k: v for k, v in files.items() if "log" not in k})   # the state file untouched
 
     def test_new_component_without_a_file(self):
-        self.assertEqual(ka.load_handoff_state(), {})
-        ka.note_save("handoff-save-x", {"at": "2026-10-05T10:00:00+00:00"})
-        self.assertEqual(ka.load_handoff_state()["saves"]["handoff-save-x"]["at"], "2026-10-05T10:00:00+00:00")
-        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(ka.STATE_FILE), "keepalive_handoff.json")))
-        self.assertIsNotNone(store.get_meta(self.conn, rs.MARK + "keepalive.handoff"))
+        self.assertEqual(dict(ka.load_fillup()), {})
+        ka.save_fillup({"plan": {"key": "fillup-x"}})
+        self.assertEqual(ka.load_fillup()["plan"]["key"], "fillup-x")
+        self.assertFalse(os.path.exists(ka.FILLUP_FILE))
+        self.assertIsNotNone(store.get_meta(self.conn, rs.MARK + "keepalive.fillup"))
 
     def test_own_sessions(self):
         self.fill()
