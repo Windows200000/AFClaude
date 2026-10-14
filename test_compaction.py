@@ -729,6 +729,30 @@ class FailStopAtStart(Env):
         self.assertEqual(self.sent, [])
 
 
+class KaResumeFailures(unittest.TestCase):
+    """ka_resume.sh: a tmux call that fails exits 1 (the keep-alive sees it), never a silent
+    "sent-keys" / "started" with exit 0 (D-234/D-235). A stub tmux on PATH; nothing real runs."""
+    def run_script(self, fail_on):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            tmux = os.path.join(d, "tmux")
+            with open(tmux, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         f'case "$1" in has-session) exit {0 if fail_on.startswith("send") else 1};; esac\n'
+                         f'case "$1 $*" in *{fail_on}*) exit 1;; esac\nexit 0\n')
+            os.chmod(tmux, 0o755)
+            env = dict(os.environ, PATH=d + ":" + os.environ["PATH"], HOME=d, KA_TRUST_ROOT=d)
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ka_resume.sh")
+            return subprocess.run(["bash", script, "--session", SID, "--message", "go", "--cwd", d],
+                                  env=env, capture_output=True, text=True, timeout=60)
+
+    def test_send_keys_failure_exits_1(self):
+        r = self.run_script("send-keys")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("send-keys to ka-abcdef01 failed", r.stderr)
+        self.assertNotIn("sent-keys", r.stdout)
+
+
 class FireFailures(unittest.TestCase):
     """keepalive.fire: a take-over whose holder does not exit, a bg worker that does not stop, and
     `claude agents` failing raise instead of resuming into a fork (D-234/D-235)."""

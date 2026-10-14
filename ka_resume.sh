@@ -32,9 +32,10 @@ NAME="${NAME:-$T}"
 
 if tmux has-session -t "=$T" 2>/dev/null; then
   # "=name" (exact match) is valid for has-session but is read as a pane name by send-keys
-  tmux send-keys -t "$T" -l "$MSG"
+  # a failed send-keys is an error the caller sees (exit 1), never a silent "sent" (D-234/D-235)
+  tmux send-keys -t "$T" -l "$MSG" || { echo "send-keys to $T failed (text)" >&2; exit 1; }
   sleep 1
-  tmux send-keys -t "$T" Enter
+  tmux send-keys -t "$T" Enter || { echo "send-keys to $T failed (Enter)" >&2; exit 1; }
   echo "sent-keys $T"
   exit 0
 fi
@@ -89,5 +90,5 @@ mkdir -p "$DIR/run"
   echo
 } >"$RUN"
 chmod 700 "$RUN"
-tmux new-session -d -s "$T" -x 220 -y 50 "bash $(printf %q "$RUN")"
+tmux new-session -d -s "$T" -x 220 -y 50 "bash $(printf %q "$RUN")" || { echo "tmux new-session $T failed" >&2; exit 1; }
 echo "started $T"
