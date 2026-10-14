@@ -23,6 +23,9 @@ Every prompt AFClaude sends lives here, so the dashboard can show and edit them 
 | `stage_eta_review.md` | appended to `usage_review.md` in the same monthly run (usage_review.py): the rare stage-ETA review (D-213) that scores the logged stage ETAs (`stage_eta.py --score`) and tunes the stages' session estimates only (D-142 analogue) | `{date}` |
 | `stage_eta_review_once.md` | a one-off stage-ETA review outside the monthly schedule (`usage_review.py --only stage-eta`, D-220/D-221), with its own extra brief instead of `stage_eta_review.md` | `{date}` |
 | `stage_eta_review_once_after_usage.md` | inserted ahead of `stage_eta_review_once.md` only for the chained one-off (`usage_review.py --only usage,stage-eta`, D-228): points the ETA review at the SEPARATE one-off usage review session's result instead of re-deriving it | `{report}` |
+| `inbox_triage.md` | D-241: Haiku sorts an owner message from the dashboard's message box (inbox_worker.py): `now` (needs a direct response) or `note` (waits for the next start); JSON answer | `{text}` |
+| `inbox_now.md` | D-241/D-186: a "now" message typed into the task-manager at once (inbox_worker.py), with its id (`[AFClaude inbox #id]`, checked in the transcript) and how to answer (`tasks.py inbox reply`); a resumed session also gets the standing rules / the hook pointer | `{id}`, `{at}`, `{text}`, `{notes}` |
+| `inbox_notes.md` | D-241: the noted owner messages, verbatim, appended to the next message into the task-manager (a start's continue / fill-up, the post-compaction message in `{resume}`, a "now" message's `{notes}`); they are then marked included | `{notes}` |
 | `usage_haiku.md` | per-session usage classification by Haiku (usage_sampler.py) | `{name}`, `{n}`, `{prompts}`, `{gaps}`, `{totals}` |
 
 Session messages are flattened to one line (tmux send-keys). Literal braces in a file with placeholders must be doubled (`{{ }}`).

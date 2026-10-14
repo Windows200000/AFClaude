@@ -16,7 +16,8 @@ serves at /afclaude/:
                 logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
-                inbox), AFClaude cron entries, the task-manager's context (D-237:
+                inbox), the owner's message box to the task-manager (counts only:
+                the page reads the messages from the inbox API, D-241), AFClaude cron entries, the task-manager's context (D-237:
                 size, cache expiry, the next re-read's cost, per owner message re-read
                 yes/no and est. cost without its text, a daily split; the compaction
                 attempts of D-238; compact_timing.context_block)
@@ -313,6 +314,20 @@ def needs_input():
             "error": err,
             # user rule 29.09.: only real questions + blocked tasks; stalled sessions are not shown here
             "count": len(open_questions) + len(blocked)}
+
+
+def inbox_block():
+    """The owner's message box (D-178/D-241): only the counts. The page reads the messages live from
+    the inbox API (/afclaude/api/inbox, inbox_api.py); their texts stay in the DB, the only copy."""
+    try:
+        import inbox
+        conn = store.connect()
+        try:
+            return inbox.summary(conn)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - shown on the page, never breaks the export
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
 
 
 def automation_block():
@@ -769,6 +784,7 @@ def main():
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),
+        "inbox": inbox_block(),
         "cron": cron_entries(),
         "docs": docs,
         "prompts": prompts,

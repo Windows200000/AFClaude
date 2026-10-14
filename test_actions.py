@@ -477,7 +477,8 @@ class SessionActions(Base):
 
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
-                  "setting.import", "automation.set", "window.set", "prompt.set", "prompt.reset", "request.add"}
+                  "setting.import", "automation.set", "window.set", "prompt.set", "prompt.reset", "request.add",
+                  "inbox.post", "inbox.retry"}
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -528,7 +529,7 @@ class SettingActions(Base):
                           "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": True,
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
-                          "compaction_enabled": True,
+                          "compaction_enabled": True, "ui_chat_reset_hours": 5.0,
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
@@ -978,6 +979,17 @@ class EveryAction(Base):
             ("doc.append", {"project": "P", "name": "progress", "text": "- x\n"}),
             ("doc.set", {"project": "P", "name": "goals", "text": "g\n"}),
             ("doc.sync", {"project": "P", "name": "progress", "text": "- x\n- y\n"}),
+            ("inbox.post", {"text": "q?", "session_id": SID}),
+            ("inbox.triage", {"message_id": 1, "verdict": "now", "reason": "a question"}),
+            ("inbox.hold", {"message_id": 1, "reason": "the owner is typing"}),
+            ("inbox.deliver", {"message_id": 1, "plan": "send-keys"}),
+            ("inbox.reply", {"message_id": 1, "answer": "a"}),
+            ("inbox.post", {"text": "a note", "session_id": SID}),
+            ("inbox.triage", {"message_id": 2, "verdict": "note", "reason": "later"}),
+            ("inbox.include", {"message_ids": [2], "by": "window-start-2026-10-09"}),
+            ("inbox.post", {"text": "x", "session_id": SID}),
+            ("inbox.fail", {"message_id": 3, "error": "Haiku timed out"}),
+            ("inbox.retry", {"message_id": 3}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):

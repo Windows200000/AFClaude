@@ -1,0 +1,1 @@
+[AFClaude inbox #{id}] The owner wrote this on the dashboard ({at}) and wants a direct response: "{text}" Answer with `python3 tasks.py inbox reply {id} "<your answer>"` (the owner reads it on the dashboard) and act on it if it asks for something. {notes}

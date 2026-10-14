@@ -31,6 +31,8 @@ services:
       - ${HOST_HOME}/.claude/sessions:/home/opc/.claude/sessions:ro
       - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro
       - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
+      # the quickview key: inbox_api.py checks it on every request too (D-150/D-241)
+      - ${HOST_HOME}/.config/afclaude/quickview.key:/run/secrets/afclaude_quickview.key:ro
     read_only: true
     tmpfs:
       - /tmp:exec,mode=1777          # exec: the unit tests put stub binaries in temp dirs

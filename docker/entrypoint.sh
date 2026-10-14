@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entrypoint of the AFClaude manager container (PID 1 is tini).
-#   AFCLAUDE_SCHEDULER=on   supercronic runs docker/crontab and the keep-alive watcher starts
+#   AFCLAUDE_SCHEDULER=on   supercronic runs docker/crontab, the keep-alive watcher and the inbox API start
 #   AFCLAUDE_SCHEDULER=off  (default) nothing is scheduled; the container only idles, so
 #                           `docker exec` works (tests, the MCP server, manual runs)
 set -eu
@@ -25,6 +25,10 @@ case "${AFCLAUDE_SCHEDULER:-off}" in
     # only at the next :07/:22/:37/:52 watchdog: retried until it runs (the bridge may need a
     # moment after a rebuild), never while PAUSED exists, never a second one (start_watcher.sh).
     "$D/docker/start_watcher.sh" --boot &
+    # The message box's API (D-241): a unix socket in data/api/ for the quickview's nginx; the cron
+    # watchdog restarts it (and alerts) if it dies.
+    python3 "$D/inbox_api.py" ensure --boot >>"$D/data/inbox_api.log" 2>&1 \
+      || echo "afclaude: the inbox API did not start (see data/inbox_api.log)" >&2
     exec /usr/local/bin/supercronic -passthrough-logs "${AFCLAUDE_CRONTAB:-$D/docker/crontab}"
     ;;
   off)
