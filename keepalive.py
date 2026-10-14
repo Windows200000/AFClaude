@@ -2300,7 +2300,14 @@ def consume_handoff(h, start_key):
 
 _ANSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b[()][A-Za-z0-9]|\x1b[=>]")
 PROMPT_GLYPHS = ("❯", ">")
-RULE_CHARS = set("─╭╮╰╯")
+# A horizontal rule or a box border, optionally with a title in it (the input box's top border
+# carries the session's name: "──── my session ─"): starts and ends with rule characters.
+_RULE = re.compile(r"[─╭╰]+(?: .*? )?[─╮╯]+")
+# A dialog or a menu in place of the input box: its key hints ("Enter to confirm · Esc to cancel",
+# "↑/↓ to navigate") or a numbered option under the cursor ("❯ 1. Yes"). Not the footer's own hints
+# ("esc to interrupt", "esc to clear input").
+_DIALOG = re.compile(r"\b(?:esc|enter|return|space|tab) to (?:cancel|confirm|select|continue|go back|close|exit"
+                     r"|quit|dismiss|skip|deny|toggle|navigate)\b|↑\s*/?\s*↓ to |^\s*[❯>›]\s*\d+\.", re.I)
 
 
 def _plain(line):
@@ -2329,20 +2336,24 @@ def _sgr(params, dim, inverse):
     return dim, inverse
 
 
+def _is_rule(line):
+    p = _plain(line).strip()
+    return len(p) >= 10 and sum(ch in "─╭╮╰╯" for ch in p) >= 10 and _RULE.fullmatch(p) is not None
+
+
 def pane_input(text):
     """The input box of a Claude Code pane capture (tmux capture-pane -e -p): the lines between the
-    last two horizontal rules, the first one starting with the prompt glyph. -> (found, typed):
-    typed = the characters shown in normal video after the glyph (a dimmed suggestion or
-    placeholder, the inverse-video cursor, spaces and the box's borders don't count); found False
-    when the pane shows no input box (a dialog or a menu is open)."""
+    last two horizontal rules (the top one may carry a title), the first one starting with the
+    prompt glyph. -> (kind, typed): kind "box" with typed = the characters shown in normal video
+    after the glyph (a dimmed suggestion or placeholder, the inverse-video cursor, spaces and the
+    box's borders don't count); "dialog" when a dialog or a menu is open in its place; None when
+    the pane shows neither (not a Claude Code screen this parser knows: owner_typing raises)."""
     lines = text.split("\n")
-    rules = [i for i, ln in enumerate(lines)
-             if len(_plain(ln).strip()) >= 10 and set(_plain(ln).strip()) <= RULE_CHARS]
-    if len(rules) < 2:
-        return False, ""
-    region = lines[rules[-2] + 1:rules[-1]]
+    rules = [i for i, ln in enumerate(lines) if _is_rule(ln)]
+    region = lines[rules[-2] + 1:rules[-1]] if len(rules) >= 2 else []
     if not region or not _plain(region[0]).strip().lstrip("│").lstrip().startswith(PROMPT_GLYPHS):
-        return False, ""
+        tail = lines[rules[-min(2, len(rules))] + 1:] if rules else lines[-15:]   # the dialog, not the chat
+        return ("dialog" if any(_DIALOG.search(_plain(ln)) for ln in tail) else None), ""
     typed, dim, inverse = [], False, False
     for n, ln in enumerate(region):
         glyph = n == 0
@@ -2360,13 +2371,14 @@ def pane_input(text):
             if m.group(2) == "m":
                 dim, inverse = _sgr(m.group(1), dim, inverse)
             pos = m.end()
-    return True, "".join(typed)
+    return "box", "".join(typed)
 
 
 def owner_typing(sid, now):
     """Why the owner may be typing into the session's tmux pane right now, or None: an attached
-    terminal with keystrokes in the last OWNER_QUIET, a draft in the input box, or no input box on
-    the pane (a dialog or menu is open). A failed tmux call raises (compaction_pass: an error)."""
+    terminal with keystrokes in the last OWNER_QUIET, a draft in the input box, or a dialog or menu
+    open in its place. A failed tmux call or a pane that shows neither the input box nor a dialog
+    (pane_input can't read it) raises (compaction_pass: an error, D-235)."""
     t = tmux_name(sid)
     r = host.run_on_host(["tmux", "list-clients", "-t", "=" + t, "-F", "#{client_activity}"], timeout=30)
     if r.returncode != 0:
@@ -2377,9 +2389,13 @@ def owner_typing(sid, now):
     r = host.run_on_host(["tmux", "capture-pane", "-e", "-p", "-t", f"={t}:"], timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"tmux capture-pane {t} failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
-    found, typed = pane_input(r.stdout)
-    if not found:
-        return f"no input box on {t}'s pane (a dialog or menu is open)"
+    kind, typed = pane_input(r.stdout)
+    if kind is None:
+        tail = [_plain(ln).strip() for ln in r.stdout.split("\n") if _plain(ln).strip()][-3:]
+        raise RuntimeError(f"can't read {t}'s pane: neither Claude Code's input box nor a dialog or menu "
+                           f"(last lines: {' | '.join(x[:80] for x in tail) or 'none'})")
+    if kind == "dialog":
+        return f"a dialog or menu is open on {t}'s pane"
     if typed:
         return f"a draft in {t}'s input box ({len(typed)} characters)"
     return None

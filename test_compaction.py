@@ -673,17 +673,54 @@ CAPTURE_DRAFT = ("─" * 80 + "\n"
 CAPTURE_BOX = ("╭" + "─" * 78 + "╮\n"
                "│ > \x1b[7m \x1b[0m\x1b[2mTry \"refactor\"\x1b[0m" + " " * 50 + "│\n"
                "╰" + "─" * 78 + "╯\n")
-CAPTURE_DIALOG = "Select model\n  1. Opus\n  2. Sonnet\n"
+CAPTURE_DIALOG = ("─" * 80 + "\n Select model\n ❯ 1. Opus\n   2. Sonnet\n\n"
+                  " \x1b[2mEnter to confirm · Esc to exit\x1b[0m\n")
+# A real idle task-manager pane (trimmed, Claude Code 2.1.283): the input box's top border carries
+# the session's title, an "Update installed" line above it, the agents panel below the footer.
+CAPTURE_TITLED = ("\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mWaiting for \x1b[1m1\x1b[0m\x1b[38;5;246m\x1b[49m background "
+                  "agent to finish\x1b[39m\n"
+                  "                                        \x1b[38;5;114m✔ Update installed · Restart to update\x1b[39m\n"
+                  "\x1b[38;5;244m" + "─" * 48 + " task-manager keep-alive build ─\n"
+                  "\x1b[39m❯\xa0\x1b[2mok\x1b[0m\x1b[39m\x1b[49m\n"
+                  "\x1b[38;5;244m" + "─" * 80 + "\n"
+                  "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m · \x1b[38;5;44m1 shell, 1 monitor\x1b[38;5;246m · "
+                  "← 1 agent · ↓ to manage\x1b[39m\n\n"
+                  "\x1b[1m  ● main\n"
+                  "\x1b[0m\x1b[38;5;246m\x1b[49m  ◯ afclaude-worker\x1b[39m  \x1b[38;5;246mFix input-box detection\x1b[39m "
+                  "\x1b[38;5;246m3m 17s · ↓ 70.6k tokens\x1b[39m\n\n")
+CAPTURE_UNKNOWN = "Welcome back\n$ \n"
 
 
 class OwnerTyping(unittest.TestCase):
     def test_pane_input(self):
-        self.assertEqual(ka.pane_input(CAPTURE_IDLE), (True, ""))             # a dimmed suggestion
-        self.assertEqual(ka.pane_input(CAPTURE_DRAFT), (True, "pleasealsoche"))
-        self.assertEqual(ka.pane_input(CAPTURE_BOX), (True, ""))              # cursor + placeholder
-        self.assertEqual(ka.pane_input(CAPTURE_DIALOG), (False, ""))
+        self.assertEqual(ka.pane_input(CAPTURE_IDLE), ("box", ""))            # a dimmed suggestion
+        self.assertEqual(ka.pane_input(CAPTURE_DRAFT), ("box", "pleasealsoche"))
+        self.assertEqual(ka.pane_input(CAPTURE_BOX), ("box", ""))             # cursor + placeholder
+        self.assertEqual(ka.pane_input(CAPTURE_DIALOG), ("dialog", ""))
         multi = "─" * 20 + "\n❯ first line\n  second\n" + "─" * 20 + "\n"
-        self.assertEqual(ka.pane_input(multi), (True, "firstlinesecond"))
+        self.assertEqual(ka.pane_input(multi), ("box", "firstlinesecond"))
+
+    def test_a_titled_border(self):
+        """14.10.: the input box's top border carries the session's title; it was read as no input
+        box (a dialog), which held the idle compaction until the cache expired."""
+        self.assertEqual(ka.pane_input(CAPTURE_TITLED), ("box", ""))
+        draft = CAPTURE_TITLED.replace("\x1b[2mok\x1b[0m", "check the logs\x1b[7m \x1b[27m")
+        self.assertEqual(ka.pane_input(draft), ("box", "checkthelogs"))
+        left = "── my session " + "─" * 60 + "\n❯ \n" + "─" * 80 + "\n"     # a title on the left
+        self.assertEqual(ka.pane_input(left), ("box", ""))
+
+    def test_dialogs_and_unreadable_panes(self):
+        permission = ("─" * 80 + "\n Bash command\n\n   ls\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+        self.assertEqual(ka.pane_input(permission), ("dialog", ""))
+        self.assertEqual(ka.pane_input("─" * 80 + "\n Resume session\n\n ↑/↓ to navigate · esc to cancel\n"),
+                         ("dialog", ""))
+        self.assertEqual(ka.pane_input(CAPTURE_UNKNOWN), (None, ""))
+        self.assertEqual(ka.pane_input(""), (None, ""))
+        # the footer's own hints aren't a dialog; a hint far up in the chat isn't either
+        self.assertEqual(ka.pane_input("─" * 80 + "\n  ⏵⏵ auto mode on · esc to interrupt\n"), (None, ""))
+        chat = "press Esc to cancel it\n" + "─" * 80 + "\nsome text\n" + "─" * 80 + "\nmore\n" + "─" * 80 + "\nend\n"
+        self.assertEqual(ka.pane_input(chat), (None, ""))
+        self.assertEqual(ka.pane_input("── a note ──\n❯ hi\n" + "─" * 80 + "\n"), (None, ""))   # too short for a rule
 
     def run_typing(self, clients, pane, rc=0):
         calls = []
@@ -711,7 +748,11 @@ class OwnerTyping(unittest.TestCase):
         why, _ = self.run_typing(f"{int(now - 3600)}\n", CAPTURE_DRAFT)
         self.assertEqual(why, "a draft in ka-abcdef01's input box (13 characters)")
         why, _ = self.run_typing("", CAPTURE_DIALOG)
-        self.assertIn("no input box", why)
+        self.assertEqual(why, "a dialog or menu is open on ka-abcdef01's pane")
+        why, _ = self.run_typing("", CAPTURE_TITLED)
+        self.assertIsNone(why)
+        with self.assertRaisesRegex(RuntimeError, r"can't read ka-abcdef01's pane: .*\(last lines: Welcome back \| \$\)"):
+            self.run_typing("", CAPTURE_UNKNOWN)
         with self.assertRaisesRegex(RuntimeError, "tmux list-clients ka-abcdef01 failed rc=1"):
             self.run_typing("", "", rc=1)
 
