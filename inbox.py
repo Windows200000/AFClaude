@@ -14,8 +14,14 @@ The owner types a message on the temp dashboard (the quickview page); inbox_api.
         noted ones verbatim and marks them included, so the session never wakes (and re-reads
         its whole context after the cache expired, D-237/D-238) just for a note.
 
-A failed triage or delivery is an error on the message (D-235: shown on the dashboard, logged,
-alerted; never delivered silently, never dropped; the owner retries it).
+A "now" message that can't be typed in (the owner holds the session or is typing, a compaction, a
+usage limit) is held and tried again while the hold lasts, at most until the next session-window
+start (D-244, hold_deadline): that start's message takes it along (held_insert, keepalive's
+_fire_start), marked as needing an answer; still not out by then is an error.
+
+A failed triage or delivery is an error on the message (D-235/D-244: shown on the dashboard,
+logged, alerted, and automation paused until the owner clears it; never delivered silently, never
+dropped; the owner retries it).
 
 This module is the pure part (prompts, the verdict parser, the note list, the dashboard view);
 the Haiku call and the delivery are inbox_worker.py's, the HTTP endpoint is inbox_api.py's.
@@ -34,12 +40,14 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import schedule  # noqa: E402
 import store  # noqa: E402
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
 NOTE_ITEM_MAX = 1500        # characters of one noted message in a message into the session ...
 NOTES_MAX = 3000            # ... and of the whole list (the rest waits for the next message, D-225)
+HELD_MAX = 3000             # characters of the held "now" messages in a start's message (the rest: id only)
 MESSAGE_MAX_BYTES = 12000   # a message typed with tmux send-keys (its command limit is 16 KB)
 VIEW_MAX = 10               # messages on the dashboard (the current thread, D-178)
 RATE_MAX = 20               # messages per hour the endpoint takes (each costs a Haiku call)
@@ -133,6 +141,56 @@ def notes_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None,
     return prompt("inbox_notes").format(notes=" ".join(items) + more).strip(), ids
 
 
+def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, list[int]]:
+    """D-244: the "now" messages for the session still waiting for delivery (held: the owner holds
+    the session or types, a compaction, a usage limit; or not tried yet), as one line for a start's
+    message (inbox_held.md), oldest first, each with its marker and how to answer. All of them go
+    (each one owes an answer): a text is cut at NOTE_ITEM_MAX, and past HELD_MAX characters only the
+    marker and a pointer to `tasks.py inbox show` remain. -> (text, ids: mark them delivered once
+    the message went out), or (None, [])."""
+    items: list[str] = []
+    ids: list[int] = []
+    size = 0
+    for m in reversed(store.list_inbox(conn, "pending", session_id, limit=200)):
+        if m["verdict"] != "now":
+            continue
+        text = one_line(m["text"])
+        if len(text) > NOTE_ITEM_MAX:
+            text = text[:NOTE_ITEM_MAX] + f"... (cut; the full text: python3 tasks.py inbox show {m['id']})"
+        item = f"{marker(m['id'])} ({berlin(m['created_at'])}): \"{text}\""
+        if size + len(item) > HELD_MAX:
+            item = f"{marker(m['id'])} ({berlin(m['created_at'])}): (its text: python3 tasks.py inbox show {m['id']})"
+        items.append(item)
+        ids.append(m["id"])
+        size += len(item)
+    if not items:
+        return None, []
+    return prompt("inbox_held").format(held=" ".join(items)).strip(), ids
+
+
+def hold_deadline(since: datetime, cfg: schedule.Config | None = None) -> datetime | None:
+    """D-244: a "now" message held since `since` waits at most until the first session-window start
+    after it (schedule.next_session_start): that start's message takes it along, else it is an
+    error (inbox_worker.hold). None: no window at all (nothing to wait for: an error too)."""
+    return schedule.next_session_start(since, cfg)
+
+
+def hold_until(m: dict[str, Any], cfg: schedule.Config | None = None) -> datetime | None:
+    """The deadline of a held message (hold_deadline of its hold_since), else None."""
+    since = _ts(m.get("hold_since")) if m.get("hold") else None
+    return hold_deadline(since, cfg) if since is not None else None
+
+
+def seen(path: str, offset: int, mark: str) -> bool:
+    """`mark` is in what the transcript `path` got after `offset` (an unreadable file: not seen)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            return mark.encode() in fh.read()
+    except OSError:
+        return False
+
+
 def now_fields(m: dict[str, Any], notes: str | None) -> dict[str, Any]:
     """The placeholders of inbox_now.md for message m (+ the noted ones going along)."""
     return {"id": m["id"], "at": berlin(m["created_at"]), "text": one_line(m["text"]), "notes": notes or ""}
@@ -185,18 +243,23 @@ def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[s
     return sorted(out, key=lambda m: m["id"])
 
 
-def message_view(m: dict[str, Any]) -> dict[str, Any]:
+def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[str, Any]:
+    until = hold_until(m, cfg) if m["status"] == "pending" else None
     return {"id": m["id"], "at": m["created_at"], "at_berlin": berlin(m["created_at"], "%a %d.%m. %H:%M"),
             "text": m["text"], "status": m["status"], "verdict": m["verdict"],
             "verdict_reason": m["verdict_reason"], "hold": m["hold"],
-            "hold_since_berlin": berlin(m["hold_since"]), "delivered_berlin": berlin(m["delivered_at"]),
+            "hold_since_berlin": berlin(m["hold_since"]),
+            "hold_until_berlin": until.astimezone(BERLIN).strftime("%a %d.%m. %H:%M") if until else None,
+            "delivered_berlin": berlin(m["delivered_at"]),
             "included_berlin": berlin(m["included_at"]), "answer": m["answer"],
             "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
 
 
 def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
     """What the page shows: the current thread with each message's verdict, status and answer."""
-    return {"messages": [message_view(m) for m in thread(conn, now)],
+    ms = thread(conn, now)
+    cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
+    return {"messages": [message_view(m, cfg) for m in ms],
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}
 
 

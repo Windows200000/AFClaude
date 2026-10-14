@@ -545,7 +545,9 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     if (m.status === "noted") return "noted for the next session";
     if (m.status === "delivered") return "delivered " + esc(m.delivered_berlin || "") + ", waiting for the answer";
     if (!m.verdict) return "sorting…";
-    return m.hold ? '<span class="warn">waiting</span>: ' + esc(m.hold) : "sending…";
+    if (!m.hold) return "sending…";
+    return '<span class="warn">waiting</span>: ' + esc(m.hold) +
+      (m.hold_until_berlin ? "; held until the window start " + esc(m.hold_until_berlin) + " (it goes out with that start, else an error)" : "");
   }
   function renderMessages(box) {
     var ms = box.messages || [];
