@@ -28,11 +28,14 @@ the session's transcript within VERIFY_TIMEOUT, else error.
 Every failure (the triage call, a refused preflight, a failed send, no trace in the transcript, a
 missed hold deadline, a DB failure, a failed pass) is an error on the message where there is one
 (inbox.fail: shown on the dashboard until the owner retries it), an ERROR log line, an alert and
-automation paused (D-244: failstop.fail with the pause, until the owner clears it with `tasks.py
-automation resume`). The pause is install-wide (automation_paused has no project scope; today
-AFClaude is the only project). It does not stop the inbox itself: "now" messages are still
-delivered while paused (the owner's own message is no automation), but no start runs, so a held one
-reaches its deadline without a start to take it along and turns into an error.
+automation paused (D-244: failstop.fail with the pause, until the owner clears it). An error about
+a message pauses only the project the message was for (the project its session is the task-manager
+of; `tasks.py automation resume --project NAME` clears it); one that is about no message (a failed
+pass, the delivery check failing to read the DB) or whose session manages no project pauses
+everything (`tasks.py automation resume`). It does not stop the inbox itself: "now" messages are
+still delivered while paused (the owner's own message is no automation), but no start of that
+project runs, so a held one reaches its deadline without a start to take it along and turns into
+an error.
 """
 from __future__ import annotations
 
@@ -77,18 +80,20 @@ def _act(conn: Any, name: str, **params: Any) -> Any:
     return actions.perform(conn, name, params, actor=ACTOR, via="runner")
 
 
-def fail_stop(subject: str, detail: str) -> None:
-    """An inbox error (D-235/D-244): an ERROR log line, an alert and automation paused (failstop)."""
-    failstop.fail("inbox", subject, detail, log=log)
+def fail_stop(subject: str, detail: str, session: str | None = None) -> None:
+    """An inbox error (D-235/D-244): an ERROR log line, an alert and automation paused (failstop):
+    with `session` (the message's) only the project that session is the task-manager of, else
+    everything."""
+    failstop.fail("inbox", subject, detail, log=log, session=session)
 
 
 def failed(conn: Any, m: dict[str, Any], subject: str, detail: str) -> None:
-    """The message failed (D-235/D-244): error on it, then fail_stop(). Never raises."""
+    """The message failed (D-235/D-244): error on it, then fail_stop() for its project. Never raises."""
     try:
         _act(conn, "inbox.fail", message_id=m["id"], error=f"{subject}: {detail}")
     except Exception as e:   # noqa: BLE001 - reported with the alert below
         detail += f" (and the error could not be stored on the message: {type(e).__name__}: {e})"
-    fail_stop(subject, f"message #{m['id']}: {detail}")
+    fail_stop(subject, f"message #{m['id']}: {detail}", session=m["session_id"])
 
 
 # ---------------------------------------------------------------- triage
@@ -231,7 +236,7 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
                 _act(conn, "inbox.include", message_ids=ids, by=f"inbox #{m['id']}")
             except Exception as e:   # noqa: BLE001 - they went out; not marked, they go out again later
                 fail_stop("noted inbox messages not marked included",
-                          f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}")
+                          f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}", session=sid)
     finally:
         ka.release_lock(lock)
     (verify or start_verify)(m["id"], path, offset)
@@ -287,8 +292,8 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
 
 def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> None:
     """The worker thread: a pass on every wake-up (a new message, a retry) and every POLL seconds.
-    A failed pass (a DB failure, ...) is an error (fail_stop: alert + automation paused); the
-    next pass still runs (the owner's messages are no automation)."""
+    A failed pass (a DB failure, ...) is an error (fail_stop: alert + automation paused, install-wide:
+    it is about no one message); the next pass still runs (the owner's messages are no automation)."""
     stop = stop or threading.Event()
     log("inbox worker started")
     while not stop.is_set():

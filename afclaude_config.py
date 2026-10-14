@@ -116,30 +116,88 @@ def setting(name: str) -> Any:
     return settings(name)[name]
 
 
-def automation_pause() -> dict[str, Any]:
-    """The pause switch (automation_paused, D-234/D-235), read strictly: unlike settings(), a DB
-    that can't be read counts as PAUSED (never the code default "not paused"). -> {paused,
-    reason, since, by}: reason = automation_paused_reason, since / by = when and by whom the
-    switch was last set (None if never)."""
+def _install_pause(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The install-wide pause (settings automation_paused / _reason) from an open connection."""
     import actions
     import store
-    out: dict[str, Any] = {"paused": True, "reason": None, "since": None, "by": None}
+    paused, src = actions.effective_setting(conn, "automation_paused")
+    reason, _ = actions.effective_setting(conn, "automation_paused_reason")
+    row = store.get_setting_row(conn, "automation_paused")
+    if src.startswith("invalid"):
+        return {"paused": True, "reason": f"the saved automation_paused is {src}", "since": None, "by": None}
+    return {"paused": bool(paused), "reason": reason or None,
+            "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None}
+
+
+def _project_pauses(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The projects paused now (store.project_pauses) as {project, name, reason, since, by}. A
+    database whose project_pauses table does not exist yet (the additive table is created by the
+    next store.connect()) has none."""
+    import store
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_pauses'").fetchone():
+        return []
+    return [{"project": r["project_id"], "name": r["name"], "reason": r["reason"], "since": r["updated_at"],
+             "by": r["updated_by"]} for r in store.project_pauses(conn)]
+
+
+def automation_pauses() -> dict[str, Any]:
+    """Every pause (D-234/D-235, D-244), read strictly (a DB that can't be read counts as PAUSED
+    install-wide): {"install": {paused, reason, since, by}, "projects": [{project (id), name,
+    reason, since, by}, ...] (the projects paused now, by rank)}."""
+    install: dict[str, Any] = {"paused": True, "reason": None, "since": None, "by": None}
+    try:
+        conn = _read_conn()
+        if conn is None:
+            return {"install": dict(install, reason=f"no database at {_db_path()}"), "projects": []}
+        try:
+            return {"install": _install_pause(conn), "projects": _project_pauses(conn)}
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - unreadable = paused (the safe side)
+        return {"install": dict(install, reason=f"the pause setting could not be read ({type(e).__name__}: {e})"[:300]),
+                "projects": []}
+
+
+def automation_pause(project: object = None, session: str | None = None) -> dict[str, Any]:
+    """The pause switch for one runner check (D-234/D-235, D-244), read strictly: unlike
+    settings(), a DB that can't be read counts as PAUSED (never the code default "not paused").
+    Paused = the install-wide pause (automation_paused) OR the pause of the check's project:
+    `project` (id or name) or the project `session` is the task-manager of (store.session_project;
+    a session that manages no project has only the install-wide one). Neither given: only the
+    install-wide one. -> {paused, reason, since, by, scope ("install" | "project" | None),
+    project (the project's name, or None)}: while both are set, the install-wide one's since / by
+    and both reasons; an unknown `project` counts as paused."""
+    import store
+    out: dict[str, Any] = {"paused": True, "reason": None, "since": None, "by": None, "scope": "install",
+                           "project": None}
     try:
         conn = _read_conn()
         if conn is None:
             return dict(out, reason=f"no database at {_db_path()}")
         try:
-            paused, src = actions.effective_setting(conn, "automation_paused")
-            reason, _ = actions.effective_setting(conn, "automation_paused_reason")
-            row = store.get_setting_row(conn, "automation_paused")
+            install = _install_pause(conn)
+            pr = None
+            if project is not None:
+                pr = store.get_project(conn, project)
+                if pr is None:
+                    return dict(out, reason=f"no project {project!r} to read the pause of")
+            elif session:
+                pr = store.session_project(conn, session)
+            mine = next((p for p in _project_pauses(conn) if pr is not None and p["project"] == pr["id"]), None)
         finally:
             conn.close()
     except Exception as e:   # noqa: BLE001 - unreadable = paused (the safe side)
         return dict(out, reason=f"the pause setting could not be read ({type(e).__name__}: {e})"[:300])
-    if src.startswith("invalid"):
-        return dict(out, reason=f"the saved automation_paused is {src}")
-    return {"paused": bool(paused), "reason": reason or None,
-            "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None}
+    name = pr["name"] if pr is not None else None
+    if install["paused"]:
+        reason = install["reason"]
+        if mine is not None:
+            reason = f"{reason or 'no reason given'} | project {name}: {mine['reason'] or 'no reason given'}"
+        return dict(install, reason=reason, scope="install", project=name)
+    if mine is not None:
+        return {"paused": True, "reason": mine["reason"], "since": mine["since"], "by": mine["by"],
+                "scope": "project", "project": name}
+    return dict(install, scope=None, project=name)
 
 
 # ---- typed views the runners use

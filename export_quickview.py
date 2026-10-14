@@ -332,12 +332,20 @@ def inbox_block():
 
 def automation_block():
     """The automation pause (D-234/D-235) for the page's banner: a runner sets it on any failure;
-    no run starts until the owner clears it. Strict read (a DB that can't be read = paused)."""
+    no run starts until the owner clears it. Strict read (a DB that can't be read = paused).
+    paused: anything is paused; install: the install-wide pause (reason, by, since_berlin, resume
+    are its own); projects: each paused project (D-244: an inbox error pauses only its project)
+    with its name, reason, by, since_berlin and resume command."""
     import failstop
-    p = failstop.paused()
-    return {"paused": bool(p["paused"]), "reason": p.get("reason"), "by": p.get("by"),
-            "since_berlin": bstr(ka.parse_ts(p["since"])) if p.get("since") else None,
-            "resume": failstop.RESUME_CMD}
+    ps = failstop.pauses()
+    i = ps["install"]
+    projects = [{"name": p["name"], "reason": p.get("reason"), "by": p.get("by"),
+                 "since_berlin": bstr(ka.parse_ts(p["since"])) if p.get("since") else None,
+                 "resume": failstop.resume_cmd(p["name"])} for p in ps["projects"]]
+    return {"paused": bool(i["paused"]) or bool(projects), "install": bool(i["paused"]),
+            "reason": i.get("reason"), "by": i.get("by"),
+            "since_berlin": bstr(ka.parse_ts(i["since"])) if i.get("since") else None,
+            "resume": failstop.RESUME_CMD, "projects": projects}
 
 
 COMPACTIONS_SHOWN = 5

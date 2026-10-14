@@ -154,6 +154,30 @@ class AutomationPaused(unittest.TestCase):
                          (True, "keepalive: start aborted", "runner:keepalive", "python3 tasks.py automation resume"))
         self.assertTrue(b["since_berlin"])
 
+    def test_block_names_the_paused_project(self):
+        """D-244: a project's pause (an inbox error) is shown by the project's name, with its reason
+        and its own resume command; the install-wide part stays unpaused."""
+        self.addCleanup(testenv.unpause)
+        testenv.unpause()
+        self.addCleanup(testenv.managed_project("PQ", "dddddddd-1111-4222-8333-444444444444"))
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set_project", {"project": "PQ", "paused": True,
+                                                             "reason": "inbox: triage failed"},
+                            actor="runner:inbox", via="runner")
+        finally:
+            conn.close()
+        b = qv.automation_block()
+        self.assertEqual((b["paused"], b["install"]), (True, False))
+        (p,) = b["projects"]
+        self.assertEqual((p["name"], p["reason"], p["by"], p["resume"]),
+                         ("PQ", "inbox: triage failed", "runner:inbox", "python3 tasks.py automation resume --project PQ"))
+        self.assertTrue(p["since_berlin"])
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        self.assertIn('id="paused-projects"', page)
+        self.assertIn("Automation PAUSED for ", page)
+
     def test_budget_model_error_is_shown_never_paused(self):
         """Task-manager decision on D-234/D-235: the quickview is a display path; a budget-model
         failure there is shown on the page, it never pauses automation."""

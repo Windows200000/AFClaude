@@ -52,6 +52,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                inbox_messages (D-178/D-241, additive the same way): the owner's messages to the
                task-manager from the dashboard, verbatim, with the Haiku triage and the delivery
                state (inbox.py, inbox_api.py; written only through actions.py's inbox.* actions).
+               project_pauses (D-244, additive the same way): the automation pause of one project
+               (an inbox error pauses the project its message was for); the install-wide pause
+               stays the settings automation_paused / automation_paused_reason (failstop.py).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -376,6 +379,19 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
     version         INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS inbox_messages_status ON inbox_messages(status, session_id, id);
+
+-- the automation pause of one project (D-244; failstop.py): its runner checks hold while it is set,
+-- on top of the install-wide one (settings automation_paused). One row per project ever paused; a
+-- resume keeps the row (paused 0, reason NULL), so its version never repeats. Written only through
+-- actions.py's automation.set_project. Additive, no schema_version bump (see the module doc).
+CREATE TABLE IF NOT EXISTS project_pauses (
+    project_id  INTEGER PRIMARY KEY REFERENCES projects(id),
+    paused      INTEGER NOT NULL DEFAULT 0,
+    reason      TEXT,                  -- why (a runner's failure says what failed); NULL when resumed
+    version     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT
+);
 """
 
 # ---- telemetry (dashboard phase 2c, D-161, §7.2/§7.3): the usage files' rows in the DB.
@@ -597,7 +613,7 @@ CREATE TABLE IF NOT EXISTS prompt_defaults (
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
 # trigger's own UPDATE doesn't fire it again.
 VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
-             "settings": "key", "prompt_overrides": "name", "inbox_messages": "id"}
+             "settings": "key", "prompt_overrides": "name", "inbox_messages": "id", "project_pauses": "project_id"}
 VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
@@ -1243,6 +1259,14 @@ def get_project(conn: sqlite3.Connection, ref: object, nearest: bool = True) -> 
     return dict(r) if r else None
 
 
+def session_project(conn: sqlite3.Connection, session_id: str) -> Row | None:
+    """The project this session is the task-manager of (projects.manager_session; the top-ranked
+    one if several), or None."""
+    r = conn.execute("SELECT * FROM projects WHERE manager_session=? ORDER BY rank, id LIMIT 1",
+                     (session_id,)).fetchone()
+    return dict(r) if r else None
+
+
 def _project_row(conn: sqlite3.Connection, ref: object) -> Row:
     p = get_project(conn, ref)
     if p is None:
@@ -1842,6 +1866,29 @@ def put_setting(conn: sqlite3.Connection, key: str, value: object, updated_by: s
     return get_setting_row(conn, key)
 
 
+def get_project_pause(conn: sqlite3.Connection, project_id: int) -> Row | None:
+    """{project_id, paused (bool), reason, version, updated_at, updated_by}, or None if the project
+    was never paused (version 0)."""
+    r = conn.execute("SELECT * FROM project_pauses WHERE project_id=?", (project_id,)).fetchone()
+    return dict(r, paused=bool(r["paused"])) if r else None
+
+
+def project_pauses(conn: sqlite3.Connection) -> list[Row]:
+    """The projects paused now, by project rank: the get_project_pause rows plus 'name'."""
+    return [dict(r, paused=True) for r in conn.execute(
+        "SELECT pp.*, p.name FROM project_pauses pp JOIN projects p ON p.id = pp.project_id "
+        "WHERE pp.paused ORDER BY p.rank, p.id")]
+
+
+def put_project_pause(conn: sqlite3.Connection, project_id: int, paused: bool, reason: str | None,
+                      updated_by: str | None = None) -> Row | None:
+    conn.execute("INSERT INTO project_pauses(project_id, paused, reason, updated_at, updated_by) "
+                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET paused=excluded.paused, "
+                 "reason=excluded.reason, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                 (project_id, int(bool(paused)), reason, now_iso(), updated_by))
+    return get_project_pause(conn, project_id)
+
+
 def reset_setting(conn: sqlite3.Connection, key: str, updated_by: str | None = None) -> Row | None:
     """Back to the code default: the value becomes JSON null (the row and its version stay)."""
     return put_setting(conn, key, None, updated_by)
@@ -2384,8 +2431,8 @@ def add_handoff(conn: sqlite3.Connection, session_id: object, body: object, proj
     if project is not None:
         project_id: int | None = _project_row(conn, project)["id"]
     else:
-        r = conn.execute("SELECT id FROM projects WHERE manager_session=? ORDER BY rank LIMIT 1", (sid,)).fetchone()
-        project_id = r["id"] if r else None
+        mp = session_project(conn, sid)
+        project_id = mp["id"] if mp else None
     with transaction(conn):
         cur = conn.execute("INSERT INTO handoffs(session_id, project_id, created_at, created_by, body) "
                            "VALUES (?, ?, ?, ?, ?)",
