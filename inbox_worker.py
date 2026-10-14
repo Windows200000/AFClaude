@@ -77,18 +77,18 @@ def _act(conn: Any, name: str, **params: Any) -> Any:
     return actions.perform(conn, name, params, actor=ACTOR, via="runner")
 
 
-def stop(subject: str, detail: str) -> None:
+def fail_stop(subject: str, detail: str) -> None:
     """An inbox error (D-235/D-244): an ERROR log line, an alert and automation paused (failstop)."""
     failstop.fail("inbox", subject, detail, log=log)
 
 
 def failed(conn: Any, m: dict[str, Any], subject: str, detail: str) -> None:
-    """The message failed (D-235/D-244): error on it, then stop(). Never raises."""
+    """The message failed (D-235/D-244): error on it, then fail_stop(). Never raises."""
     try:
         _act(conn, "inbox.fail", message_id=m["id"], error=f"{subject}: {detail}")
     except Exception as e:   # noqa: BLE001 - reported with the alert below
         detail += f" (and the error could not be stored on the message: {type(e).__name__}: {e})"
-    stop(subject, f"message #{m['id']}: {detail}")
+    fail_stop(subject, f"message #{m['id']}: {detail}")
 
 
 # ---------------------------------------------------------------- triage
@@ -230,8 +230,8 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
             try:
                 _act(conn, "inbox.include", message_ids=ids, by=f"inbox #{m['id']}")
             except Exception as e:   # noqa: BLE001 - they went out; not marked, they go out again later
-                stop("noted inbox messages not marked included",
-                     f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}")
+                fail_stop("noted inbox messages not marked included",
+                          f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}")
     finally:
         ka.release_lock(lock)
     (verify or start_verify)(m["id"], path, offset)
@@ -260,7 +260,7 @@ def verify(msg_id: int, path: str, offset: int, timeout: timedelta | None = None
         finally:
             conn.close()
     except Exception as e:   # noqa: BLE001 - the verify thread's own error (D-235): reported, not lost
-        stop("inbox delivery check failed", f"message #{msg_id}: {type(e).__name__}: {e}")
+        fail_stop("inbox delivery check failed", f"message #{msg_id}: {type(e).__name__}: {e}")
     return False
 
 
@@ -287,8 +287,8 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
 
 def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> None:
     """The worker thread: a pass on every wake-up (a new message, a retry) and every POLL seconds.
-    A failed pass (a DB failure, ...) is an error (stop: alert + automation paused); the next pass
-    still runs (the owner's messages are no automation)."""
+    A failed pass (a DB failure, ...) is an error (fail_stop: alert + automation paused); the
+    next pass still runs (the owner's messages are no automation)."""
     stop = stop or threading.Event()
     log("inbox worker started")
     while not stop.is_set():
@@ -300,5 +300,5 @@ def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> N
             finally:
                 conn.close()
         except Exception as e:   # noqa: BLE001 - an error (D-235/D-244), reported; the next pass runs
-            stop(f"inbox worker pass failed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1200:]}")
+            fail_stop(f"inbox worker pass failed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1200:]}")
         wake.wait(POLL)

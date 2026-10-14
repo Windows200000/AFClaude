@@ -228,6 +228,21 @@ class Triage(DB):
         self.assertIn("inbox: inbox message triage failed", p["reason"])
         self.assertEqual(iw.process(self.conn, verify=lambda *a: None), {})   # not retried on its own
 
+    def test_a_failed_pass_is_an_error_and_pauses(self):
+        """A DB failure in a pass (D-244): alerted, automation paused; the worker goes on."""
+        wake, stop = threading.Event(), threading.Event()
+        def boom(conn, now=None, verify=None):
+            stop.set()
+            wake.set()                                                        # no POLL wait after the pass
+            raise store.DBUnavailable("database is locked", "error")
+        old, iw.process = iw.process, boom
+        try:
+            iw.run_forever(wake, stop)
+        finally:
+            iw.process = old
+        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox worker pass failed: DBUnavailable"])
+        self.assertIn("inbox worker pass failed", failstop.paused()["reason"])
+
     def test_bad_answer_is_an_error(self):
         self.answer = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=haiku_out(raw="hmm"), stderr="")
         m = self.post()
@@ -607,6 +622,28 @@ class HeldInStarts(tc.Env):
         self.assertIn(f"{inbox.marker(long[2])} (", text)
         self.assertIn(f"its text: python3 tasks.py inbox show {long[2]}", text)   # past HELD_MAX: the id only
         self.assertNotIn("z" * 10, text)
+
+
+class Watchdog(DB):
+    def test_api_not_running_is_an_error_once_per_outage(self):
+        """The */5 watchdog found the API down (D-244): alert + automation paused, once per outage."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        started = []
+        saved = (inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen)
+        inbox_api.take_lock = lambda: open(os.devnull)
+        inbox_api.LOG, inbox_api.DOWN = os.path.join(tmp.name, "api.log"), os.path.join(tmp.name, ".down")
+        inbox_api.subprocess.Popen = lambda argv, **kw: started.append(argv)
+        try:
+            self.assertEqual(inbox_api.ensure(boot=True), 0)                  # the container start: no error
+            self.assertEqual((len(started), self.alerts), (1, []))
+            inbox_api.ensure(boot=False)
+            inbox_api.ensure(boot=False)                                      # still down: not alerted again
+        finally:
+            inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen = saved
+        self.assertEqual(len(started), 3)
+        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox API was not running"])
+        self.assertTrue(failstop.paused()["paused"])
 
 
 # ---------------------------------------------------------------- the dashboard view (D-178)
