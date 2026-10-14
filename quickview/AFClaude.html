@@ -95,6 +95,11 @@ button.chip.preview { outline: 1px solid #ec4899; outline-offset: 2px; }
 .eta { margin-left: auto; padding-left: 8px; color: #9ca3af; font-size: 12px; white-space: nowrap; cursor: help; }
 button.chip small.eta-c { color: #c4b5fd; }
 .eta-h { cursor: help; }
+.tblwrap { overflow-x: auto; }
+table.tbl { border-collapse: collapse; font-size: 13px; width: 100%; }
+table.tbl th, table.tbl td { border-bottom: 1px solid rgba(255,255,255,.08); padding: 3px 8px; text-align: right; white-space: nowrap; }
+table.tbl th { color: #9ca3af; font-weight: 500; }
+table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
 @media (max-width: 520px) {
     body { padding: 14px 12px 110px; }
     section { padding: 14px; }
@@ -125,6 +130,17 @@ button.chip small.eta-c { color: #c4b5fd; }
   <section>
     <h2>Keep-alive &amp; usage</h2>
     <div id="usage" class="grid"></div>
+  </section>
+
+  <section>
+    <h2>Task-manager context</h2>
+    <div id="ctx" class="grid"></div>
+    <h3 class="sub">Your messages to the task-manager</h3>
+    <div id="ctx-msgs" class="tblwrap"></div>
+    <h3 class="sub">Per day (est. session %)</h3>
+    <div id="ctx-days" class="tblwrap"></div>
+    <h3 class="sub">Compactions</h3>
+    <div id="ctx-comps"></div>
   </section>
 
   <section>
@@ -413,6 +429,55 @@ button.chip small.eta-c { color: #c4b5fd; }
     $("paused-cmd").textContent = a.resume || "python3 tasks.py automation resume";
   }
 
+  // D-237: the task-manager's context, the prompt cache and what each of your messages re-read;
+  // D-238: the compactions (export_quickview.context_block / compact_timing.py)
+  function kTok(n) { return n == null ? "?" : Math.round(n / 1000) + "k"; }
+  function table(head, rows) {
+    return '<table class="tbl"><tr>' + head.map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("") + "</tr>" +
+      rows.map(function (r) { return "<tr>" + r.map(function (c) { return "<td>" + c + "</td>"; }).join("") + "</tr>"; }).join("") +
+      "</table>";
+  }
+  function renderContext(s) {
+    var c = s.context || {}, out = [];
+    if (c.error) {
+      $("ctx").innerHTML = tile("Context", "–", '<div class="mut">' + esc(c.error) + "</div>");
+      $("ctx-msgs").innerHTML = $("ctx-days").innerHTML = $("ctx-comps").innerHTML = "";
+      return;
+    }
+    var l = c.live || {}, m = c.model || {};
+    out.push(tile("Context now", (l.estimated ? "~" : "") + kTok(l.context),
+      '<div class="mut">break-even ' + kTok(l.break_even) + (l.above ? ' · <span class="warn">compacts when idle</span>' : " · no compaction needed") + "</div>"));
+    out.push(tile("Prompt cache", l.warm ? '<span class="ok">warm</span>' : '<span class="warn">expired</span>',
+      '<div class="mut">' + (l.warm ? "expires " + esc(l.cache_expires_at_berlin || "?") + " (in " + Math.round(l.minutes_left || 0) + " min)"
+        : "expired " + esc(l.cache_expires_at_berlin || "?")) + "</div>"));
+    out.push(tile("Next message after expiry", (l.reread_cost != null ? l.reread_cost.toFixed(1) : "?") + "% session",
+      '<div class="mut">re-reads ' + kTok(l.context) + " ≈ " + (l.reread_weekly != null ? l.reread_weekly.toFixed(2) : "?") + "% weekly</div>"));
+    out.push(tile("Cost model", kTok(m.break_even) + " break-even",
+      '<div class="mut">' + esc(m.source || "?") + "</div>" + (m.fit && m.fit.r2 != null ? '<div class="mut">R² ' + m.fit.r2 + ", n=" + m.fit.n + "</div>" : "")));
+    $("ctx").innerHTML = out.join("");
+    var msgs = c.messages || [];
+    $("ctx-msgs").innerHTML = msgs.length ? table(["when", "gap", "re-read", "tokens", "session %", "weekly %"],
+      msgs.map(function (x) {
+        return [esc(x.at_berlin), x.gap_min != null ? hm(x.gap_min) : "–",
+          x.reread ? '<span class="bad">yes</span>' : '<span class="ok">no</span>',
+          x.reread ? kTok(x.reread_tokens) : kTok(x.context), x.session_pct.toFixed(2), x.weekly_pct.toFixed(3)];
+      })) : '<p class="mut">No messages from you in the last 7 days.</p>';
+    var days = c.days || [];
+    $("ctx-days").innerHTML = days.length ? table(["day", "re-reads", "warm reads", "writes", "output", "total", "weekly"],
+      days.map(function (d) {
+        return [esc(d.day), d.rereads + " (" + d.n_rereads + "×)", d.warm_reads, d.writes, d.output, "<strong>" + d.total + "</strong>", d.weekly];
+      })) : '<p class="mut">No requests in the last 7 days.</p>';
+    var comps = c.compactions || [];
+    $("ctx-comps").innerHTML = (c.compactions_error ? '<p class="mut">' + esc(c.compactions_error) + "</p>" : "") +
+      (comps.length ? comps.map(function (x) {
+        var cls = x.status === "compacted" ? "ok" : (x.status === "failed" ? "bad" : "warn");
+        return '<div class="sess"><span class="' + cls + '">' + esc(x.status) + "</span> " + esc(x.at_berlin || "?") +
+          (x.trigger ? " · " + esc(x.trigger) : "") + " · context " + kTok(x.context) +
+          (x.est_cost_pct != null ? " · ~" + x.est_cost_pct + "% cost, saves ~" + x.saves_per_reread_pct + "% per re-read" : "") +
+          '<div class="mut">' + esc(x.error || x.last_hold || x.reason || "") + "</div></div>";
+      }).join("") : '<p class="mut">No compaction attempts yet.</p>');
+  }
+
   function renderDecision(s) {
     $("decision").textContent = s.latest_decision || "(no keep-alive log entries yet)";
   }
@@ -463,7 +528,7 @@ button.chip small.eta-c { color: #c4b5fd; }
       var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
       $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
       $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
-      renderPaused(s); renderUsage(s); renderPhases(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
+      renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
       docList($("docs"), s.docs, "title");
       docList($("prompts"), s.prompts, "name");
     }).catch(function (e) {

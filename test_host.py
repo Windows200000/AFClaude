@@ -88,6 +88,12 @@ class BridgeArgv(unittest.TestCase):
         self.assertEqual(host.bridge_argv(["tmux", "kill-session", "-t", "=ka-0123abcd"]), ["tmux-kill", "ka-0123abcd"])
         self.assertEqual(host.bridge_argv(["tmux", "list-panes", "-s", "-t", "=ka-0123abcd", "-F", "#{pane_pid}"]),
                          ["tmux-panes", "ka-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "list-clients", "-t", "=ka-0123abcd", "-F", "#{client_activity}"]),
+                         ["tmux-clients", "ka-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=ka-0123abcd:"]),
+                         ["tmux-capture", "ka-0123abcd"])
+        with self.assertRaises(ValueError):
+            host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=Claude:"])
 
     def test_bridge_only_shapes_pass(self):
         for argv in (["kill-claude", "123"], ["claude-env", "123"], ["proc-snapshot"], ["usage-cache"],
@@ -200,6 +206,8 @@ class Whitelist(unittest.TestCase):
         for argv, ok_codes in (
                 (["tmux", "has-session", "-t", "=ka-00000000"], None),
                 (["tmux", "list-panes", "-s", "-t", "=ka-00000000", "-F", "#{pane_pid}"], None),
+                (["tmux", "list-clients", "-t", "=ka-00000000", "-F", "#{client_activity}"], None),
+                (["tmux", "capture-pane", "-e", "-p", "-t", "=ka-00000000:"], None),
                 (["tmux", "kill-session", "-t", "=ka-00000000"], None)):   # no such session: tmux exits 1
             r = run_host_exec(shlex.join(host.bridge_argv(argv)))
             self.assertNotEqual(r.returncode, 126, (argv, r.stderr))

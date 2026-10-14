@@ -18,6 +18,9 @@ Allowed (exact shapes):
   claude-env <pid>         the CLAUDE_* lines of /proc/<pid>/environ, claude pids only
   tmux-panes ka-<8 hex>    tmux list-panes -s -F '#{pane_pid}' (pane pids, read-only)
   tmux-kill ka-<8 hex>     tmux kill-session (the dispatcher's cleanup of its own sessions)
+  tmux-clients ka-<8 hex>  tmux list-clients -F '#{client_activity}' (read-only: the owner typing in an
+                           attached terminal holds a compaction, D-238)
+  tmux-capture ka-<8 hex>  tmux capture-pane -e -p (read-only: a draft in the input box holds a compaction)
   proc-snapshot            JSON {pid: [ppid, starttime, argv|null]} of every process; argv only
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
@@ -154,6 +157,10 @@ def main():
         cmd = ["tmux", "list-panes", "-s", "-t", "=" + args[0], "-F", "#{pane_pid}"]
     elif head == "tmux-kill" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
         cmd = ["tmux", "kill-session", "-t", "=" + args[0]]
+    elif head == "tmux-clients" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+        cmd = ["tmux", "list-clients", "-t", "=" + args[0], "-F", "#{client_activity}"]
+    elif head == "tmux-capture" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+        cmd = ["tmux", "capture-pane", "-e", "-p", "-t", "=" + args[0] + ":"]
     elif head == "proc-snapshot" and not args:
         sys.stdout.write(json.dumps(proc_snapshot()) + "\n")
         log("OK proc-snapshot")

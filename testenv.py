@@ -17,7 +17,8 @@ sys.path.insert(0, HERE)
 DIR = tempfile.mkdtemp(prefix="afclaude-test-")
 atexit.register(shutil.rmtree, DIR, True)
 os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=os.path.join(DIR, "afclaude.json"),
-                  AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR)
+                  AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
+                  KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
 
 import store  # noqa: E402
 import actions  # noqa: E402
