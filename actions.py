@@ -696,14 +696,10 @@ SETTINGS: dict[str, Setting] = {
                           "rate x this factor (D-212)", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
-    "compaction_enabled": _flag(True, "Compaction (D-144/D-191/D-218): a task-manager whose conversation "
-                                "(transcript) already ran before the current session window is asked to save a hand-off near "
-                                "the end of its session window and is compacted (/compact) at the next start, "
-                                "which then injects the hand-off", "automation"),
-    "handoff_before_reset_min": _num(20, 1, 120, "Compaction: the save prompt goes out this many minutes before "
-                                     "the session reset (or once the session is at session_stop_pct, whichever "
-                                     "comes first); with a fill-up run it is part of the fill-up message",
-                                     "automation"),
+    "compaction_enabled": _flag(True, "Compaction (D-144/D-191/D-218/D-233): a task-manager whose conversation "
+                                "(transcript) already ran before the session window that ends at a start is compacted "
+                                "(/compact) at that start: asked to save a hand-off right before, which the "
+                                "continue after the compaction then injects", "automation"),
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
                                "on); read by the resident runner (phase 3a)", "automation", important=True),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
@@ -1570,7 +1566,6 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),
-    StateComponent("keepalive.handoff", "runner:keepalive"),
     StateComponent("dispatcher", "runner:dispatcher", ("sessions", "handled", "starts", "alerted", "rc_held")),
     StateComponent("sampler", "runner:sampler", ("offsets", "sessions")),
     StateComponent("usage_review", "runner:usage_review", deletes=False),

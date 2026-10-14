@@ -10,7 +10,6 @@ own_session_add); this module is the runners' one door to them:
   runner_state 'keepalive.deferred' (one row per postponed start)  keepalive/keepalive_deferred.json
   runner_state 'keepalive.fillup'                                  keepalive/keepalive_fillup.json
   runner_state 'keepalive.usage_refresh' (window_start per entry)  keepalive/usage_refresh_state.json
-  runner_state 'keepalive.handoff'                                 keepalive/keepalive_handoff.json
   runner_state 'dispatcher' (sessions, handled, starts, alerted, rc_held per entry)  dispatcher_state.json
   runner_state 'sampler' (offsets, sessions per entry)             sampler_state.json
   runner_state 'usage_review'                                      usage_review_state.json
@@ -71,7 +70,6 @@ STATE_FILES: dict[str, str] = {   # component -> its legacy file, relative to th
     "keepalive.deferred": "keepalive/keepalive_deferred.json",
     "keepalive.fillup": "keepalive/keepalive_fillup.json",
     "keepalive.usage_refresh": "keepalive/usage_refresh_state.json",
-    "keepalive.handoff": "keepalive/keepalive_handoff.json",
     "dispatcher": "dispatcher_state.json",
     "sampler": "sampler_state.json",
     "usage_review": "usage_review_state.json",
