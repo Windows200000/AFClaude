@@ -100,6 +100,17 @@ table.tbl { border-collapse: collapse; font-size: 13px; width: 100%; }
 table.tbl th, table.tbl td { border-bottom: 1px solid rgba(255,255,255,.08); padding: 3px 8px; text-align: right; white-space: nowrap; }
 table.tbl th { color: #9ca3af; font-weight: 500; }
 table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
+.msg { border-left: 3px solid #7e22ce; padding: 6px 0 6px 12px; margin: 8px 0; }
+.msg.error { border-left-color: #ef4444; }
+.msg .q { white-space: pre-wrap; word-break: break-word; }
+.msg .src { color: #9ca3af; font-size: 12px; margin-top: 2px; }
+.msg .a { background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 6px 10px; margin-top: 6px; }
+.msg .e { color: #fecaca; font-size: 13px; margin-top: 4px; word-break: break-word; }
+#msg-form { margin-top: 10px; }
+#msg-text { width: 100%; min-height: 64px; resize: vertical; background: #161616; color: #e8eaed; border: 1px solid rgba(255,255,255,.15);
+    border-radius: 8px; padding: 8px 10px; font: inherit; }
+#msg-text:focus { outline: none; border-color: #7e22ce; }
+.msg-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 6px; }
 @media (max-width: 520px) {
     body { padding: 14px 12px 110px; }
     section { padding: 14px; }
@@ -125,6 +136,15 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   <section id="s-input">
     <h2>Needs your input <span id="c-input" class="count zero">0</span></h2>
     <div id="input"></div>
+  </section>
+
+  <section id="s-msg">
+    <h2>Message to the task-manager</h2>
+    <div id="msg-list" aria-live="polite"></div>
+    <form id="msg-form">
+      <textarea id="msg-text" maxlength="4000" aria-label="Message to the task-manager"></textarea>
+      <div class="msg-bar"><span id="msg-state" class="mut"></span><button type="submit" id="msg-send">Send</button></div>
+    </form>
   </section>
 
   <section>
@@ -165,7 +185,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     <h3 class="sub">Prompts</h3>
     <div id="prompts"></div>
   </section>
-  <p class="mut">Read-only temp dashboard. Data comes from ovm1 on every page load (export every 3 min). All times Europe/Berlin.</p>
+  <p class="mut">Temp dashboard. Data comes from ovm1 on every page load (export every 3 min). All times Europe/Berlin.</p>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
@@ -499,6 +519,89 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     $("c-input").className = "count" + (count ? "" : " zero");
   }
 
+  // D-178/D-241: the message box to the task-manager. The messages come live from the inbox API
+  // (inbox_api.py behind the same key), not from status.json; Haiku sorts each one: "now" is typed
+  // into the session at once, "note" goes along with its next start.
+  var API = BASE + "api/inbox", msgPoll = null, msgFastUntil = 0;
+  function api(path, body) {
+    var opt = { cache: "no-store", credentials: "same-origin", redirect: "manual" };
+    if (body !== undefined) {
+      opt.method = "POST";
+      opt.headers = { "Content-Type": "application/json" };
+      opt.body = JSON.stringify(body);
+    }
+    return fetch(API + (path || ""), opt).then(function (r) {
+      if (r.type === "opaqueredirect" || r.status === 0) throw new Error("Login expired. Reload the page to sign in again.");
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error((j && j.error) || "HTTP " + r.status);
+        return j;
+      });
+    });
+  }
+  function msgStatus(m) {
+    if (m.status === "error") return '<span class="bad">error</span>';
+    if (m.status === "answered") return '<span class="ok">answered</span> ' + esc(m.answered_berlin || "");
+    if (m.status === "included") return "read by the task-manager " + esc(m.included_berlin || "");
+    if (m.status === "noted") return "noted for the next session";
+    if (m.status === "delivered") return "delivered " + esc(m.delivered_berlin || "") + ", waiting for the answer";
+    if (!m.verdict) return "sorting…";
+    return m.hold ? '<span class="warn">waiting</span>: ' + esc(m.hold) : "sending…";
+  }
+  function renderMessages(box) {
+    var ms = box.messages || [];
+    $("msg-list").innerHTML = ms.map(function (m) {
+      return '<div class="msg' + (m.status === "error" ? " error" : "") + '"><div class="q">' + esc(m.text) + "</div>" +
+        '<div class="src">' + esc(m.at_berlin || "") + (m.verdict ? " · " + esc(m.verdict) + (m.verdict_reason ? ": " + esc(m.verdict_reason) : "") : "") +
+        " · " + msgStatus(m) + "</div>" +
+        (m.answer ? '<div class="a">' + md(m.answer) + "</div>" : "") +
+        (m.error ? '<div class="e">' + esc(m.error) + ' <button type="button" data-retry="' + m.id + '">Retry</button></div>' : "") +
+        "</div>";
+    }).join("");
+    Array.prototype.forEach.call($("msg-list").querySelectorAll("button[data-retry]"), function (b) {
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        api("/" + b.getAttribute("data-retry") + "/retry", {}).then(function () { pollMessages(true); })
+          .catch(function (e) { b.disabled = false; $("msg-state").textContent = e.message; });
+      });
+    });
+    return ms.some(function (m) { return m.status === "pending" || m.status === "delivered"; });
+  }
+  function loadMessages() {
+    return api("").then(function (box) {
+      $("msg-text").maxLength = box.max_chars || 4000;
+      return renderMessages(box);
+    }).catch(function (e) {
+      $("msg-list").innerHTML = '<div class="msg error"><div class="e">Message box unavailable: ' + esc(e.message) + "</div></div>";
+      return false;
+    });
+  }
+  // a fresh message: every 3 s for 2 min (triage, delivery); an open one: every 30 s while the page is shown
+  function pollMessages(fast) {
+    if (fast) msgFastUntil = Date.now() + 120000;
+    clearTimeout(msgPoll);
+    loadMessages().then(function (open) {
+      var wait = Date.now() < msgFastUntil ? 3000 : (open ? 30000 : 0);
+      if (!wait) return;
+      var tick = function () { if (document.hidden) msgPoll = setTimeout(tick, wait); else pollMessages(false); };
+      msgPoll = setTimeout(tick, wait);
+    });
+  }
+  $("msg-form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var text = $("msg-text").value;
+    if (!text.trim()) return;
+    $("msg-send").disabled = true;
+    $("msg-state").textContent = "";
+    api("", { text: text }).then(function () {
+      $("msg-text").value = "";
+      pollMessages(true);
+    }).catch(function (e) { $("msg-state").textContent = "Not sent: " + e.message; })
+      .then(function () { $("msg-send").disabled = false; });
+  });
+  $("msg-text").addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); $("msg-form").requestSubmit(); }
+  });
+
   function renderCron(s) {
     $("cron").innerHTML = (s.cron || []).map(function (c) {
       return '<div class="sess"><code>' + esc(c.schedule_berlin || c.schedule_utc) + "</code> " + esc(c.what) + "</div>";
@@ -537,8 +640,9 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       $("error").hidden = false;
     });
   }
-  $("reload").addEventListener("click", load);
+  $("reload").addEventListener("click", function () { load(); pollMessages(false); });
   load();
+  pollMessages(false);
 })();
 </script>
 </body>

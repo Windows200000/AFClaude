@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""The owner's message box to the task-manager (D-178, D-241; dashboard design §3).
+
+The owner types a message on the temp dashboard (the quickview page); inbox_api.py stores it
+(inbox.post: the row in store.inbox_messages is the only copy of the text, D-241) and its worker
+(inbox_worker.py) asks Haiku whether it needs the task-manager now:
+
+  now   it is typed into the task-manager's tmux session at once (D-186: no window, no budget),
+        through the keep-alive's own send path and checks (the session lock, preflight's
+        owner_holds, owner_typing), with the message id and how to answer
+        (`tasks.py inbox reply <id> "..."`); the answer shows on the dashboard.
+  note  it waits in the DB; the next message the keep-alive sends into the session (a run's
+        continue, a fill-up, the message after a compaction, or a "now" message) lists the
+        noted ones verbatim and marks them included, so the session never wakes (and re-reads
+        its whole context after the cache expired, D-237/D-238) just for a note.
+
+A failed triage or delivery is an error on the message (D-235: shown on the dashboard, logged,
+alerted; never delivered silently, never dropped; the owner retries it).
+
+This module is the pure part (prompts, the verdict parser, the note list, the dashboard view);
+the Haiku call and the delivery are inbox_worker.py's, the HTTP endpoint is inbox_api.py's.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import actions  # noqa: E402
+import store  # noqa: E402
+
+UTC = timezone.utc
+BERLIN = ZoneInfo("Europe/Berlin")
+NOTE_ITEM_MAX = 1500        # characters of one noted message in a message into the session ...
+NOTES_MAX = 3000            # ... and of the whole list (the rest waits for the next message, D-225)
+MESSAGE_MAX_BYTES = 12000   # a message typed with tmux send-keys (its command limit is 16 KB)
+VIEW_MAX = 10               # messages on the dashboard (the current thread, D-178)
+RATE_MAX = 20               # messages per hour the endpoint takes (each costs a Haiku call)
+NEWLINE = " ⏎ "             # a line break of the owner's text in a one-line session message
+
+
+class TriageError(Exception):
+    """The triage call failed or gave no usable verdict."""
+
+
+def prompt(name: str) -> str:
+    """prompts/<name>.md, the default (the senders read the files, D-169)."""
+    return actions.prompt_default(name + ".md")
+
+
+def one_line(text: str) -> str:
+    """The text on one line (tmux send-keys would submit at the first newline)."""
+    return NEWLINE.join(x.strip() for x in text.strip().splitlines() if x.strip())
+
+
+def berlin(iso: str | None, fmt: str = "%d.%m. %H:%M") -> str | None:
+    dt = store.parse_iso(iso)
+    return dt.astimezone(BERLIN).strftime(fmt) if dt else None
+
+
+# ---------------------------------------------------------------- the triage (Haiku)
+
+def triage_prompt(text: str) -> str:
+    return prompt("inbox_triage").format(text=text)
+
+
+def parse_triage(returncode: int, stdout: str, stderr: str = "") -> dict[str, Any]:
+    """`claude -p --output-format json` output -> {verdict, reason, cost_usd, usage}. Anything
+    else (a failed call, an error result, no JSON object, an unknown verdict) is a TriageError."""
+    if returncode != 0:
+        raise TriageError(f"claude -p exited {returncode}: {(stderr or stdout or '').strip()[:300]}")
+    try:
+        out = json.loads(stdout)
+    except ValueError:
+        raise TriageError(f"claude -p printed no JSON: {stdout.strip()[:300]!r}") from None
+    if not isinstance(out, dict):
+        raise TriageError(f"claude -p printed {type(out).__name__}, not an object")
+    res = out.get("result")
+    if out.get("is_error") or not isinstance(res, str):
+        raise TriageError(f"the triage call returned an error: {str(res or out.get('subtype'))[:300]}")
+    m = re.search(r"\{.*\}", res, re.S)
+    try:
+        ans = json.loads(m.group(0)) if m else None
+    except ValueError:
+        ans = None
+    if not isinstance(ans, dict):
+        raise TriageError(f"no JSON verdict in the answer: {res.strip()[:300]!r}")
+    verdict = str(ans.get("verdict", "")).strip().lower()
+    if verdict not in store.INBOX_VERDICTS:
+        raise TriageError(f"unknown verdict {ans.get('verdict')!r} (want now|note)")
+    reason = " ".join(str(ans.get("reason") or "").split()) or "(no reason given)"
+    cost = out.get("total_cost_usd")
+    usage = out.get("usage")
+    return {"verdict": verdict, "reason": reason,
+            "cost_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+            "usage": usage if isinstance(usage, dict) else None}
+
+
+# ---------------------------------------------------------------- messages into the session
+
+def _note_item(m: dict[str, Any]) -> str:
+    text = one_line(m["text"])
+    if len(text) > NOTE_ITEM_MAX:
+        text = text[:NOTE_ITEM_MAX] + f"... (cut; the full text: python3 tasks.py inbox show {m['id']})"
+    return f"#{m['id']} ({berlin(m['created_at'])}): \"{text}\""
+
+
+def notes_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, list[int]]:
+    """The noted messages for the session as one line for a message into it (inbox_notes.md),
+    oldest first, at most NOTES_MAX characters (the rest waits for the next message), and their
+    ids (mark them included once the message went out). Nothing noted: (None, [])."""
+    items: list[str] = []
+    ids: list[int] = []
+    size = 0
+    for m in reversed(store.list_inbox(conn, "noted", session_id, limit=200)):
+        item = _note_item(m)
+        if items and size + len(item) > NOTES_MAX:
+            break
+        items.append(item)
+        ids.append(m["id"])
+        size += len(item)
+    if not items:
+        return None, []
+    left = len(store.list_inbox(conn, "noted", session_id, limit=1000)) - len(ids)
+    more = f" ({left} more: python3 tasks.py inbox list)" if left > 0 else ""
+    return prompt("inbox_notes").format(notes=" ".join(items) + more).strip(), ids
+
+
+def now_fields(m: dict[str, Any], notes: str | None) -> dict[str, Any]:
+    """The placeholders of inbox_now.md for message m (+ the noted ones going along)."""
+    return {"id": m["id"], "at": berlin(m["created_at"]), "text": one_line(m["text"]), "notes": notes or ""}
+
+
+def now_message(m: dict[str, Any], notes: str | None) -> str:
+    """The "now" message as typed into a live session: inbox_now.md on one line."""
+    return " ".join(prompt("inbox_now").format(**now_fields(m, notes)).split())
+
+
+def fits(message: str) -> bool:
+    return len(message.encode()) <= MESSAGE_MAX_BYTES
+
+
+def marker(msg_id: int) -> str:
+    """What the delivered message carries (inbox_now.md), searched for in the transcript."""
+    return f"[AFClaude inbox #{msg_id}]"
+
+
+# ---------------------------------------------------------------- the dashboard view (D-178)
+
+def _ts(iso: str | None) -> datetime | None:
+    return store.parse_iso(iso) if iso else None
+
+
+def activity(m: dict[str, Any]) -> datetime:
+    """The message's last activity (posted, triaged, delivered, included, answered, failed)."""
+    times = [_ts(m.get(k)) for k in ("created_at", "triaged_at", "delivered_at", "included_at",
+                                     "answered_at", "error_at")]
+    return max(t for t in times if t is not None)
+
+
+def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
+    """The box's current thread, oldest first (D-178): newest back to the first gap longer than
+    ui_chat_reset_hours (none in the last ui_chat_reset_hours: the box is empty again), at most
+    VIEW_MAX; a message still waiting or failed always stays in view."""
+    now = now or datetime.now(UTC)
+    reset = timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
+    rows = store.list_inbox(conn, limit=200)
+    out: list[dict[str, Any]] = []
+    edge = now
+    for m in rows:
+        if edge - activity(m) > reset:
+            break
+        out.append(m)
+        edge = min(edge, _ts(m["created_at"]) or edge)
+    out = out[:VIEW_MAX]
+    seen = {m["id"] for m in out}
+    out += [m for m in rows if m["id"] not in seen and m["status"] in ("pending", "error")]
+    return sorted(out, key=lambda m: m["id"])
+
+
+def message_view(m: dict[str, Any]) -> dict[str, Any]:
+    return {"id": m["id"], "at": m["created_at"], "at_berlin": berlin(m["created_at"], "%a %d.%m. %H:%M"),
+            "text": m["text"], "status": m["status"], "verdict": m["verdict"],
+            "verdict_reason": m["verdict_reason"], "hold": m["hold"],
+            "hold_since_berlin": berlin(m["hold_since"]), "delivered_berlin": berlin(m["delivered_at"]),
+            "included_berlin": berlin(m["included_at"]), "answer": m["answer"],
+            "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
+
+
+def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
+    """What the page shows: the current thread with each message's verdict, status and answer."""
+    return {"messages": [message_view(m) for m in thread(conn, now)],
+            "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}
+
+
+def summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The counts for status.json (export_quickview.py; no texts: they stay in the DB, D-241)."""
+    counts = {s: 0 for s in store.INBOX_STATUSES}
+    for r in conn.execute("SELECT status, COUNT(*) FROM inbox_messages GROUP BY status"):
+        counts[r[0]] = int(r[1])
+    return {"counts": counts, "errors": counts["error"], "waiting": counts["pending"],
+            "unanswered": counts["delivered"]}
+
+
+def rate_ok(conn: sqlite3.Connection, now: datetime | None = None) -> bool:
+    """At most RATE_MAX messages in the last hour (each one costs a Haiku call)."""
+    since = ((now or datetime.now(UTC)) - timedelta(hours=1)).astimezone(UTC)
+    stamp = since.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (since.microsecond // 1000)   # as now_iso()
+    return store.inbox_posted_since(conn, stamp) < RATE_MAX

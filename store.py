@@ -49,6 +49,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                for now (D-169; the prompts.py loader is phase 3); prompt_overrides.base_outdated
                (COLUMNS) is refreshed by the same sync, flagging an override whose base_sha256 no
                longer matches the current default.
+               inbox_messages (D-178/D-241, additive the same way): the owner's messages to the
+               task-manager from the dashboard, verbatim, with the Haiku triage and the delivery
+               state (inbox.py, inbox_api.py; written only through actions.py's inbox.* actions).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -343,6 +346,36 @@ CREATE TABLE IF NOT EXISTS handoffs (
     consumed_by_start TEXT                 -- the start's dedup key (window-start-..., last-mile-...)
 );
 CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id, id);
+
+-- the owner's messages to the task-manager from the dashboard (D-178/D-241; inbox.py): the text as
+-- typed is kept only here. Haiku sorts each one: "now" is typed into the session at once (D-186),
+-- "note" waits for the next message the keep-alive sends into it. Written only through the
+-- inbox.* actions. Additive, no schema_version bump (see the module doc).
+CREATE TABLE IF NOT EXISTS inbox_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    created_by      TEXT NOT NULL,         -- the actor (owner via the dashboard, cli)
+    session_id      TEXT NOT NULL,         -- the task-manager session it is for
+    text            TEXT NOT NULL,         -- verbatim (D-241: the only copy)
+    status          TEXT NOT NULL DEFAULT 'pending',   -- pending | delivered | noted | included | answered | error
+    verdict         TEXT,                  -- now | note (the triage), NULL until triaged
+    verdict_reason  TEXT,                  -- the triage's one-line reason
+    triaged_at      TEXT,
+    triage_cost_usd REAL,                  -- the triage call's own cost and usage (claude -p JSON)
+    triage_usage    TEXT,
+    hold            TEXT,                  -- why a "now" message waits (owner typing, a compaction, ...)
+    hold_since      TEXT,
+    delivered_at    TEXT,
+    delivered_via   TEXT,                  -- the send plan (send-keys, resume, ...)
+    included_at     TEXT,                  -- a note sent along with a message into the session ...
+    included_by     TEXT,                  -- ... this one (a start's key, a compaction, inbox #<id>)
+    answer          TEXT,                  -- the task-manager's answer (tasks.py inbox reply)
+    answered_at     TEXT,
+    error           TEXT,
+    error_at        TEXT,
+    version         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS inbox_messages_status ON inbox_messages(status, session_id, id);
 """
 
 # ---- telemetry (dashboard phase 2c, D-161, §7.2/§7.3): the usage files' rows in the DB.
@@ -564,7 +597,7 @@ CREATE TABLE IF NOT EXISTS prompt_defaults (
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
 # trigger's own UPDATE doesn't fire it again.
 VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
-             "settings": "key", "prompt_overrides": "name"}
+             "settings": "key", "prompt_overrides": "name", "inbox_messages": "id"}
 VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
@@ -2413,6 +2446,101 @@ def render_handoff(h: Mapping[str, Any]) -> str:
     if b.get("notes"):
         parts.append(f"Notes: {b['notes']}")
     return " ".join(" ".join(p.split()) for p in parts)
+
+
+# ---- the owner's inbox to the task-manager (D-178, D-241; inbox.py)
+#
+# One row per message: the verbatim text (the only copy), the Haiku verdict, the delivery state and
+# the answer. The raw reads and writes; actions.py (inbox.*) is the only caller of the writes.
+
+INBOX_STATUSES = ("pending", "delivered", "noted", "included", "answered", "error")
+INBOX_VERDICTS = ("now", "note")
+INBOX_TEXT_MAX = 4000          # characters (a "now" message is typed into tmux in one go)
+INBOX_FIELDS = ("status", "verdict", "verdict_reason", "triaged_at", "triage_cost_usd", "triage_usage",
+                "hold", "hold_since", "delivered_at", "delivered_via", "included_at", "included_by",
+                "answer", "answered_at", "error", "error_at")
+
+
+def inbox_text(value: object) -> str:
+    """The message as typed (not stripped: D-241 keeps it verbatim); empty or too long: ValueError."""
+    if not isinstance(value, str):
+        raise ValueError(f"text must be a string, got {type(value).__name__}")
+    if not value.strip():
+        raise ValueError("text must not be empty")
+    if len(value) > INBOX_TEXT_MAX:
+        raise ValueError(f"text is too long ({len(value)} > {INBOX_TEXT_MAX} characters)")
+    if "\0" in value:
+        raise ValueError("text must not contain NUL characters")
+    return value
+
+
+def _inbox_dict(r: sqlite3.Row) -> Row:
+    return dict(r, triage_usage=_loads(r["triage_usage"]))
+
+
+def get_inbox(conn: sqlite3.Connection, msg_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM inbox_messages WHERE id=?", (msg_id,)).fetchone()
+    return _inbox_dict(r) if r else None
+
+
+def inbox_row(conn: sqlite3.Connection, msg_id: object) -> Row:
+    mid = _position(msg_id, "message id")
+    m = get_inbox(conn, mid)
+    if m is None:
+        raise NotFound(f"no inbox message #{mid}")
+    return m
+
+
+def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str) -> Row:
+    clean = inbox_text(text)
+    sid = _session_id(session_id)
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text) VALUES (?, ?, ?, ?)",
+                           (now_iso(), created_by, sid, clean))
+        m = get_inbox(conn, _rowid(cur))
+    assert m is not None
+    return m
+
+
+def list_inbox(conn: sqlite3.Connection, status: str | Iterable[str] | None = None, session_id: str | None = None,
+               limit: int = 50) -> list[Row]:
+    """Newest first."""
+    where, args = [], []
+    if status is not None:
+        sts = [status] if isinstance(status, str) else list(status)
+        for s in sts:
+            _enum(s, INBOX_STATUSES, "status")
+        where.append(f"status IN ({','.join('?' * len(sts))})")
+        args += sts
+    if session_id is not None:
+        where.append("session_id=?")
+        args.append(session_id)
+    sql = "SELECT * FROM inbox_messages" + (" WHERE " + " AND ".join(where) if where else "")
+    rows = conn.execute(sql + f" ORDER BY id DESC LIMIT {int(limit)}", args)
+    return [_inbox_dict(r) for r in rows]
+
+
+def inbox_posted_since(conn: sqlite3.Connection, since: str) -> int:
+    r = conn.execute("SELECT COUNT(*) FROM inbox_messages WHERE created_at >= ?", (since,)).fetchone()
+    return int(r[0])
+
+
+def update_inbox(conn: sqlite3.Connection, msg_id: int, allowed_from: Sequence[str], **fields: object) -> Row:
+    """Set `fields` on the message if its status is one of `allowed_from` (else InvalidTransition)."""
+    unknown = set(fields) - set(INBOX_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown inbox field(s) {sorted(unknown)}")
+    with transaction(conn):
+        m = inbox_row(conn, msg_id)
+        if m["status"] not in allowed_from:
+            raise InvalidTransition(f"inbox message #{msg_id} is {m['status']}, not {'|'.join(allowed_from)}")
+        vals = [json.dumps(v, ensure_ascii=False) if k == "triage_usage" and v is not None else v
+                for k, v in fields.items()]
+        conn.execute(f"UPDATE inbox_messages SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                     (*vals, msg_id))
+        out = get_inbox(conn, msg_id)
+    assert out is not None
+    return out
 
 
 # ---------------------------------------------------------------- project docs (phase 2d part 2)

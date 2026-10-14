@@ -720,6 +720,8 @@ SETTINGS: dict[str, Setting] = {
     "automation_paused_reason": Setting("", _reason, "Why automation is paused (set with automation.set; a "
                                         "runner's failure says what failed); cleared on resume",
                                         section="automation", kind="text"),
+    "ui_chat_reset_hours": _num(5, 1, 168, "Dashboard message box to the task-manager (D-178): it starts "
+                              "empty again after this many hours without a new message or answer", "automation"),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
                                   "that holds an approved stalled session is stopped so it can be continued",
                                   "automation"),
@@ -1151,6 +1153,167 @@ def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_k
     before = store.get_handoff(conn, store._position(handoff_id, "handoff id"))
     after = store.consume_handoff(conn, handoff_id, start_key)
     return Result(after, after["id"], before, after)
+
+
+# ---------------------------------------------------------------- the owner's inbox (D-178, D-241)
+#
+# The owner's messages to the task-manager (store.inbox_messages; inbox.py, inbox_api.py). The row
+# holds the text as typed and is its only copy (D-241): the audit rows name a text by its size and
+# sha256, never repeat it. inbox.post is the owner's (the dashboard, the CLI); the triage and the
+# delivery steps are the runner's (inbox_api.py's worker, the keep-alive), never MCP's; inbox.reply
+# is the task-manager's answer (`tasks.py inbox reply`).
+
+INBOX_REASON_MAX = 300
+INBOX_ERROR_MAX = 1000
+INBOX_VIA_MAX = 200
+
+
+def _digest(text: str | None) -> dict[str, Any] | None:
+    if text is None:
+        return None
+    return {"chars": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+
+def _inbox_audit(m: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A message for the audit row: every field but the texts, which are named by size and sha256."""
+    if m is None:
+        return None
+    out = {k: v for k, v in m.items() if k not in ("text", "answer", "triage_usage")}
+    out.update(text=_digest(m.get("text")), answer=_digest(m.get("answer")))
+    return out
+
+
+def _inbox_change(before: store.Row, after: store.Row) -> Result:
+    return Result(after, after["id"], _inbox_audit(before), _inbox_audit(after))
+
+
+def _runner_only(ctx: Ctx, what: str) -> None:
+    if ctx.via == "mcp":
+        raise Forbidden(f"{what} is the runner's step (inbox_api.py, the keep-alive), not for MCP callers")
+
+
+def _short(value: Any, what: str, limit: int, required: bool = True) -> str | None:
+    t = store._text(value, what, required=required)
+    if t is not None and len(t) > limit:
+        t = t[:limit - 3] + "..."
+    return t
+
+
+@action("inbox.post", "inbox", owner_only=True)
+def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None) -> Result:
+    """A message from the owner to the task-manager (default: the AFClaude manager session),
+    pending until the triage sorts it."""
+    sid = session_id if session_id is not None else afclaude_config.manager_session()
+    m = store.add_inbox(conn, text, sid, ctx.actor)
+    return Result(m, m["id"], None, _inbox_audit(m))
+
+
+@action("inbox.triage", "inbox")
+def inbox_triage(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, verdict: Any, reason: Any,
+                 cost_usd: Any = None, usage: Any = None) -> Result:
+    """The Haiku verdict (D-241): "note" -> noted (it waits for the next message into the session),
+    "now" -> stays pending until it is delivered."""
+    _runner_only(ctx, "the triage")
+    store._enum(verdict, store.INBOX_VERDICTS, "verdict")
+    if cost_usd is not None and (isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float))):
+        raise ValueError(f"cost_usd must be a number, got {cost_usd!r}")
+    if usage is not None and not isinstance(usage, dict):
+        raise ValueError("usage must be an object")
+    before = store.inbox_row(conn, message_id)
+    if before["verdict"] is not None:
+        raise store.InvalidTransition(f"inbox message #{before['id']} was already triaged ({before['verdict']})")
+    after = store.update_inbox(conn, before["id"], ("pending",), verdict=verdict,
+                               verdict_reason=_short(reason, "reason", INBOX_REASON_MAX),
+                               triaged_at=store.now_iso(), triage_cost_usd=cost_usd, triage_usage=usage,
+                               status="noted" if verdict == "note" else "pending")
+    return _inbox_change(before, after)
+
+
+def _pending_now(conn: sqlite3.Connection, message_id: Any) -> store.Row:
+    m = store.inbox_row(conn, message_id)
+    if m["status"] != "pending" or m["verdict"] != "now":
+        raise store.InvalidTransition(f"inbox message #{m['id']} is not waiting for delivery "
+                                      f"(status {m['status']}, verdict {m['verdict']})")
+    return m
+
+
+@action("inbox.hold", "inbox")
+def inbox_hold(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, reason: Any) -> Result:
+    """A "now" message can't be typed in yet (the owner is typing, a compaction runs, ...): why,
+    and since when (kept while the reason stays the same: a no-op, no audit row)."""
+    _runner_only(ctx, "a delivery hold")
+    before = _pending_now(conn, message_id)
+    why = _short(reason, "reason", INBOX_REASON_MAX)
+    if before["hold"] == why:
+        return Result(before, before["id"], None, None, changed=False)
+    after = store.update_inbox(conn, before["id"], ("pending",), hold=why,
+                               hold_since=before["hold_since"] or store.now_iso())
+    return _inbox_change(before, after)
+
+
+@action("inbox.deliver", "inbox")
+def inbox_deliver(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, plan: Any) -> Result:
+    """A "now" message was typed into the session (D-186) with the send plan `plan`."""
+    _runner_only(ctx, "the delivery")
+    before = _pending_now(conn, message_id)
+    after = store.update_inbox(conn, before["id"], ("pending",), status="delivered", delivered_at=store.now_iso(),
+                               delivered_via=_short(plan, "plan", INBOX_VIA_MAX), hold=None)
+    return _inbox_change(before, after)
+
+
+@action("inbox.include", "inbox")
+def inbox_include(conn: sqlite3.Connection, ctx: Ctx, message_ids: Any, by: Any) -> Result:
+    """Noted messages went into the session with the message `by` (a start, a compaction's
+    hand-off, a delivered "now" message): noted -> included."""
+    _runner_only(ctx, "an inclusion")
+    if not isinstance(message_ids, list) or not message_ids:
+        raise ValueError("message_ids must be a non-empty list of message ids")
+    who = _short(by, "by", INBOX_VIA_MAX)
+    now = store.now_iso()
+    befores, afters = [], []
+    for mid in message_ids:
+        b = store.inbox_row(conn, mid)
+        befores.append(b)
+        afters.append(store.update_inbox(conn, b["id"], ("noted",), status="included", included_at=now,
+                                         included_by=who))
+    return Result(afters, ",".join(str(a["id"]) for a in afters),
+                  [{"id": b["id"], "status": b["status"]} for b in befores],
+                  [{"id": a["id"], "status": a["status"], "included_by": who} for a in afters])
+
+
+@action("inbox.fail", "inbox")
+def inbox_fail(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, error: Any) -> Result:
+    """The triage or the delivery failed (D-235): the message shows the error on the dashboard
+    until the owner retries it; it is never dropped."""
+    _runner_only(ctx, "a failure")
+    before = store.inbox_row(conn, message_id)
+    after = store.update_inbox(conn, before["id"], ("pending", "delivered"), status="error",
+                               error=_short(error, "error", INBOX_ERROR_MAX), error_at=store.now_iso(), hold=None)
+    return _inbox_change(before, after)
+
+
+@action("inbox.retry", "inbox", owner_only=True)
+def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
+    """The owner retries a failed message: pending again (triaged again if it has no verdict yet,
+    otherwise delivered or noted per its verdict). The old error stays in the audit row."""
+    before = store.inbox_row(conn, message_id)
+    status = "noted" if before["verdict"] == "note" else "pending"
+    after = store.update_inbox(conn, before["id"], ("error",), status=status, error=None, error_at=None,
+                               hold=None, hold_since=None)
+    return _inbox_change(before, after)
+
+
+@action("inbox.reply", "inbox")
+def inbox_reply(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, answer: Any) -> Result:
+    """The task-manager's answer, shown on the dashboard. A second reply is added below the first."""
+    text = store._text(answer, "answer", required=True)
+    if len(text) > store.INBOX_TEXT_MAX:
+        raise ValueError(f"answer is too long ({len(text)} > {store.INBOX_TEXT_MAX} characters)")
+    before = store.inbox_row(conn, message_id)
+    full = f"{before['answer']}\n\n{text}" if before["answer"] else text
+    after = store.update_inbox(conn, before["id"], ("pending", "delivered", "noted", "included", "answered"),
+                               status="answered", answer=full, answered_at=store.now_iso(), hold=None)
+    return _inbox_change(before, after)
 
 
 # ---------------------------------------------------------------- project docs (phase 2d part 2, §7.2, §7.7)

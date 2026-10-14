@@ -1716,7 +1716,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         # a session in this repo has its standing rules from the SessionStart hook: only a pointer (D-225)
         return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
-    msg = build(stall.get("insert"))
+    notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
+    msg = build(with_notes(stall.get("insert"), notes))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -1733,6 +1734,11 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
               "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
+    if rc == 0 and note_ids:
+        result["inbox_notes"] = note_ids
+        if not inbox_included(note_ids, key):
+            errors.append((f"inbox notes sent with the continue of {sid[:8]} not marked included",
+                           f"messages {note_ids} went out with {key}; they would go out once more"))
     reply = verify_reply(path, sent_at) if rc == 0 else None
     try:
         live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
@@ -2296,6 +2302,45 @@ def consume_handoff(h, start_key):
         return False
 
 
+def inbox_notes(sid):
+    """D-241: the owner's noted inbox messages for this session, as one line for the next message
+    into it (inbox.notes_insert) -> (text or None, ids). A DB failure raises: the caller aborts
+    what it was about to send (D-235)."""
+    import inbox
+    import store
+    conn = store.connect()
+    try:
+        return inbox.notes_insert(conn, sid)
+    finally:
+        conn.close()
+
+
+def inbox_included(ids, by):
+    """The noted messages `ids` went out with the message `by` (a start's key, a compaction):
+    noted -> included (actions.py, audited). -> True / False (logged; the caller reports it: they
+    were sent, and would go out once more with the next message)."""
+    if not ids:
+        return True
+    import actions
+    import store
+    try:
+        conn = store.connect()
+        try:
+            actions.perform(conn, "inbox.include", {"message_ids": list(ids), "by": by}, actor="keepalive",
+                            via="runner")
+        finally:
+            conn.close()
+        return True
+    except Exception as e:   # noqa: BLE001 - it was sent; the caller reports it (fail_stop)
+        log(f"inbox notes {list(ids)} not marked included: {type(e).__name__}: {e}")
+        return False
+
+
+def with_notes(text, notes):
+    """`text` (or nothing) followed by the inbox notes (or nothing)."""
+    return f"{text} {notes}" if text and notes else (text or notes)
+
+
 # ---- the triggers (D-238): compaction_pass, once a minute in the watcher
 
 _ANSI = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])|\x1b[()][A-Za-z0-9]|\x1b[=>]")
@@ -2591,12 +2636,18 @@ def _compact_now(sid, path, d, rec, head):
         except failstop.Failed as e:
             return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record)
         rec["steps"] = _jsonable(steps)
-        msg = session_message("compact_after", hooked=rules_hooked(cwd), resume=insert)
+        notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages, read after the hand-off
+        msg = session_message("compact_after", hooked=rules_hooked(cwd), resume=with_notes(insert, notes))
         sent_at = datetime.now(UTC)
         rc, out, err = fire(sid, cwd, msg, "send-keys")
         if rc != 0:
             return _compaction_failed(sid, d.key, rec, "the hand-off could not be sent after the compaction",
                                       f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip())
+        if note_ids:
+            rec["inbox_notes"] = note_ids
+            if not inbox_included(note_ids, f"compaction {d.key}"):
+                fail_stop(f"inbox notes sent after the compaction of {sid[:8]} not marked included",
+                          f"messages {note_ids}; they would go out once more")
         consumed = consume_handoff(h, d.key)
         reply = verify_reply(path, sent_at)
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, reported

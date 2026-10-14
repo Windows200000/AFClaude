@@ -1,5 +1,6 @@
-# AFClaude quickview: a tiny read-only nginx behind the host's existing Traefik.
+# AFClaude quickview: a tiny nginx behind the host's existing Traefik.
 # Serves ONLY ../data/quickview (written by export_quickview.py) at https://$AFCLAUDE_QUICKVIEW_HOST/afclaude/,
+# plus /afclaude/api/ proxied to the afclaude container's inbox API (a unix socket in ../data/api, no port),
 # and every request needs the X-AFClaude-Key header (401 otherwise).
 # The host name comes from quickview/.env (gitignored): AFCLAUDE_QUICKVIEW_HOST=<your host>.
 # The key lives outside the repo: ~/.config/afclaude/quickview-nginx-keymap.conf (mode 600).
@@ -17,6 +18,7 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ${HOME}/.config/afclaude/quickview-nginx-keymap.conf:/etc/nginx/afclaude-keymap.conf:ro
       - ../data/quickview:/srv/quickview:ro
+      - ../data/api:/run/afclaude-api:ro       # inbox_api.py's unix socket (the message box, D-241)
     expose:
       - "80"
     mem_limit: 64m

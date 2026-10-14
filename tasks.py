@@ -27,6 +27,11 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py rule add session|project MATCH continue|ignore [--note N]
     tasks.py rule list | rule rm ID
     tasks.py inbox                         everything that needs the user's input
+    tasks.py inbox list [--all]            the owner's messages from the dashboard (D-241): open ones
+                                           (--all: the recent ones), newest first
+    tasks.py inbox show ID                 one message in full, with its verdict, status and answer
+    tasks.py inbox reply ID "answer"       answer it (the owner reads it on the dashboard)
+    tasks.py inbox retry ID                send a failed message again (triage / delivery)
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
                                            open_question_ids, notes} ("-" = read it from stdin)
@@ -454,6 +459,8 @@ def run(conn, args):
         return run_doc(conn, args) or 0
     elif c == "automation":
         run_automation(conn, args)
+    elif c == "inbox" and args.inbox_cmd:
+        run_inbox_messages(conn, args)
     elif c == "inbox":
         maybe_scan(conn, args)
         box = store.pending_user_input(conn)
@@ -463,6 +470,49 @@ def run(conn, args):
         else:
             print_inbox(box)
     return 0
+
+
+INBOX_OPEN = ("pending", "delivered", "noted", "error")
+
+
+def print_inbox_message(m, full=False):
+    verdict = f"{m['verdict']}: {m['verdict_reason']}" if m["verdict"] else "not triaged yet"
+    print(f"#{m['id']}  {m['status']}  {berlin(m['created_at'])}  ({verdict})")
+    text = m["text"] if full else cut(" ".join(m["text"].split()), 200)
+    print("   " + text.replace("\n", "\n   "))
+    if m["hold"]:
+        print(f"   waiting since {berlin(m['hold_since'])}: {m['hold']}")
+    if m["error"]:
+        print(f"   ERROR {berlin(m['error_at'])}: {m['error']}")
+    if m["included_by"]:
+        print(f"   sent along with {m['included_by']} at {berlin(m['included_at'])}")
+    if m["answer"]:
+        ans = m["answer"] if full else cut(" ".join(m["answer"].split()), 200)
+        print(f"   answer ({berlin(m['answered_at'])}): " + ans.replace("\n", "\n   "))
+
+
+def run_inbox_messages(conn, args):
+    """The owner's messages to the task-manager (D-178/D-241): read them, answer them."""
+    ic = args.inbox_cmd
+    if ic == "list":
+        rows = store.list_inbox(conn, None if args.all else INBOX_OPEN, limit=50)
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print("no open messages from the owner" if not args.all else "no messages")
+        for m in rows:
+            print_inbox_message(m)
+        return None
+    if ic == "show":
+        m = store.inbox_row(conn, args.id)
+        return dump(m) if args.json else print_inbox_message(m, full=True)
+    if ic == "reply":
+        m = act(conn, "inbox.reply", message_id=args.id, answer=args.answer)
+    else:   # retry
+        m = act(conn, "inbox.retry", message_id=args.id)
+    if args.json:
+        return dump(m)
+    return print(f"inbox #{m['id']}: {m['status']}")
 
 
 def run_automation(conn, args):
@@ -575,7 +625,18 @@ def parser():
     rs.add_parser("list", parents=[js])
     q = rs.add_parser("rm", parents=[js])
     q.add_argument("id", type=int)
-    sub.add_parser("inbox", parents=[js, scan], help="blocked tasks + undecided stalled sessions")
+    p = sub.add_parser("inbox", parents=[js, scan], help="blocked tasks + undecided stalled sessions; "
+                       "list|show|reply|retry: the owner's messages from the dashboard (D-241)")
+    ibs = p.add_subparsers(dest="inbox_cmd")
+    q = ibs.add_parser("list", parents=[js], help="the owner's open messages (--all: the recent ones)")
+    q.add_argument("--all", action="store_true")
+    q = ibs.add_parser("show", parents=[js], help="one message in full")
+    q.add_argument("id", type=int)
+    q = ibs.add_parser("reply", parents=[js], help="answer a message (shown on the dashboard)")
+    q.add_argument("id", type=int)
+    q.add_argument("answer")
+    q = ibs.add_parser("retry", parents=[js], help="send a failed message again")
+    q.add_argument("id", type=int)
     p = sub.add_parser("handoff", help="compaction hand-offs (D-144)")
     hs = p.add_subparsers(dest="handoff_cmd", required=True)
     q = hs.add_parser("write", help="save a hand-off for your compacted self (prints HANDOFF SAVED)")
