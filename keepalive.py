@@ -53,6 +53,10 @@ ERROR line, an alert, automation_paused set with the reason; failstop.py), and w
 aborted (a start before its continue went out is recorded as start-failed). No fallback to another
 rule or older data, no silent retry on the next tick. While automation_paused is set (by a failure
 or by hand) nothing starts or continues; the owner clears it: `python3 tasks.py automation resume`.
+The task-manager's checks also hold while its own project is paused (D-244: an inbox error pauses
+only the project the message was for; `automation resume --project NAME` clears it): every check
+here asks failstop.paused(session=sid), the install-wide pause OR the pause of the project sid is
+the task-manager of. --work-on (a backlog project, no session) checks the install-wide one only.
 
 Default is DRY-RUN (decides and logs "WOULD FIRE", never resumes anything).
 Pass --arm to actually fire. Create a file named STOP next to this script to
@@ -1343,7 +1347,7 @@ def last_mile_pass(sid, now, st, args):
     key = last_mile_key(w["resets_at"], slot)
     if last_mile_handled(key, st["handled"]):
         return None
-    if automation_paused(f"the last-stretch slot {key}"):
+    if automation_paused(f"the last-stretch slot {key}", sid):
         return now + LAST_MILE_RECHECK
     action, detail, stall = stall_status(sid, now)
     if action == "WAIT_RESET":
@@ -1377,10 +1381,10 @@ def window_start_pass(sid, now, args):
     way (db_paused's docstring): nothing else makes this start due again before then. Paused
     automation (D-234/D-235) skips the start (a progress note says so); a failed usage reading
     is an error (fresh_usage: alert + pause). -> the decision dict."""
-    if automation_paused(f"the session-window start {berlin(now)}"):
-        d = {"go": False, "reason": f"PAUSED: automation is paused ({paused_reason()})", "postpone": False}
+    if automation_paused(f"the session-window start {berlin(now)}", sid):
+        d = {"go": False, "reason": f"PAUSED: automation is paused ({paused_reason(sid)})", "postpone": False}
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}; clear it with "
-                      "`python3 tasks.py automation resume` once the error is fixed (D-234/D-235)")
+                      f"`{resume_hint(sid)}` once the error is fixed (D-234/D-235)")
         return d
     u = fresh_usage(now, force=True)
     if u is None:      # fresh_usage raised the error (alert + pause): no decision on unknown numbers
@@ -1491,13 +1495,13 @@ def deferred_window_start_pass(sid, now, st, args):
     due = parse_ts(ent.get("recheck_at")) or now
     if now < due:
         return due
-    paused = automation_paused(f"the postponed session-window start {key}")
+    paused = automation_paused(f"the postponed session-window start {key}", sid)
     u = None if paused else fresh_usage(now, force=True)
     if u is None:   # paused, or the usage reading failed (fresh_usage: alert + pause): dropped
         defs.pop(key, None)
         save_deferred(defs)
         progress_note(f"window-start (postponed) {berlin(now)}: not resumed, "
-                      + (f"automation is paused ({paused_reason()})" if paused else
+                      + (f"automation is paused ({paused_reason(sid)})" if paused else
                          "the usage reading failed (automation paused)") + " (D-234/D-235)")
         return None
     d = budget_eval(u, now)
@@ -1561,33 +1565,47 @@ def watch_run_usage(sid, now):
             fail_stop("run usage reading failed", f"{type(e).__name__}: {e}")
 
 
-_PAUSE_LOGGED = None   # the automation_paused reason last logged (once per reason)
+_PAUSE_LOGGED = {}     # {session or None: the pause reason last logged for its checks} (once per reason)
 
 
-def automation_paused(what):
+def automation_paused(what, sid=None):
     """The pause switch (automation_paused, D-234/D-235; failstop.paused(): a DB that can't be
-    read counts as paused). True = don't start `what`; logged once per pause reason. Set by any
-    runner's failure (fail_stop) or by hand; the owner clears it (`tasks.py automation resume`)."""
-    global _PAUSE_LOGGED
+    read counts as paused): the install-wide pause, or (D-244) the pause of the project `sid` is
+    the task-manager of. True = don't start `what`; logged once per pause reason. Set by any
+    runner's failure (fail_stop) or by hand; the owner clears it (`tasks.py automation resume`,
+    a project's with `--project NAME`)."""
     import failstop
-    p = failstop.paused()
+    p = failstop.paused(session=sid)
     if not p["paused"]:
-        if _PAUSE_LOGGED is not None:
-            log("automation_paused cleared: autonomous starts resume")
-            _PAUSE_LOGGED = None
+        if _PAUSE_LOGGED.pop(sid, None) is not None:
+            log("automation_paused cleared" + (f" for {sid[:8]}" if sid else "") + ": autonomous starts resume")
         return False
     reason = p.get("reason") or "no reason given"
-    if reason != _PAUSE_LOGGED:
-        log(f"PAUSED (automation_paused), not starting {what}: {reason}; the owner clears it with "
-            f"`{failstop.RESUME_CMD}`")
-        _PAUSE_LOGGED = reason
+    if reason != _PAUSE_LOGGED.get(sid):
+        scope = f"the project {p['project']}" if p.get("scope") == "project" else "automation_paused"
+        log(f"PAUSED ({scope}), not starting {what}: {reason}; the owner clears it with "
+            f"`{_resume_of(p)}`")
+        _PAUSE_LOGGED[sid] = reason
     return True
 
 
-def paused_reason():
-    """The pause reason for a log line or a note (the strict read)."""
+def _resume_of(p):
     import failstop
-    return failstop.paused().get("reason") or "no reason given"
+    return failstop.resume_cmd(p.get("project") if p.get("scope") == "project" else None)
+
+
+def paused_reason(sid=None):
+    """The pause reason for a log line or a note (the strict read; with `sid`, its project's too)."""
+    import failstop
+    p = failstop.paused(session=sid)
+    reason = p.get("reason") or "no reason given"
+    return f"project {p['project']}: {reason}" if p.get("scope") == "project" else reason
+
+
+def resume_hint(sid=None):
+    """The command that clears what pauses `sid` now (the install-wide one, else its project's)."""
+    import failstop
+    return _resume_of(failstop.paused(session=sid))
 
 
 _DB_PAUSE = None   # the database problem the starts are paused for (logged once per problem)
@@ -1637,7 +1655,7 @@ def handle_fire(sid, stall, reason, st, args):
     if getattr(st, "unavailable", False):   # the state is only a default (DB unreadable): decide again later
         log(f"PAUSED, not starting {sid[:8]} ({reason}): the keepalive state could not be read from the database")
         return "db_paused"
-    if automation_paused(f"{sid[:8]} ({reason})"):
+    if automation_paused(f"{sid[:8]} ({reason})", sid):
         return "paused"
     night = schedule.night(datetime.now(UTC))
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
@@ -1731,7 +1749,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     offset = os.path.getsize(path) if held_ids and path else 0   # the held messages' markers come after
     sent_at = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, msg, plan)
-    errors = []                      # failures after the continue went out: recorded, then raised
+    errors = []                      # failures after the continue went out: recorded, then raised;
+                                     # (subject, detail[, session]): an inbox one pauses only sid's project (D-244)
     st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
@@ -1740,12 +1759,12 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         result["inbox_now"] = held_ids
         if not inbox_delivered(held_ids, f"{plan}, with the start {key}"):
             errors.append((f"held inbox messages sent with the continue of {sid[:8]} not marked delivered",
-                           f"messages {held_ids} went out with {key}; they would go out once more"))
+                           f"messages {held_ids} went out with {key}; they would go out once more", sid))
     if rc == 0 and note_ids:
         result["inbox_notes"] = note_ids
         if not inbox_included(note_ids, key):
             errors.append((f"inbox notes sent with the continue of {sid[:8]} not marked included",
-                           f"messages {note_ids} went out with {key}; they would go out once more"))
+                           f"messages {note_ids} went out with {key}; they would go out once more", sid))
     reply = verify_reply(path, sent_at) if rc == 0 else None
     if rc == 0 and held_ids:             # D-244: each held message's marker must be in the transcript
         import inbox
@@ -1755,7 +1774,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
             stored = inbox_failed(unseen, f"sent with the start {key}, but not in the session's transcript")
             errors.append((f"held inbox messages sent with the continue of {sid[:8]} not in its transcript",
                            f"messages {unseen} (start {key})" + ("" if stored else "; the error could not be "
-                                                                 "stored on them either")))
+                                                                 "stored on them either"), sid))
     try:
         live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
         result["env"] = [process_env_flags(a["pid"]) for a in live]
@@ -1776,8 +1795,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     st["handled"][key] = result
     save_state(st)
     progress_note(f"fired continue for {sid[:8]} via {plan}: {result.get('result')} ({reason})")
-    for subject, detail in errors:
-        fail_stop(subject, detail)
+    for subject, detail, *inbox_sid in errors:
+        fail_stop(subject, detail, session=inbox_sid[0] if inbox_sid else None)
     return None
 
 
@@ -1847,7 +1866,7 @@ def fillup_decision(sid, now, usage=None):
     import fillup
     import failstop
     s = afclaude_config.settings("fillup_enabled", "fillup_factor", "pacing_idle_min", "pacing_last_mile_yield")
-    s["automation_paused"] = failstop.paused()["paused"]     # the strict read (unreadable = paused)
+    s["automation_paused"] = failstop.paused(session=sid)["paused"]   # strict (unreadable = paused); D-244: its project too
     u = usage if usage is not None else (usage_cache_checked() or {})
     sess, w = u.get("session") or {}, u.get("weekly") or {}
     reset = sess.get("resets_at")
@@ -1888,7 +1907,8 @@ def fillup_test_pass(sid, now, args, test):
     import failstop
     import fillup
     st = load_state()
-    d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {}, paused=failstop.paused()["paused"])
+    d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {},
+                           paused=failstop.paused(session=sid)["paused"])
     _fillup_log(f"fill-up TEST: {d['status']}: {d['reason']} (start {berlin(d['start'])}, key {d['key']})")
     if d["status"] == "fire":
         _fire_fillup(sid, now, d, args, test=True)
@@ -2621,7 +2641,7 @@ def compaction_pass(sid, now, args):
     if not _compaction_settings()["compaction_enabled"]:
         _compact_log("compaction: compaction_enabled is off")
         return None
-    if automation_paused(f"the compaction of {sid[:8]}"):
+    if automation_paused(f"the compaction of {sid[:8]}", sid):
         return None
     path = transcript_path(sid)
     if not path:
@@ -2705,7 +2725,7 @@ def _compact_now(sid, path, d, rec, head):
             rec["inbox_notes"] = note_ids
             if not inbox_included(note_ids, f"compaction {d.key}"):
                 fail_stop(f"inbox notes sent after the compaction of {sid[:8]} not marked included",
-                          f"messages {note_ids}; they would go out once more")
+                          f"messages {note_ids}; they would go out once more", session=sid)   # D-244
         consumed = consume_handoff(h, d.key)
         reply = verify_reply(path, sent_at)
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, reported
@@ -2752,7 +2772,7 @@ def work_on_project(sel, args):
     p = hits[0]
     now = datetime.now(UTC)
     if automation_paused(f"the backlog project {p['title']!r}"):
-        sys.exit(f"automation is paused ({paused_reason()}); clear it first: python3 tasks.py automation resume")
+        sys.exit(f"automation is paused ({paused_reason()}); clear it first: {resume_hint()}")
     go, reason = budget_decision(fresh_usage(now, force=True), now)
     log(f"work-on {p['title']!r} (window ignored): {reason}")
     if not go:
@@ -2907,12 +2927,13 @@ def alert(subject, body=""):
         log(f"alert itself failed: {e!r}")
 
 
-def fail_stop(subject, detail=""):
+def fail_stop(subject, detail="", session=None):
     """A failure or timeout (D-234/D-235): an ERROR line, automation_paused with the reason, an
     alert (failstop.fail with this module's log and alert). The caller aborts what it was doing.
+    session: an inbox error (D-244) pauses only the project this session is the task-manager of.
     Never raises."""
     import failstop
-    return failstop.fail("keepalive", subject, detail, log=log, alert=alert)
+    return failstop.fail("keepalive", subject, detail, log=log, alert=alert, session=session)
 
 
 if __name__ == "__main__":

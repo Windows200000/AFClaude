@@ -566,6 +566,8 @@ class Pass:
             raise RuntimeError(f"tmux kill-session rc={rc}: {err}")
 
     def run(self):
+        # the install-wide pause only: the stalled sessions it continues are no AFClaude project's
+        # (a task-manager's or a task's are never continued, afclaude_run), so no project pause applies
         p = failstop.paused()
         self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         excluded = excluded_sessions(self.cfg)

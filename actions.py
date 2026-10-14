@@ -891,6 +891,31 @@ def automation_set(conn: sqlite3.Connection, ctx: Ctx, paused: Any, reason: Any 
                   {"value": new["automation_paused"], "reason": new["automation_paused_reason"]})
 
 
+@action("automation.set_project", "project", owner_only=True)
+def automation_set_project(conn: sqlite3.Connection, ctx: Ctx, project: Any, paused: Any, reason: Any = None) -> Result:
+    """Pause / resume one project's automation (D-244; idempotent): its runner checks hold while it
+    is set, on top of the install-wide automation.set. project: id, name or directory. A pause
+    records `reason` (None keeps the current one); a resume clears it. -> {project, name, paused,
+    reason, version, updated_at, updated_by}."""
+    pr = _project(conn, project)
+    p = _bool(paused)
+    r = (_reason(reason) if reason is not None else None) if p else ""
+    row = store.get_project_pause(conn, pr["id"])
+    old = {"paused": row["paused"] if row else None, "reason": row["reason"] if row else None}
+    new_reason: str | None = old["reason"] if r is None else (r or None)
+    new = {"paused": p, "reason": new_reason}
+    if row is None and not p:
+        cur = None                                  # never paused: a resume changes nothing
+    elif new != old:
+        cur = store.put_project_pause(conn, pr["id"], p, new_reason, ctx.actor)
+    else:
+        cur = row
+    view = {"project": pr["id"], "name": pr["name"], "paused": bool(cur and cur["paused"]),
+            "reason": cur["reason"] if cur else None, "version": cur["version"] if cur else 0,
+            "updated_at": cur["updated_at"] if cur else None, "updated_by": cur["updated_by"] if cur else None}
+    return Result(view, pr["id"], old, new if cur is not None else old)
+
+
 def _fresh_group(days: Mapping[str, Any]) -> str:
     used = {w["group"] for w in days.values() if w}
     i = 1

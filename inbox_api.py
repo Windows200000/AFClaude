@@ -254,7 +254,8 @@ def ensure(boot: bool) -> int:
     elif not os.path.exists(DOWN):      # one error per outage: serve() removes the mark once it listens
         with open(DOWN, "w") as fh:
             fh.write(datetime.now(inbox.BERLIN).isoformat() + "\n")
-        failstop.fail("inbox", "inbox API was not running",   # an inbox error: alert + pause (D-244)
+        # an inbox error: alert + pause (D-244); install-wide: the API serves every project's inbox
+        failstop.fail("inbox", "inbox API was not running",
                       "the watchdog started it again; if it keeps failing, see data/inbox_api.log", log=log)
     else:
         log("inbox API still not running; started again (already alerted)")

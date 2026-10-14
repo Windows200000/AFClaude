@@ -36,9 +36,12 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            BODY = JSON {summary, done, in_progress, next_steps,
                                            open_question_ids, notes} ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
-    tasks.py automation [status]           is automation paused (D-234/D-235), why, since when
-    tasks.py automation resume             clear the pause (after looking at the error it names)
-    tasks.py automation pause [REASON]     pause every runner by hand
+    tasks.py automation [status]           is automation paused (D-234/D-235), why, since when: the
+                                           install-wide pause and every paused project (D-244)
+    tasks.py automation resume [--project P | --all]   clear the install-wide pause (after looking
+                                           at the error it names); --project: that project's pause
+                                           only; --all: the install-wide one and every project's
+    tasks.py automation pause [REASON] [--project P]   pause every runner (or one project's) by hand
     tasks.py doc list [--project P]        the project's docs in the DB (phase 2d, project_docs.py)
     tasks.py doc show NAME [--project P] [--entries N]   a doc's text (--entries: its newest entries)
     tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
@@ -516,22 +519,53 @@ def run_inbox_messages(conn, args):
 
 
 def run_automation(conn, args):
-    """D-234/D-235: a runner pauses automation on any failure; the owner looks, then resumes."""
-    if args.automation_cmd == "resume":
-        act(conn, "automation.set", paused=False)
-    elif args.automation_cmd == "pause":
-        act(conn, "automation.set", paused=True, reason=args.reason or "paused by hand (tasks.py)")
+    """D-234/D-235: a runner pauses automation on any failure; the owner looks, then resumes.
+    Two scopes (D-244): the install-wide pause and a project's (an inbox error pauses only the
+    project its message was for). resume / pause act on the install-wide one; --project on that
+    project's; resume --all on both kinds."""
+    import failstop
+    cmd = getattr(args, "automation_cmd", None)
+    project = getattr(args, "project", None)
+    if project is not None and project.isdigit():
+        project = int(project)                     # an id (store.get_project: a string is a name or path)
+    if cmd == "resume":
+        if project is not None and args.all:
+            raise ValueError("automation resume: --project or --all, not both")
+        if project is not None:
+            act(conn, "automation.set_project", project=project, paused=False)
+        else:
+            act(conn, "automation.set", paused=False)
+            if args.all:
+                for pp in store.project_pauses(conn):
+                    act(conn, "automation.set_project", project=pp["project_id"], paused=False)
+    elif cmd == "pause":
+        reason = args.reason or "paused by hand (tasks.py)"
+        if project is not None:
+            act(conn, "automation.set_project", project=project, paused=True, reason=reason)
+        else:
+            act(conn, "automation.set", paused=True, reason=reason)
     row = store.get_setting_row(conn, "automation_paused")
     st = {"paused": bool(actions.get_setting(conn, "automation_paused")),
           "reason": actions.get_setting(conn, "automation_paused_reason") or None,
-          "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None}
+          "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None,
+          "projects": [{"project": r["project_id"], "name": r["name"], "reason": r["reason"],
+                        "since": r["updated_at"], "by": r["updated_by"]} for r in store.project_pauses(conn)]}
     if args.json:
-        dump(st)
-    elif st["paused"]:
+        return dump(st)
+    if st["paused"]:
         print(f"automation PAUSED since {berlin(st['since'])} (by {st['by']}): {st['reason'] or '(no reason given)'}")
-        print("look at the error (tasks.py doc show alerts), fix it, then: python3 tasks.py automation resume")
     else:
-        print("automation running (not paused)")
+        print("automation running (not paused)" if not st["projects"] else
+              "automation running install-wide (not paused); paused project(s) below")
+    for pp in st["projects"]:
+        print(f"project {pp['name']} PAUSED since {berlin(pp['since'])} (by {pp['by']}): "
+              f"{pp['reason'] or '(no reason given)'}")
+    if st["paused"] or st["projects"]:
+        print("look at the error (tasks.py doc show alerts), fix it, then: "
+              + "; ".join(([failstop.RESUME_CMD] if st["paused"] else [])
+                          + [failstop.resume_cmd(pp["name"]) for pp in st["projects"]])
+              + (f" (or all at once: {failstop.RESUME_CMD} --all)" if len(st["projects"]) + st["paused"] > 1 else ""))
+    return None
 
 
 def parser():
@@ -649,10 +683,14 @@ def parser():
     q.add_argument("--all", action="store_true", help="the recent ones, newest first")
     p = sub.add_parser("automation", help="the automation pause (D-234/D-235): status | resume | pause")
     ats = p.add_subparsers(dest="automation_cmd")
-    ats.add_parser("status", parents=[js], help="paused or not, why, since when (the default)")
-    ats.add_parser("resume", parents=[js], help="clear the pause: the runners start and continue again")
-    q = ats.add_parser("pause", parents=[js], help="pause every runner by hand")
+    ats.add_parser("status", parents=[js], help="paused or not, why, since when; every paused project (the default)")
+    q = ats.add_parser("resume", parents=[js], help="clear the install-wide pause: the runners start and continue "
+                       "again (a paused project stays paused: --project / --all)")
+    q.add_argument("--project", help="clear only this project's pause (name, directory or id)")
+    q.add_argument("--all", action="store_true", help="clear the install-wide pause and every project's")
+    q = ats.add_parser("pause", parents=[js], help="pause every runner (or one project's) by hand")
     q.add_argument("reason", nargs="?", help="why (shown in the quickview)")
+    q.add_argument("--project", help="pause only this project's runs (name, directory or id)")
     p.set_defaults(json=False)
     p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
     ds = p.add_subparsers(dest="doc_cmd", required=True)

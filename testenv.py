@@ -73,13 +73,37 @@ def clear_settings(db=None):
 
 
 def unpause(db=None):
-    """Clear automation_paused (and its reason) as the owner would (`tasks.py automation resume`):
-    a test that made a runner fail-stop (failstop.fail, D-234/D-235) leaves no pause behind."""
+    """Clear automation_paused (and its reason) and every project's pause as the owner would
+    (`tasks.py automation resume --all`): a test that made a runner fail-stop (failstop.fail,
+    D-234/D-235/D-244) leaves no pause behind."""
     conn = store.connect(db or store.DB_PATH)
     try:
         actions.perform(conn, "automation.set", {"paused": False}, actor="cli", via="cli")
+        for p in store.project_pauses(conn):
+            actions.perform(conn, "automation.set_project", {"project": p["project_id"], "paused": False},
+                            actor="cli", via="cli")
     finally:
         conn.close()
+
+
+def managed_project(name, session, db=None):
+    """A project `name` whose task-manager is `session` (created once; projects.manager_session).
+    -> a cleanup that makes it unmanaged again (so a later test's session has no project)."""
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        if store.get_project(conn, name) is None:
+            store.add_project(conn, name)
+        store.update_project(conn, name, manager_session=session)
+    finally:
+        conn.close()
+
+    def undo():
+        c = store.connect(db or store.DB_PATH)
+        try:
+            store.update_project(c, name, manager_session="")
+        finally:
+            c.close()
+    return undo
 
 
 def notes_project(directory, db=None):

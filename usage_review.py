@@ -417,7 +417,7 @@ def _main():
         return   # a broken DB (or its state unreadable): start nothing (design §7.8); the next cron run retries
     for rec in track_reviews(now):
         ka.log(f"usage review {rec['review_id'][:8]} ({'+'.join(rec.get('reviews') or [])}): {rec['status']}")
-    pause = failstop.paused()
+    pause = failstop.paused()     # the install-wide pause only: the reviews are no one project's (D-244)
     if pause["paused"] and (args.only or args.now or now >= datetime.fromisoformat(st["next_run_at"])):
         why = pause.get("reason") or "no reason given"
         if args.only:     # its at job is used up: say so, it has to be scheduled again

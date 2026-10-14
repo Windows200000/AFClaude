@@ -228,6 +228,27 @@ class Triage(DB):
         self.assertIn("inbox: inbox message triage failed", p["reason"])
         self.assertEqual(iw.process(self.conn, verify=lambda *a: None), {})   # not retried on its own
 
+    def test_an_inbox_error_pauses_only_the_messages_project(self):
+        """D-244: the message's session is the task-manager of PA: only PA is paused (its runner
+        checks hold), a second project PB and every install-wide check go on."""
+        other = "bbbbbbbb-1111-4222-8333-444444444444"
+        self.addCleanup(testenv.managed_project("PA", SID))
+        self.addCleanup(testenv.managed_project("PB", other))
+        def boom(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 120)
+        self.answer = boom
+        m = self.post("Stop the run now!")
+        iw.process(self.conn, verify=lambda *a: None)
+        self.assertEqual(self.row(m["id"])["status"], "error")
+        p = failstop.paused(session=SID)
+        self.assertEqual((p["paused"], p["scope"], p["project"]), (True, "project", "PA"))
+        self.assertIn("inbox: inbox message triage failed", p["reason"])
+        self.assertFalse(failstop.paused(session=other)["paused"])
+        self.assertFalse(failstop.paused()["paused"])
+        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED (PA): inbox message triage failed"])
+        self.assertTrue(ka.automation_paused("the start", SID))
+        self.assertFalse(ka.automation_paused("the start", other))
+
     def test_a_failed_pass_is_an_error_and_pauses(self):
         """A DB failure in a pass (D-244): alerted, automation paused; the worker goes on."""
         wake, stop = threading.Event(), threading.Event()
@@ -598,6 +619,21 @@ class HeldInStarts(tc.Env):
         self.assertEqual(ka.load_state()["handled"][self.KEY]["inbox_unseen"], [self.held])
         self.assertTrue(any("not in its transcript" in a for a in self.alerts))
         self.assertTrue(failstop.paused()["paused"])
+
+    def test_not_in_the_transcript_pauses_only_its_project(self):
+        """D-244: the keep-alive's inbox helpers pause the project of the session (PA), not all."""
+        self.addCleanup(testenv.managed_project("PA", SID))
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            self.sent.append((plan, message))
+            self.write([tc.assistant(datetime.now(UTC))], "a")
+            return 0, "sent-keys ka-abcdef01", ""
+        ka.fire = fire
+        self.start()
+        self.assertEqual(self.row(self.held)["status"], "error")
+        p = failstop.paused(session=SID)
+        self.assertEqual((p["paused"], p["scope"], p["project"]), (True, "project", "PA"), p)
+        self.assertIn("not in its transcript", p["reason"])
+        self.assertFalse(failstop.paused()["paused"])
 
     def test_a_failed_send_leaves_it_held(self):
         ka.fire = lambda *a, **kw: (self.sent.append(a[2:4]), (1, "", "send-keys failed"))[1]

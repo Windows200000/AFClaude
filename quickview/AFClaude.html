@@ -67,7 +67,7 @@ summary .mut { font-weight: 400; margin-left: 6px; }
 details > .md { padding: 8px 0 4px; }
 section.paused { background: #3b0d0d; border: 2px solid #ef4444; }
 section.paused h2 { color: #fecaca; }
-section.paused #paused-reason { color: #fff; font-weight: 600; word-break: break-word; }
+section.paused #paused-reason, section.paused .paused-project { color: #fff; font-weight: 600; word-break: break-word; }
 .err { background: #3b0d0d; border: 1px solid #7f1d1d; color: #fecaca; border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; }
 .sub { font-size: 15px; color: #e8eaed; margin: 16px 0 6px; }
 .decision { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 8px 10px; word-break: break-word; }
@@ -127,10 +127,13 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   <div id="error" class="err" hidden></div>
   <div id="budget-error" class="err" hidden></div>
   <section id="paused" class="paused" hidden aria-live="polite">
-    <h2>Automation is PAUSED</h2>
-    <p id="paused-reason"></p>
-    <p class="mut" id="paused-meta"></p>
-    <p class="mut">No run starts or continues until you clear it. Look at the error (the alerts doc), fix it, then: <code id="paused-cmd"></code></p>
+    <h2 id="paused-title">Automation is PAUSED</h2>
+    <div id="paused-install">
+      <p id="paused-reason"></p>
+      <p class="mut" id="paused-meta"></p>
+    </div>
+    <div id="paused-projects"></div>
+    <p class="mut"><span id="paused-what">No run starts or continues until you clear it.</span> Look at the error (the alerts doc), fix it, then: <code id="paused-cmd"></code></p>
   </section>
 
   <section id="s-input">
@@ -444,9 +447,22 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     var a = s.automation || {};
     $("paused").hidden = !a.paused;
     if (!a.paused) return;
+    // D-244: the install-wide pause and/or the paused projects (an inbox error pauses only its project)
+    var install = a.install !== false, projects = a.projects || [];
+    var meta = function (x) { return (x.since_berlin ? "since " + x.since_berlin : "") + (x.by ? " · by " + x.by : ""); };
+    $("paused-title").textContent = install ? "Automation is PAUSED" :
+      "Automation PAUSED for " + projects.map(function (p) { return p.name; }).join(", ");
+    $("paused-install").hidden = !install;
     $("paused-reason").textContent = a.reason || "(no reason given)";
-    $("paused-meta").textContent = (a.since_berlin ? "since " + a.since_berlin : "") + (a.by ? " · by " + a.by : "");
-    $("paused-cmd").textContent = a.resume || "python3 tasks.py automation resume";
+    $("paused-meta").textContent = meta(a);
+    $("paused-projects").innerHTML = projects.map(function (p) {
+      return '<p class="paused-project"><b>Project ' + esc(p.name) + ":</b> " + esc(p.reason || "(no reason given)") +
+        '</p><p class="mut">' + esc(meta(p)) + "</p>";
+    }).join("");
+    $("paused-what").textContent = install ? "No run starts or continues until you clear it." :
+      "No run of " + (projects.length > 1 ? "these projects" : "this project") + " starts or continues until you clear it; other projects go on.";
+    $("paused-cmd").textContent = (install ? [a.resume || "python3 tasks.py automation resume"] : [])
+      .concat(projects.map(function (p) { return p.resume; })).join("  ;  ");
   }
 
   // D-237: the task-manager's context, the prompt cache and what each of your messages re-read;

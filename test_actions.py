@@ -477,7 +477,7 @@ class SessionActions(Base):
 
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
-                  "setting.import", "automation.set", "window.set", "prompt.set", "prompt.reset", "request.add",
+                  "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry"}
 
     def test_owner_only_set(self):
@@ -620,6 +620,32 @@ class SettingActions(Base):
         self.assertEqual(self.do("automation.set", paused=False)["value"], False)
         with self.assertRaisesRegex(ValueError, "true or false"):
             self.do("automation.set", paused="yes")
+
+    def test_automation_project_pause(self):
+        """D-244: one project's pause, separate from the install-wide one: its reason (one audit row,
+        target the project), idempotent, a resume clears the reason and keeps the row; a resume of a
+        project never paused changes nothing; an unknown project is NotFound."""
+        store.add_project(self.conn, "P1")
+        r = self.do("automation.set_project", project="P1", paused=True, reason="  inbox:  triage failed ")
+        self.assertEqual((r["name"], r["paused"], r["reason"], r["version"]), ("P1", True, "inbox: triage failed", 1))
+        self.assertFalse(actions.get_setting(self.conn, "automation_paused"))    # not the install-wide one
+        a = self.audit(target_type="project")
+        self.assertEqual((a[-1]["action"], a[-1]["before"], a[-1]["after"]),
+                         ("automation.set_project", {"paused": None, "reason": None},
+                          {"paused": True, "reason": "inbox: triage failed"}))
+        n = len(self.audit())
+        self.assertEqual(self.do("automation.set_project", project="P1", paused=True)["reason"], "inbox: triage failed")
+        self.assertEqual(len(self.audit()), n)                                   # nothing changed: no row
+        self.assertEqual([p["name"] for p in store.project_pauses(self.conn)], ["P1"])
+        r = self.do("automation.set_project", project=r["project"], paused=False)
+        self.assertEqual((r["paused"], r["reason"], r["version"]), (False, None, 2))
+        self.assertEqual(store.project_pauses(self.conn), [])
+        store.add_project(self.conn, "P2")
+        n = len(self.audit())
+        self.assertEqual(self.do("automation.set_project", project="P2", paused=False)["version"], 0)
+        self.assertEqual(len(self.audit()), n)
+        with self.assertRaises(store.NotFound):
+            self.do("automation.set_project", project="nope", paused=True)
 
     def test_automation_pause_reason(self):
         """D-234/D-235: a pause carries its reason (one audit row with both); a pause without one
@@ -966,6 +992,7 @@ class EveryAction(Base):
             ("rule.remove", {"rule_id": 1}),
             ("setting.set", {"key": "stall_verify_minutes", "value": 20}),
             ("setting.reset", {"key": "stall_verify_minutes"}), ("automation.set", {"paused": True}),
+            ("automation.set_project", {"project": "P", "paused": True, "reason": "inbox error"}),
             ("setting.import", {"source": "data/dispatcher.json", "values": {"cleanup_idle_hours": 3}}),
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
