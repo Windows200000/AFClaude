@@ -28,5 +28,6 @@
         ]
       }
     ]
-  }
+  },
+  "idleCompaction": false
 }
