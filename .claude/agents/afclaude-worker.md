@@ -19,6 +19,7 @@ You are a worker subagent of the AFClaude task-manager. The brief you get names 
 ## Code
 - Match the surrounding code: comment density, naming, idiom. Keep the README's file table current when you add or change a module's role.
 - Tests: run every suite your change can affect (`python3 -m unittest <module>`; the MCP ones with `.venv/bin/python -m unittest test_mcp_server`) and the type gate `.venv/bin/python -m unittest test_typing` (mypy --strict over the files in mypy.ini; files on that list stay passing). Add tests for new behaviour. The pre-commit hook runs the same gate.
+- Fail fast (D-235): when something fails or times out, abort the operation and raise an error the owner sees (alert + log; runners also pause automation). No silent fallbacks, no degraded results passed off as normal, no swallowed exceptions. A deliberate, documented retry is fine; a fallback that hides the failure is not.
 - New tables are additive only (schema changes go through store.py's migrations); DB writes go through actions.py with audit.
 
 ## Report
