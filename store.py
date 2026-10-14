@@ -355,11 +355,11 @@ CREATE INDEX IF NOT EXISTS handoffs_session ON handoffs(session_id, id);
 # used (D-130: never drop data, mark it).
 # Record tables (TELEMETRY_DOCS): one row per derived record that is recomputed in place (a
 # run's fill-time row until it is final, a weekly cycle, the user model, a usage review's launch
-# record until it is final); they carry the same ts/actor/via plus updated_at and a trigger-bumped
+# record until it is final, the context cost model of compact_timing.py, D-237/D-238); they carry the same ts/actor/via plus updated_at and a trigger-bumped
 # version, and can't be deleted.
 TELEMETRY_APPEND = ("usage_samples", "usage_weekly_series", "usage_session_windows", "forecast_log",
                     "haiku_judgements", "usage_reports", "usage_run_readings", "stage_eta_log")
-TELEMETRY_DOCS = ("weekly_cycles", "usage_runs", "user_model", "usage_reviews")
+TELEMETRY_DOCS = ("weekly_cycles", "usage_runs", "user_model", "usage_reviews", "cost_model")
 DEFAULT_ACCOUNT = "default"
 _APPEND_DDL = """
 CREATE TABLE IF NOT EXISTS {t} (

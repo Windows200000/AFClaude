@@ -31,7 +31,7 @@ _CFG_DIR = tempfile.TemporaryDirectory()
 import pacing as budget  # noqa: E402
 
 _OLD_FILES = (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert,
-              ka.conversation_started)
+              ka.compaction_pass)
 
 
 setcfg = testenv.setcfg     # the DB settings for a test: the code defaults, then kw
@@ -48,14 +48,14 @@ def setUpModule():
     # window-start usage bookkeeping (note_window_usage): a temp state file, never ALERTS.md / a push
     ka.USAGE_STATE_FILE = os.path.join(_CFG_DIR.name, "usage_refresh_state.json")
     ka.alert = lambda subject, body="": None
-    # compaction (D-191/D-218): no conversation start = never due (test_compaction.py tests it)
-    ka.conversation_started = lambda sid, path=None: None
+    # compaction (D-238): never in the watcher loops here (test_compaction.py tests it)
+    ka.compaction_pass = lambda sid, now, args: None
 
 
 def tearDownModule():
     testenv.clear_settings()
     (budget.SAMPLES_FILE, ka.DEFER_FILE, budget.FIRE_FILES, ka.USAGE_STATE_FILE, ka.alert,
-     ka.conversation_started) = _OLD_FILES
+     ka.compaction_pass) = _OLD_FILES
     _CFG_DIR.cleanup()
 
 

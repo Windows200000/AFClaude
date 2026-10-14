@@ -16,7 +16,10 @@ serves at /afclaude/:
                 logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
                 decision, needs-your-input (OPEN_QUESTIONS.md + task-store
-                inbox), AFClaude cron entries
+                inbox), AFClaude cron entries, the task-manager's context (D-237:
+                size, cache expiry, the next re-read's cost, per owner message re-read
+                yes/no and est. cost without its text, a daily split; the compaction
+                attempts of D-238; compact_timing.context_block)
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
                 README, design doc, prompts/*.md; PROGRESS, GOALS, ALERTS and EXCEPTIONS
                 (and the goal list) come from the project docs in the DB (design §7.7:
@@ -320,6 +323,33 @@ def automation_block():
     return {"paused": bool(p["paused"]), "reason": p.get("reason"), "by": p.get("by"),
             "since_berlin": bstr(ka.parse_ts(p["since"])) if p.get("since") else None,
             "resume": failstop.RESUME_CMD}
+
+
+COMPACTIONS_SHOWN = 5
+
+
+def context_block(now):
+    """D-237: the task-manager's context (compact_timing.context_block): its size, when its prompt
+    cache expires and what the next message would re-read, per owner message re-read yes/no,
+    tokens and est. session-% / weekly-% (no message text), a daily split (re-reads / warm reads /
+    writes / output), the cost model's break-even, and the latest compaction attempts (D-238,
+    the keepalive state's "compactions"). A display path: an error is shown, never paused (D-239)."""
+    try:
+        import compact_timing
+        out = compact_timing.context_block(ka.transcript_path(SELF_SESSION), now)
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+    try:
+        comps = [dict(v, key=k) for k, v in (ka.load_state().get("compactions") or {}).items()
+                 if isinstance(v, dict) and v.get("session") in (None, SELF_SESSION)]
+        comps.sort(key=lambda c: str(c.get("at")), reverse=True)
+        out["compactions"] = [{"at_berlin": bstr(ka.parse_ts(c["at"])) if c.get("at") else None,
+                               **{k: c.get(k) for k in ("status", "trigger", "reason", "context", "break_even",
+                                                        "est_cost_pct", "saves_per_reread_pct", "error", "last_hold")}}
+                              for c in comps[:COMPACTIONS_SHOWN]]
+    except Exception as e:   # noqa: BLE001 - shown on the page
+        out["compactions_error"] = f"{type(e).__name__}: {e}"[:300]
+    return out
 
 
 def latest_decision():
@@ -733,6 +763,7 @@ def main():
         "generated_berlin": bstr(now),
         "automation": automation_block(),
         "keepalive": keepalive_and_usage(now),
+        "context": context_block(now),
         "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
         "stages": stages(ka.read_usage_cache(), now),
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)

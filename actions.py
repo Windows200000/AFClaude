@@ -709,10 +709,10 @@ SETTINGS: dict[str, Setting] = {
                           "rate x this factor (D-212)", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
-    "compaction_enabled": _flag(True, "Compaction (D-144/D-191/D-218/D-233): a task-manager whose conversation "
-                                "(transcript) already ran before the session window that ends at a start is compacted "
-                                "(/compact) at that start: asked to save a hand-off right before, which the "
-                                "continue after the compaction then injects", "automation"),
+    "compaction_enabled": _flag(True, "Compaction (D-144/D-233/D-238): the watcher compacts the task-manager "
+                                "(save a hand-off, /compact, inject the hand-off) when a run ends or after 50 min "
+                                "idle, before its prompt cache expires, if its context is at or above the "
+                                "computed break-even (compact_timing.py)", "automation"),
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
                                "on). A runner sets it itself on any failure or timeout (D-234/D-235, "
                                "failstop.py); the owner clears it: `tasks.py automation resume`",
@@ -1343,7 +1343,7 @@ def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: 
 # put_record: an upsert carrying the same fields plus updated_at and a trigger-bumped version,
 # also without an audit row -- they are recomputable from the append-only rows (an
 # interpretation of §7.3 that gate 8a checks). The user model, which the usage review writes,
-# is the exception: user_model.set is an audited action (its history).
+# is the exception: user_model.set is an audited action (its history); so is cost_model.set.
 #
 # Every row is the JSON line its producer used to write to its (now retired, D-161) file,
 # stored as given; the importer of the legacy files dedupes on its sha256.
@@ -1433,7 +1433,9 @@ for _a in (Appender("usage.sample", "usage_samples", _ts_of("at"), _sample_stale
            Appender("usage.user_model", "user_model", _fitted_ts, key=_model_key),
            # usage_reviews (§7.2): one record per review launch (usage_review.py), final once done
            Appender("usage.review", "usage_reviews", _ts_of("started_at"), key=_field_key("review_id"),
-                    final=_flag_field("final"))):
+                    final=_flag_field("final")),
+           # cost_model: the context cost model of compact_timing.py (D-237/D-238), one record
+           Appender("usage.cost_model", "cost_model", _fitted_ts, key=_model_key)):
     register_appender(_a)
 
 
@@ -1568,6 +1570,23 @@ def user_model_set(conn: sqlite3.Connection, ctx: Ctx, doc: Any) -> Result:
     return Result({"status": r, "doc": dict(doc)}, "model", {"doc": before}, {"doc": dict(doc)}, changed=r != "same")
 
 
+@action("cost_model.set", "cost_model")
+def cost_model_set(conn: sqlite3.Connection, ctx: Ctx, doc: Any) -> Result:
+    """Replace the task-manager's context cost model (compact_timing.py, D-237/D-238: the
+    session-% weights per token kind that the compaction break-even and the quickview's re-read
+    costs come from; `python3 compact_timing.py fit --store`, run by the monthly usage review).
+    Checked by compact_timing.validate; audited with the old and the new document (the audit log
+    is its history), like user_model.set."""
+    import compact_timing
+    new = compact_timing.validate(doc)
+    a = _appender("usage.cost_model", record=True)
+    old = conn.execute(f"SELECT payload FROM {a.table} WHERE account_id=? AND doc_key='model'",
+                       (store.DEFAULT_ACCOUNT,)).fetchone()
+    before = json.loads(old[0]) if old is not None else None
+    r = put_record(conn, "usage.cost_model", json.dumps(new, ensure_ascii=False), actor=ctx.actor, via=ctx.via)
+    return Result({"status": r, "doc": new}, "model", {"doc": before}, {"doc": new}, changed=r != "same")
+
+
 # ---------------------------------------------------------------- runner state (§7.2/§7.3, phase 2d, D-161)
 #
 # The runners' state files (runner_state.py maps them) are written through state_save: one
@@ -1594,7 +1613,7 @@ class StateComponent:
 
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
-    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops")),
+    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),

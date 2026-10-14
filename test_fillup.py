@@ -156,8 +156,8 @@ class FirePath(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.old = (ka.STATE_FILE, ka.FILLUP_FILE, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire,
                     ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE,
-                    ka.conversation_started)
-        ka.conversation_started = lambda sid, path=None: None    # never compacted here (test_compaction.py)
+                    ka.compaction_pass)
+        ka.compaction_pass = lambda sid, now, args: None    # never compacted here (test_compaction.py)
         ka.STATE_FILE = os.path.join(self.tmp.name, "state.json")
         ka.FILLUP_FILE = os.path.join(self.tmp.name, "fillup.json")
         ka.PROGRESS_FILE = os.path.join(self.tmp.name, "PROGRESS.md")
@@ -181,7 +181,7 @@ class FirePath(unittest.TestCase):
     def tearDown(self):
         (ka.STATE_FILE, ka.FILLUP_FILE, ka.read_usage_cache, ka.fresh_usage, ka.handle_fire,
          ka.run_active, ka._fillup_user, ka._limit_hit_in, ka.PROGRESS_FILE,
-         ka.conversation_started) = self.old
+         ka.compaction_pass) = self.old
         self.tmp.cleanup()
 
     def test_fires_once_with_fillup_prompt(self):
@@ -240,10 +240,10 @@ class ExactTiming(unittest.TestCase):
         names = ("STATE_FILE", "FILLUP_FILE", "LOCK_FILE", "STOP_FILE", "PROGRESS_FILE", "read_usage_cache",
                  "fresh_usage", "handle_fire", "run_active", "_fillup_user", "_limit_hit_in", "stall_status",
                  "last_mile_pass", "deferred_window_start_pass", "watch_run_usage", "last_mile_next_start",
-                 "log", "_now", "_sleep", "conversation_started")
+                 "log", "_now", "_sleep", "compaction_pass")
         self.old = {n: getattr(ka, n) for n in names}
         d = self.tmp.name
-        ka.conversation_started = lambda sid, path=None: None
+        ka.compaction_pass = lambda sid, now, args: None
         ka.STATE_FILE, ka.FILLUP_FILE = os.path.join(d, "state.json"), os.path.join(d, "fillup.json")
         ka.LOCK_FILE, ka.STOP_FILE = os.path.join(d, "ka.lock"), os.path.join(d, "STOP")
         ka.PROGRESS_FILE = os.path.join(d, "PROGRESS.md")

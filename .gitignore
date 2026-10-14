@@ -10,6 +10,7 @@ keepalive_deferred.json
 keepalive_fillup.json
 usage_refresh_state.json
 keepalive.lock
+keepalive_session_*.lock
 CODE_VERSION
 *.log
 STOP

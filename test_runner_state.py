@@ -296,7 +296,7 @@ class Importer(Base):
             want = {p: {} for p in actions.state_component(comp).split} | FILES.get(rel, {})
             self.assertEqual(got, want, comp)
             self.assertEqual(rs.read_json(self.p(rel)), want)
-        self.assertEqual(ka.load_state(), KA_STATE)
+        self.assertEqual(ka.load_state(), dict(KA_STATE, compactions={}))   # the split parts are always there
         self.assertIsInstance(ka.load_state(), rs.StateDoc)
         st = dp.load_state()
         self.assertIsInstance(st, rs.StateDoc)
@@ -499,7 +499,8 @@ class Failures(Base):
 
     def test_missing_db(self):
         os.remove(self.p("afclaude.db"))
-        self.assertEqual(ka.load_state(), {"handled": {}, "fires": {}, "limit_hits": {}, "run_stops": {}})   # not the file
+        self.assertEqual(ka.load_state(), {"handled": {}, "fires": {}, "limit_hits": {}, "run_stops": {},
+                                           "compactions": {}})   # not the file
         self.assertEqual(rs.own_sessions(), set())
         with self.assertRaises(OSError):
             rs.read_json(ka.STATE_FILE)

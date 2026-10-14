@@ -17,6 +17,7 @@ derived records); this module is the producers' and readers' one door to them:
   usage.weekly_cycle     weekly_cycles          weekly_cycles.json     (record per cycle)
   usage.run              usage_runs             afclaude_runs.jsonl    (record per run)
   usage.user_model       user_model             user_model.json        (one record)
+  usage.cost_model       cost_model             (none)                 (one record; compact_timing.py, D-237/D-238)
 
 The DB is the only copy (D-161, "put EVERYTHING in the db"; the files are retired):
   - A producer names its data by the live path (the file name next to store.DB_PATH, i.e. in
@@ -72,8 +73,9 @@ FILES: dict[str, tuple[str, str]] = {
     "usage.run": ("afclaude_runs.jsonl", "records"),
     "usage.user_model": ("user_model.json", "doc"),
     "usage.review": ("usage_reviews.jsonl", "records"),     # never a file: born in the DB (usage_review.py)
+    "usage.cost_model": ("cost_model.json", "doc"),         # never a file: born in the DB (compact_timing.py)
 }
-DB_ONLY = ("usage.review",)           # kinds that never had a legacy file: the importer skips them
+DB_ONLY = ("usage.review", "usage.cost_model")           # kinds that never had a legacy file: the importer skips them
 BY_FILE = {name: kind for kind, (name, _) in FILES.items()}
 MARK = "telemetry_imported:"          # meta key prefix: the kind is DB-owned (JSON stats)
 CHUNK = 500                           # rows per import transaction
