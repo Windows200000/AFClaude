@@ -85,10 +85,14 @@ class T(unittest.TestCase):
         self.assertEqual(us.parse_breakdown(None), {})
         self.assertEqual(us.parse_breakdown("garbage · text"), {})
 
-    def test_derived_never_fails(self):
-        out = us.derived_fields({"limits_raw": 5, "text": None}, None, None)
-        self.assertIn("breakdown", out)
-        self.assertEqual(out["own_w_tokens"], 0)
+    def test_derived_fields(self):
+        out = us.derived_fields({"limits_raw": [], "text": None}, None, None)
+        self.assertEqual((out["breakdown"], out["own_w_tokens"], out["limits_kinds"]), ({}, 0, []))
+
+    def test_derived_failure_raises(self):
+        """D-234/D-235: no silently missing field; the sample run is aborted instead."""
+        with self.assertRaises(TypeError):
+            us.derived_fields({"limits_raw": 5, "text": None}, None, None)
 
     def test_series_line(self):
         row = {"at": "x", "usage": usage(), "own_w_tokens": 1, "other_w_tokens": 2,
@@ -133,29 +137,139 @@ class RatioSnapshot(unittest.TestCase):
                       "attribution", "preferred_ratio"):
                 self.assertIn(k, snap)
 
-    def test_window_file_failure_never_sinks_the_snapshot(self):
+    def test_window_file_failure_raises(self):
+        """D-234/D-235: no snapshot from the rows alone when the window store fails."""
         from datetime import timedelta
         rows, end = self.rows()
-        snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
-        self.assertEqual(snap["ratio_windows"]["n"], 1)   # derived from rows instead
+        old = us.limit_ratio.append_new_windows
+
+        def boom(*a, **k):
+            raise OSError("window store broken")
+        us.limit_ratio.append_new_windows = boom
+        try:
+            with self.assertRaises(OSError):
+                us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
+        finally:
+            us.limit_ratio.append_new_windows = old
 
     def test_time_split_uses_the_run_spans(self):
+        import os
+        import tempfile
         from datetime import timedelta
         rows, end = self.rows()
         old = us.limit_ratio.load_autonomous_spans
-        try:
-            us.limit_ratio.load_autonomous_spans = lambda rows, now=None, runs_path=None: []
-            snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
-            share = snap["attribution"]["week_share"]
-            self.assertEqual((share["method"], share["status"], share["other_share"]), ("time", "ok", 1.0))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "session_windows.jsonl")
+            try:
+                us.limit_ratio.load_autonomous_spans = lambda rows, now=None, runs_path=None: []
+                snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path=path)
+                share = snap["attribution"]["week_share"]
+                self.assertEqual((share["method"], share["status"], share["other_share"]), ("time", "ok", 1.0))
 
-            def boom(*a, **k):
-                raise OSError("x")
-            us.limit_ratio.load_autonomous_spans = boom          # never sinks the sample
-            snap = us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path="/nonexistent/dir/w.jsonl")
-            self.assertEqual(snap["attribution"]["week_share"]["status"], "insufficient_data")
+                def boom(*a, **k):
+                    raise OSError("x")
+                us.limit_ratio.load_autonomous_spans = boom      # an error now (D-234/D-235)
+                with self.assertRaises(OSError):
+                    us.ratio_snapshot(rows, end + timedelta(minutes=5), windows_path=path)
+            finally:
+                us.limit_ratio.load_autonomous_spans = old
+
+
+class Main(unittest.TestCase):
+    """D-234/D-235: a failure before the sample row aborts the run (no row, no state); one after
+    it still saves the state, then is an error; both alert and pause automation."""
+    def setUp(self):
+        import json
+        import os
+        import tempfile
+        import keepalive as ka
+        self.ka = ka
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.addCleanup(self.tmp.cleanup)
+        os.makedirs(os.path.join(d, "projects"))
+        cj = os.path.join(d, "claude.json")
+        with open(cj, "w") as fh:
+            json.dump({"cachedUsageUtilization": {"utilization": {"limits": []}}}, fh)
+        self.now = datetime.now(UTC)
+        self.refresh = {"ok": True, "rc": 0, "out": "ok", "poke": None, "retried": False,
+                        "usage": {"fetched_at": self.now, "session": {"percent": 5.0, "resets_at": None},
+                                  "weekly": {"percent": 20.0, "resets_at": None}}}
+        self.alerts, self.lines, self.saved = [], [], []
+        names = {(us, "PROJECTS"): os.path.join(d, "projects"), (us, "STATE"): os.path.join(d, "sampler_state.json"),
+                 (us, "SAMPLES"): os.path.join(d, "samples.jsonl"), (us, "SERIES"): os.path.join(d, "weekly_series.jsonl"),
+                 (us, "HAIKU_LOG"): os.path.join(d, "haiku.jsonl"), (ka, "CLAUDE_JSON"): cj,
+                 (ka, "refresh_usage_checked"): lambda cwd=None, now=None: self.refresh,
+                 (us, "agents_snapshot"): lambda: {}, (us, "ratio_snapshot"): lambda rows, t: {},
+                 (us, "track_cycle"): lambda u, t, tag: None, (us, "update_runs"): lambda t: 0,
+                 (us, "haiku_judgement"): lambda st, t: [], (us, "log"): self.lines.append,
+                 (us.failstop, "_notify"): lambda s, b="": self.alerts.append(s)}
+        old = {k: getattr(*k) for k in names}
+        for (obj, n), v in names.items():
+            setattr(obj, n, v)
+
+        def restore():
+            for (obj, n), v in old.items():
+                setattr(obj, n, v)
+        self.addCleanup(restore)
+        self.addCleanup(testenv.unpause)
+        self.d = d
+
+    def rows(self):
+        import os
+        p = os.path.join(self.d, "samples.jsonl")
+        if not os.path.exists(p):
+            return []
+        with open(p) as fh:
+            return fh.read().splitlines()
+
+    def test_ok(self):
+        self.assertEqual(us.main(["--no-haiku"]), 0)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(self.alerts, [])
+
+    def test_failed_usage_reading_aborts_the_run(self):
+        import os
+        import afclaude_config
+        self.refresh = dict(self.refresh, ok=False, rc=1, out="Total cost: $0", poke="rc=0")
+        self.assertEqual(us.main(["--no-haiku"]), 1)
+        self.assertEqual(self.rows(), [])                                  # no row from the old cache
+        self.assertFalse(os.path.exists(us.STATE))                         # nothing consumed
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: " + self.ka.USAGE_FAILED])
+        self.assertTrue(any(ln.startswith("ERROR: sampler: usage reading failed") for ln in self.lines))
+        p = afclaude_config.automation_pause()
+        self.assertTrue(p["paused"])
+        self.assertEqual(p["by"], "runner:sampler")
+        self.assertEqual(us.main(["--no-haiku"]), 1)                       # every 15 min: logged,
+        self.assertEqual(len(self.alerts), 1)                              # alerted once per pause
+
+    def test_failure_after_the_row_saves_the_state_then_errors(self):
+        import os
+
+        def boom(t):
+            raise RuntimeError("runs broken")
+        us.update_runs = boom
+        self.assertEqual(us.main(["--no-haiku"]), 1)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertTrue(os.path.exists(us.STATE))                         # no double count next run
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: run metrics update failed"])
+
+    def test_agents_snapshot_failure_aborts(self):
+        def roh(*a, **k):
+            import subprocess
+            raise subprocess.TimeoutExpired("claude agents", 60)
+        old = us.host.run_on_host, us.agents_snapshot
+        us.host.run_on_host = roh
+        us.agents_snapshot = type(self).real_agents
+        try:
+            self.assertEqual(us.main(["--no-haiku"]), 1)
         finally:
-            us.limit_ratio.load_autonomous_spans = old
+            us.host.run_on_host, us.agents_snapshot = old
+        self.assertEqual(self.rows(), [])
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: `claude agents` snapshot failed"])
+
+
+Main.real_agents = staticmethod(us.agents_snapshot)
 
 
 if __name__ == "__main__":

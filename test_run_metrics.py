@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import run_metrics as rm  # noqa: E402
 import keepalive as ka  # noqa: E402
+import afclaude_config  # noqa: E402
 
 UTC = timezone.utc
 F = datetime(2026, 10, 8, 2, 0, 5, tzinfo=UTC)          # a fire at the 04:00 Berlin session-window start
@@ -351,7 +352,8 @@ class WatcherReadings(unittest.TestCase):
         cache = {"fetched_at": M(29), "session": {"percent": 40.0, "resets_at": WEND},
                  "weekly": {"percent": 75.0, "resets_at": WRESET}}
         ka.read_usage_cache = lambda: cache
-        ka.refresh_usage_checked = lambda now=None, **k: refreshed.append(now) or {"usage": dict(cache, fetched_at=now)}
+        ka.refresh_usage_checked = lambda now=None, **k: refreshed.append(now) or {"ok": True,
+                                                                                   "usage": dict(cache, fetched_at=now)}
         ka.run_active = lambda sid, now, st=None: None
         self.assertIsNone(rm.watch_sample(SID, now, path=self.path))
         self.assertFalse(os.path.exists(self.path))
@@ -366,17 +368,36 @@ class WatcherReadings(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rm.reading_from_watch(rows[1])["t"], M(40))
 
-    def test_watcher_hook_never_fails(self):
+    def test_a_failed_refresh_raises_no_row_from_the_old_cache(self):
+        """D-234/D-235: /usage did not refresh: no reading from the old cache, an error."""
+        import failstop
+        cache = {"fetched_at": M(29), "session": {"percent": 40.0, "resets_at": WEND},
+                 "weekly": {"percent": 75.0, "resets_at": WRESET}}
+        ka.read_usage_cache = lambda: cache
+        ka.refresh_usage_checked = lambda now=None, **k: {"ok": False, "usage": cache, "rc": 1, "out": "x",
+                                                          "poke": "rc=0"}
+        ka.run_active = lambda sid, now, st=None: F
+        with self.assertRaises(failstop.Failed) as cm:
+            rm.watch_sample(SID, M(40), path=self.path)
+        self.assertEqual(cm.exception.why, ka.USAGE_FAILED)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_watcher_hook_reports_an_error_and_pauses(self):
+        """The watcher goes on, but a failed reading is an error (D-234/D-235): ERROR line, alert,
+        automation paused."""
         def boom(*a, **k):
             raise RuntimeError("x")
         ka.run_active = boom
-        logs, old_log = [], ka.log
-        ka.log = logs.append
+        logs, alerts, old = [], [], (ka.log, ka.alert)
+        ka.log, ka.alert = logs.append, (lambda subject, body="": alerts.append(subject))
         try:
             ka.watch_run_usage(SID, M(1))
+            self.assertTrue(any(ln.startswith("ERROR: keepalive: run usage reading failed") for ln in logs), logs)
+            self.assertEqual(alerts, ["AFClaude STOPPED: run usage reading failed"])
+            self.assertTrue(afclaude_config.automation_pause()["paused"])
         finally:
-            ka.log = old_log
-        self.assertTrue(logs and "run usage reading failed" in logs[0])
+            ka.log, ka.alert = old
+            testenv.unpause()
 
 
 class Hooks(unittest.TestCase):
@@ -422,7 +443,8 @@ class Hooks(unittest.TestCase):
         r = rm.compute_run(rm.group_fires([f])[0], [], [], [], now=f["at"] + timedelta(minutes=1))
         self.assertEqual((r["session_start_pct"], r["weekly_start_pct"]), (3.0, 70.0))
 
-    def test_sampler_hook_never_sinks_the_sample(self):
+    def test_sampler_hook_raises(self):
+        """A failure is an error (D-234/D-235); the sampler reports it after saving its state."""
         import usage_sampler as us
         old = rm.update
 
@@ -430,7 +452,8 @@ class Hooks(unittest.TestCase):
             raise RuntimeError("x")
         rm.update = boom
         try:
-            self.assertIsNone(us.update_runs(F))
+            with self.assertRaises(RuntimeError):
+                us.update_runs(F)
         finally:
             rm.update = old
         seen = {}

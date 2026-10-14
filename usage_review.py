@@ -59,6 +59,13 @@ usual never touching the monthly schedule.
 
   usage_review.py --only usage,stage-eta --now
   usage_review.py --only usage,stage-eta --at "2026-10-15 16:00"
+
+Failures (D-234/D-235, failstop.py): a launch that fails, a chained usage review that does not
+finish in time, an `at` job that can't be scheduled, a report doc that can't be read, a crash:
+an ERROR line, an alert, and automation paused until the owner clears it (`tasks.py automation
+resume`). While automation is paused no review starts: the monthly one waits (the hourly cron
+run starts it once the pause is cleared), a one-off one (its `at` job is used up) is reported
+and must be scheduled again.
 """
 import argparse
 import glob
@@ -76,6 +83,7 @@ import keepalive as ka  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
 import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
 import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
+import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
@@ -96,6 +104,12 @@ USAGE_DONE_POLL = timedelta(minutes=5)     # before giving up (alert) and never 
 REVIEW_REPORT_DEADLINE = timedelta(hours=24)   # a started review without its report doc by then: no_report
 REVIEWS_DIR = os.path.join(HERE, "data", "reviews")   # legacy report files (before the §7.7 switch)
 ACTOR = "runner:usage_review"
+
+
+def fail_stop(subject, detail=""):
+    """A failure (D-234/D-235): ERROR line, alert (keepalive.alert), automation paused."""
+    return failstop.fail("usage_review", subject, detail, log=lambda m: ka.log(m),
+                         alert=lambda subj, body="": ka.alert(subj, body))
 
 
 def load():
@@ -137,8 +151,9 @@ def report_ready(report):
     try:
         if project_docs.doc_text(report) is not None:
             return True
-    except Exception as e:  # noqa: BLE001 - a status check; the next poll retries
-        ka.log(f"usage review: the report doc {report} could not be read ({type(e).__name__}: {e})")
+    except Exception as e:  # noqa: BLE001 - an error (D-234/D-235), not "not ready yet"
+        raise failstop.Failed("a review's report doc could not be read",
+                              f"{report}: {type(e).__name__}: {e}"[:300]) from None
     return os.path.exists(os.path.join(REVIEWS_DIR, report.split(":", 1)[-1] + ".md"))
 
 
@@ -213,7 +228,7 @@ def run(st, now):
         ka.progress_note(f"usage review started: session {sid} (Opus medium, tmux ka-{sid[:8]}); "
                          f"next {ka.berlin(datetime.fromisoformat(st['next_run_at']))}")
     else:
-        ka.alert("usage review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
+        fail_stop("usage review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
 
 
 def run_once(st, now, which, extra=None):
@@ -242,7 +257,7 @@ def run_once(st, now, which, extra=None):
         ka.log(f"one-off {which} review started: {sid}")
         ka.progress_note(f"one-off {which} review started: session {sid} (Opus medium, tmux ka-{sid[:8]})")
     else:
-        ka.alert(f"one-off {which} review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
+        fail_stop(f"one-off {which} review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
     return ok
 
 
@@ -270,7 +285,7 @@ def schedule_once(which, at_str, now=None):
     if ok:
         ka.log(f"one-off {which} review scheduled for {ka.berlin(when)}: {result['out']}")
     else:
-        ka.alert(f"one-off {which} review scheduling failed", json.dumps(result))
+        fail_stop(f"one-off {which} review scheduling failed", json.dumps(result))
     return result
 
 
@@ -354,7 +369,7 @@ def run_usage_then_eta(st, now, wait_fn=None):
     if not wait_fn(sid, report, now):
         found = report_ready(report)
         finish_review(sid, "timed_out" if not found else "finished", datetime.now(UTC))
-        ka.alert("one-off usage review (D-228 chain) did not finish in time for the ETA review",
+        fail_stop("one-off usage review (D-228 chain) did not finish in time for the ETA review",
                  f"session {sid}; waited {USAGE_DONE_TIMEOUT}; report doc {report} "
                  f"{'found' if found else 'missing'}; the ETA review was not launched")
         return False
@@ -367,6 +382,17 @@ def run_usage_then_eta(st, now, wait_fn=None):
 
 
 def main():
+    try:
+        return _main()
+    except failstop.Failed as e:
+        fail_stop(e.why, e.detail)
+    except Exception as e:   # noqa: BLE001 - any other failure: an error (D-234/D-235)
+        import traceback
+        fail_stop(f"usage_review.py crashed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1500:]}")
+    return 1
+
+
+def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--now", action="store_true")
@@ -391,6 +417,17 @@ def main():
         return   # a broken DB (or its state unreadable): start nothing (design §7.8); the next cron run retries
     for rec in track_reviews(now):
         ka.log(f"usage review {rec['review_id'][:8]} ({'+'.join(rec.get('reviews') or [])}): {rec['status']}")
+    pause = failstop.paused()
+    if pause["paused"] and (args.only or args.now or now >= datetime.fromisoformat(st["next_run_at"])):
+        why = pause.get("reason") or "no reason given"
+        if args.only:     # its at job is used up: say so, it has to be scheduled again
+            ka.log(f"usage review: one-off {args.only} review NOT started, automation is paused ({why})")
+            ka.alert(f"one-off {args.only} review not started: automation is paused",
+                     f"Paused: {why}. Schedule it again (usage_review.py --only {args.only} --at ...) once the "
+                     f"pause is cleared ({failstop.RESUME_CMD}).")
+        else:             # the monthly one: the hourly cron run starts it once the pause is cleared
+            ka.log(f"usage review: due, but automation is paused ({why}); it starts once the pause is cleared")
+        return 0
     if args.only:
         if args.only == ",".join(ONLY_ORDER):   # "usage,stage-eta": the D-228 chain
             run_usage_then_eta(st, now)
@@ -406,4 +443,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

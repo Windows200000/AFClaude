@@ -373,7 +373,7 @@ def main(argv=None):
     tot = totals(rows, main_row)
 
     if args.fresh:
-        usage = ka.fresh_usage(now_utc(), force=True)
+        usage = ka.fresh_usage(now_utc(), force=True, display=True)   # a report never pauses
     else:
         usage = ka.read_usage_cache()
     cache_age = "-"

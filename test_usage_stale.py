@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Offline tests for stale usage data (night 03.10 -> 04.10.2026: `claude -p /usage` printed only
 the cost summary for 34 h and the cache stayed frozen): stale detection, stale rows ignored by
-pacing.py / limit_ratio.py, the shared refresh retry (subprocess calls mocked), the alert dedup
-of the window start and the sampler, and the host bridge accepting the retry's request.
+pacing.py / limit_ratio.py (old rows), the shared refresh retry (subprocess calls mocked), a failed
+refresh as an error (D-234/D-235: alert once, automation paused, nothing starts, no sampler row from
+the old cache), and the host bridge accepting the retry's request.
 No claude calls, no real ~/.claude.json, no live data/ files."""
 import io
 import json
@@ -22,6 +23,8 @@ import limit_ratio  # noqa: E402
 import pacing  # noqa: E402
 import usage_sampler as us  # noqa: E402
 import usage_stale  # noqa: E402
+import afclaude_config  # noqa: E402
+import failstop  # noqa: E402
 
 UTC = timezone.utc
 WR = datetime(2026, 10, 8, 17, 0, 0, 283789, tzinfo=UTC)        # weekly reset
@@ -113,8 +116,14 @@ class Retry(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.p(ka, "USAGE_STATE_FILE", os.path.join(self.tmp.name, "usage_state.json"))
-        self.p(ka, "CLAUDE_JSON", os.path.join(self.tmp.name, "no-claude.json"))   # never the real one
+        cj = os.path.join(self.tmp.name, "claude.json")                  # never the real one
+        with open(cj, "w") as fh:
+            json.dump({"cachedUsageUtilization": {"utilization": {"limits": []}}}, fh)
+        self.p(ka, "CLAUDE_JSON", cj)
         self.p(ka, "log", lambda msg: None)
+        self.alerts = []
+        self.p(ka, "alert", lambda subject, body="": self.alerts.append(subject))
+        self.addCleanup(testenv.unpause)
         self.now = datetime.now(UTC).replace(microsecond=0)
         self.cache = {"fetched_at": FROZEN, "weekly": {"percent": 29.0, "resets_at": WR}}
         self.calls = []
@@ -161,22 +170,25 @@ class Retry(unittest.TestCase):
         self.assertIsNotNone(ka.fresh_usage(self.now, force=False))   # now fresh: no new call
         self.assertEqual(self.calls, ["usage", "poke", "usage"])
 
-    def test_still_stale_returns_none_and_poke_is_throttled(self):
+    def test_still_stale_is_an_error_and_poke_is_throttled(self):
         r = ka.refresh_usage_checked(now=self.now)
         self.assertFalse(r["ok"])
         self.assertEqual(self.calls, ["usage", "poke", "usage"])
         self.assertIsNone(ka.fresh_usage(self.now + timedelta(minutes=15), force=True))
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: " + ka.USAGE_FAILED])   # D-234/D-235
+        self.assertTrue(afclaude_config.automation_pause()["paused"])
         self.assertEqual(self.calls.count("poke"), 1)                 # throttled: one per 30 min
         self.assertIn("skipped", ka.LAST_REFRESH["poke"])
         ka.fresh_usage(self.now + ka.POKE_MIN_INTERVAL + timedelta(minutes=1), force=True)
         self.assertEqual(self.calls.count("poke"), 2)
+        self.assertEqual(len(self.alerts), 1)                         # once per pause
 
-    def test_sampler_marks_stale_rows(self):
-        r = us.usage_now(self.now)
-        self.assertTrue(r["stale"])
-        self.assertGreater(r["stale_min"], 45)
-        self.assertEqual(r["refresh_retry"]["ok"], False)
-        self.assertEqual(r["weekly"]["percent"], 29.0)                 # the data is kept (D-130)
+    def test_sampler_takes_no_row_from_a_stale_cache(self):
+        """D-234/D-235: the sampler no longer keeps a stale-marked row; a failed refresh raises."""
+        with self.assertRaises(failstop.Failed) as cm:
+            us.usage_now(self.now)
+        self.assertEqual(cm.exception.why, ka.USAGE_FAILED)
+        self.assertIn("did not refresh", cm.exception.detail)
         self.fix_on, self.calls = "usage1", []
         r = us.usage_now(datetime.now(UTC))
         self.assertFalse(r["stale"])
@@ -188,102 +200,60 @@ class Retry(unittest.TestCase):
         self.assertNotIn("stale", us.series_line(row(t, 29.0)))
 
 
-class WindowAlert(unittest.TestCase):
+class WindowStart(unittest.TestCase):
+    """D-234/D-235: a failed usage reading at a session-window start is an error at once (alert,
+    automation paused), not after two failed checks; nothing starts, and the paused watcher does
+    not keep calling /usage."""
     def setUp(self):
         self.p = Patch(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(testenv.unpause)
         d = self.tmp.name
         self.p(ka, "USAGE_STATE_FILE", os.path.join(d, "usage_state.json"))
         self.p(ka, "DEFER_FILE", os.path.join(d, "deferred.json"))
         self.p(ka, "STATE_FILE", os.path.join(d, "state.json"))
         self.p(ka, "PROGRESS_FILE", os.path.join(d, "PROGRESS.md"))
+        testenv.notes_project(d)
         self.p(ka, "log", lambda msg: None)
         self.alerts = []
         self.p(ka, "alert", lambda subject, body="": self.alerts.append((subject, body)))
         self.p(ka, "read_usage_cache", lambda: {"fetched_at": FROZEN})
+        self.p(ka, "refresh_usage_checked", lambda now=None, cwd=None: self.usage_calls.append(now) or {
+            "ok": False, "usage": {"fetched_at": FROZEN}, "rc": 0, "out": "Total cost: $0", "poke": "rc=0"})
+        self.usage_calls = []
 
-    def test_dedup_per_window(self):
-        now = datetime(2026, 10, 3, 21, 0, tzinfo=UTC)
-        self.assertFalse(ka.note_window_usage("window-start-2026-10-04", False, now))
-        self.assertTrue(ka.note_window_usage("window-start-2026-10-04", False, now))
-        for _ in range(5):                                             # every 15 min all night: no repeat
-            self.assertFalse(ka.note_window_usage("window-start-2026-10-04", False, now))
-        self.assertEqual(len(self.alerts), 1)
-        self.assertIn("unknown", self.alerts[0][0])
-        self.assertIn("fail-safe", self.alerts[0][0])
-        # next night: a new key, counted afresh
-        self.assertFalse(ka.note_window_usage("window-start-2026-10-05", False, now))
-        self.assertTrue(ka.note_window_usage("window-start-2026-10-05", False, now))
-        self.assertEqual(len(self.alerts), 2)
-
-    def test_success_resets_and_final_alerts_at_once(self):
-        now = datetime(2026, 10, 3, 21, 0, tzinfo=UTC)
-        ka.note_window_usage("k", False, now)
-        ka.note_window_usage("k", True, now)                           # not in a row any more
-        self.assertFalse(ka.note_window_usage("k", False, now))
-        self.assertEqual(self.alerts, [])
-        self.assertTrue(ka.note_window_usage("k2", False, now, final=True))   # no recheck follows
-
-    def test_window_start_then_postponed_recheck_alerts_once_and_holds(self):
+    def test_failed_reading_alerts_at_once_and_holds(self):
         now = datetime(2026, 10, 3, 21, 0, 5, tzinfo=UTC)               # Sat 23:00 Berlin
         fired = []
-        self.p(ka, "fresh_usage", lambda n, force=False: None)        # /usage keeps failing
         self.p(ka, "handle_fire", lambda *a, **k: fired.append(a))
-        self.p(ka, "budget_eval", lambda u, n: {"go": False, "postpone": True, "text": "",
-                                                "recheck_at": n + timedelta(minutes=15),
-                                                "reason": "HOLD: weekly usage unknown (fail-safe)"})
-        args = types.SimpleNamespace(now=False, arm=False)
+        args = types.SimpleNamespace(now=False, arm=True)
         sid = "00000000-0000-0000-0000-000000000000"
-        ka.window_start_pass(sid, now, args)
-        self.assertEqual(self.alerts, [])
+        d = ka.window_start_pass(sid, now, args)
+        self.assertFalse(d["go"])
+        self.assertIn("usage reading failed", d["reason"])
+        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: " + ka.USAGE_FAILED])
+        self.assertIn("cache from 2026-10-03 08:30:03 CEST", self.alerts[0][1])
+        self.assertIn("PAUSED until you clear it", self.alerts[0][1])
+        self.assertTrue(afclaude_config.automation_pause()["paused"])
+        self.assertIn("not resumed", testenv.notes(self.tmp.name))
+        # the next start (and a postponed one) while paused: no /usage call, no alert, no fire
+        n = len(self.usage_calls)
+        ka.window_start_pass(sid, now + timedelta(hours=5), args)
+        ka.defer_window_start(schedule_key(now + timedelta(hours=5, minutes=20)), sid,
+                              now + timedelta(hours=5, minutes=20), "test")
         st = {"handled": {}, "fires": {}}
-        for i in range(1, 5):
-            ka.deferred_window_start_pass(sid, now + timedelta(minutes=15 * i, seconds=1), st, args)
-        self.assertEqual(len(self.alerts), 1)                         # after the 2nd failed check, once
-        self.assertEqual(fired, [])                                   # fail-safe: never started blind
+        ka.deferred_window_start_pass(sid, now + timedelta(hours=5, minutes=21), st, args)
+        self.assertEqual(len(self.usage_calls), n)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(fired, [])
+        self.assertEqual(ka.load_deferred(), {})                      # dropped, not retried
+        self.assertIn("automation is paused", testenv.notes(self.tmp.name))
 
 
-class SamplerAlert(unittest.TestCase):
-    def setUp(self):
-        self.sent = []
-        self.notify = lambda s, b="": self.sent.append((s, b))
-
-    def u(self, stale=True, fetched=FROZEN):
-        return {"stale": stale, "fetched_at": fetched, "text": "Total cost: $0.0000",
-                "refresh_retry": {"ok": False, "poke": "rc=0 is_error=False"}}
-
-    def test_once_per_episode_after_threshold(self):
-        st = {}
-        t = FROZEN + timedelta(minutes=45)
-        self.assertFalse(us.stale_alert(st, self.u(), t, self.notify))
-        t2 = FROZEN + us.STALE_ALERT_AFTER + timedelta(minutes=15)
-        self.assertTrue(us.stale_alert(st, self.u(), t2, self.notify))
-        for i in range(1, 10):
-            self.assertFalse(us.stale_alert(st, self.u(), t2 + timedelta(minutes=15 * i), self.notify))
-        self.assertEqual(len(self.sent), 1)
-        self.assertIn("stale", self.sent[0][0])
-        # a fresh sample ends the episode; a new one alerts again
-        us.stale_alert(st, self.u(stale=False, fetched=t2), t2, self.notify)
-        self.assertEqual(st, {})
-        f2 = t2 + timedelta(hours=1)
-        self.assertFalse(us.stale_alert(st, self.u(fetched=f2), f2 + timedelta(hours=1), self.notify))
-        self.assertTrue(us.stale_alert(st, self.u(fetched=f2), f2 + timedelta(hours=4), self.notify))
-        self.assertEqual(len(self.sent), 2)
-
-    def test_no_cache_counts_from_first_stale_sample(self):
-        st, t = {}, FROZEN
-        self.assertFalse(us.stale_alert(st, self.u(fetched=None), t, self.notify))
-        self.assertTrue(us.stale_alert(st, self.u(fetched=None), t + timedelta(hours=3, minutes=1), self.notify))
-
-    def test_failed_notify_never_raises_and_retries_later(self):
-        st = {}
-
-        def boom(s, b=""):
-            raise OSError("bridge down")
-        t = FROZEN + timedelta(hours=4)
-        self.assertFalse(us.stale_alert(st, self.u(), t, boom))
-        self.assertTrue(us.stale_alert(st, self.u(), t + timedelta(minutes=15), self.notify))
+def schedule_key(t):
+    import schedule
+    return schedule.start_key(t)
 
 
 class BridgeWhitelist(unittest.TestCase):

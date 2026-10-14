@@ -38,7 +38,12 @@ state, no ka_resume, no tmux kill). It reads the DB as the last scan left it
 settings (D-146; afclaude_config.setting): stall_take_over_idle, stall_verify_minutes,
 cleanup_finished_grace_minutes, cleanup_idle_hours. data/dispatcher.json (optional) keeps only
 session ids (keepalive_sessions, exclude_sessions); its old tunables were imported into the DB
-once. Failures go through keepalive.alert().
+once. Failures (D-234/D-235): any failure or timeout is an error the owner sees (an ERROR line in
+dispatcher.log = app_log, an alert through keepalive.alert) and pauses automation
+(automation_paused, failstop.py) until the owner clears it (`tasks.py automation resume`); the
+pass aborts what it was doing (no fallback to defaults, no "only the local watchers"). While
+automation is paused the pass continues no session and kills no tmux session; it still scans,
+verifies earlier continues and logs.
 
     dispatcher.py [--arm] [--once] [--no-scan] [--json]
 """
@@ -61,6 +66,7 @@ import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161; the log dual-written)
 import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
+import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
 
 UTC = timezone.utc
 DATA_DIR = os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data"))
@@ -132,8 +138,8 @@ def load_config(path=None, overrides=None):
             log(f"config {path or CONFIG_FILE}: {left} ignored (tunables are DB settings now, D-146)")
     except FileNotFoundError:
         pass
-    except (OSError, json.JSONDecodeError, AttributeError) as e:
-        log(f"config {path or CONFIG_FILE} unreadable ({e}); using defaults")
+    except (OSError, json.JSONDecodeError, AttributeError) as e:   # an error, no defaults (D-234/D-235)
+        raise failstop.Failed("dispatcher config unreadable", f"{path or CONFIG_FILE}: {type(e).__name__}: {e}") from None
     cfg.update({k: s[name] for k, name in SETTING_KEYS.items()})
     for k, v in (overrides or {}).items():
         if v is not None:
@@ -152,11 +158,17 @@ def save_state(st):
     runner_state.save("dispatcher", st, STATE_FILE)
 
 
+def fail_stop(subject, detail=""):
+    """A failure (D-234/D-235): ERROR line, alert (keepalive.alert), automation paused."""
+    return failstop.fail("dispatcher", subject, detail, log=log, alert=lambda s, b="": ka.alert(s, b))
+
+
 def alert_once(st, key, subject, body=""):
+    """fail_stop once per `key` (a stall, a continue, a session; the state remembers it)."""
     if key in st["alerted"]:
         return
     st["alerted"][key] = store.iso(datetime.now(UTC))
-    ka.alert(subject, body)
+    fail_stop(subject, body)
 
 
 # ---------------------------------------------------------------- who not to touch
@@ -176,7 +188,9 @@ def keepalive_targets():
         try:
             argvs += [p["argv"] for p in host.proc_snapshot().values() if p.get("argv")]
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-            log(f"host process list unavailable ({e}); only local keepalive watchers are known")
+            # without it a host watcher's session could be continued: an error, the pass stops
+            raise failstop.Failed("host process list unavailable",
+                                  f"{type(e).__name__}: {e}"[:300]) from None
     for argv in argvs:
         if not any(os.path.basename(a) == "keepalive.py" for a in argv):
             continue
@@ -333,6 +347,7 @@ class Pass:
     def __init__(self, conn, cfg, st, now, arm, usage_getter=None):
         self.conn, self.cfg, self.st, self.now, self.arm = conn, cfg, st, now, arm
         self.usage_getter = usage_getter or ka.fresh_usage
+        self.paused = None                 # the automation_paused reason while paused (run())
         self.report = {"continue": [], "skip": [], "cleanup": [], "verify": []}
         self.day = now.astimezone(ka.BERLIN).date().isoformat()
 
@@ -441,7 +456,14 @@ class Pass:
             log(f"WOULD CONTINUE (dry-run) {sid[:8]} plan={plan} cwd={cwd} name={name!r} model={entry['model']}: "
                 f"{msg[:160]!r}...")
             return
-        rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model)
+        try:
+            rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model)
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
+            self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "result": "launch-error",
+                                       "error": f"{type(e).__name__}: {e}"[:300]}
+            alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed: {type(e).__name__}",
+                       f"plan={plan}: {e}"[:500])
+            return
         entry.update(rc=rc, stdout=out.strip(), stderr=err.strip()[-500:])
         self.report["continue"].append(entry)
         log(f"CONTINUED {sid[:8]} plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()[-300:]!r}")
@@ -481,60 +503,78 @@ class Pass:
             name = s.get("tmux") or ""
             if not TMUX_RE.fullmatch(name) or name != ka.tmux_name(sid):
                 continue
-            if not tmux_alive(name):
-                s["status"] = "ended"
-                s["ended_at"] = store.iso(self.now)
-                t = store.get_task(self.conn, s["task_id"]) if s.get("task_id") else None
-                log(f"session {sid[:8]} ({name}) is gone" + (f"; task #{t['id']} is {t['status']}" if t else ""))
-                if t and t["status"] == "in_progress":
-                    alert_once(self.st, f"ended:{sid}:{s.get('sent_at')}",
-                               f"task #{t['id']} session {sid[:8]} ended while the task is still in_progress",
-                               "Reopen or finish the task by hand (tasks.py reopen/done).")
-                continue
-            if name in never or sid in excluded:
-                continue
-            path = ka.transcript_path(sid)
-            last = ka.last_message(path) if path else None
-            if not last or ka.stall_info(last):
-                continue                     # no transcript yet, or stalled: waits for a continue
-            m = last.get("message") or {}
-            if not (last.get("type") == "assistant" and m.get("stop_reason") == "end_turn"):
-                continue                     # mid-turn (tool use) or waiting on a user entry
-            idle = self.now - ka.parse_ts(last.get("timestamp"))
+            try:
+                self.cleanup_one(sid, s, name, never, excluded)
+            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the other sessions go on
+                alert_once(self.st, f"cleanup:{sid}:{s.get('sent_at')}",
+                           f"dispatcher clean-up of {name} failed: {type(e).__name__}", str(e)[:500])
+
+    def cleanup_one(self, sid, s, name, never, excluded):
+        """cleanup() for one tracked session; a host call that fails raises."""
+        if not tmux_alive(name):
+            s["status"] = "ended"
+            s["ended_at"] = store.iso(self.now)
             t = store.get_task(self.conn, s["task_id"]) if s.get("task_id") else None
-            if t and t["status"] in FINISHED_TASK and idle >= timedelta(minutes=float(self.cfg["finished_grace_minutes"])):
-                why = f"task #{t['id']} is {t['status']}, idle {idle.total_seconds() / 60:.0f} min"
-            elif idle >= timedelta(hours=float(self.cfg["idle_cleanup_hours"])):
-                why = f"idle {idle.total_seconds() / 3600:.1f} h after an end_turn"
-            else:
-                continue
-            if not s.get("own_tmux"):
-                # we only typed into a tmux session someone else started: stop counting it, never kill it
-                log(f"released {name} ({why}): not started by the dispatcher, left running")
-                if self.arm:
-                    s["status"] = "released"
-                    s["released_at"] = store.iso(self.now)
-                continue
-            rows = [a for a in ka.agent_entries(sid) if ka.pid_alive(a.get("pid"))]
-            if any(a.get("state") == "working" or a.get("status") == "busy" for a in rows):
-                self.skip(f"cleanup {name}", "process reports busy")
-                continue
-            self.report["cleanup"].append({"sid": sid, "tmux": name, "why": why})
-            if not self.arm:
-                log(f"WOULD KILL (dry-run) tmux {name}: {why}")
-                continue
-            rc, err = kill_tmux(name)
-            log(f"CLEANUP killed tmux {name} ({why}) rc={rc}{' ' + err if err else ''}")
-            if rc == 0:
-                s["status"] = "cleaned"
-                s["cleaned_at"] = store.iso(self.now)
-                s["cleaned_why"] = why
+            log(f"session {sid[:8]} ({name}) is gone" + (f"; task #{t['id']} is {t['status']}" if t else ""))
+            if t and t["status"] == "in_progress":
+                alert_once(self.st, f"ended:{sid}:{s.get('sent_at')}",
+                           f"task #{t['id']} session {sid[:8]} ended while the task is still in_progress",
+                           "Reopen or finish the task by hand (tasks.py reopen/done).")
+            return
+        if name in never or sid in excluded:
+            return
+        path = ka.transcript_path(sid)
+        last = ka.last_message(path) if path else None
+        if not last or ka.stall_info(last):
+            return                       # no transcript yet, or stalled: waits for a continue
+        m = last.get("message") or {}
+        if not (last.get("type") == "assistant" and m.get("stop_reason") == "end_turn"):
+            return                       # mid-turn (tool use) or waiting on a user entry
+        idle = self.now - ka.parse_ts(last.get("timestamp"))
+        t = store.get_task(self.conn, s["task_id"]) if s.get("task_id") else None
+        if t and t["status"] in FINISHED_TASK and idle >= timedelta(minutes=float(self.cfg["finished_grace_minutes"])):
+            why = f"task #{t['id']} is {t['status']}, idle {idle.total_seconds() / 60:.0f} min"
+        elif idle >= timedelta(hours=float(self.cfg["idle_cleanup_hours"])):
+            why = f"idle {idle.total_seconds() / 3600:.1f} h after an end_turn"
+        else:
+            return
+        if self.paused is not None:      # automation paused (D-234/D-235): nothing is released or killed
+            self.skip(f"cleanup {name}", f"automation paused ({self.paused})")
+            return
+        if not s.get("own_tmux"):
+            # we only typed into a tmux session someone else started: stop counting it, never kill it
+            log(f"released {name} ({why}): not started by the dispatcher, left running")
+            if self.arm:
+                s["status"] = "released"
+                s["released_at"] = store.iso(self.now)
+            return
+        rows = [a for a in ka.agent_entries(sid) if ka.pid_alive(a.get("pid"))]
+        if any(a.get("state") == "working" or a.get("status") == "busy" for a in rows):
+            self.skip(f"cleanup {name}", "process reports busy")
+            return
+        self.report["cleanup"].append({"sid": sid, "tmux": name, "why": why})
+        if not self.arm:
+            log(f"WOULD KILL (dry-run) tmux {name}: {why}")
+            return
+        rc, err = kill_tmux(name)
+        log(f"CLEANUP killed tmux {name} ({why}) rc={rc}{' ' + err if err else ''}")
+        if rc == 0:
+            s["status"] = "cleaned"
+            s["cleaned_at"] = store.iso(self.now)
+            s["cleaned_why"] = why
+        else:
+            raise RuntimeError(f"tmux kill-session rc={rc}: {err}")
 
     def run(self):
+        p = failstop.paused()
+        self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         excluded = excluded_sessions(self.cfg)
         self.verify()
         self.cleanup(excluded)
         for r, key in self.stalled_candidates(excluded):
+            if self.paused is not None:  # D-234/D-235: no continue until the owner cleared the pause
+                self.skip(f"stalled {r['session_id'][:8]}", f"automation paused ({self.paused})")
+                continue
             self.continue_stalled(r, key)
         # no task-session starts and no in-window starts of task-managers here (D-205): runs
         # begin only at the session-window / last-stretch slot starts (keepalive.py)
@@ -604,7 +644,11 @@ def main(argv=None):
         return 0
     ka.log = log            # keepalive's own log lines (usage refresh, alerts) go to dispatcher.log too
     afclaude_config.LOG = log   # settings problems (and the one-time import) too
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except failstop.Failed as e:
+        fail_stop(e.why, e.detail)
+        return 1
     now = datetime.now(UTC)
     if db_paused(args.arm):
         return 0
@@ -613,7 +657,13 @@ def main(argv=None):
         if args.arm and not args.no_scan:
             stalled.scan(conn)
         st = load_state()
-        rep = run_pass(conn, cfg, st, now, args.arm)
+        try:
+            rep = run_pass(conn, cfg, st, now, args.arm)
+        except failstop.Failed as e:      # the pass stops (D-234/D-235); what it did so far is kept
+            fail_stop(e.why, e.detail)
+            if args.arm:
+                save_state(st)
+            return 1
         seen = set(st.get("last_skips") or []) if args.arm else set()
         for line in rep["skip"]:
             if line not in seen:        # armed (cron): each skip reason is logged when it first shows up
@@ -642,5 +692,5 @@ if __name__ == "__main__":
         finally:
             if not (written and is_log_file(sys.stderr)):   # cron: stderr is the log file too
                 sys.stderr.write(tb)
-            ka.alert(f"dispatcher.py crashed: {type(e).__name__}: {e}"[:200], traceback.format_exc()[-1500:])
+            fail_stop(f"dispatcher.py crashed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1500:]}")
         sys.exit(1)

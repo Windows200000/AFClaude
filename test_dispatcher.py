@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -19,6 +20,7 @@ import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
 import pacing as budget  # noqa: E402
+import afclaude_config  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
 
@@ -104,6 +106,8 @@ echo "started $T"
 
 class Base(unittest.TestCase):
     def setUp(self):
+        testenv.unpause()            # a failure in an earlier test paused automation (D-234/D-235)
+        self.addCleanup(testenv.unpause)
         self.tmp = tempfile.TemporaryDirectory()
         d = self.d = self.tmp.name
         self.proj = os.path.join(d, "projects")
@@ -525,6 +529,78 @@ class Cleanup(Base):
         self.assertIn(f"{s[:8]} verified", rep["verify"])
 
 
+class FailStop(Base):
+    """D-234/D-235: while automation is paused the pass continues and kills nothing; a failure
+    (a launch that raises, a clean-up that fails, the host process list, an unreadable config,
+    a failed usage reading) is an error that pauses automation."""
+    track, idle, killed = Cleanup.track, Cleanup.idle, Cleanup.killed
+    def paused(self):
+        return afclaude_config.automation_pause()
+
+    def test_paused_continues_and_kills_nothing(self):
+        import failstop
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        self.track(sid(2)); self.idle(sid(2), 180)                  # would be killed (idle 3 h)
+        with mock.patch.object(failstop, "paused", return_value={"paused": True, "reason": "owner looks"}):
+            rep = self.run_pass()
+        self.assertEqual((self.resumed_sessions(), self.killed()), ([], []))
+        self.assertIn(f"stalled {sid(1)[:8]}: automation paused (owner looks)", rep["skip"])
+        self.assertIn(f"cleanup {ka.tmux_name(sid(2))}: automation paused (owner looks)", rep["skip"])
+        self.assertEqual(self.st["sessions"][sid(2)]["status"], "running")
+
+    def test_a_launch_that_raises_is_recorded_and_pauses(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        with mock.patch.object(ka, "fire", side_effect=OSError("bridge down")):
+            self.run_pass()
+        h = next(iter(self.st["handled"].values()))
+        self.assertEqual(h["result"], "launch-error")
+        self.assertIn("bridge down", h["error"])
+        self.assertIn("dispatcher: dispatcher continue of 00000001 failed: OSError", self.paused()["reason"])
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_a_failed_usage_reading_never_continues(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        rep = dp.run_pass(self.conn, self.cfg, self.st, NOW, True, usage_getter=lambda n: None)
+        self.assertEqual(self.resumed_sessions(), [])
+        self.assertTrue(any("USAGE_FAILED" in x for x in rep["skip"]), rep["skip"])
+
+    def test_a_failed_clean_up_pauses_and_the_others_go_on(self):
+        self.track(sid(1)); self.idle(sid(1), 180)
+        self.track(sid(2)); self.idle(sid(2), 180)
+        real = dp.kill_tmux
+        dp.kill_tmux = lambda name: (1, "no server") if name == ka.tmux_name(sid(1)) else real(name)
+        try:
+            self.run_pass()
+        finally:
+            dp.kill_tmux = real
+        self.assertEqual(self.killed(), [ka.tmux_name(sid(2))])
+        self.assertEqual(self.st["sessions"][sid(1)]["status"], "running")
+        self.assertIn(f"dispatcher clean-up of {ka.tmux_name(sid(1))} failed: RuntimeError", self.paused()["reason"])
+
+    def test_host_process_list_unavailable_stops_the_pass(self):
+        import failstop
+        dp.keepalive_targets = self.saved["dp"][5]                  # the real one
+        with mock.patch.object(dp.host, "in_container", return_value=True), \
+                mock.patch.object(dp.host, "proc_snapshot", side_effect=OSError("bridge down")):
+            with self.assertRaises(failstop.Failed) as cm:
+                dp.keepalive_targets()
+        self.assertEqual(cm.exception.why, "host process list unavailable")
+
+    def test_unreadable_config_is_an_error(self):
+        import failstop
+        path = os.path.join(self.d, "bad.json")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        with self.assertRaises(failstop.Failed):
+            dp.load_config(path)
+
+
 class DryRun(Base):
     def test_dry_run_changes_nothing(self):
         self.stalled_session(sid(1))
@@ -568,11 +644,13 @@ class DryRun(Base):
         env = dict(os.environ, AFCLAUDE_DB=os.path.join(self.d, "t.db"), DISPATCHER_DATA_DIR=data,
                    KEEPALIVE_PROJECTS_DIR=self.proj, KEEPALIVE_KA_RESUME=ka.KA_RESUME,
                    AFCLAUDE_OWN_LIST=self.own, KA_TRUST_ROOT=self.d)
-        # stub claude inside SCRUBBED_ENV too, and no usage cache: an approved stall needs no budget (D-206)
+        # stub claude inside SCRUBBED_ENV too, and a fresh usage reading: an approved stall needs no
+        # budget (D-206), but a reading (a failed one is an error, D-234/D-235)
         code = ("import sys, keepalive as ka, dispatcher as dp;"
                 f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
                 f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
+                "ka.fresh_usage=lambda now, force=False: {'fetched_at': now, 'session': {'percent': 5.0}};"
                 "ka.alert=lambda s, b='': print('ALERT', s);"
                 "sys.exit(dp.main(['--once', '--json']))")
         r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True,
@@ -594,6 +672,7 @@ class DryRun(Base):
                 f"ka.SCRUBBED_ENV['PATH']={self.bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                 f"ka.CLAUDE_JSON={os.path.join(self.d, 'no-claude.json')!r};"
                 f"ka.USAGE_STATE_FILE={os.path.join(self.d, 'usage_state.json')!r};"
+                "ka.fresh_usage=lambda now, force=False: {'fetched_at': now, 'session': {'percent': 5.0}};"
                 "ka.alert=lambda s, b='': None;"
                 "sys.exit(dp.main(['--once']))")
         with open(out_path, "a") as out:

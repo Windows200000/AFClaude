@@ -11,9 +11,8 @@ Per run:
     no model call): session + weekly %, reset times, raw text (incl. the
     "what's contributing" breakdown). If /usage does not refresh the cache,
     keepalive.refresh_usage_checked retries after one tiny token-refresh request;
-    a cache still older than usage_stale.USAGE_STALE_AFTER gives a row marked
-    usage.stale = true (kept, but ignored by pacing.py / limit_ratio.py), and
-    after STALE_ALERT_AFTER of that, one alert (notify.py) per episode
+    if it still did not refresh, that is an error (D-234/D-235): no row from the
+    old cache, the run is aborted (see Failures below)
   - incremental scan of all transcripts (subagents included) since the last run:
     tokens by model (input / cache write / cache read / output / thinking),
     assistant turns, human prompts, limit hits, active sessions, split into
@@ -37,6 +36,14 @@ the old data/ files are frozen legacy copies): samples, the weekly series and th
 through the actions.py appenders, the weekly cycles as records, the sampler state per entry.
 
 Times in rows are UTC ISO plus Berlin-local convenience fields.
+
+Failures (D-234/D-235, failstop.py): any failure or timeout is an error the owner sees (an ERROR
+line in sampler.log = app_log, an alert) and pauses automation (automation_paused, until the owner
+clears it; the sampler itself keeps sampling on later runs, it starts nothing). One before the
+sample row is stored (the usage reading, `claude agents`, the ratio snapshot, ...) aborts the run:
+no row, no state saved, so the next run re-reads the same transcript bytes. One after it (the
+weekly-reset `at` jobs, the run rows, a Haiku call) still saves the state (else the next run would
+count the activity twice), then raises the error. No degraded fallbacks, no swallowed exceptions.
 """
 import argparse
 import glob
@@ -56,6 +63,7 @@ import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-samp
 import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ignore them)
 import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual-write)
 import runner_state  # noqa: E402  (phase 2d: the sampler state and log lines too)
+import failstop  # noqa: E402  (D-234/D-235: every failure is an error the owner sees)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -98,10 +106,12 @@ def local_fields(t):
 
 def usage_now(t=None):
     """/usage (with the shared retry, keepalive.refresh_usage_checked) -> the row's usage dict.
-    A cache older than usage_stale.USAGE_STALE_AFTER is kept but marked stale: true."""
+    A refresh that failed raises failstop.Failed (D-234/D-235: no row from an old cache)."""
     t = t or now_utc()
     res = ka.refresh_usage_checked(cwd=DATA, now=t)
     rc, out = res["rc"], res["out"]
+    if not res.get("ok") or not res.get("usage"):
+        raise failstop.Failed(ka.USAGE_FAILED, ka.usage_failure_detail(res))
     u = res["usage"] or {}
     row = {"rc": rc, "fetched_at": u.get("fetched_at")}
     for k in ("session", "weekly"):
@@ -114,12 +124,16 @@ def usage_now(t=None):
         row["refresh_retry"] = {"ok": res["ok"], "poke": res["poke"]}
     row["text"] = out.strip()[:3000]
     try:
-        cache = host.usage_cache() if host.in_container() else json.load(open(ka.CLAUDE_JSON)).get("cachedUsageUtilization", {})
-        raw = cache.get("utilization", {})
-        row["limits_raw"] = raw.get("limits")
-        row["extra_usage_enabled"] = (raw.get("extra_usage") or {}).get("is_enabled")
-    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
-        pass
+        if host.in_container():
+            cache = host.usage_cache()
+        else:
+            with open(ka.CLAUDE_JSON) as fh:
+                cache = json.load(fh).get("cachedUsageUtilization", {})
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise failstop.Failed("usage cache unreadable", f"{type(e).__name__}: {e}"[:300]) from None
+    raw = cache.get("utilization", {})
+    row["limits_raw"] = raw.get("limits")
+    row["extra_usage_enabled"] = (raw.get("extra_usage") or {}).get("is_enabled")
     return row
 
 
@@ -281,11 +295,14 @@ def summarize(agg, sessions):
 # ------------------------------------------------------------------ agents
 
 def agents_snapshot():
+    """Counts of `claude agents` rows by kind:status. A failure raises failstop.Failed."""
     try:
         r = host.run_on_host(["claude", "agents", "--json"], timeout=60, env=ka.SCRUBBED_ENV)
+        if r.returncode != 0:
+            raise OSError(f"rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
         rows = json.loads(r.stdout or "[]")
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return None
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        raise failstop.Failed("`claude agents` snapshot failed", f"{type(e).__name__}: {e}"[:300]) from None
     snap = {}
     for a in rows:
         key = f"{a.get('kind')}:{a.get('status') or a.get('state')}"
@@ -296,9 +313,11 @@ def agents_snapshot():
 # ------------------------------------------------------------------ weekly cycles
 
 def track_cycle(usage, t, tag):
+    """The weekly cycle bookkeeping (the DB) and its pre/post-reset `at` jobs. -> None, or the
+    error text if an `at` job could not be scheduled (main raises it after the state is saved)."""
     w = usage.get("weekly") or {}
     if not w.get("resets_at"):
-        return
+        return None
     cycles = telemetry.read_cycles(CYCLES)   # the DB (D-161)
     # resets_at jitters by milliseconds between fetches -> round to the minute
     r0 = w["resets_at"] + timedelta(seconds=30)
@@ -331,6 +350,9 @@ def track_cycle(usage, t, tag):
                                                 "out": (r.stderr or r.stdout).strip()[-120:]})
         c["scheduled"] = ok
     telemetry.write_cycles(cycles, CYCLES)   # the changed cycles -> the DB
+    if not c["scheduled"]:
+        return f"cycle {key}: " + json.dumps(c.get("at_jobs", [])[-2:])[:400]
+    return None
 
 
 # ------------------------------------------------------------------ haiku
@@ -387,7 +409,7 @@ def haiku_judgement(st, t):
             if not m:
                 row["raw"] = res[:500]
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as e:
-            row["error"] = f"{type(e).__name__}: {e}"[:300]
+            row["error"] = f"{type(e).__name__}: {e}"[:300]     # kept in the row; main raises it
         meta["last_haiku_at"] = t.isoformat()
         meta["tokens_since_haiku"] = {}
         append(HAIKU_LOG, row)
@@ -494,23 +516,18 @@ def parse_breakdown(text):
             if m:
                 bd[f"top_subagents_{key}"] = {n.strip(): float(p) for n, p in
                                               re.findall(r"([^,%]+?)\s+(\d+(?:\.\d+)?)%", m.group(1))}
-    except Exception:  # never fail a sample over text parsing
-        pass
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235), not a silent gap in the row
+        raise failstop.Failed("/usage breakdown parsing failed", f"{type(e).__name__}: {e}"[:300]) from None
     return bd
 
 
 def derived_fields(usage, activity, prev):
-    """All additive per-sample fields; each guarded so one failure can't sink the row."""
-    out = {}
-    for name, fn in (("limits_kinds", lambda: {"limits_kinds": limits_kinds(usage)}),
-                     ("tokens", lambda: token_totals(activity)),
-                     ("deltas", lambda: pct_deltas(usage, prev)),
-                     ("session_start", lambda: {"session_start": session_start(usage)}),
-                     ("breakdown", lambda: {"breakdown": parse_breakdown(usage.get("text"))})):
-        try:
-            out.update(fn())
-        except Exception:
-            pass
+    """All additive per-sample fields. A failure raises (D-234/D-235: the run is aborted)."""
+    out = {"limits_kinds": limits_kinds(usage)}
+    out.update(token_totals(activity))
+    out.update(pct_deltas(usage, prev))
+    out["session_start"] = session_start(usage)
+    out["breakdown"] = parse_breakdown(usage.get("text"))
     return out
 
 
@@ -535,57 +552,12 @@ def ratio_snapshot(rows, t, windows_path=None):
     """limit_ratio snapshot for this row. First appends every session window
     that has completed by `t` and isn't stored yet (the DB; so a window is
     recorded on the first run after it ends; a missed run catches up), then
-    computes with the stored windows. A failure in the window store never
-    sinks the sample: the snapshot is then built from `rows` alone."""
+    computes with the stored windows and the autonomous runs' time split. A failure raises
+    (D-234/D-235: no snapshot from `rows` alone, the run is aborted)."""
     windows_path = windows_path or SESSION_WINDOWS
-    stored = None
-    try:
-        stored, _new = limit_ratio.append_new_windows(rows, path=windows_path, now=t)
-    except Exception:   # noqa: BLE001
-        stored = None
-    try:   # the autonomous AFClaude runs: the time-based AFClaude vs user split of the week
-        spans = limit_ratio.load_autonomous_spans(rows, now=t, runs_path=RUNS)
-    except Exception:   # noqa: BLE001 - the split is then reported as unavailable
-        spans = None
+    stored, _new = limit_ratio.append_new_windows(rows, path=windows_path, now=t)
+    spans = limit_ratio.load_autonomous_spans(rows, now=t, runs_path=RUNS)
     return limit_ratio.compute(rows, now=t, windows=stored, spans=spans)
-
-
-# ------------------------------------------------------------------ stale-usage alert
-
-STALE_ALERT_AFTER = timedelta(hours=3)   # the cache stale this long -> one alert (notify.py)
-
-
-def stale_alert(st, usage, t, notify_fn=None):
-    """One alert (notify.py, D-049) per stale episode once the usage cache has been stale for
-    more than STALE_ALERT_AFTER; the episode is keyed by the frozen fetch time, so the 15-min
-    runs don't repeat it. A fresh sample ends the episode. -> True if it alerted."""
-    if not usage.get("stale"):
-        st.pop("stale_since", None)
-        st.pop("stale_alerted", None)
-        return False
-    since = _dt(st.get("stale_since")) or t
-    st["stale_since"] = since.isoformat()
-    f = _dt(usage.get("fetched_at"))
-    start = min(f, since) if f else since
-    key = f.isoformat() if f else "no-cache"
-    if st.get("stale_alerted") == key or t - start < STALE_ALERT_AFTER:
-        return False
-    if notify_fn is None:
-        from notify import notify as notify_fn
-    hours = (t - start).total_seconds() / 3600
-    subject = f"usage data stale for {hours:.0f} h: /usage does not refresh the cache"
-    body = (f"`claude -p /usage` has not refreshed ~/.claude.json since "
-            f"{f.astimezone(BERLIN).strftime('%a %d.%m. %H:%M') if f else 'n/a'} (Berlin), also not "
-            f"after a token-refresh request ({(usage.get('refresh_retry') or {}).get('poke') or 'not tried'}). "
-            f"Sampler rows are kept but marked stale (ignored by the forecast and the ratio); autonomous "
-            f"starts hold (fail-safe). Last /usage output: {(usage.get('text') or '').strip()[:200]!r}")
-    try:
-        notify_fn(subject, body)
-    except Exception as e:   # noqa: BLE001 - an alert failure must not sink the sample
-        print(f"stale alert failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return False
-    st["stale_alerted"] = key
-    return True
 
 
 # ------------------------------------------------------------------ AFClaude runs (D-207)
@@ -596,76 +568,108 @@ RUN_USAGE = os.path.join(DATA, "run_usage.jsonl")     # the watcher's extra read
 
 def update_runs(t):
     """The fill-time rows of every AFClaude run not final yet, with this sample included
-    (run_metrics.update; the first call backfills all past runs). Never sinks the sample."""
-    try:
-        import run_metrics
-        rows = run_metrics.update(now=t, out_path=RUNS, samples_path=SAMPLES, watch_path=RUN_USAGE)
-        return len(rows)
-    except Exception as e:   # noqa: BLE001 - advisory
-        print(f"run metrics failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+    (run_metrics.update; the first call backfills all past runs). -> the number of rows. A
+    failure raises (main reports it after the state is saved)."""
+    import run_metrics
+    rows = run_metrics.update(now=t, out_path=RUNS, samples_path=SAMPLES, watch_path=RUN_USAGE)
+    return len(rows)
 
 
 # ------------------------------------------------------------------ main
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="cron", help="cron | pre_reset | post_reset | manual")
-    ap.add_argument("--no-haiku", action="store_true")
-    args = ap.parse_args()
-    os.makedirs(DATA, exist_ok=True)
-    try:   # the sampler starts nothing; as a frequent cron job it reports a broken AFClaude DB
-        import store   # (alert once per episode) and its recovery (design §7.8, store.db_gate)
-        problem = store.db_gate("sampler")
-        if problem is not None:
-            print(f"database problem ({problem.kind}): {problem}; {problem.escalation}", file=sys.stderr)
-    except Exception as e:   # noqa: BLE001 - never sinks the sample
-        print(f"database check failed: {type(e).__name__}: {e}", file=sys.stderr)
-    t = now_utc()
+def log(msg):
+    """One line into sampler.log (stdout is the live log: the cron redirect) and app_log."""
+    line = f"{now_utc().isoformat()} {msg}"
+    print(line, flush=True)
+    runner_state.tee("sampler", line)
+
+
+def fail(subject, detail=""):
+    """A failure (D-234/D-235): ERROR line, alert, automation paused (failstop.fail)."""
+    return failstop.fail("sampler", subject, detail, log=log)
+
+
+def sample(args, t):
+    """One sample (see the module doc). A failure before the row is stored raises (nothing
+    saved); later ones come back as [(subject, detail)] after the state was saved."""
     st = runner_state.load("sampler", STATE)   # the DB (D-161)
     baseline = not st.get("offsets")
     usage = usage_now(t)
-    stale = bool(usage.get("stale"))
     agg = scan(st, baseline)
     row = {"at": t.isoformat(), **local_fields(t), "tag": args.tag, "baseline": baseline,
            "since": st.get("last_sample_at"), "usage": usage,
            "activity": summarize(agg, st["sessions"]) if agg is not None else None,
            "agents": agents_snapshot()}
     w = usage.get("weekly") or {}
-    if w.get("resets_at") and not stale:
+    if w.get("resets_at"):
         start = w["resets_at"] - ka.WEEK
         row["week_elapsed_frac"] = round((t - start) / ka.WEEK, 4)
         row["projected_linear"] = round(ka.project_weekly(w["percent"], w["resets_at"], t), 1)
     # Cheap: reuse the samples already on disk plus this row, so the ratio
     # snapshot's own history is kept alongside every sample (limit_ratio.py).
     row["limit_ratio"] = ratio_snapshot(limit_ratio.load_samples(SAMPLES) + [row], t)
-    # stale meters: no deltas from / against them (a 34 h-old % is no previous reading)
-    row.update(derived_fields(usage, row["activity"], None if stale else st.get("prev_pct")))
-    try:
-        if stale:
-            st.pop("prev_pct", None)
-        else:
-            st["prev_pct"] = pct_state(usage)
-    except Exception:
-        st.pop("prev_pct", None)
+    row.update(derived_fields(usage, row["activity"], st.get("prev_pct")))
+    st["prev_pct"] = pct_state(usage)
     st["last_sample_at"] = t.isoformat()
     append(SAMPLES, row)
+    append(SERIES, series_line(row))
+    # -- the row is stored: from here on the state must be saved; failures are reported after it
+    errors = []
     try:
-        append(SERIES, series_line(row))
-    except Exception:
-        pass
-    if not stale:                     # a frozen % would fake the cycle's max / pre-reset value
-        track_cycle(usage, t, args.tag)
-    update_runs(t)
-    stale_alert(st, usage, t)
+        why = track_cycle(usage, t, args.tag)
+        if why:
+            errors.append(("scheduling the weekly-reset samples failed", why))
+    except Exception as e:   # noqa: BLE001
+        errors.append(("weekly cycle bookkeeping failed", f"{type(e).__name__}: {e}"))
+    try:
+        update_runs(t)
+    except Exception as e:   # noqa: BLE001
+        errors.append(("run metrics update failed", f"{type(e).__name__}: {e}"))
     if not args.no_haiku and args.tag == "cron":
-        haiku_judgement(st, t)
-    runner_state.save("sampler", st, STATE)
+        try:
+            bad = [r for r in haiku_judgement(st, t) if r.get("error")]
+            if bad:
+                errors.append(("Haiku usage judgement failed",
+                               "; ".join(f"{r.get('name')}: {r['error']}" for r in bad)[:500]))
+        except Exception as e:   # noqa: BLE001
+            errors.append(("Haiku usage judgement failed", f"{type(e).__name__}: {e}"))
+    if not runner_state.save("sampler", st, STATE):
+        errors.append(("sampler state not saved", "recorded in data/ALERTS.fallback.md (D-171)"))
     line = (f"{t.isoformat()} tag={args.tag} baseline={baseline} weekly={w.get('percent')} "
             f"session={(usage.get('session') or {}).get('percent')}")
     print(line, flush=True)
     runner_state.tee("sampler", line)   # stdout IS the live sampler.log (the cron redirect)
+    return errors
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tag", default="cron", help="cron | pre_reset | post_reset | manual")
+    ap.add_argument("--no-haiku", action="store_true")
+    args = ap.parse_args(argv)
+    os.makedirs(DATA, exist_ok=True)
+    try:   # the sampler starts nothing; as a frequent cron job it reports a broken AFClaude DB
+        import store   # (alert once per episode) and its recovery (design §7.8, store.db_gate)
+        problem = store.db_gate("sampler")
+        if problem is not None:
+            print(f"database problem ({problem.kind}): {problem}; {problem.escalation}", file=sys.stderr)
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235)
+        fail("database check failed", f"{type(e).__name__}: {e}")
+        return 1
+    t = now_utc()
+    try:
+        errors = sample(args, t)
+    except failstop.Failed as e:
+        fail(e.why, e.detail)
+        return 1
+    except Exception as e:   # noqa: BLE001 - any other failure: the run is aborted, an error
+        import traceback
+        fail(f"usage_sampler.py failed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1200:]}")
+        return 1
+    for subject, detail in errors:
+        fail(subject, detail)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

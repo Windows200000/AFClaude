@@ -529,7 +529,8 @@ class SettingActions(Base):
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "compaction_enabled": True,
-                          "automation_paused": False, "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
+                          "automation_paused": False, "automation_paused_reason": "",
+                          "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
                           "log_retention_days": 30.0, "log_retention_overrides": {}})
 
@@ -618,6 +619,25 @@ class SettingActions(Base):
         self.assertEqual(self.do("automation.set", paused=False)["value"], False)
         with self.assertRaisesRegex(ValueError, "true or false"):
             self.do("automation.set", paused="yes")
+
+    def test_automation_pause_reason(self):
+        """D-234/D-235: a pause carries its reason (one audit row with both); a pause without one
+        keeps it; a resume clears it; the reason is checked text."""
+        r = self.do("automation.set", paused=True, reason="  keepalive:  save   timeout ")
+        self.assertEqual((r["value"], r["reason"]), (True, "keepalive: save timeout"))
+        a = self.audit(target_type="setting")
+        self.assertEqual(len(a), 1)
+        self.assertEqual((a[0]["before"], a[0]["after"]),
+                         ({"value": None, "reason": None}, {"value": True, "reason": "keepalive: save timeout"}))
+        self.assertEqual(self.do("automation.set", paused=True)["reason"], "keepalive: save timeout")
+        self.assertEqual(len(self.audit(target_type="setting")), 1)          # nothing changed: no row
+        r = self.do("automation.set", paused=False, reason="ignored on a resume")
+        self.assertEqual((r["value"], r["reason"]), (False, ""))
+        self.assertEqual(actions.get_setting(self.conn, "automation_paused_reason"), "")
+        with self.assertRaisesRegex(ValueError, "at most 2000"):
+            self.do("automation.set", paused=True, reason="x" * 2001)
+        with self.assertRaisesRegex(ValueError, "must be text"):
+            self.do("automation.set", paused=True, reason=5)
 
 
 class WindowActions(Base):

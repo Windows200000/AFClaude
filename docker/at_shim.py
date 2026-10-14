@@ -9,6 +9,11 @@ claims every due pending job (marks it started, so it never runs twice) and star
 /bin/sh. A job that can't be stored (a broken DB) is recorded in data/ALERTS.fallback.md
 (§7.8) and `at` exits 1.
 
+Failures of `--run-due` (D-234/D-235, failstop.py): the jobs can't be read or claimed, or a job
+can't be started: an ERROR line in at_shim.log (= app_log), an alert, and automation paused until
+the owner clears it; the run stops there. The shim itself runs no AFClaude session: the jobs it
+starts (the sampler's samples, a one-off review) check the pause themselves.
+
 The old spool dir ($AFCLAUDE_AT_SPOOL, default <data>/at_spool) is a read-only legacy: its
 files are never written or deleted any more; `--run-due` adds a spooled job the DB doesn't
 know yet (one an older shim copy spooled without its DB write) to the DB and runs it from there.
@@ -26,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 AFCLAUDE_DIR = os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude")
 sys.path.insert(0, AFCLAUDE_DIR)
+import failstop  # noqa: E402  (D-234/D-235)
 import runner_state  # noqa: E402
 import store  # noqa: E402
 
@@ -73,25 +79,42 @@ def _due(job, now):
     return t is not None and (t if t.tzinfo else t.replace(tzinfo=timezone.utc)) <= now
 
 
+def log(msg):
+    """One line into at_shim.log (stdout, the cron redirect) and app_log."""
+    line = f"{datetime.now(timezone.utc).isoformat()} at-shim: {msg}"
+    print(line, flush=True)
+    runner_state.tee("at_shim", line)
+
+
+def fail(subject, detail=""):
+    """A failure (D-234/D-235): ERROR line, alert, automation paused (failstop.fail)."""
+    return failstop.fail("at_shim", subject, detail, log=log)
+
+
 def run_due():
     now = datetime.now(timezone.utc)
     try:
         _adopt_legacy({j["id"] for j in runner_state.jobs()})
         due = [j for j in jobs("pending") if _due(j, now)]
     except store.DBError as e:
-        print(f"{now.isoformat()} at-shim: database problem ({e.kind}): {e}; no job started", flush=True)
+        fail("scheduled jobs unreadable: no job started", f"database problem ({e.kind}): {e}")
         return 1
     for job in due:
         try:
             if not runner_state.job_claim(job["id"]):     # claim it first: never run a job twice
                 continue
         except store.DBError as e:
-            print(f"{now.isoformat()} at-shim: job {job['id']} not claimed ({e.kind}): {e}", flush=True)
-            continue
-        print(f"{now.isoformat()} at-shim: running job {job['id']} (due {job['run_at']})", flush=True)
+            fail("a due job could not be claimed: no further job started",
+                 f"job {job['id']} ({e.kind}): {e}")
+            return 1
+        log(f"running job {job['id']} (due {job['run_at']})")
         cwd = job.get("cwd") if os.path.isdir(job.get("cwd") or "") else "/"
-        subprocess.Popen(["/bin/sh", "-c", job["cmd"]], cwd=cwd, start_new_session=True,
-                         stdin=subprocess.DEVNULL)
+        try:
+            subprocess.Popen(["/bin/sh", "-c", job["cmd"]], cwd=cwd, start_new_session=True,
+                             stdin=subprocess.DEVNULL)
+        except OSError as e:
+            fail("a claimed job could not be started", f"job {job['id']} ({job['cmd'].strip()[:200]}): {e}")
+            return 1
     return 0
 
 

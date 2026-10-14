@@ -42,6 +42,13 @@ Forecast (my choice): linear extrapolation of the weekly % over the elapsed
 part of the week, with elapsed floored at 24h so an early-week burst doesn't
 explode the projection.
 
+Failures (D-234, D-235): any failure or timeout (a usage reading, the budget model, a host call, the
+compaction steps, a continue without a reply, ...) is an error the owner sees: fail_stop() (an
+ERROR line, an alert, automation_paused set with the reason; failstop.py), and what was going on is
+aborted (a start before its continue went out is recorded as start-failed). No fallback to another
+rule or older data, no silent retry on the next tick. While automation_paused is set (by a failure
+or by hand) nothing starts or continues; the owner clears it: `python3 tasks.py automation resume`.
+
 Default is DRY-RUN (decides and logs "WOULD FIRE", never resumes anything).
 Pass --arm to actually fire. Create a file named STOP next to this script to
 make a running watcher exit.
@@ -97,11 +104,11 @@ RESET_GRACE = timedelta(seconds=90)       # fire this long after the reset time
 USAGE_MAX_AGE = timedelta(minutes=10)     # refresh /usage if cache older than this
 REFRESH_OK_AGE = timedelta(minutes=2)     # /usage left the cache this young: OK (claude skips the rewrite < 60 s)
 POKE_MIN_INTERVAL = timedelta(minutes=30) # at most one token-refresh request per this (sampler + watcher + cron)
-USAGE_ALERT_AFTER = 2                     # failed usage checks in a row at one window start -> one ALERT
 USAGE_STATE_FILE = os.path.join(STATE_DIR, "usage_refresh_state.json")
 HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this often
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
 VERIFY_TIMEOUT = timedelta(minutes=10)
+TAKE_OVER_WAIT = 30                       # seconds for a SIGTERMed holder to exit before a take-over resume
 
 IGNORE_WINDOW = False  # --now: skip the window-start-hour gate (budget rule still applies)
 BACKLOG_FILE = os.path.join(HERE, "BACKLOG.md")
@@ -348,15 +355,22 @@ def parse_reset_text(text, ref):
 
 # ---------------------------------------------------------------- usage
 
+_CACHE_ERROR = None   # why the last read_usage_cache() failed (usage_cache_checked raises it)
+
+
 def read_usage_cache():
-    """Parse ~/.claude.json cachedUsageUtilization -> dict or None."""
+    """Parse ~/.claude.json cachedUsageUtilization -> dict or None (no cache, or the read failed:
+    the file, the bridge, a timeout, bad JSON; the read-only views use this)."""
+    global _CACHE_ERROR
+    _CACHE_ERROR = None
     try:
         if host.in_container():
             c = host.usage_cache()
         else:
             with open(CLAUDE_JSON) as fh:
                 c = json.load(fh).get("cachedUsageUtilization") or {}
-    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as e:
+        _CACHE_ERROR = e
         return None
     if not c.get("fetchedAtMs"):
         return None
@@ -372,6 +386,15 @@ def read_usage_cache():
             out[key] = {"percent": float(util[src].get("utilization") or 0),
                         "resets_at": parse_ts(util[src].get("resets_at"))}
     return out
+
+
+def usage_cache_checked():
+    """read_usage_cache() for the runners' decision paths: a read that failed raises (an error
+    there, never "no cache", D-234/D-235); no cache at all is still None."""
+    u = read_usage_cache()
+    if u is None and _CACHE_ERROR is not None:
+        raise _CACHE_ERROR
+    return u
 
 
 def refresh_usage(cwd=HERE):
@@ -439,7 +462,10 @@ def _refreshed(u, before, now):
 def refresh_usage_checked(cwd=HERE, now=None):
     """The ONE usage refresh with retry, used by the sampler and the watcher / window-start paths:
     /usage; if the cache did not refresh, one cheap real request (poke_auth: renews an expired
-    OAuth token) and /usage again. -> dict rc, out (last /usage output), usage (cache after,
+    OAuth token) and /usage again. This one retry is DELIBERATE (D-235 allows deliberate,
+    documented retries; task-manager decision 14.10.): `-p /usage` alone does not renew an expired
+    token (the 03./04.10. incident, usage_stale.py). If it still did not refresh, the callers treat
+    it as an error (fresh_usage: fail_stop), never a second silent retry. -> dict rc, out (last /usage output), usage (cache after,
     or None), ok (refreshed), retried, poke (poke_auth result or None)."""
     now = now or datetime.now(UTC)
     before = (read_usage_cache() or {}).get("fetched_at")
@@ -460,41 +486,35 @@ def refresh_usage_checked(cwd=HERE, now=None):
     return res
 
 
-def fresh_usage(now, force=False):
+USAGE_FAILED = "usage reading failed: /usage did not refresh the usage cache"
+
+
+def usage_failure_detail(r):
+    """The alert text of a failed usage refresh (refresh_usage_checked's result `r`)."""
+    cache = (r.get("usage") or read_usage_cache() or {}).get("fetched_at")
+    return (f"`claude -p /usage` did not refresh ~/.claude.json (cache from {berlin(cache) if cache else 'n/a'}), "
+            f"also not after a token-refresh request ({r.get('poke') or 'not tried'}); rc={r.get('rc')}. Last "
+            f"/usage output: {(r.get('out') or '').strip()[:300]!r}. A real Claude request (or `claude /login`) "
+            "on the host usually fixes it.")
+
+
+def fresh_usage(now, force=False, display=False):
+    """The usage cache, refreshed first if forced or older than USAGE_MAX_AGE. A refresh that
+    fails (also after refresh_usage_checked's one token-refresh retry) is an error (D-234/D-235):
+    fail_stop (alert, automation paused) and None; the caller starts nothing. display=True (a
+    read-only view: --decide, usage_report.py) never pauses: it only logs the error and
+    returns None."""
     u = read_usage_cache()
     if force or not u or now - u["fetched_at"] > USAGE_MAX_AGE:
         r = refresh_usage_checked(now=now)
         u = r["usage"]
         if not u or now - u["fetched_at"] > USAGE_MAX_AGE:
-            log(f"usage refresh failed or cache still stale (rc={r['rc']}, retried={r['retried']}): "
-                f"{r['out'].strip()[:200]!r}")
+            if display:
+                log(f"ERROR (display only, not paused): {USAGE_FAILED}: {usage_failure_detail(r)}")
+            else:
+                fail_stop(USAGE_FAILED, usage_failure_detail(r))
             return None
     return u
-
-
-def note_window_usage(key, ok, now, final=False):
-    """Window-start usage bookkeeping: count failed (unknown / stale) usage checks in a row per
-    window-start key; after USAGE_ALERT_AFTER of them send ONE alert (notify.py; D-048 /
-    D-049), not one every 15 min; at once if `final` (no recheck follows tonight). A good check
-    resets the count. The fail-safe itself is unchanged: unknown usage never starts work.
-    -> True if it alerted."""
-    st = _load_usage_state()
-    ent = (st.get("window_start") or {}).get(key) or {"fails": 0, "alerted": False}
-    ent["fails"] = 0 if ok else ent.get("fails", 0) + 1
-    alerted = False
-    if not ok and (ent["fails"] >= USAGE_ALERT_AFTER or final) and not ent.get("alerted"):
-        cache = (LAST_REFRESH.get("usage") or read_usage_cache() or {}).get("fetched_at")
-        alert(f"weekly usage unknown at the window start ({ent['fails']} checks in a row): "
-              "no autonomous start (fail-safe)",
-              f"`claude -p /usage` did not refresh ~/.claude.json (cache from "
-              f"{berlin(cache) if cache else 'n/a'}), also not after a token-refresh request "
-              f"({LAST_REFRESH.get('poke') or 'not tried'}). Last /usage output: "
-              f"{(LAST_REFRESH.get('out') or '').strip()[:300]!r}. The watcher rechecks every 15 min; "
-              "a real Claude request (or `claude /login`) on the host usually fixes it.")
-        ent["alerted"] = alerted = True
-    st["window_start"] = {key: ent}      # older nights are over
-    _save_usage_state(st)
-    return alerted
 
 
 # ---------------------------------------------------------------- budget rule
@@ -521,12 +541,15 @@ def _ratio_text(extra, ratio):
 BUDGET_ADVICE = "; check usage_report.py / keepalive.py --decide and stop before exceeding it"
 
 
-def budget_eval(usage, now):
+def budget_eval(usage, now, display=False):
     """THE budget evaluation every caller uses (watcher, window-start, last mile, deferred
     window-start, --decide, --work-on, the dispatcher gate, the quickview), so they all show
     the same number. -> dict(go, reason, headroom, text, postpone, recheck_at, last_mile,
-    session_cap). Model: afclaude_config.usage_model(); any failure of pacing.py -> the
-    original linear rule (which HOLDs inside the last mile: it cannot see the user)."""
+    session_cap). Model: afclaude_config.usage_model(). A failure of pacing.py is an error
+    (D-234/D-235): fail_stop (alert, automation paused) and a HOLD (failed_eval, mode "failed"),
+    no fallback to another rule. display=True (the quickview, --decide): the same HOLD with the
+    error in it, but never a pause (a display path never pauses; the runners that hit the same
+    failure do)."""
     try:
         m = _budget_model()
         if m:
@@ -536,10 +559,18 @@ def budget_eval(usage, now):
             if d["headroom"] is not None:
                 text += BUDGET_ADVICE
             return dict(d, text=text, last_mile=d.get("mode") == "last_mile")
-    except Exception as e:   # noqa: BLE001 - any model failure falls back to the linear rule
-        log(f"budget model failed ({type(e).__name__}: {e}); falling back to the linear rule")
-        return fallback_eval(usage, now)
-    return linear_eval(usage, now)
+        return linear_eval(usage, now)
+    except Exception as e:   # noqa: BLE001 - any model failure: an error, nothing starts
+        if not display:
+            fail_stop("budget model failed", f"{type(e).__name__}: {e}"[:500])
+        return failed_eval(f"{type(e).__name__}: {e}")
+
+
+def failed_eval(why):
+    """The decision after a budget-model failure: HOLD, nothing runs (D-234/D-235)."""
+    return {"go": False, "reason": f"HOLD: budget model failed ({why})"[:300], "headroom": None,
+            "text": "budget for this run: none (budget model failed)", "postpone": False, "recheck_at": None,
+            "last_mile": False, "session_cap": 85.0, "mode": "failed"}
 
 
 def budget_decision(usage, now):
@@ -570,21 +601,9 @@ def linear_eval(usage, now, reason_suffix=""):
     if extra is not None:
         reason += f"; budget for this run +{extra:.1f}%"
         text += _ratio_text(extra, _limit_ratio()) + BUDGET_ADVICE
-    lm = _fallback_last_mile(usage, now)
+    lm = in_last_mile(now, usage or {"weekly": {}})
     return {"go": go, "reason": reason + reason_suffix, "headroom": extra, "text": text, "postpone": False,
             "recheck_at": None, "last_mile": lm, "session_cap": 100.0 if lm else 85.0, "mode": "linear"}
-
-
-def fallback_eval(usage, now):
-    """Linear rule after a budget-model failure. The linear rule cannot see the user, so the
-    last mile (where it would spend up to 100%) holds instead of continuing."""
-    if _fallback_last_mile(usage, now):
-        return {"go": False, "reason": "HOLD: budget model failed and the linear fallback does not spend the "
-                                       "last mile; budget for this run +0.0%",
-                "headroom": 0.0, "text": "budget for this run: none (budget model failed; the last mile is not "
-                                         "spent)", "postpone": False, "recheck_at": None, "last_mile": True,
-                "session_cap": 85.0, "mode": "fallback"}
-    return linear_eval(usage, now, " [linear fallback: budget model failed]")
 
 
 def last_mile_hours(weekly_pct, resets_at=None, now=None):
@@ -615,18 +634,6 @@ def in_last_mile(now, usage=None):
     """Last-mile check from given usage or the cached usage (no refresh)."""
     w = (usage or read_usage_cache() or {}).get("weekly") or {}
     return last_mile_left(w.get("resets_at"), now, w.get("percent")) is not None
-
-
-def _fallback_last_mile(usage, now):
-    try:
-        return in_last_mile(now, usage or {"weekly": {}})
-    except Exception:   # noqa: BLE001 - unknown: assume the last mile (the safe side)
-        return True
-
-
-def fallback_budget_decision(usage, now):
-    d = fallback_eval(usage, now)
-    return d["go"], d["reason"]
 
 
 def linear_settings():
@@ -682,12 +689,13 @@ def linear_budget_decision(usage, now):
 
 def agent_entries(session_id):
     """All `claude agents` rows for this session (a session can show up twice,
-    e.g. a dead bg row plus a live interactive one)."""
-    try:
-        r = host.run_on_host(["claude", "agents", "--json", "--all"], timeout=60, env=SCRUBBED_ENV)
-        return [a for a in json.loads(r.stdout or "[]") if a.get("sessionId") == session_id]
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return []
+    e.g. a dead bg row plus a live interactive one). A failure (timeout, bridge, exit code,
+    bad JSON) raises (OSError / TimeoutExpired / ValueError): an empty list would read as
+    "nothing holds the session" and a resume could fork it (D-234/D-235)."""
+    r = host.run_on_host(["claude", "agents", "--json", "--all"], timeout=60, env=SCRUBBED_ENV)
+    if r.returncode != 0:
+        raise OSError(f"`claude agents` failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
+    return [a for a in json.loads(r.stdout or "[]") if a.get("sessionId") == session_id]
 
 
 def job_state(session_id):
@@ -708,12 +716,10 @@ def tmux_alive(session_id):
 
 
 def tmux_pids(session_id):
-    """Pane pids of our own tmux session ka-<id8> (empty if none)."""
-    try:
-        r = host.run_on_host(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
-                             timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
+    """Pane pids of our own tmux session ka-<id8> (empty if none). A failed host call raises
+    (preflight() refuses then)."""
+    r = host.run_on_host(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
+                         timeout=30)
     return {int(x) for x in r.stdout.split() if x.isdigit()} if r.returncode == 0 else set()
 
 
@@ -938,12 +944,18 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
                 host.kill_claude(pid)
             except ProcessLookupError:
                 pass
-        for _ in range(30):
+        for _ in range(TAKE_OVER_WAIT):
             if not any(pid_alive(p) for p in pids):
                 break
             time.sleep(1)
+        else:   # still alive: a resume now would make a second writer on the transcript (a fork)
+            raise RuntimeError(f"take-over: pid(s) {[p for p in pids if pid_alive(p)]} still alive "
+                               f"{TAKE_OVER_WAIT} s after SIGTERM; not resumed")
     if plan == "stop-bg-then-resume":
-        host.run_on_host(["claude", "stop", session_id[:8]], env=SCRUBBED_ENV, timeout=60)
+        r = host.run_on_host(["claude", "stop", session_id[:8]], env=SCRUBBED_ENV, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f"`claude stop {session_id[:8]}` failed rc={r.returncode}: "
+                               f"{(r.stderr or r.stdout or '').strip()[:200]}; not resumed")
         time.sleep(5)
     cmd = [KA_RESUME, "--session", session_id, "--message", message,
            "--cwd", cwd]
@@ -1073,7 +1085,7 @@ def stall_status(session_id, now):
     # trusted it and fired 80 min early.
     reset = stall["reset_from_text"]
     if reset is None:
-        u = (read_usage_cache() or {}).get(stall["kind"]) or {}
+        u = (usage_cache_checked() or {}).get(stall["kind"]) or {}
         reset = u.get("resets_at") if u.get("resets_at") and u["resets_at"] > stall["timestamp"] \
             else stall["timestamp"] + timedelta(hours=5)
     stall["reset"] = reset
@@ -1089,11 +1101,13 @@ def evaluate(session_id, now, usage_getter=fresh_usage):
     window and no AFClaude budget/pacing gate; only a live session limit still at 100% waits.
     The AFClaude task-manager and every other AFClaude run never get this (D-204: a limit hit
     ends the run; the watcher only logs it). -> (action, detail, stall), action one of
-    NO_TRANSCRIPT, OTHER_ERROR, NO_STALL, WAIT_RESET, FIRE."""
+    NO_TRANSCRIPT, OTHER_ERROR, NO_STALL, WAIT_RESET, USAGE_FAILED, FIRE."""
     action, detail, stall = stall_status(session_id, now)
     if action != "RESET_PASSED":
         return action, detail, stall
     usage = usage_getter(now)   # only fetched when a fire is actually on the table
+    if usage is None:           # the reading failed (fresh_usage: alert + pause): never continue blind
+        return "USAGE_FAILED", f"{detail}; the usage reading failed, not continued (D-234/D-235)", stall
     s = (usage or {}).get("session") or {}
     if s.get("percent", 0) >= 100 and s.get("resets_at") and s["resets_at"] > now:
         return "WAIT_RESET", f"live usage still shows session limit 100% until {berlin(s['resets_at'])}", stall
@@ -1156,7 +1170,7 @@ def sleep_seconds(now, *due):
 def last_mile_next_start(now, usage=None):
     """The next time after `now` at which the last stretch opens or a new last-stretch slot
     starts (weekly reset - k x session length, last_mile_slot), or None. From the usage cache."""
-    w = ((usage if usage is not None else read_usage_cache()) or {}).get("weekly") or {}
+    w = ((usage if usage is not None else usage_cache_checked()) or {}).get("weekly") or {}
     reset = w.get("resets_at")
     if not reset:
         return None
@@ -1191,39 +1205,46 @@ def run(args):
             lm_checked = now
             try:     # wake at the next last-stretch slot start, not up to a poll (or a HOLD recheck) late
                 lm_start = last_mile_next_start(now)
-            except Exception as e:   # noqa: BLE001 - advisory: the regular poll still finds the slot
+            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
                 lm_start = None
-                log(f"last-stretch slot time failed: {type(e).__name__}: {e}")
+                fail_stop("last-stretch slot time failed", f"{type(e).__name__}: {e}")
         if now >= next_eval:
             # Detection + logging only: a limit hit ends the run, the watcher never continues the
             # session at the reset (D-204). Runs begin only at starts: the session-window starts
             # (cron --window-start, a postponed one below) and the last-stretch slot starts.
-            action, detail, stall = stall_status(sid, now)
-            if stall:
-                action, detail = "LIMIT_HIT", f"{detail}; {LIMIT_HIT_NOTE}"
-                note_limit_hit(sid, stall, st, now)
-            line = f"{action}: {detail}"
-            if line != last_line:
-                log(line)
-                last_line = line
             next_eval = now + timedelta(seconds=POLL_SECONDS)
-            # a last-stretch slot start decides by its own check, stalled or not (D-204)
-            next_lm = last_mile_pass(sid, now, st, args)
-            if next_lm:
-                next_eval = max(next_eval, next_lm)
+            try:
+                action, detail, stall = stall_status(sid, now)
+                if stall:
+                    action, detail = "LIMIT_HIT", f"{detail}; {LIMIT_HIT_NOTE}"
+                    note_limit_hit(sid, stall, st, now)
+                line = f"{action}: {detail}"
+                if line != last_line:
+                    log(line)
+                    last_line = line
+                # a last-stretch slot start decides by its own check, stalled or not (D-204)
+                next_lm = last_mile_pass(sid, now, st, args)
+                if next_lm:
+                    next_eval = max(next_eval, next_lm)
+            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
+                fail_stop(f"watcher pass failed: {type(e).__name__}", str(e)[:500])
         if lm_start is not None and lm_start + WAKE_SLACK < next_eval:
             next_eval = lm_start + WAKE_SLACK      # a new slot's start is not held by the last one's HOLD
         # a postponed session-window start (D-018/D-202), also when the previous run ended at a
         # limit (D-204: "limit hit before 4am and the next run starts at 4am")
-        deferred_due = deferred_window_start_pass(sid, now, st, args)
+        try:
+            deferred_due = deferred_window_start_pass(sid, now, st, args)
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
+            deferred_due = None
+            fail_stop(f"postponed window-start pass failed: {type(e).__name__}", str(e)[:500])
         if now >= next_fillup:    # the fill-up run of an AFClaude session window (D-212)
             next_fillup = now + FILLUP_EVERY
             try:
                 due = fillup_pass(sid, now, args)
                 if isinstance(due, datetime):     # its planned start (or recheck): wake right then
                     next_fillup = max(min(next_fillup, due + WAKE_SLACK), now + timedelta(seconds=MIN_SLEEP))
-            except Exception as e:   # noqa: BLE001 - a fill-up problem must not take the watcher down
-                log(f"fill-up pass failed: {type(e).__name__}: {e}")
+            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
+                fail_stop("fill-up pass failed", f"{type(e).__name__}: {e}")
         if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
             next_reading = now + RUN_READING_EVERY
             watch_run_usage(sid, now)
@@ -1297,8 +1318,9 @@ def last_mile_pass(sid, now, st, args):
     start like a session-window start (D-204): it decides by its own check whether or not the
     previous slot's run ended at a limit, and nothing continues at a limit reset in between
     (a slot already handled waits for the next slot). A limit that has not reset yet makes the
-    slot's start wait for that reset. Returns the next re-check time after a HOLD, else None."""
-    w = (read_usage_cache() or {}).get("weekly") or {}
+    slot's start wait for that reset. Paused automation (D-234/D-235) holds it like a HOLD.
+    Returns the next re-check time after a HOLD, else None."""
+    w = (usage_cache_checked() or {}).get("weekly") or {}
     left = last_mile_left(w.get("resets_at"), now, w.get("percent"))
     if left is None:
         return None
@@ -1306,6 +1328,8 @@ def last_mile_pass(sid, now, st, args):
     key = last_mile_key(w["resets_at"], slot)
     if last_mile_handled(key, st["handled"]):
         return None
+    if automation_paused(f"the last-stretch slot {key}"):
+        return now + LAST_MILE_RECHECK
     action, detail, stall = stall_status(sid, now)
     if action == "WAIT_RESET":
         log(f"last-mile: slot start waits for the limit reset, {detail}")
@@ -1335,22 +1359,33 @@ def window_start_pass(sid, now, args):
     while that is before the night's next session-window start: a later recheck (also any at the
     last start, the run would end after the window end) is skipped; the next session-window start
     decides again. A FIRE dropped for a DB pause (handle_fire -> db_paused) is postponed the same
-    way (db_paused's docstring): nothing else makes this start due again before then. -> the
-    decision dict."""
+    way (db_paused's docstring): nothing else makes this start due again before then. Paused
+    automation (D-234/D-235) skips the start (a progress note says so); a failed usage reading
+    is an error (fresh_usage: alert + pause). -> the decision dict."""
+    if automation_paused(f"the session-window start {berlin(now)}"):
+        d = {"go": False, "reason": f"PAUSED: automation is paused ({paused_reason()})", "postpone": False}
+        progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}; clear it with "
+                      "`python3 tasks.py automation resume` once the error is fixed (D-234/D-235)")
+        return d
     u = fresh_usage(now, force=True)
+    if u is None:      # fresh_usage raised the error (alert + pause): no decision on unknown numbers
+        d = {"go": False, "reason": "HOLD: usage reading failed (automation paused, D-234/D-235)",
+             "postpone": False}
+        progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
+        return d
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
     key = f"manual-now-{now.isoformat()}" if args.now else schedule.start_key(now)
     deadline = schedule.postpone_deadline(now)
     defer = bool(d.get("postpone") and d.get("recheck_at") and not args.now and d["recheck_at"] < deadline)
-    if not args.now:
-        note_window_usage(key, u is not None, now, final=not defer)
     if not args.now and getattr(args, "arm", False):
         try:                                  # score the forecast later (pacing.forecast_errors)
             import pacing
             pacing.record_forecast(d, ((u or {}).get("weekly") or {}).get("resets_at"))
-        except Exception as e:   # noqa: BLE001 - the log is advisory
-            log(f"forecast log failed: {type(e).__name__}: {e}")
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): the start is aborted
+            fail_stop("forecast log failed at a session-window start", f"{type(e).__name__}: {e}")
+            progress_note(f"window-start {berlin(now)}: not resumed, the forecast log failed (automation paused)")
+            return dict(d, go=False, reason=f"HOLD: forecast log failed ({type(e).__name__})")
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
                  "start_at": schedule.latest_session_start(now) or now}
@@ -1441,12 +1476,19 @@ def deferred_window_start_pass(sid, now, st, args):
     due = parse_ts(ent.get("recheck_at")) or now
     if now < due:
         return due
-    u = fresh_usage(now, force=True)
+    paused = automation_paused(f"the postponed session-window start {key}")
+    u = None if paused else fresh_usage(now, force=True)
+    if u is None:   # paused, or the usage reading failed (fresh_usage: alert + pause): dropped
+        defs.pop(key, None)
+        save_deferred(defs)
+        progress_note(f"window-start (postponed) {berlin(now)}: not resumed, "
+                      + (f"automation is paused ({paused_reason()})" if paused else
+                         "the usage reading failed (automation paused)") + " (D-234/D-235)")
+        return None
     d = budget_eval(u, now)
     log(f"window-start (postponed): {d['reason']}")
     deadline = schedule.postpone_deadline(now)
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
-    note_window_usage(key, u is not None, now, final=not again)
     if d["go"]:
         fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
                                   "start_at": schedule.latest_session_start(now) or now},
@@ -1484,22 +1526,53 @@ def deferred_window_start_pass(sid, now, st, args):
 
 def _fire_usage():
     """The usage cache at a fire (session/weekly %, reset times, fetch time; the start decision
-    just refreshed it), JSON-safe, or None. Never fails a fire."""
-    try:
-        import run_metrics
-        return run_metrics.fire_usage(read_usage_cache())
-    except Exception:   # noqa: BLE001 - advisory: run_metrics falls back to the sampler rows
-        return None
+    just refreshed it), JSON-safe, or None. A failure raises (handle_fire aborts the start)."""
+    import run_metrics
+    return run_metrics.fire_usage(usage_cache_checked())
 
 
 def watch_run_usage(sid, now):
     """While a run is going: one extra usage reading per run_metrics.RUN_SAMPLE_EVERY into
-    the run readings in the DB (D-207, the fill-time measurement). Never fails the watcher."""
+    the run readings in the DB (D-207, the fill-time measurement). A failure is an error
+    (D-234/D-235: alert + automation paused); the watcher itself goes on."""
     try:
         import run_metrics
         run_metrics.watch_sample(sid, now)
-    except Exception as e:   # noqa: BLE001 - advisory
-        log(f"run usage reading failed: {type(e).__name__}: {e}")
+    except Exception as e:   # noqa: BLE001 - reported, never takes the watcher down
+        import failstop
+        if isinstance(e, failstop.Failed):
+            fail_stop(e.why, e.detail)
+        else:
+            fail_stop("run usage reading failed", f"{type(e).__name__}: {e}")
+
+
+_PAUSE_LOGGED = None   # the automation_paused reason last logged (once per reason)
+
+
+def automation_paused(what):
+    """The pause switch (automation_paused, D-234/D-235; failstop.paused(): a DB that can't be
+    read counts as paused). True = don't start `what`; logged once per pause reason. Set by any
+    runner's failure (fail_stop) or by hand; the owner clears it (`tasks.py automation resume`)."""
+    global _PAUSE_LOGGED
+    import failstop
+    p = failstop.paused()
+    if not p["paused"]:
+        if _PAUSE_LOGGED is not None:
+            log("automation_paused cleared: autonomous starts resume")
+            _PAUSE_LOGGED = None
+        return False
+    reason = p.get("reason") or "no reason given"
+    if reason != _PAUSE_LOGGED:
+        log(f"PAUSED (automation_paused), not starting {what}: {reason}; the owner clears it with "
+            f"`{failstop.RESUME_CMD}`")
+        _PAUSE_LOGGED = reason
+    return True
+
+
+def paused_reason():
+    """The pause reason for a log line or a note (the strict read)."""
+    import failstop
+    return failstop.paused().get("reason") or "no reason given"
 
 
 _DB_PAUSE = None   # the database problem the starts are paused for (logged once per problem)
@@ -1536,15 +1609,21 @@ def db_paused(what):
 
 
 def handle_fire(sid, stall, reason, st, args):
-    """-> None (already handled, fire cap reached, or it fired/was handled below), or the
-    string "db_paused" (dropped without marking handled; a window-start caller must postpone
-    it itself, see db_paused's docstring)."""
+    """One start (a session-window start, a postponed one, a last-stretch slot, a fill-up).
+    -> None (already handled, fire cap reached, or it fired / was handled below), "db_paused"
+    (dropped without marking handled; a window-start caller must postpone it itself, see
+    db_paused's docstring), "paused" (automation_paused: dropped, not handled) or "failed" (the
+    start was aborted on an error, D-234/D-235: recorded as start-failed, alerted, automation
+    paused; abort_start)."""
+    import failstop
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
         return None
     if getattr(st, "unavailable", False):   # the state is only a default (DB unreadable): decide again later
         log(f"PAUSED, not starting {sid[:8]} ({reason}): the keepalive state could not be read from the database")
         return "db_paused"
+    if automation_paused(f"{sid[:8]} ({reason})"):
+        return "paused"
     night = schedule.night(datetime.now(UTC))
     if st["fires"].get(night, 0) >= MAX_FIRES_PER_WINDOW:
         log(f"fire cap reached for window ending {night}; not firing")
@@ -1554,12 +1633,57 @@ def handle_fire(sid, stall, reason, st, args):
     ok, problems, plan = preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
-        st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "preflight-failed", "problems": problems}
+        held = owner_holds(problems)
+        st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "preflight-failed", "problems": problems,
+                              "held": held}
         save_state(st)
+        if held:   # the owner has the session (Remote Control, a terminal, mid-turn): a skip, not a failure
+            progress_note(f"start {key} of {sid[:8]} skipped: the owner holds the session ({problems[0]}); "
+                          "no pause, the next start decides again")
+            return None
         progress_note(f"did NOT fire for stall {key}: preflight failed: {problems}")
-        alert(f"keep-alive did NOT continue {sid[:8]}: preflight failed", "; ".join(problems))
-        return
-    budget = stall.get("budget") or budget_headroom(read_usage_cache(), datetime.now(UTC))[1]
+        fail_stop(f"keep-alive did NOT continue {sid[:8]}: preflight failed", "; ".join(problems))
+        return None
+    try:
+        return _fire_start(sid, stall, reason, st, args, key, night, plan)
+    except failstop.Failed as e:
+        abort_start(sid, key, st, reason, plan, e.why, e.detail, e.record)
+    except Exception as e:   # noqa: BLE001 - any other failure before the continue went out
+        abort_start(sid, key, st, reason, plan, "start failed", f"{type(e).__name__}: {e}")
+    return "failed"
+
+
+OWNER_HOLDS = (RC_HELD, OTHER_HELD, "session is busy in another process", "held by an idle interactive process")
+
+
+def owner_holds(problems):
+    """A preflight refusal because the session is in use (a Remote Control thread, an attached
+    terminal or another live process holding it, a busy turn): a normal skip like the
+    dispatcher's (task-manager decision 14.10. on D-234/D-235), not a failure. Anything else (the
+    host process info unavailable, ...) is a failure."""
+    return bool(problems) and all(any(m in p for m in OWNER_HOLDS) for p in problems)
+
+
+def abort_start(sid, key, st, reason, plan, why, detail="", record=None):
+    """A start that failed before its continue went out (D-234/D-235): recorded as start-failed
+    (handled: not retried), a progress note, and fail_stop (alert, automation paused: no run until
+    the owner has looked at it). Nothing more is sent to the session."""
+    rec = {"at": datetime.now(UTC).isoformat(), "result": "start-failed", "plan": plan, "reason": reason,
+           "session": sid, "error": f"{why}: {detail}"[:500] if detail else why}
+    if record:
+        rec["compaction"] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in record.items()}
+    st["handled"][key] = rec
+    save_state(st)
+    progress_note(f"start {key} of {sid[:8]} ABORTED ({reason}): {why}; automation paused until the owner "
+                  "clears it (D-234/D-235)")
+    fail_stop(f"start of {sid[:8]} aborted: {why}", detail)
+
+
+def _fire_start(sid, stall, reason, st, args, key, night, plan):
+    """handle_fire after a passed preflight. A failure before the continue goes out raises (the
+    caller aborts the start); a failure after it is recorded with the run and raised as an error
+    (fail_stop) here."""
+    budget = stall.get("budget") or budget_headroom(usage_cache_checked(), datetime.now(UTC))[1]
 
     path = transcript_path(sid)
     cwd = session_cwd(path)
@@ -1581,34 +1705,27 @@ def handle_fire(sid, stall, reason, st, args):
         save_state(st)
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})"
                       + (" after a save prompt and compacting it (D-191/D-218/D-233)" if comp and comp["due"] else ""))
-        return
+        return None
     handoff = None
     if comp and comp["due"]:
         # D-233: the hand-off is written right before the compaction, so it covers everything since
-        # the last one (also the owner's interactive chats)
+        # the last one (also the owner's interactive chats). Any failure aborts the start (D-234).
+        import failstop
         try:
-            save = save_before_compaction(sid, cwd, path)
-        except Exception as e:   # noqa: BLE001 - a save problem never stops the start; compact anyway
-            log(f"save before the compaction of {sid[:8]} failed: {type(e).__name__}: {e}")
-            save = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
-        comp["save"] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in save.items()}
-        if save["status"] not in ("saved", "busy"):
-            log(f"WARNING: no new hand-off from {sid[:8]} before the compaction ({save['status']}); compacting anyway")
-        try:
-            comp.update(compaction_busy(sid, "before the save prompt") if save["status"] == "busy"
-                        else compact_session(sid, cwd, path))
-        except Exception as e:   # noqa: BLE001 - a compaction problem never stops the start itself
-            log(f"compaction of {sid[:8]} failed: {type(e).__name__}: {e}; continuing without it")
-            comp.update(status="error", error=f"{type(e).__name__}: {e}"[:200])
-        if comp["status"] in ("compacted", "timeout"):
-            insert, handoff = compact_resume_text(sid, save)
-            msg = build(" ".join(x for x in (stall.get("insert"), insert) if x))
-            comp["handoff_id"] = handoff["id"] if handoff else None
-    sent_at = datetime.now(UTC)
+            insert, handoff, done = compact_with_handoff(sid, cwd, path)
+        except failstop.Failed as e:
+            raise failstop.Failed(f"compaction failed: {e.why}", e.detail, dict(comp, **e.record)) from None
+        comp.update(done)
+        msg = build(" ".join(x for x in (stall.get("insert"), insert) if x))
     at_fire = _fire_usage()          # the run's start values (run_metrics.py, D-207)
+    sent_at = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, msg, plan)
+    errors = []                      # failures after the continue went out: recorded, then raised
     if handoff and rc == 0:
         comp["handoff_consumed"] = consume_handoff(handoff, key)
+        if not comp["handoff_consumed"]:
+            errors.append((f"hand-off #{handoff['id']} of {sid[:8]} not marked consumed",
+                           "it was sent; the next compacting start would inject it again"))
     st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
@@ -1616,21 +1733,29 @@ def handle_fire(sid, stall, reason, st, args):
     if comp:
         result["compaction"] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in comp.items()}
     reply = verify_reply(path, sent_at) if rc == 0 else None
-    live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
-    result["env"] = [process_env_flags(a["pid"]) for a in live]
+    try:
+        live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
+        result["env"] = [process_env_flags(a["pid"]) for a in live]
+    except Exception as e:   # noqa: BLE001 - recorded, then raised as an error below
+        result["env_error"] = f"{type(e).__name__}: {e}"[:300]
+        errors.append((f"process check after the continue of {sid[:8]} failed", result["env_error"]))
     if reply:
         result["result"] = "continued-in-place"
         result["reply_model"] = (reply.get("message") or {}).get("model")
         log(f"VERIFIED: new assistant message in {sid[:8]} at {reply.get('timestamp')} "
-            f"model={result['reply_model']} env={result['env']}")
+            f"model={result['reply_model']} env={result.get('env')}")
     else:
         result["result"] = "no-reply-within-timeout" if rc == 0 else "launcher-failed"
         log(f"VERIFY FAILED: {result['result']}")
-        alert(f"keep-alive continue of {sid[:8]} failed: {result['result']}",
-              f"plan={plan} rc={rc} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
+        errors.insert(0, (f"keep-alive continue of {sid[:8]} failed: {result['result']}",
+                          f"plan={plan} rc={rc} (no reply within {VERIFY_TIMEOUT} after the continue if rc=0) "
+                          f"stdout={out.strip()[:300]} stderr={err.strip()[:500]}"))
     st["handled"][key] = result
     save_state(st)
     progress_note(f"fired continue for {sid[:8]} via {plan}: {result.get('result')} ({reason})")
+    for subject, detail in errors:
+        fail_stop(subject, detail)
+    return None
 
 
 # ---------------------------------------------------------------- fill-up run (D-212)
@@ -1663,19 +1788,15 @@ def _fillup_log(line):
 
 
 def _fillup_rows():
-    try:
-        import run_metrics
-        return run_metrics.read_rows()
-    except Exception:   # noqa: BLE001 - no run data: the default rate
-        return []
+    """The run rows (run_metrics.py) for the fill rate; a failure raises (fillup_pass: an error)."""
+    import run_metrics
+    return run_metrics.read_rows()
 
 
 def _fillup_ratio():
-    try:
-        import pacing
-        return float(pacing.ratio_info()[0])
-    except Exception:   # noqa: BLE001
-        return 0.2
+    """The session->weekly ratio (pacing.py); a failure raises (no default ratio, D-234/D-235)."""
+    import pacing
+    return float(pacing.ratio_info()[0])
 
 
 def _limit_hit_in(sid, reset):
@@ -1701,9 +1822,10 @@ def _fillup_user(now, last_stretch, s):
 def fillup_decision(sid, now, usage=None):
     """The fill-up decision for the current session window (fillup.decide with the live inputs)."""
     import fillup
-    s = afclaude_config.settings("fillup_enabled", "fillup_factor", "automation_paused",
-                                 "pacing_idle_min", "pacing_last_mile_yield")
-    u = usage if usage is not None else (read_usage_cache() or {})
+    import failstop
+    s = afclaude_config.settings("fillup_enabled", "fillup_factor", "pacing_idle_min", "pacing_last_mile_yield")
+    s["automation_paused"] = failstop.paused()["paused"]     # the strict read (unreadable = paused)
+    u = usage if usage is not None else (usage_cache_checked() or {})
     sess, w = u.get("session") or {}, u.get("weekly") or {}
     reset = sess.get("resets_at")
     st = load_state()
@@ -1740,10 +1862,10 @@ def _fire_fillup(sid, now, d, args, test=False):
 
 def fillup_test_pass(sid, now, args, test):
     """-> the time to look again (its start while planned, a re-check while held), or None."""
+    import failstop
     import fillup
-    s = afclaude_config.settings("automation_paused")
     st = load_state()
-    d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {}, paused=bool(s["automation_paused"]))
+    d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {}, paused=failstop.paused()["paused"])
     _fillup_log(f"fill-up TEST: {d['status']}: {d['reason']} (start {berlin(d['start'])}, key {d['key']})")
     if d["status"] == "fire":
         _fire_fillup(sid, now, d, args, test=True)
@@ -1763,21 +1885,22 @@ def _usage_young(u, now):
 
 def fillup_pass(sid, now, args):
     """Once per watcher minute: plan / fire the fill-up of the current session window (D-212).
-    A --plan-fillup-test entry for this session takes precedence. Never raises for a missing input.
+    A --plan-fillup-test entry for this session takes precedence. A failure raises (the watcher
+    reports it: fail_stop).
     The fire decides on usage at most FILLUP_FRESH old: within FILLUP_PREFETCH of the planned start
     the usage is refreshed ahead, so the run fires AT its start (the watcher wakes then, run()),
     not after a /usage call. -> the time to look again (the planned start, a re-check), or None."""
     test = load_fillup().get("test")
     if isinstance(test, dict) and test.get("session") == sid:
         return fillup_test_pass(sid, now, args, test)
-    u = read_usage_cache() or {}
+    u = usage_cache_checked() or {}
     d = fillup_decision(sid, now, u)
     planned = d["status"] == "wait" and d.get("recheck_at") is not None and d.get("recheck_at") == d.get("start")
     if (d["status"] == "fire" or (planned and d["start"] - now <= FILLUP_PREFETCH)) and not _usage_young(u, now):
         fu = fresh_usage(now, force=True)   # the plan used the cache: decide on fresh numbers
-        if fu is None:
+        if fu is None:                       # fresh_usage raised the error (alert + automation paused)
             if d["status"] == "fire":
-                return None                  # no fresh numbers: not fired, the next pass tries again
+                return None                  # not fired; the pause holds the next passes
         else:
             u = fu
             d = fillup_decision(sid, now, u)
@@ -1823,7 +1946,7 @@ def plan_fillup_test(sid, remaining, args):
     print(f"scheduled (DB: keepalive.fillup); the running watcher fires it at {berlin(p['start'])}")
 
 
-# ---------------------------------------------------------------- compaction (D-144, D-191, D-214, D-233)
+# ---------------------------------------------------------------- compaction (D-144, D-191, D-214, D-233, D-234)
 # Minimal version of design §5.5, built in today's keep-alive (D-214; phase 3c's runner reuses it).
 # The trigger is algorithmic (D-191, D-218): at a start, a session is due for compaction if its
 # conversation already ran before the session window that ended at this start began, i.e. the
@@ -1831,26 +1954,29 @@ def plan_fillup_test(sid, remaining, args):
 # appending to) is older than that window's start. So the first compaction comes after 1 to 2
 # session lengths, and a resume into a new tmux session keeps the conversation's age. A start that
 # continues the session in its live tmux session (window-start, postponed start, last-stretch slot;
-# never a fill-up) then, once the session's turn has ended:
-#   1. types the save prompt (prompts/session_end_save.md) and waits for the session's NEW hand-off
-#      in the DB (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is
-#      written directly before the compaction (D-233), so it also holds the owner's interactive
-#      chats since the last run (there is no end-of-window save prompt any more);
+# never a fill-up) then runs compact_with_handoff():
+#   1. once the session's turn has ended (up to COMPACT_IDLE_WAIT), types the save prompt
+#      (prompts/session_end_save.md) and waits for the session's NEW hand-off in the DB
+#      (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is written
+#      directly before the compaction (D-233), so it also holds the owner's interactive chats since
+#      the last run (there is no end-of-window save prompt any more);
 #   2. sends `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
-#      compact_boundary / isCompactSummary entry);
-#   3. sends the continue message with that hand-off inserted (prompts/compact_resume.md) and
-#      consumes it. Without a new hand-off (timeout, no reply, send failure) it still compacts (the
-#      session must go on), but never injects an older hand-off silently: one written before the
-#      session's last activity goes in with the stale label (compact_resume_stale.md), and a
-#      WARNING goes to the log and the progress doc.
+#      compact_boundary / isCompactSummary entry; up to COMPACT_TIMEOUT);
+#   3. the continue message goes out with that hand-off inserted (prompts/compact_resume.md), and
+#      handle_fire consumes it.
+# Any failure or timeout on the way (a busy session, no new hand-off, a send failure, no compaction
+# marker, the saved hand-off not found, a DB error) is an error (D-234): the start is aborted (no
+# /compact after a failed save, no continue), recorded as start-failed, alerted, and automation is
+# paused until the owner has looked at it ("no run until fixed"). An older hand-off is never
+# injected in place of a fresh one.
 
 COMPACT_TOLERANCE = timedelta(minutes=15)   # a conversation begun this little before the window
                                             # start (an early start, clock skew) counts as begun in it
-COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction, then continue anyway
-COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn
+COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction marker, then: error
+COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn, then: error
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
 COMPACT_POLL = 10                           # seconds
-SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt
+SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt, then: error
 TASKS_PY = os.path.join(HERE, "tasks.py")
 
 
@@ -1866,21 +1992,19 @@ def conversation_started(session_id, path=None):
     """When the Claude session's conversation began: the timestamp of the first user/assistant entry
     of its transcript (only the head of the file is read). A `claude --resume` appends to the same
     file, so a resume into a new tmux session keeps the age. None if there is no transcript or no
-    timestamped entry (unknown = no compaction, the safe side)."""
+    timestamped entry (unknown = no compaction). A transcript that can't be read raises (OSError:
+    the start is aborted, D-234/D-235)."""
     path = path or transcript_path(session_id)
-    if not path:
+    if not path or not os.path.exists(path):
         return None
-    try:
-        for e in iter_entries(path):
-            if e.get("type") in ("user", "assistant"):
-                try:
-                    ts = parse_ts(e.get("timestamp"))
-                except (AttributeError, ValueError):
-                    ts = None
-                if ts:
-                    return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
-    except OSError:
-        return None
+    for e in iter_entries(path):
+        if e.get("type") in ("user", "assistant"):
+            try:
+                ts = parse_ts(e.get("timestamp"))
+            except (AttributeError, ValueError):
+                ts = None
+            if ts:
+                return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
     return None
 
 
@@ -1891,12 +2015,9 @@ def _compaction_settings():
 def compaction_plan(sid, start_at):
     """At a start: is this session due for compaction (D-191/D-218, judged at the end of the session
     window before `start_at`: did the conversation already run before that window began)?
-    -> dict(due, why, first_activity)."""
-    try:
-        if not _compaction_settings()["compaction_enabled"]:
-            return {"due": False, "why": "compaction_enabled is off", "first_activity": None}
-    except Exception as e:   # noqa: BLE001
-        return {"due": False, "why": f"settings unreadable ({type(e).__name__})", "first_activity": None}
+    -> dict(due, why, first_activity). A failure raises (handle_fire aborts the start)."""
+    if not _compaction_settings()["compaction_enabled"]:
+        return {"due": False, "why": "compaction_enabled is off", "first_activity": None}
     first = conversation_started(sid)
     if first is None:
         return {"due": False, "why": "conversation start unknown (no transcript): no compaction",
@@ -1961,25 +2082,24 @@ def wait_idle(path):
 
 
 def compaction_busy(sid, what):
-    """The session was still mid-turn after COMPACT_IDLE_WAIT: no compaction at this start."""
-    log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT} ({what}); not compacted at this start")
-    progress_note(f"compaction of {sid[:8]} skipped: the session was still mid-turn (D-191/D-218 apply again "
-                  "at the next start)")
-    return {"status": "busy"}
+    """The session was still mid-turn after COMPACT_IDLE_WAIT (`what`: before which step)."""
+    log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT} ({what})")
+    return {"status": "busy", "busy_before": what}
 
 
 def compact_session(sid, cwd, path):
     """Send /compact into our live tmux session and wait until the transcript shows it finished.
-    -> dict status: compacted | timeout (continue anyway) | busy (still mid-turn after
-    COMPACT_IDLE_WAIT: not compacted this time) | send-failed."""
+    -> dict status: compacted | timeout (no marker within COMPACT_TIMEOUT) | busy (still mid-turn
+    after COMPACT_IDLE_WAIT) | send-failed. Only "compacted" lets the start go on
+    (compact_with_handoff)."""
     if not wait_idle(path):
         return compaction_busy(sid, "before /compact")
     since = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, compact_command(), "send-keys")
     log(f"compaction: sent /compact to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     if rc != 0:
-        alert(f"keep-alive could not send /compact to {sid[:8]}", f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}")
-        return {"status": "send-failed", "sent_at": since, "rc": rc}
+        return {"status": "send-failed", "sent_at": since, "rc": rc,
+                "error": f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip()}
     deadline = time.time() + COMPACT_TIMEOUT.total_seconds()
     while True:
         hit = compacted_since(path, since)
@@ -1987,9 +2107,7 @@ def compact_session(sid, cwd, path):
             log(f"compaction: {sid[:8]} compacted ({hit.get('subtype') or 'summary'} at {hit.get('timestamp')})")
             return {"status": "compacted", "sent_at": since, "done_at": hit.get("timestamp")}
         if time.time() >= deadline:
-            log(f"compaction: no compaction marker in {sid[:8]}'s transcript after {COMPACT_TIMEOUT}; "
-                "continuing anyway")
-            progress_note(f"compaction of {sid[:8]}: no compaction marker after {COMPACT_TIMEOUT}, continued anyway")
+            log(f"compaction: no compaction marker in {sid[:8]}'s transcript after {COMPACT_TIMEOUT}")
             return {"status": "timeout", "sent_at": since}
         time.sleep(COMPACT_POLL)
 
@@ -2005,7 +2123,7 @@ def _entry_ts(e, key="timestamp"):
 def last_activity(path):
     """When the session was last active: the timestamp of its transcript's last user/assistant
     entry (interactive chats included). Read before the save prompt, so the save turn itself never
-    counts. None if unknown."""
+    counts (kept in the start's record). None if unknown."""
     if not path or not os.path.exists(path):
         return None
     try:
@@ -2037,28 +2155,34 @@ def save_text(sid):
     return " ".join(load_prompt("session_end_save").format(session=sid, tasks=TASKS_PY).split())
 
 
-SAVE_WHY = {   # why there is no new hand-off: the continue message and the warning say it
-    "timeout": f"none arrived within {SAVE_TIMEOUT.total_seconds() / 60:g} min of the save prompt",
-    "no-handoff": "the session answered the save prompt without writing one",
+SAVE_WHY = {   # why there is no new hand-off: the error says it (D-234)
+    "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the start, "
+            "so no save prompt was sent",
+    "timeout": f"no new hand-off within {SAVE_TIMEOUT.total_seconds() / 60:g} min of the save prompt",
+    "no-handoff": "the session answered the save prompt without writing a hand-off",
     "send-failed": "the save prompt could not be sent",
-    "db-error": "the hand-offs could not be read, so no save prompt was sent",
-    "error": "the save step failed",
+    "db-error": "the hand-offs could not be read",
+}
+COMPACT_WHY = {
+    "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the save",
+    "timeout": f"no compaction marker within {COMPACT_TIMEOUT.total_seconds() / 60:g} min of /compact",
+    "send-failed": "/compact could not be sent",
 }
 
 
 def save_before_compaction(sid, cwd, path):
     """D-233: the hand-off is written directly before the compaction. Wait until the session's turn
-    ended (else busy: no save and no compaction at this start), type the save prompt, then wait for
-    a new hand-off row of the session (up to SAVE_TIMEOUT; given up early once the session answered
-    and went idle without one). -> dict status: saved (+ handoff_id) | busy | db-error |
-    send-failed | no-handoff | timeout, active (the session's last activity before the save
-    prompt, for the stale label), sent_at."""
+    ended (else busy), type the save prompt, then wait for a new hand-off row of the session (up to
+    SAVE_TIMEOUT; given up early once the session answered and went idle without one). -> dict
+    status: saved (+ handoff_id) | busy | db-error | send-failed | no-handoff | timeout (the session
+    still working on it or silent: no new row in time), active (the session's last activity before
+    the save prompt), sent_at, error. Only "saved" lets the compaction go on (D-234)."""
     out = {"active": last_activity(path)}
     if not wait_idle(path):
         return dict(out, status="busy")
     try:
         before = newest_handoff_id(sid)
-    except Exception as e:   # noqa: BLE001 - no save; the compaction still goes on (the stale label applies)
+    except Exception as e:   # noqa: BLE001 - an error (D-234): no save prompt, the start is aborted
         log(f"compaction: {sid[:8]}'s hand-offs unreadable ({type(e).__name__}: {e}); no save prompt")
         return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
     since = datetime.now(UTC)
@@ -2066,77 +2190,95 @@ def save_before_compaction(sid, cwd, path):
     log(f"compaction: sent the save prompt to {sid[:8]} rc={rc} stdout={o.strip()!r} stderr={err.strip()!r}")
     out["sent_at"] = since
     if rc != 0:
-        alert(f"keep-alive could not send the save prompt to {sid[:8]}", f"rc={rc} {err.strip()[:300]}")
-        return dict(out, status="send-failed", rc=rc)
+        return dict(out, status="send-failed", rc=rc, error=f"rc={rc} {err.strip()[:300]}".strip())
     deadline = time.time() + SAVE_TIMEOUT.total_seconds()
-    db_error = None
     while True:
         done = replied_since(path, since)   # before the DB read: the row is written before the reply
         try:
             newest = newest_handoff_id(sid)
-        except Exception as e:   # noqa: BLE001 - keep waiting; logged once
-            newest = before
-            if db_error is None:
-                db_error = f"{type(e).__name__}: {e}"
-                log(f"compaction: {sid[:8]}'s hand-offs unreadable while waiting for the save ({db_error})")
+        except Exception as e:   # noqa: BLE001 - an error (D-234): store.retrying already retried (D-171)
+            log(f"compaction: {sid[:8]}'s hand-offs unreadable while waiting for the save ({type(e).__name__}: {e})")
+            return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
         if newest > before:
             log(f"compaction: {sid[:8]} saved hand-off #{newest} right before the compaction (D-233)")
             return dict(out, status="saved", handoff_id=newest)
         if done:
             return dict(out, status="no-handoff")
         if time.time() >= deadline:
-            return dict(out, status="timeout")
+            return dict(out, status="timeout", still_busy=not session_idle(path))
         time.sleep(COMPACT_POLL)
 
 
-def _handoff_warning(line):
-    log(f"WARNING: {line}")
-    progress_note(f"WARNING: {line}")
-
-
-def compact_resume_text(sid, save=None):
-    """The text inserted into the continue message after a compaction -> (text, hand-off row or
-    None). The session's latest unconsumed hand-off, normally the one the save right before this
-    compaction wrote (`save`: save_before_compaction's result; compact_resume.md). Without a new
-    one, an older hand-off written before the session's last activity goes in with the stale label
-    (compact_resume_stale.md) and a WARNING (log + progress note), never silently; none at all:
-    compact_resume_none.md (+ the warning). A DB problem never stops the continue."""
+def compact_resume_text(sid, save):
+    """The text inserted into the continue message after a compaction -> (text, hand-off row):
+    the session's latest unconsumed hand-off, which must be the one the save right before this
+    compaction wrote (`save`: save_before_compaction's result, status "saved"; compact_resume.md).
+    Anything else raises failstop.Failed (D-234): no save, the saved hand-off not found (e.g.
+    consumed or gone meanwhile), or the DB could not be read."""
+    import failstop
     import store
-    save = save or {}
-    status = save.get("status")
-    why = SAVE_WHY.get(status, f"save step: {status}")
+    want = int((save or {}).get("handoff_id") or 0)
+    if (save or {}).get("status") != "saved" or not want:
+        raise failstop.Failed("no fresh hand-off to inject", f"save status {(save or {}).get('status')!r}")
     try:
         conn = store.connect()
         try:
             h = store.latest_handoff(conn, sid)
         finally:
             conn.close()
-    except Exception as e:   # noqa: BLE001 - the continue goes out without it (D-171)
-        log(f"hand-off not read: {type(e).__name__}: {e}")
-        return load_prompt("compact_resume_none").format(
-            why=f"it could not be read: database problem, {type(e).__name__}", progress=PROGRESS_FILE), None
-    if status == "saved" and h is not None and h["id"] >= int(save.get("handoff_id") or 0):
-        return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
-    if h is None:
-        if status != "saved":
-            _handoff_warning(f"{sid[:8]} compacted without a hand-off: {why}")
-        return load_prompt("compact_resume_none").format(
-            why="none was saved" + (f": {why}" if status != "saved" else ""), progress=PROGRESS_FILE), None
-    active, written = save.get("active"), _entry_ts(h, "created_at")
-    if active is not None and written is not None and written >= active:
-        log(f"compaction: no new hand-off from {sid[:8]} ({why}), but #{h['id']} (written {berlin(written)}) "
-            f"is newer than the session's last activity ({berlin(active)}): injected as is")
-        return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
-    w = berlin(written) if written else str(h.get("created_at"))
-    a = berlin(active) if active else "an unknown time"
-    _handoff_warning(f"{sid[:8]} compacted without a fresh hand-off ({why}): injected the older hand-off "
-                     f"#{h['id']} labelled stale (written {w}, the session was active until {a})")
-    return load_prompt("compact_resume_stale").format(
-        why=why, written=w, active=a, handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
+    except Exception as e:   # noqa: BLE001 - an error (D-234): no continue without the hand-off
+        raise failstop.Failed("the saved hand-off could not be read", f"{type(e).__name__}: {e}"[:300]) from None
+    if h is None or h["id"] < want:
+        raise failstop.Failed("the saved hand-off was not found",
+                              f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
+                              + (f"#{h['id']}" if h else "none"))
+    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE), h
+
+
+def _jsonable(d):
+    return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
+
+
+def compact_with_handoff(sid, cwd, path):
+    """The compaction at a start (D-233/D-234): save_before_compaction -> compact_session ->
+    compact_resume_text. -> (the text to insert into the continue message, the hand-off row to
+    consume once it went out, the record: save (its result), status "compacted", sent_at,
+    done_at, handoff_id). Every failure or timeout raises failstop.Failed(why, detail, record) and
+    stops right there: no /compact after a failed save, no continue after a failed compaction
+    (the caller aborts the start, abort_start). Also the live test (tools/test_compact_live.sh)
+    runs exactly this."""
+    import failstop
+    rec = {}
+    try:
+        save = save_before_compaction(sid, cwd, path)
+    except Exception as e:   # noqa: BLE001
+        raise failstop.Failed("the save step failed", f"{type(e).__name__}: {e}"[:300], rec) from None
+    rec["save"] = _jsonable(save)
+    if save["status"] != "saved":
+        st = save["status"]
+        why = SAVE_WHY.get(st, f"save status {st}")
+        if st == "timeout" and save.get("still_busy"):
+            why += " (the session was still working on it)"
+        raise failstop.Failed(f"no fresh hand-off before the compaction: {why}", save.get("error") or "", rec)
+    try:
+        comp = compact_session(sid, cwd, path)
+    except Exception as e:   # noqa: BLE001
+        raise failstop.Failed("the /compact step failed", f"{type(e).__name__}: {e}"[:300], rec) from None
+    rec.update(_jsonable(comp))
+    if comp["status"] != "compacted":
+        raise failstop.Failed(f"compaction not done: {COMPACT_WHY.get(comp['status'], comp['status'])}",
+                              comp.get("error") or "", rec)
+    try:
+        insert, h = compact_resume_text(sid, save)
+    except failstop.Failed as e:
+        raise failstop.Failed(e.why, e.detail, rec) from None
+    rec["handoff_id"] = h["id"]
+    return insert, h, rec
 
 
 def consume_handoff(h, start_key):
-    """Mark the injected hand-off consumed by this start (actions.py, audited). -> True / False."""
+    """Mark the injected hand-off consumed by this start (actions.py, audited). -> True / False
+    (logged; handle_fire raises it as an error)."""
     import actions
     import store
     try:
@@ -2147,7 +2289,7 @@ def consume_handoff(h, start_key):
         finally:
             conn.close()
         return True
-    except Exception as e:   # noqa: BLE001 - it was sent; a later start would only repeat it
+    except Exception as e:   # noqa: BLE001 - it was sent; handle_fire reports it (fail_stop)
         log(f"hand-off #{h.get('id')} not marked consumed: {type(e).__name__}: {e}")
         return False
 
@@ -2178,6 +2320,8 @@ def work_on_project(sel, args):
                  + "; ".join(f"{i['n']}={i['title']}" for i in items))
     p = hits[0]
     now = datetime.now(UTC)
+    if automation_paused(f"the backlog project {p['title']!r}"):
+        sys.exit(f"automation is paused ({paused_reason()}); clear it first: python3 tasks.py automation resume")
     go, reason = budget_decision(fresh_usage(now, force=True), now)
     log(f"work-on {p['title']!r} (window ignored): {reason}")
     if not go:
@@ -2205,6 +2349,9 @@ def work_on_project(sel, args):
     log(f"work-on {p['title']!r}: {'VERIFIED new assistant message' if reply else 'VERIFY FAILED'}")
     progress_note(f"started backlog project {p['title']!r} as session {sid[:8]} "
                   f"({'verified' if reply else 'NOT verified'}; {reason})")
+    if not reply:
+        fail_stop(f"backlog project start failed: {'no reply' if rc == 0 else 'launcher failed'}",
+                  f"{p['title']!r} session {sid} rc={rc} stdout={out.strip()[:300]} stderr={err.strip()[:300]}")
 
 
 def main():
@@ -2283,12 +2430,12 @@ def main():
         return
     if args.decide:
         now = datetime.now(UTC)
-        u = fresh_usage(now, force=True)
+        u = fresh_usage(now, force=True, display=True)
         nws = schedule.next_window_start(now)
         print(f"now {berlin(now)} in_window={schedule.in_window(now)} "
               f"next_window={berlin(nws) if nws else 'none'} ({schedule.describe()})")
         print(f"usage: {json.dumps(u, default=str)}")
-        d = budget_eval(u, now)
+        d = budget_eval(u, now, display=True)
         print((d["go"], d["reason"]))
         print(d["text"])
         if d.get("postpone") and d.get("recheck_at"):
@@ -2329,6 +2476,14 @@ def alert(subject, body=""):
         log(f"alert itself failed: {e!r}")
 
 
+def fail_stop(subject, detail=""):
+    """A failure or timeout (D-234/D-235): an ERROR line, automation_paused with the reason, an
+    alert (failstop.fail with this module's log and alert). The caller aborts what it was doing.
+    Never raises."""
+    import failstop
+    return failstop.fail("keepalive", subject, detail, log=log, alert=alert)
+
+
 if __name__ == "__main__":
     try:
         main()
@@ -2338,5 +2493,5 @@ if __name__ == "__main__":
         # e.g. the 2026-09-29 00:00 fire died on "Permission denied: ka_resume.sh" and nobody noticed
         import traceback
         traceback.print_exc()
-        alert(f"keepalive.py crashed: {type(e).__name__}: {e}"[:200], traceback.format_exc()[-1500:])
+        fail_stop(f"keepalive.py crashed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1500:]}")
         sys.exit(1)

@@ -585,16 +585,19 @@ def watch_sample(session_id, now, st=None, path=None):
     """The watcher's extra usage reading while a run is active (every RUN_SAMPLE_EVERY): reuse the
     ~/.claude.json cache if it is younger than RUN_SAMPLE_REFRESH (the sampler or a start just
     refreshed it), else one `claude -p /usage` (a local command, no model call; the shared retry
-    of keepalive.refresh_usage_checked). Appends one row to the run readings (the DB). -> the row or None."""
+    of keepalive.refresh_usage_checked). Appends one row to the run readings (the DB). -> the row or None.
+    A refresh that fails raises failstop.Failed (D-234/D-235: no row from the old cache)."""
+    import failstop
     import keepalive as ka
     fire = ka.run_active(session_id, now, st)
     if fire is None:
         return None
     u = ka.read_usage_cache()
     if not u or now - u["fetched_at"] > RUN_SAMPLE_REFRESH:
-        u = ka.refresh_usage_checked(now=now).get("usage") or u
-    if not u:
-        return None
+        r = ka.refresh_usage_checked(now=now)
+        if not r.get("ok") or not r.get("usage"):
+            raise failstop.Failed(ka.USAGE_FAILED, ka.usage_failure_detail(r))
+        u = r["usage"]
     s, w = u.get("session") or {}, u.get("weekly") or {}
     row = {"at": iso(now), "run_start": iso(fire), "session": session_id, "fetched_at": iso(u.get("fetched_at")),
            "session_pct": s.get("percent"), "session_resets_at": iso(s.get("resets_at")),

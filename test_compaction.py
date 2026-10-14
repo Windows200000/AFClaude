@@ -2,8 +2,9 @@
 """Offline tests for the compaction of long-running sessions (D-144, D-191, D-214, D-233; design
 §5.5): the D-191/D-218 rule (the conversation's first transcript entry before the session window),
 and the save-then-compact-then-continue sequence at a start: the save prompt right before the
-/compact (D-233), the new hand-off injected and consumed, and the fallbacks (no new hand-off: an
-older one goes in labelled stale, with a warning; a busy session; DB and send failures).
+/compact (D-233), the new hand-off injected and consumed; any failure or timeout on the way (no
+new hand-off, a busy session, no compaction marker, DB and send failures) aborts the start and
+pauses automation (D-234).
 A fake tmux (fire / preflight) and a fake transcript; no real Claude, no tmux."""
 import json
 import os
@@ -16,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import actions  # noqa: E402
+import afclaude_config  # noqa: E402
 import fillup  # noqa: E402
 import keepalive as ka  # noqa: E402
 import schedule  # noqa: E402
@@ -324,10 +326,31 @@ class CompactAtStart(Env):
         self.assertEqual(rec["compaction"]["save"]["status"], "saved")
         self.assertEqual(rec["compaction"]["save"]["active"], (day + timedelta(hours=3, minutes=1)).isoformat())
 
-    def test_save_timeout_still_compacts_and_labels_the_old_handoff_stale(self):
-        """The save prompt got no hand-off (here: it never reached the session): it compacts anyway,
-        and the older hand-off goes in with the stale label, plus a WARNING in the log and the
-        progress doc."""
+    # ---- D-234: every failure or timeout on the way aborts the start and pauses automation
+    def assert_aborted(self, rec, why, sent):
+        """The start was aborted: recorded as start-failed with `why`, exactly the messages `sent`
+        (prefixes) went out (never a continue), automation is paused with the reason, the owner got
+        an alert and the progress doc says so."""
+        self.assertEqual(rec["result"], "start-failed")
+        self.assertIn(why, rec["error"])
+        self.assertEqual(len(self.sent), len(sent), [m[:40] for _, m in self.sent])
+        for (_, m), want in zip(self.sent, sent):
+            self.assertTrue(m.startswith(want), (m[:60], want))
+        self.assertFalse(any("compacted at this start" in m or m.startswith("[keep-alive] A new run")
+                             for _, m in self.sent))
+        p = afclaude_config.automation_pause()
+        self.assertTrue(p["paused"])
+        self.assertIn(f"keepalive: start of {SID[:8]} aborted: compaction failed", p["reason"])
+        self.assertEqual(p["by"], "runner:keepalive")
+        self.assertTrue(any(a.startswith(f"AFClaude STOPPED: start of {SID[:8]} aborted: compaction failed")
+                            for a in self.alerts), self.alerts)
+        self.assertIn("ABORTED", self.progress())
+        self.assertNotIn("compacted at this start", json.dumps(rec))
+        return rec
+
+    def test_save_timeout_aborts_the_start(self):
+        """D-234: the save prompt got no hand-off in time (here: it never reached the session). No
+        /compact, no continue; an older hand-off is never injected (no stale label any more)."""
         ka.SAVE_TIMEOUT = timedelta(0)
         self.saves = "ignore"
         old = self.handoff("Old state.", at=NIGHT - timedelta(days=2))
@@ -338,69 +361,40 @@ class CompactAtStart(Env):
             rec = self.start()
         finally:
             ka.log = old_log
-        self.assertEqual(len(self.sent), 3)
-        self.assertTrue(self.sent[1][1].startswith("/compact "))
-        cont = self.sent[2][1]
-        for part in ("STALE", "hand-off written 2026-10-03 23:00:00 CEST",
-                     "the session was active until 2026-10-05 22:10:00 CEST",
-                     "and the decision store are newer, trust them first", f"Hand-off #{old['id']}",
-                     "Summary: Old state.", "none arrived within"):
-            self.assertIn(part, cont)
-        c = rec["compaction"]
-        self.assertEqual((c["save"]["status"], c["status"], c["handoff_id"], c["handoff_consumed"]),
-                         ("timeout", "compacted", old["id"], True))
-        self.assertTrue(any(ln.startswith("WARNING:") and "labelled stale" in ln for ln in logs), logs)
-        self.assertIn("WARNING:", self.progress())
-        self.assertIn("labelled stale", self.progress())
+        self.assert_aborted(rec, "no new hand-off within 10 min of the save prompt", [SAVE])
+        self.assertEqual(rec["compaction"]["save"]["status"], "timeout")
+        self.assertTrue(any(ln.startswith("ERROR: keepalive: start of") for ln in logs), logs)
+        self.assertEqual(self.latest()["id"], old["id"])                      # not consumed
+        self.assertNotIn("STALE", json.dumps(self.sent))
 
-    def test_older_handoff_newer_than_the_activity_is_not_stale(self):
-        """No new hand-off, but the latest one was written after the session's last activity: it is
-        injected as is. The save turn's own transcript entries don't count as activity."""
+    def test_a_reply_without_a_handoff_aborts_the_start(self):
         self.saves = "silent"                                  # it answered, but wrote none
         self.handoff("Written after the last chat.", at=NIGHT - timedelta(minutes=20))
         rec = self.start()
-        cont = self.sent[2][1]
-        self.assertIn("Summary: Written after the last chat.", cont)
-        self.assertNotIn("STALE", cont)
+        self.assert_aborted(rec, "the session answered the save prompt without writing a hand-off", [SAVE])
         self.assertEqual(rec["compaction"]["save"]["status"], "no-handoff")
-        self.assertNotIn("WARNING", self.progress())
 
-    def test_no_handoff_at_all_says_so(self):
-        self.saves = "silent"
-        rec = self.start()
-        cont = self.sent[2][1]
-        self.assertIn("no hand-off from before the compaction (none was saved: the session answered the save "
-                      "prompt without writing one)", cont)
-        self.assertIn("PROGRESS.md", cont)
-        self.assertEqual((rec["compaction"]["status"], rec["compaction"]["handoff_id"]), ("compacted", None))
-        self.assertIn("WARNING:", self.progress())
-
-    def test_save_prompt_send_failure_still_compacts(self):
+    def test_save_prompt_send_failure_aborts_the_start(self):
         def fire(sid, cwd, message, plan, new=False, **kw):
             if message.startswith(SAVE):
                 self.sent.append((plan, message))
                 return 1, "", "no tmux session"
             return self.fake_fire(sid, cwd, message, plan)
         ka.fire = fire
-        self.handoff("Old state.", at=NIGHT - timedelta(days=2))
         rec = self.start()
-        self.assertEqual(len(self.sent), 3)
-        self.assertIn("STALE", self.sent[2][1])
-        self.assertIn("the save prompt could not be sent", self.sent[2][1])
+        self.assert_aborted(rec, "the save prompt could not be sent", [SAVE])
+        self.assertIn("no tmux session", rec["error"])
         self.assertEqual(rec["compaction"]["save"]["status"], "send-failed")
-        self.assertTrue(any("save prompt" in a for a in self.alerts), self.alerts)
 
-    def test_save_still_running_after_the_timeout_is_not_compacted(self):
-        """The session is still working on the save at the timeout: /compact would hit a busy session,
-        so this start does not compact (as for any busy session); the old hand-off stays."""
+    def test_save_still_running_at_the_timeout_aborts_the_start(self):
+        """The session is still working on the save at the timeout: an error, no /compact."""
         ka.SAVE_TIMEOUT = timedelta(0)
-        ka.COMPACT_IDLE_WAIT = timedelta(0)
         self.saves = "hang"
         old = self.handoff("Old state.", at=NIGHT - timedelta(days=2))
+        os.utime(self.path, None)                                             # it just wrote: busy
         rec = self.start()
-        self.assertEqual(len(self.sent), 2)                                   # the save, the continue
-        self.assertNotIn("compacted at this start", self.sent[1][1])
-        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("timeout", "busy"))
+        self.assert_aborted(rec, "(the session was still working on it)", [SAVE])
+        self.assertEqual(rec["compaction"]["save"]["status"], "timeout")
         self.assertEqual(self.latest()["id"], old["id"])
 
     def test_session_outside_the_repo_gets_the_rules_inline(self):
@@ -460,28 +454,49 @@ class CompactAtStart(Env):
                     assistant(NIGHT + timedelta(seconds=40))])
         self.assertFalse(ka.compaction_plan(SID, S2)["due"])
 
-    def test_compaction_marker_timeout_continues_anyway(self):
+    def test_compaction_marker_timeout_aborts_the_start(self):
+        """No compaction marker within COMPACT_TIMEOUT: no continue; the saved hand-off stays
+        unconsumed for the next start."""
         self.compacts = False
         ka.COMPACT_TIMEOUT = timedelta(0)
         rec = self.start()
-        self.assertEqual(len(self.sent), 3)
-        h = self.latest(unconsumed=False)
-        self.assertIn(f"Hand-off #{h['id']}", self.sent[2][1])
-        self.assertEqual(rec["compaction"]["status"], "timeout")
-        self.assertIn("no compaction marker", self.progress())
+        self.assert_aborted(rec, "no compaction marker within 10 min of /compact", [SAVE, "/compact "])
+        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("saved", "timeout"))
+        self.assertEqual(self.latest()["id"], rec["compaction"]["save"]["handoff_id"])
 
-    def test_busy_session_is_neither_saved_nor_compacted_this_time(self):
+    def test_busy_session_aborts_the_start(self):
+        """Still mid-turn COMPACT_IDLE_WAIT after the start: no save prompt, no /compact, no continue."""
         self.write([assistant(datetime.now(UTC), stop="tool_use",
                               content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}])], "a")
         self.make_old()
         ka.COMPACT_IDLE_WAIT = timedelta(0)
         self.handoff()
         rec = self.start()
-        self.assertEqual(len(self.sent), 1)                                   # no save prompt, no /compact
-        self.assertNotIn("compacted at this start", self.sent[0][1])
-        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("busy", "busy"))
-        self.assertIsNotNone(self.latest())                                   # kept for the next start
-        self.assertIn("still mid-turn", self.progress())
+        self.assert_aborted(rec, "the session was still mid-turn", [])
+        self.assertEqual(rec["compaction"]["save"]["status"], "busy")
+        self.assertIsNotNone(self.latest())                                   # kept
+
+    def test_saved_but_not_found_is_an_error(self):
+        """The edge case of the D-233 build: the save wrote a hand-off, but by the continue there is
+        no unconsumed one that new (here something consumed it meanwhile). An error, never a silent
+        "none saved" continue."""
+        orig = self.fake_fire
+
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            r = orig(sid, cwd, message, plan, new, **kw)
+            if message.startswith("/compact "):
+                h = self.latest()
+                conn = store.connect()
+                try:
+                    actions.perform(conn, "handoff.consume", {"handoff_id": h["id"], "start_key": "other"},
+                                    actor="keepalive", via="runner")
+                finally:
+                    conn.close()
+            return r
+        ka.fire = fire
+        rec = self.start()
+        self.assert_aborted(rec, "the saved hand-off was not found", [SAVE, "/compact "])
+        self.assertIn("the latest unconsumed one of abcdef01 is none", rec["error"])
 
     def test_session_idle(self):
         now = datetime.now(UTC)
@@ -500,36 +515,34 @@ class CompactAtStart(Env):
         self.assertIsNone(ka.last_activity(None))
         self.assertIsNone(ka.last_activity(os.path.join(self.tmp.name, "gone.jsonl")))
 
-    def test_db_error_never_stops_the_continue(self):
+    def test_db_error_aborts_the_start(self):
+        """The hand-offs can't be read (after store.retrying, D-171): no save prompt, no continue."""
         h = self.handoff()
-        old = store.connect
+        old = store.latest_handoff
 
         def broken(*a, **k):
             raise store.DBUnavailable("the database is missing", "missing")
-        store.connect = broken
+        store.latest_handoff = broken
         try:
             rec = self.start()
         finally:
-            store.connect = old
-        self.assertEqual(len(self.sent), 2)                                   # no save prompt: /compact, continue
-        self.assertTrue(self.sent[0][1].startswith("/compact "))
-        self.assertIn("database problem, DBUnavailable", self.sent[1][1])
-        self.assertEqual((rec["result"], rec["compaction"]["save"]["status"]), ("continued-in-place", "db-error"))
+            store.latest_handoff = old
+        self.assert_aborted(rec, "the hand-offs could not be read", [])
+        self.assertIn("DBUnavailable", rec["error"])
         self.assertEqual(self.latest()["id"], h["id"])                        # not consumed
 
-    def test_a_failing_compaction_never_stops_the_start(self):
+    def test_a_failing_compact_step_aborts_the_start(self):
         def fire(sid, cwd, message, plan, new=False, **kw):
             if message.startswith("/compact"):
                 raise OSError("host bridge down")
             return self.fake_fire(sid, cwd, message, plan)
         ka.fire = fire
         rec = self.start()
-        self.assertEqual(len(self.sent), 2)                                   # the save, the continue
-        self.assertNotIn("compacted at this start", self.sent[1][1])
-        self.assertEqual((rec["result"], rec["compaction"]["status"]), ("continued-in-place", "error"))
+        self.assert_aborted(rec, "the /compact step failed", [SAVE])
+        self.assertIn("host bridge down", rec["error"])
         self.assertIsNotNone(self.latest())                                   # the saved one waits
 
-    def test_a_failing_save_step_still_compacts(self):
+    def test_a_failing_save_step_aborts_the_start(self):
         old = ka.save_before_compaction
 
         def boom(*a):
@@ -539,11 +552,12 @@ class CompactAtStart(Env):
             rec = self.start()
         finally:
             ka.save_before_compaction = old
-        self.assertEqual(len(self.sent), 2)
-        self.assertIn("none was saved: the save step failed", self.sent[1][1])
-        self.assertEqual((rec["compaction"]["save"]["status"], rec["compaction"]["status"]), ("error", "compacted"))
+        self.assert_aborted(rec, "the save step failed", [])
+        self.assertIn("RuntimeError: unexpected", rec["error"])
 
-    def test_consume_failure_is_logged_only(self):
+    def test_consume_failure_is_an_error_after_the_continue(self):
+        """The continue went out (the run goes on), but the hand-off could not be marked consumed:
+        recorded, alerted and automation paused (the next start would inject it again)."""
         old = store.consume_handoff
 
         def broken(*a, **k):
@@ -555,6 +569,24 @@ class CompactAtStart(Env):
             store.consume_handoff = old
         self.assertEqual(rec["result"], "continued-in-place")
         self.assertFalse(rec["compaction"]["handoff_consumed"])
+        p = afclaude_config.automation_pause()
+        self.assertTrue(p["paused"])
+        self.assertIn("not marked consumed", p["reason"])
+
+    def test_paused_automation_starts_nothing(self):
+        """D-234/D-235: while automation_paused is set, a start sends nothing and is not handled
+        (it is decided again once the owner cleared the pause)."""
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "test"}, actor="cli", via="cli")
+        finally:
+            conn.close()
+        at = NIGHT + timedelta(days=1)
+        r = ka.handle_fire(SID, {"uuid": self.KEY, "timestamp": at, "budget": "b", "headroom": 1.0,
+                                 "start_at": at}, "window start, CONTINUE: test", ka.load_state(), Armed())
+        self.assertEqual(r, "paused")
+        self.assertEqual(self.sent, [])
+        self.assertNotIn(self.KEY, ka.load_state()["handled"])
 
     def test_dry_run_records_the_plan(self):
         rec = self.start(args=DryRun())
@@ -586,6 +618,210 @@ class CompactAtStart(Env):
             ka.handle_fire = old
         self.assertEqual(seen[0]["start_at"], NIGHT + timedelta(days=1))
         self.assertEqual(seen[1]["start_at"], wr - 2 * L)                     # slot 2 starts 10 h before
+
+
+# ---------------------------------------------------------------- D-234/D-235: the other start failures
+
+class FailStopAtStart(Env):
+    """Every failure or timeout of a start (not only the compaction) is an error: alerted, recorded,
+    automation paused; before the continue went out the start is aborted (start-failed)."""
+    KEY = "window-start-2026-10-07"
+
+    def setUp(self):
+        super().setUp()
+        self.first = NIGHT + timedelta(days=1) - L + timedelta(seconds=5)   # not due: no compaction
+        self.addCleanup(testenv.unpause)
+
+    def start(self):
+        at = NIGHT + timedelta(days=1)
+        r = ka.handle_fire(SID, {"uuid": self.KEY, "timestamp": at, "budget": "b", "headroom": 1.0,
+                                 "start_at": at}, "window start, CONTINUE: test", ka.load_state(), Armed())
+        return r, ka.load_state()["handled"].get(self.KEY)
+
+    def paused(self):
+        return afclaude_config.automation_pause()
+
+    def test_no_reply_within_the_verify_timeout_pauses(self):
+        old = ka.verify_reply
+        ka.verify_reply = lambda path, since, timeout=None: None
+        try:
+            r, rec = self.start()
+        finally:
+            ka.verify_reply = old
+        self.assertEqual(rec["result"], "no-reply-within-timeout")             # the run counts (RUN_RESULTS)
+        self.assertIn("keep-alive continue of abcdef01 failed: no-reply-within-timeout", self.paused()["reason"])
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: keep-alive continue of abcdef01 failed: "
+                                       "no-reply-within-timeout"])
+
+    def test_launcher_failure_pauses(self):
+        ka.fire = lambda *a, **k: (1, "", "ka_resume.sh: no such session")
+        r, rec = self.start()
+        self.assertEqual(rec["result"], "launcher-failed")
+        self.assertTrue(self.paused()["paused"])
+
+    def test_fire_raising_aborts_the_start(self):
+        """e.g. the bridge call timed out, or a take-over's holder did not exit."""
+        def fire(*a, **k):
+            raise ka.subprocess.TimeoutExpired("ka_resume.sh", 120)
+        ka.fire = fire
+        r, rec = self.start()
+        self.assertEqual((r, rec["result"]), ("failed", "start-failed"))
+        self.assertIn("TimeoutExpired", rec["error"])
+        self.assertIn("keepalive: start of abcdef01 aborted: start failed", self.paused()["reason"])
+        self.assertNotIn("fires", json.dumps(rec))
+        self.assertIn("ABORTED", self.progress())
+
+    def test_preflight_refusal_pauses(self):
+        ka.preflight = lambda sid: (False, ["host process info unavailable (TimeoutExpired: x)"], None)
+        r, rec = self.start()
+        self.assertEqual((rec["result"], rec["held"]), ("preflight-failed", False))
+        self.assertIn("keep-alive did NOT continue abcdef01: preflight failed", self.paused()["reason"])
+        self.assertEqual(self.sent, [])
+
+    def test_the_owner_holding_the_session_is_a_skip_not_a_failure(self):
+        """Task-manager decision on D-234/D-235: Remote Control, an attached terminal, another live
+        holder or a busy turn at a start is a normal skip (log + progress note), no alert, no pause."""
+        for problem in (f"{ka.RC_HELD} thread (pid [7]); a take-over would fork ...",
+                        f"{ka.OTHER_HELD} [8] (~/.claude/sessions, outside our tmux); ...",
+                        "session is busy in another process (someone is using it)",
+                        "held by an idle interactive process [9] outside tmux; a resume would FORK a copy"):
+            ka.save_state({"handled": {}, "fires": {}})
+            ka.preflight = lambda sid, p=problem: (False, [p], None)
+            r, rec = self.start()
+            self.assertEqual((rec["result"], rec["held"]), ("preflight-failed", True), problem)
+            self.assertFalse(self.paused()["paused"], problem)
+        self.assertEqual((self.alerts, self.sent), ([], []))
+        self.assertIn("skipped: the owner holds the session", self.progress())
+        self.assertFalse(ka.owner_holds(["host process info unavailable (OSError: x); not touching the session"]))
+        self.assertFalse(ka.owner_holds([]))
+
+    def test_an_unreadable_transcript_aborts_the_start(self):
+        def boom(sid, path=None):
+            raise OSError("I/O error")
+        ka.conversation_started = boom
+        r, rec = self.start()
+        self.assertEqual(rec["result"], "start-failed")
+        self.assertIn("OSError: I/O error", rec["error"])
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_process_check_after_the_continue_pauses(self):
+        def boom(sid):
+            raise OSError("`claude agents` failed rc=1")
+        ka.agent_entries = boom
+        r, rec = self.start()
+        self.assertEqual(rec["result"], "continued-in-place")
+        self.assertIn("OSError", rec["env_error"])
+        self.assertIn("process check after the continue of abcdef01 failed", self.paused()["reason"])
+
+    def test_paused_window_start_neither_reads_usage_nor_fires(self):
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "owner looks"}, actor="cli", via="cli")
+        finally:
+            conn.close()
+        ka.fresh_usage = lambda now, force=False: self.fail("no /usage call while paused")
+        d = ka.window_start_pass(SID, NIGHT + timedelta(days=1, seconds=40), types.SimpleNamespace(arm=True, now=False))
+        self.assertFalse(d["go"])
+        self.assertIn("PAUSED: automation is paused (owner looks)", d["reason"])
+        self.assertEqual(self.sent, [])
+        self.assertIn("tasks.py automation resume", self.progress())
+
+
+    def test_paused_last_stretch_slot_waits_without_reading_usage(self):
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "owner looks"}, actor="cli", via="cli")
+        finally:
+            conn.close()
+        wr = datetime(2026, 10, 8, 15, 0, tzinfo=UTC)
+        self.usage["weekly"] = {"percent": 90.0, "resets_at": wr}
+        ka.fresh_usage = lambda now, force=False: self.fail("no /usage call while paused")
+        old = ka.last_mile_hours
+        ka.last_mile_hours = lambda pct, r=None, n=None: 10
+        try:
+            now = wr - timedelta(hours=7)
+            self.assertEqual(ka.last_mile_pass(SID, now, {"handled": {}}, Armed()), now + ka.LAST_MILE_RECHECK)
+        finally:
+            ka.last_mile_hours = old
+        self.assertEqual(self.sent, [])
+
+
+class KaResumeFailures(unittest.TestCase):
+    """ka_resume.sh: a tmux call that fails exits 1 (the keep-alive sees it), never a silent
+    "sent-keys" / "started" with exit 0 (D-234/D-235). A stub tmux on PATH; nothing real runs."""
+    def run_script(self, fail_on):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            tmux = os.path.join(d, "tmux")
+            with open(tmux, "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         f'case "$1" in has-session) exit {0 if fail_on.startswith("send") else 1};; esac\n'
+                         f'case "$1 $*" in *{fail_on}*) exit 1;; esac\nexit 0\n')
+            os.chmod(tmux, 0o755)
+            env = dict(os.environ, PATH=d + ":" + os.environ["PATH"], HOME=d, KA_TRUST_ROOT=d)
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ka_resume.sh")
+            return subprocess.run(["bash", script, "--session", SID, "--message", "go", "--cwd", d],
+                                  env=env, capture_output=True, text=True, timeout=60)
+
+    def test_send_keys_failure_exits_1(self):
+        r = self.run_script("send-keys")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("send-keys to ka-abcdef01 failed", r.stderr)
+        self.assertNotIn("sent-keys", r.stdout)
+
+
+class FireFailures(unittest.TestCase):
+    """keepalive.fire: a take-over whose holder does not exit, a bg worker that does not stop, and
+    `claude agents` failing raise instead of resuming into a fork (D-234/D-235)."""
+    def setUp(self):
+        self.old = {n: getattr(ka, n) for n in ("pid_alive", "TAKE_OVER_WAIT")}
+        self.old_host = {n: getattr(ka.host, n) for n in ("kill_claude", "run_on_host")}
+        self.runs = []
+        ka.host.run_on_host = lambda argv, **k: self.runs.append(argv) or types.SimpleNamespace(
+            returncode=self.rc, stdout="[]", stderr="nope")
+        ka.host.kill_claude = lambda pid: True
+        self.rc = 0
+
+    def tearDown(self):
+        for n, v in self.old.items():
+            setattr(ka, n, v)
+        for n, v in self.old_host.items():
+            setattr(ka.host, n, v)
+
+    def test_take_over_holder_still_alive_raises(self):
+        ka.pid_alive = lambda pid: True
+        ka.TAKE_OVER_WAIT = 0
+        with self.assertRaisesRegex(RuntimeError, r"pid\(s\) \[42\] still alive"):
+            ka.fire(SID, "/tmp", "go", "take-over:42")
+        self.assertEqual(self.runs, [])                                      # never resumed
+
+    def test_bg_stop_failure_raises(self):
+        self.rc = 1
+        with self.assertRaisesRegex(RuntimeError, "claude stop abcdef01. failed rc=1"):
+            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume")
+        self.assertEqual(len(self.runs), 1)                                  # only the stop, no resume
+
+    def test_a_failed_usage_cache_read_raises_in_the_decision_paths(self):
+        old = ka.CLAUDE_JSON
+        ka.CLAUDE_JSON = "/nonexistent/claude.json"
+        try:
+            self.assertIsNone(ka.read_usage_cache())                        # the read-only views
+            with self.assertRaises(OSError):
+                ka.usage_cache_checked()                                    # the runners' decisions
+            with self.assertRaises(OSError):
+                ka.last_mile_pass(SID, datetime.now(UTC), {"handled": {}}, Armed())
+        finally:
+            ka.CLAUDE_JSON = old
+
+    def test_agent_entries_failure_raises(self):
+        self.rc = 1
+        with self.assertRaisesRegex(OSError, "claude agents. failed rc=1"):
+            ka.agent_entries(SID)
+        self.rc = 0
+        self.assertEqual(ka.agent_entries(SID), [])
+        ka.host.run_on_host = lambda argv, **k: types.SimpleNamespace(returncode=0, stdout="not json", stderr="")
+        with self.assertRaises(ValueError):
+            ka.agent_entries(SID)
 
 
 if __name__ == "__main__":

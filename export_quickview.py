@@ -312,6 +312,16 @@ def needs_input():
             "count": len(open_questions) + len(blocked)}
 
 
+def automation_block():
+    """The automation pause (D-234/D-235) for the page's banner: a runner sets it on any failure;
+    no run starts until the owner clears it. Strict read (a DB that can't be read = paused)."""
+    import failstop
+    p = failstop.paused()
+    return {"paused": bool(p["paused"]), "reason": p.get("reason"), "by": p.get("by"),
+            "since_berlin": bstr(ka.parse_ts(p["since"])) if p.get("since") else None,
+            "resume": failstop.RESUME_CMD}
+
+
 def latest_decision():
     log = read(os.path.join(ka.STATE_DIR, "keepalive.log")) or ""
     lines = [l for l in log.splitlines() if l.startswith("[")]
@@ -527,7 +537,9 @@ def keepalive_and_usage(now):
     for k in ("session", "weekly"):
         if u.get(k):
             out[k] = {"percent": u[k]["percent"], "resets_at_berlin": bstr(u[k]["resets_at"])}
-    d = ka.budget_eval(u, now)
+    d = ka.budget_eval(u, now, display=True)      # a display path never pauses (D-234/D-235)
+    if d.get("mode") == "failed":
+        out["budget_error"] = d["reason"]             # shown prominently on the page
     out["next_run"] = next_run_block(u, now, d)
     out["limits"] = limits_block()
     out["threshold"] = threshold_block(now, d)
@@ -719,6 +731,7 @@ def main():
     status = {
         "generated_at": now.isoformat(),
         "generated_berlin": bstr(now),
+        "automation": automation_block(),
         "keepalive": keepalive_and_usage(now),
         "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
         "stages": stages(ka.read_usage_cache(), now),

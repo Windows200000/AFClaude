@@ -628,8 +628,22 @@ class Writes(Base):
         failed = [e for e in store.fallback_events(store.fallback_path()) if e.get("event") == "failed"]
         self.assertEqual(failed[0]["action"], "job.put")
         self.assertEqual(failed[0]["params"]["job"]["cmd"], "true\n")   # kept for a replay
+        fails = []
+        shim.fail = lambda subject, detail="": fails.append(subject)
         self.assertEqual(shim.run_due(), 1)
+        self.assertEqual(fails, ["scheduled jobs unreadable: no job started"])   # D-234/D-235: an error
         self.conn = store.connect(os.path.join(self.dir, "other.db"), create=True)
+
+    def test_at_shim_job_that_cannot_start_is_an_error(self):
+        shim = self._shim()
+        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
+        fails = []
+        shim.fail = lambda subject, detail="": fails.append((subject, detail))
+        with mock.patch.object(shim.subprocess, "Popen", side_effect=OSError("no /bin/sh")):
+            self.assertEqual(shim.run_due(), 1)
+        self.assertEqual(fails[0][0], "a claimed job could not be started")
+        self.assertIn("no /bin/sh", fails[0][1])
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")   # claimed: never run twice
 
 
 if __name__ == "__main__":

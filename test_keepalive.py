@@ -246,7 +246,7 @@ class Evaluate(unittest.TestCase):
         self.assertEqual(self.ev("2026-09-26T02:50:00Z", usage(10))[0], "WAIT_RESET")
         self.assertEqual(self.ev("2026-09-26T02:50:31Z", usage(10))[0], "FIRE")
         self.assertEqual(self.ev("2026-09-26T02:50:31Z", usage(32))[0], "FIRE")    # no AFClaude budget gate
-        self.assertEqual(self.ev("2026-09-26T02:50:31Z", None)[0], "FIRE")         # usage unknown: still the reset
+        self.assertEqual(self.ev("2026-09-26T02:50:31Z", None)[0], "USAGE_FAILED")  # a failed reading: D-234/D-235
         # live usage says the session limit is still on
         self.assertEqual(self.ev("2026-09-26T02:51:00Z",
                                  usage(10, sess_pct=100, sess_reset=Z("2026-09-26T03:30:00Z")))[0], "WAIT_RESET")
@@ -353,7 +353,7 @@ class BudgetWiring(unittest.TestCase):
         import contextlib
         import io
         olds = (ka.fresh_usage, ka.datetime, sys.argv)
-        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.fresh_usage = lambda n, force=False, display=False: self.u()
 
         class FakeDT(datetime):
             @classmethod
@@ -416,29 +416,36 @@ class BudgetWiring(unittest.TestCase):
         self.assertTrue(d["postpone"])
         self.assertIn("yield", d["reason"])
 
-    def test_fallback_to_linear_on_error(self):
-        now = self.NIGHT
+    def test_model_error_is_an_error_and_holds(self):
+        """D-234/D-235: a budget-model failure is no reason to fall back to the linear rule: it
+        HOLDs (also where linear would CONTINUE to 100% in the last mile), alerts and pauses
+        automation."""
+        alerts = []
+        old_alert = ka.alert
+        ka.alert = lambda subject, body="": alerts.append(subject)
         def boom(*a, **k):
             raise RuntimeError("broken model")
         self.bm.decide = boom
-        go, why = ka.budget_decision(self.u(20), now)
-        self.assertEqual(go, ka.linear_budget_decision(self.u(20), now)[0])
-        self.assertIn("linear fallback", why)
-        extra, text = ka.budget_headroom(self.u(20), now)
-        self.assertEqual(extra, ka.linear_budget_headroom(self.u(20), now)[0])
-        self.assertIn(f"+{extra:.1f}%", why)                             # the same number there too
-        self.assertFalse(ka.budget_decision(None, now)[0])
-
-    def test_fallback_holds_in_last_mile(self):
-        now = self.R - timedelta(hours=2)                                # linear would CONTINUE to 100%
-        self.assertTrue(ka.linear_budget_decision(self.u(50), now)[0])
-        def boom(*a, **k):
-            raise RuntimeError("broken model")
-        self.bm.decide = boom
-        go, why = ka.budget_decision(self.u(50), now)
-        self.assertFalse(go, why)
-        self.assertIn("budget model failed", why)
-        self.assertEqual(ka.budget_headroom(self.u(50), now)[0], 0.0)
+        try:
+            for now, pct in ((self.NIGHT, 20), (self.R - timedelta(hours=2), 50)):
+                go, why = ka.budget_decision(self.u(pct), now)
+                self.assertFalse(go, why)
+                self.assertIn("HOLD: budget model failed (RuntimeError: broken model)", why)
+                self.assertEqual(ka.budget_eval(self.u(pct), now)["mode"], "failed")
+                self.assertIsNone(ka.budget_headroom(self.u(pct), now)[0])
+            self.assertTrue(ka.linear_budget_decision(self.u(50), self.R - timedelta(hours=2))[0])
+            p = afclaude_config.automation_pause()
+            self.assertTrue(p["paused"])
+            self.assertIn("keepalive: budget model failed", p["reason"])
+            self.assertEqual(alerts, ["AFClaude STOPPED: budget model failed"])   # once per pause
+            testenv.unpause()
+            d = ka.budget_eval(self.u(20), self.NIGHT, display=True)        # a display path never pauses
+            self.assertEqual((d["go"], d["mode"]), (False, "failed"))
+            self.assertFalse(afclaude_config.automation_pause()["paused"])
+            self.assertEqual(len(alerts), 1)
+        finally:
+            ka.alert = old_alert
+            testenv.unpause()
 
     def test_unknown_usage_and_stale_sampler_postpone(self):
         now = self.NIGHT + timedelta(minutes=5)

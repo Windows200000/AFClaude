@@ -116,6 +116,32 @@ def setting(name: str) -> Any:
     return settings(name)[name]
 
 
+def automation_pause() -> dict[str, Any]:
+    """The pause switch (automation_paused, D-234/D-235), read strictly: unlike settings(), a DB
+    that can't be read counts as PAUSED (never the code default "not paused"). -> {paused,
+    reason, since, by}: reason = automation_paused_reason, since / by = when and by whom the
+    switch was last set (None if never)."""
+    import actions
+    import store
+    out: dict[str, Any] = {"paused": True, "reason": None, "since": None, "by": None}
+    try:
+        conn = _read_conn()
+        if conn is None:
+            return dict(out, reason=f"no database at {_db_path()}")
+        try:
+            paused, src = actions.effective_setting(conn, "automation_paused")
+            reason, _ = actions.effective_setting(conn, "automation_paused_reason")
+            row = store.get_setting_row(conn, "automation_paused")
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - unreadable = paused (the safe side)
+        return dict(out, reason=f"the pause setting could not be read ({type(e).__name__}: {e})"[:300])
+    if src.startswith("invalid"):
+        return dict(out, reason=f"the saved automation_paused is {src}")
+    return {"paused": bool(paused), "reason": reason or None,
+            "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None}
+
+
 # ---- typed views the runners use
 
 def last_mile_setting() -> str | float:
