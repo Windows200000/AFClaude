@@ -154,6 +154,32 @@ class AutomationPaused(unittest.TestCase):
                          (True, "keepalive: start aborted", "runner:keepalive", "python3 tasks.py automation resume"))
         self.assertTrue(b["since_berlin"])
 
+    def test_budget_model_error_is_shown_never_paused(self):
+        """Task-manager decision on D-234/D-235: the quickview is a display path; a budget-model
+        failure there is shown on the page, it never pauses automation."""
+        from unittest import mock
+        import keepalive as ka
+        import pacing
+        self.addCleanup(testenv.unpause)
+        testenv.unpause()
+        testenv.setcfg(usage_model="pacing")
+        self.addCleanup(testenv.clear_settings)
+        now = datetime.now(qv.UTC)
+        cache = {"fetched_at": now, "session": {"percent": 5.0, "resets_at": None},
+                 "weekly": {"percent": 20.0, "resets_at": None}}
+        alerts = []
+        with mock.patch.object(ka, "read_usage_cache", return_value=cache), \
+                mock.patch.object(pacing, "decide", side_effect=RuntimeError("broken model")), \
+                mock.patch.object(ka, "alert", lambda s, b="": alerts.append(s)):
+            out = qv.keepalive_and_usage(now)
+        self.assertIn("budget model failed (RuntimeError: broken model)", out["budget_error"])
+        self.assertEqual(alerts, [])
+        self.assertFalse(qv.automation_block()["paused"])
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        self.assertIn('id="budget-error"', page)
+        self.assertIn("budget_error", page)
+
     def test_page_renders_the_banner_first(self):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()

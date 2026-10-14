@@ -462,7 +462,10 @@ def _refreshed(u, before, now):
 def refresh_usage_checked(cwd=HERE, now=None):
     """The ONE usage refresh with retry, used by the sampler and the watcher / window-start paths:
     /usage; if the cache did not refresh, one cheap real request (poke_auth: renews an expired
-    OAuth token) and /usage again. -> dict rc, out (last /usage output), usage (cache after,
+    OAuth token) and /usage again. This one retry is DELIBERATE (D-235 allows deliberate,
+    documented retries; task-manager decision 14.10.): `-p /usage` alone does not renew an expired
+    token (the 03./04.10. incident, usage_stale.py). If it still did not refresh, the callers treat
+    it as an error (fresh_usage: fail_stop), never a second silent retry. -> dict rc, out (last /usage output), usage (cache after,
     or None), ok (refreshed), retried, poke (poke_auth result or None)."""
     now = now or datetime.now(UTC)
     before = (read_usage_cache() or {}).get("fetched_at")
@@ -495,16 +498,21 @@ def usage_failure_detail(r):
             "on the host usually fixes it.")
 
 
-def fresh_usage(now, force=False):
+def fresh_usage(now, force=False, display=False):
     """The usage cache, refreshed first if forced or older than USAGE_MAX_AGE. A refresh that
     fails (also after refresh_usage_checked's one token-refresh retry) is an error (D-234/D-235):
-    fail_stop (alert, automation paused) and None; the caller starts nothing."""
+    fail_stop (alert, automation paused) and None; the caller starts nothing. display=True (a
+    read-only view: --decide, usage_report.py) never pauses: it only logs the error and
+    returns None."""
     u = read_usage_cache()
     if force or not u or now - u["fetched_at"] > USAGE_MAX_AGE:
         r = refresh_usage_checked(now=now)
         u = r["usage"]
         if not u or now - u["fetched_at"] > USAGE_MAX_AGE:
-            fail_stop(USAGE_FAILED, usage_failure_detail(r))
+            if display:
+                log(f"ERROR (display only, not paused): {USAGE_FAILED}: {usage_failure_detail(r)}")
+            else:
+                fail_stop(USAGE_FAILED, usage_failure_detail(r))
             return None
     return u
 
@@ -533,13 +541,15 @@ def _ratio_text(extra, ratio):
 BUDGET_ADVICE = "; check usage_report.py / keepalive.py --decide and stop before exceeding it"
 
 
-def budget_eval(usage, now):
+def budget_eval(usage, now, display=False):
     """THE budget evaluation every caller uses (watcher, window-start, last mile, deferred
     window-start, --decide, --work-on, the dispatcher gate, the quickview), so they all show
     the same number. -> dict(go, reason, headroom, text, postpone, recheck_at, last_mile,
     session_cap). Model: afclaude_config.usage_model(). A failure of pacing.py is an error
-    (D-234/D-235): fail_stop (alert, automation paused) and a HOLD (failed_eval), no fallback
-    to another rule."""
+    (D-234/D-235): fail_stop (alert, automation paused) and a HOLD (failed_eval, mode "failed"),
+    no fallback to another rule. display=True (the quickview, --decide): the same HOLD with the
+    error in it, but never a pause (a display path never pauses; the runners that hit the same
+    failure do)."""
     try:
         m = _budget_model()
         if m:
@@ -551,7 +561,8 @@ def budget_eval(usage, now):
             return dict(d, text=text, last_mile=d.get("mode") == "last_mile")
         return linear_eval(usage, now)
     except Exception as e:   # noqa: BLE001 - any model failure: an error, nothing starts
-        fail_stop("budget model failed", f"{type(e).__name__}: {e}"[:500])
+        if not display:
+            fail_stop("budget model failed", f"{type(e).__name__}: {e}"[:500])
         return failed_eval(f"{type(e).__name__}: {e}")
 
 
@@ -1622,8 +1633,14 @@ def handle_fire(sid, stall, reason, st, args):
     ok, problems, plan = preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
-        st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "preflight-failed", "problems": problems}
+        held = owner_holds(problems)
+        st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "preflight-failed", "problems": problems,
+                              "held": held}
         save_state(st)
+        if held:   # the owner has the session (Remote Control, a terminal, mid-turn): a skip, not a failure
+            progress_note(f"start {key} of {sid[:8]} skipped: the owner holds the session ({problems[0]}); "
+                          "no pause, the next start decides again")
+            return None
         progress_note(f"did NOT fire for stall {key}: preflight failed: {problems}")
         fail_stop(f"keep-alive did NOT continue {sid[:8]}: preflight failed", "; ".join(problems))
         return None
@@ -1634,6 +1651,17 @@ def handle_fire(sid, stall, reason, st, args):
     except Exception as e:   # noqa: BLE001 - any other failure before the continue went out
         abort_start(sid, key, st, reason, plan, "start failed", f"{type(e).__name__}: {e}")
     return "failed"
+
+
+OWNER_HOLDS = (RC_HELD, OTHER_HELD, "session is busy in another process", "held by an idle interactive process")
+
+
+def owner_holds(problems):
+    """A preflight refusal because the session is in use (a Remote Control thread, an attached
+    terminal or another live process holding it, a busy turn): a normal skip like the
+    dispatcher's (task-manager decision 14.10. on D-234/D-235), not a failure. Anything else (the
+    host process info unavailable, ...) is a failure."""
+    return bool(problems) and all(any(m in p for m in OWNER_HOLDS) for p in problems)
 
 
 def abort_start(sid, key, st, reason, plan, why, detail="", record=None):
@@ -2402,12 +2430,12 @@ def main():
         return
     if args.decide:
         now = datetime.now(UTC)
-        u = fresh_usage(now, force=True)
+        u = fresh_usage(now, force=True, display=True)
         nws = schedule.next_window_start(now)
         print(f"now {berlin(now)} in_window={schedule.in_window(now)} "
               f"next_window={berlin(nws) if nws else 'none'} ({schedule.describe()})")
         print(f"usage: {json.dumps(u, default=str)}")
-        d = budget_eval(u, now)
+        d = budget_eval(u, now, display=True)
         print((d["go"], d["reason"]))
         print(d["text"])
         if d.get("postpone") and d.get("recheck_at"):

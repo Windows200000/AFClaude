@@ -674,9 +674,26 @@ class FailStopAtStart(Env):
     def test_preflight_refusal_pauses(self):
         ka.preflight = lambda sid: (False, ["host process info unavailable (TimeoutExpired: x)"], None)
         r, rec = self.start()
-        self.assertEqual(rec["result"], "preflight-failed")
+        self.assertEqual((rec["result"], rec["held"]), ("preflight-failed", False))
         self.assertIn("keep-alive did NOT continue abcdef01: preflight failed", self.paused()["reason"])
         self.assertEqual(self.sent, [])
+
+    def test_the_owner_holding_the_session_is_a_skip_not_a_failure(self):
+        """Task-manager decision on D-234/D-235: Remote Control, an attached terminal, another live
+        holder or a busy turn at a start is a normal skip (log + progress note), no alert, no pause."""
+        for problem in (f"{ka.RC_HELD} thread (pid [7]); a take-over would fork ...",
+                        f"{ka.OTHER_HELD} [8] (~/.claude/sessions, outside our tmux); ...",
+                        "session is busy in another process (someone is using it)",
+                        "held by an idle interactive process [9] outside tmux; a resume would FORK a copy"):
+            ka.save_state({"handled": {}, "fires": {}})
+            ka.preflight = lambda sid, p=problem: (False, [p], None)
+            r, rec = self.start()
+            self.assertEqual((rec["result"], rec["held"]), ("preflight-failed", True), problem)
+            self.assertFalse(self.paused()["paused"], problem)
+        self.assertEqual((self.alerts, self.sent), ([], []))
+        self.assertIn("skipped: the owner holds the session", self.progress())
+        self.assertFalse(ka.owner_holds(["host process info unavailable (OSError: x); not touching the session"]))
+        self.assertFalse(ka.owner_holds([]))
 
     def test_an_unreadable_transcript_aborts_the_start(self):
         def boom(sid, path=None):

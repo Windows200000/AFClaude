@@ -109,6 +109,7 @@ button.chip small.eta-c { color: #c4b5fd; }
     <div><span id="updated" class="meta">loading…</span> <button id="reload" type="button">Refresh</button></div>
   </header>
   <div id="error" class="err" hidden></div>
+  <div id="budget-error" class="err" hidden></div>
   <section id="paused" class="paused" hidden aria-live="polite">
     <h2>Automation is PAUSED</h2>
     <p id="paused-reason"></p>
@@ -401,6 +402,9 @@ button.chip small.eta-c { color: #c4b5fd; }
   }
 
   function renderPaused(s) {
+    var be = (s.keepalive || {}).budget_error;
+    $("budget-error").hidden = !be;
+    $("budget-error").textContent = be ? "Budget model error: " + be + " (no run starts on it; the runners pause)" : "";
     var a = s.automation || {};
     $("paused").hidden = !a.paused;
     if (!a.paused) return;

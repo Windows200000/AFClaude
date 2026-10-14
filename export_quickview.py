@@ -537,7 +537,9 @@ def keepalive_and_usage(now):
     for k in ("session", "weekly"):
         if u.get(k):
             out[k] = {"percent": u[k]["percent"], "resets_at_berlin": bstr(u[k]["resets_at"])}
-    d = ka.budget_eval(u, now)
+    d = ka.budget_eval(u, now, display=True)      # a display path never pauses (D-234/D-235)
+    if d.get("mode") == "failed":
+        out["budget_error"] = d["reason"]             # shown prominently on the page
     out["next_run"] = next_run_block(u, now, d)
     out["limits"] = limits_block()
     out["threshold"] = threshold_block(now, d)

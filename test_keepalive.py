@@ -353,7 +353,7 @@ class BudgetWiring(unittest.TestCase):
         import contextlib
         import io
         olds = (ka.fresh_usage, ka.datetime, sys.argv)
-        ka.fresh_usage = lambda n, force=False: self.u()
+        ka.fresh_usage = lambda n, force=False, display=False: self.u()
 
         class FakeDT(datetime):
             @classmethod
@@ -438,6 +438,11 @@ class BudgetWiring(unittest.TestCase):
             self.assertTrue(p["paused"])
             self.assertIn("keepalive: budget model failed", p["reason"])
             self.assertEqual(alerts, ["AFClaude STOPPED: budget model failed"])   # once per pause
+            testenv.unpause()
+            d = ka.budget_eval(self.u(20), self.NIGHT, display=True)        # a display path never pauses
+            self.assertEqual((d["go"], d["mode"]), (False, "failed"))
+            self.assertFalse(afclaude_config.automation_pause()["paused"])
+            self.assertEqual(len(alerts), 1)
         finally:
             ka.alert = old_alert
             testenv.unpause()
