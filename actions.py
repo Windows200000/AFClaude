@@ -552,6 +552,19 @@ def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Conn
     return check
 
 
+REASON_MAX = 2000
+
+
+def _reason(v: Any, conn: sqlite3.Connection | None = None) -> str:
+    """Free text (one line), at most REASON_MAX characters; "" = none."""
+    if not isinstance(v, str):
+        raise ValueError(f"must be text, got {v!r}")
+    s = " ".join(v.split())
+    if len(s) > REASON_MAX:
+        raise ValueError(f"at most {REASON_MAX} characters, got {len(s)}")
+    return s
+
+
 def _window_days(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     """Validate + normalize {mon..sun: {start, n, group} | null}: start on the 30-min
     grid, 1 <= n whole session windows (D-148) with n x session_hours <= 24 h, identical
@@ -701,7 +714,12 @@ SETTINGS: dict[str, Setting] = {
                                 "(/compact) at that start: asked to save a hand-off right before, which the "
                                 "continue after the compaction then injects", "automation"),
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
-                               "on); read by the resident runner (phase 3a)", "automation", important=True),
+                               "on). A runner sets it itself on any failure or timeout (D-234/D-235, "
+                               "failstop.py); the owner clears it: `tasks.py automation resume`",
+                               "automation", important=True),
+    "automation_paused_reason": Setting("", _reason, "Why automation is paused (set with automation.set; a "
+                                        "runner's failure says what failed); cleared on resume",
+                                        section="automation", kind="text"),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
                                   "that holds an approved stalled session is stopped so it can be continued",
                                   "automation"),
@@ -852,9 +870,23 @@ def setting_import(conn: sqlite3.Connection, ctx: Ctx, source: Any, values: Any,
 
 
 @action("automation.set", "setting", owner_only=True)
-def automation_set(conn: sqlite3.Connection, ctx: Ctx, paused: Any) -> Result:
-    """Pause / resume every runner (idempotent). Running sessions keep running."""
-    return _write_setting(conn, ctx, "automation_paused", _bool(paused), None)
+def automation_set(conn: sqlite3.Connection, ctx: Ctx, paused: Any, reason: Any = None) -> Result:
+    """Pause / resume every runner (idempotent). Running sessions keep running. A pause records
+    `reason` (why: a runner's failure, D-234/D-235; None keeps the current one); a resume clears
+    it. One audit row with both values. -> the automation_paused view + "reason"."""
+    p = _bool(paused)
+    r = (_reason(reason) if reason is not None else None) if p else ""
+    keys = ("automation_paused", "automation_paused_reason")
+    rows = {k: store.get_setting_row(conn, k) for k in keys}
+    old = {k: (row["value"] if row else None) for k, row in rows.items()}
+    new = {"automation_paused": p,
+           "automation_paused_reason": old["automation_paused_reason"] if r is None else (r or None)}
+    for k in keys:
+        if new[k] != old[k]:
+            store.put_setting(conn, k, new[k], ctx.actor)
+    view = dict(_setting_view(conn, "automation_paused"), reason=get_setting(conn, "automation_paused_reason"))
+    return Result(view, "automation_paused", {"value": old["automation_paused"], "reason": old["automation_paused_reason"]},
+                  {"value": new["automation_paused"], "reason": new["automation_paused_reason"]})
 
 
 def _fresh_group(days: Mapping[str, Any]) -> str:

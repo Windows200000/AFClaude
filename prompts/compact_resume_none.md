@@ -1,1 +1,0 @@
-This session was compacted at this start (D-144/D-191), but there is no hand-off from before the compaction ({why}). Rebuild your state from {progress} (its latest Status line), GOALS.md and the recent git log before you go on.

@@ -21,18 +21,18 @@
 #   2. sends two short prompts (a codeword task: remember the codeword, skip the commit/PROGRESS
 #      steps of a later save prompt, put the codeword into the hand-off) and waits for each reply
 #      in the transcript (~/.claude/projects/<encoded cwd>/<uuid>.jsonl);
-#   3. runs handle_fire's compaction step with the keep-alive's own functions, in one python
-#      process: keepalive.save_before_compaction() (save prompt, wait for a NEW handoffs row of
-#      the session, SAVE_TIMEOUT), keepalive.compact_session() (/compact, wait for the marker,
-#      COMPACT_TIMEOUT), keepalive.compact_resume_text(sid, save), then the continue message
-#      (that text + a one-line test question instead of the run's continue prompt) and
+#   3. runs handle_fire's compaction step with the keep-alive's own code, in one python process:
+#      keepalive.compact_with_handoff() (save prompt, wait for a NEW handoffs row of the session,
+#      SAVE_TIMEOUT; /compact, wait for the marker, COMPACT_TIMEOUT; the fresh hand-off's text; any
+#      failure raises, as it aborts a real start, D-234), then the continue message (that text + a
+#      one-line test question instead of the run's continue prompt) and
 #      keepalive.consume_handoff(). Only keepalive.fire is replaced: it types into
 #      `afc-compacttest` the keep-alive's way (tmux send-keys -l, 1 s, Enter; ka_resume.sh would
 #      target ka-<id>) and saves pane captures; keepalive.log / progress_note / alert only print.
 #      No fire or run record is made, no real session is involved;
 #   4. checks: a new handoffs row of THIS session in the temp DB; the compaction marker and
-#      keepalive.compacted_since(); the continue text is the fresh template (compact_resume.md, not
-#      compact_resume_stale.md / _none.md) with that row; the session's reply to it names the
+#      keepalive.compacted_since(); the continue text is the fresh template (compact_resume.md)
+#      with that row; the session's reply to it names the
 #      codeword and says FRESH (it read the inserted text); same transcript; the row consumed; the
 #      live DB has no row of this session;
 #   5. saves pane captures and the step result to run/test_compact_live-<time>.pane.txt, kills the
@@ -205,7 +205,7 @@ DUR[prompts]=$((SECONDS - T_START))
 # ---- 3. handle_fire's compaction step with the keep-alive's own functions (fire -> this tmux session)
 capture "before the keep-alive's compaction step"
 TS=$SECONDS
-echo "running keepalive.save_before_compaction -> compact_session -> compact_resume_text -> continue (up to ~40 min)"
+echo "running keepalive.compact_with_handoff (save -> /compact -> the fresh hand-off) -> continue (up to ~40 min)"
 py "$SID" "$CWD" "$P1" "$T" "$PANE" "$STEP" "$LIVE_DB" <<'PY'
 import json, os, subprocess, sys, time
 from datetime import datetime, timezone
@@ -264,18 +264,27 @@ def flat(s):
     return " ".join((s or "").split())
 
 
-res = {"templates": {n: flat(ka.load_prompt(n)).split("{")[0] for n in
-                     ("compact_resume", "compact_resume_stale", "compact_resume_none")}}
+res = {"templates": {"compact_resume": flat(ka.load_prompt("compact_resume")).split("{")[0]}}
 try:
     res["before_id"] = ka.newest_handoff_id(sid)
-    # -- handle_fire's compaction block (keepalive.py), minus the fire/run record
-    t = time.time()
+    # -- handle_fire's compaction step (keepalive.py): exactly keepalive.compact_with_handoff, minus
+    #    the fire/run record; any failure raises failstop.Failed (D-234), as it aborts a real start
+    import failstop
+    t0 = datetime.now(UTC)
+    insert = handoff = None
     try:
-        save = ka.save_before_compaction(sid, cwd, path)
-    except Exception as e:   # noqa: BLE001 - as handle_fire
-        save = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
-    res["save_s"] = round(time.time() - t)
-    res["save"] = ser(save)
+        insert, handoff, rec = ka.compact_with_handoff(sid, cwd, path)
+    except failstop.Failed as e:
+        rec = e.record
+        res["failed"] = f"{e.why}: {e.detail}" if e.detail else e.why
+    t1 = datetime.now(UTC)
+    save = rec.get("save") or {}
+    res["save"] = save
+    sent = ka.parse_ts(rec.get("sent_at")) if rec.get("sent_at") else None   # /compact typed
+    res["save_s"] = round(((sent or t1) - t0).total_seconds())
+    res["compact_s"] = round((t1 - sent).total_seconds()) if sent else 0
+    res["comp"] = {k: v for k, v in rec.items() if k != "save"}
+    res["comp"].setdefault("status", "not reached")
     conn = store.connect()
     try:
         res["rows"] = [{"id": h["id"], "session_id": h["session_id"], "created_at": h["created_at"],
@@ -283,17 +292,6 @@ try:
                        for h in store.list_handoffs(conn, sid, limit=5)]
     finally:
         conn.close()
-    t = time.time()
-    try:
-        comp = (ka.compaction_busy(sid, "before the save prompt") if save["status"] == "busy"
-                else ka.compact_session(sid, cwd, path))
-    except Exception as e:   # noqa: BLE001
-        comp = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}
-    res["compact_s"] = round(time.time() - t)
-    res["comp"] = ser(comp)
-    insert = handoff = None
-    if comp["status"] in ("compacted", "timeout"):
-        insert, handoff = ka.compact_resume_text(sid, save)
     res["insert"] = flat(insert)
     res["handoff_id"] = handoff["id"] if handoff else None
     if insert:
@@ -323,9 +321,11 @@ DUR[step]=$((SECONDS - TS))
 [ -s "$STEP" ] || { capture "no step result"; echo "FAIL: the keep-alive step wrote no result"; exit 1; }
 ERR="$(field 'r.get("error")')"
 [ -n "$ERR" ] && FAILS+=("keep-alive step raised: $ERR")
+FAILED="$(field 'r.get("failed")')"
+[ -n "$FAILED" ] && FAILS+=("compact_with_handoff failed (a real start would be aborted, D-234): $FAILED")
 
 # ---- 4a. the save: a new handoffs row of THIS session in the temp DB
-SAVE_ST="$(field 'r["save"]["status"]')"
+SAVE_ST="$(field 'r["save"].get("status")')"
 SAVE_ID="$(field 'r["save"].get("handoff_id")')"
 BEFORE_ID="$(field 'r["before_id"]')"
 ROW="$(field '[x for x in r["rows"] if x["id"] == r["save"].get("handoff_id")][0]')"
@@ -376,7 +376,7 @@ DUR[compact]="$(field 'r.get("compact_s")')"
 # ---- 4c. the continue text: the fresh template with that row
 INSERT="$(field 'r.get("insert")')"
 INS_ID="$(field 'r.get("handoff_id")')"
-KIND="$(field '"fresh" if r["insert"].startswith(r["templates"]["compact_resume"]) else "stale" if r["insert"].startswith(r["templates"]["compact_resume_stale"]) else "none" if r["insert"].startswith(r["templates"]["compact_resume_none"]) else "other"')"
+KIND="$(field '"fresh" if r["insert"] and r["insert"].startswith(r["templates"]["compact_resume"]) else "none" if not r["insert"] else "other"')"
 if [ "$KIND" = fresh ] && [ -n "$SAVE_ID" ] && [ "$INS_ID" = "$SAVE_ID" ] && grep -qF "Hand-off #$SAVE_ID " <<<"$INSERT"; then
   RES[continue]=PASS
 else
@@ -425,9 +425,9 @@ echo "================ compaction live test ($STAMP) ================"
 echo "session       $SID (haiku, dontAsk, cwd $CWD, temp DB)"
 echo "transcript    $P1"
 echo "[${RES[prompts]}] prompts      ${DUR[prompts]}s  1: $R1 | 2: $R2"
-echo "[${RES[save]}] save         ${DUR[save]}s  save_before_compaction: $SAVE_ST, row #${SAVE_ID:-none} (newest before: #$BEFORE_ID), session ${ROW_SID:0:8}"
+echo "[${RES[save]}] save         ${DUR[save]}s  save step: $SAVE_ST, row #${SAVE_ID:-none} (newest before: #$BEFORE_ID), session ${ROW_SID:0:8}"
 echo "               summary: ${ROW_SUM:0:160}"
-echo "[${RES[compact]}] compaction   ${DUR[compact]}s  compact_session: $COMP_ST; markers: $MARKS; Enter->marker ${LAT:-?}s; compacted_since(): $CS"
+echo "[${RES[compact]}] compaction   ${DUR[compact]}s  compaction: $COMP_ST; markers: $MARKS; Enter->marker ${LAT:-?}s; compacted_since(): $CS"
 echo "[${RES[continue]}] continue     template $KIND, hand-off #${INS_ID:-none}: ${INSERT:0:200}"
 echo "[${RES[reply]}] reply        ${DUR[reply]}s  $R3 (same transcript: $SAME)"
 echo "[${RES[consume]}] consumed     $CONS"

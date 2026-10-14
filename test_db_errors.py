@@ -512,11 +512,12 @@ class Runners(Base):
         import keepalive as ka
         import dispatcher as dp
         self.ka, self.dp = ka, dp
-        self.logs, self.notes, self.preflights = [], [], []
+        self.logs, self.notes, self.preflights, self.failures = [], [], [], []
         for obj, name, value in ((ka, "log", self.logs.append), (ka, "progress_note", self.notes.append),
                                  (ka, "save_state", lambda st: None),
                                  (ka, "preflight", lambda sid: self.preflights.append(sid) or (False, ["stop"], "-")),
                                  (ka, "alert", lambda s, b="": None), (ka, "_DB_PAUSE", None),
+                                 (ka, "fail_stop", lambda s, d="": self.failures.append(s)),
                                  (dp, "log", self.logs.append), (dp, "DATA_DIR", self.dir),
                                  (dp, "STATE_FILE", os.path.join(self.dir, "dispatcher_state.json")),
                                  (dp, "LOCK_FILE", os.path.join(self.dir, "dispatcher.lock")),
@@ -544,6 +545,7 @@ class Runners(Base):
         st = self.fire("k3")
         self.assertEqual(len(self.preflights), 1)                       # starts again on its own
         self.assertIn("preflight-failed", json.dumps(st["handled"]))
+        self.assertEqual(self.failures, ["keep-alive did NOT continue 00000000: preflight failed"])  # D-234/D-235
         self.assertEqual(len(self.alerts), 2)
         self.assertIn("healthy again", self.alerts[1][0])
         self.assertIn("autonomous starts resume", " ".join(self.logs))

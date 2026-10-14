@@ -137,6 +137,32 @@ class PreviewMarker(unittest.TestCase):
         self.assertIn("#ec4899", page)   # the pink outline color, distinct from the purple "cur" ring
 
 
+class AutomationPaused(unittest.TestCase):
+    """D-234/D-235: the page shows a paused automation with its reason up front, and how to clear it."""
+    def test_block(self):
+        self.addCleanup(testenv.unpause)
+        testenv.unpause()
+        self.assertFalse(qv.automation_block()["paused"])
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "keepalive: start aborted"},
+                            actor="runner:keepalive", via="runner")
+        finally:
+            conn.close()
+        b = qv.automation_block()
+        self.assertEqual((b["paused"], b["reason"], b["by"], b["resume"]),
+                         (True, "keepalive: start aborted", "runner:keepalive", "python3 tasks.py automation resume"))
+        self.assertTrue(b["since_berlin"])
+
+    def test_page_renders_the_banner_first(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        for part in ('id="paused"', "Automation is PAUSED", "s.automation", "renderPaused(s); renderUsage(s)",
+                     'id="paused-reason"', 'id="paused-cmd"'):
+            self.assertIn(part, page)
+        self.assertLess(page.index('id="paused"'), page.index('id="s-input"'))
+
+
 class WindowInfo(unittest.TestCase):
     """The 23:00-09:00 window spans midnight: inside it, the next window is the following
     evening's; outside, this evening's."""

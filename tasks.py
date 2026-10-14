@@ -31,6 +31,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            BODY = JSON {summary, done, in_progress, next_steps,
                                            open_question_ids, notes} ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
+    tasks.py automation [status]           is automation paused (D-234/D-235), why, since when
+    tasks.py automation resume             clear the pause (after looking at the error it names)
+    tasks.py automation pause [REASON]     pause every runner by hand
     tasks.py doc list [--project P]        the project's docs in the DB (phase 2d, project_docs.py)
     tasks.py doc show NAME [--project P] [--entries N]   a doc's text (--entries: its newest entries)
     tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
@@ -449,6 +452,8 @@ def run(conn, args):
         run_handoff(conn, args)
     elif c == "doc":
         return run_doc(conn, args) or 0
+    elif c == "automation":
+        run_automation(conn, args)
     elif c == "inbox":
         maybe_scan(conn, args)
         box = store.pending_user_input(conn)
@@ -458,6 +463,25 @@ def run(conn, args):
         else:
             print_inbox(box)
     return 0
+
+
+def run_automation(conn, args):
+    """D-234/D-235: a runner pauses automation on any failure; the owner looks, then resumes."""
+    if args.automation_cmd == "resume":
+        act(conn, "automation.set", paused=False)
+    elif args.automation_cmd == "pause":
+        act(conn, "automation.set", paused=True, reason=args.reason or "paused by hand (tasks.py)")
+    row = store.get_setting_row(conn, "automation_paused")
+    st = {"paused": bool(actions.get_setting(conn, "automation_paused")),
+          "reason": actions.get_setting(conn, "automation_paused_reason") or None,
+          "since": row["updated_at"] if row else None, "by": row["updated_by"] if row else None}
+    if args.json:
+        dump(st)
+    elif st["paused"]:
+        print(f"automation PAUSED since {berlin(st['since'])} (by {st['by']}): {st['reason'] or '(no reason given)'}")
+        print("look at the error (tasks.py doc show alerts), fix it, then: python3 tasks.py automation resume")
+    else:
+        print("automation running (not paused)")
 
 
 def parser():
@@ -562,6 +586,13 @@ def parser():
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")
     q.add_argument("--all", action="store_true", help="the recent ones, newest first")
+    p = sub.add_parser("automation", help="the automation pause (D-234/D-235): status | resume | pause")
+    ats = p.add_subparsers(dest="automation_cmd")
+    ats.add_parser("status", parents=[js], help="paused or not, why, since when (the default)")
+    ats.add_parser("resume", parents=[js], help="clear the pause: the runners start and continue again")
+    q = ats.add_parser("pause", parents=[js], help="pause every runner by hand")
+    q.add_argument("reason", nargs="?", help="why (shown in the quickview)")
+    p.set_defaults(json=False)
     p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
     ds = p.add_subparsers(dest="doc_cmd", required=True)
     q = ds.add_parser("list", parents=[js], help="the project's docs")

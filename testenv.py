@@ -25,6 +25,8 @@ import actions  # noqa: E402
 DB = os.environ["AFCLAUDE_DB"]
 store.DB_PATH = DB
 store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes the alerts doc
+import notify  # noqa: E402
+notify.push = lambda text: "test: push not sent"   # an alert (failstop.fail, keepalive.alert) never runs claude
 store.connect(DB, create=True).close()   # explicit, like a real install's setup: an empty DB, no
                                           # "no database" log line from the settings reads
 
@@ -65,6 +67,16 @@ def clear_settings(db=None):
     try:
         with store.transaction(conn):
             conn.execute("DELETE FROM settings")
+    finally:
+        conn.close()
+
+
+def unpause(db=None):
+    """Clear automation_paused (and its reason) as the owner would (`tasks.py automation resume`):
+    a test that made a runner fail-stop (failstop.fail, D-234/D-235) leaves no pause behind."""
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        actions.perform(conn, "automation.set", {"paused": False}, actor="cli", via="cli")
     finally:
         conn.close()
 

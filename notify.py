@@ -51,7 +51,7 @@ def push(text):
     return f"push: no tool result (rc={r.returncode})"
 
 
-def notify(subject, body="", do_push=True):
+def notify(subject: str, body: str = "", do_push: bool = True) -> str:
     now = datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
     os.makedirs(os.path.join(HERE, "data"), exist_ok=True)
     result = push(f"AFClaude: {subject}"[:180]) if do_push else "push skipped"

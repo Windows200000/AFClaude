@@ -23,6 +23,7 @@ import usage_review as ur  # noqa: E402
 import actions  # noqa: E402
 import store  # noqa: E402
 import telemetry  # noqa: E402
+import afclaude_config  # noqa: E402
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
@@ -30,6 +31,8 @@ NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
 
 class Base(unittest.TestCase):
     def setUp(self):
+        testenv.unpause()            # a failure in an earlier test paused automation (D-234/D-235)
+        self.addCleanup(testenv.unpause)
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {"fire": ka.fire, "alert": ka.alert, "log": ka.log, "progress_note": ka.progress_note,
                      "state": ur.STATE, "subprocess_run": ur.subprocess.run}
@@ -83,6 +86,29 @@ class RunOnce(Base):
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("one-off stage-eta review launch failed", self.alerts[0][0])
         self.assertEqual(st["next_run_at"], "2026-11-01T00:00:00+00:00")
+        p = afclaude_config.automation_pause()                          # D-234/D-235: an error, paused
+        self.assertTrue(p["paused"])
+        self.assertIn("usage_review: one-off stage-eta review launch failed", p["reason"])
+
+    def test_paused_automation_starts_no_review(self):
+        """While automation is paused (D-234/D-235) neither a one-off nor the monthly review starts;
+        the one-off's at job is used up, so the owner is told to schedule it again."""
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "a test"}, actor="cli", via="cli")
+        finally:
+            conn.close()
+        old_argv = sys.argv
+        try:
+            for argv in (["--only", "stage-eta", "--now"], ["--now"]):
+                sys.argv = ["usage_review.py"] + argv
+                self.assertEqual(ur.main(), 0)
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(self.fires, [])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("one-off stage-eta review not started: automation is paused", self.alerts[0][0])
+        self.assertIn("a test", self.alerts[0][1])
 
     def test_two_one_off_runs_each_fire_once(self):
         st = {"next_run_at": "2026-11-01T00:00:00+00:00", "runs": []}
