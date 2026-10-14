@@ -9,7 +9,7 @@ bridge, where the Claude CLI's login is), prompts/inbox_triage.md. Its cost and 
 the message.
 
 Delivery of a "now" message (D-186: no window, no budget, not held by automation_paused: the owner
-is asking) goes through the keep-alive's own send path and checks, never around them:
+is asking, that is no automation) goes through the keep-alive's own send path and checks, never around them:
   - keepalive.session_lock (non-blocking): a compaction or a start typing into the session holds it;
   - the session at a usage limit (its last entry is the limit notice) holds it until the reset;
   - keepalive.preflight: the owner holding the session (Remote Control, a terminal, a busy process:
@@ -17,13 +17,22 @@ is asking) goes through the keep-alive's own send path and checks, never around 
   - plan send-keys: keepalive.owner_typing (keystrokes in an attached terminal, a draft in the input
     box, a dialog) holds it; an unreadable pane is an error (D-235);
   - keepalive.fire (ka_resume.sh: send-keys into the live tmux session, else a resume into one).
-A hold is shown on the message and tried again every POLL; after HOLD_MAX it is an error. After
-the send the message must show up in the session's transcript within VERIFY_TIMEOUT, else error.
+A hold is shown on the message and tried again every POLL while it lasts, at most until the next
+session-window start after it began (D-244, inbox.hold_deadline; the dashboard shows "held until"):
+that start's message takes the message along (keepalive._fire_start, inbox.held_insert: with its
+marker and how to answer) and marks it delivered. Still pending START_GRACE after that start (the
+start was skipped, held, failed or postponed; the session still held or at its limit) is an error;
+so is a hold with no session-window start ahead at all. After the send the message must show up in
+the session's transcript within VERIFY_TIMEOUT, else error.
 
-Every failure (the triage call, a refused preflight, a failed send, no trace in the transcript) is
-an error on the message (inbox.fail: shown on the dashboard until the owner retries it), a log
-line and an alert (failstop.fail). It does not pause automation (pause=False): the inbox starts no
-autonomous work, and the error is the owner's to see on the message they just sent.
+Every failure (the triage call, a refused preflight, a failed send, no trace in the transcript, a
+missed hold deadline, a DB failure, a failed pass) is an error on the message where there is one
+(inbox.fail: shown on the dashboard until the owner retries it), an ERROR log line, an alert and
+automation paused (D-244: failstop.fail with the pause, until the owner clears it with `tasks.py
+automation resume`). The pause is install-wide (automation_paused has no project scope; today
+AFClaude is the only project). It does not stop the inbox itself: "now" messages are still
+delivered while paused (the owner's own message is no automation), but no start runs, so a held one
+reaches its deadline without a start to take it along and turns into an error.
 """
 from __future__ import annotations
 
@@ -43,6 +52,7 @@ import failstop  # noqa: E402
 import host  # noqa: E402
 import inbox  # noqa: E402
 import keepalive as ka  # noqa: E402
+import schedule  # noqa: E402
 import store  # noqa: E402
 
 UTC = timezone.utc
@@ -50,7 +60,10 @@ ACTOR = "runner:inbox"
 DATA = os.path.join(HERE, "data")
 POLL = 30                                 # seconds between passes (a held message is tried again)
 TRIAGE_TIMEOUT = 120                      # seconds for the Haiku call
-HOLD_MAX = timedelta(hours=2)             # a "now" message held this long: an error
+# a held "now" message is an error this long after its deadline (the next session-window start) if
+# that start did not take it along: the cron checks a start within CRON_STEP after it, the start
+# waits up to COMPACT_LOCK_WAIT for a compaction, then sends and marks it delivered
+START_GRACE = schedule.CRON_STEP + ka.COMPACT_LOCK_WAIT + timedelta(minutes=5)
 VERIFY_TIMEOUT = timedelta(minutes=10)    # the sent message must be in the transcript by then
 VERIFY_POLL = 5                           # seconds
 HOLD_LOCKED = "a compaction or a start is typing into the session"
@@ -64,13 +77,18 @@ def _act(conn: Any, name: str, **params: Any) -> Any:
     return actions.perform(conn, name, params, actor=ACTOR, via="runner")
 
 
+def stop(subject: str, detail: str) -> None:
+    """An inbox error (D-235/D-244): an ERROR log line, an alert and automation paused (failstop)."""
+    failstop.fail("inbox", subject, detail, log=log)
+
+
 def failed(conn: Any, m: dict[str, Any], subject: str, detail: str) -> None:
-    """The message failed (D-235): error on it, a log line, an alert. Never raises."""
+    """The message failed (D-235/D-244): error on it, then stop(). Never raises."""
     try:
         _act(conn, "inbox.fail", message_id=m["id"], error=f"{subject}: {detail}")
     except Exception as e:   # noqa: BLE001 - reported with the alert below
         detail += f" (and the error could not be stored on the message: {type(e).__name__}: {e})"
-    failstop.fail("inbox", subject, f"message #{m['id']}: {detail}", log=log, pause=False)
+    stop(subject, f"message #{m['id']}: {detail}")
 
 
 # ---------------------------------------------------------------- triage
@@ -126,18 +144,29 @@ def delivery_hold(sid: str, path: str, now: datetime) -> tuple[str | None, str]:
     return None, plan
 
 
-def hold(conn: Any, m: dict[str, Any], why: str, now: datetime) -> None:
-    since = store.parse_iso(m["hold_since"]) if m["hold_since"] else None
-    if since is not None and now - since > HOLD_MAX:
-        failed(conn, m, "inbox message not delivered",
-               f"held for more than {HOLD_MAX.total_seconds() / 3600:g} h; the last reason: {why}")
-        return
+def hold(conn: Any, m: dict[str, Any], why: str, now: datetime) -> str:
+    """The message can't go in now: held (shown on it, tried again by the next pass) until its
+    deadline (the next session-window start after the hold began, D-244) + START_GRACE, then an
+    error. -> "held" | "failed"."""
+    since = (store.parse_iso(m["hold_since"]) if m["hold_since"] else None) or now
+    deadline = inbox.hold_deadline(since)
+    if deadline is None:
+        failed(conn, m, "inbox message held without a window start to wait for",
+               f"no session-window start is scheduled (window_days); the reason: {why}")
+        return "failed"
+    if now >= deadline + START_GRACE:
+        failed(conn, m, "inbox message held past its window start",
+               f"held since {ka.berlin(since)} until the window start {ka.berlin(deadline)}, but that start "
+               f"did not take it along (skipped, held, failed or postponed; see the progress notes); "
+               f"the last reason: {why}")
+        return "failed"
     if m["hold"] != why:
         log(f"inbox #{m['id']}: held: {why}")
     try:
         _act(conn, "inbox.hold", message_id=m["id"], reason=why)
     except store.InvalidTransition as e:      # answered or changed meanwhile: nothing to hold
         log(f"inbox #{m['id']}: hold not stored ({e})")
+    return "held"
 
 
 def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[int]]:
@@ -156,7 +185,8 @@ def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[
 
 
 def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., Any] | None = None) -> str:
-    """Try to type one "now" message into its session. -> "delivered" | "held" | "failed"."""
+    """Try to type one "now" message into its session. -> "delivered" | "held" | "failed" |
+    "gone" (a start took it along meanwhile, or it changed: nothing to do)."""
     sid = m["session_id"]
     path = ka.transcript_path(sid)
     if not path:
@@ -164,17 +194,20 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
         return "failed"
     lock = ka.session_lock(sid)
     if lock is None:
-        hold(conn, m, HOLD_LOCKED, now)
-        return "held"
+        return hold(conn, m, HOLD_LOCKED, now)
     try:
+        cur = store.get_inbox(conn, m["id"])     # under the lock: a start may have taken it along (D-244)
+        if cur is None or cur["status"] != "pending":
+            log(f"inbox #{m['id']}: no longer pending ({cur['status'] if cur else 'gone'}), not sent")
+            return "gone"
+        m = cur
         try:
             why, plan = delivery_hold(sid, path, now)
         except Exception as e:   # noqa: BLE001 - an error on the message (D-235)
             failed(conn, m, "inbox message not delivered", f"{type(e).__name__}: {e}")
             return "failed"
         if why:
-            hold(conn, m, why, now)
-            return "held"
+            return hold(conn, m, why, now)
         cwd = ka.session_cwd(path)
         try:
             msg, ids = build(conn, m, plan, cwd)
@@ -187,27 +220,22 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
             failed(conn, m, "inbox message not delivered",
                    f"plan={plan} rc={rc} {(out or '').strip()[:200]} {(err or '').strip()[:300]}".strip())
             return "failed"
-        _act(conn, "inbox.deliver", message_id=m["id"], plan=plan)
+        try:
+            _act(conn, "inbox.deliver", message_id=m["id"], plan=plan)
+        except Exception as e:   # noqa: BLE001 - it went out; an error on it keeps it from going out again
+            failed(conn, m, "inbox message sent but not marked delivered", f"{type(e).__name__}: {e}")
+            return "failed"
         log(f"inbox #{m['id']}: delivered to {sid[:8]} ({plan}" + (f", with notes {ids}" if ids else "") + ")")
         if ids:
             try:
                 _act(conn, "inbox.include", message_ids=ids, by=f"inbox #{m['id']}")
             except Exception as e:   # noqa: BLE001 - they went out; not marked, they go out again later
-                failstop.fail("inbox", "noted inbox messages not marked included",
-                              f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}", log=log, pause=False)
+                stop("noted inbox messages not marked included",
+                     f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}")
     finally:
         ka.release_lock(lock)
     (verify or start_verify)(m["id"], path, offset)
     return "delivered"
-
-
-def seen(path: str, offset: int, mark: str) -> bool:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(offset)
-            return mark.encode() in fh.read()
-    except OSError:
-        return False
 
 
 def verify(msg_id: int, path: str, offset: int, timeout: timedelta | None = None) -> bool:
@@ -217,19 +245,22 @@ def verify(msg_id: int, path: str, offset: int, timeout: timedelta | None = None
     timeout = VERIFY_TIMEOUT if timeout is None else timeout
     deadline = time.time() + timeout.total_seconds()
     while True:
-        if seen(path, offset, mark):
+        if inbox.seen(path, offset, mark):
             return True
         if time.time() >= deadline:
             break
         time.sleep(VERIFY_POLL)
-    conn = store.connect()
     try:
-        m = store.get_inbox(conn, msg_id)
-        if m is not None and m["status"] == "delivered":
-            failed(conn, m, "inbox message not delivered",
-                   f"typed into the session, but not in its transcript after {timeout}")
-    finally:
-        conn.close()
+        conn = store.connect()
+        try:
+            m = store.get_inbox(conn, msg_id)
+            if m is not None and m["status"] == "delivered":
+                failed(conn, m, "inbox message not delivered",
+                       f"typed into the session, but not in its transcript after {timeout}")
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - the verify thread's own error (D-235): reported, not lost
+        stop("inbox delivery check failed", f"message #{msg_id}: {type(e).__name__}: {e}")
     return False
 
 
@@ -256,7 +287,8 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
 
 def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> None:
     """The worker thread: a pass on every wake-up (a new message, a retry) and every POLL seconds.
-    A failed pass is logged and alerted (failstop, no pause) and the next one runs."""
+    A failed pass (a DB failure, ...) is an error (stop: alert + automation paused); the next pass
+    still runs (the owner's messages are no automation)."""
     stop = stop or threading.Event()
     log("inbox worker started")
     while not stop.is_set():
@@ -267,7 +299,6 @@ def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> N
                 process(conn)
             finally:
                 conn.close()
-        except Exception as e:   # noqa: BLE001 - an error (D-235), reported; the next pass runs
-            failstop.fail("inbox", f"inbox worker pass failed: {type(e).__name__}",
-                          f"{e}\n{traceback.format_exc()[-1200:]}", log=log, pause=False)
+        except Exception as e:   # noqa: BLE001 - an error (D-235/D-244), reported; the next pass runs
+            stop(f"inbox worker pass failed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1200:]}")
         wake.wait(POLL)

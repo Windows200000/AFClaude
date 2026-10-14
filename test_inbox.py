@@ -2,10 +2,11 @@
 """Offline tests for the owner's message box to the task-manager (D-178, D-186, D-241; inbox.py,
 inbox_worker.py, inbox_api.py): the table and its actions (verbatim text, audit rows without the
 text, the status transitions), the Haiku verdict parser, the worker's failure paths (a failed
-triage is an error + an alert and nothing is delivered), the delivery's gates (the session lock,
-the owner holding or typing, a usage limit, an unreadable pane, a failed send, the transcript
-check), the noted messages going along with the next start and the post-compaction message, the
-endpoint's key check and limits, the CLI and the quickview. A temp DB, a fake tmux / transcript
+triage is an error + an alert + automation paused and nothing is delivered, D-244), the delivery's
+gates (the session lock, the owner holding or typing, a usage limit, an unreadable pane, a failed
+send, the transcript check), a hold until the next session-window start (D-244: the start takes
+the message along, else an error), the noted messages going along with the next start and the
+post-compaction message, the endpoint's key check and limits, the CLI and the quickview. A temp DB, a fake tmux / transcript
 (test_compaction.Env), a fake Haiku; no real Claude, no tmux, no live session."""
 import http.client
 import json
@@ -29,6 +30,7 @@ import inbox  # noqa: E402
 import inbox_api  # noqa: E402
 import inbox_worker as iw  # noqa: E402
 import keepalive as ka  # noqa: E402
+import schedule  # noqa: E402
 import store  # noqa: E402
 import tasks  # noqa: E402
 import test_compaction as tc  # noqa: E402  (its Env: a fake tmux session and transcript)
@@ -221,7 +223,9 @@ class Triage(DB):
         self.assertEqual(self.fired, [])                                      # never delivered silently
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("inbox message triage failed", self.alerts[0][0])
-        self.assertFalse(failstop.paused()["paused"])                         # no automation pause
+        p = failstop.paused()                                                 # an inbox error stops automation (D-244)
+        self.assertTrue(p["paused"])
+        self.assertIn("inbox: inbox message triage failed", p["reason"])
         self.assertEqual(iw.process(self.conn, verify=lambda *a: None), {})   # not retried on its own
 
     def test_bad_answer_is_an_error(self):
@@ -318,6 +322,7 @@ class Delivery(tc.Env):
         self.assertEqual(self.deliver(m), "held")
         self.assertIn("the owner holds the session", self.row(m)["hold"])
         self.assertEqual(self.notified, [])
+        self.assertFalse(failstop.paused()["paused"])                         # a hold is no error
 
     def test_held_at_a_usage_limit(self):
         at = datetime.now(UTC) - timedelta(minutes=5)
@@ -329,17 +334,46 @@ class Delivery(tc.Env):
         self.assertEqual(self.deliver(m), "held")
         self.assertIn("usage limit", self.row(m)["hold"])
 
-    def test_a_long_hold_is_an_error(self):
+    def test_held_until_the_next_window_start_then_an_error(self):
+        """D-244: no 2 h limit; the hold lasts until the next session-window start (+ START_GRACE for
+        that start to take it along); still pending then: an error, alerted, automation paused."""
         self.typing = "the owner typed in a terminal attached to ka-abcdef01 1 min ago"
         m = self.now_msg()
-        self.deliver(m)
-        later = datetime.now(UTC) + iw.HOLD_MAX + timedelta(minutes=1)
-        self.deliver(m, later)
+        self.assertEqual(self.deliver(m), "held")
+        since = store.parse_iso(self.row(m)["hold_since"])
+        deadline = schedule.next_session_start(since)
+        self.assertEqual(inbox.hold_until(self.row(m)), deadline)
+        view = inbox.message_view(self.row(m))
+        self.assertEqual(view["hold_until_berlin"], deadline.astimezone(inbox.BERLIN).strftime("%a %d.%m. %H:%M"))
+        for later in (since + timedelta(hours=3), deadline + iw.START_GRACE - timedelta(minutes=1)):
+            self.assertEqual(self.deliver(m, later), "held")                  # no 2 h limit any more
+        self.assertEqual(self.notified, [])
+        self.assertEqual(self.deliver(m, deadline + iw.START_GRACE), "failed")
         r = self.row(m)
         self.assertEqual(r["status"], "error")
-        self.assertIn("held for more than 2 h", r["error"])
+        self.assertIn("held past its window start", r["error"])
+        self.assertIn("did not take it along", r["error"])
         self.assertEqual(self.sent, [])
-        self.assertEqual(self.notified, ["inbox message not delivered"])
+        self.assertEqual(self.notified, ["AFClaude STOPPED: inbox message held past its window start"])
+        self.assertIn("inbox message held past its window start", failstop.paused()["reason"])
+        self.assertIsNone(inbox.message_view(r)["hold_until_berlin"])
+
+    def test_a_hold_without_any_window_start_is_an_error(self):
+        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        testenv.set_setting("window_days", {d: None for d in schedule.DAYS})
+        m = self.now_msg()
+        self.assertEqual(self.deliver(m), "failed")
+        self.assertIn("without a window start", self.row(m)["error"])
+        self.assertTrue(failstop.paused()["paused"])
+
+    def test_not_sent_again_after_a_start_took_it_along(self):
+        m = self.now_msg()
+        stale = self.row(m)                                                  # the pass read it as pending ...
+        actions.perform(self.conn, "inbox.deliver", {"message_id": m["id"], "plan": "send-keys, with the start k"},
+                        actor="keepalive", via="runner")                    # ... then a start sent it
+        self.assertEqual(iw.deliver(self.conn, stale, datetime.now(UTC), verify=lambda *a: None), "gone")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.row(m)["status"], "delivered")
 
     def test_errors(self):
         """A refused preflight (not the owner), an unreadable pane, a failed send: an error on the
@@ -353,6 +387,7 @@ class Delivery(tc.Env):
                   "rc=1")]
         for what, arrange, want in cases:
             with self.subTest(what):
+                testenv.unpause()                                             # each one pauses (D-244)
                 old = (ka.preflight, ka.owner_typing, ka.fire)
                 arrange()
                 try:
@@ -363,7 +398,8 @@ class Delivery(tc.Env):
                 r = self.row(m)
                 self.assertEqual(r["status"], "error")
                 self.assertIn(want, r["error"])
-                self.assertEqual(self.notified[-1], "inbox message not delivered")
+                self.assertEqual(self.notified[-1], "AFClaude STOPPED: inbox message not delivered")
+                self.assertTrue(failstop.paused()["paused"])
         self.assertEqual(self.sent, [])
 
     def test_not_in_the_transcript_is_an_error(self):
@@ -379,6 +415,7 @@ class Delivery(tc.Env):
         r = self.row(m)
         self.assertEqual(r["status"], "error")
         self.assertIn("not in its transcript", r["error"])
+        self.assertTrue(failstop.paused()["paused"])
 
     def test_a_resumed_session_gets_the_rules_pointer(self):
         ka.preflight = lambda sid: (True, [], "resume")
@@ -474,6 +511,102 @@ class NotesInStarts(tc.Env):
         self.assertIn("1 more: python3 tasks.py inbox list", text)
         self.assertIn(f"full text: python3 tasks.py inbox show {long[0]}", text)
         self.assertNotIn("x" * 1501, text)
+
+
+# ---------------------------------------------------------------- held "now" messages go along with the next start (D-244)
+
+class HeldInStarts(tc.Env):
+    KEY = "window-start-2026-10-07"
+
+    def setUp(self):
+        super().setUp()
+        conn = store.connect()
+        try:
+            with store.transaction(conn):
+                conn.execute("DELETE FROM inbox_messages")
+            self.held = self.msg(conn, "Why did the 04:00 run stop?\nPlease check.", "now")
+            actions.perform(conn, "inbox.hold", {"message_id": self.held, "reason": "the owner holds the session (x)"},
+                            actor="runner:inbox", via="runner")
+            self.noted = self.msg(conn, "FYI: the host reboots on Sunday.", "note")
+        finally:
+            conn.close()
+
+    def msg(self, conn, text, verdict):
+        m = actions.perform(conn, "inbox.post", {"text": text, "session_id": SID}, actor="owner", via="dashboard")
+        actions.perform(conn, "inbox.triage", {"message_id": m["id"], "verdict": verdict, "reason": "r"},
+                        actor="runner:inbox", via="runner")
+        return m["id"]
+
+    def row(self, mid):
+        conn = store.connect()
+        try:
+            return store.get_inbox(conn, mid)
+        finally:
+            conn.close()
+
+    def start(self, args=None, key=KEY):
+        at = tc.NIGHT + timedelta(days=1)
+        return ka.handle_fire(SID, {"uuid": key, "timestamp": at, "budget": "b", "headroom": 14.0, "start_at": at},
+                              "window start, CONTINUE: test", ka.load_state(), args or tc.Armed())
+
+    def test_the_start_takes_it_along_marked_as_needing_an_answer(self):
+        self.start()
+        msg = self.sent[0][1]
+        self.assertTrue(msg.startswith("[keep-alive] A new run starts"))
+        self.assertIn(f'{inbox.marker(self.held)} (', msg)
+        self.assertIn('"Why did the 04:00 run stop? ⏎ Please check."', msg)
+        self.assertIn('python3 tasks.py inbox reply <id> "<your answer>"', msg)
+        self.assertIn('"FYI: the host reboots on Sunday."', msg)
+        self.assertLess(msg.index(inbox.marker(self.held)), msg.index("reboots"))   # held first, then the notes
+        r = self.row(self.held)
+        self.assertEqual((r["status"], r["delivered_via"], r["hold"]),
+                         ("delivered", f"send-keys, with the start {self.KEY}", None))
+        self.assertEqual(self.row(self.noted)["status"], "included")
+        rec = ka.load_state()["handled"][self.KEY]
+        self.assertEqual((rec["inbox_now"], rec.get("inbox_unseen")), ([self.held], None))
+        self.assertEqual(self.alerts, [])
+        self.assertFalse(failstop.paused()["paused"])
+        self.sent.clear()                                                    # the next start: nothing more
+        self.start(key=self.KEY + "-s2")
+        self.assertNotIn(inbox.marker(self.held), self.sent[0][1])
+
+    def test_not_in_the_transcript_is_an_error(self):
+        def fire(sid, cwd, message, plan, new=False, **kw):                 # a reply, but the message never shows
+            self.sent.append((plan, message))
+            self.write([tc.assistant(datetime.now(UTC))], "a")
+            return 0, "sent-keys ka-abcdef01", ""
+        ka.fire = fire
+        self.start()
+        r = self.row(self.held)
+        self.assertEqual(r["status"], "error")
+        self.assertIn("not in the session's transcript", r["error"])
+        self.assertEqual(ka.load_state()["handled"][self.KEY]["inbox_unseen"], [self.held])
+        self.assertTrue(any("not in its transcript" in a for a in self.alerts))
+        self.assertTrue(failstop.paused()["paused"])
+
+    def test_a_failed_send_leaves_it_held(self):
+        ka.fire = lambda *a, **kw: (self.sent.append(a[2:4]), (1, "", "send-keys failed"))[1]
+        self.start()
+        r = self.row(self.held)
+        self.assertEqual((r["status"], r["hold"] is not None), ("pending", True))   # the worker's deadline decides
+
+    def test_a_dry_run_marks_nothing(self):
+        self.start(tc.DryRun())
+        self.assertEqual(self.row(self.held)["status"], "pending")
+
+    def test_insert_cuts_long_texts_but_takes_all(self):
+        conn = store.connect()
+        try:
+            long = [self.msg(conn, c * 2000, "now") for c in "xyz"]
+            text, ids = inbox.held_insert(conn, SID)
+        finally:
+            conn.close()
+        self.assertEqual(ids, [self.held] + long)                            # every one owes an answer
+        self.assertIn(f"full text: python3 tasks.py inbox show {long[0]}", text)
+        self.assertNotIn("x" * 1501, text)
+        self.assertIn(f"{inbox.marker(long[2])} (", text)
+        self.assertIn(f"its text: python3 tasks.py inbox show {long[2]}", text)   # past HELD_MAX: the id only
+        self.assertNotIn("z" * 10, text)
 
 
 # ---------------------------------------------------------------- the dashboard view (D-178)

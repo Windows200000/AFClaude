@@ -26,6 +26,7 @@ Every prompt AFClaude sends lives here, so the dashboard can show and edit them 
 | `inbox_triage.md` | D-241: Haiku sorts an owner message from the dashboard's message box (inbox_worker.py): `now` (needs a direct response) or `note` (waits for the next start); JSON answer | `{text}` |
 | `inbox_now.md` | D-241/D-186: a "now" message typed into the task-manager at once (inbox_worker.py), with its id (`[AFClaude inbox #id]`, checked in the transcript) and how to answer (`tasks.py inbox reply`); a resumed session also gets the standing rules / the hook pointer | `{id}`, `{at}`, `{text}`, `{notes}` |
 | `inbox_notes.md` | D-241: the noted owner messages, verbatim, appended to the next message into the task-manager (a start's continue / fill-up, the post-compaction message in `{resume}`, a "now" message's `{notes}`); they are then marked included | `{notes}` |
+| `inbox_held.md` | D-244: the "now" messages still held (the owner held the session, a usage limit, ...) go out with the next start's message (`keepalive._fire_start`), each with its `[AFClaude inbox #id]` marker (checked in the transcript) and how to answer (`tasks.py inbox reply`); they are then marked delivered | `{held}` |
 | `usage_haiku.md` | per-session usage classification by Haiku (usage_sampler.py) | `{name}`, `{n}`, `{prompts}`, `{gaps}`, `{totals}` |
 
 Session messages are flattened to one line (tmux send-keys). Literal braces in a file with placeholders must be doubled (`{{ }}`).

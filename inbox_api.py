@@ -20,7 +20,8 @@ owner, via dashboard: audited). The worker (inbox_worker.run_forever) runs in th
   inbox_api.py serve [--socket PATH]    the server (one per data/: a lock file); the entrypoint
                                          starts it with `ensure --boot`
   inbox_api.py ensure [--boot]          start the server detached unless one runs (cron watchdog;
-                                         without --boot a server that was not running is alerted)
+                                         without --boot a server that was not running is an
+                                         error: alert + automation paused, D-244)
 """
 from __future__ import annotations
 
@@ -250,11 +251,11 @@ def ensure(boot: bool) -> int:
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, cwd=HERE)
     if boot:
         log("inbox API started")
-    elif not os.path.exists(DOWN):      # one alert per outage: serve() removes the mark once it listens
+    elif not os.path.exists(DOWN):      # one error per outage: serve() removes the mark once it listens
         with open(DOWN, "w") as fh:
             fh.write(datetime.now(inbox.BERLIN).isoformat() + "\n")
-        failstop.fail("inbox", "inbox API was not running",
-                      "the watchdog started it again; if it keeps failing, see data/inbox_api.log", log=log, pause=False)
+        failstop.fail("inbox", "inbox API was not running",   # an inbox error: alert + pause (D-244)
+                      "the watchdog started it again; if it keeps failing, see data/inbox_api.log", log=log)
     else:
         log("inbox API still not running; started again (already alerted)")
     return 0

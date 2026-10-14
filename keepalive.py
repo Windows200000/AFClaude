@@ -1716,8 +1716,9 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         # a session in this repo has its standing rules from the SessionStart hook: only a pointer (D-225)
         return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
+    held, held_ids = inbox_held(sid)     # D-244: held "now" inbox messages go along, to be answered
     notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
-    msg = build(with_notes(stall.get("insert"), notes))
+    msg = build(with_notes(with_notes(stall.get("insert"), held), notes))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -1727,6 +1728,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})")
         return None
     at_fire = _fire_usage()          # the run's start values (run_metrics.py, D-207)
+    offset = os.path.getsize(path) if held_ids and path else 0   # the held messages' markers come after
     sent_at = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, msg, plan)
     errors = []                      # failures after the continue went out: recorded, then raised
@@ -1734,12 +1736,26 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
               "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
+    if rc == 0 and held_ids:
+        result["inbox_now"] = held_ids
+        if not inbox_delivered(held_ids, f"{plan}, with the start {key}"):
+            errors.append((f"held inbox messages sent with the continue of {sid[:8]} not marked delivered",
+                           f"messages {held_ids} went out with {key}; they would go out once more"))
     if rc == 0 and note_ids:
         result["inbox_notes"] = note_ids
         if not inbox_included(note_ids, key):
             errors.append((f"inbox notes sent with the continue of {sid[:8]} not marked included",
                            f"messages {note_ids} went out with {key}; they would go out once more"))
     reply = verify_reply(path, sent_at) if rc == 0 else None
+    if rc == 0 and held_ids:             # D-244: each held message's marker must be in the transcript
+        import inbox
+        unseen = [i for i in held_ids if not (path and inbox.seen(path, offset, inbox.marker(i)))]
+        if unseen:
+            result["inbox_unseen"] = unseen
+            stored = inbox_failed(unseen, f"sent with the start {key}, but not in the session's transcript")
+            errors.append((f"held inbox messages sent with the continue of {sid[:8]} not in its transcript",
+                           f"messages {unseen} (start {key})" + ("" if stored else "; the error could not be "
+                                                                 "stored on them either")))
     try:
         live = [a for a in agent_entries(sid) if pid_alive(a.get("pid"))]
         result["env"] = [process_env_flags(a["pid"]) for a in live]
@@ -2313,6 +2329,48 @@ def inbox_notes(sid):
         return inbox.notes_insert(conn, sid)
     finally:
         conn.close()
+
+
+def inbox_held(sid):
+    """D-244: the "now" inbox messages still waiting for this session (held), as one line for a
+    start's message (inbox.held_insert) -> (text or None, ids). A DB failure raises: the caller
+    aborts the start (D-235)."""
+    import inbox
+    import store
+    conn = store.connect()
+    try:
+        return inbox.held_insert(conn, sid)
+    finally:
+        conn.close()
+
+
+def _inbox_act(name, ids, **params):
+    """One inbox.<name> action per message id (actions.py, audited, actor keepalive). -> True /
+    False (logged; the caller reports it, fail_stop)."""
+    import actions
+    import store
+    try:
+        conn = store.connect()
+        try:
+            for i in ids:
+                actions.perform(conn, name, dict(params, message_id=i), actor="keepalive", via="runner")
+        finally:
+            conn.close()
+        return True
+    except Exception as e:   # noqa: BLE001 - the caller reports it (fail_stop)
+        log(f"{name} of inbox messages {list(ids)} failed: {type(e).__name__}: {e}")
+        return False
+
+
+def inbox_delivered(ids, plan):
+    """The held "now" messages `ids` went out with a start (`plan` names it): pending -> delivered."""
+    return _inbox_act("inbox.deliver", ids, plan=plan)
+
+
+def inbox_failed(ids, error):
+    """The held "now" messages `ids` failed after they went out (no marker in the transcript): an
+    error on each, shown on the dashboard (the caller raises the error itself, fail_stop)."""
+    return _inbox_act("inbox.fail", ids, error=error)
 
 
 def inbox_included(ids, by):
