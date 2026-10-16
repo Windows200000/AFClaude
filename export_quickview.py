@@ -29,6 +29,7 @@ serves at /afclaude/:
 Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
 ~/.claude.json cache that the sampler keeps fresh. All times Europe/Berlin.
+Also publishes the page itself (quickview/AFClaude.html -> AFClaude.html, D-253).
 Run from cron every few minutes (via flock); each file is replaced atomically.
 """
 import glob
@@ -49,6 +50,8 @@ import afclaude_config  # noqa: E402  (local machine-specific values)
 import stage_eta  # noqa: E402  (stage ETAs, D-213: read-only, plus its once-a-day prediction log)
 
 OUT = os.environ.get("QUICKVIEW_DIR", os.path.join(HERE, "data", "quickview"))
+# D-253: the page itself, published next to status.json on every export (served at /afclaude/AFClaude.html)
+PAGE = os.environ.get("QUICKVIEW_PAGE", os.path.join(HERE, "quickview", "AFClaude.html"))
 USAGE_REVIEW_STATE_FILE = os.path.join(HERE, "data", "usage_review_state.json")
 AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # legacy (frozen): jobs the at-shim adopts
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
@@ -151,6 +154,16 @@ def write_atomic(name, data):
         fh.write(data)
     os.chmod(tmp, 0o644)  # the container's nginx user must be able to read it
     os.replace(tmp, path)
+
+
+def publish_page():
+    """D-253: copy the page to OUT/AFClaude.html, so ovm3 proxies the current page instead of a copy
+    made by hand. A page that can't be read raises (the export fails, never publishes without it)."""
+    with open(PAGE, encoding="utf-8") as fh:
+        page = fh.read()
+    if "status.json" not in page:
+        raise ValueError(f"{PAGE} does not look like the quickview page (no status.json in it)")
+    write_atomic("AFClaude.html", page)
 
 
 # -------------------------------------------------------------------- GOALS.md
@@ -798,6 +811,7 @@ def main():
         "prompts": prompts,
     }
     write_atomic("status.json", json.dumps(status, indent=1, ensure_ascii=False, default=str))
+    publish_page()   # after the data, so a page that reads a new field finds it
 
 
 if __name__ == "__main__":
