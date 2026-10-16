@@ -1,0 +1,312 @@
+# Phase 3a: the resident runner (implementation plan)
+
+Plan for design §5.1 / §13 step 3a: one resident runner (`runner.py`) replaces supercronic, the at-shim's `--run-due`, the keep-alive watcher loop and the inbox worker thread. No code changes yet; each step in §5 is one worker branch.
+
+Binding inputs: D-153/D-173 (one resident runner; run-now later, in 3b), D-154 (one write path with audit), D-161 (everything in the DB), D-202–D-206 (starts only at session-window starts; the 10-min pass only cleans up; approved stalls at their reset), D-212 (fill-up), D-224 (run end), D-228/D-251 (review chain), D-234/D-235/D-239 (fail-stop), D-238 (compaction timing), D-241/D-244/D-252 (inbox, per-project pause).
+
+## 0. Already decided
+
+- **Build, don't adopt.** A small stdlib `asyncio` loop. Checked and rejected on 13.10.: APScheduler 3 (its own job-store schema outside `actions.py`, no window semantics), APScheduler 4 (alpha), Huey (a task queue with its own tables), rq-scheduler/Celery beat (need Redis or a broker), Dagster/Prefect (far too big), supercronic/systemd (what is being replaced).
+- **`schedule.py` owns the windows.** The runner asks it for start times and never computes window times itself.
+- **Must be tested:** catching up missed ticks, handler timeouts, coalescing wakes.
+- **15.10. lesson:** a process that waits inside the container dies silently on every deploy. **The rule here: no waiting inside a process.** A wait is stored in the DB as state plus a due time, and the next run of the job checks it.
+- **`review-failfast`** (in progress) moves the D-228 chain into `usage_review` state (`st["chain"]`). An at-job `--chain-step` advances it every 5 min; the hourly run is the backstop that re-queues it; a file lock makes sure only one pass runs at a time; there is a quota gate and early death detection. 3a only changes what triggers it (§5, S3/S4). It does not touch its logic.
+
+## 1. Today
+
+| what | trigger | process | survives a restart? |
+|---|---|---|---|
+| usage sampler | cron */15 | one-shot | yes (next tick) |
+| window start | cron */30, acts if `schedule.due_session_start` | one-shot, up to ~75 min (waits for a compaction lock up to 40 min, then save, `/compact`, continue) | **no**: killed mid-sequence, nothing records it |
+| watcher watchdog | cron :07/:22/:37/:52 + entrypoint `start_watcher.sh --boot` | — | — |
+| keep-alive watcher (`keepalive.run`) | 30-s loop: stall/limit detection, last-stretch slots, postponed starts, fill-up (60 s), run readings (5 min), compaction (60 s) | long-lived; next due times kept **in memory** | partly: dedup state is in the DB, but a start, fill-up or compaction cut off mid-way is lost silently |
+| usage review | cron hourly | one-shot (the 6-h chain waiter is removed by `review-failfast`) | yes after `review-failfast` |
+| quickview export | cron */3 | one-shot | yes |
+| dispatcher (10-min pass + `stalled.scan`) | cron */10 | one-shot | yes |
+| at-jobs (`scheduled_jobs`) | cron */1 `at_shim --run-due` | **claimed, then detached**; the result is never recorded | **no**: a claimed job killed by a restart is lost, with no error |
+| docs import | cron */10 | one-shot | yes |
+| inbox API + worker | entrypoint + cron */5 `inbox_api ensure` | long-lived HTTP server; a worker thread (30 s + wake); **a verify thread per delivered message (up to 10 min)** | **no**: a restart during verify leaves the message `delivered`, never checked and never failed |
+| log retention | cron 03:17 | one-shot | yes |
+
+The rows in bold are the same kind of failure as on 15.10. 3a fixes all of them.
+
+## 2. What moves, what stays
+
+**Moves into the runner by the end of 3a:** every crontab line, the at-job execution, the watcher's passes, the window starts, the inbox worker and its verify step, and supervision of the inbox API process.
+
+**Stays outside:**
+- `inbox_api.py serve` stays its own process: the HTTP endpoint behind the quickview proxy, and later part of `afclaude-web` (phase 6). It only stores a message and wakes the runner. The runner starts and supervises it, replacing the */5 cron watchdog.
+- The CLIs keep working unchanged: `tasks.py`, `keepalive.py --run-stopped / --decide / --work-on / --plan-fillup-test`, `at -t` (scheduling only, plus a wake), `store.py import-prompts` (the entrypoint runs it before the runner starts), the MCP server and the SessionStart hook.
+- **Not part of 3a:**
+  - run-now / `action_requests`, the task-manager unification and retiring the keep-alive continuation: 3b;
+  - the compaction redesign: 3c (the runner runs today's `compaction_pass` as it is);
+  - Litestream, backups and host checks: 5b/5c.
+
+## 3. Runner design
+
+### 3.1 Process and loop
+- `python3 -u runner.py serve`: one asyncio loop in the main thread.
+- **Single instance:**
+  - an `flock` on `data/run/runner.lock`;
+  - at boot it refuses to start (fail-stop) while a keep-alive watcher runs in the container or on the host (the host check from `start_watcher.sh`);
+  - each process gets a `boot_id` (uuid).
+- **Loop:**
+  1. read the due times;
+  2. `await` whichever comes first: the earliest due time, a wake, or a child exiting;
+  3. start the due runs;
+  4. repeat.
+  - There is no fixed poll. A 60-s maximum sleep is the backstop for a lost wake.
+- **Handlers run as child processes:** `python3 runner_jobs.py <job> [--key K]` via `asyncio.create_subprocess_exec`, each in its own process group. A hang or crash can't wedge the loop, and a timeout can kill the child.
+  - The child calls the existing function and prints one JSON result line: `{status, next_due, note}`.
+  - **Exit codes:**
+
+    | exit | meaning |
+    |---|---|
+    | 0 | ok |
+    | 3 | failed, and the handler already reported it (`failstop.fail` inside) |
+    | anything else (crash, signal, timeout) | the runner reports it |
+
+    So there is never a second alert and never a silent failure.
+- **At most one run per job at a time.** A job that is still running when it comes due again is not started twice. The overrun is logged once; it is not an error until its timeout.
+- The jobs that type into the task-manager session (start, fill-up, compaction, inbox delivery) keep `keepalive.session_lock` as their guard. It works across processes, so it also covers a legacy rollback.
+
+### 3.2 Jobs
+
+| job | trigger | timeout (setting `runner_timeout_<job>`) | while paused | on interrupt | calls |
+|---|---|---|---|---|---|
+| `stall_scan` | 3 min (new: its own tick, §5.1) | 2 min | runs | rerun | `stalled.scan` |
+| `sampler` | 15 min | 10 min | runs (D-239.4) | rerun | `usage_sampler.main` |
+| `dispatcher` | 10 min | 8 min | the handler checks | rerun | `dispatcher.main(--arm --once)` |
+| `quickview` | 3 min | 2 min | runs; a failure alerts but never pauses (D-239.3) | rerun | `export_quickview` |
+| `docs_import` | 10 min | 5 min | runs | rerun | `project_docs import --cron` |
+| `prune_logs` | daily 03:17 UTC | 10 min | runs | rerun | `store.py prune-logs` |
+| `usage_review` | hourly | 15 min | the handler checks | rerun | `usage_review.main` (the backstop for the chain) |
+| `at:<id>` | `scheduled_jobs.run_at` | 30 min or payload `timeout` | the job checks | payload `on_interrupt` (default `fail`; chain steps and samples `rerun`) | the job's command |
+| `window_start:<start_key>` | each `schedule.next_session_start`, exact | sum of its inner waits + 5 min | the handler checks | **fail** | `keepalive.window_start_pass` |
+| `deferred_start:<key>`, `last_stretch:<key>`, `fillup:<key>` | `next_due` from the plan step | as for `window_start` | the handler checks | **fail** | the keep-alive passes' act step (S6) |
+| `watch` | 60 s | 2 min | runs (detection only) | rerun | `stall_status` + `note_limit_hit` + `watch_run_usage` + the plan steps (next postponed recheck, slot start, fill-up time) |
+| `compaction` (check) / `compaction:<key>` (act) | 60 s / when the check says act | 1 min / inner waits + 5 min | the handler checks | rerun / **fail** | `compaction_pass`, split |
+| `inbox` | a wake from the inbox API, plus 30 s while any message is pending or held | 5 min | runs (owner messages are not automation, D-186/D-244) | rerun | `inbox_worker.process` |
+| `inbox_verify` | 5 s while any verification is pending | 30 s | runs | rerun (its state is in the DB) | one verify check per pending message |
+| `inbox_api` | a supervised child | — | runs | restart + alert | `inbox_api.py serve` |
+
+- **Plan and act are separate runs.** A tick only reads and plans, so rerunning it is safe. Typing into a session is always a keyed run, whose interruption is a failure. S6 splits the watcher's passes this way.
+- **Dedup keys:** the keyed runs use the existing keys: `schedule.start_key`, the deferral key, `last_mile_key`, and the fill-up's window key. The runner and a legacy rollback therefore share one dedup (`keepalive` state `handled`).
+- **Outer timeout = the sum of the handler's inner timeouts + a margin**, computed from the `keepalive` constants. A test asserts it, so an inner timeout (with its own clear error) always fires first.
+- **Due times:**
+  - The parent computes window starts itself (`schedule.py` is pure; the settings come from the DB).
+  - Every other exact time (a postponed recheck, a last-stretch slot, a planned fill-up, the usage refresh 2 min before it) comes back as `next_due` in the handler's result and is stored. A restart therefore wakes at the planned time.
+
+### 3.3 Tables (additive: `RUNNER_SCHEMA`, `CREATE … IF NOT EXISTS`, no schema-version bump)
+
+- **`runner_jobs`**, the "job table" of §13, one row per job: `name` PK, `next_due`, `last_run_id`, `last_status`, `last_ok_at`, `consecutive_failures`, `heartbeat_at`, `updated_at`, `version` (bumped by a trigger).
+- **`runner_runs`**, one row per run:
+  - columns: `id`, `boot_id`, `job`, `key` (NULL for a tick), `status` (`running|ok|failed|timeout|interrupted|skipped`), `started_at`, `finished_at`, `pid`, `timeout_s`, `result` JSON, `error` (stderr tail ≤ 2 kB), `actor` (`runner:<job>`), `via`.
+  - `UNIQUE(job, key) WHERE key IS NOT NULL`: a keyed run can't start twice, also across a restart.
+  - A trigger lets `status` leave `running` only once.
+  - Retention: a setting `runner_runs_retention_days` (30), with deletes only through a prune gate, the way `app_log` does it.
+- **Writes** go through `actions.py`: `runner_job_set`, `run_begin`, `run_end` (with `_check_writer`, `store.retrying` and the §7.8 DB-error path). Audit volume: see question 1.
+- **Pending work stays in the handlers' own `runner_state` components**, as `review-failfast` does with `st["chain"]`. Inbox verifications become `runner_state` "inbox" entries `{msg, path, offset, deadline}`. The runner itself stores only due times and run records.
+
+### 3.4 Restart recovery
+At boot, after taking the lock:
+1. **`running` rows from another `boot_id`** become `interrupted`, then follow the job's policy (table above):
+   - `rerun`: the job is due now;
+   - `fail`: `failstop.fail("runner", "<job> <key> interrupted by a runner restart", …)`. That is an alert and a pause (D-235), and the run is never rerun: a start or compaction cut off mid-way leaves the session in an unknown state.
+2. **The previous boot ended without a clean exit** (`runner_state` `runner.clean_exit` is false): an error (question 2).
+3. **Missed timed runs:**
+   - The last session start is within the catch-up grace (setting `runner_start_catchup`, default 30 min = today's `CRON_STEP` tolerance) and not yet handled: it runs now.
+   - It is older than that: an error, "missed start" (question 2).
+   - Overdue at-jobs run now (as today).
+   - Each interval job runs once, not once per missed tick, staggered by a few seconds.
+4. **SIGTERM (`docker stop`):**
+   - no new runs start;
+   - running runs get up to `stop_grace_period` (compose: 90 s);
+   - the runner records `clean_exit` and exits.
+   - Children still alive at the kill show up as interrupted at the next boot.
+5. **Deploys use `runner.py drain` first:**
+   - no new runs that act on a session start;
+   - it waits until none is running (bounded by the longest timeout);
+   - then the deploy runs.
+   - The manager prompt's deploy steps are updated so that a deploy never kills a start.
+
+### 3.5 Timeouts (D-234)
+- **On a timeout:** the child's process group gets SIGTERM, then SIGKILL 10 s later; the run is marked `timeout`; `failstop.fail` pauses and alerts.
+- All timeouts are settings in the registry, with the defaults in the table above.
+- No timeout is retried silently. A deliberate retry exists only where one exists today (D-239.6).
+
+### 3.6 Fail-stop and pause
+- **Before spawning a job that pauses**, the runner checks `failstop.paused()` (install-wide). A DB that can't be read counts as paused, as today.
+  - A skipped run is recorded as `skipped`, with the reason logged once per reason.
+  - The jobs that run while paused are listed in the table (D-239).
+- **Per-project pause (D-244):** the handlers keep their checks (`automation_paused(what, sid)` resolves the session's project). In 3a the runner does not duplicate the project mapping.
+- **The runner's own failures** (a run row can't be written, the socket can't be bound, the loop crashes): `failstop.fail("runner", …)`, then a non-zero exit, then `restart: unless-stopped`. The next boot sees the unclean exit.
+- **Liveness:**
+  - A watchdog thread checks the loop's heartbeat. If the loop is stuck for more than 5 min, it logs and calls `os._exit(70)`, which restarts the container.
+  - Docker's health check by itself doesn't restart a container, so §5.1's "the container restarts on a stale heartbeat" needs this thread.
+  - The heartbeat is written to `runner_jobs` at most every 30 s.
+
+### 3.7 Wake socket
+- `data/run/runner.sock`, `SOCK_DGRAM`. Any datagram means "re-read the DB".
+- **Senders in 3a:**
+  - `at -t` after it stores a job;
+  - `inbox_api` after it stores a message;
+  - `tasks.py automation resume`;
+  - `window.set` and settings writes, after their commit.
+- **Sending never blocks or fails a write.** If the runner is down, the sender logs a warning line; the stale heartbeat is what raises the alert. The DB is the truth, and the next tick catches a lost wake.
+- **Coalescing:** one `asyncio.Event`. N wakes while the loop is busy cause one re-scan.
+
+### 3.8 Logging and status
+- **Runner lines** go to component `runner` (`data/runner.log` + `app_log` via `runner_state.tee`, plus stdout for `docker logs`):
+  - the boot;
+  - each run's start and end (job, key, duration, status);
+  - skips, once per reason.
+- **Handlers keep their own logs** (`keepalive.log`, `dispatcher.log`, …).
+- **A failed or timed-out run** keeps its stderr tail in `runner_runs.error`.
+- **`runner.py status`** shows the jobs, next due times, last status, the running runs and the heartbeat age.
+- **The quickview's "cron" section** reads `runner_jobs`, plus the crontab lines still left while the cut-over runs.
+
+## 4. Cut-over
+
+- **One owner per job per image.** A test reads `docker/crontab` and the runner's `RUNNER_OWNS` set and fails if they overlap.
+  - Each step moves jobs by removing their cron lines and adding them to `RUNNER_OWNS` in one commit, deployed in one go.
+  - The deploy restarts the container, which stops the old owner (supercronic and the watcher are processes in that container). The runner's boot catch-up covers the restart gap.
+- **Double-start guards that don't depend on ownership:**
+  - the existing dedup (`handled` keys, `scheduled_jobs` claims, the flocks, `session_lock`);
+  - `runner_runs` `UNIQUE(job, key)`;
+  - the runner's single-instance lock and its watcher check.
+- **No gap:**
+  - boot catch-up (§3.4);
+  - `runner.py drain` before each deploy;
+  - no cut-over deploy within 30 min of a session-window start, or while a run is going.
+- **`AFCLAUDE_SCHEDULER` modes:**
+
+  | mode | what runs |
+  |---|---|
+  | `off` | nothing (unchanged) |
+  | `on` (S2–S7) | supercronic with `docker/crontab` + the runner for `RUNNER_OWNS` |
+  | `runner` (S8) | the runner only |
+  | `legacy` | supercronic with `docker/crontab.legacy` (today's crontab, frozen at S2) + the watcher + the inbox `ensure`; no runner |
+- **Rollback:**
+  - Set `legacy` in `docker/.env` and run `docker compose up -d` (recreates the container, no rebuild).
+  - The dedup state is shared, so nothing starts twice across the switch.
+  - A pause set by an interrupted run stays until the owner clears it.
+  - Inside one step: revert the step's commit and redeploy.
+  - `legacy` is removed only after 7 days of `runner` mode with no runner incident (S9).
+
+## 5. Steps
+
+**S0, prerequisite:** `review-failfast` merged and deployed. 3a builds on its stored chain and only changes how it is triggered.
+
+**S1: runner core, not started live.**
+- **Build:**
+  - `runner.py` and `runner_jobs.py`;
+  - the tables, the `actions.py` writes, the settings;
+  - the loop, child processes, timeouts, wake, lock, recovery, `drain` and `status`;
+  - both files on the `mypy --strict` list.
+- **Tests:**
+  - a fake clock and fake spawner;
+  - real children (`sleep` past the timeout: killed and recorded; a crash; exit 3: no second alert);
+  - catch-up (a boot after missed ticks runs each once; a start within or after the grace);
+  - coalescing (100 datagrams during a run cause 1 re-scan);
+  - recovery (a `running` row from another boot is rerun or fails per policy);
+  - `UNIQUE` key;
+  - two runners: one exits;
+  - SIGTERM drain;
+  - the outer > inner timeout check.
+- **Done when:** all suites, `test_typing` and `check_public` are green. The deploy is an image rebuild with no change in behaviour.
+- **Risk:** asyncio subprocess and signal handling under tini in the read-only container. Check it with `docker exec` against a temp DB (`testenv.py`).
+
+**S2: the runner live, owning only new jobs.**
+- **Build:**
+  - The entrypoint (`on`) starts `runner.py serve` next to supercronic.
+  - The runner owns the heartbeat and `stall_scan`.
+  - A temporary cron watchdog `runner.py ensure` (*/5) runs until S8.
+  - **Shadow log:** "would run at" for every job cron owns, compared with cron's actual runs over 2 nights.
+  - Add `docker/crontab.legacy` and the `legacy` mode.
+- **Done when:**
+  - 48 h of continuous heartbeat;
+  - no failed runs;
+  - the shadow times match cron (window starts to the second);
+  - the rollback to `legacy` has been exercised once.
+- **Risk:** `stall_scan` running at the same time as the dispatcher's and the quickview's scans. They already overlap today; check that there are no DB lock errors.
+
+**S3: the simple ticks.**
+- **Build:**
+  - `sampler`, `quickview`, `docs_import`, `prune_logs`, `usage_review` (hourly) and `dispatcher` move to the runner, and their 6 cron lines are removed;
+  - `export_quickview`'s cron section reads `runner_jobs`.
+- **Done when:** one day in which each cadence matches cron's, with no failed runs. The scripts' own flocks stay for now; they do no harm.
+- **Risk:** the dispatcher pass and the sampler's Haiku call sometimes run long. Measure their p99 duration first and set the timeouts above it.
+
+**S4: at-jobs.**
+- **Build:**
+  - The runner runs `scheduled_jobs`: it claims the job (`job_claim`), then runs it as a tracked child with a timeout.
+  - A new payload field `on_interrupt` (the sampler's samples and `review-failfast`'s `--chain-step` jobs get `rerun`).
+  - `at -t` sends a wake.
+  - `--run-due` is kept for `legacy` only, and the */1 cron line is removed.
+- **Done when:**
+  - the next pre/post-reset samples run on their minute and are recorded `ok`;
+  - a test job interrupted by a restart is rerun or fails according to its flag.
+- **Risk:** a job that relied on being detached. List every `at -t` caller and check that each returns within its timeout.
+
+**S5: window starts.**
+- **Build:** the exact-time `window_start` job, keyed by `start_key`, with a 30-min catch-up; the */30 cron line is removed.
+- **Done when:**
+  - two nights of 23:00 and 04:00 starts, fired at the second;
+  - the decision lines (`FIRE`/`HOLD`/`POSTPONE`) are of the same kind as cron's;
+  - a DST test at the runner level (the DST transition gives the next start).
+- **Risk:** the postponed path still runs in the watcher during this step. That is fine: it is the same split as today.
+
+**S6: the watcher passes.**
+- **Build:**
+  - Refactor `keepalive` into one function per pass (`watch`, `last_stretch`, `deferred_start`, `fillup`, `run_readings`, `compaction`), each split into a plan step that returns `next_due` and a keyed act step. `keepalive.run()` calls the same functions, which keeps `legacy` working.
+  - Add the runner jobs for these passes.
+  - The entrypoint no longer starts the watcher, and the watchdog cron line is removed.
+- **Done when:**
+  - a full night with a start, a compaction and a fill-up (if one is planned) all run by the runner;
+  - the fill-up starts within seconds of its plan;
+  - `test_keepalive` and `test_compaction` pass through both callers.
+- **Risk: the largest step.** The watcher's in-memory timing (`lm_start`, `WAKE_SLACK`, the 2-min usage refresh before a fill-up) must become stored `next_due` values. A compaction cut off by a deploy fails and pauses; `drain` is there to prevent that.
+
+**S7: the inbox.**
+- **Build:**
+  - `inbox_worker.process` becomes the `inbox` job (woken by `inbox_api`);
+  - the verify threads become stored checks (`inbox_verify`);
+  - `inbox_api` only serves HTTP, stores the message and sends the wake;
+  - the runner supervises `inbox_api` (restart + alert), and both the entrypoint start and the `ensure` cron line are removed.
+- **Done when:**
+  - `test_inbox` and `test_inbox_active` pass with the new driver;
+  - a restart during a verify is resumed and ends correctly (seen, or an error at its deadline);
+  - end-to-end with the quickview box: one note and one "now" message.
+- **Risk:** delivery now depends on the runner; a down runner shows up as a stale heartbeat.
+
+**S8: runner only.**
+- **Build:**
+  - `on` becomes `runner`: the entrypoint `exec`s `runner.py serve` (still under tini), and supercronic no longer starts;
+  - the temporary watchdog line is removed;
+  - the internal loop watchdog plus `restart: unless-stopped`;
+  - compose `stop_grace_period: 90s` and a heartbeat health check.
+- **Done when:**
+  - 7 days with every job's cadence met and no unexplained pause;
+  - a test that blocks the loop (a synchronous sleep injected into a test job) makes the watchdog thread exit the process, and Docker restarts the container.
+- **Risk:** there is no outside watchdog anymore. The watchdog thread is the only one, so it is tested on its own.
+
+**S9: cleanup and observation.**
+- **(a) Cleanup**, after 7 calm days in `runner` mode:
+  - remove the `legacy` mode, both crontabs, supercronic from the image, `at_shim --run-due`, `start_watcher.sh` and the `keepalive.run()` loop;
+  - the watcher's `STOP`/`PAUSED` files give way to `automation_paused`;
+  - update the README file table and design §5.1 "as built".
+- **(b) The remaining 3a items of the design** (can start any time after S1):
+  - a `status_snapshot` row written each loop, at most once a minute;
+  - `run_log` decisions and `driven_sessions` rows for starts and reviews, through `actions.py`.
+
+## 6. Open questions for the owner
+
+1. **Audit per runner run (D-154).**
+   - Each run row would be written through `actions.py`, with actor and via on the row, but without its own `audit_log` row. That is the same as `app_log` lines today.
+   - The cost of a full audit: about 3,000 runs a day, mostly 1- and 3-min ticks, means about 6,000 extra `audit_log` rows a day, with no retention on them.
+   - What a run changes in work or state is still audited by the handler's own actions.
+   - **Recommended:** run rows without audit rows.
+2. **Runner downtime as a failure (D-235).** Cases: an unclean runner exit (crash, host reboot), a start or compaction killed mid-way, a session-window start missed by more than 30 min.
+   - **Recommended:** alert and pause until cleared, as D-235 reads literally, with deploys draining first so they never trigger it.
+   - **Alternative:** alert only when AFClaude's code didn't cause it (host reboot, Docker restart), and keep the pause for crashes and interrupted runs.
