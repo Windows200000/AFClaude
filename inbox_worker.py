@@ -8,6 +8,14 @@ shape docker/host_exec.py whitelists, so inside the container it runs on the hos
 bridge, where the Claude CLI's login is), prompts/inbox_triage.md. Its cost and usage are kept on
 the message.
 
+No triage while the task-manager is active (D-252): a message whose session has a keep-alive run
+going (keepalive.run_active, D-224), a turn or a subagent running (keepalive.compaction_busy_reason)
+or a request in its transcript within ACTIVE_WINDOW (compact_timing.scan) is "now" without the
+Haiku call (its reason says so): the task-manager is working anyway, so the message goes in now,
+through the same delivery and its checks, instead of waiting as a note for the next message into
+the session. A failed activity check (the keepalive state unreadable, the transcript unreadable,
+...) is an error on the message, never a triage or a delivery in its place (D-235/D-244).
+
 Delivery of a "now" message (D-186: no window, no budget, not held by automation_paused: the owner
 is asking, that is no automation) goes through the keep-alive's own send path and checks, never around them:
   - keepalive.session_lock (non-blocking): a compaction or a start typing into the session holds it;
@@ -51,10 +59,12 @@ from typing import Any, Callable
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import compact_timing  # noqa: E402
 import failstop  # noqa: E402
 import host  # noqa: E402
 import inbox  # noqa: E402
 import keepalive as ka  # noqa: E402
+import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
 
@@ -63,6 +73,7 @@ ACTOR = "runner:inbox"
 DATA = os.path.join(HERE, "data")
 POLL = 30                                 # seconds between passes (a held message is tried again)
 TRIAGE_TIMEOUT = 120                      # seconds for the Haiku call
+ACTIVE_WINDOW = timedelta(minutes=10)     # D-252: a request this recent: the task-manager is active, no triage
 # a held "now" message is an error this long after its deadline (the next session-window start) if
 # that start did not take it along: the cron checks a start within CRON_STEP after it, the start
 # waits up to COMPACT_LOCK_WAIT for a compaction, then sends and marks it delivered
@@ -110,13 +121,45 @@ def triage_call(text: str) -> dict[str, Any]:
     return inbox.parse_triage(r.returncode, r.stdout or "", r.stderr or "")
 
 
-def triage(conn: Any, m: dict[str, Any]) -> str | None:
-    """Sort one message. -> its verdict, or None (failed: the message shows the error)."""
-    try:
-        t = triage_call(m["text"])
-    except inbox.TriageError as e:
-        failed(conn, m, "inbox message triage failed", str(e))
+def manager_active(sid: str, now: datetime) -> str | None:
+    """D-252: why the task-manager session `sid` counts as active (a keep-alive run going, a turn
+    or a subagent running, a request within ACTIVE_WINDOW), else None (no transcript: not active).
+    A check that can't be made raises (the keepalive state or the transcript unreadable)."""
+    st = ka.load_state()
+    if getattr(st, "unavailable", False):
+        raise RuntimeError("the keepalive state can't be read from the DB: "
+                           + (runner_state.load_failed() or "unknown reason"))
+    if ka.run_active(sid, now, st) is not None:
+        return "a keep-alive run is going"
+    path = ka.transcript_path(sid)
+    if not path:
         return None
+    busy = ka.compaction_busy_reason(path, now)
+    if busy:
+        return busy
+    sc = compact_timing.scan_cached(path)
+    if sc.requests and now - sc.requests[-1].ts <= ACTIVE_WINDOW:
+        return f"its last request was {max(0.0, (now - sc.requests[-1].ts).total_seconds()) / 60:.0f} min ago"
+    return None
+
+
+def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | None:
+    """Sort one message: "now" without a Haiku call while its task-manager is active (D-252),
+    else the Haiku verdict. -> its verdict, or None (failed: the message shows the error)."""
+    try:
+        active = manager_active(m["session_id"], now or datetime.now(UTC))
+    except Exception as e:   # noqa: BLE001 - an error on the message (D-235/D-244), never a triage instead
+        failed(conn, m, "inbox activity check failed", f"{type(e).__name__}: {e}")
+        return None
+    if active:
+        t: dict[str, Any] = {"verdict": "now", "reason": f"task-manager active ({active}): no triage",
+                             "cost_usd": None, "usage": None}
+    else:
+        try:
+            t = triage_call(m["text"])
+        except inbox.TriageError as e:
+            failed(conn, m, "inbox message triage failed", str(e))
+            return None
     try:
         _act(conn, "inbox.triage", message_id=m["id"], verdict=t["verdict"], reason=t["reason"],
              cost_usd=t["cost_usd"], usage=t["usage"])
@@ -281,7 +324,7 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
     out: dict[str, int] = {}
     for m in reversed(store.list_inbox(conn, "pending", limit=200)):
         if m["verdict"] is None:
-            v = triage(conn, m)
+            v = triage(conn, m, now)
             out[v or "failed"] = out.get(v or "failed", 0) + 1
     for m in reversed(store.list_inbox(conn, "pending", limit=200)):
         if m["verdict"] == "now":
