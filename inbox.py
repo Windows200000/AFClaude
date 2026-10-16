@@ -210,7 +210,7 @@ def marker(msg_id: int) -> str:
     return f"[AFClaude inbox #{msg_id}]"
 
 
-# ---------------------------------------------------------------- the dashboard view (D-178)
+# ---------------------------------------------------------------- the dashboard view (D-178, D-246, D-248)
 
 def _ts(iso: str | None) -> datetime | None:
     return store.parse_iso(iso) if iso else None
@@ -223,16 +223,23 @@ def activity(m: dict[str, Any]) -> datetime:
     return max(t for t in times if t is not None)
 
 
+CHAT_STATUSES = ("pending", "delivered", "answered", "error")   # the chat; noted ones are lines, included ones gone
+BUSY_STATES = ("sorting", "sending", "held", "delivered")         # the box shows a loading animation
+VIEW_FMT = "%a %d.%m. %H:%M"
+
+
 def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
-    """The box's current thread, oldest first (D-178): newest back to the first gap longer than
-    ui_chat_reset_hours (none in the last ui_chat_reset_hours: the box is empty again), at most
-    VIEW_MAX; a message still waiting or failed always stays in view."""
+    """The box's chat, oldest first (D-178, D-246): the messages passed on to the task-manager or on
+    their way (not the noted or included ones), newest back to the first gap longer than
+    ui_chat_reset_hours (none in the last ui_chat_reset_hours: the chat is empty again), at most
+    VIEW_MAX; a message still waiting or failed always stays in view. Walked by last activity, not
+    id: an old message answered now (a noted one, included, then answered) is the newest."""
     now = now or datetime.now(UTC)
     reset = timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
-    rows = store.list_inbox(conn, limit=200)
+    rows = store.list_inbox(conn, CHAT_STATUSES, limit=200)
     out: list[dict[str, Any]] = []
     edge = now
-    for m in rows:
+    for m in sorted(rows, key=activity, reverse=True):
         if edge - activity(m) > reset:
             break
         out.append(m)
@@ -243,23 +250,60 @@ def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[s
     return sorted(out, key=lambda m: m["id"])
 
 
+def state(m: dict[str, Any]) -> str:
+    """What the box shows for the message (D-246): sorting (Haiku has not answered yet), sending
+    ("now", being typed in), held, delivered (waiting for the answer): the loading animation;
+    noted: a checkmark; answered: the chat; error: a red mark and Retry; included: gone (D-248)."""
+    if m["status"] != "pending":
+        return str(m["status"])
+    if not m["verdict"]:
+        return "sorting"
+    return "held" if m["hold"] else "sending"
+
+
+def tip(m: dict[str, Any], until: datetime | None = None) -> str:
+    """The tooltip of the message's mark in the box (D-230: no labels on the page itself)."""
+    st = state(m)
+    if st == "sorting":
+        return f"Sent {berlin(m['created_at'], VIEW_FMT)} · sorting"
+    if st == "sending":
+        return f"Passing it on to the task-manager · sent {berlin(m['created_at'], VIEW_FMT)}"
+    if st == "held":
+        return f"Held: {m['hold']}" + (f" · goes out with the window start {until.astimezone(BERLIN).strftime(VIEW_FMT)} "
+                                       "at the latest" if until else "")
+    if st == "delivered":
+        return f"Delivered {berlin(m['delivered_at'], VIEW_FMT)} · waiting for the answer"
+    if st == "noted":
+        return f"Saved for the next session · {berlin(m['triaged_at'] or m['created_at'], VIEW_FMT)}"
+    if st == "answered":
+        return f"Answered {berlin(m['answered_at'], VIEW_FMT)}"
+    if st == "error":
+        return f"Failed {berlin(m['error_at'], VIEW_FMT)}: {m['error']}"
+    return f"Read by the task-manager {berlin(m['included_at'], VIEW_FMT)}"
+
+
 def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[str, Any]:
     until = hold_until(m, cfg) if m["status"] == "pending" else None
-    return {"id": m["id"], "at": m["created_at"], "at_berlin": berlin(m["created_at"], "%a %d.%m. %H:%M"),
-            "text": m["text"], "status": m["status"], "verdict": m["verdict"],
-            "verdict_reason": m["verdict_reason"], "hold": m["hold"],
+    return {"id": m["id"], "at": m["created_at"], "at_berlin": berlin(m["created_at"], VIEW_FMT),
+            "text": m["text"], "status": m["status"], "state": state(m), "tip": tip(m, until),
+            "verdict": m["verdict"], "verdict_reason": m["verdict_reason"], "hold": m["hold"],
             "hold_since_berlin": berlin(m["hold_since"]),
-            "hold_until_berlin": until.astimezone(BERLIN).strftime("%a %d.%m. %H:%M") if until else None,
+            "hold_until_berlin": until.astimezone(BERLIN).strftime(VIEW_FMT) if until else None,
             "delivered_berlin": berlin(m["delivered_at"]),
             "included_berlin": berlin(m["included_at"]), "answer": m["answer"],
             "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
 
 
 def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
-    """What the page shows: the current thread with each message's verdict, status and answer."""
-    ms = thread(conn, now)
+    """What the box shows (D-246/D-248), oldest first: the chat (thread) and the noted messages
+    still waiting for the next message into the session (an included one is gone; a noted one
+    stays until then, whatever the chat's reset). `chat`: an answer is in view (the box shows it
+    as a chat); `busy`: a message is still on its way (the page polls faster)."""
+    ms = sorted(thread(conn, now) + store.list_inbox(conn, "noted", limit=200), key=lambda m: m["id"])
     cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
-    return {"messages": [message_view(m, cfg) for m in ms],
+    out = [message_view(m, cfg) for m in ms]
+    return {"messages": out, "chat": any(m["answer"] for m in ms),
+            "busy": any(m["state"] in BUSY_STATES for m in out),
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}
 
 

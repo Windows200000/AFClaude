@@ -100,17 +100,46 @@ table.tbl { border-collapse: collapse; font-size: 13px; width: 100%; }
 table.tbl th, table.tbl td { border-bottom: 1px solid rgba(255,255,255,.08); padding: 3px 8px; text-align: right; white-space: nowrap; }
 table.tbl th { color: #9ca3af; font-weight: 500; }
 table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
-.msg { border-left: 3px solid #7e22ce; padding: 6px 0 6px 12px; margin: 8px 0; }
-.msg.error { border-left-color: #ef4444; }
-.msg .q { white-space: pre-wrap; word-break: break-word; }
-.msg .src { color: #9ca3af; font-size: 12px; margin-top: 2px; }
-.msg .a { background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 6px 10px; margin-top: 6px; }
-.msg .e { color: #fecaca; font-size: 13px; margin-top: 4px; word-break: break-word; }
-#msg-form { margin-top: 10px; }
-#msg-text { width: 100%; min-height: 64px; resize: vertical; background: #161616; color: #e8eaed; border: 1px solid rgba(255,255,255,.15);
+/* D-246: the message box: a text box; each message a mark beside it (loading, checkmark, red mark), answers as a chat */
+#msg-log { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+#msg-log:empty { display: none; }
+#msg-log.chat { background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; padding: 10px; }
+.m-row, .m-note, .m-err { display: flex; justify-content: flex-end; align-items: flex-start; gap: 8px; }
+.m-me { background: rgba(126,34,206,.18); border: 1px solid rgba(168,85,247,.35); border-radius: 10px 10px 2px 10px;
+    padding: 5px 10px; max-width: 85%; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.m-ai { align-self: flex-start; background: #232323; border: 1px solid rgba(255,255,255,.08); border-radius: 10px 10px 10px 2px;
+    padding: 5px 10px; max-width: 92%; min-width: 0; word-break: break-word; }
+.m-ai .md > :first-child { margin-top: 0; } .m-ai .md > :last-child { margin-bottom: 0; }
+.m-note { color: #9ca3af; font-size: 13px; }
+.m-note .t { min-width: 0; max-width: 85%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.m-note.open .t { white-space: pre-wrap; word-break: break-word; }
+.m-err { align-items: center; color: #fecaca; font-size: 13px; }
+.m-err .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-err button { flex: none; padding: 2px 10px; }
+.st { flex: none; position: relative; width: 16px; height: 16px; margin-top: 5px; color: #a855f7; outline: none; }
+.m-note .st { margin-top: 2px; }
+.m-err .st { margin-top: 0; }
+.st svg { display: block; width: 16px; height: 16px; }
+.st.s-spin::before { content: ""; position: absolute; inset: 1px; border: 2px solid rgba(168,85,247,.25); border-top-color: #a855f7;
+    border-radius: 50%; animation: m-spin .8s linear infinite; }
+.st.s-spin.held::before { border-color: rgba(245,158,11,.25); border-top-color: #f59e0b; animation-duration: 1.6s; }
+.st.s-err::before { content: "!"; position: absolute; inset: 0; background: #ef4444; color: #fff; border-radius: 50%;
+    font-size: 11px; font-weight: 700; line-height: 16px; text-align: center; }
+@keyframes m-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .st.s-spin::before { animation-duration: 3s; } }
+[data-tip] { position: relative; }
+[data-tip]::after { content: attr(data-tip); position: absolute; right: 0; bottom: calc(100% + 6px); width: max-content; max-width: 260px;
+    background: #2a2a2a; color: #e8eaed; border: 1px solid rgba(168,85,247,.5); border-radius: 6px; padding: 4px 8px;
+    font-size: 12px; font-weight: 400; line-height: 1.35; text-align: left; white-space: normal; z-index: 10; pointer-events: none;
+    visibility: hidden; opacity: 0; transform: translateY(3px); transition: opacity .12s ease-out, transform .12s ease-out; }
+.st[data-tip]:focus::after { visibility: visible; opacity: 1; transform: none; }
+@media (hover: hover) { [data-tip]:hover::after { visibility: visible; opacity: 1; transform: none; } }
+#msg-form { display: flex; align-items: flex-end; gap: 8px; }
+#msg-text { flex: 1; min-width: 0; min-height: 44px; resize: vertical; background: #161616; color: #e8eaed; border: 1px solid rgba(255,255,255,.15);
     border-radius: 8px; padding: 8px 10px; font: inherit; }
 #msg-text:focus { outline: none; border-color: #7e22ce; }
-.msg-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 6px; }
+#msg-send { flex: none; }
+#msg-state { color: #fecaca; font-size: 13px; margin-top: 6px; word-break: break-word; }
 @media (max-width: 520px) {
     body { padding: 14px 12px 110px; }
     section { padding: 14px; }
@@ -143,11 +172,12 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
 
   <section id="s-msg">
     <h2>Message to the task-manager</h2>
-    <div id="msg-list" aria-live="polite"></div>
+    <div id="msg-log" aria-live="polite"></div>
     <form id="msg-form">
-      <textarea id="msg-text" maxlength="4000" aria-label="Message to the task-manager"></textarea>
-      <div class="msg-bar"><span id="msg-state" class="mut"></span><button type="submit" id="msg-send">Send</button></div>
+      <textarea id="msg-text" rows="2" maxlength="4000" aria-label="Message to the task-manager"></textarea>
+      <button type="submit" id="msg-send" data-tip="Ctrl+Enter">Send</button>
     </form>
+    <div id="msg-state" role="alert" hidden></div>
   </section>
 
   <section>
@@ -535,10 +565,17 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     $("c-input").className = "count" + (count ? "" : " zero");
   }
 
-  // D-178/D-241: the message box to the task-manager. The messages come live from the inbox API
+  // D-178/D-241/D-246: the message box to the task-manager. The messages come live from the inbox API
   // (inbox_api.py behind the same key), not from status.json; Haiku sorts each one: "now" is typed
-  // into the session at once, "note" goes along with its next start.
-  var API = BASE + "api/inbox", msgPoll = null, msgFastUntil = 0;
+  // into the session at once, "note" goes along with its next message. The box is a text box; each
+  // message sits above it with a mark: loading while it is sorted, typed in or waits for the answer,
+  // a checkmark once noted (gone once included, D-248), a red mark with Retry on an error; answers
+  // turn the list into a chat (inbox.view: the chat resets after ui_chat_reset_hours). The marks'
+  // tooltips (inbox.tip) say the rest.
+  var API = BASE + "api/inbox", msgPoll = null, msgFastUntil = 0, msgGen = 0, msgBox = { messages: [] }, msgShown = null, msgOpen = {};
+  var CHECK = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  var MARK = { sorting: "s-spin", sending: "s-spin", held: "s-spin held", delivered: "s-spin", noted: "s-check", error: "s-err" };
   function api(path, body) {
     var opt = { cache: "no-store", credentials: "same-origin", redirect: "manual" };
     if (body !== undefined) {
@@ -554,66 +591,96 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       });
     });
   }
-  function msgStatus(m) {
-    if (m.status === "error") return '<span class="bad">error</span>';
-    if (m.status === "answered") return '<span class="ok">answered</span> ' + esc(m.answered_berlin || "");
-    if (m.status === "included") return "read by the task-manager " + esc(m.included_berlin || "");
-    if (m.status === "noted") return "noted for the next session";
-    if (m.status === "delivered") return "delivered " + esc(m.delivered_berlin || "") + ", waiting for the answer";
-    if (!m.verdict) return "sorting…";
-    if (!m.hold) return "sending…";
-    return '<span class="warn">waiting</span>: ' + esc(m.hold) +
-      (m.hold_until_berlin ? "; held until the window start " + esc(m.hold_until_berlin) + " (it goes out with that start, else an error)" : "");
+  function msgMark(m) {
+    var cls = MARK[m.state];
+    if (!cls) return "";
+    return '<span class="st ' + cls + '" tabindex="0" role="img" aria-label="' + esc(m.tip) + '" data-tip="' + esc(m.tip) + '">' +
+      (m.state === "noted" ? CHECK : "") + "</span>";
+  }
+  function msgItem(m) {
+    if (m.state === "noted") {
+      return '<div class="m-note' + (msgOpen[m.id] ? " open" : "") + '" data-id="' + m.id + '"><span class="t">' + esc(m.text) +
+        "</span>" + msgMark(m) + "</div>";
+    }
+    return '<div class="m-row"><div class="m-me">' + esc(m.text) + "</div>" + msgMark(m) + "</div>" +
+      (m.answer ? '<div class="m-ai">' + md(m.answer) + "</div>" : "") +
+      (m.state === "error" ? '<div class="m-err"><span class="t">' + esc(m.error) + '</span><button type="button" data-retry="' +
+        m.id + '">Retry</button></div>' : "");
+  }
+  function msgError(text) {
+    $("msg-state").textContent = text;
+    $("msg-state").hidden = !text;
   }
   function renderMessages(box) {
-    var ms = box.messages || [];
-    $("msg-list").innerHTML = ms.map(function (m) {
-      return '<div class="msg' + (m.status === "error" ? " error" : "") + '"><div class="q">' + esc(m.text) + "</div>" +
-        '<div class="src">' + esc(m.at_berlin || "") + (m.verdict ? " · " + esc(m.verdict) + (m.verdict_reason ? ": " + esc(m.verdict_reason) : "") : "") +
-        " · " + msgStatus(m) + "</div>" +
-        (m.answer ? '<div class="a">' + md(m.answer) + "</div>" : "") +
-        (m.error ? '<div class="e">' + esc(m.error) + ' <button type="button" data-retry="' + m.id + '">Retry</button></div>' : "") +
-        "</div>";
-    }).join("");
-    Array.prototype.forEach.call($("msg-list").querySelectorAll("button[data-retry]"), function (b) {
-      b.addEventListener("click", function () {
-        b.disabled = true;
-        api("/" + b.getAttribute("data-retry") + "/retry", {}).then(function () { pollMessages(true); })
-          .catch(function (e) { b.disabled = false; $("msg-state").textContent = e.message; });
+    msgBox = box;
+    var key = JSON.stringify([box.chat, box.messages]);
+    if (key === msgShown) return;          // unchanged: keep the DOM (an open tooltip, a focused mark)
+    msgShown = key;
+    var log = $("msg-log");
+    log.className = box.chat ? "chat" : "";
+    log.innerHTML = (box.messages || []).map(msgItem).join("");
+    Array.prototype.forEach.call(log.querySelectorAll(".m-note .t"), function (t) {
+      t.addEventListener("click", function () {
+        var id = t.parentNode.getAttribute("data-id");
+        msgOpen[id] = !msgOpen[id];
+        t.parentNode.classList.toggle("open", msgOpen[id]);
       });
     });
-    return ms.some(function (m) { return m.status === "pending" || m.status === "delivered"; });
-  }
-  function loadMessages() {
-    return api("").then(function (box) {
-      $("msg-text").maxLength = box.max_chars || 4000;
-      return renderMessages(box);
-    }).catch(function (e) {
-      $("msg-list").innerHTML = '<div class="msg error"><div class="e">Message box unavailable: ' + esc(e.message) + "</div></div>";
-      return false;
+    Array.prototype.forEach.call(log.querySelectorAll("button[data-retry]"), function (b) {
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        msgError("");
+        api("/" + b.getAttribute("data-retry") + "/retry", {}).then(function () { pollMessages(true); })
+          .catch(function (e) { b.disabled = false; msgError("Retry failed: " + e.message); });
+      });
     });
   }
-  // a fresh message: every 3 s for 2 min (triage, delivery); an open one: every 30 s while the page is shown
+  // -> how long until the next look: a message on its way 30 s; noted ones (to clear them once
+  // included) or a chat (to reset it) 5 min; an empty box: none; null: a newer look started meanwhile
+  function loadMessages(gen) {
+    return api("").then(function (box) {
+      if (gen !== msgGen) return null;
+      $("msg-text").maxLength = box.max_chars || 4000;
+      renderMessages(box);
+      return box.busy ? 30000 : (box.messages || []).length ? 300000 : 0;
+    }).catch(function (e) {
+      if (gen !== msgGen) return null;
+      msgShown = null;
+      $("msg-log").className = "";
+      var why = "Message box unavailable: " + e.message;
+      $("msg-log").innerHTML = '<div class="m-err"><span class="t">' + esc(why) + '</span><span class="st s-err" tabindex="0" ' +
+        'role="img" aria-label="' + esc(why) + '" data-tip="' + esc(why) + '"></span></div>';
+      return 0;
+    });
+  }
+  // a fresh message: every 3 s for 2 min (triage, delivery); then as loadMessages says, while the page is shown.
+  // One chain of looks: a new call (Send, Retry, Refresh) supersedes the one before (msgGen).
   function pollMessages(fast) {
     if (fast) msgFastUntil = Date.now() + 120000;
     clearTimeout(msgPoll);
-    loadMessages().then(function (open) {
-      var wait = Date.now() < msgFastUntil ? 3000 : (open ? 30000 : 0);
+    var gen = ++msgGen;
+    loadMessages(gen).then(function (next) {
+      if (next === null) return;
+      var wait = Date.now() < msgFastUntil ? 3000 : next;
       if (!wait) return;
-      var tick = function () { if (document.hidden) msgPoll = setTimeout(tick, wait); else pollMessages(false); };
+      var tick = function () {
+        if (gen !== msgGen) return;
+        if (document.hidden) msgPoll = setTimeout(tick, wait); else pollMessages(false);
+      };
       msgPoll = setTimeout(tick, wait);
     });
   }
   $("msg-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     var text = $("msg-text").value;
-    if (!text.trim()) return;
+    if (!text.trim() || $("msg-send").disabled) return;
     $("msg-send").disabled = true;
-    $("msg-state").textContent = "";
-    api("", { text: text }).then(function () {
-      $("msg-text").value = "";
+    msgError("");
+    api("", { text: text }).then(function (m) {
+      $("msg-text").value = "";          // the text moves above the box, with its loading mark
+      renderMessages({ chat: msgBox.chat, busy: true, messages: (msgBox.messages || []).concat([m]) });
       pollMessages(true);
-    }).catch(function (e) { $("msg-state").textContent = "Not sent: " + e.message; })
+    }).catch(function (e) { msgError("Not sent: " + e.message); })
       .then(function () { $("msg-send").disabled = false; });
   });
   $("msg-text").addEventListener("keydown", function (ev) {
