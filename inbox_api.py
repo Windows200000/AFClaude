@@ -5,7 +5,7 @@ the afclaude container (`inbox_api.py serve`); the quickview's nginx proxies /af
 socket (quickview/nginx.conf: the socket's directory data/api/ is mounted into that container), so
 nothing new is published and the request has passed nginx's X-AFClaude-Key check (D-150) first.
 
-  GET  /afclaude/api/inbox               the box: the current thread (inbox.view)
+  GET  /afclaude/api/inbox               the box: the chat and the noted messages (inbox.view)
   POST /afclaude/api/inbox               {"text": "..."} -> 201, the new message (pending); the
                                          worker triages it (and delivers a "now" one) right away
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200

@@ -8,9 +8,11 @@ send, the transcript check), a hold until the next session-window start (D-244: 
 the message along, else an error), the noted messages going along with the next start and the
 post-compaction message, the endpoint's key check and limits, the CLI and the quickview. A temp DB, a fake tmux / transcript
 (test_compaction.Env), a fake Haiku; no real Claude, no tmux, no live session."""
+import html.parser
 import http.client
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -381,6 +383,9 @@ class Delivery(tc.Env):
         self.assertEqual(inbox.hold_until(self.row(m)), deadline)
         view = inbox.message_view(self.row(m))
         self.assertEqual(view["hold_until_berlin"], deadline.astimezone(inbox.BERLIN).strftime("%a %d.%m. %H:%M"))
+        self.assertEqual(view["state"], "held")                              # D-246: the box's tooltip says until when
+        self.assertEqual(view["tip"], f"Held: {self.typing} · goes out with the window start "
+                                      f"{view['hold_until_berlin']} at the latest")
         for later in (since + timedelta(hours=3), deadline + iw.START_GRACE - timedelta(minutes=1)):
             self.assertEqual(self.deliver(m, later), "held")                  # no 2 h limit any more
         self.assertEqual(self.notified, [])
@@ -393,6 +398,8 @@ class Delivery(tc.Env):
         self.assertEqual(self.notified, ["AFClaude STOPPED: inbox message held past its window start"])
         self.assertIn("inbox message held past its window start", failstop.paused()["reason"])
         self.assertIsNone(inbox.message_view(r)["hold_until_berlin"])
+        self.assertEqual(inbox.message_view(r)["state"], "error")
+        self.assertTrue(inbox.message_view(r)["tip"].startswith("Failed "), inbox.message_view(r)["tip"])
 
     def test_a_hold_without_any_window_start_is_an_error(self):
         self.typing = "a draft in ka-abcdef01's input box (5 characters)"
@@ -704,6 +711,58 @@ class View(DB):
         testenv.set_setting("ui_chat_reset_hours", 24)
         self.assertEqual(len(inbox.view(self.conn, now)["messages"]), 3)
 
+    def test_each_state_has_its_mark_and_tooltip(self):
+        """D-246: the box shows a mark per message, its tooltip says the rest (no labels on the page)."""
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+        at = now - timedelta(minutes=5)
+        ms = [self.post(t) for t in ("sorting", "sending", "delivered", "noted", "failed")]
+        self.at(ms[1], at, verdict="now")
+        self.at(ms[2], at, verdict="now", status="delivered", delivered_at=at)
+        self.at(ms[3], at, verdict="note", status="noted", triaged_at=at)
+        self.at(ms[4], at, status="error", error="Haiku timed out", error_at=at)
+        self.at(ms[0], at)
+        v = inbox.view(self.conn, now)
+        when = at.astimezone(inbox.BERLIN).strftime("%a %d.%m. %H:%M")
+        self.assertEqual([(x["text"], x["state"], x["tip"]) for x in v["messages"]], [
+            ("sorting", "sorting", f"Sent {when} · sorting"),
+            ("sending", "sending", f"Passing it on to the task-manager · sent {when}"),
+            ("delivered", "delivered", f"Delivered {when} · waiting for the answer"),
+            ("noted", "noted", f"Saved for the next session · {when}"),
+            ("failed", "error", f"Failed {when}: Haiku timed out")])
+        self.assertEqual((v["busy"], v["chat"]), (True, False))
+
+    def test_an_answer_makes_it_a_chat_until_the_reset(self):
+        """D-246: a passed-on message's answer turns the box into a chat, a later one continues it,
+        and D-178's reset empties it after ui_chat_reset_hours of quiet."""
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+        a, b = self.post("q1"), self.post("q2")
+        self.at(a, now - timedelta(hours=2), verdict="now", status="answered", answer="a1", answered_at=now - timedelta(hours=1))
+        self.at(b, now - timedelta(minutes=1), verdict="now", status="delivered", delivered_at=now - timedelta(minutes=1))
+        v = inbox.view(self.conn, now)
+        self.assertEqual([(x["text"], x["state"], x["answer"]) for x in v["messages"]],
+                         [("q1", "answered", "a1"), ("q2", "delivered", None)])
+        self.assertEqual((v["chat"], v["busy"]), (True, True))
+        self.at(b, now - timedelta(minutes=1), status="answered", answer="a2", answered_at=now)
+        v = inbox.view(self.conn, now + timedelta(hours=5, minutes=1))
+        self.assertEqual((v["messages"], v["chat"], v["busy"]), ([], False, False))
+
+    def test_a_noted_message_stays_until_it_is_included(self):
+        """D-248: a noted message waits in the box (whatever the chat's reset) and clears once a
+        message to the task-manager took it along; answered later, it shows in the chat."""
+        now = datetime.now(UTC)
+        n, q = self.post("note it"), self.post("q")
+        self.at(n, now - timedelta(hours=9), verdict="note", status="noted", triaged_at=now - timedelta(hours=9))
+        self.at(q, now - timedelta(hours=20), verdict="now", status="answered", answer="a", answered_at=now - timedelta(hours=19))
+        v = inbox.view(self.conn, now)
+        self.assertEqual([(x["text"], x["state"]) for x in v["messages"]], [("note it", "noted")])   # the chat reset
+        self.assertEqual((v["chat"], v["busy"]), (False, False))
+        self.run_("inbox.include", message_ids=[n["id"]], by="start")
+        self.assertEqual(inbox.view(self.conn, now)["messages"], [])
+        actions.perform(self.conn, "inbox.reply", {"message_id": n["id"], "answer": "done"}, actor="cli", via="cli")
+        v = inbox.view(self.conn)                                             # its answer is the latest activity
+        self.assertEqual([(x["text"], x["state"], x["answer"]) for x in v["messages"]], [("note it", "answered", "done")])
+        self.assertTrue(v["chat"])
+
     def test_errors_stay_in_view(self):
         now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
         m = self.post("failed one")
@@ -884,11 +943,46 @@ class Quickview(DB):
         box = page.index('id="s-msg"')
         self.assertLess(page.index('id="s-input"'), box)                      # right after "needs your input"
         self.assertLess(box, page.index("Keep-alive &amp; usage"))
-        for s in ('id="msg-form"', 'id="msg-text"', 'API = BASE + "api/inbox"', '"Content-Type": "application/json"',
-                  "data-retry", "/retry", "m.verdict_reason", "m.answer", "m.error", "m.hold", "noted for the next session",
-                  "waiting for the answer"):
+        for s in ('id="msg-log"', 'id="msg-form"', 'id="msg-text"', 'id="msg-send"', 'API = BASE + "api/inbox"',
+                  '"Content-Type": "application/json"', "data-retry", "/retry", "m.answer", "m.error", "m.state", "m.tip",
+                  "data-tip", "box.chat", "box.busy", "s-spin", "s-check", "s-err", "Ctrl+Enter"):
             self.assertIn(s, page, s)
+        for s in ("m.verdict_reason", "m.hold", "msg-list", "noted for the next session"):   # D-246: no thread list, no labels
+            self.assertNotIn(s, page, s)
         self.assertNotIn("arguments.callee", page)                            # "use strict"
+
+    def test_page_marks_every_state(self):
+        """Each state inbox.view sends has a mark on the page (MARK) except answered (the chat)."""
+        with open(os.path.join(HERE, "quickview", "AFClaude.html")) as fh:
+            page = fh.read()
+        line = next(x for x in page.splitlines() if "var MARK = {" in x)
+        marked = set(re.findall(r"(\w+): \"s-", line))
+        self.assertEqual(marked | {"answered"}, set(inbox.BUSY_STATES) | {"noted", "error", "answered"})
+
+    def test_page_markup_is_balanced(self):
+        """The page's static HTML: every element closed in order, ids unique (html.parser)."""
+        class P(html.parser.HTMLParser):
+            VOID = {"meta", "link", "br", "img", "input", "hr", "source", "path"}
+
+            def __init__(self):
+                super().__init__()
+                self.stack, self.ids, self.bad = [], [], []
+
+            def handle_starttag(self, tag, attrs):
+                self.ids += [v for k, v in attrs if k == "id"]
+                if tag not in self.VOID:
+                    self.stack.append(tag)
+
+            def handle_endtag(self, tag):
+                if not self.stack or self.stack.pop() != tag:
+                    self.bad.append(tag)
+
+        with open(os.path.join(HERE, "quickview", "AFClaude.html")) as fh:
+            p = P()
+            p.feed(fh.read())
+        self.assertEqual((p.stack, p.bad), ([], []))
+        self.assertEqual(len(p.ids), len(set(p.ids)))
+        self.assertIn("msg-log", p.ids)
 
     def test_nginx_proxies_only_the_api(self):
         with open(os.path.join(HERE, "quickview", "nginx.conf")) as fh:
