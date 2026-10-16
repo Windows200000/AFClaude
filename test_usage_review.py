@@ -4,10 +4,12 @@ fires immediately and logs under st["one_off_runs"] without touching the monthly
 schedule_once() spools an at-shim job for the right UTC time without running or scheduling
 anything itself; main() wires --only/--at together. Also the D-228 chain (--only usage,stage-eta):
 parse_only() canonicalizes the combination regardless of typing order; session_idle() /
-usage_review_finished() / wait_for_usage_review() detect the usage review session finishing
-without the (not yet built) D-224 stop-marker CLI; run_usage_then_eta() fires the usage review,
-waits, then fires a SEPARATE fresh session for the ETA review pointed at its result -- or alerts
-and never fires the ETA leg if the wait times out -- all without touching the monthly schedule."""
+usage_review_finished() detect the usage review session finishing; start_chain() fires the usage
+review and keeps the pending step in the state (no long-lived waiter: a container restart can't
+lose it), chain_pass() then fires a SEPARATE fresh session for the ETA review pointed at its
+result. The quota gate (no review starts without REVIEW_NEEDS free: postponed to the reset) and
+the dead-review detection (review_death: a usage limit is retried once after the reset, any
+other death is an error at once), with fixture transcripts."""
 import argparse
 import json
 import os
@@ -24,33 +26,57 @@ import actions  # noqa: E402
 import store  # noqa: E402
 import telemetry  # noqa: E402
 import afclaude_config  # noqa: E402
+import runner_state  # noqa: E402
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
+
+
+def usage(weekly=20.0, session=10.0, now=None):
+    """A usage reading as keepalive.fresh_usage returns it (weekly resets Thu 17:00 UTC, the
+    session window 2 h from `now`)."""
+    now = now or NOW
+    return {"fetched_at": now,
+            "weekly": {"percent": weekly, "resets_at": datetime(2026, 10, 15, 17, 0, tzinfo=UTC)},
+            "session": {"percent": session, "resets_at": now + timedelta(hours=2)}}
 
 
 class Base(unittest.TestCase):
     def setUp(self):
         testenv.unpause()            # a failure in an earlier test paused automation (D-234/D-235)
         self.addCleanup(testenv.unpause)
+        finalize_records()           # an earlier test's started reviews are not this test's
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {"fire": ka.fire, "alert": ka.alert, "log": ka.log, "progress_note": ka.progress_note,
-                     "state": ur.STATE, "subprocess_run": ur.subprocess.run}
+                      "state": ur.STATE, "subprocess_run": ur.subprocess.run, "fresh_usage": ka.fresh_usage,
+                      "projects": ka.PROJECTS_DIR, "tmux_alive": ka.tmux_alive}
         self.fires = []
         self.alerts = []
+        self.at_calls = []
+        self.usage = usage()
         ka.fire = lambda sid, cwd, msg, plan, new=False, **k: self.fires.append(
             (sid, msg, plan, new, k)) or (0, "started", "")
         ka.alert = lambda subject, body="": self.alerts.append((subject, body))
         ka.log = lambda msg: None
         ka.progress_note = lambda line: None
+        ka.fresh_usage = lambda now, force=False, display=False: self.usage
+        ka.PROJECTS_DIR = os.path.join(self.tmp.name, "projects")    # no transcript unless a test writes one
+        ka.tmux_alive = lambda sid: True
         ur.STATE = os.path.join(self.tmp.name, "usage_review_state.json")
+        ur.subprocess.run = lambda argv, input=None, **k: self.at_calls.append((argv, input)) or type(  # noqa: A002
+            "R", (), {"returncode": 0, "stdout": "", "stderr": "job x at y"})()
 
     def tearDown(self):
         ka.fire, ka.alert, ka.log, ka.progress_note = (self.saved["fire"], self.saved["alert"],
                                                         self.saved["log"], self.saved["progress_note"])
+        ka.fresh_usage, ka.PROJECTS_DIR, ka.tmux_alive = (self.saved["fresh_usage"], self.saved["projects"],
+                                                          self.saved["tmux_alive"])
         ur.STATE = self.saved["state"]
         ur.subprocess.run = self.saved["subprocess_run"]
         self.tmp.cleanup()
+
+    def paused(self):
+        return afclaude_config.automation_pause()["paused"]
 
 
 class RunOnce(Base):
@@ -263,6 +289,14 @@ class SessionIdle(unittest.TestCase):
         self.assertFalse(ur.session_idle("sid", NOW))
 
 
+def finalize_records():
+    """Mark every started usage_reviews record of the shared test DB final."""
+    for r in telemetry.read_records("usage.review"):
+        if not r.get("final"):
+            r.update(final=True, status="test-closed")
+            telemetry.write_records("usage.review", [r], actor="cli")
+
+
 def this_project():
     """The test DB's project for this repo (usage_review's report docs live there)."""
     conn = store.connect()
@@ -370,145 +404,419 @@ class UsageReviewRecords(Base):
         self.assertEqual([(r["status"], r["final"]) for r in failed], [("launch_failed", True)])
 
 
-class WaitForUsageReview(unittest.TestCase):
-    """The bounded poll itself, with an injectable clock/sleep so it runs instantly in tests
-    instead of really waiting hours."""
+LIMIT_TEXT = "You've hit your weekly limit · resets 5pm (UTC)"
+T0 = datetime(2026, 10, 15, 14, 0, tzinfo=UTC)        # the 15.10. case: 16:00 Berlin, reset 17:00 UTC
+
+
+def entry(kind, at, **kw):
+    """A transcript line: user / assistant (end_turn) / limit (the synthetic notice) / turn_end
+    (turn_duration with `pending` background agents) / notify (a task notification)."""
+    ts = at.isoformat().replace("+00:00", "Z")
+    if kind == "user":
+        return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": kw.get("text", "go")}}
+    if kind == "assistant":
+        return {"type": "assistant", "timestamp": ts,
+                "message": {"model": "claude-opus-5-5", "stop_reason": kw.get("stop", "end_turn"),
+                            "content": [{"type": "text", "text": kw.get("text", "ok")}]}}
+    if kind == "limit":
+        return {"type": "assistant", "timestamp": ts, "error": "rate_limit", "isApiErrorMessage": True,
+                "message": {"model": "<synthetic>", "stop_reason": "stop_sequence",
+                            "content": [{"type": "text", "text": LIMIT_TEXT}]}}
+    if kind == "turn_end":
+        e = {"type": "system", "subtype": "turn_duration", "timestamp": ts, "durationMs": 1000}
+        if kw.get("pending"):
+            e["pendingBackgroundAgentCount"] = kw["pending"]
+        return e
+    if kind == "notify":
+        return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": (
+            "<task-notification>\n<task-id>a1</task-id>\n<status>failed</status>\n<summary>Agent \"Usage review\" "
+            f"failed: Agent terminated early due to an API error: {kw['text']}</summary>\n</task-notification>")}}
+    raise ValueError(kind)
+
+
+class Transcripts(Base):
+    """Fixture transcripts under a temp PROJECTS_DIR; the report docs a set (the shared test DB
+    keeps every doc an earlier test wrote)."""
     def setUp(self):
-        self.saved_finished = ur.usage_review_finished
+        super().setUp()
+        self.reports = set()
+        self.saved_ready = ur.report_ready
+        ur.report_ready = lambda report: report in self.reports
+        ur.STATE = runner_state.live_path("usage_review")    # the DB, as live (merge saves, no key deleted)
+        st = ur.load()
+        st.update(chain=None, retry_attempt=None)
+        self.assertTrue(ur.save(st))
 
     def tearDown(self):
-        ur.usage_review_finished = self.saved_finished
+        ur.report_ready = self.saved_ready
+        super().tearDown()
 
-    def _clock(self, start):
-        state = {"t": start}
+    def transcript(self, sid, entries, age=timedelta(minutes=20), now=None):
+        """The session's transcript under the test PROJECTS_DIR, last written `age` before `now`."""
+        d = os.path.join(ka.PROJECTS_DIR, "proj")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{sid}.jsonl")
+        with open(path, "w") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+        t = ((now or self.now) - age).timestamp()
+        os.utime(path, (t, t))
+        return path
 
-        def now_fn():
-            return state["t"]
+    def rec(self, sid):
+        return ur.review_record(sid)
 
-        def sleep_fn(seconds):
-            state["t"] += timedelta(seconds=seconds)
-        return now_fn, sleep_fn
-
-    def test_returns_true_as_soon_as_finished_is_seen(self):
-        seen = []
-        ur.usage_review_finished = lambda sid, report, now: seen.append(now) or len(seen) >= 3
-        now_fn, sleep_fn = self._clock(NOW)
-        ok = ur.wait_for_usage_review("sid", "report.md", NOW, timeout=timedelta(hours=1),
-                                      poll=timedelta(minutes=5), now_fn=now_fn, sleep_fn=sleep_fn)
-        self.assertTrue(ok)
-        self.assertEqual(len(seen), 3)   # two misses, then a hit -- no more polling after that
-
-    def test_gives_up_after_the_timeout_without_hanging(self):
-        ur.usage_review_finished = lambda sid, report, now: False
-        now_fn, sleep_fn = self._clock(NOW)
-        ok = ur.wait_for_usage_review("sid", "report.md", NOW, timeout=timedelta(minutes=20),
-                                      poll=timedelta(minutes=5), now_fn=now_fn, sleep_fn=sleep_fn)
-        self.assertFalse(ok)
-
-    def test_already_finished_at_the_first_check_never_sleeps(self):
-        ur.usage_review_finished = lambda sid, report, now: True
-        sleeps = []
-        ok = ur.wait_for_usage_review("sid", "report.md", NOW, now_fn=lambda: NOW,
-                                      sleep_fn=lambda s: sleeps.append(s))
-        self.assertTrue(ok)
-        self.assertEqual(sleeps, [])
+    def at_jobs(self):
+        """(UTC time, command) of every at job spooled."""
+        return [(argv[2], cmd) for argv, cmd in self.at_calls]
 
 
-class ChainUsageEta(Base):
-    """run_usage_then_eta() (--only usage,stage-eta, D-228): fires the usage review, waits for it
-    (wait_fn, injected so no real waiting happens here), then fires a SEPARATE fresh session for
-    the ETA review pointed at the usage review's result -- in that order, never in one session --
-    or alerts and skips the ETA leg if the wait fails. Never touches the monthly schedule."""
-    def test_chain_fires_usage_then_a_separate_eta_session_pointed_at_its_result(self):
-        st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
-        waited = []
+class QuotaGate(Transcripts):
+    """No review session starts without REVIEW_NEEDS free (the 15.10. one started at 99 % weekly):
+    it is postponed to the reset that frees it, recorded and logged; a postponement is no error.
+    Enough quota: the start is unchanged."""
+    now = T0
 
-        def fake_wait(sid, report, start):
-            waited.append((sid, report, start))
-            return True
-        ok = ur.run_usage_then_eta(st, NOW, wait_fn=fake_wait)
-        self.assertTrue(ok)
-        self.assertEqual(len(self.fires), 2)
-        (sid1, msg1, plan1, new1, k1), (sid2, msg2, plan2, new2, k2) = self.fires
-        self.assertEqual(plan1, "resume")
-        self.assertEqual(plan2, "resume")
-        self.assertTrue(new1)
-        self.assertTrue(new2)
-        # the usage leg: the full monthly brief
-        self.assertIn("periodic usage-model review", msg1)
-        self.assertNotIn("Schedule the eta review at end of this week", msg1)
-        # the ETA leg: a SEPARATE session (different sid), never the usage brief, pointed at the
-        # usage review's result instead
-        self.assertNotEqual(sid1, sid2)
-        self.assertNotIn("periodic usage-model review", msg2)
-        self.assertIn("Schedule the eta review at end of this week", msg2)
-        d = NOW.astimezone(ka.BERLIN).date().isoformat()
-        report = f"review:{d}"
-        self.assertIn(f"the review doc {report} in the AFClaude DB", msg2)
-        self.assertIn("telemetry.py user-model get", msg2)
-        # waited on the usage session specifically, before firing the ETA leg
-        self.assertEqual(waited, [(sid1, report, NOW)])
-        # order: the usage one-off entry logged before the stage-eta one
-        self.assertEqual(len(st["one_off_runs"]), 2)
-        self.assertEqual(st["one_off_runs"][0]["only"], "usage")
-        self.assertEqual(st["one_off_runs"][0]["session"], sid1)
-        self.assertEqual(st["one_off_runs"][1]["only"], "stage-eta")
-        self.assertEqual(st["one_off_runs"][1]["session"], sid2)
-        # the monthly schedule is untouched
-        self.assertEqual(st["runs"], [])
-        self.assertEqual(st["next_run_at"], (NOW + timedelta(days=5)).isoformat())
+    def test_one_off_at_99_percent_weekly_is_postponed_to_the_weekly_reset(self):
+        self.usage = usage(weekly=99.0, now=T0)
+        st = ur.load()
+        self.assertFalse(ur.start_one_off(st, T0, "usage"))
+        self.assertEqual(self.fires, [])                      # no session started
+        self.assertEqual(self.at_jobs(), [("202610151702", self.at_jobs()[0][1])])   # 17:00 UTC + 90 s grace
+        self.assertIn("usage_review.py --only usage --now", self.at_jobs()[0][1])
+        self.assertNotIn("--attempt", self.at_jobs()[0][1])
+        p = st["postponed"][-1]
+        self.assertEqual((p["review"], p["until"]), ("one-off usage", "2026-10-15T17:02:00+00:00"))
+        self.assertIn("weekly 99% used", p["why"])
+        self.assertEqual(self.alerts, [])                      # not an error
+        self.assertFalse(self.paused())
+
+    def test_chain_without_quota_is_postponed_as_a_whole(self):
+        self.usage = usage(weekly=99.0, now=T0)
+        st = ur.load()
+        self.assertFalse(ur.start_chain(st, T0))
+        self.assertEqual(self.fires, [])
+        self.assertIn("usage_review.py --only usage,stage-eta --now", self.at_jobs()[0][1])
+        self.assertIsNone(ur.load().get("chain"))
+
+    def test_session_short_postpones_to_the_session_reset(self):
+        self.usage = usage(weekly=20.0, session=70.0, now=T0)
+        st = ur.load()
+        st["next_run_at"] = T0.isoformat()
+        self.assertFalse(ur.start_monthly(st, T0))
+        self.assertEqual(self.fires, [])
+        st = ur.load()
+        self.assertEqual(st["next_run_at"], "2026-10-15T16:02:00+00:00")   # the session reset + grace
+        self.assertEqual(st["postponed"][-1]["review"], "monthly usage")
         self.assertEqual(self.alerts, [])
 
-    def test_usage_review_timeout_alerts_and_never_fires_the_eta_leg(self):
-        st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
-        ok = ur.run_usage_then_eta(st, NOW, wait_fn=lambda sid, report, start: False)
-        self.assertFalse(ok)
-        self.assertEqual(len(self.fires), 1)   # only the usage leg ever fired
-        self.assertEqual(len(st["one_off_runs"]), 1)
-        self.assertEqual(st["one_off_runs"][0]["only"], "usage")
-        self.assertEqual(len(self.alerts), 1)
-        self.assertIn("did not finish in time", self.alerts[0][0])
-        self.assertEqual(st["runs"], [])
-        self.assertEqual(st["next_run_at"], (NOW + timedelta(days=5)).isoformat())
+    def test_enough_quota_starts_as_before(self):
+        self.usage = usage(weekly=50.0, session=40.0, now=T0)
+        st = ur.load()
+        before = (st["next_run_at"], len(st.get("postponed") or []))
+        self.assertTrue(ur.start_one_off(st, T0, "stage-eta"))
+        self.assertEqual(len(self.fires), 1)
+        self.assertEqual(self.at_calls, [])
+        st = ur.load()
+        self.assertEqual((st["next_run_at"], len(st.get("postponed") or [])), before)
+        self.assertEqual(st["one_off_runs"][-1]["session"], self.fires[0][0])
 
-    def test_usage_launch_failure_never_waits_or_fires_the_eta_leg(self):
-        ka.fire = lambda *a, **k: (1, "", "boom")
-        st = {"next_run_at": "2026-11-01T00:00:00+00:00", "runs": []}
-        waited = []
-        ok = ur.run_usage_then_eta(st, NOW, wait_fn=lambda *a, **k: waited.append(1) or True)
-        self.assertFalse(ok)
-        self.assertEqual(waited, [])    # never even started waiting
-        self.assertEqual(len(self.fires), 0)
-        self.assertEqual(len(st["one_off_runs"]), 1)
-        self.assertEqual(len(self.alerts), 1)   # the usage launch-failed alert, from run_once
-        self.assertEqual(st["next_run_at"], "2026-11-01T00:00:00+00:00")
+    def test_no_reset_to_postpone_to_is_an_error(self):
+        self.usage = usage(weekly=99.0, now=T0)
+        self.usage["weekly"]["resets_at"] = None
+        with self.assertRaises(ur.failstop.Failed) as cm:
+            ur.start_one_off(ur.load(), T0, "usage")
+        self.assertIn("can't be scheduled", cm.exception.why)
+        self.assertEqual(self.fires, [])
 
-    def test_default_wait_fn_is_looked_up_at_call_time(self):
-        # a module-level monkeypatch of wait_for_usage_review (not passing wait_fn explicitly)
-        # must still take effect -- it must not be bound as a stale default at def time.
-        st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
-        saved = ur.wait_for_usage_review
-        ur.wait_for_usage_review = lambda sid, report, start: True
+    def test_a_failed_usage_reading_starts_nothing(self):
+        self.usage = None
+        with self.assertRaises(ur.failstop.Failed) as cm:
+            ur.start_chain(ur.load(), T0)
+        self.assertIn("usage reading failed", cm.exception.why)
+        self.assertEqual(self.fires, [])
+
+    def test_main_postpones_without_an_error(self):
+        now = datetime.now(UTC)
+        self.usage = usage(weekly=99.5, now=now)
+        self.usage["weekly"]["resets_at"] = now + timedelta(hours=3)
+        old_argv = sys.argv
+        sys.argv = ["usage_review.py", "--only", "usage", "--now"]
         try:
-            ok = ur.run_usage_then_eta(st, NOW)
+            ur.main()
         finally:
-            ur.wait_for_usage_review = saved
-        self.assertTrue(ok)
+            sys.argv = old_argv
+        self.assertEqual(self.fires, [])
+        self.assertEqual(len(self.at_calls), 1)
+        self.assertFalse(self.paused())
+        self.assertEqual(self.alerts, [])
+
+
+class Chain(Transcripts):
+    """The D-228 chain without a long-lived waiter: start_chain() fires the usage leg and saves the
+    pending step; chain_pass() (its own at job / the hourly run, here called directly, also from a
+    freshly loaded state as after a container restart) checks it every CHAIN_POLL."""
+    now = T0 + timedelta(minutes=30)
+
+    def start(self, attempt=1):
+        st = ur.load()
+        self.next_run_at = st["next_run_at"]
+        self.assertTrue(ur.start_chain(st, T0, attempt))
+        self.at_calls.clear()
+        return st["chain"]["session"]
+
+    def test_start_fires_usage_and_keeps_the_step_in_the_state(self):
+        sid = self.start()
+        self.assertEqual(len(self.fires), 1)
+        self.assertIn("periodic usage-model review", self.fires[0][1])
+        st = ur.load()                                       # a new process: the step survived
+        self.assertEqual((st["chain"]["step"], st["chain"]["session"]), ("usage", sid))
+        r = self.rec(sid)
+        self.assertEqual((r["chain"], r["attempt"]), ("usage", 1))
+
+    def test_start_spools_its_first_step(self):
+        ur.start_chain(ur.load(), T0)
+        self.assertEqual(self.at_jobs()[-1][0], "202610151405")
+        self.assertIn("usage_review.py --chain-step", self.at_jobs()[-1][1])
+
+    def test_a_second_chain_while_one_is_pending_is_an_error(self):
+        self.start()
+        with self.assertRaises(ur.failstop.Failed):
+            ur.start_chain(ur.load(), T0)
+        self.assertEqual(len(self.fires), 1)
+
+    def test_normal_path_fires_a_separate_eta_session_pointed_at_the_report(self):
+        sid = self.start()
+        st = ur.load()
+        self.assertEqual(ur.chain_pass(st, T0 + timedelta(minutes=5)), "waiting")   # no transcript yet
+        self.assertIn("--chain-step", self.at_jobs()[-1][1])
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=10)),
+                              entry("turn_end", T0 + timedelta(minutes=10))])
+        self.reports.add("review:2026-10-15")
+        st = ur.load()
+        self.assertEqual(ur.chain_pass(st, self.now), "eta_started")
         self.assertEqual(len(self.fires), 2)
+        sid2, msg2 = self.fires[1][0], self.fires[1][1]
+        self.assertNotEqual(sid, sid2)
+        self.assertNotIn("periodic usage-model review", msg2)
+        self.assertIn("Schedule the eta review at end of this week", msg2)
+        self.assertIn("the review doc review:2026-10-15 in the AFClaude DB", msg2)
+        self.assertEqual(self.rec(sid)["status"], "finished")
+        r2 = self.rec(sid2)
+        self.assertEqual((r2["chain"], r2["after_report"], r2["attempt"]), ("stage-eta", "review:2026-10-15", 1))
+        self.assertIsNone(ur.load()["chain"])
+        self.assertIsNone(ur.chain_pass(ur.load(), self.now))   # a second pass fires nothing
+        self.assertEqual(len(self.fires), 2)
+        self.assertEqual(self.alerts, [])
+        st = ur.load()
+        self.assertEqual([r["only"] for r in st["one_off_runs"][-2:]], ["usage", "stage-eta"])
+        self.assertEqual(st["next_run_at"], self.next_run_at)   # the monthly schedule untouched
+
+    def test_limit_death_is_seen_early_and_retried_once_after_the_reset(self):
+        """15.10.: the worker died at the weekly limit 3 min in, the session sat idle on the
+        notice: seen at the next check, the chain retried at 17:02 UTC, an alert, no pause."""
+        sid = self.start()
+        t = T0 + timedelta(minutes=3)
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(seconds=30)),
+                              entry("turn_end", T0 + timedelta(seconds=31), pending=1),
+                              entry("notify", t, text=LIMIT_TEXT), entry("limit", t)],
+                        age=timedelta(minutes=2), now=t + timedelta(minutes=2))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=4)), "dead")
+        self.assertEqual(self.rec(sid)["status"], "limit")
+        self.assertEqual(len(self.fires), 1)                 # no ETA leg
+        self.assertIsNone(ur.load()["chain"])
+        self.assertEqual(self.at_jobs(), [("202610151702", self.at_jobs()[0][1])])
+        self.assertIn("usage_review.py --only usage,stage-eta --now --attempt 2", self.at_jobs()[0][1])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("usage limit", self.alerts[0][0])
+        self.assertFalse(self.paused())
+
+    def test_a_worker_failing_at_the_limit_counts_as_a_limit_death(self):
+        sid = self.start()
+        t = T0 + timedelta(minutes=3)
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(seconds=30)),
+                              entry("notify", t, text=LIMIT_TEXT),
+                              entry("assistant", t + timedelta(seconds=5), text="the worker failed")],
+                        age=timedelta(minutes=1), now=t + timedelta(minutes=1))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=1)), "dead")
+        self.assertEqual(self.rec(sid)["status"], "limit")
+        self.assertIn("--attempt 2", self.at_jobs()[0][1])
+        self.assertFalse(self.paused())
+
+    def test_the_retry_hitting_the_limit_again_is_an_error(self):
+        sid = self.start(attempt=2)
+        t = T0 + timedelta(minutes=3)
+        self.transcript(sid, [entry("user", T0), entry("limit", t)], age=timedelta(minutes=1),
+                        now=t + timedelta(minutes=1))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=1)), "dead")
+        self.assertEqual(self.at_calls, [])                  # no third attempt
+        self.assertTrue(self.paused())
+        self.assertIn("usage limit again", self.alerts[-1][0])
+
+    def test_idle_without_report_and_no_agent_is_an_error_at_once(self):
+        sid = self.start()
+        t = T0 + timedelta(minutes=20)
+        self.transcript(sid, [entry("user", T0), entry("assistant", t), entry("turn_end", t)],
+                        age=timedelta(minutes=1), now=t + timedelta(minutes=1))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=1)), "dead")   # not after 6 h
+        self.assertEqual(self.rec(sid)["status"], "died")
+        self.assertTrue(self.paused())
+        self.assertIn("died", self.alerts[-1][0])
+        self.assertEqual(len(self.fires), 1)
+        self.assertEqual(self.at_calls, [])
+        self.assertIsNone(ur.load()["chain"])
+
+    def test_a_running_worker_agent_keeps_waiting(self):
+        sid = self.start()
+        t = T0 + timedelta(minutes=20)
+        self.transcript(sid, [entry("user", T0), entry("assistant", t), entry("turn_end", t, pending=1)],
+                        age=timedelta(minutes=1), now=t + timedelta(minutes=1))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=1)), "waiting")
+        self.assertFalse(self.paused())
+        self.assertIn("--chain-step", self.at_jobs()[-1][1])
+
+    def test_a_gone_tmux_session_mid_turn_is_dead(self):
+        sid = self.start()
+        t = T0 + timedelta(minutes=20)
+        self.transcript(sid, [entry("user", T0), entry("assistant", t, stop="tool_use")],
+                        age=timedelta(minutes=10), now=t + timedelta(minutes=10))
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=10)), "waiting")   # tmux alive
+        ka.tmux_alive = lambda s: False
+        self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=10)), "dead")
+        self.assertIn("tmux", self.rec(sid)["why"])
+        self.assertTrue(self.paused())
+
+    def test_still_running_after_the_timeout_is_an_error(self):
+        sid = self.start()
+        t = T0 + ur.USAGE_DONE_TIMEOUT
+        self.transcript(sid, [entry("user", T0), entry("assistant", t, stop="tool_use")],
+                        age=timedelta(seconds=10), now=t)
+        self.assertEqual(ur.chain_pass(ur.load(), t), "timed_out")
+        self.assertEqual(self.rec(sid)["status"], "timed_out")
+        self.assertIn("did not finish in time", self.alerts[-1][0])
+        self.assertEqual(len(self.fires), 1)
+
+    def test_eta_leg_without_quota_is_postponed(self):
+        sid = self.start()
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=10))])
+        self.reports.add("review:2026-10-15")
+        self.usage = usage(weekly=95.0, now=self.now)
+        self.assertEqual(ur.chain_pass(ur.load(), self.now), "postponed")
+        st = ur.load()
+        self.assertEqual((st["chain"]["step"], st["chain"]["not_before"]), ("stage-eta", "2026-10-15T17:02:00+00:00"))
+        self.assertEqual(self.at_jobs()[-1][0], "202610151702")
+        self.assertEqual(len(self.fires), 1)
+        self.assertEqual(ur.chain_pass(ur.load(), self.now + timedelta(minutes=30)), "waiting")   # not before
+        self.usage = usage(weekly=0.0, now=T0 + timedelta(hours=3))
+        self.assertEqual(ur.chain_pass(ur.load(), T0 + timedelta(hours=3, minutes=3)), "eta_started")
+        self.assertEqual(len(self.fires), 2)
+
+    def test_eta_leg_limit_retry_points_at_the_same_report(self):
+        sid = self.start()
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=10))])
+        self.reports.add("review:2026-10-15")
+        ur.chain_pass(ur.load(), self.now)
+        eta = self.fires[-1][0]
+        self.reports.clear()                               # the ETA leg has not written its part yet
+        t = self.now + timedelta(minutes=5)
+        self.transcript(eta, [entry("user", self.now), entry("limit", t)], age=timedelta(minutes=1),
+                        now=t + timedelta(minutes=1))
+        ur.track_reviews(t + timedelta(minutes=1))
+        self.assertEqual(self.rec(eta)["status"], "limit")
+        st = ur.load()
+        self.assertEqual((st["chain"]["step"], st["chain"]["report"], st["chain"]["attempt"]),
+                         ("stage-eta", "review:2026-10-15", 2))
+        self.assertIn("--chain-step", self.at_jobs()[-1][1])
+        self.assertFalse(self.paused())
+
+    def test_paused_automation_holds_the_chain(self):
+        sid = self.start()
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": "a test"}, actor="cli", via="cli")
+        finally:
+            conn.close()
+        self.assertEqual(ur.chain_pass(ur.load(), self.now), "paused")
+        self.assertEqual(ur.load()["chain"]["session"], sid)
+        self.assertEqual(self.at_calls, [])
+
+    def test_a_pending_chain_step_job_is_not_spooled_twice(self):
+        job = {"id": "chainstep01", "at": T0.isoformat(), "cmd": "python3 usage_review.py --chain-step\n", "cwd": "/"}
+        self.assertTrue(runner_state.job_add(job))
+        try:
+            self.assertIsNone(ur.spool_chain_step(T0))
+            self.assertEqual(self.at_calls, [])
+        finally:
+            runner_state.job_claim("chainstep01")
+
+    def test_cli_chain_step_advances_a_saved_chain(self):
+        """After a restart, the at job (or the hourly run) is a new process: it reads the pending step
+        from the DB-backed state and goes on."""
+        sid = self.start()
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=10))],
+                        now=datetime.now(UTC))
+        self.reports.add("review:2026-10-15")
+        old_argv = sys.argv
+        sys.argv = ["usage_review.py", "--chain-step"]
+        try:
+            ur.main()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(len(self.fires), 2)
+        self.assertIsNone(ur.load()["chain"])
+
+
+class TrackDeaths(Transcripts):
+    """The hourly check finds a dead solo or monthly review too (no chain waits for them)."""
+    now = T0 + timedelta(hours=1)
+
+    def test_solo_one_off_limit_death_is_retried_once(self):
+        st = ur.load()
+        ur.run_once(st, T0, "usage")
+        sid = self.fires[-1][0]
+        self.transcript(sid, [entry("user", T0), entry("limit", T0 + timedelta(minutes=3))])
+        done = ur.track_reviews(self.now)
+        self.assertEqual([(d["review_id"], d["status"]) for d in done], [(sid, "limit")])
+        self.assertIn("usage_review.py --only usage --now --attempt 2", self.at_jobs()[0][1])
+        self.assertFalse(self.paused())
+
+    def test_monthly_limit_death_moves_next_run_at_to_the_reset(self):
+        st = ur.load()
+        ur.run(st, T0)
+        ur.save(st)
+        sid = self.fires[-1][0]
+        self.transcript(sid, [entry("user", T0), entry("limit", T0 + timedelta(minutes=3))])
+        ur.track_reviews(self.now)
+        st = ur.load()
+        self.assertEqual((st["next_run_at"], st["retry_attempt"]), ("2026-10-15T17:02:00+00:00", 2))
+        self.usage = usage(weekly=0.0, now=T0 + timedelta(hours=4))
+        ur.start_monthly(st, T0 + timedelta(hours=4))
+        self.assertEqual(self.rec(self.fires[-1][0])["attempt"], 2)
+        self.assertIsNone(ur.load()["retry_attempt"])
+
+    def test_a_dead_solo_review_is_an_error(self):
+        st = ur.load()
+        ur.run_once(st, T0, "stage-eta")
+        sid = self.fires[-1][0]
+        t = T0 + timedelta(minutes=5)
+        self.transcript(sid, [entry("user", T0), {"type": "assistant", "timestamp": t.isoformat(),
+                                                   "isApiErrorMessage": True,
+                                                   "message": {"model": "<synthetic>", "content": "API Error: 500"}}])
+        ur.track_reviews(self.now)
+        self.assertEqual(self.rec(sid)["status"], "died")
+        self.assertTrue(self.paused())
+        self.assertEqual(self.at_calls, [])
 
 
 class ChainCli(Base):
-    """main() wiring for the chained --only value: dispatched to run_usage_then_eta (never to two
+    """main() wiring for the chained --only value: dispatched to start_chain (never to two
     separate run_once() calls), and schedulable via --at like any other --only value."""
     def setUp(self):
         super().setUp()
-        self.calls = []
-        ur.subprocess.run = lambda argv, **k: self.calls.append((argv, k)) or type(
-            "R", (), {"returncode": 0, "stdout": "ok\n", "stderr": ""})()
-        self.saved_chain = ur.run_usage_then_eta
+        self.saved_chain = ur.start_chain
 
     def tearDown(self):
-        ur.run_usage_then_eta = self.saved_chain
+        ur.start_chain = self.saved_chain
         super().tearDown()
 
     def _run(self, *argv):
@@ -521,21 +829,21 @@ class ChainCli(Base):
 
     def test_only_usage_stage_eta_now_dispatches_to_the_chain(self):
         called = []
-        ur.run_usage_then_eta = lambda st, now: called.append((st, now)) or True
+        ur.start_chain = lambda st, now, attempt=1: called.append((now, attempt)) or True
         self._run("--only", "usage,stage-eta", "--now")
-        self.assertEqual(len(called), 1)
-        self.assertEqual(len(self.fires), 0)   # run_usage_then_eta is the spy above, never fired
+        self.assertEqual([a for _, a in called], [1])
+        self.assertEqual(len(self.fires), 0)   # start_chain is the spy above, never fired
 
     def test_only_reverse_order_also_dispatches_to_the_chain(self):
         called = []
-        ur.run_usage_then_eta = lambda st, now: called.append((st, now)) or True
-        self._run("--only", "stage-eta,usage", "--now")
-        self.assertEqual(len(called), 1)
+        ur.start_chain = lambda st, now, attempt=1: called.append((now, attempt)) or True
+        self._run("--only", "stage-eta,usage", "--now", "--attempt", "2")
+        self.assertEqual([a for _, a in called], [2])
 
     def test_only_usage_stage_eta_at_schedules_without_firing(self):
         self._run("--only", "usage,stage-eta", "--at", "2026-10-15 16:00")
-        self.assertEqual(len(self.calls), 1)
-        self.assertIn("usage_review.py --only usage,stage-eta --now", self.calls[0][1]["input"])
+        self.assertEqual(len(self.at_calls), 1)
+        self.assertIn("usage_review.py --only usage,stage-eta --now", self.at_calls[0][1])
         self.assertEqual(len(self.fires), 0)
         self.assertFalse(os.path.exists(ur.STATE))   # the monthly state untouched
 
