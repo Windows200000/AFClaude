@@ -259,11 +259,13 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   function tile(k, v, extra) {
     return '<div class="tile"><div class="k">' + esc(k) + '</div><div class="v">' + v + "</div>" + (extra || "") + "</div>";
   }
-  function pctTile(k, u) {
-    if (!u) return tile(k, "–");
+  // a meter with no reset time has no window open (0%, nothing used since the last reset)
+  function pctTile(k, u, extra) {
+    if (!u) return tile(k, "–", extra);
     var pc = Math.round(u.percent);
     return tile(k, pc + "%", '<div class="bar"><div class="' + (pc >= 80 ? "hi" : "") + '" style="width:' +
-      Math.min(100, pc) + '%"></div></div><div class="mut">resets ' + esc(u.resets_at_berlin || "?") + "</div>");
+      Math.min(100, pc) + '%"></div></div><div class="mut">' + (u.resets_at_berlin ? "resets " + esc(u.resets_at_berlin) :
+      "no window open") + "</div>" + (extra || ""));
   }
   function hm(min) {
     if (min == null) return "?";
@@ -306,7 +308,10 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     var k = s.keepalive || {}, out = [];
     if (k.usage_error) out.push(tile("Usage", "–", '<div class="mut">' + esc(k.usage_error) + "</div>"));
     else {
-      out.push(pctTile("Session", k.session));
+      // when /usage was last read (the sampler, every 15 min): an old reading is marked
+      var age = k.age_minutes, read = k.fetched_at_berlin ? '<div class="mut' + (age > 30 ? " warn" : "") + '">read ' +
+        esc(k.fetched_at_berlin) + (age != null ? " (" + Math.round(age) + " min ago)" : "") + "</div>" : "";
+      out.push(pctTile("Session", k.session, read));
       out.push(pctTile("Week", k.weekly));
     }
     var nr = k.next_run || {};   // D-166: when the next run takes place, not the budget rule
