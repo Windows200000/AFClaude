@@ -22,16 +22,20 @@ window to the end):
     No forecast (< MIN_FORECAST_HOURS of closed-week user data): the straight line: RUN iff
     w + run_cost <= threshold x the elapsed fraction of the week at tonight's window end.
 
-Forecast (the predictor): the user's typical weekly-% rise per hour of the week (Berlin weekday x
-hour), from the closed weekly cycles in data/samples.jsonl (last 4; user-only: intervals inside
-an autonomous AFClaude run, from a recorded fire until the next prompt in an AFClaude session,
-are left out; usage the user drives in AFClaude sessions counts as the user's). Hours without
-data use the mean rate. forecast(a, b) = the sum over [a, b). Needs >= MIN_FORECAST_HOURS (72)
-of covered hours, else the straight line above is used.
+Forecast (the predictor): (1 - budget_weight) x the rate forecast + budget_weight x the weekly
+budget left. The rate forecast: the user's typical weekly-% rise per hour of the week (Berlin
+weekday x hour) from the last 4 closed weekly cycles, each hour shrunk toward the mean rate
+(shrink_hours pseudo-hours). The weekly budget: the user's typical weekly total (a closed cycle's
+final weekly % minus AFClaude's own rise in it) minus the user's use so far in the open cycle,
+spread over the rest of it in the shape of the rate forecast. User-only: AFClaude's runs (the
+recorded run rows, else a fire until the next prompt in an AFClaude session or the run going
+idle) are left out; usage the user drives in AFClaude sessions outside a run counts as the
+user's. PREDICTOR_DEFAULTS, overridden by the user model's "predictor" object. Needs >=
+MIN_FORECAST_HOURS (72) of covered hours, else the straight line above is used.
 
 Accuracy, computed in code: forecast_backtest() back-calculates the predictor's error from the
-usage data (at every past night session-window start, the profile fitted on the cycles closed
-before it vs the user's real use until the reset); ratio_stats() gives the session/weekly ratio's
+usage data (at every past night session-window start, the forecast fitted on the samples up to
+it vs the user's real use until the reset); ratio_stats() gives the session/weekly ratio's
 dispersion per session window (limit_ratio.py); threshold_info() puts both, the full-session cost
 +- its uncertainty, the dynamic default and the active threshold together for the UI. Window-start
 decisions are also logged (data/forecast_log.jsonl) and forecast_errors() scores them.
@@ -406,52 +410,138 @@ def _how(t):
     return lt.weekday() * 24 + lt.hour
 
 
-def user_intervals(rows, fires):
-    """-> [(t0, t1, user weekly-% rise)] of consecutive samples in one weekly cycle (<= 1 h apart),
-    0 inside an autonomous AFClaude run."""
+def run_rows():
+    """AFClaude's recorded runs (run_metrics: the DB's usage.run rows, start..end). Read errors
+    propagate (D-235): the decision then fails visibly instead of counting runs as the user."""
+    import run_metrics
+    return run_metrics.read_rows()
+
+
+def run_spans(rows, fires, runs=None):
+    """[(start, end)] of AFClaude's autonomous runs: the recorded runs (run_metrics rows, the
+    split limit_ratio's week share uses), plus autonomous_spans() for the fires no run row covers.
+    Without run rows the fire spans alone (the earlier definition). The fire spans alone end too
+    early when a run's own start compaction or the test sessions it starts are counted as typed
+    prompts, so the run's rise was fitted as the user's."""
+    fallback = autonomous_spans(rows, fires)
+    if not runs:
+        return fallback
+    import limit_ratio
+    return limit_ratio.combine_spans(runs, fallback)
+
+
+def _intervals(rows, fires, runs=None):
+    """-> [(t0, t1, weekly-% rise, auto, cycle)] of consecutive samples in one weekly cycle (<= 1 h
+    apart); auto = the interval overlaps an autonomous AFClaude run."""
     rows = [r for r in rows if _num(_weekly(r).get("percent")) and _ts(r.get("at"))]
-    spans = autonomous_spans(rows, fires)
+    spans = run_spans(rows, fires, runs)
     out = []
     for p, c in zip(rows, rows[1:]):
         t0, t1 = _ts(p["at"]), _ts(c["at"])
-        if _round_reset(_weekly(p).get("resets_at")) != _round_reset(_weekly(c).get("resets_at")) \
-                or not timedelta(0) < t1 - t0 <= timedelta(hours=1):
+        cyc = _round_reset(_weekly(c).get("resets_at"))
+        if _round_reset(_weekly(p).get("resets_at")) != cyc or not timedelta(0) < t1 - t0 <= timedelta(hours=1):
             continue
-        auto = any(a < t1 and t0 < b for a, b in spans)
         dw = max(float(_weekly(c)["percent"]) - float(_weekly(p)["percent"]), 0.0)
-        out.append((t0, t1, 0.0 if auto else dw))
+        out.append((t0, t1, dw, any(a < t1 and t0 < b for a, b in spans), cyc))
     return out
 
 
-def fit_profile(rows, fires, now):
-    """The user's typical weekly-% rise per hour of the week (168 Berlin weekday x hour slots) from
-    the last FIT_CYCLES closed cycles. -> (rates [168] | None, info text)."""
-    cyc_of = {}
-    for r in rows:
-        c = _round_reset(_weekly(r).get("resets_at"))
-        if c is not None and c <= now:
-            cyc_of.setdefault(c, []).append(r)
-    keep = sorted(cyc_of)[-FIT_CYCLES:]
-    use = [r for c in keep for r in cyc_of[c]]
-    use.sort(key=lambda r: _ts(r["at"]))
+def user_intervals(rows, fires, runs=None):
+    """-> [(t0, t1, user weekly-% rise)] of consecutive samples in one weekly cycle (<= 1 h apart),
+    0 inside an autonomous AFClaude run (run_spans)."""
+    return [(t0, t1, 0.0 if auto else dw) for t0, t1, dw, auto, _ in _intervals(rows, fires, runs)]
+
+
+# Predictor defaults (generic; the user model's "predictor" object overrides them per user):
+#   shrink_hours: each hour-of-week slot's rate is shrunk toward the mean rate with this many
+#       pseudo-hours, (rise + m x mean) / (hours + m). With a few weeks a slot holds a few hours
+#       of data; unshrunk, one busy hour of one week became the forecast for that hour.
+#   budget_weight: the forecast blends the rate forecast with the weekly budget: the user's
+#       typical weekly total (final weekly % of a closed cycle - AFClaude's own rise in it) minus
+#       what the user used so far this cycle. 0 = the rate forecast alone.
+PREDICTOR_DEFAULTS = {"shrink_hours": 24.0, "budget_weight": 0.5}
+PREDICTOR_RANGES = {"shrink_hours": (0.0, 1000.0), "budget_weight": (0.0, 1.0)}
+FINAL_MAX_GAP = timedelta(hours=1)     # a closed cycle's last reading this close to its reset = its final %
+
+
+def predictor_params(doc=None):
+    """-> (params, source). doc = the user model (default: telemetry.read_user_model()); its
+    optional "predictor" object overrides PREDICTOR_DEFAULTS. An invalid value raises
+    ValueError (D-235: no silent fallback to the defaults)."""
+    doc = telemetry.read_user_model() if doc is None else doc
+    over = _dict(_dict(doc).get("predictor"))
+    out = dict(PREDICTOR_DEFAULTS)
+    for k, (lo, hi) in PREDICTOR_RANGES.items():
+        if k in over:
+            v = over[k]
+            if not _num(v) or isinstance(v, bool) or not lo <= float(v) <= hi:
+                raise ValueError(f"user model predictor.{k} = {v!r} is not a number in [{lo:g}, {hi:g}]")
+            out[k] = float(v)
+    return out, "user model" if any(k in over for k in PREDICTOR_RANGES) else "defaults"
+
+
+class Profile(list):
+    """The fitted forecast: 168 hour-of-week rates (a list, as before) plus the weekly-budget
+    state forecast_user() blends in: week_total (the user's typical weekly total, None without
+    a closed cycle with a final reading), cycle_end (the open cycle's reset), used (the user's
+    use so far in it, at as_of), budget_weight."""
+    week_total = None
+    cycle_end = None
+    as_of = None
+    used = 0.0
+    budget_weight = 0.0
+
+
+def fit_profile(rows, fires, now, runs=None, params=None):
+    """The user's typical weekly-% rise per hour of the week (168 Berlin weekday x hour slots,
+    shrunk toward the mean rate) from the last FIT_CYCLES closed cycles, plus the weekly budget
+    of the open cycle. runs = run_metrics rows (default: none). params = predictor_params()
+    (default: read them). -> (Profile | None, info text)."""
+    P = predictor_params()[0] if params is None else {**PREDICTOR_DEFAULTS, **params}
+    rows = sorted((r for r in rows if _ts(_dict(r).get("at")) and _ts(r["at"]) <= now + timedelta(minutes=1)),
+                  key=lambda r: _ts(r["at"]))
+    iv = _intervals(rows, fires, runs)
+    closed = sorted({x[4] for x in iv if x[4] is not None and x[4] <= now})[-FIT_CYCLES:]
+    keep = set(closed)
     hours, rise = [0.0] * 168, [0.0] * 168
-    for t0, t1, dw in user_intervals(use, fires):
-        k = _how(t1 - timedelta(seconds=1))
-        hours[k] += (t1 - t0).total_seconds() / 3600
-        rise[k] += dw
+    for t0, t1, dw, auto, cyc in iv:
+        if cyc in keep:
+            k = _how(t1 - timedelta(seconds=1))
+            hours[k] += (t1 - t0).total_seconds() / 3600
+            rise[k] += 0.0 if auto else dw
     covered = sum(hours)
     if covered < MIN_FORECAST_HOURS:
         return None, (f"too little user data for a forecast ({covered:.0f} h of closed weeks < "
                       f"{MIN_FORECAST_HOURS:g} h): the straight line")
-    mean = sum(rise) / covered
-    rates = [rise[k] / hours[k] if hours[k] >= 0.5 else mean for k in range(168)]
-    return rates, f"forecast from {len(keep)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% user usage"
+    mean, m = sum(rise) / covered, P["shrink_hours"]
+    rates = Profile((rise[k] + m * mean) / (hours[k] + m) if hours[k] + m > 0 else mean for k in range(168))
+    # the weekly budget: per closed cycle, its final weekly % minus AFClaude's own rise in it
+    last = {}
+    for r in rows:
+        c = _round_reset(_weekly(r).get("resets_at"))
+        if c is not None and _num(_weekly(r).get("percent")):
+            last[c] = r
+    auto = {}
+    for t0, t1, dw, a, cyc in iv:
+        if a:
+            auto[cyc] = auto.get(cyc, 0.0) + dw
+    totals = [max(float(_weekly(last[c])["percent"]) - auto.get(c, 0.0), 0.0) for c in closed
+              if c in last and c - _ts(last[c]["at"]) <= FINAL_MAX_GAP]
+    info = f"forecast from {len(closed)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% user usage"
+    open_c = [c for c in last if c > now]
+    if totals and open_c and P["budget_weight"] > 0:
+        c = min(open_c)
+        r = last[c]
+        rates.week_total = sum(totals) / len(totals)
+        rates.cycle_end, rates.as_of = c, _ts(r["at"])
+        rates.used = max(float(_weekly(r)["percent"]) - auto.get(c, 0.0), 0.0)
+        rates.budget_weight = P["budget_weight"]
+        info += (f"; weekly budget {rates.week_total:.0f}% (mean of {len(totals)}), used {rates.used:.0f}%, "
+                 f"weight {rates.budget_weight:g}")
+    return rates, info
 
 
-def forecast_user(rates, a, b):
-    """Forecast of the user's weekly-% use in [a, b) (no margin: the threshold is the spare)."""
-    if rates is None or b <= a:
-        return 0.0
+def _rate_forecast(rates, a, b):
     tot, t = 0.0, a
     while t < b:
         nxt = min((t.astimezone(UTC) + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0), b)
@@ -460,22 +550,49 @@ def forecast_user(rates, a, b):
     return tot
 
 
+def forecast_user(rates, a, b):
+    """Forecast of the user's weekly-% use in [a, b) (no margin: the threshold is the spare):
+    the rate forecast, blended inside the open cycle with the weekly budget left
+    (budget_weight x max(week_total - used, 0), spread over [as_of, cycle_end) in the shape of
+    the rate forecast)."""
+    if rates is None or b <= a:
+        return 0.0
+    base = _rate_forecast(rates, a, b)
+    wt, end, as_of = getattr(rates, "week_total", None), getattr(rates, "cycle_end", None), getattr(rates, "as_of", None)
+    alpha = getattr(rates, "budget_weight", 0.0)
+    if wt is None or end is None or as_of is None or not alpha:
+        return base
+    lo, hi = max(a, as_of), min(b, end)
+    if hi <= lo:
+        return base
+    inside = _rate_forecast(rates, lo, hi)
+    whole = _rate_forecast(rates, as_of, end)
+    share = inside / whole if whole > 0 else (hi - lo) / (end - as_of)
+    return base - alpha * inside + alpha * max(wt - rates.used, 0.0) * share
+
+
 _PROFILE_CACHE = {}
 
 
-def profile(rows=None, now=None, fires=None):
-    """fit_profile() over the long samples tail, cached while the samples are unchanged."""
+def profile(rows=None, now=None, fires=None, runs=None):
+    """fit_profile() over the long samples tail (runs: the recorded runs, default run_rows()),
+    cached while the samples, the runs and the predictor parameters are unchanged."""
     now = now or datetime.now(UTC)
+    runs = run_rows() if runs is None else runs
+    params = predictor_params()[0]
     if rows is not None:
-        return fit_profile(rows, fire_times() if fires is None else fires, now)
-    try:
-        st = os.stat(SAMPLES_FILE)
-    except OSError:
-        return None, "no samples: the straight line"
-    key = (SAMPLES_FILE, _file_sig(SAMPLES_FILE, st), now.date())
+        return fit_profile(rows, fire_times() if fires is None else fires, now, runs, params)
+    sig = telemetry.signature(SAMPLES_FILE)      # the DB for the live path (the file is frozen legacy)
+    if sig is None:
+        try:
+            sig = _file_sig(SAMPLES_FILE, os.stat(SAMPLES_FILE))
+        except OSError:
+            return None, "no samples: the straight line"
+    key = (SAMPLES_FILE, sig, now.replace(minute=0, second=0, microsecond=0),
+           json.dumps(runs, sort_keys=True, default=str), tuple(sorted(params.items())))
     if _PROFILE_CACHE.get("key") != key:
         _PROFILE_CACHE.update(key=key, val=fit_profile(tail_rows(max_bytes=LONG_BYTES),
-                                                       fire_times() if fires is None else fires, now))
+                                                       fire_times() if fires is None else fires, now, runs, params))
     return _PROFILE_CACHE["val"]
 
 
@@ -842,14 +959,16 @@ def record_forecast(d, resets_at, path=None):
     return telemetry.record("usage.forecast", json.dumps(rec), path or FORECAST_LOG, actor="runner:pacing")
 
 
-def forecast_errors(rows, fires, now, path=None):
+def forecast_errors(rows, fires, now, path=None, runs=None):
     """Score the logged forecasts of closed weeks against the user's real use from the logged
-    time to the reset. -> list of {at, forecast, actual, error} (error = forecast - actual)."""
+    time to the reset (runs: run_metrics rows for the AFClaude/user split, as the fit; default
+    run_rows()).
+    -> list of {at, forecast, actual, error} (error = forecast - actual)."""
     try:
         recs = [json.loads(x) for x in telemetry.lines(path or FORECAST_LOG) if x.strip()]
     except (OSError, ValueError):
         return []
-    iv = user_intervals(sorted(rows, key=lambda r: _ts(r["at"])), fires)
+    iv = user_intervals(sorted(rows, key=lambda r: _ts(r["at"])), fires, run_rows() if runs is None else runs)
     out, seen = [], set()
     for r in recs:
         a, reset = _ts(r.get("at")), _ts(r.get("reset"))
@@ -867,10 +986,12 @@ def forecast_errors(rows, fires, now, path=None):
 MIN_BACKTEST_CLOSED = 7     # closed-horizon points (about a week of nights) before the error is "ok"
 
 
-def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8):
+def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8, runs=None, params=None):
     """Back-calculate the predictor's error from the usage data. At every past night
     session-window start t (the window start, + 5 h, ... inside the window) the profile fitted on
-    the cycles closed before t (what the gate would have used) forecasts the user's use until
+    the samples up to t (what the gate would have used: the closed cycles' rates and weekly
+    budget, the use so far in this cycle; runs = run_metrics rows, default run_rows(); params as
+    fit_profile) forecasts the user's use until
     the weekly reset (for the open cycle: until now, a partial horizon); actual = the user's real
     use over the same span (user_intervals, the definition the fit uses). Spans the samples cover
     less than min_coverage are skipped. -> [{at, reset, end, closed, horizon_h, predicted, actual,
@@ -878,14 +999,15 @@ def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8):
     sched = sched or schedule.load()
     rows = sorted((r for r in rows or () if _ts(_dict(r).get("at"))), key=lambda r: _ts(r["at"]))
     cycles = sorted({c for c in (_round_reset(_weekly(r).get("resets_at")) for r in rows) if c is not None})
-    iv = user_intervals(rows, fires)
+    params = predictor_params()[0] if params is None else params
+    runs = run_rows() if runs is None else runs
+    iv = user_intervals(rows, fires, runs)
     step = timedelta(hours=SESSION_H)
     out = []
     for c in cycles:
         start, end = c - WEEK, min(c, now)
-        prior = [r for r in rows if _ts(r["at"]) <= start]
-        rates = fit_profile(prior, fires, start)[0] if prior else None
-        if rates is None:
+        if not any(_ts(r["at"]) <= start for r in rows) or fit_profile(
+                [r for r in rows if _ts(r["at"]) <= start], fires, start, runs, params)[0] is None:
             continue
         cyc_iv = [x for x in iv if x[0] >= start and x[1] <= c + timedelta(minutes=5)]
         for k, _ in schedule.session_slots(start - timedelta(microseconds=1), end, sched):
@@ -893,6 +1015,7 @@ def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8):
                 span = [x for x in cyc_iv if x[0] >= k and x[1] <= end + timedelta(minutes=5)]
                 hz = (end - k).total_seconds() / 3600
                 if sum((x[1] - x[0]).total_seconds() for x in span) / 3600 >= min_coverage * hz:
+                    rates = fit_profile([r for r in rows if _ts(r["at"]) <= k], fires, k, runs, params)[0]
                     pred, act = forecast_user(rates, k, end), sum(x[2] for x in span)
                     out.append({"at": k.astimezone(UTC).isoformat(), "reset": c.isoformat(),
                                 "end": end.isoformat(), "closed": end == c, "horizon_h": round(hz, 1),
@@ -926,7 +1049,7 @@ def _rnd(x, k=1):
     return round(x, k) if _num(x) else None
 
 
-def threshold_info(rows=None, fires=None, now=None, decision=None):
+def threshold_info(rows=None, fires=None, now=None, decision=None, runs=None):
     """Everything the threshold setting shows, computed in code: the session/weekly ratio +- its
     spread per session window, the full-session weekly cost +- its uncertainty, the predictor's
     back-calculated error (forecast_backtest), the uncertainty of the predicted week end, the
@@ -939,17 +1062,18 @@ def threshold_info(rows=None, fires=None, now=None, decision=None):
         except Exception:   # noqa: BLE001
             rows = []
     fires = fire_times() if fires is None else fires
+    runs = run_rows() if runs is None else runs
     rs = ratio_stats(rows)
     ratio = rs["value"]
     cost = full_session_cost(ratio)
     intr, se, spread = rs["intrinsic_stdev"], rs["se"], rs["weighted_stdev"]
     cost_sd = 100.0 * ((intr or 0.0) ** 2 + (se or 0.0) ** 2) ** 0.5 if intr is not None or se is not None else None
     try:
-        me = error_stats(forecast_backtest(rows, fires, now))
+        me = error_stats(forecast_backtest(rows, fires, now, runs=runs))
     except Exception as e:   # noqa: BLE001 - advisory
         me = dict(error_stats([]), note=f"backtest failed: {type(e).__name__}")
     try:
-        logged = [x["actual"] - x["forecast"] for x in forecast_errors(rows, fires, now)]
+        logged = [x["actual"] - x["forecast"] for x in forecast_errors(rows, fires, now, runs=runs)]
     except Exception:   # noqa: BLE001
         logged = []
     setting, tsrc = afclaude_config.reserve_threshold_setting()
