@@ -97,6 +97,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from types import FrameType
 from typing import Any, Literal, TypeVar, overload
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -731,6 +732,119 @@ def parse_iso(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
 
 
+# ---- long write transactions, attributable (incident 16.10.: a ~40-s lock with no audit row)
+#
+# Every connection connect() opens is a TimedConnection: it notes when a transaction opens
+# (after the first statement that leaves in_transaction true: BEGIN IMMEDIATE, or a DML
+# statement with Python's implicit BEGIN, so the write lock is held from then on) and where
+# (the first frames outside store.py), and when it ends (commit, rollback, close, `with conn:`,
+# or a statement that ended it). One held longer than SLOW_TX_SECONDS is a WARN line on stderr
+# (the process's own log) and in app_log (component "db", actions.app_log_append), naming the
+# process, its pid, how it ended and the code that opened it. The cost is one Python call and
+# an attribute check per statement; the frame walk runs once per transaction.
+SLOW_TX_SECONDS = 3.0
+_STORE_FILE = os.path.abspath(__file__)
+
+
+def _tx_origin() -> str:
+    """The code that opened a transaction: up to 6 frames outside store.py and contextlib,
+    innermost first ('stalled.py:212 scan < export_quickview.py:315 build')."""
+    out: list[str] = []
+    f: FrameType | None = sys._getframe(1)
+    while f is not None and len(out) < 6:
+        fn = f.f_code.co_filename
+        if os.path.basename(fn) != "contextlib.py" and os.path.abspath(fn) != _STORE_FILE:
+            out.append(f"{os.path.basename(fn)}:{f.f_lineno} {f.f_code.co_name}")
+        f = f.f_back
+    return " < ".join(out) or "?"
+
+
+def _report_slow_tx(conn: sqlite3.Connection, seconds: float, how: str, origin: str) -> None:
+    """One slow transaction: the WARN line on stderr and in app_log ("db"). The transaction
+    itself is over (committed or rolled back), so a failure to store the line doesn't fail
+    it: the failure goes to stderr next to the line instead (never silent)."""
+    proc = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "python"
+    line = (f"WARN: slow write transaction: held the database write lock {seconds:.1f} s "
+            f"(ended by {how}) in {proc} pid {os.getpid()}, opened at {origin}")[:2000]
+    print(f"{now_iso()} {line}", file=sys.stderr, flush=True)
+    try:
+        import actions
+        actions.app_log_append(conn, "db", [(now_iso(), "warn", line)], actor="runner:db", via="runner")
+    except Exception as e:   # noqa: BLE001 - reported on stderr; the transaction is already over
+        print(f"{now_iso()} ERROR: the slow-transaction warning above could not be stored in "
+              f"app_log ({type(e).__name__}: {e})", file=sys.stderr, flush=True)
+
+
+class TimedConnection(sqlite3.Connection):
+    """sqlite3.Connection that reports write transactions held longer than SLOW_TX_SECONDS
+    (see above). Behaves exactly like its base otherwise."""
+    _tx_start: float | None = None
+    _tx_origin: str = ""
+    _tx_reporting: bool = False
+
+    def _tx_mark(self, how: str) -> None:
+        if self._tx_reporting:
+            return
+        try:
+            open_ = self.in_transaction
+        except sqlite3.ProgrammingError:   # closed / wrong thread: the statement itself raised that
+            return
+        if open_:
+            if self._tx_start is None:
+                self._tx_start, self._tx_origin = time.monotonic(), _tx_origin()
+        elif self._tx_start is not None:
+            held, self._tx_start = time.monotonic() - self._tx_start, None
+            if held > SLOW_TX_SECONDS:
+                self._tx_reporting = True
+                try:
+                    _report_slow_tx(self, held, how, self._tx_origin)
+                finally:
+                    self._tx_reporting = False
+
+    def execute(self, *args: Any) -> sqlite3.Cursor:
+        try:
+            return super().execute(*args)
+        finally:
+            self._tx_mark("a statement")
+
+    def executemany(self, *args: Any) -> sqlite3.Cursor:
+        try:
+            return super().executemany(*args)
+        finally:
+            self._tx_mark("a statement")
+
+    def executescript(self, *args: Any) -> sqlite3.Cursor:
+        try:
+            return super().executescript(*args)
+        finally:
+            self._tx_mark("a script")
+
+    def commit(self) -> None:
+        try:
+            super().commit()
+        finally:
+            self._tx_mark("commit")
+
+    def rollback(self) -> None:
+        try:
+            super().rollback()
+        finally:
+            self._tx_mark("rollback")
+
+    def __exit__(self, *args: Any) -> Literal[False]:
+        try:
+            return super().__exit__(*args)
+        finally:
+            self._tx_mark("the with block")
+
+    def close(self) -> None:
+        try:
+            if self._tx_start is not None and self.in_transaction:
+                self.rollback()      # what close() does anyway; measured (and reported) first
+        finally:
+            super().close()
+
+
 def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection:
     """Open the database (WAL, foreign keys on) and bring its schema up to date (init), on
     the DB error path (§7.8): a transient error is retried, a persistent one is a DBError.
@@ -758,7 +872,7 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
         raise DBUnavailable(f"the database directory of {db} can't be created ({e})", "missing") from e
 
     def open_() -> sqlite3.Connection:
-        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT)
+        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT, factory=TimedConnection)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -2942,8 +3056,10 @@ def doc_counts(conn: sqlite3.Connection) -> dict[str, int]:
 # that automation resumes.
 
 # 5 tries with 7.5 s of backoff; each try waits up to BUSY_TIMEOUT for a lock (SQLite's busy
-# handler), so a lock held throughout fails after ~30 s, as the single 30-s wait did before
-# (the stalled-session scan holds the write lock for its whole pass).
+# handler), so a lock held throughout fails after ~30 s, as the single 30-s wait did before.
+# No writer should come near that: the stalled-session scan commits in short batches
+# (stalled.FLUSH_SECONDS), and a transaction held longer than SLOW_TX_SECONDS is logged with
+# its origin (TimedConnection).
 BUSY_TIMEOUT = 5.0
 RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 MIN_FREE_BYTES = 4 * 1024 * 1024                         # less free space = disk full (health())

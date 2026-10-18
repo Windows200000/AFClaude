@@ -11,7 +11,11 @@ claims every due pending job (marks it started, so it never runs twice) and star
 
 Failures of `--run-due` (D-234/D-235, failstop.py): the jobs can't be read or claimed, or a job
 can't be started: an ERROR line in at_shim.log (= app_log), an alert, and automation paused until
-the owner clears it; the run stops there. The shim itself runs no AFClaude session: the jobs it
+the owner clears it; the run stops there. One deliberate retry first: a read or claim that failed
+only because the database stayed locked or busy through store.py's whole retry budget (~30 s:
+another writer held the lock that long) gets one more try after LOCK_RETRY_WAIT (a WARN line),
+since a missed job and paused automation cost more than the wait; any other DB error, or the
+second try failing too, is the failure above. The shim itself runs no AFClaude session: the jobs it
 starts (the sampler's samples, a one-off review) check the pause themselves.
 
 The old spool dir ($AFCLAUDE_AT_SPOOL, default <data>/at_spool) is a read-only legacy: its
@@ -25,6 +29,7 @@ know yet (one an older shim copy spooled without its DB write) to the DB and run
 import os
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -36,6 +41,9 @@ import runner_state  # noqa: E402
 import store  # noqa: E402
 
 SPOOL = os.environ.get("AFCLAUDE_AT_SPOOL", os.path.join(AFCLAUDE_DIR, "data", "at_spool"))   # legacy, read-only
+LOCK_RETRY_WAIT = 10.0       # seconds before the one extra try of a step whose DB stayed locked (module doc)
+LOCK_KINDS = ("locked", "io")  # store.DBError kinds of a transient error that outlasted store's retries
+_sleep = time.sleep           # patched by tests
 
 
 def parse_t(value, tz):
@@ -91,17 +99,37 @@ def fail(subject, detail=""):
     return failstop.fail("at_shim", subject, detail, log=log)
 
 
+def _db_step(what, step):
+    """step() (a DB read or claim), with the one extra try of the module doc: a DBError of a
+    LOCK_KINDS kind is logged (WARN) and step() runs once more after LOCK_RETRY_WAIT; whatever
+    that raises reaches the caller, as does any other DBError at once. -> step()'s result."""
+    try:
+        return step()
+    except store.DBError as e:
+        if e.kind not in LOCK_KINDS:
+            raise
+        log(f"WARN: {what}: database {e.kind} through store's whole retry budget ({e}); "
+            f"one more try in {LOCK_RETRY_WAIT:g} s")
+    _sleep(LOCK_RETRY_WAIT)
+    return step()
+
+
+def _read_due(now):
+    _adopt_legacy({j["id"] for j in runner_state.jobs()})
+    return [j for j in jobs("pending") if _due(j, now)]
+
+
 def run_due():
     now = datetime.now(timezone.utc)
     try:
-        _adopt_legacy({j["id"] for j in runner_state.jobs()})
-        due = [j for j in jobs("pending") if _due(j, now)]
+        due = _db_step("reading the scheduled jobs", lambda: _read_due(now))
     except store.DBError as e:
         fail("scheduled jobs unreadable: no job started", f"database problem ({e.kind}): {e}")
         return 1
     for job in due:
         try:
-            if not runner_state.job_claim(job["id"]):     # claim it first: never run a job twice
+            if not _db_step(f"claiming job {job['id']}",       # claim it first: never run a job twice
+                            lambda: runner_state.job_claim(job["id"])):
                 continue
         except store.DBError as e:
             fail("a due job could not be claimed: no further job started",

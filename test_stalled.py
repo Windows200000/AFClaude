@@ -3,11 +3,13 @@
 Real-host tests only READ files under ~/.claude/projects."""
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
@@ -258,6 +260,69 @@ class Incremental(Base):
             if want:
                 self.assertEqual(s["stall_reset_at"], store.iso(want["reset_from_text"]))
         self.assertEqual(len(store.session_history(self.conn, SID)), 2)
+
+
+class ShortTransactions(Base):
+    """The scan never holds the write lock while it reads or parses (incident 16.10.: a ~40-s
+    lock): results are written in short batches, and a file's hits and byte offset always land
+    in the same transaction."""
+    def three(self):
+        self.write([U1, A1, S1])
+        self.write([U1, stall("s2", "2026-09-26T02:10:00.000Z")], sid=SID2)
+        sid3 = "00000000-0000-4000-8000-000000000003"
+        self.write([U1, A1], sid=sid3)
+        return [SID, SID2, sid3]
+
+    def test_no_open_transaction_while_parsing(self):
+        self.three()
+        seen = []
+        real = stalled.process_chunk
+
+        def spy(*a):
+            seen.append(self.conn.in_transaction)
+            return real(*a)
+        with mock.patch.object(stalled, "process_chunk", spy):
+            st = self.scan()
+        self.assertEqual(seen, [False, False, False])
+        self.assertFalse(self.conn.in_transaction)
+        self.assertEqual((st["new_hits"], st["new_sessions"], st["stalled"]), (2, 3, 2))
+
+    def test_batches_commit_as_the_scan_goes(self):
+        sids = self.three()
+        commits = []
+        real = stalled._committed
+
+        def spy(conn, write):
+            out = real(conn, write)
+            commits.append(sorted(r[0] for r in conn.execute("SELECT session_id FROM sessions")))
+            return out
+        with mock.patch.object(stalled, "FLUSH_SECONDS", 0.0), mock.patch.object(stalled, "_committed", spy):
+            st = self.scan()
+        self.assertEqual(commits, [sorted(sids[:1]), sorted(sids[:2]), sorted(sids), sorted(sids)])
+        self.assertEqual(st["new_hits"], 2)
+        self.assertEqual(store.get_meta(self.conn, "last_scan_seconds"), str(st["seconds"]))
+
+    def test_a_failed_batch_rolls_back_and_offsets_stay_with_their_rows(self):
+        sids = self.three()
+        real = store.add_hit
+
+        def add_hit(conn, sid, *a):
+            if sid == SID2:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(conn, sid, *a)
+        with mock.patch.object(stalled, "FLUSH_SECONDS", 0.0), mock.patch.object(store, "add_hit", add_hit):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.scan()
+        self.assertFalse(self.conn.in_transaction)              # rolled back: the lock is free
+        first = self.sess(SID)                                  # the batch before: committed, consistent
+        self.assertEqual(first["last_scanned_offset"], os.path.getsize(self.path(SID)))
+        self.assertEqual(len(store.session_history(self.conn, SID)), 1)
+        self.assertIsNone(self.sess(SID2))                      # nothing of the failed batch
+        self.assertEqual(store.session_history(self.conn, SID2), [])
+        st = self.scan()                                        # the next scan picks it up
+        self.assertEqual((st["new_hits"], st["sessions"], st["stalled"]), (1, 3, 2))
+        self.assertEqual(self.sess(SID2)["last_scanned_offset"], os.path.getsize(self.path(SID2)))
+        self.assertEqual(self.sess(sids[2])["stalled"], 0)
 
 
 class CLI(Base):
