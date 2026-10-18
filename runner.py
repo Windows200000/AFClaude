@@ -174,7 +174,7 @@ def log(msg: str) -> None:
     """A runner line: data/runner.log (+ app_log, component runner) and stdout (docker logs).
     When stdout IS runner.log (a shell redirect), it is written once. Never raises."""
     line = f"[{datetime.now(BERLIN):%Y-%m-%d %H:%M:%S %Z}] {msg}"
-    path = runner_state.live_path(COMPONENT)
+    path = runner_state.live_path(COMPONENT, runner_state.LOG_FILES)
     try:
         a, b = os.fstat(sys.stdout.fileno()), os.stat(path)
         same = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
@@ -691,6 +691,7 @@ class Runner:
         """The loop until a stop (SIGTERM / request_stop). -> exit code 0; raises on the runner's
         own failure (the caller reports it and exits non-zero, without the clean exit)."""
         loop = asyncio.get_running_loop()
+        self.wake_event = asyncio.Event()     # of this loop (Python 3.9 binds an Event to a loop at creation)
         if install_signals:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, self.request_stop)

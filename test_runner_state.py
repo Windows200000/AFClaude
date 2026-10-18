@@ -61,8 +61,8 @@ LOGS = {
                      "2026-10-01T10:20:37 DENY not whitelisted: 'cat /etc/passwd'\n",
     "keepalive/watchdog.log": "start_watcher: a keepalive.py watcher runs on the HOST\n",
 }
-JOBS = [{"id": "4d6dda0d5724", "at": "2026-10-15T17:06:00+00:00", "cmd": "true\n", "cwd": "/"},
-        {"id": "a4a2cedcd99a", "at": "2026-10-15T16:56:00+00:00", "cmd": "true\n", "cwd": "/"}]
+JOBS = [{"id": "4d6dda0d5724", "at": "2099-10-15T17:06:00+00:00", "cmd": "true\n", "cwd": "/"},
+        {"id": "a4a2cedcd99a", "at": "2099-10-15T16:56:00+00:00", "cmd": "true\n", "cwd": "/"}]
 OWN = "# own sessions\na954f3c8-e15e-41dd-9b25-b2f8b1a88a06\n"
 
 

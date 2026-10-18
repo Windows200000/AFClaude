@@ -533,7 +533,13 @@ class SettingActions(Base):
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
-                          "log_retention_days": 30.0, "log_retention_overrides": {}})
+                          "log_retention_days": 30.0, "log_retention_overrides": {},
+                          "runner_timeout_stall_scan": 2.0, "runner_timeout_sampler": 10.0,
+                          "runner_timeout_dispatcher": 8.0, "runner_timeout_quickview": 2.0,
+                          "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
+                          "runner_timeout_prune_runs": 10.0, "runner_timeout_usage_review": 15.0,
+                          "runner_timeout_window_start": 70.0, "runner_start_catchup": 30.0,
+                          "runner_runs_retention_days": 30.0})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -1000,7 +1006,7 @@ class EveryAction(Base):
             ("request.add", {"kind": "continue_now", "target": SID}),
             ("handoff.write", {"session_id": SID, "body": {"summary": "s"}}),
             ("handoff.consume", {"handoff_id": 1, "start_key": "window-start-2026-10-09"}),
-            ("log.prune", {}),
+            ("log.prune", {}), ("runner.prune", {}),
             ("user_model.set", {"doc": {"schema": "afclaude.user_model/1", "weeks_of_data": 1}}),
             ("cost_model.set", {"doc": __import__("compact_timing").BUILTIN}),
             ("doc.append", {"project": "P", "name": "progress", "text": "- x\n"}),
