@@ -635,6 +635,56 @@ class Writes(Base):
         self.assertEqual(fails, ["scheduled jobs unreadable: no job started"])   # D-234/D-235: an error
         self.conn = store.connect(os.path.join(self.dir, "other.db"), create=True)
 
+    def _locked_shim(self, fail_times, kind="locked", target="jobs"):
+        """A shim whose runner_state.<target> raises a DBError of `kind` the first `fail_times` calls."""
+        shim = self._shim()
+        shim.log = lambda msg: self.shim_log.append(msg)
+        self.shim_log, self.sleeps, self.fails = [], [], []
+        shim._sleep = self.sleeps.append
+        shim.fail = lambda subject, detail="": self.fails.append(subject)
+        real = getattr(rs, target)
+        left = [fail_times]
+
+        def flaky(*a, **k):
+            if left[0] > 0:
+                left[0] -= 1
+                raise store.DBUnavailable(f"database {kind}: simulated (still failing after 5 tries)", kind)
+            return real(*a, **k)
+        p = mock.patch.object(rs, target, flaky)
+        p.start()
+        self.addCleanup(p.stop)
+        return shim
+
+    def test_at_shim_waits_once_more_for_a_locked_db(self):
+        shim = self._locked_shim(1)
+        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
+        self.assertEqual(shim.run_due(), 0)                          # the second try read the jobs
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
+        self.assertEqual((self.sleeps, self.fails), ([shim.LOCK_RETRY_WAIT], []))
+        self.assertTrue(self.shim_log[0].startswith("WARN: reading the scheduled jobs: database locked"))
+
+    def test_at_shim_claim_waits_once_more_too(self):
+        shim = self._locked_shim(1, target="job_claim")
+        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
+        self.assertEqual(shim.run_due(), 0)
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
+        self.assertEqual((self.sleeps, self.fails), ([shim.LOCK_RETRY_WAIT], []))
+        self.assertIn(f"claiming job {jid}", self.shim_log[0])
+
+    def test_at_shim_locked_twice_is_still_a_failure(self):
+        shim = self._locked_shim(2)                                  # D-235: no endless waiting
+        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
+        self.assertEqual(shim.run_due(), 1)
+        self.assertEqual(self.sleeps, [shim.LOCK_RETRY_WAIT])
+        self.assertEqual(self.fails, ["scheduled jobs unreadable: no job started"])
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "pending")
+
+    def test_at_shim_other_db_errors_fail_at_once(self):
+        shim = self._locked_shim(1, kind="corrupt")
+        self.assertEqual(shim.run_due(), 1)
+        self.assertEqual((self.sleeps, self.shim_log), ([], []))
+        self.assertEqual(self.fails, ["scheduled jobs unreadable: no job started"])
+
     def test_at_shim_job_that_cannot_start_is_an_error(self):
         shim = self._shim()
         jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")

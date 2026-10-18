@@ -208,6 +208,101 @@ class TransactionCommitFailure(unittest.TestCase):
         self.assertEqual(conn.log.count("BEGIN IMMEDIATE"), 2)
 
 
+class SlowTransactions(Base):
+    """A write transaction held longer than store.SLOW_TX_SECONDS is a WARN line on stderr and
+    in app_log (component "db") naming the process and the code that opened it (incident 16.10.:
+    a ~40-s lock with no audit row, its holder unknown). The threshold is patched to -1 so any
+    transaction counts as slow; nothing waits."""
+    def setUp(self):
+        super().setUp()
+        self.conn = store.connect(self.db)
+        self.addCleanup(self.conn.close)
+
+    def warnings(self):
+        return [r["line"] for r in self.conn.execute(
+            "SELECT line FROM app_log WHERE component='db' ORDER BY id")]
+
+    def slow(self, fn):
+        err = io.StringIO()
+        with mock.patch.object(store, "SLOW_TX_SECONDS", -1.0), contextlib.redirect_stderr(err):
+            fn()
+        return err.getvalue()
+
+    def opener_of_a_raw_write(self):      # its name must show up as the origin
+        store.upsert_session(self.conn, "s1", title="x")
+
+    def test_a_fast_transaction_is_not_reported(self):
+        self.opener_of_a_raw_write()
+        self.conn.commit()
+        with store.transaction(self.conn):
+            store.set_meta(self.conn, "k", "v")
+        self.assertEqual(self.warnings(), [])
+
+    def test_a_slow_raw_write_names_its_origin(self):
+        def run():
+            self.opener_of_a_raw_write()
+            self.conn.commit()
+        err = self.slow(run)
+        [line] = self.warnings()
+        self.assertIn("slow write transaction", line)
+        self.assertIn("ended by commit", line)
+        self.assertIn(f"pid {os.getpid()}", line)
+        self.assertIn("test_db_errors.py:", line)
+        self.assertIn("opener_of_a_raw_write", line)
+        self.assertIn("WARN: slow write transaction", err)
+        self.assertEqual(store.get_session(self.conn, "s1")["title"], "x")   # the write itself stands
+        self.assertEqual(self.conn.execute("SELECT actor, level FROM app_log WHERE component='db'").fetchone()[:],
+                         ("runner:db", "warn"))
+
+    def test_store_transaction_and_actions_perform_are_covered(self):
+        self.slow(lambda: actions.perform(self.conn, "setting.set", {"key": "log_retention_days", "value": 30},
+                                          actor="cli", via="cli"))
+        [line] = self.warnings()                # one per transaction: its own app_log write is not reported
+        self.assertIn("ended by commit", line)
+        self.assertIn("actions.py:", line)      # the frames outside store.py: the action, then this test
+        self.assertIn("perform < test_db_errors.py:", line)
+
+    def test_rollback_with_block_and_close_end_it_too(self):
+        def rolled_back():
+            with self.assertRaises(RuntimeError):
+                with store.transaction(self.conn):
+                    store.set_meta(self.conn, "k", "v")
+                    raise RuntimeError("boom")
+        self.slow(rolled_back)
+
+        def with_block():
+            with self.conn:
+                store.set_meta(self.conn, "k2", "v")
+        self.slow(with_block)
+        other = store.connect(self.db)
+
+        def closed():
+            store.set_meta(other, "k3", "v")
+            other.close()                   # an open transaction: rolled back by close, measured first
+        self.slow(closed)
+        hows = [ln.split("(ended by ")[1].split(")")[0] for ln in self.warnings()]
+        self.assertEqual(hows, ["rollback", "the with block", "rollback"])
+        self.assertIsNone(store.get_meta(self.conn, "k"))
+        self.assertEqual(store.get_meta(self.conn, "k2"), "v")
+        self.assertIsNone(store.get_meta(self.conn, "k3"))
+
+    def test_a_warning_that_cannot_be_stored_goes_to_stderr_and_the_commit_stands(self):
+        def run():
+            self.opener_of_a_raw_write()
+            self.conn.commit()
+        with mock.patch.object(actions, "app_log_append", side_effect=store.DBUnavailable("locked", "locked")):
+            err = self.slow(run)
+        self.assertIn("WARN: slow write transaction", err)
+        self.assertIn("could not be stored in app_log (DBUnavailable: locked)", err)
+        self.assertEqual(store.get_session(self.conn, "s1")["title"], "x")
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_a_closed_connection_still_raises_its_own_error(self):
+        self.conn.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            self.conn.execute("SELECT 1")
+
+
 class Persistent(Base):
     def test_read_only_file(self):
         self.read_only()

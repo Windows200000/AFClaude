@@ -22,6 +22,13 @@ Only lines that can matter are JSON-decoded: lines mentioning <synthetic> or a
 title entry type, plus a short backwards walk from the end of each new chunk to
 find its last user/assistant entry.
 
+Short write transactions: files are read and parsed without the write lock; their
+results are written in batches, each in one short transaction that commits at
+least every FLUSH_SECONDS of scanning (a long host-wide scan used to hold the lock
+for its whole pass, and every other writer timed out behind it). A file's limit
+hits and its session row, byte offset included, are always written in the same
+transaction, so a saved offset never runs ahead of the rows it covers.
+
     stalled.py scan                       one-line summary
     stalled.py list [--all] [--json]      currently stalled (or: ever hit a limit)
     stalled.py history <session-prefix>   one session's limit hits
@@ -60,6 +67,7 @@ RESET_ON_RESCAN = dict(title=None, title_rank=None, first_seen=None, last_activi
                        stall_text=None, stall_uuid=None)
 CLEAR_STALL = dict(stalled=0, stalled_since=None, stall_kind=None, stall_reset_at=None,
                    stall_text=None, stall_uuid=None)
+FLUSH_SECONDS = 1.0     # parsed results are written (one short transaction) at least this often
 
 
 def is_message_entry(e):
@@ -90,12 +98,13 @@ def is_own(sid, cwd, title, own_extra):
             or bool(OWN_NAME_RE.match(title or "")))
 
 
-def process_chunk(conn, sid, chunk, row):
-    """Apply the complete lines in `chunk` (bytes) to session `sid`.
-    `row` is the session's current DB state (dict). Returns (#new hits, updates)."""
+def process_chunk(sid, chunk, row):
+    """Parse the complete lines in `chunk` (bytes) of session `sid`; no DB access.
+    `row` is the session's current DB state (dict). Returns (hits, updates): the limit
+    notices as store.add_hit arguments after conn, and the session fields to set."""
     lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
     upd = {}
-    new_hits = 0
+    hits = []
 
     # forward pass: hits (in order) and titles
     rank = row.get("title_rank") or 0
@@ -114,9 +123,8 @@ def process_chunk(conn, sid, chunk, row):
             continue
         si = ka.stall_info(e)
         if si:
-            if store.add_hit(conn, sid, si["uuid"] or f"{sid}:{e.get('timestamp')}", si["timestamp"],
-                             si["kind"], si["reset_from_text"], si["text"]):
-                new_hits += 1
+            hits.append((sid, si["uuid"] or f"{sid}:{e.get('timestamp')}", si["timestamp"],
+                         si["kind"], si["reset_from_text"], si["text"]))
 
     # first entry timestamp (only once per session)
     if not row.get("first_seen"):
@@ -159,12 +167,40 @@ def process_chunk(conn, sid, chunk, row):
                        stall_uuid=si["uuid"])
         else:
             upd.update(CLEAR_STALL)
-    return new_hits, upd
+    return hits, upd
+
+
+def _write(conn, pending):
+    """Write the parsed results of some files (no commit). Per file: the session row first
+    if it is new (hits reference it), its hits, then its fields with the new byte offset,
+    so a file's offset and the rows it covers land in the same transaction. -> new hits."""
+    new_hits = 0
+    for sid, path, new, hits, upd in pending:
+        if new:
+            store.upsert_session(conn, sid, path=path)
+        for h in hits:
+            new_hits += store.add_hit(conn, *h)
+        store.upsert_session(conn, sid, **upd)
+    return new_hits
+
+
+def _committed(conn, write):
+    """write() and commit; on any failure roll back (the write lock is never left held)
+    and raise. -> write()'s result."""
+    try:
+        out = write()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return out
 
 
 def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None,
          own_list: str | None = None) -> dict[str, Any]:
-    """Incremental scan of all top-level transcripts. Returns a stats dict."""
+    """Incremental scan of all top-level transcripts. Returns a stats dict. Commits in
+    short transactions as it goes (module doc), the last one with the own flags and
+    the scan time."""
     t0 = time.monotonic()
     own_conn = conn is None
     conn = conn or store.connect()
@@ -173,6 +209,8 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
     st = {"files": 0, "changed": 0, "rescanned": 0, "bytes": 0, "new_hits": 0, "new_sessions": 0}
     known = {r["session_id"]: dict(r) for r in conn.execute("SELECT * FROM sessions")}
     now = store.iso(datetime.now(UTC))
+    pending = []
+    flushed_at = time.monotonic()
     for path in transcripts(projects_dir):
         st["files"] += 1
         sid = os.path.basename(path)[:-len(".jsonl")]
@@ -198,31 +236,36 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
             fh.seek(off)
             chunk = fh.read(size - off)
         last_nl = chunk.rfind(b"\n")
-        if not row.get("session_id"):
-            store.upsert_session(conn, sid, path=path)   # hits reference the row (FK)
+        hits = []
         if last_nl >= 0:
             st["changed"] += 1
             st["bytes"] += last_nl + 1
-            hits, u = process_chunk(conn, sid, chunk[:last_nl + 1], row)
-            st["new_hits"] += hits
+            hits, u = process_chunk(sid, chunk[:last_nl + 1], row)
             upd.update(u)
             upd["last_scanned_offset"] = off + last_nl + 1
         else:
             upd["last_scanned_offset"] = off
-        store.upsert_session(conn, sid, **upd)
+        pending.append((sid, path, not row.get("session_id"), hits, upd))
         known[sid] = dict(row, **upd, session_id=sid)
+        if time.monotonic() - flushed_at >= FLUSH_SECONDS:
+            st["new_hits"] += _committed(conn, lambda: _write(conn, pending))
+            pending, flushed_at = [], time.monotonic()
     # own flag for every session (the own list can change without any transcript changing):
     # the DB (driven_sessions kind 'own', D-161) for the live list, else the side file
     import runner_state
     own_extra = runner_state.own_sessions(own_list)
-    for sid, r in known.items():
-        own = int(is_own(sid, r.get("cwd"), r.get("title"), own_extra))
-        if own != r.get("own"):
-            conn.execute("UPDATE sessions SET own=? WHERE session_id=?", (own, sid))
-    st["seconds"] = round(time.monotonic() - t0, 3)
-    store.set_meta(conn, "last_scan_at", now)
-    store.set_meta(conn, "last_scan_seconds", st["seconds"])
-    conn.commit()
+
+    def last_batch():
+        n = _write(conn, pending)
+        for sid, r in known.items():
+            own = int(is_own(sid, r.get("cwd"), r.get("title"), own_extra))
+            if own != r.get("own"):
+                conn.execute("UPDATE sessions SET own=? WHERE session_id=?", (own, sid))
+        st["seconds"] = round(time.monotonic() - t0, 3)
+        store.set_meta(conn, "last_scan_at", now)
+        store.set_meta(conn, "last_scan_seconds", st["seconds"])
+        return n
+    st["new_hits"] += _committed(conn, last_batch)
     st.update(store.counts(conn))
     if own_conn:
         conn.close()

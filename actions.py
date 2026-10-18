@@ -1844,7 +1844,8 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("nightly_tasks", "runner:nightly_tasks", ("tasks",), deletes=False),   # D-254/D-261: one row per task
     StateComponent("runner", "runner"),       # the resident runner: boot, exit, drain (runner.py)
 )}
-LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim", "runner")
+# "db": store.TimedConnection's warnings about write transactions held too long, from any process
+LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim", "runner", "db")
 LOG_LEVELS = ("info", "warn", "error")
 STATE_MARK = "state_file:"          # meta: the state file as the last DB save saw it (mtime_ns:size)
 STATE_AUDIT_PATHS = 20              # changed paths named in a save's audit row
