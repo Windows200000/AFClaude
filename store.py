@@ -19,6 +19,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Later column (COLUMNS, no version bump): tasks.estimated_sessions
                (D-213: how many full session windows the stage still needs, set by
                the task-manager or the stage-ETA review; NULL = stage_eta.py's default).
+               Later columns (COLUMNS, no version bump): projects.manager_model and
+               projects.manager_effort (D-260: the task-manager session's launch; NULL = the
+               default; manager_launch.py, set only by actions.project.manager_launch).
   v4 (dashboard phase 1, docs/dashboard_design.md §4): settings, prompt_overrides,
                audit_log (append-only), idempotency_keys, run_log, driven_sessions,
                action_requests; a `version` column on projects, tasks,
@@ -685,7 +688,8 @@ VERSION_TRIGGERS = [
 # connect() adds any that an existing database lacks.
 VERSION_COL = ("version", "INTEGER NOT NULL DEFAULT 0")
 COLUMNS = {
-    "projects": [("manager_session", "TEXT"), VERSION_COL],
+    "projects": [("manager_session", "TEXT"), VERSION_COL,
+                 ("manager_model", "TEXT"), ("manager_effort", "TEXT")],   # D-260: manager_launch.py
     "sessions": [],
     "limit_hits": [],
     "tasks": [VERSION_COL, ("estimated_sessions", "REAL")],   # D-213: stage_eta.py
@@ -1152,6 +1156,7 @@ RULE_SCOPES = ("session", "project")
 TASK_EDITABLE = ("title", "description", "project", "priority", "kind", "estimated_sessions")
 ESTIMATE_MAX = 100.0          # estimated_sessions: full session windows a stage still needs (D-213)
 PROJECT_EDITABLE = ("name", "description", "path", "manager_session")
+PROJECT_LAUNCH = ("manager_model", "manager_effort")   # D-260: only through set_project_launch (owner-only)
 
 _PRIO_SQL = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END"
 TASK_ORDER_SQL = f"{_PRIO_SQL}, p.rank IS NULL, p.rank, t.stage_seq, t.created_at, t.id"
@@ -1446,6 +1451,21 @@ def update_project(conn: sqlite3.Connection, ref: object, **fields: object) -> R
         if "manager_session" in fields:
             clean["manager_session"] = _text(fields["manager_session"], "manager_session")
         clean = {k: v for k, v in clean.items() if p[k] != v}
+        if clean:
+            conn.execute(f"UPDATE projects SET {', '.join(f'{k}=?' for k in clean)}, updated_at=? WHERE id=?",
+                         list(clean.values()) + [now_iso(), p["id"]])
+        return _project_row(conn, p["id"])
+
+
+def set_project_launch(conn: sqlite3.Connection, ref: object, **fields: str | None) -> Row:
+    """Set a project's task-manager launch (D-260): manager_model / manager_effort, already
+    checked by the caller (actions.project.manager_launch, manager_launch.py); None = the default."""
+    bad = set(fields) - set(PROJECT_LAUNCH)
+    if bad:
+        raise ValueError(f"not a launch field: {sorted(bad)} (fields: {', '.join(PROJECT_LAUNCH)})")
+    with transaction(conn):
+        p = _project_row(conn, ref)
+        clean = {k: v for k, v in fields.items() if p[k] != v}
         if clean:
             conn.execute(f"UPDATE projects SET {', '.join(f'{k}=?' for k in clean)}, updated_at=? WHERE id=?",
                          list(clean.values()) + [now_iso(), p["id"]])

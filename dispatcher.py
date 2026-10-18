@@ -441,7 +441,7 @@ class Pass:
             return
         reason_txt = "dispatcher, " + detail
         af = is_afclaude_cwd(cwd)
-        model = None                                  # AFClaude-repo sessions: LAUNCH (Opus 5.5, high)
+        model = None                                  # AFClaude-repo sessions: LAUNCH or their project's (D-260, ka.fire)
         if af:
             prog = os.path.join(cwd, "PROGRESS.md")
             msg = ka.session_message("continue", reason=reason_txt, hooked=ka.rules_hooked(cwd),  # D-225

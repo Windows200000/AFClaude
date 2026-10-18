@@ -83,6 +83,7 @@ import runner_state  # phase 2d: the state lives in the DB only (D-161); the log
 import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
+import manager_launch  # D-260: a project's task-manager model / effort
 
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
@@ -123,9 +124,11 @@ TAKE_OVER_WAIT = 30                       # seconds for a SIGTERMed holder to ex
 IGNORE_WINDOW = False  # --now: skip the window-start-hour gate (budget rule still applies)
 BACKLOG_FILE = os.path.join(HERE, "BACKLOG.md")
 TAKE_OVER_IDLE = False  # opt-in: SIGTERM an idle interactive holder (e.g. an open terminal)
-# Core AFClaude sessions always run on Opus 5.5 with high effort (user rule, 2026-09-26);
-# subagents they spawn may use other models.
-LAUNCH = {"model": "claude-opus-5-5", "effort": "high", "name": "task-manager keep-alive build"}
+# Core AFClaude sessions run on Opus 5.5 with high effort (user rule, 2026-09-26); subagents they
+# spawn may use other models. A project can give its task-manager another model / effort (D-260,
+# manager_launch.py): launch_for() puts that on top of this for the session it manages.
+LAUNCH = {"model": manager_launch.DEFAULT_MODEL, "effort": manager_launch.DEFAULT_EFFORT,
+          "name": "task-manager keep-alive build"}
 
 SCRUBBED_ENV = {
     "HOME": os.path.expanduser("~"),
@@ -944,9 +947,27 @@ def _preflight(session_id):
     return True, [], "resume"
 
 
+def launch_for(session_id, name=None, model=None):
+    """The ka_resume.sh launch (--model/--effort/--name) for session_id: LAUNCH, then the caller's
+    name / model, then the model / effort of the project(s) the session is the task-manager of
+    (D-260, manager_launch.for_session: the owner's per-project choice wins over a caller's model).
+    ka_resume.sh uses it only when it starts or resumes the session; a live tmux session just gets
+    the message and keeps its model. An unreadable DB or an invalid stored value raises (D-235):
+    the caller aborts the start, it is never launched on the default instead."""
+    import store
+    conn = store.connect()
+    try:
+        project = manager_launch.for_session(conn, session_id)
+    finally:
+        conn.close()
+    return {**LAUNCH, **({"name": name} if name else {}), **({"model": model} if model else {}), **project}
+
+
 def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
     """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg).
-    name/model override LAUNCH's for this launch."""
+    name/model override LAUNCH's for this launch; a project's task-manager launch overrides both
+    (launch_for, D-260). It is resolved first, so a failure there changes nothing."""
+    launch = launch_for(session_id, name, model)
     if plan.startswith("take-over:"):
         pids = [int(x) for x in plan.split(":", 1)[1].split(",")]
         for pid in pids:
@@ -969,7 +990,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
         time.sleep(5)
     cmd = [KA_RESUME, "--session", session_id, "--message", message,
            "--cwd", cwd]
-    for k, v in {**LAUNCH, **({"name": name} if name else {}), **({"model": model} if model else {})}.items():
+    for k, v in launch.items():
         if v:
             cmd += [f"--{k}", v]
     if new:
@@ -1761,7 +1782,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
-        log(f"WOULD FIRE (dry-run): plan={plan} cwd={cwd} ka_resume.sh --session {sid} {LAUNCH} {msg!r}")
+        log(f"WOULD FIRE (dry-run): plan={plan} cwd={cwd} ka_resume.sh --session {sid} {launch_for(sid)} {msg!r}")
         st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "dry-run", "plan": plan, "reason": reason}
         save_state(st)
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})")
