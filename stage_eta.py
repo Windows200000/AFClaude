@@ -42,6 +42,7 @@ Phase 2c (telemetry.py): each logged prediction also goes into the DB table stag
 
     python3 stage_eta.py [--db PATH]            the current prediction (JSON)
     python3 stage_eta.py --score [--db PATH]    the logged predictions vs the real completions
+    python3 stage_eta.py --split                the weekly % per usage cycle in three categories (D-221)
 """
 from __future__ import annotations
 
@@ -402,6 +403,35 @@ def score(log_rows: Iterable[Mapping[str, Any]], done: Mapping[int, datetime],
             "per_stage": {k: {"n": len(v), "bias_days": _r(statistics.fmean(v), 2)} for k, v in per.items()}}
 
 
+def usage_split(samples: Iterable[Mapping[str, Any]],
+                runs: Sequence[tuple[datetime, datetime, float]]) -> dict[str, dict[str, float]]:
+    """The weekly % per usage cycle (keyed by its reset date) in three categories (D-221, a
+    measurement for the review; the capacity model does not use it): "run" = the sample interval
+    overlaps an AFClaude run, "design" = AFClaude sessions' own activity outside runs (the owner's
+    task-manager chats; today user usage), "other" = other sessions on this host plus usage with no
+    host activity (other devices). A mixed interval is split by own vs other weighted tokens.
+    Samples without a weekly_pct_delta (before the token split existed) are skipped."""
+    out: dict[str, dict[str, float]] = {}
+    for s in samples:
+        d = s.get("weekly_pct_delta")
+        t = _ts(s.get("at"))
+        if not isinstance(d, (int, float)) or isinstance(d, bool) or t is None:
+            continue
+        since = _ts(s.get("since")) or t - timedelta(minutes=15)
+        u = s.get("usage") or {}
+        reset = str(((u.get("weekly") or {}).get("resets_at") or "?"))[:10]
+        c = out.setdefault(reset, {"run": 0.0, "design": 0.0, "other": 0.0})
+        own, oth = float(s.get("own_w_tokens") or 0), float(s.get("other_w_tokens") or 0)
+        if any(since <= r1 and t >= r0 for r0, r1, _ in runs):
+            c["run"] += d
+        elif own + oth <= 0:
+            c["other"] += d
+        else:
+            c["design"] += d * own / (own + oth)
+            c["other"] += d * oth / (own + oth)
+    return {k: {c: round(v, 1) for c, v in out[k].items()} for k in sorted(out)}
+
+
 # ------------------------------------------------------------------ live inputs (I/O)
 
 def open_stages(conn: sqlite3.Connection) -> list[Stage]:
@@ -477,11 +507,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Stage ETAs (D-213)")
     ap.add_argument("--db", help="SQLite file (default: store.DB_PATH)")
     ap.add_argument("--score", action="store_true", help="score the logged predictions")
+    ap.add_argument("--split", action="store_true", help="weekly %% per cycle: run / design / other (D-221)")
     args = ap.parse_args(argv)
     import store
     conn = store.connect(args.db or store.DB_PATH)
     try:
-        if args.score:
+        if args.split:
+            print(json.dumps(usage_split([json.loads(ln) for ln in telemetry.rows("usage.sample") if ln.strip()], run_sessions()), indent=1))
+        elif args.score:
             rows = []
             try:
                 rows = [json.loads(ln) for ln in telemetry.lines(LOG_FILE) if ln.strip()]

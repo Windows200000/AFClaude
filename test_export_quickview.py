@@ -614,5 +614,109 @@ class NextUsageReview(unittest.TestCase):
             self.assertIn(needle, page)
 
 
+PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")
+
+
+class UsageTiles(unittest.TestCase):
+    """The Session / Week tiles: the fields the page reads are the ones the export writes (the
+    browser check is tools/quickview_render_check.py)."""
+    def usage(self, cache):
+        from unittest import mock
+        import keepalive as ka
+        now = datetime.now(qv.UTC)
+        cache = dict(cache, fetched_at=now)
+        with mock.patch.object(ka, "read_usage_cache", return_value=cache):
+            return qv.keepalive_and_usage(now)
+
+    def test_export_and_page_agree(self):
+        out = self.usage({"session": {"percent": 40.0, "resets_at": datetime(2026, 10, 17, 3, 39, tzinfo=qv.UTC)},
+                          "weekly": {"percent": 7.0, "resets_at": datetime(2026, 10, 22, 17, 0, tzinfo=qv.UTC)}})
+        self.assertEqual(out["session"], {"percent": 40.0, "resets_at_berlin": "Sat 17.10. 05:39 CEST"})
+        self.assertEqual(out["weekly"]["percent"], 7.0)
+        self.assertNotIn("usage_error", out)
+        self.assertEqual(out["age_minutes"], 0.0)
+        self.assertTrue(out["fetched_at_berlin"])
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        for read in ('pctTile("Session", k.session', 'pctTile("Week", k.weekly', "u.percent", "u.resets_at_berlin",
+                     "k.usage_error", "k.fetched_at_berlin", "k.age_minutes"):
+            self.assertIn(read, page)
+
+    def test_no_window_open(self):
+        """After a reset with nothing used, /usage has no reset time: 0%, shown as "no window open"."""
+        out = self.usage({"session": {"percent": 0.0, "resets_at": None},
+                          "weekly": {"percent": 0.0, "resets_at": None}})
+        self.assertEqual(out["session"], {"percent": 0.0, "resets_at_berlin": None})
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            self.assertIn("no window open", fh.read())
+
+    def test_no_cache(self):
+        from unittest import mock
+        import keepalive as ka
+        with mock.patch.object(ka, "read_usage_cache", return_value=None):
+            out = qv.keepalive_and_usage(datetime.now(qv.UTC))
+        self.assertNotIn("session", out)
+        self.assertIn("usage_error", out)
+
+
+class PublishPage(unittest.TestCase):
+    """D-253: every export publishes the page next to status.json; nginx serves it as HTML."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old = (qv.OUT, qv.PAGE)
+        self.addCleanup(lambda: setattr(qv, "OUT", self.old[0]) or setattr(qv, "PAGE", self.old[1]))
+        qv.OUT = self.tmp.name
+
+    def test_publish_copies_the_page_atomically(self):
+        qv.PAGE = PAGE_FILE
+        with open(os.path.join(self.tmp.name, "AFClaude.html"), "w") as fh:
+            fh.write("old page")
+        qv.publish_page()
+        out = os.path.join(self.tmp.name, "AFClaude.html")
+        with open(PAGE_FILE, encoding="utf-8") as a, open(out, encoding="utf-8") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
+        self.assertEqual([f for f in os.listdir(self.tmp.name) if f.startswith(".tmp-")], [])
+
+    def test_unreadable_or_wrong_page_raises_and_keeps_the_old_one(self):
+        out = os.path.join(self.tmp.name, "AFClaude.html")
+        with open(out, "w") as fh:
+            fh.write("old page")
+        qv.PAGE = os.path.join(self.tmp.name, "missing.html")
+        with self.assertRaises(OSError):
+            qv.publish_page()
+        qv.PAGE = os.path.join(self.tmp.name, "empty.html")
+        open(qv.PAGE, "w").close()
+        with self.assertRaises(ValueError):
+            qv.publish_page()
+        with open(out) as fh:
+            self.assertEqual(fh.read(), "old page")
+
+    def test_main_publishes_the_page_after_the_data(self):
+        from unittest import mock
+        qv.PAGE = PAGE_FILE
+        written = []
+        real = qv.write_atomic
+        blocks = {n: mock.DEFAULT for n in ("automation_block", "keepalive_and_usage", "context_block", "parse_goals",
+                                             "stages", "latest_decision", "needs_input", "inbox_block", "cron_entries")}
+        with mock.patch.multiple(qv, all_docs=lambda: [], doc_source=lambda n, s: ("", None), **blocks), \
+                mock.patch.object(qv.ka, "read_usage_cache", return_value=None), \
+                mock.patch.object(qv.glob, "glob", return_value=[]), \
+                mock.patch.object(qv, "write_atomic", lambda n, d: written.append(n) or real(n, d)):
+            for n in blocks:
+                getattr(qv, n).return_value = {}
+            qv.main()
+        self.assertEqual(written, ["status.json", "AFClaude.html"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "AFClaude.html")))
+
+    def test_nginx_serves_html_as_html(self):
+        with open(os.path.join(os.path.dirname(PAGE_FILE), "nginx.conf"), encoding="utf-8") as fh:
+            conf = fh.read()
+        loc = conf[conf.index("location /afclaude/ {"):conf.index("location /afclaude/api/")]
+        self.assertRegex(loc, r"types \{[^}]*text/html html;")
+        self.assertRegex(loc, r"charset_types [^;]*text/html")
+
+
 if __name__ == "__main__":
     unittest.main()

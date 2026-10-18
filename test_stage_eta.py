@@ -277,5 +277,25 @@ class StoreAndDashboard(unittest.TestCase):
             self.assertIn(needle, html)
 
 
+class UsageSplitTest(unittest.TestCase):
+    """usage_split (D-221 measurement): run / design / other per weekly cycle."""
+
+    def test_categories(self) -> None:
+        t0 = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
+        wk = {"weekly": {"resets_at": "2026-10-15 17:00:00+00:00"}}
+
+        def smp(h: int, d: float, own: float, oth: float) -> dict:
+            t = t0 + timedelta(hours=h)
+            return {"at": t.isoformat(), "since": (t - timedelta(minutes=15)).isoformat(), "usage": wk,
+                    "weekly_pct_delta": d, "own_w_tokens": own, "other_w_tokens": oth}
+        runs = [(t0 + timedelta(hours=1), t0 + timedelta(hours=2), 0.5)]
+        rows = [smp(1, 3, 100, 0),      # in a run: run, whatever the tokens
+                smp(5, 4, 300, 100),    # mixed outside a run: 3 design, 1 other
+                smp(6, 2, 0, 0),        # no host activity: other device
+                {"at": t0.isoformat(), "usage": wk}]   # no delta (old sample): skipped
+        self.assertEqual(se.usage_split(rows, runs),
+                         {"2026-10-15": {"run": 3.0, "design": 3.0, "other": 3.0}})
+
+
 if __name__ == "__main__":
     unittest.main()
