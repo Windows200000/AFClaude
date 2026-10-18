@@ -1736,7 +1736,9 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
     held, held_ids = inbox_held(sid)     # D-244: held "now" inbox messages go along, to be answered
     notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
-    msg = build(with_notes(with_notes(stall.get("insert"), held), notes))
+    # D-254: a night start (not a last-stretch slot or a fill-up) says when the monthly review is due
+    review, review_id = monthly_review_due() if stall.get("prompt", "continue") == "continue" else (None, None)
+    msg = build(with_notes(with_notes(with_notes(stall.get("insert"), held), notes), review))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -1755,6 +1757,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
               "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
+    if review_id:
+        result["monthly_review"] = review_id   # usage_review.track_monthly counts the runs that took it along
     if rc == 0 and held_ids:
         result["inbox_now"] = held_ids
         if not inbox_delivered(held_ids, f"{plan}, with the start {key}"):
@@ -2349,6 +2353,20 @@ def inbox_notes(sid):
         return inbox.notes_insert(conn, sid)
     finally:
         conn.close()
+
+
+def monthly_review_due():
+    """D-254: the monthly usage review usage_review.py marked due (its state's "monthly", the DB),
+    as one line for a night start's message (monthly_review_due.md) -> (text or None, its id). An
+    unreadable state raises: the caller aborts the start (D-235)."""
+    import failstop
+    st = runner_state.load("usage_review", runner_state.live_path("usage_review"))
+    if getattr(st, "unavailable", False):
+        raise failstop.Failed("the usage review state could not be read", runner_state.load_failed() or "")
+    p = st.get("monthly")
+    if not p:
+        return None, None
+    return load_prompt("monthly_review_due").format(**p).strip(), p["review_id"]
 
 
 def inbox_held(sid):

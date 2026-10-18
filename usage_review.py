@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """Periodic usage-model review (user rules, 2026-09-29).
 
-ONE run that tests hypotheses on data/ (samples, Haiku judgements, weekly cycles,
+ONE review that tests hypotheses on data/ (samples, Haiku judgements, weekly cycles,
 keep-alive decisions), then sorts every finding into universal (goes into the code,
-public) or user-specific (the user model in the DB, local only). It starts a NEW
-Opus 5.5 session at MEDIUM effort (tmux, Remote-Control visible, via ka_resume.sh)
-with prompts/usage_review.md + stage_eta_review.md (the rare stage-ETA review, D-213:
-it tunes the stages' session estimates only) + guard_respect.md + manager.md, and runs
-without user input. The report is the review doc review:<date> in the DB (`tasks.py doc set`,
-design §7.7; the old data/reviews/<date>.md files are legacy, still imported); the results are
-surfaced via the progress doc, a push, and an "unread review" memory entry that the user's next
-conversation picks up.
+public) or user-specific (the user model in the DB, local only), with prompts/usage_review.md +
+stage_eta_review.md (the rare stage-ETA review, D-213: it tunes the stages' session estimates
+only). The report is the review doc review:<date> in the DB (`tasks.py doc set`, design §7.7; the
+old data/reviews/<date>.md files are legacy, still imported); the results are surfaced via the
+progress doc, a push, and an "unread review" memory entry that the user's next conversation picks up.
 
 usage_reviews (the review docs' structured part, D-161, design §7.2): every launch is a record
-in the DB (telemetry kind usage.review, keyed by the session id): which reviews, one-off or
-monthly, when, the report doc, the attempt, and its status (started -> finished / no_report /
-limit / died, or launch_failed / timed_out); the hourly cron run (track_reviews) marks a started
+in the DB (telemetry kind usage.review, keyed by the session id; the monthly one by its
+monthly-<time> id): which reviews, one-off or monthly, when, the report doc, the attempt, and its
+status (started -> finished / no_report / limit / died, or launch_failed / timed_out; the monthly
+one pending -> finished / not_done); the hourly cron run (track_reviews) marks a started
 review finished once its report doc exists and its session went idle, limit or died once
 review_death() finds it dead, or no_report after REVIEW_REPORT_DEADLINE.
 
-Schedule: at `next_run_at` in its state (the DB, runner_state "usage_review"). The first run is Thu 2026-10-01 17:00
-Berlin, 2 h before that week's reset, so it spends quota that would expire anyway.
-It deliberately IGNORES the weekly budget rule and the night window (but not the quota a
-review needs, see Quota below). Each later run is 2 h before the first weekly reset that is at
-least MIN_GAP_DAYS after the previous run. Cron checks hourly.
+The monthly review (D-254): a task for the next nightly run, not a session of its own. At
+`next_run_at` in its state (the DB, runner_state "usage_review"; then MIN_GAP_DAYS later) the
+hourly cron run marks it due: st["monthly"] (pending, its usage_reviews record status "pending"),
+no session started. Every night start's continue (keepalive._fire_start, keepalive.monthly_review_due;
+not a last-stretch slot or a fill-up) carries one line saying it is due, and the start's handled
+entry its id (monthly_review). The task-manager runs it as a worker subagent inside that run's
+budget, its brief printed by `usage_review.py --brief` (usage_review.md + stage_eta_review.md,
+filled in); it writes review:<date> (the date it became due). The hourly run (track_monthly)
+marks it finished once that doc was written after it became due; still without it once
+MONTHLY_MAX_RUNS night starts took it along and the last one's run is over (MONTHLY_RUN_SPAN),
+it is an error (D-235): the pending one ends not_done and it is due again (a fresh count) once the
+owner has cleared the pause.
 
-  usage_review.py            # cron mode: run if next_run_at has passed
+  usage_review.py            # cron mode: track the reviews; mark the monthly one due once next_run_at passed
   usage_review.py --status
-  usage_review.py --now      # run immediately
+  usage_review.py --now      # mark the monthly one due now
+  usage_review.py --brief    # the pending monthly review's brief (for the task-manager's worker)
 
 One-off review (--only, owner request, D-220/D-221): run just ONE of the reviews below, outside
 the monthly schedule, without touching next_run_at or st["runs"] (st["one_off_runs"] instead) --
@@ -65,11 +71,11 @@ too) and from every hourly cron run (the backstop that re-spools it), under a fi
 pass at a time, so the ETA leg never fires twice).
 
 Quota (fix of 15.10.: the one-off review started at 99 % weekly and its worker died at the
-limit three minutes later): no review session starts (monthly, one-off, either chain leg)
-unless the fresh usage reading (keepalive.fresh_usage, the keep-alive's own) has REVIEW_NEEDS
-free; otherwise it is POSTPONED to the reset that frees it (+ RESET_GRACE): a one-off gets an
-at job for that time, the monthly one a later next_run_at, the chain's ETA leg a later chain
-step. Postponing is logged, noted in the progress doc and kept in st["postponed"]; it is not an
+limit three minutes later): no review session starts (one-off, either chain leg; the monthly one
+has no session, it runs inside a nightly run's budget) unless the fresh usage reading
+(keepalive.fresh_usage, the keep-alive's own) has REVIEW_NEEDS free; otherwise it is POSTPONED to
+the reset that frees it (+ RESET_GRACE): a one-off gets an at job for that time, the chain's ETA
+leg a later chain step. Postponing is logged, noted in the progress doc and kept in st["postponed"]; it is not an
 error. A reading that fails, or a meter without a reset time to postpone to, is (D-235).
 
 Dead reviews (review_death()): a review session whose transcript ends on a usage-limit notice,
@@ -82,9 +88,10 @@ alert, no pause); a second limit death, or any other death, is an error (fail-st
 Failures (D-234/D-235, failstop.py): a launch that fails, a dead review, a chained usage review
 that does not finish within USAGE_DONE_TIMEOUT, a review without its report after
 REVIEW_REPORT_DEADLINE, an `at` job that can't be scheduled, a report doc that can't be read, a
-crash: an ERROR line, an alert, and automation paused until the owner clears it (`tasks.py
-automation resume`). While automation is paused no review starts: the monthly one waits (the
-hourly cron run starts it once the pause is cleared), a pending chain step waits too (the hourly
+crash, a monthly review not done after MONTHLY_MAX_RUNS nightly runs: an ERROR line, an alert, and
+automation paused until the owner clears it (`tasks.py automation resume`). While automation is
+paused no review starts: the monthly one is not marked due (the hourly cron run does it once the
+pause is cleared), a pending chain step waits too (the hourly
 run picks it up), a one-off one (its `at` job is used up) is reported and must be scheduled
 again.
 """
@@ -105,12 +112,15 @@ import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
 import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
 import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
+import afclaude_config  # noqa: E402  (SESSION_LENGTH: how long a run can last)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
 FIRST_RUN = datetime(2026, 10, 1, 17, 0, tzinfo=ka.BERLIN)
 MIN_GAP_DAYS = 28                    # "once a month, or every other month"; tune here
-BEFORE_RESET = timedelta(hours=2)
+MONTHLY_MAX_RUNS = 3                 # D-254: night starts that took the due review along without its report: an error
+MONTHLY_RUN_SPAN = afclaude_config.SESSION_LENGTH + timedelta(hours=1)   # ... once the last one's run is over
+MONTHLY_REVIEWS = ("usage", "stage-eta")
 MODEL, EFFORT = "claude-opus-5-5", "medium"
 # --only names -> their one-off prompt (prompts/<name>.md), distinct from the regular review's
 # own prompt so the one-off brief (the owner's specific ask) can differ from the periodic one.
@@ -353,42 +363,6 @@ def schedule_once(which, at_str, now=None):
 
 # ---------------------------------------------------------------- launches
 
-def next_run_after(now):
-    """2 h before the first weekly reset >= MIN_GAP_DAYS from now."""
-    u = ka.read_usage_cache() or {}
-    reset = (u.get("weekly") or {}).get("resets_at")
-    if not reset:
-        return now + timedelta(days=MIN_GAP_DAYS)
-    while reset < now + timedelta(days=MIN_GAP_DAYS):
-        reset += ka.WEEK
-    return reset - BEFORE_RESET
-
-
-def run(st, now):
-    """Fire the monthly review (start_monthly() checks the quota first)."""
-    local = now.astimezone(ka.BERLIN)
-    since = st["runs"][-1]["at"][:10] if st["runs"] else "2026-09-26"
-    d = local.date().isoformat()
-    parts = [ka.load_prompt("usage_review").format(date=d, since=since),
-             ka.load_prompt("stage_eta_review").format(date=d),
-             ka.load_prompt("guard_respect"), ka.load_prompt("manager")]
-    msg = " ".join(" ".join(parts).split())
-    sid = str(uuid.uuid4())
-    ka.LAUNCH.update(model=MODEL, effort=EFFORT)
-    rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude usage review {d}")
-    ok = rc == 0 and out.strip().startswith("started")
-    st["runs"].append({"at": now.isoformat(), "session": sid, "rc": rc, "out": out.strip(), "err": err.strip()[-300:]})
-    attempt, st["retry_attempt"] = st.get("retry_attempt") or 1, None   # None, not deleted: the state never deletes
-    record_review(sid, ("usage", "stage-eta"), now, ok, rc, False, attempt=attempt)
-    if ok:
-        st["next_run_at"] = next_run_after(now).isoformat()
-        ka.log(f"usage review started: {sid}")
-        ka.progress_note(f"usage review started: session {sid} (Opus medium, tmux ka-{sid[:8]}); "
-                         f"next {ka.berlin(datetime.fromisoformat(st['next_run_at']))}")
-    else:
-        fail_stop("usage review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
-
-
 def run_once(st, now, which, extra=None, record=None):
     """A one-off review of just `which` (one ONLY_PROMPTS key: "stage-eta" or "usage"), fired
     right away in its OWN fresh session: its own prompt (not the regular periodic one; "usage"
@@ -418,20 +392,6 @@ def run_once(st, now, which, extra=None, record=None):
     else:
         fail_stop(f"one-off {which} review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
     return ok
-
-
-def start_monthly(st, now):
-    """The due monthly review (or --now): run() if the quota allows, else postponed (next_run_at =
-    the point with quota; the hourly cron run starts it then). -> started."""
-    q = quota_check(now, "monthly usage")
-    if q:
-        st["next_run_at"] = q["until"].isoformat()
-        note_postponed(st, now, "monthly usage", q["until"], q["why"], st.get("retry_attempt") or 1)
-        save_checked(st, "the postponed monthly review's next_run_at")
-        return False
-    run(st, now)
-    save(st)
-    return True
 
 
 def start_one_off(st, now, which, attempt=1):
@@ -569,14 +529,10 @@ def review_death(sid, now):
 
 
 def retry_review(st, rec, when, attempt, now):
-    """Schedule the retry of review `rec` (it hit a usage limit) at `when`: the monthly one by its
-    next_run_at, a solo one-off by an at job, the chain's usage leg as the whole chain again (an
-    at job), its ETA leg as a pending chain step pointed at the same usage report."""
-    if not rec.get("one_off"):
-        st["next_run_at"] = when.isoformat()
-        st["retry_attempt"] = attempt
-        save_checked(st, "the monthly review's retry")
-    elif rec.get("chain") == "usage":
+    """Schedule the retry of review `rec` (it hit a usage limit) at `when`: a solo one-off by an at
+    job, the chain's usage leg as the whole chain again (an at job), its ETA leg as a pending chain
+    step pointed at the same usage report. (The monthly review has no session of its own, D-254.)"""
+    if rec.get("chain") == "usage":
         spool_review(CHAIN, when, attempt)
     elif rec.get("chain") == "stage-eta":
         if st.get("chain"):
@@ -757,6 +713,101 @@ def chain_pass(st, now):
     return chain_eta_step(st, st["chain"], now)
 
 
+# ---------------------------------------------------------------- the monthly review (D-254)
+
+def mark_due(st, now):
+    """The monthly review is due (D-254): recorded as pending (st["monthly"], a usage_reviews
+    record with status "pending"), no session started: the next nightly run's start message
+    carries it (keepalive.monthly_review_due) and the task-manager runs it as a worker subagent.
+    next_run_at moves MIN_GAP_DAYS on. -> the pending entry."""
+    d = now.astimezone(ka.BERLIN).date().isoformat()
+    since = st["runs"][-1]["at"][:10] if st["runs"] else "2026-09-26"
+    p = {"review_id": f"monthly-{now.astimezone(UTC):%Y-%m-%dT%H:%MZ}", "date": d, "since": since,
+         "report": report_doc(now), "due_at": now.isoformat()}
+    st["monthly"] = p
+    st["runs"].append({"at": now.isoformat(), "review_id": p["review_id"], "mode": "nightly run (D-254)"})
+    st["next_run_at"] = (now + timedelta(days=MIN_GAP_DAYS)).isoformat()
+    save_checked(st, "the pending monthly review")
+    telemetry.write_records("usage.review", [{
+        "review_id": p["review_id"], "session": None, "reviews": list(MONTHLY_REVIEWS), "one_off": False,
+        "date": d, "started_at": now.isoformat(), "report_doc": p["report"], "status": "pending", "final": False,
+        "attempt": 1}], actor=ACTOR)
+    ka.log(f"usage review: the monthly review is due ({p['review_id']}): the next nightly run takes it along")
+    ka.progress_note(f"monthly usage review due: the next nightly run takes it along (D-254), report {p['report']}; "
+                     f"next one due {ka.berlin(datetime.fromisoformat(st['next_run_at']))}")
+    return p
+
+
+def monthly_brief(st):
+    """The pending monthly review's brief for the task-manager's worker (`--brief`): usage_review.md
+    + stage_eta_review.md, filled in. -> text, None if none is pending."""
+    p = st.get("monthly")
+    if not p:
+        return None
+    return "\n\n".join([ka.load_prompt("usage_review").format(date=p["date"], since=p["since"]).strip(),
+                         ka.load_prompt("stage_eta_review").format(date=p["date"]).strip()])
+
+
+def monthly_carried(p):
+    """The night starts that took the pending monthly review `p` along: the keep-alive's handled
+    entries carrying its id (monthly_review) that started a run. -> their times, oldest first. An
+    unreadable keep-alive state is an error (D-235)."""
+    st = ka.load_state()
+    if getattr(st, "unavailable", False):
+        raise failstop.Failed("the keep-alive state could not be read", "checking the pending monthly review")
+    times = [ka.parse_ts(r.get("at")) for r in (st.get("handled") or {}).values()
+             if isinstance(r, dict) and r.get("monthly_review") == p["review_id"] and r.get("result") in ka.RUN_RESULTS]
+    return sorted(t for t in times if t is not None)
+
+
+def report_written_since(report, since):
+    """The report doc `report` exists in the DB and was written at or after `since` (an older doc of
+    the same name does not count). A DB read error is an error (D-234/D-235)."""
+    import store
+    try:
+        conn = store.connect()
+        try:
+            proj = store.get_project(conn, os.path.abspath(HERE))
+            doc = store.get_doc(conn, proj["id"], report) if proj is not None else None
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - an error, not "not written yet"
+        raise failstop.Failed("a review's report doc could not be read", f"{report}: {type(e).__name__}: {e}"[:300]) \
+            from None
+    written = ka.parse_ts(doc["updated_at"]) if doc else None
+    return written is not None and written >= since
+
+
+def track_monthly(st, now):
+    """The hourly check of the pending monthly review (D-254): finished once its report doc was
+    written after it became due (the pending entry cleared); still without it once MONTHLY_MAX_RUNS
+    night starts took it along and the last one's run is over (MONTHLY_RUN_SPAN): an error
+    (fail-stop), the record ends not_done, and next_run_at is now, so the hourly run marks it due
+    again (a fresh count) once the owner has cleared the pause. -> "finished" | "not_done" | None."""
+    p = st.get("monthly")
+    if not p:
+        return None
+    carried = monthly_carried(p)
+    if report_written_since(p["report"], datetime.fromisoformat(p["due_at"])):
+        finish_review(p["review_id"], "finished", now, runs=len(carried))
+        st["monthly"] = None      # None, never deleted: the usage_review state never deletes a key
+        save_checked(st, "the finished monthly review")
+        ka.log(f"usage review: the monthly review {p['review_id']} is done ({p['report']}, {len(carried)} night run(s))")
+        return "finished"
+    if len(carried) >= MONTHLY_MAX_RUNS and now - carried[-1] >= MONTHLY_RUN_SPAN:
+        why = (f"{len(carried)} nightly runs took it along (the last started {ka.berlin(carried[-1])}), but its "
+               f"report doc {p['report']} was not written")
+        finish_review(p["review_id"], "not_done", now, runs=len(carried), why=why)
+        st["monthly"] = None
+        st["next_run_at"] = now.isoformat()
+        save_checked(st, "the monthly review that was not done")
+        fail_stop("the monthly usage review was not done",
+                  f"{p['review_id']}, due since {ka.berlin(datetime.fromisoformat(p['due_at']))}: {why}. It is due "
+                  "again (the next nightly runs take it along) once the pause is cleared.")
+        return "not_done"
+    return None
+
+
 def main():
     try:
         return _main()
@@ -771,7 +822,10 @@ def main():
 def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--status", action="store_true")
-    ap.add_argument("--now", action="store_true")
+    ap.add_argument("--now", action="store_true", help="mark the monthly review due now (D-254); with --only: "
+                                                         "run that one-off review now")
+    ap.add_argument("--brief", action="store_true",
+                    help="print the pending monthly review's brief (the task-manager's worker runs it, D-254)")
     ap.add_argument("--only", type=parse_only,
                     help="run (or, with --at, schedule) only this review, once, outside the monthly schedule: "
                          f"'stage-eta', 'usage', or the chained '{CHAIN}' (D-228)")
@@ -790,6 +844,13 @@ def _main():
     if args.status:
         print(json.dumps(st, indent=1), "\nnext:", ka.berlin(datetime.fromisoformat(st["next_run_at"])))
         return
+    if args.brief:
+        brief = monthly_brief(st)
+        if brief is None:
+            sys.stderr.write("no monthly usage review is pending (usage_review.py --status)\n")
+            return 1
+        print(brief)
+        return
     if args.at:
         print(json.dumps(schedule_once(args.only, args.at, now), indent=1))
         return
@@ -807,6 +868,7 @@ def _main():
 def _locked(args, st, now):
     for rec in track_reviews(now, st):
         ka.log(f"usage review {rec['review_id'][:8]} ({'+'.join(rec.get('reviews') or [])}): {rec['status']}")
+    track_monthly(st, now)
     pause = failstop.paused()     # the install-wide pause only: the reviews are no one project's (D-244)
     if pause["paused"] and (args.only or args.now or now >= datetime.fromisoformat(st["next_run_at"])):
         why = pause.get("reason") or "no reason given"
@@ -815,8 +877,8 @@ def _locked(args, st, now):
             ka.alert(f"one-off {args.only} review not started: automation is paused",
                      f"Paused: {why}. Schedule it again (usage_review.py --only {args.only} --at ...) once the "
                      f"pause is cleared ({failstop.RESUME_CMD}).")
-        else:             # the monthly one: the hourly cron run starts it once the pause is cleared
-            ka.log(f"usage review: due, but automation is paused ({why}); it starts once the pause is cleared")
+        else:             # the monthly one: the hourly cron run marks it due once the pause is cleared
+            ka.log(f"usage review: due, but automation is paused ({why}); it is marked due once the pause is cleared")
         return 0
     if args.only:
         if args.only == CHAIN:
@@ -827,8 +889,8 @@ def _locked(args, st, now):
     chain_pass(st, now)          # --chain-step, and every hourly run (the backstop)
     if args.chain_step:
         return
-    if args.now or now >= datetime.fromisoformat(st["next_run_at"]):
-        start_monthly(st, now)
+    if (args.now or now >= datetime.fromisoformat(st["next_run_at"])) and not st.get("monthly"):
+        mark_due(st, now)
     elif not stored():
         save(st)
 

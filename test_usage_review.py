@@ -9,7 +9,9 @@ review and keeps the pending step in the state (no long-lived waiter: a containe
 lose it), chain_pass() then fires a SEPARATE fresh session for the ETA review pointed at its
 result. The quota gate (no review starts without REVIEW_NEEDS free: postponed to the reset) and
 the dead-review detection (review_death: a usage limit is retried once after the reset, any
-other death is an error at once), with fixture transcripts."""
+other death is an error at once), with fixture transcripts. The monthly review (D-254): due ->
+pending with no session, the night start's continue carries one line (never a fill-up or a
+last-stretch slot), done once its report doc exists, an error after MONTHLY_MAX_RUNS runs."""
 import argparse
 import json
 import os
@@ -27,6 +29,7 @@ import store  # noqa: E402
 import telemetry  # noqa: E402
 import afclaude_config  # noqa: E402
 import runner_state  # noqa: E402
+import test_compaction as tc  # noqa: E402  (its Env: a fake tmux session and transcript, for the night starts)
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
@@ -390,10 +393,10 @@ class UsageReviewRecords(Base):
     def test_no_report_and_launch_failure(self):
         st = {"next_run_at": (NOW + timedelta(days=5)).isoformat(), "runs": []}
         when = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
-        ur.run(st, when)
+        ur.run_once(st, when, "usage")
         sid = self.fires[-1][0]
-        self.assertEqual(self.rec(sid)["reviews"], ["usage", "stage-eta"])
-        self.assertFalse(self.rec(sid)["one_off"])
+        self.assertEqual(self.rec(sid)["reviews"], ["usage"])
+        self.assertTrue(self.rec(sid)["one_off"])
         ur.session_idle = lambda s, now, idle=None: False
         self.assertEqual(ur.track_reviews(when + timedelta(hours=23)), [])
         done = ur.track_reviews(when + ur.REVIEW_REPORT_DEADLINE)
@@ -502,12 +505,10 @@ class QuotaGate(Transcripts):
     def test_session_short_postpones_to_the_session_reset(self):
         self.usage = usage(weekly=20.0, session=70.0, now=T0)
         st = ur.load()
-        st["next_run_at"] = T0.isoformat()
-        self.assertFalse(ur.start_monthly(st, T0))
+        self.assertFalse(ur.start_one_off(st, T0, "stage-eta"))
         self.assertEqual(self.fires, [])
-        st = ur.load()
-        self.assertEqual(st["next_run_at"], "2026-10-15T16:02:00+00:00")   # the session reset + grace
-        self.assertEqual(st["postponed"][-1]["review"], "monthly usage")
+        self.assertEqual(self.at_jobs()[0][0], "202610151602")                # the session reset + grace
+        self.assertEqual(ur.load()["postponed"][-1]["review"], "one-off stage-eta")
         self.assertEqual(self.alerts, [])
 
     def test_enough_quota_starts_as_before(self):
@@ -780,20 +781,6 @@ class TrackDeaths(Transcripts):
         self.assertIn("usage_review.py --only usage --now --attempt 2", self.at_jobs()[0][1])
         self.assertFalse(self.paused())
 
-    def test_monthly_limit_death_moves_next_run_at_to_the_reset(self):
-        st = ur.load()
-        ur.run(st, T0)
-        ur.save(st)
-        sid = self.fires[-1][0]
-        self.transcript(sid, [entry("user", T0), entry("limit", T0 + timedelta(minutes=3))])
-        ur.track_reviews(self.now)
-        st = ur.load()
-        self.assertEqual((st["next_run_at"], st["retry_attempt"]), ("2026-10-15T17:02:00+00:00", 2))
-        self.usage = usage(weekly=0.0, now=T0 + timedelta(hours=4))
-        ur.start_monthly(st, T0 + timedelta(hours=4))
-        self.assertEqual(self.rec(self.fires[-1][0])["attempt"], 2)
-        self.assertIsNone(ur.load()["retry_attempt"])
-
     def test_a_dead_solo_review_is_an_error(self):
         st = ur.load()
         ur.run_once(st, T0, "stage-eta")
@@ -806,6 +793,186 @@ class TrackDeaths(Transcripts):
         self.assertEqual(self.rec(sid)["status"], "died")
         self.assertTrue(self.paused())
         self.assertEqual(self.at_calls, [])
+
+
+# ---------------------------------------------------------------- the monthly review (D-254)
+
+class Monthly(Base):
+    """D-254: the due monthly review starts no session; it is pending (st["monthly"]) until the
+    hourly run finds its report doc, or an error after MONTHLY_MAX_RUNS night starts took it along."""
+    def setUp(self):
+        super().setUp()
+        this_project()
+        ur.STATE = runner_state.live_path("usage_review")    # the DB, as live (keepalive reads it there)
+        st = ur.load()
+        st.update(monthly=None, chain=None, next_run_at=(NOW - timedelta(minutes=1)).isoformat())
+        self.assertTrue(ur.save(st))
+        self.t0 = datetime.now(UTC)      # wall clock: a report doc's updated_at is the real time
+        self.saved_ka_state = ka.STATE_FILE
+        ka.STATE_FILE = os.path.join(self.tmp.name, "keepalive_state.json")   # the night starts' handled entries
+
+    def tearDown(self):
+        ka.STATE_FILE = self.saved_ka_state
+        st = ur.load()
+        st["monthly"] = None
+        ur.save(st)
+        super().tearDown()
+
+    def cron(self, *argv):
+        old_argv = sys.argv
+        sys.argv = ["usage_review.py", *argv]
+        try:
+            return ur.main()
+        finally:
+            sys.argv = old_argv
+
+    def carried(self, p, at, key=None, result="continued-in-place"):
+        """A night start at `at` that took the pending review along (keepalive._fire_start's entry)."""
+        st = ka.load_state()
+        st["handled"][key or f"window-start-{at.isoformat()}"] = {
+            "at": at.isoformat(), "result": result, "plan": "send-keys", "monthly_review": p["review_id"]}
+        ka.save_state(st)
+
+    def test_due_is_pending_with_no_session(self):
+        self.cron()
+        self.assertEqual((self.fires, self.at_calls, self.alerts), ([], [], []))
+        st = ur.load()
+        p = st["monthly"]
+        self.assertEqual((p["report"], p["since"]), (ur.report_doc(datetime.now(UTC)), p["since"]))
+        self.assertTrue(p["review_id"].startswith("monthly-"))
+        self.assertGreater(datetime.fromisoformat(st["next_run_at"]), datetime.now(UTC) + timedelta(days=27))
+        rec = ur.review_record(p["review_id"])
+        self.assertEqual((rec["status"], rec["final"], rec["one_off"], rec["reviews"], rec["session"]),
+                         ("pending", False, False, ["usage", "stage-eta"], None))
+        self.cron()                                         # the next hourly run: still pending, nothing new
+        self.assertEqual(ur.load()["monthly"], p)
+        self.assertEqual(self.fires, [])
+
+    def test_now_marks_it_due_and_brief_prints_the_filled_in_prompts(self):
+        self.assertEqual(self.cron("--brief"), 1)           # nothing pending yet
+        st = ur.load()
+        st["next_run_at"] = (datetime.now(UTC) + timedelta(days=5)).isoformat()
+        ur.save(st)
+        self.cron("--now")
+        p = ur.load()["monthly"]
+        brief = ur.monthly_brief(ur.load())
+        self.assertIn(f"[AFClaude usage review {p['date']}]", brief)
+        self.assertIn(f"since {p['since']}", brief)
+        self.assertIn(f"[AFClaude stage-ETA review {p['date']}]", brief)
+        self.assertNotIn("{date}", brief)
+        self.assertNotIn("{since}", brief)
+        self.assertIn("worker subagent inside a nightly run", brief)
+        self.assertEqual(self.fires, [])
+
+    def test_done_once_the_report_exists(self):
+        p = ur.mark_due(ur.load(), self.t0)
+        self.carried(p, self.t0 + timedelta(hours=11))
+        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=12)))   # no report yet
+        set_doc(p["report"], "# Review\n")
+        self.assertEqual(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=13)), "finished")
+        self.assertIsNone(ur.load()["monthly"])
+        rec = ur.review_record(p["review_id"])
+        self.assertEqual((rec["status"], rec["final"], rec["runs"]), ("finished", True, 1))
+        self.assertFalse(self.paused())
+
+    def test_an_older_doc_of_the_same_name_does_not_count(self):
+        set_doc(ur.report_doc(self.t0), "# an earlier review the same day\n")
+        p = ur.mark_due(ur.load(), datetime.now(UTC) + timedelta(seconds=1))
+        self.carried(p, self.t0 + timedelta(minutes=30))
+        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=1)))
+        self.assertEqual(ur.load()["monthly"], p)
+
+    def test_an_error_after_max_runs_that_took_it_along(self):
+        p = ur.mark_due(ur.load(), self.t0)
+        night = self.t0 + timedelta(hours=11)
+        for i in range(ur.MONTHLY_MAX_RUNS):
+            self.carried(p, night + timedelta(days=i))
+        self.carried(p, night + timedelta(days=5), result="start-failed")      # never started a run: not counted
+        last = night + timedelta(days=ur.MONTHLY_MAX_RUNS - 1)
+        self.assertIsNone(ur.track_monthly(ur.load(), last + timedelta(hours=2)))   # its run may still be going
+        self.assertFalse(self.paused())
+        self.assertEqual(ur.track_monthly(ur.load(), last + ur.MONTHLY_RUN_SPAN), "not_done")
+        self.assertTrue(self.paused())
+        self.assertIn("the monthly usage review was not done", self.alerts[-1][0])
+        st = ur.load()
+        self.assertIsNone(st["monthly"])
+        self.assertEqual(st["next_run_at"], (last + ur.MONTHLY_RUN_SPAN).isoformat())   # due again after the pause
+        rec = ur.review_record(p["review_id"])
+        self.assertEqual((rec["status"], rec["final"], rec["runs"]), ("not_done", True, ur.MONTHLY_MAX_RUNS))
+
+    def test_two_runs_are_not_yet_an_error(self):
+        p = ur.mark_due(ur.load(), self.t0)
+        for i in range(ur.MONTHLY_MAX_RUNS - 1):
+            self.carried(p, self.t0 + timedelta(days=i, hours=11))
+        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(days=10)))
+        self.assertFalse(self.paused())
+
+    def test_one_offs_keep_their_own_sessions(self):
+        ur.mark_due(ur.load(), self.t0)
+        self.usage = usage(weekly=20.0, session=10.0, now=datetime.now(UTC))
+        self.cron("--only", "usage", "--now")
+        self.assertEqual(len(self.fires), 1)
+        sid, msg, plan, new, k = self.fires[0]
+        self.assertTrue(new)
+        self.assertIn("(one-off)", k.get("name", ""))
+        rec = ur.review_record(sid)
+        self.assertEqual((rec["status"], rec["one_off"]), ("started", True))
+        self.assertIsNotNone(ur.load()["monthly"])          # the pending monthly one is untouched
+
+
+class MonthlyInStarts(tc.Env):
+    """D-254 in keepalive._fire_start: a night start's continue carries the due line while the
+    monthly review is pending (and its handled entry the review's id); a last-stretch slot or a
+    fill-up never does."""
+    def setUp(self):
+        super().setUp()
+        this_project()
+        self.saved_state = ur.STATE
+        ur.STATE = runner_state.live_path("usage_review")
+        self.saved_ur = (ka.log, ka.progress_note)
+        ka.log = lambda m: None
+        self.p = ur.mark_due(ur.load(), datetime.now(UTC))
+
+    def tearDown(self):
+        st = ur.load()
+        st["monthly"] = None
+        ur.save(st)
+        ur.STATE = self.saved_state
+        ka.log = self.saved_ur[0]
+        super().tearDown()
+
+    def start(self, key, prompt=None):
+        at = tc.NIGHT + timedelta(days=1)
+        stall = {"uuid": key, "timestamp": at, "budget": "b", "headroom": 14.0, "start_at": at}
+        if prompt:
+            stall["prompt"] = prompt
+        if prompt == "fillup":
+            stall["fields"] = {"remaining": "30", "reset": "04:00 CEST"}
+        ka.handle_fire(tc.SID, stall, "test start", ka.load_state(), tc.Armed())
+        return self.sent[-1][1]
+
+    def test_a_night_start_carries_the_line_while_pending(self):
+        msg = self.start("window-start-m1")
+        self.assertTrue(msg.startswith("[keep-alive] A new run starts"))
+        self.assertIn("The monthly usage review is due (D-254)", msg)
+        self.assertIn("python3 usage_review.py --brief", msg)
+        self.assertIn(self.p["report"], msg)
+        rec = ka.load_state()["handled"]["window-start-m1"]
+        self.assertEqual((rec["monthly_review"], rec["result"]), (self.p["review_id"], "continued-in-place"))
+        self.assertEqual(ur.monthly_carried(self.p), [ka.parse_ts(rec["at"])])
+        st = ur.load()                                       # done: the next start has no line
+        st["monthly"] = None
+        ur.save(st)
+        self.assertNotIn("monthly usage review", self.start("window-start-m2"))
+        self.assertNotIn("monthly_review", ka.load_state()["handled"]["window-start-m2"])
+
+    def test_no_line_in_fill_ups_or_last_stretch_slots(self):
+        for key, prompt in (("fillup-m1", "fillup"), ("last-mile-m1", "last_mile")):
+            msg = self.start(key, prompt)
+            self.assertNotIn("monthly usage review", msg)
+            self.assertNotIn("usage_review.py --brief", msg)
+            self.assertNotIn("monthly_review", ka.load_state()["handled"][key])
+        self.assertEqual(ur.monthly_carried(self.p), [])
 
 
 class ChainCli(Base):

@@ -483,7 +483,7 @@ class Failures(Base):
         self.assertEqual(r, "db_paused")                               # not handled: decided again later
         pf.assert_not_called()
         import usage_review as ur
-        with mock.patch.object(ur, "run") as run, mock.patch.object(ur, "run_once") as once, \
+        with mock.patch.object(ur, "mark_due") as run, mock.patch.object(ur, "run_once") as once, \
                 mock.patch.object(sys, "argv", ["usage_review.py", "--now"]), mock.patch.object(ka, "log"):
             ur.main()
         run.assert_not_called()
