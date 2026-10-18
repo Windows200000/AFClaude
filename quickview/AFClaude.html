@@ -388,11 +388,13 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       '<div class="mut">' + esc(k.window_berlin || "") + " " + esc(k.window_tz || "Europe/Berlin") + (k.in_window ? ", next " + esc(k.next_window_berlin || "?") : "") + "</div>"));
     var nurSec = k.next_usage_review_secondary, nurSecLine = "";
     if (nurSec) {
-      var nurSecWhat = nurSec.which === "monthly" ? "monthly" : "one-off" + (nurSec.label ? " (" + esc(nurSec.label) + ")" : "");
+      var nurSecWhat = nurSec.which === "monthly" ? "monthly" : nurSec.which === "nightly" ? esc(nurSec.label)
+        : "one-off" + (nurSec.label ? " (" + esc(nurSec.label) + ")" : "");
       nurSecLine = '<div class="mut">' + nurSecWhat + ": " + esc(nurSec.at_berlin || "?") + "</div>";
     }
     out.push(tile("Next usage review", esc(k.next_usage_review_berlin || "–"),
-      (k.next_usage_review_label ? '<div class="mut">one-off: ' + esc(k.next_usage_review_label) + '</div>' : "") + nurSecLine));
+      (k.next_usage_review_label ? '<div class="mut">' + (k.next_usage_review_which === "nightly" ? "" : "one-off: ")
+        + esc(k.next_usage_review_label) + '</div>' : "") + nurSecLine));
     $("usage").innerHTML = out.join("");
   }
 

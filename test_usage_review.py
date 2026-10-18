@@ -10,13 +10,14 @@ lose it), chain_pass() then fires a SEPARATE fresh session for the ETA review po
 result. The quota gate (no review starts without REVIEW_NEEDS free: postponed to the reset) and
 the dead-review detection (review_death: a usage limit is retried once after the reset, any
 other death is an error at once), with fixture transcripts. The monthly review (D-254): due ->
-pending with no session, the night start's continue carries one line (never a fill-up or a
-last-stretch slot), done once its report doc exists, an error after MONTHLY_MAX_RUNS runs."""
+a nightly task (nightly_tasks.py, its own tests: test_nightly_tasks.py) with no session, its
+record finished once the task is done, a missed task an error that stays due."""
 import argparse
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -29,7 +30,7 @@ import store  # noqa: E402
 import telemetry  # noqa: E402
 import afclaude_config  # noqa: E402
 import runner_state  # noqa: E402
-import test_compaction as tc  # noqa: E402  (its Env: a fake tmux session and transcript, for the night starts)
+import nightly_tasks  # noqa: E402
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 9, 10, 0, tzinfo=UTC)
@@ -309,6 +310,16 @@ def this_project():
             store.add_project(conn, "AFC-test", None, ur.HERE)
             p = store.get_project(conn, ur.HERE)
         return p["name"]
+    finally:
+        conn.close()
+
+
+def clear_nightly_tasks():
+    """No nightly tasks in the shared test DB (a test's names are the next one's too; the runners never delete)."""
+    conn = store.connect()
+    try:
+        with store.transaction(conn):
+            conn.execute("DELETE FROM runner_state WHERE component=?", (nightly_tasks.COMPONENT,))
     finally:
         conn.close()
 
@@ -798,12 +809,14 @@ class TrackDeaths(Transcripts):
 # ---------------------------------------------------------------- the monthly review (D-254)
 
 class Monthly(Base):
-    """D-254: the due monthly review starts no session; it is pending (st["monthly"]) until the
-    hourly run finds its report doc, or an error after MONTHLY_MAX_RUNS night starts took it along."""
+    """D-254: the due monthly review starts no session; it is a nightly task (nightly_tasks.py)
+    named by st["monthly"], its record pending until the task is done; a missed task is an error."""
     def setUp(self):
         super().setUp()
         this_project()
-        ur.STATE = runner_state.live_path("usage_review")    # the DB, as live (keepalive reads it there)
+        clear_nightly_tasks()
+        self.addCleanup(clear_nightly_tasks)
+        ur.STATE = runner_state.live_path("usage_review")    # the DB, as live
         st = ur.load()
         st.update(monthly=None, chain=None, next_run_at=(NOW - timedelta(minutes=1)).isoformat())
         self.assertTrue(ur.save(st))
@@ -826,86 +839,92 @@ class Monthly(Base):
         finally:
             sys.argv = old_argv
 
-    def carried(self, p, at, key=None, result="continued-in-place"):
-        """A night start at `at` that took the pending review along (keepalive._fire_start's entry)."""
+    def carried(self, p, at, result="continued-in-place"):
+        """A night start at `at` that took the task along (keepalive._fire_start's handled entry)."""
         st = ka.load_state()
-        st["handled"][key or f"window-start-{at.isoformat()}"] = {
-            "at": at.isoformat(), "result": result, "plan": "send-keys", "monthly_review": p["review_id"]}
+        st["handled"][f"window-start-{at.isoformat()}"] = {
+            "at": at.isoformat(), "result": result, "plan": "send-keys", "nightly_tasks": [p["task"]]}
         ka.save_state(st)
 
-    def test_due_is_pending_with_no_session(self):
+    def test_due_is_a_nightly_task_with_no_session(self):
         self.cron()
         self.assertEqual((self.fires, self.at_calls, self.alerts), ([], [], []))
         st = ur.load()
         p = st["monthly"]
-        self.assertEqual((p["report"], p["since"]), (ur.report_doc(datetime.now(UTC)), p["since"]))
-        self.assertTrue(p["review_id"].startswith("monthly-"))
+        self.assertEqual(p["report"], ur.report_doc(datetime.now(UTC)))
+        self.assertTrue(p["task"].startswith("monthly-usage-review-"))
         self.assertGreater(datetime.fromisoformat(st["next_run_at"]), datetime.now(UTC) + timedelta(days=27))
+        task = nightly_tasks.get(p["task"])
+        self.assertEqual((task["status"], task["prompts"], task["report"], task["fields"], task["by"]),
+                         ("pending", ["usage_review", "stage_eta_review"], p["report"],
+                          {"date": p["date"], "since": p["since"]}, ur.ACTOR))
+        self.assertEqual(nightly_tasks.start_insert(datetime.now(UTC))[1], [p["task"]])
         rec = ur.review_record(p["review_id"])
         self.assertEqual((rec["status"], rec["final"], rec["one_off"], rec["reviews"], rec["session"]),
                          ("pending", False, False, ["usage", "stage-eta"], None))
         self.cron()                                         # the next hourly run: still pending, nothing new
         self.assertEqual(ur.load()["monthly"], p)
+        self.assertEqual(len([t for t in nightly_tasks.load()["tasks"].values() if t["status"] == "pending"]), 1)
         self.assertEqual(self.fires, [])
 
-    def test_now_marks_it_due_and_brief_prints_the_filled_in_prompts(self):
-        self.assertEqual(self.cron("--brief"), 1)           # nothing pending yet
+    def test_now_marks_it_due_and_the_brief_is_the_filled_in_prompts(self):
         st = ur.load()
         st["next_run_at"] = (datetime.now(UTC) + timedelta(days=5)).isoformat()
         ur.save(st)
         self.cron("--now")
         p = ur.load()["monthly"]
-        brief = ur.monthly_brief(ur.load())
+        brief = nightly_tasks.brief(p["task"])
+        self.assertIn(f"[AFClaude nightly task {p['task']}: the monthly usage review {p['date']}]", brief)
         self.assertIn(f"[AFClaude usage review {p['date']}]", brief)
         self.assertIn(f"since {p['since']}", brief)
         self.assertIn(f"[AFClaude stage-ETA review {p['date']}]", brief)
         self.assertNotIn("{date}", brief)
         self.assertNotIn("{since}", brief)
-        self.assertIn("worker subagent inside a nightly run", brief)
         self.assertEqual(self.fires, [])
 
     def test_done_once_the_report_exists(self):
         p = ur.mark_due(ur.load(), self.t0)
         self.carried(p, self.t0 + timedelta(hours=11))
-        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=12)))   # no report yet
+        ur.track_nightly(ur.load(), self.t0 + timedelta(hours=12))     # no report yet
+        self.assertEqual(ur.load()["monthly"], p)
+        time.sleep(0.01)
         set_doc(p["report"], "# Review\n")
-        self.assertEqual(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=13)), "finished")
+        [(task, event, _)] = ur.track_nightly(ur.load(), self.t0 + timedelta(hours=13))
+        self.assertEqual((task["name"], event), (p["task"], "done"))
         self.assertIsNone(ur.load()["monthly"])
         rec = ur.review_record(p["review_id"])
         self.assertEqual((rec["status"], rec["final"], rec["runs"]), ("finished", True, 1))
         self.assertFalse(self.paused())
 
-    def test_an_older_doc_of_the_same_name_does_not_count(self):
-        set_doc(ur.report_doc(self.t0), "# an earlier review the same day\n")
-        p = ur.mark_due(ur.load(), datetime.now(UTC) + timedelta(seconds=1))
-        self.carried(p, self.t0 + timedelta(minutes=30))
-        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(hours=1)))
-        self.assertEqual(ur.load()["monthly"], p)
+    def test_a_cancelled_task_ends_its_record(self):
+        p = ur.mark_due(ur.load(), self.t0)
+        nightly_tasks.cancel(p["task"], "the owner skipped it")
+        ur.track_nightly(ur.load(), self.t0 + timedelta(hours=1))
+        self.assertIsNone(ur.load()["monthly"])
+        self.assertEqual(ur.review_record(p["review_id"])["status"], "cancelled")
 
-    def test_an_error_after_max_runs_that_took_it_along(self):
+    def test_a_lost_task_is_added_again(self):
+        p = ur.mark_due(ur.load(), self.t0)
+        clear_nightly_tasks()                   # e.g. the add failed after the state was saved
+        ur.track_nightly(ur.load(), self.t0 + timedelta(minutes=5))
+        self.assertEqual(nightly_tasks.get(p["task"])["status"], "pending")
+
+    def test_missed_after_max_runs_is_an_error_and_it_stays_due(self):
         p = ur.mark_due(ur.load(), self.t0)
         night = self.t0 + timedelta(hours=11)
-        for i in range(ur.MONTHLY_MAX_RUNS):
+        for i in range(nightly_tasks.MAX_RUNS):
             self.carried(p, night + timedelta(days=i))
         self.carried(p, night + timedelta(days=5), result="start-failed")      # never started a run: not counted
-        last = night + timedelta(days=ur.MONTHLY_MAX_RUNS - 1)
-        self.assertIsNone(ur.track_monthly(ur.load(), last + timedelta(hours=2)))   # its run may still be going
+        last = night + timedelta(days=nightly_tasks.MAX_RUNS - 1)
+        self.assertEqual(ur.track_nightly(ur.load(), last + timedelta(hours=2)), [])   # its run may still be going
         self.assertFalse(self.paused())
-        self.assertEqual(ur.track_monthly(ur.load(), last + ur.MONTHLY_RUN_SPAN), "not_done")
+        [(task, event, _)] = ur.track_nightly(ur.load(), last + nightly_tasks.RUN_SPAN)
+        self.assertEqual(event, "missed")
         self.assertTrue(self.paused())
-        self.assertIn("the monthly usage review was not done", self.alerts[-1][0])
-        st = ur.load()
-        self.assertIsNone(st["monthly"])
-        self.assertEqual(st["next_run_at"], (last + ur.MONTHLY_RUN_SPAN).isoformat())   # due again after the pause
-        rec = ur.review_record(p["review_id"])
-        self.assertEqual((rec["status"], rec["final"], rec["runs"]), ("not_done", True, ur.MONTHLY_MAX_RUNS))
-
-    def test_two_runs_are_not_yet_an_error(self):
-        p = ur.mark_due(ur.load(), self.t0)
-        for i in range(ur.MONTHLY_MAX_RUNS - 1):
-            self.carried(p, self.t0 + timedelta(days=i, hours=11))
-        self.assertIsNone(ur.track_monthly(ur.load(), self.t0 + timedelta(days=10)))
-        self.assertFalse(self.paused())
+        self.assertIn(f"the nightly task {p['task']} was not done", self.alerts[-1][0])
+        self.assertEqual(ur.load()["monthly"], p)                                   # still pending
+        self.assertEqual(nightly_tasks.get(p["task"])["status"], "pending")
+        self.assertEqual(ur.review_record(p["review_id"])["status"], "pending")
 
     def test_one_offs_keep_their_own_sessions(self):
         ur.mark_due(ur.load(), self.t0)
@@ -918,61 +937,6 @@ class Monthly(Base):
         rec = ur.review_record(sid)
         self.assertEqual((rec["status"], rec["one_off"]), ("started", True))
         self.assertIsNotNone(ur.load()["monthly"])          # the pending monthly one is untouched
-
-
-class MonthlyInStarts(tc.Env):
-    """D-254 in keepalive._fire_start: a night start's continue carries the due line while the
-    monthly review is pending (and its handled entry the review's id); a last-stretch slot or a
-    fill-up never does."""
-    def setUp(self):
-        super().setUp()
-        this_project()
-        self.saved_state = ur.STATE
-        ur.STATE = runner_state.live_path("usage_review")
-        self.saved_ur = (ka.log, ka.progress_note)
-        ka.log = lambda m: None
-        self.p = ur.mark_due(ur.load(), datetime.now(UTC))
-
-    def tearDown(self):
-        st = ur.load()
-        st["monthly"] = None
-        ur.save(st)
-        ur.STATE = self.saved_state
-        ka.log = self.saved_ur[0]
-        super().tearDown()
-
-    def start(self, key, prompt=None):
-        at = tc.NIGHT + timedelta(days=1)
-        stall = {"uuid": key, "timestamp": at, "budget": "b", "headroom": 14.0, "start_at": at}
-        if prompt:
-            stall["prompt"] = prompt
-        if prompt == "fillup":
-            stall["fields"] = {"remaining": "30", "reset": "04:00 CEST"}
-        ka.handle_fire(tc.SID, stall, "test start", ka.load_state(), tc.Armed())
-        return self.sent[-1][1]
-
-    def test_a_night_start_carries_the_line_while_pending(self):
-        msg = self.start("window-start-m1")
-        self.assertTrue(msg.startswith("[keep-alive] A new run starts"))
-        self.assertIn("The monthly usage review is due (D-254)", msg)
-        self.assertIn("python3 usage_review.py --brief", msg)
-        self.assertIn(self.p["report"], msg)
-        rec = ka.load_state()["handled"]["window-start-m1"]
-        self.assertEqual((rec["monthly_review"], rec["result"]), (self.p["review_id"], "continued-in-place"))
-        self.assertEqual(ur.monthly_carried(self.p), [ka.parse_ts(rec["at"])])
-        st = ur.load()                                       # done: the next start has no line
-        st["monthly"] = None
-        ur.save(st)
-        self.assertNotIn("monthly usage review", self.start("window-start-m2"))
-        self.assertNotIn("monthly_review", ka.load_state()["handled"]["window-start-m2"])
-
-    def test_no_line_in_fill_ups_or_last_stretch_slots(self):
-        for key, prompt in (("fillup-m1", "fillup"), ("last-mile-m1", "last_mile")):
-            msg = self.start(key, prompt)
-            self.assertNotIn("monthly usage review", msg)
-            self.assertNotIn("usage_review.py --brief", msg)
-            self.assertNotIn("monthly_review", ka.load_state()["handled"][key])
-        self.assertEqual(ur.monthly_carried(self.p), [])
 
 
 class ChainCli(Base):

@@ -1808,6 +1808,7 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("dispatcher", "runner:dispatcher", ("sessions", "handled", "starts", "alerted", "rc_held")),
     StateComponent("sampler", "runner:sampler", ("offsets", "sessions")),
     StateComponent("usage_review", "runner:usage_review", deletes=False),
+    StateComponent("nightly_tasks", "runner:nightly_tasks", ("tasks",), deletes=False),   # D-254/D-261: one row per task
 )}
 LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim")
 LOG_LEVELS = ("info", "warn", "error")

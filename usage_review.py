@@ -10,30 +10,27 @@ old data/reviews/<date>.md files are legacy, still imported); the results are su
 progress doc, a push, and an "unread review" memory entry that the user's next conversation picks up.
 
 usage_reviews (the review docs' structured part, D-161, design §7.2): every launch is a record
-in the DB (telemetry kind usage.review, keyed by the session id; the monthly one by its
-monthly-<time> id): which reviews, one-off or monthly, when, the report doc, the attempt, and its
+in the DB (telemetry kind usage.review, keyed by the session id; the monthly one by its nightly
+task's name): which reviews, one-off or monthly, when, the report doc, the attempt, and its
 status (started -> finished / no_report / limit / died, or launch_failed / timed_out; the monthly
-one pending -> finished / not_done); the hourly cron run (track_reviews) marks a started
+one pending -> finished / cancelled); the hourly cron run (track_reviews) marks a started
 review finished once its report doc exists and its session went idle, limit or died once
 review_death() finds it dead, or no_report after REVIEW_REPORT_DEADLINE.
 
 The monthly review (D-254): a task for the next nightly run, not a session of its own. At
 `next_run_at` in its state (the DB, runner_state "usage_review"; then MIN_GAP_DAYS later) the
-hourly cron run marks it due: st["monthly"] (pending, its usage_reviews record status "pending"),
-no session started. Every night start's continue (keepalive._fire_start, keepalive.monthly_review_due;
-not a last-stretch slot or a fill-up) carries one line saying it is due, and the start's handled
-entry its id (monthly_review). The task-manager runs it as a worker subagent inside that run's
-budget, its brief printed by `usage_review.py --brief` (usage_review.md + stage_eta_review.md,
-filled in); it writes review:<date> (the date it became due). The hourly run (track_monthly)
-marks it finished once that doc was written after it became due; still without it once
-MONTHLY_MAX_RUNS night starts took it along and the last one's run is over (MONTHLY_RUN_SPAN),
-it is an error (D-235): the pending one ends not_done and it is due again (a fresh count) once the
-owner has cleared the pause.
+hourly cron run marks it due (mark_due): a nightly task (nightly_tasks.py, its brief
+nightly_task.md + usage_review.md + stage_eta_review.md, its report review:<the date it became
+due>), st["monthly"] naming it, its usage_reviews record "pending"; no session is started. The
+next nightly runs' start messages name it, the task-manager runs it as a worker subagent inside
+that run's budget (`nightly_tasks.py brief <name>`). The hourly run (track_nightly) checks all
+nightly tasks (nightly_tasks.track: done once the report doc was written after it became due; a
+task still without it after nightly_tasks.MAX_RUNS nightly runs is an error, D-235, and stays
+due) and finishes the monthly review's record once its task is done.
 
-  usage_review.py            # cron mode: track the reviews; mark the monthly one due once next_run_at passed
+  usage_review.py            # cron mode: track the reviews and nightly tasks; mark the monthly one due once next_run_at passed
   usage_review.py --status
   usage_review.py --now      # mark the monthly one due now
-  usage_review.py --brief    # the pending monthly review's brief (for the task-manager's worker)
 
 One-off review (--only, owner request, D-220/D-221): run just ONE of the reviews below, outside
 the monthly schedule, without touching next_run_at or st["runs"] (st["one_off_runs"] instead) --
@@ -88,7 +85,7 @@ alert, no pause); a second limit death, or any other death, is an error (fail-st
 Failures (D-234/D-235, failstop.py): a launch that fails, a dead review, a chained usage review
 that does not finish within USAGE_DONE_TIMEOUT, a review without its report after
 REVIEW_REPORT_DEADLINE, an `at` job that can't be scheduled, a report doc that can't be read, a
-crash, a monthly review not done after MONTHLY_MAX_RUNS nightly runs: an ERROR line, an alert, and
+crash, a nightly task not done after its nightly runs (nightly_tasks.MAX_RUNS): an ERROR line, an alert, and
 automation paused until the owner clears it (`tasks.py automation resume`). While automation is
 paused no review starts: the monthly one is not marked due (the hourly cron run does it once the
 pause is cleared), a pending chain step waits too (the hourly
@@ -112,15 +109,14 @@ import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
 import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
 import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
-import afclaude_config  # noqa: E402  (SESSION_LENGTH: how long a run can last)
+import nightly_tasks  # noqa: E402  (D-254: the monthly review is a task of the next nightly run)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
 FIRST_RUN = datetime(2026, 10, 1, 17, 0, tzinfo=ka.BERLIN)
 MIN_GAP_DAYS = 28                    # "once a month, or every other month"; tune here
-MONTHLY_MAX_RUNS = 3                 # D-254: night starts that took the due review along without its report: an error
-MONTHLY_RUN_SPAN = afclaude_config.SESSION_LENGTH + timedelta(hours=1)   # ... once the last one's run is over
 MONTHLY_REVIEWS = ("usage", "stage-eta")
+MONTHLY_PROMPTS = ("usage_review", "stage_eta_review")   # D-254: the monthly nightly task's brief (+ nightly_task.md)
 MODEL, EFFORT = "claude-opus-5-5", "medium"
 # --only names -> their one-off prompt (prompts/<name>.md), distinct from the regular review's
 # own prompt so the one-off brief (the owner's specific ask) can differ from the periodic one.
@@ -376,7 +372,7 @@ def run_once(st, now, which, extra=None, record=None):
     local = now.astimezone(ka.BERLIN)
     d = local.date().isoformat()
     since = st["runs"][-1]["at"][:10] if st.get("runs") else "2026-09-26"
-    brief = ka.load_prompt(ONLY_PROMPTS[which]).format(date=d, since=since)
+    brief = ka.load_prompt(ONLY_PROMPTS[which]).format(date=d, since=since, report=report_doc(now))
     parts = [brief] + ([extra] if extra else []) + [ka.load_prompt("guard_respect"), ka.load_prompt("manager")]
     msg = " ".join(" ".join(parts).split())
     sid = str(uuid.uuid4())
@@ -715,97 +711,70 @@ def chain_pass(st, now):
 
 # ---------------------------------------------------------------- the monthly review (D-254)
 
+def monthly_task_name(now):
+    """The nightly task of the monthly review due at `now` (one per minute: never reused)."""
+    return f"monthly-usage-review-{now.astimezone(ka.BERLIN):%Y%m%d-%H%M}"
+
+
 def mark_due(st, now):
-    """The monthly review is due (D-254): recorded as pending (st["monthly"], a usage_reviews
-    record with status "pending"), no session started: the next nightly run's start message
-    carries it (keepalive.monthly_review_due) and the task-manager runs it as a worker subagent.
-    next_run_at moves MIN_GAP_DAYS on. -> the pending entry."""
+    """The monthly review is due (D-254): a nightly task (nightly_tasks.py: the next nightly runs
+    take it along and the task-manager runs it as a worker subagent), no session of its own. Its
+    usage_reviews record is "pending" until the task is done; st["monthly"] names the task, and
+    next_run_at moves MIN_GAP_DAYS on. The state is saved before the task is added, so a pass that
+    fails in between adds the same task again (ensure_monthly_task). -> st["monthly"]."""
     d = now.astimezone(ka.BERLIN).date().isoformat()
     since = st["runs"][-1]["at"][:10] if st["runs"] else "2026-09-26"
-    p = {"review_id": f"monthly-{now.astimezone(UTC):%Y-%m-%dT%H:%MZ}", "date": d, "since": since,
-         "report": report_doc(now), "due_at": now.isoformat()}
+    name = monthly_task_name(now)
+    p = {"task": name, "review_id": name, "date": d, "since": since, "report": report_doc(now),
+         "due_at": now.isoformat()}
     st["monthly"] = p
-    st["runs"].append({"at": now.isoformat(), "review_id": p["review_id"], "mode": "nightly run (D-254)"})
+    st["runs"].append({"at": now.isoformat(), "review_id": name, "mode": "nightly task (D-254)"})
     st["next_run_at"] = (now + timedelta(days=MIN_GAP_DAYS)).isoformat()
     save_checked(st, "the pending monthly review")
     telemetry.write_records("usage.review", [{
-        "review_id": p["review_id"], "session": None, "reviews": list(MONTHLY_REVIEWS), "one_off": False,
+        "review_id": name, "session": None, "reviews": list(MONTHLY_REVIEWS), "one_off": False,
         "date": d, "started_at": now.isoformat(), "report_doc": p["report"], "status": "pending", "final": False,
-        "attempt": 1}], actor=ACTOR)
-    ka.log(f"usage review: the monthly review is due ({p['review_id']}): the next nightly run takes it along")
-    ka.progress_note(f"monthly usage review due: the next nightly run takes it along (D-254), report {p['report']}; "
-                     f"next one due {ka.berlin(datetime.fromisoformat(st['next_run_at']))}")
+        "attempt": 1, "nightly_task": name}], actor=ACTOR)
+    ensure_monthly_task(p)
+    ka.log(f"usage review: the monthly review is due ({name}): the next nightly run takes it along")
+    ka.progress_note(f"monthly usage review due: the next nightly run takes it along (D-254, nightly task {name}), "
+                     f"report {p['report']}; next one due {ka.berlin(datetime.fromisoformat(st['next_run_at']))}")
     return p
 
 
-def monthly_brief(st):
-    """The pending monthly review's brief for the task-manager's worker (`--brief`): usage_review.md
-    + stage_eta_review.md, filled in. -> text, None if none is pending."""
+def ensure_monthly_task(p):
+    """The nightly task of the pending monthly review `p` (added if it is not there yet). -> the task."""
+    task = nightly_tasks.get(p["task"])
+    if task is not None:
+        return task
+    return nightly_tasks.add(p["task"], datetime.fromisoformat(p["due_at"]), f"the monthly usage review {p['date']}",
+                             list(MONTHLY_PROMPTS), p["report"], {"date": p["date"], "since": p["since"]},
+                             by=ACTOR, now=datetime.fromisoformat(p["due_at"]))
+
+
+def track_nightly(st, now):
+    """The hourly check of the nightly tasks (nightly_tasks.track, D-254/D-261) and of the pending
+    monthly review: its record finished once its task is done (cancelled: its record says so);
+    a task missed (still no report after its nightly runs) is an error (D-235), it stays pending.
+    -> the (task, event, why) of this pass."""
+    events = nightly_tasks.track(now, ka.load_state(), tuple(ka.RUN_RESULTS))
     p = st.get("monthly")
-    if not p:
-        return None
-    return "\n\n".join([ka.load_prompt("usage_review").format(date=p["date"], since=p["since"]).strip(),
-                         ka.load_prompt("stage_eta_review").format(date=p["date"]).strip()])
-
-
-def monthly_carried(p):
-    """The night starts that took the pending monthly review `p` along: the keep-alive's handled
-    entries carrying its id (monthly_review) that started a run. -> their times, oldest first. An
-    unreadable keep-alive state is an error (D-235)."""
-    st = ka.load_state()
-    if getattr(st, "unavailable", False):
-        raise failstop.Failed("the keep-alive state could not be read", "checking the pending monthly review")
-    times = [ka.parse_ts(r.get("at")) for r in (st.get("handled") or {}).values()
-             if isinstance(r, dict) and r.get("monthly_review") == p["review_id"] and r.get("result") in ka.RUN_RESULTS]
-    return sorted(t for t in times if t is not None)
-
-
-def report_written_since(report, since):
-    """The report doc `report` exists in the DB and was written at or after `since` (an older doc of
-    the same name does not count). A DB read error is an error (D-234/D-235)."""
-    import store
-    try:
-        conn = store.connect()
-        try:
-            proj = store.get_project(conn, os.path.abspath(HERE))
-            doc = store.get_doc(conn, proj["id"], report) if proj is not None else None
-        finally:
-            conn.close()
-    except Exception as e:  # noqa: BLE001 - an error, not "not written yet"
-        raise failstop.Failed("a review's report doc could not be read", f"{report}: {type(e).__name__}: {e}"[:300]) \
-            from None
-    written = ka.parse_ts(doc["updated_at"]) if doc else None
-    return written is not None and written >= since
-
-
-def track_monthly(st, now):
-    """The hourly check of the pending monthly review (D-254): finished once its report doc was
-    written after it became due (the pending entry cleared); still without it once MONTHLY_MAX_RUNS
-    night starts took it along and the last one's run is over (MONTHLY_RUN_SPAN): an error
-    (fail-stop), the record ends not_done, and next_run_at is now, so the hourly run marks it due
-    again (a fresh count) once the owner has cleared the pause. -> "finished" | "not_done" | None."""
-    p = st.get("monthly")
-    if not p:
-        return None
-    carried = monthly_carried(p)
-    if report_written_since(p["report"], datetime.fromisoformat(p["due_at"])):
-        finish_review(p["review_id"], "finished", now, runs=len(carried))
-        st["monthly"] = None      # None, never deleted: the usage_review state never deletes a key
-        save_checked(st, "the finished monthly review")
-        ka.log(f"usage review: the monthly review {p['review_id']} is done ({p['report']}, {len(carried)} night run(s))")
-        return "finished"
-    if len(carried) >= MONTHLY_MAX_RUNS and now - carried[-1] >= MONTHLY_RUN_SPAN:
-        why = (f"{len(carried)} nightly runs took it along (the last started {ka.berlin(carried[-1])}), but its "
-               f"report doc {p['report']} was not written")
-        finish_review(p["review_id"], "not_done", now, runs=len(carried), why=why)
-        st["monthly"] = None
-        st["next_run_at"] = now.isoformat()
-        save_checked(st, "the monthly review that was not done")
-        fail_stop("the monthly usage review was not done",
-                  f"{p['review_id']}, due since {ka.berlin(datetime.fromisoformat(p['due_at']))}: {why}. It is due "
-                  "again (the next nightly runs take it along) once the pause is cleared.")
-        return "not_done"
-    return None
+    if p:
+        task = ensure_monthly_task(p)
+        if task["status"] in ("done", "cancelled"):
+            status = "finished" if task["status"] == "done" else "cancelled"
+            finish_review(p["review_id"], status, now, runs=task.get("runs"), why=task.get("why"))
+            st["monthly"] = None      # None, never deleted: the usage_review state never deletes a key
+            save_checked(st, "the monthly review that ended")
+            ka.log(f"usage review: the monthly review {p['review_id']} {status} ({p['report']})")
+    for task, event, why in events:
+        ka.log(f"nightly task {task['name']}: {event} ({why})")
+        if event == "missed":
+            fail_stop(f"the nightly task {task['name']} was not done",
+                      f"{task['title']}, due since {nightly_tasks.berlin(datetime.fromisoformat(task['due_from']))}: "
+                      f"{why}. It stays due: the next nightly runs take it along again once the pause is cleared "
+                      f"(or cancel it: python3 nightly_tasks.py cancel {task['name']}).")
+    return events
 
 
 def main():
@@ -824,8 +793,6 @@ def _main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--now", action="store_true", help="mark the monthly review due now (D-254); with --only: "
                                                          "run that one-off review now")
-    ap.add_argument("--brief", action="store_true",
-                    help="print the pending monthly review's brief (the task-manager's worker runs it, D-254)")
     ap.add_argument("--only", type=parse_only,
                     help="run (or, with --at, schedule) only this review, once, outside the monthly schedule: "
                          f"'stage-eta', 'usage', or the chained '{CHAIN}' (D-228)")
@@ -844,13 +811,6 @@ def _main():
     if args.status:
         print(json.dumps(st, indent=1), "\nnext:", ka.berlin(datetime.fromisoformat(st["next_run_at"])))
         return
-    if args.brief:
-        brief = monthly_brief(st)
-        if brief is None:
-            sys.stderr.write("no monthly usage review is pending (usage_review.py --status)\n")
-            return 1
-        print(brief)
-        return
     if args.at:
         print(json.dumps(schedule_once(args.only, args.at, now), indent=1))
         return
@@ -868,7 +828,7 @@ def _main():
 def _locked(args, st, now):
     for rec in track_reviews(now, st):
         ka.log(f"usage review {rec['review_id'][:8]} ({'+'.join(rec.get('reviews') or [])}): {rec['status']}")
-    track_monthly(st, now)
+    track_nightly(st, now)      # the nightly tasks (D-254/D-261), the monthly review among them
     pause = failstop.paused()     # the install-wide pause only: the reviews are no one project's (D-244)
     if pause["paused"] and (args.only or args.now or now >= datetime.fromisoformat(st["next_run_at"])):
         why = pause.get("reason") or "no reason given"

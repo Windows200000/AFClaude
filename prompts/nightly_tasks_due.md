@@ -1,0 +1,1 @@
+Scheduled nightly tasks are due (D-254): {tasks}. Run each in this run, inside its budget, as one worker subagent told to run `python3 nightly_tasks.py brief <name>`, follow what it prints and stop before the budget you give it runs out; writing its report doc marks it done. Not enough budget left for one: leave it, the next nightly run brings it again.

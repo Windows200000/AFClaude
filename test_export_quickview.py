@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
@@ -602,6 +602,28 @@ class NextUsageReview(unittest.TestCase):
         self.spool_job("db-job", "2026-10-13T10:00:00Z", "stage-eta")       # the DB's row wins
         out = qv.one_off_reviews()
         self.assertEqual([(o["which"], o["at"].day) for o in out], [("usage", 16)])
+
+    def test_a_pending_nightly_task_is_shown(self):
+        """D-254/D-261: a nightly task (here the ETA review's re-run) shows with its due time."""
+        import nightly_tasks
+        conn = store.connect()
+        try:
+            with store.transaction(conn):
+                conn.execute("DELETE FROM runner_state WHERE component=?", (nightly_tasks.COMPONENT,))
+        finally:
+            conn.close()
+        self.write_state("2026-10-29T08:00:00Z")
+        nightly_tasks.add("eta-rerun", datetime(2026, 10, 23, 20, 0, tzinfo=timezone.utc), "the ETA review re-run",
+                          ["stage_eta_review_once"], "review:eta-rerun", {"date": "2026-10-23"})
+        nightly_tasks.add("gone", datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc), "cancelled one",
+                          ["stage_eta_review_once"], "review:gone", {"date": "2026-10-20"})
+        nightly_tasks.cancel("gone", "test")
+        out = qv.next_review_block()
+        self.assertEqual((out["which"], out["label"]), ("nightly", "the ETA review re-run (nightly run)"))
+        self.assertTrue(out["at_berlin"].startswith("Fri 23.10."))
+        self.assertEqual(out["secondary"]["which"], "monthly")
+        nightly_tasks.cancel("eta-rerun", "test")
+        self.assertEqual(qv.next_review_block()["which"], "monthly")
 
     def test_nothing_scheduled(self):
         self.assertEqual(qv.next_review_block(),
