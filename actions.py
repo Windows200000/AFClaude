@@ -692,8 +692,9 @@ SETTINGS: dict[str, Setting] = {
                            "budget"),
     "pacing_session_cap": _num(85, 1, 100, "Session guard: no night start while the current session window "
                                "is at or above this % (the last stretch uses 100%)", "budget"),
-    "pacing_last_mile_yield": _flag(True, "Also yield to an active user in the last stretch before the "
-                                    "weekly reset", "budget"),
+    "pacing_last_mile_yield": _flag(False, "Also yield to an active user in the last stretch before the "
+                                    "weekly reset (off: the last stretch runs regardless of the owner's "
+                                    "activity, D-259)", "budget"),
     "projection_threshold": _num(90, 1, 100, 'Linear model: continue while the end of the week is projected '
                                  'below this weekly %', "budget"),
     "cutoff_after_window_hours": _num(2, 0, 24, "Linear model: a weekly reset this many hours after the "

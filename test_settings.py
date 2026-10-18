@@ -170,13 +170,13 @@ class Import(FileCase):
 
     def test_bad_window_and_pacing_object(self):
         self.write(ac.CONFIG_FILE, {"window_start": "23:15"})
-        self.write(ac.USER_MODEL_FILE, {"idle_min": 10, "pacing": {"idle_min": 20, "last_mile_yield": False,
+        self.write(ac.USER_MODEL_FILE, {"idle_min": 10, "pacing": {"idle_min": 20, "last_mile_yield": True,
                                                                    "forecast_margin": 1.25}})
         res = ac.import_file_settings()
         self.assertEqual(res[0]["imported"], {})
         self.assertIn("30-minute grid", res[0]["notes"]["window_start"])
         # as pacing.py read it: the "pacing" object wins; the shadowed top-level key is dropped
-        self.assertEqual(res[1]["imported"], {"pacing_idle_min": 20.0, "pacing_last_mile_yield": False})
+        self.assertEqual(res[1]["imported"], {"pacing_idle_min": 20.0, "pacing_last_mile_yield": True})
         self.assertIn("ignored before", res[1]["notes"]["idle_min"])
         self.assertEqual(self.user_model(), {"pacing": {"forecast_margin": 1.25}})
 

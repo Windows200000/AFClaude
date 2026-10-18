@@ -526,7 +526,7 @@ class SettingActions(Base):
         self.assertEqual({k: v["value"] for k, v in s.items() if k != "window_days"},
                          {"window_tz": "Europe/Berlin", "session_hours": 5.0, "usage_model": "pacing",
                           "reserve_threshold": "auto", "last_mile_hours": "auto", "pacing_idle_min": 60.0,
-                          "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": True,
+                          "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": False,
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "compaction_enabled": True, "ui_chat_reset_hours": 5.0,

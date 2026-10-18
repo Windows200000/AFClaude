@@ -47,7 +47,9 @@ overrides it, 0 = off).
 Yield: only activity in NON-AFClaude sessions and a weekly-% rise without local turns (another
 device) count as the user; the user's input to AFClaude sessions does not. A HOLD for the user
 POSTPONES: recheck at last activity + idle_min (60). Unknown sampler data = active, recheck in
-15 min. Also in the last stretch unless last_mile_yield is false. Fail-safes: unknown usage or
+15 min. Not in the last stretch (D-259: it runs regardless of the owner's activity) unless
+last_mile_yield is set; keepalive still never types into a session the owner is typing in or
+holds (handle_fire's owner check). Fail-safes: unknown usage or
 a stale reset time -> HOLD (recheck 15 min); exhausted -> HOLD.
 
 ratio = weekly % per session % = limit_ratio.preferred_ratio() (the per-session-window estimate,
@@ -82,7 +84,7 @@ WEEK = timedelta(days=7)
 SESSION_H = afclaude_config.SESSION_LENGTH.total_seconds() / 3600
 LAST_MILE_MAX_SESSIONS = 2
 # the code defaults of the pacing_* settings (actions.SETTINGS; test_pacing checks they agree)
-DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": True}
+DEFAULTS = {"idle_min": 60.0, "min_gap": 1.0, "session_cap": 85.0, "last_mile_yield": False}
 THRESHOLD_RANGE = (50.0, 99.0)
 LAST_MILE_SESSION_CAP = 100.0
 DEFAULT_RATIO = 0.2
