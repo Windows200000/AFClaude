@@ -1755,7 +1755,9 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
     held, held_ids = inbox_held(sid)     # D-244: held "now" inbox messages go along, to be answered
     notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
-    msg = build(with_notes(with_notes(stall.get("insert"), held), notes))
+    # D-254/D-261: a night start (not a last-stretch slot or a fill-up) names the due nightly tasks
+    tasks, task_names = nightly_tasks_due(cwd) if stall.get("prompt", "continue") == "continue" else (None, [])
+    msg = build(with_notes(with_notes(with_notes(stall.get("insert"), held), notes), tasks))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -1774,6 +1776,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
               "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
+    if task_names:
+        result["nightly_tasks"] = task_names   # nightly_tasks.track counts the runs that took them along
     if rc == 0 and held_ids:
         result["inbox_now"] = held_ids
         if not inbox_delivered(held_ids, f"{plan}, with the start {key}"):
@@ -2374,6 +2378,17 @@ def inbox_notes(sid):
         return inbox.notes_insert(conn, sid)
     finally:
         conn.close()
+
+
+def nightly_tasks_due(cwd):
+    """D-254/D-261: the nightly tasks due now, as one line for a night start's message
+    (nightly_tasks.start_insert) -> (text or None, their names). Only the AFClaude task-manager
+    (a session in this checkout, rules_hooked) does them. An unreadable state raises
+    failstop.Failed: the caller aborts the start (D-235)."""
+    if not rules_hooked(cwd):
+        return None, []
+    import nightly_tasks
+    return nightly_tasks.start_insert(datetime.now(UTC))
 
 
 def inbox_held(sid):

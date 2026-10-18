@@ -717,12 +717,30 @@ def one_off_reviews():
     return out
 
 
+def nightly_reviews():
+    """The pending nightly tasks (nightly_tasks.py, D-254/D-261: the monthly review once due, a
+    one-off like the ETA review's re-run), done in the first nightly run from their due time. A
+    DB that can't be read: none (as one_off_reviews). Earliest first. -> [{"at", "at_berlin", "label"}]."""
+    try:
+        import nightly_tasks
+        tasks = nightly_tasks.load()["tasks"].values()
+    except Exception:   # noqa: BLE001 - no DB, or a hiccup: none shown (the runners report it)
+        return []
+    out = []
+    for t in tasks:
+        at = ka.parse_ts(t.get("due_from")) if isinstance(t, dict) and t.get("status") == "pending" else None
+        if at is not None:
+            out.append({"at": at, "at_berlin": bstr(at), "label": f"{t.get('title')} (nightly run)"})
+    out.sort(key=lambda j: j["at"])
+    return out
+
+
 def next_review_block():
     """The next usage review for the quickview tile (owner bug report: the monthly schedule
     alone ignores a one-off review the owner asked for, which can land first). The EARLIEST of
-    the monthly schedule (usage_review_state.json's next_run_at) and any pending one-off job,
-    tagged which one it is; the other one (if any), as a secondary line. ->
-    {"at_berlin", "which": "monthly"|"one-off", "label": None|str, "secondary": None|
+    the monthly schedule (usage_review_state.json's next_run_at), any pending one-off job and any
+    pending nightly task (D-254/D-261, its due time), tagged which one it is; the other one (if any), as a secondary line. ->
+    {"at_berlin", "which": "monthly"|"one-off"|"nightly", "label": None|str, "secondary": None|
      {"at_berlin", "which", "label"}} (all-None fields if nothing is scheduled at all)."""
     cands = []
     rev = usage_review()
@@ -730,6 +748,8 @@ def next_review_block():
         cands.append({"kind": "monthly", "at": rev["next_run_at"], "at_berlin": rev["next_run_berlin"], "label": None})
     for o in one_off_reviews():
         cands.append({"kind": "one-off", "at": o["at"], "at_berlin": o["at_berlin"], "label": o["label"]})
+    for o in nightly_reviews():
+        cands.append({"kind": "nightly", "at": o["at"], "at_berlin": o["at_berlin"], "label": o["label"]})
     if not cands:
         return {"at_berlin": None, "which": None, "label": None, "secondary": None}
     cands.sort(key=lambda c: c["at"])
