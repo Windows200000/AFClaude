@@ -55,6 +55,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                project_pauses (D-244, additive the same way): the automation pause of one project
                (an inbox error pauses the project its message was for); the install-wide pause
                stays the settings automation_paused / automation_paused_reason (failstop.py).
+               runner_jobs, runner_runs (phase 3a, additive the same way, RUNNER_RUNS_SCHEMA): the
+               resident runner's due times and its run records (runner.py; actions.py writes).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -532,7 +534,66 @@ CREATE TRIGGER IF NOT EXISTS app_log_guarded_delete BEFORE DELETE ON app_log
 WHEN (SELECT allowed FROM app_log_prune_gate WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'app_log deletes only through store.prune_app_log (retention)'); END;
 """
-RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log")
+RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "runner_runs")
+
+# ---- the resident runner (phase 3a, docs/phase3a_plan.md §3.3; runner.py, written only through
+# actions.py: runner_job_set, run_begin, run_pid, run_end, runner.prune). Additive, no version bump.
+# runner_jobs: one row per job (its next due time and last outcome) plus the row 'runner' (the
+# loop's heartbeat). runner_runs: one row per run, actor runner:<job> and via on the row (no
+# audit_log row per run, D-256). A keyed run (a session-window start, an at-job, ...) can't start
+# twice, also across a restart: UNIQUE (job, key) over the rows that were not interrupted (an
+# interrupted run whose job reruns gets a new row with the same key; one whose job fails never runs
+# again: actions.run_begin(rerun=False)). A run leaves
+# 'running' once: a finished row is immutable (trigger). Deletes only through prune_runner_runs()
+# and its gate row (retention, runner_runs_retention_days), the way app_log does it.
+RUNNER_RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runner_jobs (
+    name                 TEXT PRIMARY KEY,   -- a job of runner.JOBS, or 'runner' (the loop's heartbeat)
+    next_due             TEXT,               -- UTC; NULL = not planned yet
+    last_run_id          INTEGER,
+    last_status          TEXT,
+    last_ok_at           TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at         TEXT,
+    updated_at           TEXT NOT NULL,
+    version              INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS runner_jobs_version AFTER UPDATE ON runner_jobs FOR EACH ROW
+WHEN NEW.version IS OLD.version
+BEGIN UPDATE runner_jobs SET version = OLD.version + 1 WHERE name = NEW.name; END;
+
+CREATE TABLE IF NOT EXISTS runner_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    boot_id     TEXT NOT NULL,           -- the runner process that ran it
+    job         TEXT NOT NULL,
+    key         TEXT,                    -- NULL for a tick
+    status      TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed', 'timeout', 'interrupted', 'skipped')),
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    pid         INTEGER,                 -- the child (the leader of its own process group)
+    timeout_s   REAL,
+    result      TEXT,                    -- the handler's JSON result line
+    error       TEXT,                    -- why it failed or was skipped; a failed child's stderr tail (<= 2 kB)
+    actor       TEXT NOT NULL,           -- runner:<job>
+    via         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS runner_runs_key ON runner_runs(job, key)
+    WHERE key IS NOT NULL AND status != 'interrupted';
+CREATE INDEX IF NOT EXISTS runner_runs_job ON runner_runs(job, id);
+CREATE INDEX IF NOT EXISTS runner_runs_running ON runner_runs(status) WHERE status = 'running';
+CREATE TRIGGER IF NOT EXISTS runner_runs_finished BEFORE UPDATE ON runner_runs
+WHEN OLD.status != 'running'
+BEGIN SELECT RAISE(ABORT, 'runner_runs: a finished run is immutable (status leaves running once)'); END;
+
+CREATE TABLE IF NOT EXISTS runner_runs_prune_gate (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    allowed INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO runner_runs_prune_gate(id, allowed) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS runner_runs_guarded_delete BEFORE DELETE ON runner_runs
+WHEN (SELECT allowed FROM runner_runs_prune_gate WHERE id = 1) = 0 OR OLD.status = 'running'
+BEGIN SELECT RAISE(ABORT, 'runner_runs deletes only through store.prune_runner_runs (retention)'); END;
+"""
 
 # ---- project docs (dashboard phase 2d part 2, D-161, D-152, D-181; §7.2, §7.7): PROGRESS, GOALS,
 # EXCEPTIONS, ALERTS and the review reports per project (project_docs.py maps the files; actions.py
@@ -727,6 +788,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.executescript(TELEMETRY_SCHEMA)
     conn.executescript(RUNNER_SCHEMA)
+    conn.executescript(RUNNER_RUNS_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
@@ -2332,6 +2394,105 @@ def mark_job_started(conn: sqlite3.Connection, job_id: str, actor: str, via: str
 def list_jobs(conn: sqlite3.Connection, status: str | None = None) -> list[Row]:
     sql = "SELECT * FROM scheduled_jobs" + (" WHERE status=?" if status else "") + " ORDER BY run_at, id"
     return [dict(r) for r in conn.execute(sql, (status,) if status else ())]
+
+
+# ---- the resident runner's jobs and runs (RUNNER_RUNS_SCHEMA; written only through actions.py)
+
+RUNNER_JOB_FIELDS = ("next_due", "last_run_id", "last_status", "last_ok_at", "consecutive_failures",
+                     "heartbeat_at")
+
+
+def get_runner_job(conn: sqlite3.Connection, name: str) -> Row | None:
+    r = conn.execute("SELECT * FROM runner_jobs WHERE name=?", (name,)).fetchone()
+    return dict(r) if r else None
+
+
+def runner_job_rows(conn: sqlite3.Connection) -> dict[str, Row]:
+    return {str(r["name"]): dict(r) for r in conn.execute("SELECT * FROM runner_jobs ORDER BY name")}
+
+
+def put_runner_job(conn: sqlite3.Connection, name: str, fields: Mapping[str, object]) -> Row:
+    """Insert the job's row or update the given fields (RUNNER_JOB_FIELDS). -> the row."""
+    bad = set(fields) - set(RUNNER_JOB_FIELDS)
+    if bad:
+        raise ValueError(f"unknown runner_jobs field(s) {sorted(bad)}")
+    now = now_iso()
+    conn.execute("INSERT OR IGNORE INTO runner_jobs(name, updated_at) VALUES (?, ?)", (name, now))
+    if fields:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE runner_jobs SET {cols}, updated_at=? WHERE name=?", (*fields.values(), now, name))
+    row = get_runner_job(conn, name)
+    assert row is not None     # inserted above
+    return row
+
+
+def get_run(conn: sqlite3.Connection, run_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM runner_runs WHERE id=?", (run_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def key_runs(conn: sqlite3.Connection, job: str, key: str) -> list[Row]:
+    """Every run of the keyed run (job, key), oldest first (interrupted ones included)."""
+    return [dict(r) for r in conn.execute("SELECT * FROM runner_runs WHERE job=? AND key=? ORDER BY id", (job, key))]
+
+
+def insert_run(conn: sqlite3.Connection, boot_id: str, job: str, key: str | None, status: str, timeout_s: float | None,
+               actor: str, via: str, error: str | None = None) -> int:
+    """A new run row: 'running' (finished_at NULL) or an already finished one ('skipped')."""
+    now = now_iso()
+    cur = conn.execute("INSERT INTO runner_runs(boot_id, job, key, status, started_at, finished_at, timeout_s, error, "
+                       "actor, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (boot_id, job, key, status, now, None if status == "running" else now, timeout_s, error,
+                        actor, via))
+    return _rowid(cur)
+
+
+def set_run_pid(conn: sqlite3.Connection, run_id: int, pid: int) -> bool:
+    return conn.execute("UPDATE runner_runs SET pid=? WHERE id=? AND status='running'", (pid, run_id)).rowcount > 0
+
+
+def finish_run(conn: sqlite3.Connection, run_id: int, status: str, result: str | None, error: str | None) -> bool:
+    """running -> status (the trigger refuses a second change). -> False: it was not running."""
+    cur = conn.execute("UPDATE runner_runs SET status=?, finished_at=?, result=?, error=? WHERE id=? AND status='running'",
+                       (status, now_iso(), result, error, run_id))
+    return cur.rowcount > 0
+
+
+def running_runs(conn: sqlite3.Connection) -> list[Row]:
+    return [dict(r) for r in conn.execute("SELECT * FROM runner_runs WHERE status='running' ORDER BY id")]
+
+
+def recent_runs(conn: sqlite3.Connection, limit: int = 20, job: str | None = None) -> list[Row]:
+    sql = "SELECT * FROM runner_runs" + (" WHERE job=?" if job else "") + " ORDER BY id DESC LIMIT ?"
+    return [dict(r) for r in conn.execute(sql, ((job,) if job else ()) + (int(limit),))]
+
+
+def runner_runs_prune_count(conn: sqlite3.Connection, cutoff: str) -> int:
+    """Read-only: how many runs prune_runner_runs(conn, cutoff) would delete."""
+    return int(conn.execute("SELECT COUNT(*) FROM runner_runs WHERE status != 'running' AND started_at < ?",
+                            (cutoff,)).fetchone()[0])
+
+
+def prune_runner_runs(conn: sqlite3.Connection, cutoff: str, *, batch_size: int = 1000) -> int:
+    """Delete the finished runs started before `cutoff` (ISO, exclusive), in batches, through
+    runner_runs_prune_gate opened and closed in THIS transaction only (as prune_app_log does: no
+    other connection ever sees it open; a running row is never deleted, gate or not). -> rows
+    deleted. Inside a caller's transaction (actions.perform) it runs in that one."""
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size!r}")
+    total = 0
+    with transaction(conn):
+        conn.execute("UPDATE runner_runs_prune_gate SET allowed=1 WHERE id=1")
+        try:
+            while True:
+                cur = conn.execute("DELETE FROM runner_runs WHERE id IN (SELECT id FROM runner_runs WHERE "
+                                   "status != 'running' AND started_at < ? ORDER BY id LIMIT ?)", (cutoff, batch_size))
+                total += cur.rowcount
+                if cur.rowcount < batch_size:
+                    break
+        finally:
+            conn.execute("UPDATE runner_runs_prune_gate SET allowed=0 WHERE id=1")
+    return total
 
 
 # ---- compaction hand-offs (D-144, D-155, D-191; design §5.5)

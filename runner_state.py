@@ -83,6 +83,7 @@ LOG_FILES: dict[str, str] = {
     "watchdog": "keepalive/watchdog.log",
     "host_exec": "host_exec.log",
     "at_shim": "at_shim.log",
+    "runner": "runner.log",          # the resident runner (phase 3a, runner.py): written and dual-written by it
 }
 OWN_FILE = "own_sessions.txt"
 SPOOL_DIR = "at_spool"

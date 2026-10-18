@@ -135,6 +135,7 @@ class Result:
 
 ActionFn = Callable[..., Result]          # fn(conn, ctx, **params) -> Result
 _A = TypeVar("_A", bound=ActionFn)
+_T = TypeVar("_T")
 
 
 class Spec:
@@ -739,14 +740,45 @@ SETTINGS: dict[str, Setting] = {
     # (audited, actor runner:retention); the no-delete trigger only opens for that one transaction
     # (store.app_log_prune_gate). Log FILES are untouched (retired separately, later).
     "log_retention_days": _num(30, 1, 3650, "How many days of app_log lines (keepalive, dispatcher, "
-                               "sampler, watchdog, host_exec, at_shim) to keep before the daily prune "
+                               "sampler, watchdog, host_exec, at_shim, runner) to keep before the daily prune "
                                "deletes them; a component in log_retention_overrides uses that instead",
                                "storage"),
     "log_retention_overrides": Setting({}, _log_retention_overrides, 'Per-component days overriding '
                                'log_retention_days (e.g. {"host_exec": 14} for the noisiest log); a '
                                'component not listed here uses log_retention_days', section="storage",
                                kind="component_days"),
+    # --- the resident runner (phase 3a, runner.py; docs/phase3a_plan.md §3.2-3.5). Each job's outer
+    # timeout is the setting RUNNER_TIMEOUT + <job> (minutes; D-234: a run past it is killed, recorded
+    # as a timeout and fails), defaulting to its runner.JOBS entry (a test keeps both equal).
+    "runner_timeout_stall_scan": _num(2, 0.5, 720, "Runner: minutes a stall scan may run before it is killed "
+                                      "and fails (D-234)", "automation"),
+    "runner_timeout_sampler": _num(10, 0.5, 720, "Runner: minutes a usage-sampler run may take before it is "
+                                   "killed and fails (D-234)", "automation"),
+    "runner_timeout_dispatcher": _num(8, 0.5, 720, "Runner: minutes a dispatcher pass may take before it is "
+                                      "killed and fails (D-234)", "automation"),
+    "runner_timeout_quickview": _num(2, 0.5, 720, "Runner: minutes a quickview export may take before it is "
+                                     "killed (an alert, no pause: D-239)", "automation"),
+    "runner_timeout_docs_import": _num(5, 0.5, 720, "Runner: minutes a docs import may take before it is killed "
+                                       "and fails (D-234)", "automation"),
+    "runner_timeout_prune_logs": _num(10, 0.5, 720, "Runner: minutes the daily log prune may take before it is "
+                                      "killed and fails (D-234)", "automation"),
+    "runner_timeout_prune_runs": _num(10, 0.5, 720, "Runner: minutes the daily prune of its run records may "
+                                      "take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_usage_review": _num(15, 0.5, 720, "Runner: minutes a usage-review run may take before it "
+                                        "is killed and fails (D-234)", "automation"),
+    # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
+    # test_runner checks it), so an inner timeout, with its own clear error, always fires first
+    "runner_timeout_window_start": _num(70, 70, 720, "Runner: minutes a session-window start may take (its "
+                                        "waits for a compaction, the resume and its verification) before it "
+                                        "is killed and fails (D-234)", "automation"),
+    # at most 30 for now: keepalive.py --window-start acts only within CRON_STEP (30 min) of a start
+    "runner_start_catchup": _num(30, 0, 30, "Runner: a session-window start the runner missed (down at that "
+                                 "time) still runs when it is back within this many minutes; a later one is "
+                                 "an error that pauses automation (missed start, D-257)", "automation"),
+    "runner_runs_retention_days": _num(30, 1, 3650, "Runner: days of run records (runner_runs) kept before the "
+                                       "runner's daily prune deletes them", "storage"),
 }
+RUNNER_TIMEOUT = "runner_timeout_"
 
 
 def _setting_spec(key: str) -> Setting:
@@ -1810,8 +1842,9 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("sampler", "runner:sampler", ("offsets", "sessions")),
     StateComponent("usage_review", "runner:usage_review", deletes=False),
     StateComponent("nightly_tasks", "runner:nightly_tasks", ("tasks",), deletes=False),   # D-254/D-261: one row per task
+    StateComponent("runner", "runner"),       # the resident runner: boot, exit, drain (runner.py)
 )}
-LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim")
+LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim", "runner")
 LOG_LEVELS = ("info", "warn", "error")
 STATE_MARK = "state_file:"          # meta: the state file as the last DB save saw it (mtime_ns:size)
 STATE_AUDIT_PATHS = 20              # changed paths named in a save's audit row
@@ -2082,3 +2115,166 @@ def own_session_add(conn: sqlite3.Connection, session_id: object, *, actor: str,
             store.add_audit(conn, actor, via, "driven_session.add", "driven_session", sid, None, row)
         return True
     return store.retrying(run, conn)
+
+
+# ---------------------------------------------------------------- the resident runner (phase 3a)
+#
+# runner.py's writes (docs/phase3a_plan.md §3.3): its job rows (runner_jobs), its run records
+# (runner_runs: run_begin -> run_pid -> run_end), its own state (runner_state 'runner': boot,
+# clean exit, drain; runner_state_put) and the retention prune (runner.prune). The run writes are
+# plain functions like job_put (no perform(): one per run, not an owner's action), with the writer
+# check, store.retrying and the §7.8 DB-error path (report_db_error, runner=True); the runner then
+# fails (failstop) and exits. D-256: a run row carries its actor (runner:<job>) and via, and gets no
+# audit_log row of its own (about 3,000 runs a day); what a run changes in work or state is audited
+# by the handler's own actions.
+
+RUN_STATUSES = ("running", "ok", "failed", "timeout", "interrupted", "skipped")
+RUN_END_STATUSES = ("ok", "failed", "timeout", "interrupted")
+RUN_ERROR_MAX = 2048            # characters of a run's error (a failed child's stderr: its tail)
+RUN_RESULT_MAX = 16 * 1024      # characters of the handler's JSON result line
+JOB_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+RUN_KEY_RE = re.compile(r"^[A-Za-z0-9_.:+-]{1,128}$")
+BOOT_ID_RE = re.compile(r"^[0-9a-f]{8,64}$")
+RUNNER_ACTOR = "runner"         # the runner's own writes (job rows, its state); a run's actor is runner:<job>
+RUNNER_ROW = "runner"           # the runner_jobs row of the loop itself (its heartbeat), not a job
+
+
+def _runner_write(conn: sqlite3.Connection, action_name: str, actor: str, params: Mapping[str, Any],
+                  fn: Callable[[], _T]) -> _T:
+    """fn() on the DB error path: retried when transient; a persistent failure is recorded in the
+    fallback file (§7.8) and raised (store.DBError)."""
+    try:
+        return store.retrying(fn, conn)
+    except store.DBError as e:
+        if e.escalation is None:
+            store.report_db_error(e, actor=actor, action=action_name, params=params, db_path=_db_path(conn),
+                                  runner=True)
+        raise
+
+
+def _job_name(job: object) -> str:
+    if not isinstance(job, str) or not JOB_NAME_RE.match(job):
+        raise ValueError(f"bad runner job name {job!r}")
+    return job
+
+
+def _run_key(key: object) -> Optional[str]:
+    if key is None:
+        return None
+    if not isinstance(key, str) or not RUN_KEY_RE.match(key):
+        raise ValueError(f"bad run key {key!r}")
+    return key
+
+
+def runner_state_put(conn: sqlite3.Connection, entries: Mapping[str, Any], *, actor: str, via: str) -> None:
+    """Set top-level entries of the runner's own state (runner_state 'runner'), keeping the others
+    (a merge save on the rows as they are now; value None deletes the entry). Audited like every
+    state save (runner_state.save)."""
+    base = store.state_rows(conn, "runner")
+    doc = state_unflatten("runner", base)
+    for k, v in entries.items():
+        if v is None:
+            doc.pop(k, None)
+        else:
+            doc[k] = v
+    state_save(conn, "runner", doc, base=base, actor=actor, via=via)
+
+
+def runner_state_get(conn: sqlite3.Connection) -> dict[str, Any]:
+    return state_unflatten("runner", store.state_rows(conn, "runner"))
+
+
+def runner_drain(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    """The drain in force (`runner.py drain`: no new run that acts on a session), else None:
+    the runner state's "drain" entry while its `until` is in the future."""
+    d = runner_state_get(conn).get("drain")
+    if not isinstance(d, dict) or not isinstance(d.get("until"), str):
+        return None
+    until = store.parse_iso(d["until"])
+    return dict(d) if until is not None and until > store._utcnow() else None
+
+
+def runner_job_set(conn: sqlite3.Connection, name: str, *, actor: str, via: str, **fields: Any) -> store.Row:
+    """Create the job's runner_jobs row or update its fields (store.RUNNER_JOB_FIELDS). -> the row."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    job = RUNNER_ROW if name == RUNNER_ROW else _job_name(name)
+
+    def run() -> store.Row:
+        with store.transaction(conn):
+            return store.put_runner_job(conn, job, fields)
+    return _runner_write(conn, "runner_job.set", actor, dict(fields, name=job), run)
+
+
+def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional[str], timeout_s: Optional[float],
+              actor: str, via: str, session: bool = False, rerun: bool = True,
+              skipped: Optional[str] = None) -> tuple[Optional[int], Optional[str]]:
+    """Record a run start ('running'), or with `skipped` (the reason) a run that was not started
+    ('skipped', finished). In one transaction with the checks: a keyed run that ran before is
+    refused (UNIQUE (job, key): any row that was not interrupted; with rerun=False, for a job whose
+    interrupted run must never run again, any row at all), and so is a run that acts on a session
+    (`session`) while a drain is in force. -> (run id, None) or (None, why not)."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    name, k = _job_name(job), _run_key(key)
+    if not isinstance(boot_id, str) or not BOOT_ID_RE.match(boot_id):
+        raise ValueError(f"bad boot id {boot_id!r}")
+    why = None if skipped is None else _short(skipped, "skip reason", RUN_ERROR_MAX)
+
+    def run() -> tuple[Optional[int], Optional[str]]:
+        with store.transaction(conn):
+            if k is not None:
+                done = [r for r in store.key_runs(conn, name, k) if not rerun or r["status"] != "interrupted"]
+                if done:
+                    return None, f"{name} {k} ran before (run {done[0]['id']}, {done[0]['status']})"
+            if session and why is None:
+                d = runner_drain(conn)
+                if d is not None:
+                    return None, f"drained until {d['until']}"
+            status = "running" if why is None else "skipped"
+            return store.insert_run(conn, boot_id, name, k, status, timeout_s, actor, via, why), None
+    return _runner_write(conn, "run.begin", actor, {"job": name, "key": k, "boot_id": boot_id}, run)
+
+
+def run_pid(conn: sqlite3.Connection, run_id: int, pid: int, *, actor: str, via: str) -> bool:
+    """The running run's child pid (its process group). -> False: it is not running."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+
+    def run() -> bool:
+        with store.transaction(conn):
+            return store.set_run_pid(conn, int(run_id), int(pid))
+    return _runner_write(conn, "run.pid", actor, {"run_id": run_id, "pid": pid}, run)
+
+
+def run_end(conn: sqlite3.Connection, run_id: int, status: str, *, actor: str, via: str,
+            result: Optional[str] = None, error: Optional[str] = None) -> bool:
+    """running -> status (RUN_END_STATUSES), with the handler's JSON result line and the error
+    (its tail is kept: RUN_ERROR_MAX). -> False: the run was not running (nothing changed)."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if status not in RUN_END_STATUSES:
+        raise ValueError(f"a run ends as one of {'|'.join(RUN_END_STATUSES)}, got {status!r}")
+    if result is not None:
+        if not isinstance(result, str) or len(result) > RUN_RESULT_MAX:
+            raise ValueError(f"a run result is a JSON text of at most {RUN_RESULT_MAX} characters")
+        json.loads(result)
+    err = None if error is None else str(error)[-RUN_ERROR_MAX:]
+
+    def run() -> bool:
+        with store.transaction(conn):
+            return store.finish_run(conn, int(run_id), status, result, err)
+    return _runner_write(conn, "run.end", actor, {"run_id": run_id, "status": status}, run)
+
+
+def runner_runs_cutoff(conn: sqlite3.Connection) -> str:
+    """Runs started before this (ISO) are due for deletion (runner_runs_retention_days)."""
+    return _iso(store._utcnow() - timedelta(days=get_setting(conn, "runner_runs_retention_days")))
+
+
+@action("runner.prune", "runner_runs")
+def runner_prune(conn: sqlite3.Connection, ctx: Ctx, batch_size: Any = 1000) -> Result:
+    """The runner's daily retention prune of its run records (runner_runs_retention_days; the
+    runner's prune_runs job), through the one gated path (store.prune_runner_runs). Always one
+    audit row with the count, as log.prune (a daily trail either way)."""
+    _runner_only(ctx, "runner.prune")
+    cutoff = runner_runs_cutoff(conn)
+    deleted = store.prune_runner_runs(conn, cutoff, batch_size=_check_batch_size(batch_size))
+    after = {"deleted": deleted, "cutoff": cutoff}
+    return Result(after, "runner_runs", None, after, changed=True)

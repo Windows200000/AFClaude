@@ -216,6 +216,13 @@ At boot, after taking the lock:
   - the outer > inner timeout check.
 - **Done when:** all suites, `test_typing` and `check_public` are green. The deploy is an image rebuild with no change in behaviour.
 - **Risk:** asyncio subprocess and signal handling under tini in the read-only container. Check it with `docker exec` against a temp DB (`testenv.py`).
+- **As built:**
+  - D-256 (no audit row per run) and D-257 (unclean exit, an interrupted start, a start missed by > 30 min: alert + pause) are in; a crash the runner reported itself is not alerted a second time at the next boot.
+  - `RUNNER_OWNS` is empty; the jobs whose code exists today are defined (`stall_scan`, `sampler`, `dispatcher`, `quickview`, `docs_import`, `prune_logs`, `usage_review`, `window_start`), plus a new daily `prune_runs` (the `runner_runs` retention). The watcher passes, at-jobs and the inbox jobs come with S4, S6 and S7.
+  - The watcher check at boot applies only once the runner owns a watcher pass (S6): in S2-S5 the watcher runs beside it by design.
+  - A boot lifts a drain (the deploy that drained the old runner is done; the new one catches up). `runner.py undrain` lifts one by hand.
+  - `runner_start_catchup` is at most 30 min for now: `keepalive.py --window-start` itself acts only within `CRON_STEP` of a start (S5 can lift both).
+  - The window start's outer timeout (default 70 min) has the sum of its inner timeouts + 5 min as its lower bound (`runner_jobs.window_start_inner`, checked against keepalive's source by `test_runner`).
 
 **S2: the runner live, owning only new jobs.**
 - **Build:**
