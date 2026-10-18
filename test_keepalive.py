@@ -459,7 +459,7 @@ class BudgetWiring(unittest.TestCase):
         self.samples(now - timedelta(minutes=45))                        # sampler stopped 45 min ago
         self.assertFalse(ka.budget_decision(self.u(), now)[0])
 
-    def test_last_stretch_yields_and_fires_once_per_slot(self):
+    def test_last_stretch_ignores_activity_and_fires_once_per_slot(self):
         fired = []
         cache = {"fetched_at": self.R, "weekly": {"percent": 70.0, "resets_at": self.R},
                  "session": {"percent": 0.0, "resets_at": None}}
@@ -478,14 +478,16 @@ class BudgetWiring(unittest.TestCase):
             self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
             self.assertEqual(fired, [])
             now = self.R - timedelta(hours=9)
-            self.samples(now, prompt_minutes_ago=0, week=70)              # the user is active: postpone
+            self.samples(now, prompt_minutes_ago=0, week=70)              # the user is active ...
+            self.setcfg(pacing_last_mile_yield=True)                      # (the setting's yield: postpone)
             self.assertEqual(ka.last_mile_pass(SID, now, st, None), now + timedelta(minutes=60))
             self.assertEqual(fired, [])
-            self.samples(now, week=70)                                    # idle: fires slot 2
+            self.setcfg()                                                 # ... D-259: fires slot 2 anyway
             self.assertIsNone(ka.last_mile_pass(SID, now, st, None))
             self.assertEqual(len(fired), 1)
             self.assertTrue(fired[0][0]["uuid"].endswith("-s2"), fired[0][0]["uuid"])
             self.assertIn("last stretch", fired[0][1])
+            self.assertTrue(fired[0][0]["owner_check"])                   # ... but not into the owner's typing
             self.assertIn("+30.0 weekly %", fired[0][0]["budget"])
             ka.last_mile_pass(SID, self.R - timedelta(hours=6), st, None)      # same slot: no second fire
             self.assertEqual(len(fired), 1)

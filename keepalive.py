@@ -36,7 +36,8 @@ night runs a FULL session window only if the week is then predicted to end at or
 reserve threshold (default: one session window left), w + session cost + the user's forecast
 use until the weekly reset; re-checked per session window; the final <= 2 session windows
 before the weekly reset fill to 100%; AFClaude yields to an active user by POSTPONING to last
-activity + 60 min).
+activity + 60 min, except in the last stretch, D-259: there a start only waits while the owner
+is typing into the session or holds it, handle_fire's owner check).
 The setting usage_model = "linear" (DB settings, afclaude_config.setting) selects the original
 linear rule, which is also the fallback if pacing.py fails:
   projected end-of-week usage < projection_threshold (90%)   -> continue
@@ -1358,11 +1359,11 @@ def last_mile_pass(sid, now, st, args):
     if not d["go"]:
         return max(d.get("recheck_at") or now + LAST_MILE_RECHECK, now + timedelta(seconds=POLL_SECONDS)) \
             if d.get("postpone") else now + LAST_MILE_RECHECK
-    handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"],
-                      "headroom": d.get("headroom"),
-                      "start_at": _round_reset(w["resets_at"]) - slot * afclaude_config.SESSION_LENGTH},
-                d["reason"], st, args)
-    return None
+    fired = handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"],
+                              "headroom": d.get("headroom"), "owner_check": True,
+                              "start_at": _round_reset(w["resets_at"]) - slot * afclaude_config.SESSION_LENGTH},
+                        d["reason"], st, args)
+    return now + OWNER_BUSY_RECHECK if fired == OWNER_BUSY else None
 
 
 # ---------------------------------------------------------------- window start
@@ -1407,16 +1408,18 @@ def window_start_pass(sid, now, args):
             return dict(d, go=False, reason=f"HOLD: forecast log failed ({type(e).__name__})")
     if d["go"]:
         stall = {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
-                 "start_at": schedule.latest_session_start(now) or now}
+                 "start_at": schedule.latest_session_start(now) or now,
+                 "owner_check": bool(d.get("last_mile")) and not args.now}   # D-259
         fired = handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
-        if fired == "db_paused" and not args.now:
-            recheck_at = now + DB_PAUSE_RECHECK
+        if fired in ("db_paused", OWNER_BUSY) and not args.now:
+            why = "database problem" if fired == "db_paused" else "the owner is typing into or holds the session"
+            recheck_at = now + (DB_PAUSE_RECHECK if fired == "db_paused" else OWNER_BUSY_RECHECK)
             if recheck_at < deadline:
                 defer_window_start(key, sid, recheck_at, d["reason"], deadline)
-                progress_note(f"window-start {berlin(now)}: database problem, postponed to "
-                              f"{berlin(recheck_at)} to retry once it's healthy again (D-202)")
+                progress_note(f"window-start {berlin(now)}: {why}, postponed to "
+                              f"{berlin(recheck_at)} to retry (D-202)")
             else:
-                progress_note(f"window-start {berlin(now)}: database problem at the night's last "
+                progress_note(f"window-start {berlin(now)}: {why} at the night's last "
                               "session-window start, not retried before the window ends (D-202)")
     elif defer:
         defer_window_start(key, sid, d["recheck_at"], d["reason"], deadline)
@@ -1510,10 +1513,11 @@ def deferred_window_start_pass(sid, now, st, args):
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
     if d["go"]:
         fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
-                                  "start_at": schedule.latest_session_start(now) or now},
+                                  "start_at": schedule.latest_session_start(now) or now,
+                                  "owner_check": bool(d.get("last_mile"))},   # D-259
                             "window start (postponed), " + d["reason"], st, args)
-        if fired == "db_paused":
-            recheck_at = now + DB_PAUSE_RECHECK
+        if fired in ("db_paused", OWNER_BUSY):
+            recheck_at = now + (DB_PAUSE_RECHECK if fired == "db_paused" else OWNER_BUSY_RECHECK)
             if recheck_at < deadline:
                 ent["recheck_at"] = recheck_at.astimezone(UTC).isoformat()
                 ent["reason"] = d["reason"]
@@ -1521,8 +1525,10 @@ def deferred_window_start_pass(sid, now, st, args):
                 return recheck_at
             defs.pop(key, None)
             save_deferred(defs)
-            progress_note(f"window-start (postponed) {berlin(now)}: database problem at the night's last "
-                          "session-window start, not retried before the window ends (D-202)")
+            progress_note(f"window-start (postponed) {berlin(now)}: "
+                          + ("database problem" if fired == "db_paused" else "the owner is typing into or holds "
+                             "the session") + " at the night's last session-window start, not retried before "
+                          "the window ends (D-202)")
             return None
         defs.pop(key, None)
         save_deferred(defs)
@@ -1643,7 +1649,10 @@ def db_paused(what):
 
 def handle_fire(sid, stall, reason, st, args):
     """One start (a session-window start, a postponed one, a last-stretch slot, a fill-up).
-    -> None (already handled, fire cap reached, or it fired / was handled below), "db_paused"
+    stall["owner_check"] (a last-stretch start, which doesn't yield to the owner's activity,
+    D-259): while the owner holds the session or is typing into its tmux pane (owner_typing) the
+    start is not handled and returns OWNER_BUSY, so the caller retries it later.
+    -> None (already handled, fire cap reached, or it fired / was handled below), OWNER_BUSY, "db_paused"
     (dropped without marking handled; a window-start caller must postpone it itself, see
     db_paused's docstring), "paused" (automation_paused: dropped, not handled) or "failed" (the
     start was aborted on an error, D-234/D-235: recorded as start-failed, alerted, automation
@@ -1667,6 +1676,9 @@ def handle_fire(sid, stall, reason, st, args):
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
         held = owner_holds(problems)
+        if held and stall.get("owner_check"):   # D-259: wait for the owner, don't drop the slot
+            log(f"start {key} of {sid[:8]} waits: the owner holds the session ({problems[0]})")
+            return OWNER_BUSY
         st["handled"][key] = {"at": datetime.now(UTC).isoformat(), "result": "preflight-failed", "problems": problems,
                               "held": held}
         save_state(st)
@@ -1685,6 +1697,11 @@ def handle_fire(sid, stall, reason, st, args):
         if lock is None:
             raise failstop.Failed("the session is still busy with a compaction",
                                   f"its lock was held for {COMPACT_LOCK_WAIT} (keepalive_session_{sid[:8]}.lock)")
+        if stall.get("owner_check") and plan == "send-keys":   # D-259: never type into the owner's typing
+            why = owner_typing(sid, datetime.now(UTC))           # (a failed tmux read raises: aborted)
+            if why:
+                log(f"start {key} of {sid[:8]} waits: {why}")
+                return OWNER_BUSY
         return _fire_start(sid, stall, reason, st, args, key, night, plan)
     except failstop.Failed as e:
         abort_start(sid, key, st, reason, plan, e.why, e.detail, e.record)
@@ -1696,6 +1713,8 @@ def handle_fire(sid, stall, reason, st, args):
 
 
 OWNER_HOLDS = (RC_HELD, OTHER_HELD, "session is busy in another process", "held by an idle interactive process")
+OWNER_BUSY = "owner_busy"                    # handle_fire: an owner_check start waits for the owner (D-259)
+OWNER_BUSY_RECHECK = timedelta(minutes=5)    # ... and is retried this much later
 
 
 def owner_holds(problems):
@@ -1812,6 +1831,7 @@ FILLUP_EVERY = timedelta(seconds=60)
 FILLUP_PREFETCH = timedelta(minutes=2)   # refresh the usage this long before a planned start ...
 FILLUP_FRESH = timedelta(minutes=3)      # ... so the start fires at once on numbers at most this old
 _FILLUP_LINE = None
+_FILLUP_BUSY = {}   # fill-up key -> when to try again after the owner was busy (OWNER_BUSY, D-259)
 
 
 def load_fillup():
@@ -1876,14 +1896,14 @@ def fillup_decision(sid, now, usage=None):
     active, recheck = (False, None)
     if s["fillup_enabled"] and reset and reset > now:
         active, recheck = _fillup_user(now, last_stretch, s)
-    return fillup.decide(
+    return {**fillup.decide(
         now=now, session_pct=sess.get("percent"), session_reset=reset, weekly_pct=w.get("percent"),
         handled=st.get("handled") or {}, rows=_fillup_rows(), ratio=_fillup_ratio(),
         enabled=bool(s["fillup_enabled"]), factor=float(s["fillup_factor"]), paused=bool(s["automation_paused"]),
         run_active=run_active(sid, now, st) is not None, limit_hit=bool(reset) and _limit_hit_in(sid, reset),
         in_night=bool(reset) and schedule.in_window(probe), in_last_stretch=last_stretch,
         next_start=schedule.next_session_start(now), user_active=active, user_recheck=recheck,
-        budget_fallback=lambda: budget_eval(u, now).get("headroom"))
+        budget_fallback=lambda: budget_eval(u, now).get("headroom")), "in_last_stretch": last_stretch}
 
 
 def _fillup_text(d):
@@ -1897,7 +1917,8 @@ def _fire_fillup(sid, now, d, args, test=False):
     stall = {"uuid": d["key"], "timestamp": now, "prompt": "fillup", "headroom": d.get("cost"),
              "budget": (f"budget for this run: the rest of this session window (~{float(d['remaining']):.0f}% "
                         f"session" + (f", ~{d['cost']:.1f}% weekly)" if d.get("cost") is not None else ")")),
-             "fields": {"remaining": f"{float(d['remaining']):.0f}", "reset": d["reset"].astimezone(BERLIN).strftime("%H:%M %Z")}}
+             "fields": {"remaining": f"{float(d['remaining']):.0f}", "reset": d["reset"].astimezone(BERLIN).strftime("%H:%M %Z")},
+             "owner_check": bool(d.get("in_last_stretch"))}   # D-259: no yield there, only the owner check
     log(f"{what}: FIRE {d['key']}")
     return handle_fire(sid, stall, f"{what}, session window resets {berlin(d['reset'])}", load_state(), args)
 
@@ -1938,6 +1959,8 @@ def fillup_pass(sid, now, args):
         return fillup_test_pass(sid, now, args, test)
     u = usage_cache_checked() or {}
     d = fillup_decision(sid, now, u)
+    if d["status"] == "fire" and now < _FILLUP_BUSY.get(d.get("key"), now):
+        return _FILLUP_BUSY[d["key"]]        # the owner was busy: not before then (no /usage call either)
     planned = d["status"] == "wait" and d.get("recheck_at") is not None and d.get("recheck_at") == d.get("start")
     if (d["status"] == "fire" or (planned and d["start"] - now <= FILLUP_PREFETCH)) and not _usage_young(u, now):
         fu = fresh_usage(now, force=True)   # the plan used the cache: decide on fresh numbers
@@ -1954,7 +1977,9 @@ def fillup_pass(sid, now, args):
         save_fillup(f)
     _fillup_log(f"fill-up: {d['status']}: {d['reason']}" + (f"; {_fillup_text(d)}" if "start" in d else ""))
     if d["status"] == "fire":
-        _fire_fillup(sid, now, d, args)
+        if _fire_fillup(sid, now, d, args) == OWNER_BUSY:
+            _FILLUP_BUSY[d["key"]] = now + OWNER_BUSY_RECHECK
+            return _FILLUP_BUSY[d["key"]]
         return None
     return d.get("recheck_at")
 

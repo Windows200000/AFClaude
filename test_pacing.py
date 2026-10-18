@@ -72,12 +72,14 @@ class LastStretch(unittest.TestCase):
 
     def test_yield_and_holds(self):
         now = R - timedelta(hours=3)
-        d = core(90, now, msu=20.0)                                       # yields by default
+        # D-259: the last stretch runs regardless of the owner's activity by default
+        self.assertTrue(core(90, now, msu=20.0)["go"])
+        self.assertTrue(core(90, now, known=False, msu=None)["go"])
+        d = core(90, now, msu=20.0, P={"last_mile_yield": True})          # the setting turns the yield back on
         self.assertFalse(d["go"])
         self.assertEqual(d["recheck_at"], now + timedelta(minutes=40))
-        nyp = {"last_mile_yield": False}
-        self.assertTrue(core(90, now, msu=20.0, P=nyp)["go"])
-        self.assertTrue(core(90, now, known=False, msu=None, P=nyp)["go"])
+        d = core(30, R - timedelta(hours=30), msu=20.0)                  # the night gate still yields
+        self.assertEqual((d["mode"], d["go"], d["postpone"]), ("night", False, True), d["reason"])
         self.assertTrue(core(90, now, s_pct=95, s_reset=now + timedelta(hours=1))["go"])   # cap 100
         d = core(90, now, s_pct=100, s_reset=now + timedelta(hours=1))
         self.assertTrue(d["postpone"])
