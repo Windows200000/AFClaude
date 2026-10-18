@@ -439,6 +439,39 @@ class ProjectActions(Base):
         last = self.audit(target_type="project")[-1]
         self.assertEqual((last["before"], last["after"]), ({"manager_session": SID}, {"manager_session": None}))
 
+    def test_manager_launch(self):
+        """D-260: a project's task-manager model / effort: checked, audited, "default" clears it."""
+        self.do("project.add", name="P", path="/home/x/p")
+        self.assertEqual((store.get_project(self.conn, "P")["manager_model"],
+                          store.get_project(self.conn, "P")["manager_effort"]), (None, None))
+        r = self.do("project.manager_launch", project="P", model="claude-sonnet-5-5", effort=" XHigh ")
+        self.assertEqual((r["manager_model"], r["manager_effort"]), ("claude-sonnet-5-5", "xhigh"))
+        self.assertEqual(r["launch"], {"model": "claude-sonnet-5-5", "effort": "xhigh",
+                                       "source": {"model": "project", "effort": "project"}})
+        last = self.audit(target_type="project")[-1]
+        self.assertEqual((last["action"], last["before"], last["after"]),
+                         ("project.manager_launch", {"manager_model": None, "manager_effort": None},
+                          {"manager_model": "claude-sonnet-5-5", "manager_effort": "xhigh"}))
+        n = self.count("audit_log")
+        self.do("project.manager_launch", project="P", effort="xhigh")         # unchanged: no audit
+        self.assertEqual(self.count("audit_log"), n)
+        r = self.do("project.manager_launch", project="P", model="default")    # effort stays
+        self.assertEqual((r["manager_model"], r["manager_effort"]), (None, "xhigh"))
+        self.assertEqual(r["launch"]["model"], "claude-opus-5-5")
+        self.assertEqual(self.do("project.manager_launch", project="P", effort="")["manager_effort"], None)
+        for params, msg in (({"model": "opus"}, "model must be one of"),          # aliases move: full ids only
+                            ({"model": "claude-haiku-5-5"}, "model must be one of"),
+                            ({"model": 5}, "model must be one of"),
+                            ({"effort": "extreme"}, "effort must be one of"),
+                            ({}, "needs model and/or effort")):
+            with self.assertRaisesRegex(ValueError, msg, msg=str(params)):
+                self.do("project.manager_launch", project="P", **params)
+        with self.assertRaisesRegex(ValueError, "unknown parameter"):         # never through project.edit
+            self.do("project.edit", project="P", manager_model="claude-sonnet-5-5")
+        v = store.get_project(self.conn, "P")["version"]
+        with self.assertRaises(actions.Conflict):
+            self.do("project.manager_launch", project="P", model="claude-opus-5", version=v - 1)
+
 
 class SessionActions(Base):
     def test_decide_clear_and_stall_ref(self):
@@ -478,7 +511,7 @@ class SessionActions(Base):
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
-                  "inbox.post", "inbox.retry"}
+                  "inbox.post", "inbox.retry", "project.manager_launch"}
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -993,6 +1026,7 @@ class EveryAction(Base):
             ("task.update", {"task_id": 3, "fields": {"title": "T2"}}),
             ("project.add", {"name": "Q"}), ("project.edit", {"project": "Q", "description": "d"}),
             ("project.move", {"project": "Q", "rank": 1}), ("project.priority", {"project": "P", "priority": "low"}),
+            ("project.manager_launch", {"project": "Q", "model": "claude-sonnet-5-5"}),
             ("session.decide", {"session_id": SID, "decision": "continue"}), ("session.clear", {"session_id": SID}),
             ("rule.add", {"scope": "session", "match": SID, "decision": "ignore"}),
             ("rule.remove", {"rule_id": 1}),

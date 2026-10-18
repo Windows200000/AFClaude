@@ -912,6 +912,22 @@ class CLI(Base):
         rc, _, err = self.run_cli("project", "add", "B")
         self.assertIn("already exists", err)
 
+    def test_project_launch(self):
+        """D-260: show / set / clear a project's task-manager model and effort."""
+        self.run_cli("project", "add", "A")
+        rc, out, _ = self.run_cli("project", "launch", "A")
+        self.assertEqual((rc, out.strip()), (0, "task-manager: model claude-opus-5-5 (default), effort high (default)"))
+        rc, out, _ = self.run_cli("project", "launch", "A", "--model", "claude-sonnet-5-5", "--effort", "max")
+        self.assertEqual(out.strip(), "project A: task-manager model claude-sonnet-5-5, effort max "
+                                      "(from its next start/resume)")
+        rc, out, _ = self.run_cli("project", "list")
+        self.assertIn("[task-manager model claude-sonnet-5-5, effort max]", out)
+        rc, out, _ = self.run_cli("project", "launch", "A", "--effort", "default", "--json")
+        self.assertEqual((json.loads(out)["manager_effort"], json.loads(out)["launch"]["effort"]), (None, "high"))
+        rc, _, err = self.run_cli("project", "launch", "A", "--model", "opus")
+        self.assertEqual(rc, 1)
+        self.assertIn("model must be one of", err)
+
     def test_errors(self):
         rc, _, err = self.run_cli("answer", "1", "x")
         self.assertEqual((rc, err.strip()), (1, "error: no task #1"))

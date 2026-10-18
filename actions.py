@@ -70,6 +70,7 @@ sys.path.insert(0, HERE)
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
 import schedule  # noqa: E402
+import manager_launch  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
@@ -436,6 +437,29 @@ def project_priority(conn: sqlite3.Connection, ctx: Ctx, project: Any, priority:
     r = store.set_project_priority(conn, p["id"], priority)
     return Result(r, p["id"], {"changed": []}, {"priority": r["priority"], "changed": r["changed"]},
                   changed=bool(r["changed"]))
+
+
+@action("project.manager_launch", "project", owner_only=True)
+def project_manager_launch(conn: sqlite3.Connection, ctx: Ctx, project: Any, model: Any = None, effort: Any = None,
+                           version: Any = None) -> Result:
+    """The model / effort the project's task-manager session starts or resumes with (D-260,
+    manager_launch.py). model / effort: a known value sets it, "default" (or "") clears it to the
+    code default, None leaves it. Owner-only like every setting. It applies at the session's next
+    start or resume; a running session keeps its model until then. -> the project row + "launch"."""
+    before = _project(conn, project)
+    _check_version(before, version, f"project {before['name']!r}")
+    fields: dict[str, str | None] = {}
+    for key, raw, check in (("manager_model", model, manager_launch.check_model),
+                            ("manager_effort", effort, manager_launch.check_effort)):
+        if raw is None:
+            continue
+        reset = isinstance(raw, str) and raw.strip().lower() in manager_launch.RESET
+        fields[key] = None if reset else check(raw)
+    if not fields:
+        raise ValueError("project.manager_launch needs model and/or effort")
+    after = store.set_project_launch(conn, before["id"], **fields)
+    return Result(dict(after, launch=manager_launch.view(after)), after["id"],
+                  {k: before[k] for k in fields}, {k: after[k] for k in fields})
 
 
 # ---------------------------------------------------------------- stalled sessions and rules

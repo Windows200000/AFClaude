@@ -210,6 +210,25 @@ class Projects(Env):
             with self.assertRaisesRegex(ToolError, msg):
                 asyncio.run(coro)
 
+    def test_launch(self):
+        """D-260: the task-manager's model / effort per project, owner-only."""
+        run(ms.afclaude_project("add", name="A"))
+        r = run(ms.afclaude_project("launch", name="A", model="claude-sonnet-5-5", effort="max"))
+        self.assertEqual((r["manager_model"], r["manager_effort"]), ("claude-sonnet-5-5", "max"))
+        lst = run(ms.afclaude_project("list"))["projects"]
+        self.assertEqual([(p.get("manager_model"), p.get("manager_effort")) for p in lst], [("claude-sonnet-5-5", "max")])
+        r = run(ms.afclaude_project("launch", name="A", model="default"))
+        self.assertNotIn("manager_model", r)
+        for kw, msg in (({"model": "opus"}, "model must be one of"), ({}, "needs model and/or effort")):
+            with self.assertRaisesRegex(ToolError, msg):
+                asyncio.run(ms.afclaude_project("launch", name="A", **kw))
+        os.environ["CLAUDE_GUARD_DISABLE"] = "1"                  # an autonomous session may not set it
+        try:
+            with self.assertRaisesRegex(ToolError, "not allowed for an autonomous"):
+                asyncio.run(ms.afclaude_project("launch", name="A", effort="low"))
+        finally:
+            os.environ.pop("CLAUDE_GUARD_DISABLE", None)
+
 
 class Sessions(Env):
     def stall(self, sid, cwd):

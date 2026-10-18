@@ -118,7 +118,8 @@ def task_full(t: Mapping[str, Any], events: Iterable[Mapping[str, Any]]) -> dict
 def project_brief(p: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"rank": p["rank"], "name": p["name"], "open": p.get("open"), "ready": p.get("ready"),
                     "path": p["path"], "description": p["description"],
-                    "manager_session": p.get("manager_session")})
+                    "manager_session": p.get("manager_session"), "manager_model": p.get("manager_model"),
+                    "manager_effort": p.get("manager_effort")})
 
 
 def session_brief(s: Mapping[str, Any]) -> dict[str, Any]:
@@ -342,11 +343,14 @@ async def afclaude_ask(question: str, project: Optional[str] = None, ctx: Option
       "move (name, rank); prio (name, priority: sets every open stage of the project); edit (name, new_name/"
       "description/path/manager_session). name may be '.' = the caller's project; path '.' = the caller's "
       "directory. manager_session (session id or unique prefix; '' = none) makes the project managed: that "
-      "session (the project's task-manager) works its stages itself.")
-async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"], name: Optional[str] = None,
+      "session (the project's task-manager) works its stages itself. launch (name, model and/or effort; "
+      "owner-only, D-260): the model / effort of the project's task-manager session from its next start or "
+      "resume; 'default' clears one.")
+async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit", "launch"], name: Optional[str] = None,
                            rank: Optional[int] = None, priority: Optional[Priority] = None,
                            description: Optional[str] = None, new_name: Optional[str] = None,
                            path: Optional[str] = None, manager_session: Optional[str] = None,
+                           model: Optional[str] = None, effort: Optional[str] = None,
                            ctx: Optional[Context] = None) -> str:
     conn = db()
     try:
@@ -368,6 +372,8 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
                 raise ValueError("prio needs priority")
             r = act(conn, "project.priority", project=ref, priority=priority)
             return out({"project": r["project"], "priority": r["priority"], "changed_tasks": r["changed"]})
+        elif action == "launch":
+            p = act(conn, "project.manager_launch", project=ref, model=model, effort=effort)
         else:
             f: dict[str, str | None] = {k: v for k, v in (("name", new_name), ("description", description),
                                                           ("path", path)) if v is not None}

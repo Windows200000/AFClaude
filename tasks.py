@@ -17,6 +17,8 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py project move P RANK
     tasks.py project prio P high|medium|low   every open stage of the project at once
     tasks.py project edit P [--name N] [-d TEXT] [--path DIR] [--manager SESSION|""]
+    tasks.py project launch P [--model M] [--effort E]   the model / effort of P's task-manager session
+                                           (D-260; "default" clears one); used at its next start/resume
     tasks.py block ID "question"           -> blocked, waits for the user
     tasks.py answer ID "answer"            -> pending again, for the next pass
     tasks.py start ID [--session S]        -> in_progress
@@ -78,6 +80,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write: validation, one transaction, audit row)
+import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -128,7 +131,14 @@ def print_projects(rows):
         r = p["ready"]
         print(f"{p['rank']:>4}  {p['open']:>4}  {r['high']:>3}/{r['medium']}/{r['low']:<5}  "
               f"{cut(p['name'], 20):20}  {p['path'] or '-'}"
-              + (f"  (managed by {p['manager_session'][:8]})" if p.get("manager_session") else ""))
+              + (f"  (managed by {p['manager_session'][:8]})" if p.get("manager_session") else "")
+              + launch_text(p))
+
+
+def launch_text(p):
+    """"  [model M, effort E]" for a project whose task-manager launch is set (D-260), else ""."""
+    set_ = [f"{k} {p[f'manager_{k}']}" for k in ("model", "effort") if p.get(f"manager_{k}")]
+    return f"  [task-manager {', '.join(set_)}]" if set_ else ""
 
 
 def event_text(e):
@@ -277,6 +287,18 @@ def run_project(conn, args):
         if not f:
             raise ValueError("nothing to change (use --name/-d/--path/--manager)")
         p = act(conn, "project.edit", project=project_ref(args.project), **f)
+    elif pc == "launch":
+        if args.model is None and args.effort is None:
+            v = manager_launch.view(store._project_row(conn, project_ref(args.project)))
+            return dump(v) if args.json else print(
+                f"task-manager: model {v['model']} ({v['source']['model']}), effort {v['effort']} "
+                f"({v['source']['effort']})")
+        p = act(conn, "project.manager_launch", project=project_ref(args.project), model=args.model,
+                effort=args.effort)
+        if not args.json:
+            v = p["launch"]
+            return print(f"project {p['name']}: task-manager model {v['model']}, effort {v['effort']} "
+                         "(from its next start/resume)")
     else:  # prio
         r = act(conn, "project.priority", project=project_ref(args.project), priority=args.priority)
         if args.json:
@@ -619,6 +641,11 @@ def parser():
     q.add_argument("--manager", metavar="SESSION",
                    help="managed project: this session works its stages, the dispatcher starts no "
                         "task sessions for it (\"\" = unmanaged)")
+    q = ps.add_parser("launch", parents=[js], help="show / set the model and effort of the project's "
+                      "task-manager session (D-260, owner-only)")
+    q.add_argument("project")
+    q.add_argument("--model", help=f"{'|'.join(manager_launch.MODELS)} or \"default\"")
+    q.add_argument("--effort", help=f"{'|'.join(manager_launch.EFFORTS)} or \"default\"")
     p = sub.add_parser("show", parents=[js], help="task + history")
     p.add_argument("id", type=int)
     p = sub.add_parser("edit", parents=[js], help="change title/description/project/kind")

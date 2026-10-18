@@ -20,7 +20,9 @@ serves at /afclaude/:
                 the page reads the messages from the inbox API, D-241), AFClaude cron entries, the task-manager's context (D-237:
                 size, cache expiry, the next re-read's cost, per owner message re-read
                 yes/no and est. cost without its text, a daily split; the compaction
-                attempts of D-238; compact_timing.context_block)
+                attempts of D-238; compact_timing.context_block), each project's
+                task-manager model / effort (D-260, manager_launch.py; data only, the page
+                has no settings area yet)
   docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
                 README, design doc, prompts/*.md; PROGRESS, GOALS, ALERTS and EXCEPTIONS
                 (and the goal list) come from the project docs in the DB (design §7.7:
@@ -359,6 +361,24 @@ def automation_block():
             "reason": i.get("reason"), "by": i.get("by"),
             "since_berlin": bstr(ka.parse_ts(i["since"])) if i.get("since") else None,
             "resume": failstop.RESUME_CMD, "projects": projects}
+
+
+def manager_launch_block():
+    """D-260: the code default and each project's task-manager launch (manager_launch.view: model,
+    effort, source project|default per value). A display path: an error is shown, never raised."""
+    import manager_launch
+    try:
+        import store
+        conn = store.connect()
+        try:
+            projects = [dict(manager_launch.view(p), name=p["name"])
+                        for p in store.list_projects(conn)]
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+    return {"default": {"model": manager_launch.DEFAULT_MODEL, "effort": manager_launch.DEFAULT_EFFORT},
+            "projects": projects}
 
 
 COMPACTIONS_SHOWN = 5
@@ -818,6 +838,7 @@ def main():
         "generated_at": now.isoformat(),
         "generated_berlin": bstr(now),
         "automation": automation_block(),
+        "manager_launch": manager_launch_block(),
         "keepalive": keepalive_and_usage(now),
         "context": context_block(now),
         "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
