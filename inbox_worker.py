@@ -13,12 +13,19 @@ going (keepalive.run_active, D-224), a turn or a subagent running (keepalive.com
 or a request in its transcript within ACTIVE_WINDOW (compact_timing.scan) is "now" without the
 Haiku call (its reason says so): the task-manager is working anyway, so the message goes in now,
 through the same delivery and its checks, instead of waiting as a note for the next message into
-the session. A failed activity check (the keepalive state unreadable, the transcript unreadable,
-...) is an error on the message, never a triage or a delivery in its place (D-235/D-244).
+the session. The keep-alive's compaction flow is no activity (D-262; compaction_flow reads its
+record in the keepalive state's "compactions"): from its start (right before the save prompt) until
+its end the message is triaged, and after it only a prompt that came after its end (and that turn's
+requests) counts, never the flow's own turns (save prompt, hand-off, /compact, compact_after,
+READY) nor what came before it. A failed activity check (the keepalive state unreadable, the
+transcript unreadable, ...) is an error on the message, never a triage or a delivery in its place
+(D-235/D-244).
 
 Delivery of a "now" message (D-186: no window, no budget, not held by automation_paused: the owner
 is asking, that is no automation) goes through the keep-alive's own send path and checks, never around them:
   - keepalive.session_lock (non-blocking): a compaction or a start typing into the session holds it;
+    so does the compaction flow's "running" record (D-262: a "now" verdict made during the flow
+    goes in after its READY, through these same checks);
   - the session at a usage limit (its last entry is the limit notice) holds it until the reset;
   - keepalive.preflight: the owner holding the session (Remote Control, a terminal, a busy process:
     owner_holds) holds it; any other refusal is an error;
@@ -67,6 +74,7 @@ import keepalive as ka  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
+import usage_stale  # noqa: E402
 
 UTC = timezone.utc
 ACTOR = "runner:inbox"
@@ -81,6 +89,12 @@ START_GRACE = schedule.CRON_STEP + ka.COMPACT_LOCK_WAIT + timedelta(minutes=5)
 VERIFY_TIMEOUT = timedelta(minutes=10)    # the sent message must be in the transcript by then
 VERIFY_POLL = 5                           # seconds
 HOLD_LOCKED = "a compaction or a start is typing into the session"
+# D-262: the keep-alive's compaction flow (keepalive._compact_now: save prompt, hand-off, /compact,
+# compact_after, READY) is no task-manager activity, and a "now" message waits until it is over.
+# Every step has a timeout, so a flow still recorded "running" this long after its start is over
+COMPACT_FLOW_MAX = (2 * ka.COMPACT_IDLE_WAIT + ka.SAVE_TIMEOUT + ka.COMPACT_TIMEOUT + ka.VERIFY_TIMEOUT
+                    + timedelta(minutes=5))
+HOLD_COMPACTING = "the keep-alive's compaction flow is running (it goes in after the READY, D-262)"
 
 
 def log(msg: str) -> None:
@@ -121,25 +135,80 @@ def triage_call(text: str) -> dict[str, Any]:
     return inbox.parse_triage(r.returncode, r.stdout or "", r.stderr or "")
 
 
-def manager_active(sid: str, now: datetime) -> str | None:
-    """D-252: why the task-manager session `sid` counts as active (a keep-alive run going, a turn
-    or a subagent running, a request within ACTIVE_WINDOW), else None (no transcript: not active).
-    A check that can't be made raises (the keepalive state or the transcript unreadable)."""
+def load_state() -> Any:
+    """The keepalive state (its "handled" fires, "compactions", ...); unreadable raises."""
     st = ka.load_state()
     if getattr(st, "unavailable", False):
         raise RuntimeError("the keepalive state can't be read from the DB: "
                            + (runner_state.load_failed() or "unknown reason"))
-    if ka.run_active(sid, now, st) is not None:
+    return st
+
+
+_STALE_FLOWS: set[str] = set()   # "running" records already alerted as stale (once per process)
+
+
+def compaction_flow(sid: str, st: Any, now: datetime) -> tuple[datetime, datetime | None] | None:
+    """D-262: the session's latest compaction flow, from the keepalive state's "compactions"
+    (keepalive.record_compaction: "running" from right before the save prompt until the READY reply
+    or the failure, then "compacted"/"failed" with done_at): -> (its start, its end; None while it
+    runs), or None (no flow). A failed attempt whose save prompt never went out (its save step has
+    no sent_at) was no flow. A record still "running" COMPACT_FLOW_MAX after its start can't be
+    running any more (every step has a timeout; the keep-alive died in it): it ended there, with an
+    alert (once) so the owner sees it."""
+    best: tuple[datetime, datetime | None, str] | None = None
+    for key, v in (st.get("compactions") or {}).items():
+        if not isinstance(v, dict) or v.get("session") not in (None, sid) or v.get("status") not in ka.COMPACT_STARTED:
+            continue
+        save = (v.get("steps") or {}).get("save")
+        if v.get("status") == "failed" and isinstance(save, dict) and not save.get("sent_at"):
+            continue
+        start = usage_stale.ts(v.get("at"))
+        if start is None or start > now or (best and start <= best[0]):
+            continue
+        end = None if v.get("status") == "running" else (usage_stale.ts(v.get("done_at")) or start)
+        best = (start, end, key)
+    if best is None:
+        return None
+    start, end, key = best
+    if end is None and now - start > COMPACT_FLOW_MAX:
+        end = start + COMPACT_FLOW_MAX
+        if key not in _STALE_FLOWS:
+            _STALE_FLOWS.add(key)
+            ka.alert(f"compaction {key} of {sid[:8]} still recorded as running",
+                     f"started {ka.berlin(start)}, longer than its steps' timeouts allow ({COMPACT_FLOW_MAX}): the "
+                     "keep-alive likely died in it. The inbox treats it as over (D-262); look at keepalive.log.")
+            log(f"inbox: compaction {key} of {sid[:8]} recorded running since {ka.berlin(start)}: treated as over")
+    return start, end
+
+
+def manager_active(sid: str, now: datetime) -> str | None:
+    """D-252: why the task-manager session `sid` counts as active (a keep-alive run going, a turn
+    or a subagent running, a request within ACTIVE_WINDOW), else None (no transcript: not active).
+    D-262: the keep-alive's compaction flow is no activity: while it runs nothing counts (the
+    message is triaged; a "now" one waits for the READY, delivery_hold), and after it only what
+    came after its end counts (a prompt after it, and the requests of such prompts' turns), so
+    neither the flow's own turns nor the activity before it make the task-manager active. A check
+    that can't be made raises (the keepalive state or the transcript unreadable)."""
+    st = load_state()
+    flow = compaction_flow(sid, st, now)
+    if flow and flow[1] is None:
+        return None
+    if ka.run_active(sid, now, st) is not None:   # only a run fired after the flow (run_active)
         return "a keep-alive run is going"
     path = ka.transcript_path(sid)
     if not path:
         return None
-    busy = ka.compaction_busy_reason(path, now)
-    if busy:
-        return busy
     sc = compact_timing.scan_cached(path)
-    if sc.requests and now - sc.requests[-1].ts <= ACTIVE_WINDOW:
-        return f"its last request was {max(0.0, (now - sc.requests[-1].ts).total_seconds()) / 60:.0f} min ago"
+    since = flow[1] if flow else None
+    busy = ka.compaction_busy_reason(path, now)
+    if busy and (since is None or any(p.ts > since for p in sc.prompts)):
+        return busy
+    if since is None:
+        reqs = sc.requests
+    else:
+        reqs = [r for p, rs in compact_timing.turns(sc) if p.ts > since for r in rs]
+    if reqs and now - reqs[-1].ts <= ACTIVE_WINDOW:
+        return f"its last request was {max(0.0, (now - reqs[-1].ts).total_seconds()) / 60:.0f} min ago"
     return None
 
 
@@ -173,7 +242,13 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
 # ---------------------------------------------------------------- delivery
 
 def delivery_hold(sid: str, path: str, now: datetime) -> tuple[str | None, str]:
-    """Why the message can't be typed in now (or None) and the send plan. A failed check raises."""
+    """Why the message can't be typed in now (or None) and the send plan. A failed check raises.
+    The keep-alive's compaction flow holds it until the READY (D-262): the session lock (deliver)
+    and, next to it, the flow's "running" record (compaction_flow), which also covers a keep-alive
+    whose lock directory isn't this process's."""
+    flow = compaction_flow(sid, load_state(), now)
+    if flow and flow[1] is None:
+        return f"{HOLD_COMPACTING}, since {ka.berlin(flow[0])}", ""
     stall = ka.stall_info(ka.last_message(path))
     if stall:
         reset = stall.get("reset_from_text")

@@ -14,6 +14,12 @@ The owner types a message on the temp dashboard (the quickview page); inbox_api.
         noted ones verbatim and marks them included, so the session never wakes (and re-reads
         its whole context after the cache expired, D-237/D-238) just for a note.
 
+No triage while the task-manager is active (D-252): a keep-alive run going, a turn or subagent
+running or a recent request makes a message "now" without the Haiku call. The keep-alive's
+compaction flow (save prompt, hand-off, /compact, compact_after, READY) is no activity (D-262):
+from the save prompt on and after the compaction messages are triaged again, and a "now" verdict
+made during the flow goes in only after its READY (inbox_worker.manager_active, delivery_hold).
+
 A "now" message that can't be typed in (the owner holds the session or is typing, a compaction, a
 usage limit) is held and tried again while the hold lasts, at most until the next session-window
 start (D-244, hold_deadline): that start's message takes it along (held_insert, keepalive's
