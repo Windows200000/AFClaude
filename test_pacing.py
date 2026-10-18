@@ -312,13 +312,15 @@ class Predictor(unittest.TestCase):
             t += timedelta(minutes=15)
         return rows
 
+    RAW = {"shrink_hours": 0.0, "budget_weight": 0.0}     # the unshrunk rate profile alone
+
     def test_threshold(self):
         rates, why = pm.fit_profile(self.week()[:200], [], R)        # 50 h < 72 h
         self.assertIsNone(rates)
         self.assertIn("too little user data", why)
 
     def test_profile_and_forecast(self):
-        rates, why = pm.fit_profile(self.week(), [], R)
+        rates, why = pm.fit_profile(self.week(), [], R, params=self.RAW)
         self.assertIn("1 closed week", why)
         self.assertAlmostEqual(rates[pm._how(Z("2026-10-06T10:00:00Z"))], 2.0, places=3)   # Tue 12:00
         self.assertAlmostEqual(rates[pm._how(SUN)], 0.1, places=3)
@@ -334,16 +336,91 @@ class Predictor(unittest.TestCase):
     def test_autonomous_runs_are_not_user_demand(self):
         fire = self.OLD - timedelta(days=2)
         rows = self.week(tue_rate=0.0, other_rate=0.0, burn=(fire, fire + timedelta(hours=3)))
-        with_fire, _ = pm.fit_profile(rows, [fire], R)
-        without, _ = pm.fit_profile(rows, [], R)
+        with_fire, _ = pm.fit_profile(rows, [fire], R, params=self.RAW)
+        without, _ = pm.fit_profile(rows, [], R, params=self.RAW)
         self.assertAlmostEqual(sum(with_fire), 0.0)
         self.assertAlmostEqual(sum(without), 15.0, places=3)
         # the user typing into an AFClaude session ends the autonomous span
         for r in rows:
             if pm._ts(r["at"]) == fire + timedelta(hours=1):
                 r["activity"]["own"] = {"human_prompts": 1}
-        back, _ = pm.fit_profile(rows, [fire], R)
+        back, _ = pm.fit_profile(rows, [fire], R, params=self.RAW)
         self.assertAlmostEqual(sum(back), 10.0, places=3)
+        # a recorded run (run_metrics row) keeps the whole run AFClaude's despite that prompt
+        run = {"start": fire.isoformat(), "end": (fire + timedelta(hours=3)).isoformat(), "kind": "window-start"}
+        rec, _ = pm.fit_profile(rows, [fire], R, runs=[run], params=self.RAW)
+        self.assertAlmostEqual(sum(rec), 0.0)
+        self.assertEqual(pm.run_spans(rows, [fire], [run]), [(fire, fire + timedelta(hours=3))])
+
+    def test_shrinkage_toward_the_mean_rate(self):
+        rows = self.week()
+        raw, _ = pm.fit_profile(rows, [], R, params=self.RAW)
+        ws = [x["usage"]["weekly"]["percent"] for x in rows]
+        mean = (ws[-1] - ws[0]) / 167.75                        # 15-min samples from 00:15 on
+        m = 24.0
+        shrunk, _ = pm.fit_profile(rows, [], R, params={"shrink_hours": m, "budget_weight": 0.0})
+        tue = pm._how(Z("2026-10-06T10:00:00Z"))
+        self.assertAlmostEqual(shrunk[tue], (2.0 + m * mean) / (1 + m), places=3)
+        self.assertAlmostEqual(sum(shrunk), sum(raw), delta=0.1)  # about the week's total
+        self.assertLess(shrunk[tue], raw[tue])
+
+    def test_weekly_budget_blend(self):
+        old = self.week(tue_rate=0.0, other_rate=0.3)             # a closed cycle: 50.4% by the user
+        final = old[-1]["usage"]["weekly"]["percent"]
+        now = self.OLD + timedelta(days=2)                         # 48 h into the open cycle (reset R)
+        cur, t, w = [], self.OLD, 0.0
+        while t < now:
+            w += 0.05 / 4                                          # a quiet start: 2.4% so far
+            cur.append(row(t + timedelta(minutes=15), round(w, 4), reset=R))
+            t += timedelta(minutes=15)
+        P = {"shrink_hours": 0.0, "budget_weight": 0.5}
+        rates, why = pm.fit_profile(old + cur, [], now, params=P)
+        self.assertIn("weekly budget", why)
+        self.assertAlmostEqual(rates.week_total, final, places=3)
+        self.assertAlmostEqual(rates.used, w, places=3)
+        self.assertEqual(rates.cycle_end, R)
+        rate_only = pm._rate_forecast(rates, now, R)               # 0.3 %/h x 108 h (not Tue 9-21)
+        self.assertAlmostEqual(rate_only, 32.4, places=2)
+        fc = pm.forecast_user(rates, now, R)
+        self.assertAlmostEqual(fc, 0.5 * rate_only + 0.5 * (final - w), places=2)
+        mid = now + timedelta(hours=37, minutes=20)                # additive over sub-intervals
+        self.assertAlmostEqual(pm.forecast_user(rates, now, mid) + pm.forecast_user(rates, mid, R), fc, places=6)
+        # AFClaude's own rise in the closed cycle is not the user's weekly total
+        burn = (self.OLD - timedelta(days=2), self.OLD - timedelta(days=2) + timedelta(hours=2))
+        old2 = self.week(tue_rate=0.0, other_rate=0.3, burn=burn)
+        r2, _ = pm.fit_profile(old2 + cur, [burn[0]], now, params=P)
+        auto = sum(dw for _, _, dw, a, _ in pm._intervals(old2, [burn[0]]) if a)
+        self.assertGreaterEqual(auto, 10.0)                        # the run's 2 h x 5 %/h (+ its intervals' user rise)
+        self.assertAlmostEqual(r2.week_total, old2[-1]["usage"]["weekly"]["percent"] - auto, places=3)
+        # weight 0, no open-cycle reading, or no final reading of the closed cycle: the rates alone
+        r0, _ = pm.fit_profile(old + cur, [], now, params={"shrink_hours": 0.0, "budget_weight": 0.0})
+        self.assertIsNone(r0.week_total)
+        self.assertAlmostEqual(pm.forecast_user(r0, now, R), rate_only, places=6)
+        r3, _ = pm.fit_profile(old, [], now, params=P)
+        self.assertIsNone(r3.week_total)
+        r4, _ = pm.fit_profile(old[:-8] + cur, [], now, params=P)  # the last 2 h before the reset missing
+        self.assertIsNone(r4.week_total)
+        # the user already above the typical week: the budget part is 0, the rates still count
+        hi = [dict(x, usage={"weekly": {"percent": x["usage"]["weekly"]["percent"] + 60, "resets_at": R.isoformat()}})
+              for x in cur]
+        r5, _ = pm.fit_profile(old + hi, [], now, params=P)
+        self.assertAlmostEqual(pm.forecast_user(r5, now, R), 0.5 * rate_only, places=2)
+
+    def test_profile_reads_the_db_without_the_legacy_file(self):
+        self.assertFalse(os.path.exists(pm.SAMPLES_FILE))       # the frozen legacy file may be archived
+        rates, why = pm.profile(now=R)
+        self.assertIsNone(rates)
+        self.assertNotIn("no samples", why)                     # the DB was read (empty here)
+        self.assertIn("too little user data", why)
+
+    def test_predictor_params(self):
+        self.assertEqual(pm.predictor_params({})[0], pm.PREDICTOR_DEFAULTS)
+        self.assertEqual(pm.predictor_params(None)[1], "defaults")      # no user model in the test DB
+        P, src = pm.predictor_params({"predictor": {"budget_weight": 0.3}, "safety": 1.25})
+        self.assertEqual((P["budget_weight"], P["shrink_hours"], src), (0.3, 24.0, "user model"))
+        for bad in (-0.1, 1.5, "x", True, None):
+            with self.assertRaises(ValueError):
+                pm.predictor_params({"predictor": {"budget_weight": bad}})
 
     def test_autonomous_span_ends_when_the_run_goes_idle_not_at_its_own_prompt(self):
         f = Z("2026-10-01T12:00:32Z")
