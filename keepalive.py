@@ -1598,7 +1598,6 @@ def run_pace_text(sid, stall, now, u):
 
 WINDOW_PING_TIMEOUT = 120                        # seconds for the request
 WINDOW_PING_VERIFY_AFTER = timedelta(seconds=90)  # then read the session reset again
-WINDOW_PING_FLOOR = timedelta(minutes=10)        # Claude floors a new session window's start to this
 WINDOW_PING_SLACK = timedelta(minutes=1)         # reset times jitter by milliseconds
 WINDOW_PINGS_KEPT = 30                           # st["window_pings"]: the last pings
 
