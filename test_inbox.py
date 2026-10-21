@@ -899,6 +899,10 @@ class Endpoint(DB):
 # ---------------------------------------------------------------- the CLI and the quickview
 
 class CLI(DB):
+    def setUp(self):
+        testenv.fresh_db(self)       # `inbox` also lists blocked tasks: none from another module
+        super().setUp()
+
     def cli(self, *argv):
         out = []
         old = sys.stdout

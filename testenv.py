@@ -32,6 +32,25 @@ store.connect(DB, create=True).close()   # explicit, like a real install's setup
                                           # "no database" log line from the settings reads
 
 
+def fresh_db(test):
+    """A new, empty DB for one test: store.DB_PATH and $AFCLAUDE_DB point at it until the test's
+    cleanup puts the shared one back. For a test that needs a table to itself (e.g. no other
+    module's projects): a DELETE on the shared DB can trip a foreign key another module's rows
+    hold, and a setUp that fails mid-transaction leaves its connection's write lock behind.
+    -> the path."""
+    d = tempfile.mkdtemp(prefix="afclaude-test-db-")
+    test.addCleanup(shutil.rmtree, d, True)
+    path = os.path.join(d, "afclaude.db")
+    old = store.DB_PATH, os.environ["AFCLAUDE_DB"]
+
+    def restore():
+        store.DB_PATH, os.environ["AFCLAUDE_DB"] = old
+    test.addCleanup(restore)
+    store.DB_PATH = os.environ["AFCLAUDE_DB"] = path
+    store.connect(path, create=True).close()
+    return path
+
+
 def set_setting(key, value, db=None):
     """Save a setting through actions.py (value None = reset to the code default)."""
     conn = store.connect(db or store.DB_PATH)

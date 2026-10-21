@@ -20,12 +20,9 @@ OTHER = "abcdef02-0000-4000-8000-000000000002"
 
 class Base(unittest.TestCase):
     def setUp(self):
+        testenv.fresh_db(self)                  # no other module's projects (or their foreign keys)
         self.conn = store.connect()
-        self.conn.execute("DELETE FROM projects")
-        self.conn.commit()
-
-    def tearDown(self):
-        self.conn.close()
+        self.addCleanup(self.conn.close)
 
     def do(self, _action, /, **params):
         return actions.perform(self.conn, _action, params, actor="cli", via="cli")
