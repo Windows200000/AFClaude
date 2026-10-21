@@ -1363,6 +1363,25 @@ def note_limit_hit(sid, stall, st, now):
     return True
 
 
+_WATCH_LINE = None   # watch_pass: the detection line last logged (logged when it changes)
+
+
+def watch_pass(sid, now, st):
+    """The watch pass: limit detection and logging only. A limit hit ends the run; nothing
+    continues the session at its reset (D-204): runs begin only at starts (the session-window
+    starts, a postponed or planned one, the last-stretch slot starts, a fill-up). The line is
+    logged when it changes; a stall is noted once (note_limit_hit). A failure raises."""
+    global _WATCH_LINE
+    action, detail, stall = stall_status(sid, now)
+    if stall:
+        action, detail = "LIMIT_HIT", f"{detail}; {LIMIT_HIT_NOTE}"
+        note_limit_hit(sid, stall, st, now)
+    line = f"{action}: {detail}"
+    if line != _WATCH_LINE:
+        log(line)
+        _WATCH_LINE = line
+
+
 WAKE_SLACK = timedelta(seconds=1)     # wake this long after a due time (resets_at jitters by ms)
 MIN_SLEEP = 0.5                       # seconds; never a busy loop
 LM_BOUNDARY_EVERY = timedelta(minutes=5)   # re-read the next last-stretch slot start this often
@@ -1412,7 +1431,8 @@ def run(args):
     mode = "ARMED" if args.arm else "DRY-RUN"
     log(f"keepalive start ({mode}) target={sid} windows {schedule.describe()} pid={os.getpid()}")
     st = load_state()
-    last_line = None
+    global _WATCH_LINE
+    _WATCH_LINE = None
     next_eval = next_reading = next_fillup = next_compact = lm_checked = datetime.min.replace(tzinfo=UTC)
     lm_start = None
     while True:
@@ -1428,19 +1448,9 @@ def run(args):
                 lm_start = None
                 fail_stop("last-stretch slot time failed", f"{type(e).__name__}: {e}")
         if now >= next_eval:
-            # Detection + logging only: a limit hit ends the run, the watcher never continues the
-            # session at the reset (D-204). Runs begin only at starts: the session-window starts
-            # (cron --window-start, a postponed one below) and the last-stretch slot starts.
             next_eval = now + timedelta(seconds=POLL_SECONDS)
             try:
-                action, detail, stall = stall_status(sid, now)
-                if stall:
-                    action, detail = "LIMIT_HIT", f"{detail}; {LIMIT_HIT_NOTE}"
-                    note_limit_hit(sid, stall, st, now)
-                line = f"{action}: {detail}"
-                if line != last_line:
-                    log(line)
-                    last_line = line
+                watch_pass(sid, now, st)
                 # a last-stretch slot start decides by its own check, stalled or not (D-204)
                 next_lm = last_mile_pass(sid, now, st, args)
                 if next_lm:
@@ -1544,7 +1554,16 @@ def last_mile_pass(sid, now, st, args):
     previous slot's run ended at a limit, and nothing continues at a limit reset in between
     (a slot already handled waits for the next slot). A limit that has not reset yet makes the
     slot's start wait for that reset. Paused automation (D-234/D-235) holds it like a HOLD.
-    Returns the next re-check time after a HOLD, else None."""
+    Returns the next re-check time after a HOLD, else None. The plan step (last_stretch_plan:
+    which slot is due) and the act step (last_stretch_act: the check and the start), as the
+    resident runner calls them apart (phase 3a S6)."""
+    p = last_stretch_plan(sid, now, st)
+    return None if p is None else last_stretch_act(sid, now, st, args, p)
+
+
+def last_stretch_plan(sid, now, st):
+    """The plan step of the last stretch: the slot whose start is due now (in the last stretch,
+    not handled yet) -> {key, slot, resets_at}, else None. Reads only (the usage cache)."""
     w = (usage_cache_checked() or {}).get("weekly") or {}
     left = last_mile_left(w.get("resets_at"), now, w.get("percent"))
     if left is None:
@@ -1553,6 +1572,13 @@ def last_mile_pass(sid, now, st, args):
     key = last_mile_key(w["resets_at"], slot)
     if last_mile_handled(key, st["handled"]):
         return None
+    return {"key": key, "slot": slot, "resets_at": w["resets_at"]}
+
+
+def last_stretch_act(sid, now, st, args, p):
+    """The act step of the last stretch (the plan `p`, last_stretch_plan): the slot start's own
+    check, then the start (handle_fire). -> the next re-check time after a HOLD, else None."""
+    key, slot, w = p["key"], p["slot"], {"resets_at": p["resets_at"]}
     if automation_paused(f"the last-stretch slot {key}", sid):
         return now + LAST_MILE_RECHECK
     action, detail, stall = stall_status(sid, now)
@@ -1989,7 +2015,22 @@ def deferred_window_start_pass(sid, now, st, args):
     recheck would reach the night's next session-window start or the window end: that start
     decides itself, D-202). A FIRE dropped for a DB pause (handle_fire -> db_paused) is
     postponed again the same way, instead of being dropped with the entry already removed.
-    -> the next recheck time or None."""
+    -> the next recheck time or None. The plan step (deferred_plan: which entry, when) and the
+    act step (deferred_act: decide again, fire), as the resident runner calls them apart (S6)."""
+    p = deferred_plan(sid, now, st)
+    if p is None:
+        return None
+    key, ent, defs = p
+    due = parse_ts(ent.get("recheck_at")) or now
+    if now < due:
+        return due
+    return deferred_act(sid, now, st, args, key, ent, defs)
+
+
+def deferred_plan(sid, now, st):
+    """The plan step of a postponed / planned session-window start: drops the entries that are
+    over (an older start's, another session's, a handled one's) -> (key, entry, all entries) of
+    the current start's entry (its recheck_at: when the act step decides again), else None."""
     defs = load_deferred()
     if not defs:
         return None
@@ -2008,9 +2049,12 @@ def deferred_window_start_pass(sid, now, st, args):
         save_deferred(defs)
     if not ent:
         return None
-    due = parse_ts(ent.get("recheck_at")) or now
-    if now < due:
-        return due
+    return key, ent, defs
+
+
+def deferred_act(sid, now, st, args, key, ent, defs):
+    """The act step of the postponed / planned start `key` (its entry `ent` of `defs`, due): decide
+    again, then fire, postpone again or drop it. -> the next recheck time or None."""
     paused = automation_paused(f"the postponed session-window start {key}", sid)
     u = None if paused else fresh_usage(now, force=True)
     if u is None:   # paused, or the usage reading failed (fresh_usage: alert + pause): dropped
@@ -2466,21 +2510,39 @@ def _fire_fillup(sid, now, d, args, test=False):
 
 def fillup_test_pass(sid, now, args, test):
     """-> the time to look again (its start while planned, a re-check while held), or None."""
+    d = fillup_test_plan(sid, now, test)
+    return fillup_test_act(sid, now, args, test, d) if d["status"] == "fire" else d.get("recheck_at")
+
+
+def fillup_test_plan(sid, now, test):
+    """The plan step of a --plan-fillup-test entry: its decision (fillup.decide_test; status
+    "fire": the act step fires it); an entry that is done or expired is removed."""
     import failstop
     import fillup
     st = load_state()
     d = fillup.decide_test(now=now, test=test, handled=st.get("handled") or {},
                            paused=failstop.paused(session=sid)["paused"])
     _fillup_log(f"fill-up TEST: {d['status']}: {d['reason']} (start {berlin(d['start'])}, key {d['key']})")
-    if d["status"] == "fire":
-        _fire_fillup(sid, now, d, args, test=True)
-        d = fillup.decide_test(now=now, test=test, handled=load_state().get("handled") or {}, paused=False)
     if d["status"] in ("done", "expired"):
-        f = load_fillup()
-        f.pop("test", None)
-        save_fillup(f)
-        progress_note(f"fill-up TEST {d['key']}: {d['reason']}")
+        _fillup_test_over(d)
+    return d
+
+
+def fillup_test_act(sid, now, args, test, d):
+    """The act step of a due --plan-fillup-test entry: fire it. -> as fillup_test_pass."""
+    import fillup
+    _fire_fillup(sid, now, d, args, test=True)
+    d = fillup.decide_test(now=now, test=test, handled=load_state().get("handled") or {}, paused=False)
+    if d["status"] in ("done", "expired"):
+        _fillup_test_over(d)
     return d.get("recheck_at")
+
+
+def _fillup_test_over(d):
+    f = load_fillup()
+    f.pop("test", None)
+    save_fillup(f)
+    progress_note(f"fill-up TEST {d['key']}: {d['reason']}")
 
 
 def _usage_young(u, now):
@@ -2494,20 +2556,30 @@ def fillup_pass(sid, now, args):
     reports it: fail_stop).
     The fire decides on usage at most FILLUP_FRESH old: within FILLUP_PREFETCH of the planned start
     the usage is refreshed ahead, so the run fires AT its start (the watcher wakes then, run()),
-    not after a /usage call. -> the time to look again (the planned start, a re-check), or None."""
+    not after a /usage call. -> the time to look again (the planned start, a re-check), or None.
+    The plan step (fillup_plan) and the act step (fillup_act), as the resident runner calls them
+    apart (phase 3a S6)."""
     test = load_fillup().get("test")
     if isinstance(test, dict) and test.get("session") == sid:
         return fillup_test_pass(sid, now, args, test)
+    d, due, fire_now = fillup_plan(sid, now)
+    return fillup_act(sid, now, args, d) if fire_now else due
+
+
+def fillup_plan(sid, now):
+    """The plan step of the fill-up (not a test entry): the decision on the usage cache, refreshed
+    first when the start is due or within FILLUP_PREFETCH; the plan stored (the quickview's) and
+    logged when it changes. -> (the decision, the time to look again or None, fire now)."""
     u = usage_cache_checked() or {}
     d = fillup_decision(sid, now, u)
     if d["status"] == "fire" and now < _FILLUP_BUSY.get(d.get("key"), now):
-        return _FILLUP_BUSY[d["key"]]        # the owner was busy: not before then (no /usage call either)
+        return d, _FILLUP_BUSY[d["key"]], False   # the owner was busy: not before then (no /usage call either)
     planned = d["status"] == "wait" and d.get("recheck_at") is not None and d.get("recheck_at") == d.get("start")
     if (d["status"] == "fire" or (planned and d["start"] - now <= FILLUP_PREFETCH)) and not _usage_young(u, now):
         fu = fresh_usage(now, force=True)   # the plan used the cache: decide on fresh numbers
         if fu is None:                       # fresh_usage raised the error (alert + automation paused)
             if d["status"] == "fire":
-                return None                  # not fired; the pause holds the next passes
+                return d, None, False        # not fired; the pause holds the next passes
         else:
             u = fu
             d = fillup_decision(sid, now, u)
@@ -2517,12 +2589,16 @@ def fillup_pass(sid, now, args):
         f["plan"] = plan
         save_fillup(f)
     _fillup_log(f"fill-up: {d['status']}: {d['reason']}" + (f"; {_fillup_text(d)}" if "start" in d else ""))
-    if d["status"] == "fire":
-        if _fire_fillup(sid, now, d, args) == OWNER_BUSY:
-            _FILLUP_BUSY[d["key"]] = now + OWNER_BUSY_RECHECK
-            return _FILLUP_BUSY[d["key"]]
-        return None
-    return d.get("recheck_at")
+    return d, d.get("recheck_at"), d["status"] == "fire"
+
+
+def fillup_act(sid, now, args, d):
+    """The act step of the fill-up (the decision `d`, status fire): the start. -> when to try
+    again after the owner was busy (OWNER_BUSY, D-259), else None."""
+    if _fire_fillup(sid, now, d, args) == OWNER_BUSY:
+        _FILLUP_BUSY[d["key"]] = now + OWNER_BUSY_RECHECK
+        return _FILLUP_BUSY[d["key"]]
+    return None
 
 
 def plan_fillup_test(sid, remaining, args):
@@ -3362,19 +3438,30 @@ def compaction_pass(sid, now, args):
     context above the threshold whose cache expired without a compaction is recorded "missed" (the
     quickview shows both). A failure of the compaction itself is recorded and reported here
     (fail_stop); a failure before it (the transcript, the cost model, a host call) raises (run()
-    reports it: fail_stop)."""
+    reports it: fail_stop). The check (compaction_plan) and the compaction (compaction_act), as the
+    resident runner calls them apart (phase 3a S6)."""
+    d, ready = compaction_plan(sid, now, args)
+    if ready is not None:
+        compaction_act(sid, d, *ready)
+    return d
+
+
+def compaction_plan(sid, now, args):
+    """The check: is a compaction due now? -> (the Decision or None, None or (transcript path,
+    the attempt's record, the log head) when it is due and armed: compaction_act then compacts).
+    Holds are logged once per reason, a missed or dry-run attempt is recorded here."""
     import compact_timing as ct
     cfg = _compaction_settings()
     if not cfg["compaction_enabled"]:
         _compact_log("compaction: compaction_enabled is off")
-        return None
+        return None, None
     threshold = int(cfg["compaction_threshold_tokens"])
     if automation_paused(f"the compaction of {sid[:8]}", sid):
-        return None
+        return None, None
     path = transcript_path(sid)
     if not path:
         _compact_log(f"compaction of {sid[:8]}: no transcript")
-        return None
+        return None, None
     model = ct.load()
     sc = ct.scan_cached(path)
     state = ct.context_state(sc, model, now, threshold)
@@ -3384,7 +3471,7 @@ def compaction_pass(sid, now, args):
     d = ct.decide(now, state, run_using=using, run_ended=not using and run_ended(sid, sc, st, now),
                   busy=compaction_busy_reason(path, now, subagents=not using), mid_run_hold=mid)
     if d.key and (d.key in (st.get("compactions") or {}) or d.key in _COMPACT_TRIED):
-        return d
+        return d, None
     if d.due:
         why = _compaction_hold(sid, now, path)
         if why:
@@ -3403,22 +3490,27 @@ def compaction_pass(sid, now, args):
             _COMPACT_TRIED.add(d.key)
             record_compaction(sid, d.key, dict(rec, status="missed", last_hold=_COMPACT_LINE))
         _compact_log(head + d.reason)
-        return d
+        return d, None
     _COMPACT_TRIED.add(d.key)
     if not getattr(args, "arm", False):
         _compact_log(head + f"WOULD COMPACT (dry-run, {d.trigger}: {d.reason})")
         record_compaction(sid, d.key, dict(rec, status="dry-run"))
-        return d
+        return d, None
+    return d, (path, rec, head)
+
+
+def compaction_act(sid, d, path, rec, head):
+    """The compaction compaction_plan found due (`d`), under the session's send lock (a start
+    typing into the session holds it: then later, the next check decides again)."""
     lock = session_lock(sid)
     if lock is None:
         _COMPACT_TRIED.discard(d.key)
         _compact_log(head + "a start is typing into the session (its lock is held): later")
-        return d
+        return
     try:
         _compact_now(sid, path, d, rec, head)
     finally:
         release_lock(lock)
-    return d
 
 
 MID_RUN_KIND = {   # the run's start prompt -> what its continue said that the run still needs
