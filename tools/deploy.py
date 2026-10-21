@@ -16,13 +16,17 @@ quiet, so a rebuild never starts while one of these is in flight.
 
     python3 tools/deploy.py [--max-wait-drain MIN] [--max-wait-clear MIN] [--force]
 
-Steps: 1) `runner.py drain()` (existing). 2) poll `docker top` for a sampler / usage-review /
+Steps: 0) refuse within START_GUARD (30 min) before or after a scheduled session-window start
+(schedule.py): from phase 3a S5 on, a restart during a start is an alert + pause (D-257), and a
+start missed by the restart gap is one too; the refusal prints the next safe time.
+1) `runner.py drain()` (existing). 2) poll `docker top` for a sampler / usage-review /
 unittest / claude process (any bridge call, including a plain usage read) still running in
 the container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` with
 AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README/prompts/manager_afclaude.md
 say to run it; the image has no .git, so without this the build commit is unknown).
-Exit 1 (no rebuild) if draining or clearing timed out; --force rebuilds anyway, printing
-what was still running.
+Exit 1 (no rebuild) inside the start guard (checked before the drain and again before the
+rebuild) or if draining or clearing timed out; an aborted deploy lifts its drain again.
+--force rebuilds anyway, printing what was still running.
 """
 from __future__ import annotations
 
@@ -32,18 +36,20 @@ import re
 import subprocess
 import sys
 import time
-from datetime import timedelta
-from typing import Callable, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Callable, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import runner  # noqa: E402  (drain)
+import schedule  # noqa: E402
 import store  # noqa: E402
 
 CONTAINER = "afclaude"
 COMPOSE_FILE = os.path.join(HERE, "docker", "compose.yml")
 CLEAR_POLL = 5.0                              # seconds between docker-top polls
 DEFAULT_CLEAR_WAIT = timedelta(minutes=10)
+START_GUARD = timedelta(minutes=30)           # no rebuild this close to a session-window start
 
 # Any of these in one of the container's own process lines means a bridge call (or a plain
 # usage read: it still goes out as `claude -p ... /usage`) that a rebuild must not cut off
@@ -94,6 +100,50 @@ def wait_clear(max_wait: timedelta, *, poll: float = CLEAR_POLL,
         sleep(poll)
 
 
+def start_guard(now: datetime, cfg: schedule.Config,
+                guard: timedelta = START_GUARD) -> Tuple[Optional[datetime], datetime]:
+    """-> (the session-window start within `guard` before or after `now`, or None; the next
+    safe time: `now` itself when none is that close, else the first time at least `guard`
+    after every start that close, chained if the next start is near too). A start exactly
+    `guard` away is safe. Both UTC."""
+    t = now.astimezone(timezone.utc)
+    near: Optional[datetime] = None
+    while True:
+        close = [s for s, _ in schedule.session_slots(t - guard, t + guard, cfg)]
+        if not close:
+            return near, t
+        near = near or close[0]
+        t = close[-1] + guard
+
+
+def check_start_guard(force: bool, now: Optional[datetime] = None,
+                      cfg: Optional[schedule.Config] = None,
+                      out: Callable[[str], object] = print) -> bool:
+    """True = rebuild now is fine (no session-window start within START_GUARD, or --force,
+    which only prints the warning); False = refused, the next safe time printed."""
+    c = cfg if cfg is not None else schedule.load()
+    near, safe = start_guard(now or datetime.now(timezone.utc), c)
+    if near is None:
+        return True
+    msg = (f"a session-window start is at {near.astimezone(c.zone):%Y-%m-%d %H:%M %Z}: no rebuild "
+           f"within {START_GUARD.total_seconds() / 60:.0f} min of it (a restart during a start alerts "
+           f"+ pauses, D-257); next safe time {safe.astimezone(c.zone):%Y-%m-%d %H:%M %Z}")
+    if force:
+        out(f"--force: {msg}; deploying anyway")
+        return True
+    out(f"deploy refused: {msg}; rerun with --force to rebuild anyway")
+    return False
+
+
+def lift_drain(conn: object) -> int:
+    """An aborted deploy lifts its drain at once (runner.undrain): else it would hold the next
+    session runs until the drain expires (the longest session-run timeout + 5 min), long enough
+    to turn a start into a missed one (D-257). -> 1 (the deploy's exit code)."""
+    runner.undrain(conn)
+    print("drain lifted (no rebuild)")
+    return 1
+
+
 def code_version(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> str:
     return run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
               check=True).stdout.strip()
@@ -108,19 +158,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--max-wait-clear", type=float, default=DEFAULT_CLEAR_WAIT.total_seconds() / 60,
                     help="minutes to wait for the container to go quiet (default 10)")
     ap.add_argument("--force", action="store_true",
-                    help="rebuild even if draining or clearing timed out (prints what was still running)")
+                    help="rebuild even within 30 min of a session-window start or if draining or "
+                         "clearing timed out (prints what was still running)")
     args = ap.parse_args(argv)
 
+    if not check_start_guard(args.force):
+        return 1
     conn = store.connect()
     try:
         drained = runner.drain(conn, timedelta(minutes=args.max_wait_drain)
                                if args.max_wait_drain is not None else None) == 0
+        cleared = wait_clear(timedelta(minutes=args.max_wait_clear))
+        if not (drained and cleared) and not args.force:
+            print("deploy aborted: not drained/clear (see above); rerun with --force to rebuild anyway")
+            return lift_drain(conn)
+        if not check_start_guard(args.force):  # again: the drain and the clear wait can be long
+            return lift_drain(conn)
     finally:
         conn.close()
-    cleared = wait_clear(timedelta(minutes=args.max_wait_clear))
-    if not (drained and cleared) and not args.force:
-        print("deploy aborted: not drained/clear (see above); rerun with --force to rebuild anyway")
-        return 1
 
     version = code_version()
     print(f"rebuilding (AFCLAUDE_CODE_VERSION={version}) ...")
