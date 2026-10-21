@@ -63,6 +63,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
                row's project) and action_requests.run_id / updated_at (run-now, D-153); the
                driven_sessions backfill is `python3 store.py import-driven` (driven.py).
+               prompt_vars (phase 4a, D-197, additive the same way): a project's values of the
+               prompt variables prompts.PROJECT_VARS declares (prompts.py; actions.py writes).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -681,6 +683,23 @@ CREATE TABLE IF NOT EXISTS prompt_defaults (
 );
 """
 
+# ---- per-project prompt variables (D-197; phase 4a, prompts.py, docs/phase4_plan.md P1): prompts stay
+# system-wide (D-193), a project only fills the variables prompts.PROJECT_VARS declares. One row per
+# (project, variable) ever set; a reset sets value NULL (the row and its version stay, as in
+# prompt_overrides), so the variable's declared default applies again. Written only through
+# actions.py (prompt_var.set / prompt_var.reset / prompt_var.migrate). Additive, no schema_version bump.
+PROMPT_VARS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prompt_vars (
+    project_id  INTEGER NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,          -- a prompts.PROJECT_VARS name
+    value       TEXT,                   -- NULL = reset to the variable's default
+    version     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL,
+    updated_by  TEXT,
+    PRIMARY KEY (project_id, name)
+);
+"""
+
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
 # owner / task-manager decision, mirrored from DECISIONS.md (the source the task-manager edits for
 # now; actions.decision_import, audited) with the full entry text and its fields. keywords is the
@@ -733,7 +752,11 @@ VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
     f"UPDATE {t} SET version = OLD.version + 1 WHERE {pk} = NEW.{pk}; END"
-    for t, pk in VERSIONED.items()]
+    for t, pk in VERSIONED.items()] + [
+    # prompt_vars has a two-column key, so its trigger is spelled out
+    "CREATE TRIGGER IF NOT EXISTS prompt_vars_version AFTER UPDATE ON prompt_vars FOR EACH ROW "
+    "WHEN NEW.version IS OLD.version BEGIN "
+    "UPDATE prompt_vars SET version = OLD.version + 1 WHERE project_id = NEW.project_id AND name = NEW.name; END"]
 
 # Columns added after a table first shipped: {table: [(name, decl), ...]}.
 # connect() adds any that an existing database lacks.
@@ -962,6 +985,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(RUNNER_RUNS_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
+    conn.executescript(PROMPT_VARS_SCHEMA)
     conn.executescript(DECISIONS_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         _init_decisions_fts(conn)
@@ -2232,6 +2256,31 @@ def mark_override_base_outdated(conn: sqlite3.Connection, name: str, outdated: b
         return
     conn.execute("UPDATE prompt_overrides SET base_outdated=? WHERE name=?",
                  (None if outdated is None else int(outdated), name))
+
+
+def get_prompt_var(conn: sqlite3.Connection, project_id: int, name: str) -> Row | None:
+    r = conn.execute("SELECT * FROM prompt_vars WHERE project_id=? AND name=?", (project_id, name)).fetchone()
+    return dict(r) if r else None
+
+
+def list_prompt_vars(conn: sqlite3.Connection, project_id: int | None = None) -> list[Row]:
+    """Every prompt_vars row (incl. reset ones, value NULL), of one project or all, by project and name."""
+    if project_id is None:
+        return [dict(r) for r in conn.execute("SELECT * FROM prompt_vars ORDER BY project_id, name")]
+    return [dict(r) for r in conn.execute("SELECT * FROM prompt_vars WHERE project_id=? ORDER BY name",
+                                          (project_id,))]
+
+
+def put_prompt_var(conn: sqlite3.Connection, project_id: int, name: str, value: str | None,
+                   updated_by: str | None = None) -> Row:
+    """Set one project's variable (value None = reset: the row and its version stay)."""
+    conn.execute("INSERT INTO prompt_vars(project_id, name, value, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) "
+                 "ON CONFLICT(project_id, name) DO UPDATE SET value=excluded.value, "
+                 "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                 (project_id, name, value, now_iso(), updated_by))
+    row = get_prompt_var(conn, project_id, name)
+    assert row is not None     # just written, in the same connection
+    return row
 
 
 def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,

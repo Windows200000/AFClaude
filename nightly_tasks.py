@@ -51,6 +51,7 @@ import runner_state  # noqa: E402
 import failstop  # noqa: E402
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
+import prompts as prompt_registry  # noqa: E402  (add() has a parameter named prompts)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -62,13 +63,11 @@ MAX_RUNS = 3                                   # night starts that took a task a
 RUN_SPAN = afclaude_config.SESSION_LENGTH + timedelta(hours=1)   # ... once the last one's run is over
 STATUSES = ("pending", "done", "cancelled")
 ALWAYS_FIELDS = ("name", "title", "report")
-PROMPTS_DIR = os.path.join(HERE, "prompts")
 
 
 def _prompt(name: str) -> str:
-    """prompts/<name>.md (as keepalive.load_prompt)."""
-    with open(os.path.join(PROMPTS_DIR, name + ".md")) as fh:
-        return fh.read()
+    """prompts/<name>.md, through the registry (prompts.py; an unknown name is an OSError)."""
+    return prompt_registry.default(name)
 
 
 def _ts(s: object) -> Optional[datetime]:

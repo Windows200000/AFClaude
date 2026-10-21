@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import prompts  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
@@ -67,8 +68,8 @@ class TriageError(Exception):
 
 
 def prompt(name: str) -> str:
-    """prompts/<name>.md, the default (the senders read the files, D-169)."""
-    return actions.prompt_default(name + ".md")
+    """prompts/<name>.md, the default (D-169), through the registry (prompts.py)."""
+    return prompts.default(name)
 
 
 def one_line(text: str) -> str:

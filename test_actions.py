@@ -516,7 +516,8 @@ class SessionActions(Base):
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
-                  "inbox.post", "inbox.retry", "project.manager_launch"}
+                  "inbox.post", "inbox.retry", "project.manager_launch",
+                  "prompt_var.set", "prompt_var.reset", "prompt_var.migrate"}   # D-197: the people set them (5a)
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -1049,6 +1050,10 @@ class EveryAction(Base):
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
             ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
             ("prompt.defaults_sync", {}),
+            ("prompt_var.set", {"project": "P", "name": "project_notes", "value": "n"}),
+            ("prompt_var.reset", {"project": "P", "name": "project_notes"}),
+            ("project.add", {"name": "Here", "path": __import__("prompts").HERE}),
+            ("prompt_var.migrate", {}),
             ("request.add", {"kind": "continue_now", "target": SID}),
             ("request.start", {"request_id": 1, "tmux": "ka-00000000", "run_id": 7}),
             ("request.add", {"kind": "work_on_now", "target": "P"}),

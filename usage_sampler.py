@@ -64,6 +64,7 @@ import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ig
 import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual-write)
 import runner_state  # noqa: E402  (phase 2d: the sampler state and log lines too)
 import failstop  # noqa: E402  (D-234/D-235: every failure is an error the owner sees)
+import prompts as prompt_registry  # noqa: E402  (phase 4a; "prompts" is a local name here)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -357,7 +358,7 @@ def track_cycle(usage, t, tag):
 
 # ------------------------------------------------------------------ haiku
 
-HAIKU_PROMPT = open(os.path.join(HERE, "prompts", "usage_haiku.md")).read().rstrip("\n")  # default prompt, editable
+HAIKU_PROMPT = prompt_registry.default("usage_haiku").rstrip("\n")  # default prompt, editable
 
 
 def fmt_tokens(tok_by_model):

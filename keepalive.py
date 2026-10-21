@@ -90,6 +90,7 @@ import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
 import manager_launch  # D-260: a project's task-manager model / effort
 import remote_control  # D-269: Remote Control per session category
+import prompts  # phase 4a: the prompt registry (prompts/*.md)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
@@ -148,9 +149,8 @@ SCRUBBED_ENV = {
 }
 
 def load_prompt(name):
-    """prompts/<name>.md, the default prompts (the dashboard will surface/edit these)."""
-    with open(os.path.join(HERE, "prompts", name + ".md")) as fh:
-        return fh.read()
+    """prompts/<name>.md, the default prompts, through the registry (prompts.py)."""
+    return prompts.default(name)
 
 
 def session_message(name, afclaude=True, manager=True, insert=None, hooked=False, **fields):
