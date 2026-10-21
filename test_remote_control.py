@@ -32,6 +32,7 @@ class Base(unittest.TestCase):
 class Registry(Base):
     def test_one_bool_setting_per_category_default_on(self):
         self.assertEqual(set(rcs.CATEGORIES), {"task_manager", "review", "continue", "test"})
+        self.assertEqual({k for k in actions.SETTINGS if k.startswith(rcs.PREFIX)}, set(KEYS))
         for k in KEYS:
             spec = actions.SETTINGS[k]
             self.assertIs(spec.default(), True, k)                        # today's launch: --remote-control

@@ -685,6 +685,14 @@ def _flag(default: bool, doc: str, section: str, important: bool = False) -> Set
     return Setting(default, _bool, doc, section=section, kind="bool", important=important)
 
 
+def _remote_control(category: str) -> Setting:
+    """D-269: Remote Control on/off for one session category (remote_control.py; its key is
+    remote_control.setting_key(category), test_remote_control checks every category has one)."""
+    return _flag(remote_control.DEFAULT, f"Remote Control (claude --remote-control, D-269) for "
+                 f"{remote_control.CATEGORIES[category]}; applies at the session's next start or resume",
+                 "automation")
+
+
 USAGE_MODELS = ("pacing", "linear")
 
 # Everything the dashboard can change (D-146): the runners read these (afclaude_config.setting()),
@@ -761,10 +769,10 @@ SETTINGS: dict[str, Setting] = {
                                "idle this long after its last turn", "automation"),
     # --- Remote Control per session category (D-269, remote_control.py): applied when a session is
     # started or resumed (ka_resume.sh --no-remote-control when off); default on = the launch before D-269
-    **{remote_control.PREFIX + cat: _flag(remote_control.DEFAULT, f"Remote Control (claude --remote-control, "
-                                          f"D-269) for {covers}; applies at the session's next start or "
-                                          f"resume", "automation")
-       for cat, covers in remote_control.CATEGORIES.items()},
+    "remote_control_task_manager": _remote_control(remote_control.TASK_MANAGER),
+    "remote_control_review": _remote_control(remote_control.REVIEW),
+    "remote_control_continue": _remote_control(remote_control.CONTINUE),
+    "remote_control_test": _remote_control(remote_control.TEST),
     # --- app_log retention (phase 2d part 2, D-161: everything in the DB; D-130: never drop
     # usage/telemetry data -- this prunes only the app_log lines). A daily cron run of
     # `python3 store.py prune-logs` deletes rows older than the retention through actions.log_prune
