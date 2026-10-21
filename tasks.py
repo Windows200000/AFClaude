@@ -352,8 +352,12 @@ def run_decision(conn, args):
         if args.json:
             return dump(r)
         parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r[k]]
-        return print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
-                     + (f" ({r['moved']} moved)" if r["moved"] else ""))
+        print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
+              + (f" ({r['moved']} moved)" if r["moved"] else ""))
+        if r["no_status"]:
+            print(f"no Status line ({len(r['no_status'])}, counted as active unless the title names a "
+                  f"state): {', '.join(r['no_status'])}")
+        return None
     if dc == "tldr":
         rows = store.list_decision_entries(conn, None if args.all else decisions.CURRENT)
         if args.json:

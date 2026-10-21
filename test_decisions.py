@@ -142,6 +142,25 @@ class Parse(unittest.TestCase):
                               ("Done (2026-10-01)", "done")):
             self.assertEqual(dec.state_of(status), state, status)
 
+    def test_title_marker_only_when_no_status_line(self):
+        # M-003-like: no Status line, but the title names its own fate (D-242 follow-up).
+        self.assertEqual(dec.state_of(None, "Old default (SUPERSEDED by D-141: new default)"), "superseded")
+        self.assertEqual(dec.state_of("", "default (superseded by D-9)"), "superseded")   # case-insensitive
+        self.assertEqual(dec.state_of(None, "No marker here"), "active")                  # stays active
+        self.assertEqual(dec.state_of("active", "Title says SUPERSEDED"), "active")       # a real Status wins
+
+    def test_title_marker_through_parse_and_row(self):
+        text = textwrap.dedent('''
+            ### M-003 week_target default 90 (SUPERSEDED by D-141: one session left)
+            **Type:** manager decision · **Keywords:** budget
+
+            ### M-004 Still no Status line, no marker either
+            **Type:** manager decision · **Keywords:** budget
+            ''')
+        rows = {e.id: e.row() for e in dec.parse(text)}
+        self.assertEqual(rows["M-003"]["state"], "superseded")
+        self.assertEqual(rows["M-004"]["state"], "active")
+
     def test_check_entries(self):
         with self.assertRaisesRegex(dec.SourceError, "no '### D-NNN'"):
             dec.check_entries(dec.parse("# nothing\n## a\ntext\n"), "x")
@@ -156,6 +175,7 @@ class Import(Env):
         r = self.imp()
         self.assertEqual((r["entries"], r["added"], r["changed"], r["removed"]),
                          (5, ["D-001", "D-002", "D-003", "M-001", "D-004"], [], []))
+        self.assertEqual(r["no_status"], ["M-001"])   # the only SOURCE entry with no Status line
         c = self.conn()
         try:
             d = store.get_decision_entry(c, "d-001")                                # ids case-insensitive
@@ -480,6 +500,7 @@ class Cli(Env):
         code, out, _ = self.cli("import", "--file", self.src)
         self.assertEqual(code, 0)
         self.assertIn("5 decisions from", out)
+        self.assertIn("no Status line (1, counted as active unless the title names a state): M-001", out)
         self.assertIn("unchanged", self.cli("import", "--file", self.src)[1])
         out = self.cli("tldr")[1]
         self.assertIn("D-003 Session cap 95% at night [partly superseded]", out)

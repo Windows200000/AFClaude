@@ -32,9 +32,10 @@ atq, the DB read-only) and prints nothing else. --compare FILE takes a fresh one
 saved snapshot's time is then the default --since. --budget prints only the token count per
 section (≈ chars / 3.5); --sections 1,3b,... picks sections.
 
-Decisions come from one function, load_decisions(): today it parses DECISIONS.md (local only,
-never committed; each "### D-NNN" entry's "**Keywords:**" and "**Status:**" lines), later the DB
-decision store (D-242) can replace the reader behind it. Superseded decisions are not matched.
+Decisions default to the DB decision store (D-242: load_decisions_db, --db PATH; its keywords
+include whatever the task-manager added or removed since the import, so a lookup fix is matched
+here too). --decisions PATH reads a DECISIONS.md-like file instead (load_decisions: each
+"### D-NNN" entry's "**Keywords:**" and "**Status:**" lines). Superseded decisions are not matched.
 
 Any failure (git, a missing DB or decisions file, docker/crontab/atq, a bad mapping line) aborts
 with an error on stderr and exit code 2 (D-235); a Python file that doesn't parse is reported in
@@ -60,7 +61,6 @@ from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.environ.get("AFCLAUDE_DB", os.path.join(HERE, "data", "afclaude.db"))
-DEFAULT_DECISIONS = os.path.join(HERE, "DECISIONS.md")
 
 # Code the live system imports (the worker rules; D-243 3a): full hunks in section 3a.
 LIVE_FILES = ("keepalive.py", "store.py", "stalled.py", "usage_sampler.py", "export_quickview.py",
@@ -770,9 +770,10 @@ FIELD_RE = r"^\s*-\s*\*\*{}:\*\*\s*(.*)$"
 
 
 def load_decisions(source: str) -> list[Decision]:
-    """Every decision with its keywords and status. Today `source` is the DECISIONS.md path (each
-    "### D-NNN title" entry's "- **Keywords:** a, b" and "- **Status:** ..." lines); the DB decision
-    store (D-242) replaces this reader, nothing else. A missing or unreadable source raises."""
+    """Every decision with its keywords and status, from a DECISIONS.md-like file (each
+    "### D-NNN title" entry's "- **Keywords:** a, b" and "- **Status:** ..." lines). --decisions
+    PATH asks for this reader explicitly; the default (no --decisions) is load_decisions_db, the
+    DB store (D-242). A missing or unreadable source raises."""
     try:
         with open(source, encoding="utf-8") as fh:
             text = fh.read()
@@ -789,6 +790,33 @@ def load_decisions(source: str) -> list[Decision]:
     if not out:
         raise ManifestError(f"decisions: no '### D-NNN' entries in {source}")
     return out
+
+
+def load_decisions_db(db_path: str) -> list[Decision]:
+    """Every decision from the DB decision store (D-242: decisions.py/store.py), the default
+    source when --decisions is not given. `status` is the row's computed state (active, partial,
+    done or superseded; decisions.state_of -- it also infers superseded from a title marker on an
+    entry with no Status line, e.g. the early M-003), and `keywords` is the effective set: the
+    source's Keywords line plus whatever the task-manager added or removed since
+    (store.decision_keywords), so a keyword added after a lookup missed is matched here too. A
+    missing or empty DB raises (as a missing DECISIONS.md does for load_decisions)."""
+    import store as _store
+    if not os.path.isfile(db_path):
+        raise ManifestError(f"decisions: DB {db_path} does not exist; pass --decisions PATH or --db PATH")
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        raise ManifestError(f"decisions: DB {db_path}: {e}") from e
+    try:
+        rows = _store.list_decision_entries(conn)
+    except sqlite3.Error as e:
+        raise ManifestError(f"decisions: DB {db_path}: {e}") from e
+    finally:
+        conn.close()
+    if not rows:
+        raise ManifestError(f"decisions: no decisions in the DB {db_path}; pass --decisions PATH")
+    return [Decision(r["id"], r["title"], tuple(r["effective_keywords"]), r["state"]) for r in rows]
 
 
 def active(d: Decision) -> bool:
@@ -1297,7 +1325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     g.add_argument("--snapshot", metavar="FILE", help="save the containers/crontab/jobs state to FILE and exit")
     g.add_argument("--compare", metavar="FILE", help="diff the current state against a saved --snapshot")
     ap.add_argument("--mapping", metavar="FILE", help="the worker's 'symbol: D-xxx|none' list")
-    ap.add_argument("--decisions", default=DEFAULT_DECISIONS, help="DECISIONS.md (default: next to this script)")
+    ap.add_argument("--decisions", default=None,
+                    help="a DECISIONS.md-like file (default: the DB decision store at --db, D-242)")
     ap.add_argument("--db", default=DEFAULT_DB, help="the AFClaude DB, opened read-only")
     ap.add_argument("--live-hunks", action="store_true",
                     help=f"also the full hunks of the live-imported files ({', '.join(LIVE_FILES)}); off by "
@@ -1328,7 +1357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ManifestError(f"--compare {a.compare}: {e}") from e
         since = a.since or (compare["taken_at"] if compare else None)
         base, head = resolve_range(a.range)
-        man = build(base, head, decisions=load_decisions(a.decisions),
+        man = build(base, head, decisions=load_decisions(a.decisions) if a.decisions else load_decisions_db(a.db),
                     mapping=load_mapping(a.mapping) if a.mapping else None,
                     db=a.db, since=since, until=a.until, compare=compare, live_hunks=a.live_hunks)
     except ManifestError as e:
