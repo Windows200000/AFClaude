@@ -295,6 +295,26 @@ class Activity(unittest.TestCase):
         self.assertEqual(d["recheck_at"], self.NOW + timedelta(minutes=45))
 
 
+class DesignGate(unittest.TestCase):
+    """D-266: the night gate adds the user's other use and the design chats, and shows them apart."""
+
+    def test_gate_adds_both_parts(self):
+        now = SUN
+        d = pm.decide_core(30, R, now, 600.0, None, None, None, True, 0.125, "auto", WIN, "auto",
+                           flat_fc(0.1), flat_fc(0.05))
+        h = (R - now).total_seconds() / 3600
+        self.assertAlmostEqual(d["forecast_other"], 0.1 * h)
+        self.assertAlmostEqual(d["forecast_design"], 0.05 * h)
+        self.assertAlmostEqual(d["forecast"], 0.15 * h)
+        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.15 * h)
+        self.assertIn("forecast other user use", d["reason"])
+        self.assertIn("design chats", d["reason"])
+        old = pm.decide_core(30, R, now, 600.0, None, None, None, True, 0.125, "auto", WIN, "auto", flat_fc(0.15))
+        self.assertEqual((old["go"], round(old["predicted_end"], 6)), (d["go"], round(d["predicted_end"], 6)))
+        self.assertIsNone(old["forecast_design"])
+        self.assertNotIn("design chats", old["reason"])
+
+
 class Predictor(unittest.TestCase):
     """The forecast: the user's typical rise per hour of the week from closed cycles."""
     OLD = R - pm.WEEK                                   # the closed cycle reset Thu 01.10. 19:00
@@ -391,7 +411,7 @@ class Predictor(unittest.TestCase):
         burn = (self.OLD - timedelta(days=2), self.OLD - timedelta(days=2) + timedelta(hours=2))
         old2 = self.week(tue_rate=0.0, other_rate=0.3, burn=burn)
         r2, _ = pm.fit_profile(old2 + cur, [burn[0]], now, params=P)
-        auto = sum(dw for _, _, dw, a, _ in pm._intervals(old2, [burn[0]]) if a)
+        auto = sum(dw for _, _, dw, a, _, _ in pm._intervals(old2, [burn[0]]) if a)
         self.assertGreaterEqual(auto, 10.0)                        # the run's 2 h x 5 %/h (+ its intervals' user rise)
         self.assertAlmostEqual(r2.week_total, old2[-1]["usage"]["weekly"]["percent"] - auto, places=3)
         # weight 0, no open-cycle reading, or no final reading of the closed cycle: the rates alone
@@ -407,6 +427,78 @@ class Predictor(unittest.TestCase):
               for x in cur]
         r5, _ = pm.fit_profile(old + hi, [], now, params=P)
         self.assertAlmostEqual(pm.forecast_user(r5, now, R), 0.5 * rate_only, places=2)
+
+    def test_design_chats_are_split_from_the_user_forecast(self):
+        """D-266: the rise outside runs is split by the own (AFClaude) vs other sessions' weighted
+        tokens; the rates and the weekly budget are the other use, the design chats a flat weekly
+        amount (D-264); the gate adds both."""
+        sonnet = lambda n: {"tokens": {"claude-sonnet-5": {"out": n, "think": 0}}}   # noqa: E731
+        rows, w, t = [], 0.0, self.OLD - pm.WEEK
+        while t < self.OLD:
+            lt = t.astimezone(pm.BERLIN)
+            design = lt.weekday() == 2 and 10 <= lt.hour < 14       # Wed 10-14: a design chat, 2 %/h
+            w += (2.0 if design else 0.1) / 4
+            r = row(t + timedelta(minutes=15), round(w, 4), reset=self.OLD,
+                    own=sonnet(300) if design else None, other=None if design else sonnet(100))
+            rows.append(r)
+            t += timedelta(minutes=15)
+        final = rows[-1]["usage"]["weekly"]["percent"]
+        now = self.OLD + timedelta(days=1)
+        cur = [row(self.OLD + timedelta(minutes=15 * (i + 1)), 0.0, reset=R) for i in range(96)]
+        rates, why = pm.fit_profile(rows + cur, [], now, params={"shrink_hours": 0.0, "budget_weight": 0.5})
+        self.assertIn("design chats", why)
+        self.assertAlmostEqual(sum(rates), 0.1 * 164, places=2)              # other use only
+        self.assertAlmostEqual(rates[pm._how(Z("2026-10-07T09:00:00Z"))], 0.0, places=6)   # Wed 11:00
+        self.assertAlmostEqual(rates.design_week, 8.0 * 168 / 167.75, places=2)            # 4 h x 2 %/h
+        self.assertEqual(rates.design_weeks, 1)
+        self.assertAlmostEqual(rates.week_total, final - 8.0, places=2)    # the design chats are not the user's
+        dw = rates.design_week
+        self.assertEqual((rates.design_end, rates.design_used, rates.design_weight), (R, 0.0, 0.5))
+        # after the open cycle: the steady amount, evenly; inside it blended with the week's amount left
+        self.assertAlmostEqual(pm.forecast_design(rates, R, R + pm.WEEK / 2), dw / 2, places=6)
+        self.assertAlmostEqual(pm.forecast_design(rates, now, now + pm.WEEK / 2),
+                               dw / 2 - 0.5 * dw / 2 + 0.5 * dw * 3.5 / 6, places=6)
+        self.assertAlmostEqual(pm.forecast_design(rates, now, R), 0.5 * dw * 6 / 7 + 0.5 * dw, places=6)  # none used yet
+        rates.design_used = dw + 5                                   # already above the weekly amount
+        self.assertAlmostEqual(pm.forecast_design(rates, now, R), 0.5 * dw * 6 / 7, places=6)
+        rates.design_used = 0.0
+        self.assertEqual(pm.forecast_design(rates, now, now), 0.0)
+        self.assertAlmostEqual(pm.forecast_gate(rates, now, R),
+                               pm.forecast_user(rates, now, R) + pm.forecast_design(rates, now, R), places=9)
+        self.assertAlmostEqual(sum(d for _, _, d in pm.design_intervals(rows, [])), 8.0, places=3)
+        # the gate (and the backtest) still counts everything outside runs
+        self.assertAlmostEqual(sum(x for _, _, x in pm.user_intervals(rows, [])), final - rows[0]["usage"]["weekly"]["percent"],
+                               places=3)
+        # a mixed interval is split by the tokens; no local tokens (another device): the user's
+        r = rows[1]
+        r["activity"] = {"own": sonnet(30), "other": sonnet(10)}
+        iv = pm._intervals(rows[:2], [])
+        self.assertAlmostEqual(iv[0][5], iv[0][2] * 0.75, places=6)
+        r["activity"] = {"own": {}, "other": {}}
+        self.assertEqual(pm._intervals(rows[:2], [])[0][5], 0.0)
+
+    def test_weekly_budget_needs_sample_coverage(self):
+        old = self.week(tue_rate=0.0, other_rate=0.3)
+        now = self.OLD + timedelta(days=1)
+        cur = [row(self.OLD + timedelta(minutes=15 * (i + 1)), 0.0, reset=R) for i in range(96)]
+        P = {"shrink_hours": 0.0, "budget_weight": 0.5}
+        self.assertIsNotNone(pm.fit_profile(old + cur, [], now, params=P)[0].week_total)
+        part = old[:200] + old[-400:]                          # 600 of 671 intervals... still >= 80 %
+        self.assertIsNotNone(pm.fit_profile(part + cur, [], now, params=P)[0].week_total)
+        part = old[-500:]                                      # 125 h of 168: < 80 %, the rest can't be split
+        rates, _ = pm.fit_profile(part + cur, [], now, params=P)
+        self.assertIsNone(rates.week_total)
+
+    def test_own_other_tokens(self):
+        import usage_sampler
+        act = {"own": {"tokens": {"claude-opus-5-5": {"out": 10, "think": 5, "cache_r": 999},
+                                  "claude-haiku-4": {"out": 100, "think": 0}}},
+               "other": {"tokens": {"claude-sonnet-5": {"out": 7, "think": 3}}}}
+        own, oth = pm.own_other_tokens({"activity": act})
+        self.assertAlmostEqual(own, usage_sampler.weighted_tokens(act["own"]["tokens"]))   # the sampler's weighting
+        self.assertAlmostEqual(oth, usage_sampler.weighted_tokens(act["other"]["tokens"]))
+        self.assertEqual(pm.own_other_tokens({"activity": act, "own_w_tokens": 1, "other_w_tokens": 2}), (1.0, 2.0))
+        self.assertEqual(pm.own_other_tokens({}), (0.0, 0.0))
 
     def test_profile_reads_the_db_without_the_legacy_file(self):
         self.assertFalse(os.path.exists(pm.SAMPLES_FILE))       # the frozen legacy file may be archived
@@ -528,7 +620,8 @@ class Accuracy(unittest.TestCase):
         d = pm.decide_core(30, R + pm.WEEK, now, 600.0, None, None, None, True, 0.15, "auto", WIN, "auto",
                            flat_fc(0.2))
         ti = pm.threshold_info(rows, [], now, d)
-        self.assertEqual(set(ti), {"ratio", "full_session_cost", "model_error", "predicted_end_sd", "threshold", "now"})
+        self.assertEqual(set(ti), {"ratio", "full_session_cost", "model_error", "predicted_end_sd", "forecast",
+                                   "threshold", "now"})
         self.assertEqual((ti["ratio"]["value"], ti["ratio"]["n"], ti["ratio"]["spread"]), (0.15, 10, 0.02))
         self.assertEqual(ti["full_session_cost"]["value"], 15.0)
         self.assertAlmostEqual(ti["full_session_cost"]["sd"], 100 * (0.012 ** 2 + 0.005 ** 2) ** 0.5, places=1)

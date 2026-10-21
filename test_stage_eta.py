@@ -80,6 +80,43 @@ class Formula(unittest.TestCase):
         self.assertIsNotNone(r["stages"][1]["eta_days"])
 
 
+class DesignChats(unittest.TestCase):
+    """D-266/D-264: the design chats are AFClaude work (capacity, stage cost) and still in the gate."""
+
+    def test_design_chats_are_capacity_and_in_the_gate(self):
+        # other 10 + design 30 = the same 40 %/week the gate saw before: the same night slots,
+        # plus 30 / 15 = 2 session windows of design chats a week; the formula uses the other use
+        r = se.predict(stages(1.0), gate(10.0, design_week=30.0), NOW)
+        a = r["assumptions"]
+        before = se.predict(stages(1.0), gate(40.0), NOW)["assumptions"]
+        self.assertAlmostEqual(a["night_sessions_per_week"], before["gate_sessions_per_week"], places=2)
+        self.assertAlmostEqual(a["design_sessions_per_week"], 2.0, places=2)
+        self.assertAlmostEqual(a["gate_sessions_per_week"], 6.0, places=2)
+        self.assertAlmostEqual(a["formula_sessions_per_week"], 6.0, places=2)     # (100 - 10) / 15
+        self.assertAlmostEqual(a["user_forecast_week"], 10.0, places=1)
+        self.assertEqual(a["design_forecast_week"], 30.0)
+        self.assertIn("design chats", se.assumptions_text(r))
+        slots = se.capacity_slots(gate(10.0, design_week=30.0), NOW, NOW + timedelta(days=3, hours=1))
+        self.assertEqual([s.at for s in slots], sorted(s.at for s in slots))
+        des = [s for s in slots if s.kind == "design"]
+        self.assertEqual([s.at for s in des], [NOW + timedelta(days=k) for k in (1, 2, 3)])
+        self.assertAlmostEqual(des[0].sessions, 2.0 / 7, places=6)
+        same = se.predict(stages(1.0), gate(10.0, design_week=30.0, design_forecast=flat(30.0)), NOW)
+        self.assertEqual(same["assumptions"], a)                  # pacing's design forecast, when given, is the gate's
+        slow = se.predict(stages(2.0, 2.0), gate(40.0), NOW)["stages"][-1]["eta_days"]
+        fast = se.predict(stages(2.0, 2.0), gate(10.0, design_week=30.0), NOW)["stages"][-1]["eta_days"]
+        self.assertLess(fast, slow)
+
+    def test_stage_cost_counts_design_chats(self):
+        h = lambda x: NOW + timedelta(hours=x)   # noqa: E731
+        done = [(h(0), h(10)), (h(20), h(30)), (h(40), h(50)), (h(60), h(60) + timedelta(minutes=20))]
+        runs = [(h(1), h(3), 0.8)]
+        design = [(h(21), h(21.25), 0.25), (h(22), h(22.25), 0.25), (h(41), h(41.25), 0.1),
+                  (h(60.1), h(60.35), 0.5)]        # the last: a stage closed within MIN_WINDOW, no measurement
+        self.assertEqual(se.history_default(done, runs + design), (0.5, 3))      # median of 0.8, 0.5, 0.1
+        self.assertEqual(se.history_default(done, runs), (None, 1))
+
+
 class Cumulative(unittest.TestCase):
     def test_order_and_cumulative_sums(self):
         r = se.predict(stages(1.0, 2.0, 0.5, 3.0), gate(40.0), NOW)

@@ -303,6 +303,9 @@ def eta_summary(eta):
     return {"status": eta.get("status"), "reason": eta.get("reason"), "text": stage_eta.assumptions_text(eta),
             "sessions_per_day": a.get("sessions_per_day"), "gate_sessions_per_week": a.get("gate_sessions_per_week"),
             "formula_sessions_per_week": a.get("formula_sessions_per_week"),
+            "night_sessions_per_week": a.get("night_sessions_per_week"),
+            "design_sessions_per_week": a.get("design_sessions_per_week"),
+            "user_forecast_week": a.get("user_forecast_week"), "design_forecast_week": a.get("design_forecast_week"),
             "estimate_sources": a.get("estimate_sources")}
 
 

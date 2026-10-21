@@ -286,9 +286,11 @@ def main():
                          (os.path.join(a.data, "dispatcher_state.json"), "sessions", "sent_at"),
                          (os.path.join(a.data, "usage_review_state.json"), "runs", "at")]
     rates, fsrc = pacing.fit_profile(upto, pacing.fire_times(), reset + timedelta(minutes=10))   # in-sample
+    design = getattr(rates, "design_week", 0.0) if rates else 0.0     # D-266: the gate adds the design chats
     if rates:
         rates = [x * a.user_scale for x in rates]
-    fc = (lambda x, y: pacing.forecast_user(rates, x, y)) if rates else None
+    fc = (lambda x, y: pacing.forecast_user(rates, x, y) + design * a.user_scale * ((y - x) / pacing.WEEK)) \
+        if rates else None
     try:
         import telemetry
         user_env, weeks, _ = usage_model.parse_user_model(telemetry.read_user_model(a.user_model))
