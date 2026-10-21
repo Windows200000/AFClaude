@@ -60,6 +60,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                stays the settings automation_paused / automation_paused_reason (failstop.py).
                runner_jobs, runner_runs (phase 3a, additive the same way, RUNNER_RUNS_SCHEMA): the
                resident runner's due times and its run records (runner.py; actions.py writes).
+               Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
+               row's project) and action_requests.run_id / updated_at (run-now, D-153); the
+               driven_sessions backfill is `python3 store.py import-driven` (driven.py).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -306,29 +309,34 @@ CREATE TABLE IF NOT EXISTS run_log (
 CREATE INDEX IF NOT EXISTS run_log_component ON run_log(component, id);
 
 -- every session AFClaude started or continued (replaces dispatcher_state.json's list
--- and data/own_sessions.txt once the runners fill it, phase 3)
+-- and data/own_sessions.txt once the runners fill it, phase 3). Phase 3b: the tmux name is
+-- looked up here, never computed from the id; written by actions.driven_set (own_session_add
+-- for kind 'own'); project_id (COLUMNS) is the project a task-manager row runs.
 CREATE TABLE IF NOT EXISTS driven_sessions (
     session_id  TEXT PRIMARY KEY,
     tmux        TEXT,
-    kind        TEXT NOT NULL,          -- keepalive | task | stall | review
+    kind        TEXT NOT NULL,          -- task-manager | review | stall | request | own (legacy: keepalive | task)
     task_id     INTEGER,
     started_at  TEXT NOT NULL,
     last_seen   TEXT,
     ended_at    TEXT,
     holder_kind TEXT,
-    rc_url      TEXT
+    rc_url      TEXT,
+    project_id  INTEGER REFERENCES projects(id)
 );
 
--- the dashboard's only way to ask for execution; the dispatcher consumes them (phase 2)
+-- the dashboard's only way to ask for execution; the runner consumes them (phase 3b S5)
 CREATE TABLE IF NOT EXISTS action_requests (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         TEXT NOT NULL,
     actor      TEXT NOT NULL,
-    kind       TEXT NOT NULL,           -- continue_now | review_now
-    target     TEXT,                    -- session id (continue_now), NULL (review_now)
-    status     TEXT NOT NULL DEFAULT 'open',   -- open | done | failed | cancelled
-    result     TEXT,
-    handled_at TEXT
+    kind       TEXT NOT NULL,           -- continue_now | review_now | work_on_now
+    target     TEXT,                    -- session id (continue_now), project id (work_on_now), NULL (review_now)
+    status     TEXT NOT NULL DEFAULT 'open',   -- open | started | refused | failed (legacy: done | cancelled)
+    result     TEXT,                    -- JSON: {tmux, session_id} (started) | {reason} (refused, failed)
+    handled_at TEXT,
+    run_id     INTEGER,                 -- the runner_runs row that handled it (no FK: runs are pruned)
+    updated_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS action_requests_one_open ON action_requests(kind, COALESCE(target, ''))
     WHERE status = 'open';
@@ -747,6 +755,9 @@ COLUMNS = {
     # §7.7 switch: the file's text at the sync mark, the base of the 3-way merge when the file
     # (hand edits) and the DB (doc.append/doc.set) both changed since (actions.doc_sync).
     "docs": [("file_text", "TEXT")],
+    # phase 3b S1 (docs/phase3b_plan.md §3.1): the project of a task-manager row; a request's run
+    "driven_sessions": [("project_id", "INTEGER REFERENCES projects(id)")],
+    "action_requests": [("run_id", "INTEGER"), ("updated_at", "TEXT")],
 }
 
 SESSION_FIELDS = (
@@ -1578,6 +1589,27 @@ def list_projects(conn: sqlite3.Connection) -> list[Row]:
     return out
 
 
+def task_managers(conn: sqlite3.Connection) -> list[Row]:
+    """The task-manager registry (phase 3b §2), read-only: EVERY project, by rank (D-064), as
+    {project_id, name, rank, path, session, tmux, model, effort, paused, pause_reason, open, ready}.
+    Each project is its task-manager session (D-281); session None = not created yet (it is
+    created at the project's first start). tmux: the live driven_sessions task-manager row's
+    name, or None. paused: the project's own pause (D-244), not the install-wide one."""
+    rows = {int(r["project_id"]): str(r["tmux"]) for r in conn.execute(
+        "SELECT project_id, tmux FROM driven_sessions WHERE kind='task-manager' AND ended_at IS NULL "
+        "AND project_id IS NOT NULL AND tmux IS NOT NULL")}
+    out: list[Row] = []
+    for p in list_projects(conn):
+        pause = get_project_pause(conn, int(p["id"]))
+        paused = bool(pause and pause["paused"])
+        out.append({"project_id": p["id"], "name": p["name"], "rank": p["rank"], "path": p["path"],
+                    "session": p["manager_session"] or None, "tmux": rows.get(int(p["id"])),
+                    "model": p.get("manager_model"), "effort": p.get("manager_effort"),
+                    "paused": paused, "pause_reason": pause["reason"] if pause and paused else None,
+                    "open": p["open"], "ready": p["ready"]})
+    return out
+
+
 def update_project(conn: sqlite3.Connection, ref: object, **fields: object) -> Row:
     """Rename a project or change its description/path/manager_session. A
     manager_session (full session id; empty = none) makes the project managed:
@@ -2265,7 +2297,8 @@ def run_log(conn: sqlite3.Connection, component: str | None = None, limit: int =
     return [dict(r) for r in rows]
 
 
-DRIVEN_FIELDS = ("tmux", "kind", "task_id", "started_at", "last_seen", "ended_at", "holder_kind", "rc_url")
+DRIVEN_FIELDS = ("tmux", "kind", "task_id", "started_at", "last_seen", "ended_at", "holder_kind", "rc_url",
+                 "project_id")
 
 
 def upsert_driven_session(conn: sqlite3.Connection, session_id: str, **fields: Any) -> Row | None:
@@ -2297,6 +2330,21 @@ def driven_sessions(conn: sqlite3.Connection, include_ended: bool = True) -> lis
     return [dict(r) for r in conn.execute(sql + " ORDER BY started_at DESC, session_id")]
 
 
+def live_driven_with(conn: sqlite3.Connection, tmux: str | None = None, task_manager_of: int | None = None,
+                     other_than: str | None = None) -> list[Row]:
+    """The live rows (ended_at NULL) holding the tmux name `tmux`, or the live task-manager
+    rows of project `task_manager_of`; `other_than`: not this session's row."""
+    if (tmux is None) == (task_manager_of is None):
+        raise ValueError("live_driven_with: tmux or task_manager_of, exactly one")
+    args: list[object] = [tmux if tmux is not None else task_manager_of]
+    where = "tmux=?" if tmux is not None else "kind='task-manager' AND project_id=?"
+    sql = f"SELECT * FROM driven_sessions WHERE ended_at IS NULL AND {where}"
+    if other_than is not None:
+        sql += " AND session_id<>?"
+        args.append(other_than)
+    return [dict(r) for r in conn.execute(sql + " ORDER BY session_id", args)]
+
+
 def open_request(conn: sqlite3.Connection, kind: str, target: str | None = None) -> Row | None:
     r = conn.execute("SELECT * FROM action_requests WHERE status='open' AND kind=? AND COALESCE(target, '')=?",
                      (kind, target or "")).fetchone()
@@ -2304,9 +2352,29 @@ def open_request(conn: sqlite3.Connection, kind: str, target: str | None = None)
 
 
 def add_request(conn: sqlite3.Connection, actor: str, kind: str, target: str | None = None) -> Row:
-    cur = conn.execute("INSERT INTO action_requests(ts, actor, kind, target) VALUES (?, ?, ?, ?)",
-                       (now_iso(), actor, kind, target))
+    ts = now_iso()
+    cur = conn.execute("INSERT INTO action_requests(ts, actor, kind, target, updated_at) VALUES (?, ?, ?, ?, ?)",
+                       (ts, actor, kind, target, ts))
     return dict(conn.execute("SELECT * FROM action_requests WHERE id=?", (cur.lastrowid,)).fetchone())
+
+
+def get_request(conn: sqlite3.Connection, request_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM action_requests WHERE id=?", (request_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def set_request_state(conn: sqlite3.Connection, request_id: int, status: str, result: str,
+                      run_id: int | None) -> Row:
+    """A request's outcome (actions.request_start / request_finish check the transition): the
+    status, its JSON result, the run that handled it (kept when None), handled_at and updated_at."""
+    ts = now_iso()
+    conn.execute("UPDATE action_requests SET status=?, result=?, run_id=COALESCE(?, run_id), "
+                 "handled_at=COALESCE(handled_at, ?), updated_at=? WHERE id=?",
+                 (status, result, run_id, ts, ts, request_id))
+    r = get_request(conn, request_id)
+    if r is None:
+        raise NotFound(f"no request #{request_id}")
+    return r
 
 
 def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: int = 50) -> list[Row]:
@@ -3816,7 +3884,17 @@ def main(argv: list[str] | None = None) -> int:
                                                "(docker/entrypoint.sh), audited as prompt.defaults_sync")
     pp.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     pp.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
+    dv = sub.add_parser("import-driven", help="the driven_sessions backfill of phase 3b (idempotent; driven.py): "
+                                              "a row per task-manager and per running review / continued "
+                                              "session, then `tasks.py driven check`")
+    dv.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    dv.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
     args = ap.parse_args(argv)
+    if args.cmd == "import-driven":
+        import importlib
+        driven = importlib.import_module("driven")
+        return int(driven.main(["import"] + (["--db", args.db] if args.db else [])
+                               + (["--dry-run"] if args.dry_run else [])))
     if args.cmd == "import-prompts":
         import importlib
         actions = importlib.import_module("actions")

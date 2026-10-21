@@ -270,8 +270,10 @@ def _own_list() -> set[str]:
 
 def autonomous_sessions(conn: sqlite3.Connection) -> set[str]:
     """Session ids AFClaude drives: driven_sessions (incl. the own sessions), the
-    manager session (data/afclaude.json) and every managed project's manager_session."""
-    ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions")}
+    manager session (data/afclaude.json) and every managed project's manager_session. A 'stall'
+    row is the owner's own session AFClaude only continued (phase 3b): its id stays the owner's
+    (a continue AFClaude launches runs with CLAUDE_GUARD_DISABLE=1, so that one is autonomous anyway)."""
+    ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions WHERE kind<>'stall'")}
     ids |= {r[0] for r in conn.execute("SELECT manager_session FROM projects WHERE manager_session IS NOT NULL")}
     ids |= _own_list()
     ids.add(afclaude_config.manager_session())
@@ -1212,19 +1214,32 @@ def prompt_defaults_sync(conn: sqlite3.Connection, ctx: Ctx) -> Result:
 
 
 # ---------------------------------------------------------------- execution requests (§4.6)
+#
+# Phase 3b (docs/phase3b_plan.md §2, §3.1): work_on_now (target = a project; run-now, D-153) joins
+# continue_now and review_now. A request goes open -> started | refused | failed; the runner
+# (S5) records that through request.start / request.finish, audited: that is what the requester
+# sees, unlike the run row itself (D-256). Nothing consumes requests before S5.
 
-REQUEST_KINDS = ("continue_now", "review_now")
+REQUEST_KINDS = ("continue_now", "review_now", "work_on_now")
+REQUEST_STATUSES = ("open", "started", "refused", "failed", "done", "cancelled")   # done, cancelled: legacy
+REQUEST_FINISH = {"refused": ("open",), "failed": ("open", "started")}   # outcome -> from
 
 
 @action("request.add", "request", owner_only=True)
 def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = None) -> Result:
-    """Queue continue_now (target = a stalled session id) or review_now (no target).
-    One open request per (kind, target): asking again returns the open one."""
+    """Queue continue_now (target = a stalled session id), review_now (no target) or work_on_now
+    (target = a project, name or id; stored as its id). One open request per (kind, target):
+    asking again returns the open one. A project whose task-manager session doesn't exist yet
+    is a valid target: its first start creates it (D-281)."""
     store._enum(kind, REQUEST_KINDS, "kind")
     if kind == "continue_now":
         target = store._text(target, "target", required=True)
         if store.get_session(conn, target) is None:
             raise store.NotFound(f"unknown session {target}")
+    elif kind == "work_on_now":
+        if target is None:
+            raise ValueError("work_on_now needs a target (a project)")
+        target = str(store._project_row(conn, target)["id"])
     elif target is not None:
         raise ValueError("review_now takes no target")
     open_ = store.open_request(conn, kind, target)
@@ -1232,6 +1247,121 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
         return Result(open_, open_["id"], open_, open_, changed=False)
     r = store.add_request(conn, ctx.actor, kind, target)
     return Result(r, r["id"], None, r)
+
+
+def _request(conn: sqlite3.Connection, request_id: Any) -> store.Row:
+    r = store.get_request(conn, store._position(request_id, "request id"))
+    if r is None:
+        raise store.NotFound(f"no request #{request_id}")
+    return r
+
+
+def _run_id(run_id: Any) -> int | None:
+    return None if run_id is None else store._position(run_id, "run id")
+
+
+@action("request.start", "request")
+def request_start(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, tmux: Any, run_id: Any = None,
+                  session_id: Any = None) -> Result:
+    """open -> started: the runner's run `run_id` started the requested session in tmux `tmux`
+    (session_id: its id, when known). The runner's step, not for MCP callers."""
+    _runner_only(ctx, "request.start")
+    before = _request(conn, request_id)
+    name = _tmux_name(tmux)
+    sid = None if session_id is None else store._session_id(session_id)
+    if before["status"] != "open":
+        raise store.InvalidTransition(f"request #{before['id']} is {before['status']}, not open")
+    result = json.dumps({"tmux": name, "session_id": sid}, ensure_ascii=False)
+    after = store.set_request_state(conn, int(before["id"]), "started", result, _run_id(run_id))
+    return Result(after, after["id"], before, after)
+
+
+@action("request.finish", "request")
+def request_finish(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, status: Any, reason: Any,
+                   run_id: Any = None) -> Result:
+    """open -> refused (it can't run now: running, at its limit, held, unknown target) or
+    open | started -> failed (it broke; the runner also alerts and pauses, D-235/D-282), with
+    the reason. The runner's step, not for MCP callers."""
+    _runner_only(ctx, "request.finish")
+    st = store._enum(status, tuple(REQUEST_FINISH), "status")
+    why = _short(reason, "reason", 2000)
+    before = _request(conn, request_id)
+    if before["status"] not in REQUEST_FINISH[st]:
+        raise store.InvalidTransition(f"request #{before['id']} is {before['status']}: it can't become {st}")
+    result = json.dumps({"reason": why}, ensure_ascii=False)
+    after = store.set_request_state(conn, int(before["id"]), st, result, _run_id(run_id))
+    return Result(after, after["id"], before, after)
+
+
+# ---------------------------------------------------------------- driven sessions (phase 3b)
+#
+# driven.set: a driven_sessions row of the phase 3b kinds (docs/phase3b_plan.md §2, §3.1). The tmux
+# name is stored, never computed from the id (S2 makes every launcher write its row first). A
+# live name (ended_at NULL) belongs to one row; a project has one live task-manager row. The own
+# sessions (kind 'own') keep their own writer, own_session_add.
+
+DRIVEN_KINDS = ("task-manager", "review", "stall", "request")
+# today's ka-<id8> names (until S6) and the readable afc-... ones (§3.2: [a-z0-9-], at most 40 characters)
+TMUX_RE = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})$")
+
+
+def _tmux_name(value: Any) -> str:
+    name = store._text(value, "tmux", required=True)
+    if not TMUX_RE.match(name):
+        raise ValueError(f"tmux must be ka-<8 hex> or afc-<a-z 0-9 -, at most 36>, got {name!r}")
+    return name
+
+
+@action("driven.set", "driven_session")
+def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = None, tmux: Any = None,
+               project: Any = None, task_id: Any = None, started_at: Any = None, ended_at: Any = None) -> Result:
+    """Add or change a driven session's row: kind (DRIVEN_KINDS), tmux (its name), project (name
+    or id; required for a task-manager), task_id, started_at, ended_at (ISO times; a set ended_at
+    frees the name). A new row needs kind and tmux. A row of another kind ('own', legacy rows) is
+    not changed here. The runners' step (S2 on), and the backfill's; not for MCP callers."""
+    _runner_only(ctx, "driven.set")
+    sid = store._session_id(session_id)
+    before = store.get_driven_session(conn, sid)
+    if before is not None and before["kind"] not in DRIVEN_KINDS:
+        raise ValueError(f"the row of {sid} is of kind {before['kind']!r}: driven.set changes only "
+                         f"{'|'.join(DRIVEN_KINDS)} rows")
+    fields: dict[str, Any] = {}
+    if kind is not None:
+        fields["kind"] = store._enum(kind, DRIVEN_KINDS, "kind")
+    if tmux is not None:
+        fields["tmux"] = _tmux_name(tmux)
+    if project is not None:
+        fields["project_id"] = int(store._project_row(conn, project)["id"])
+    if task_id is not None:
+        fields["task_id"] = int(_task(conn, task_id)["id"])
+    for k, v in (("started_at", started_at), ("ended_at", ended_at)):
+        if v is not None:
+            t = store._text(v, k, required=True)
+            try:
+                store.parse_iso(t)
+            except ValueError:
+                raise ValueError(f"{k} must be an ISO time, got {t!r}") from None
+            fields[k] = t
+    if before is None and ("kind" not in fields or "tmux" not in fields):
+        raise ValueError(f"a new driven session needs kind and tmux ({sid})")
+    row = dict(before or {}, **fields)
+    if row["kind"] == "task-manager" and row.get("project_id") is None:
+        raise ValueError("a task-manager row needs its project")
+    if row.get("ended_at") is None:
+        holders = store.live_driven_with(conn, tmux=row["tmux"], other_than=sid) if row.get("tmux") else []
+        if holders:
+            taken = holders[0]
+            raise Conflict(f"tmux {row['tmux']} is the live name of {taken['session_id']} ({taken['kind']})",
+                           current=taken)
+        if row["kind"] == "task-manager":
+            other = store.live_driven_with(conn, task_manager_of=row["project_id"], other_than=sid)
+            if other:
+                raise Conflict(f"project #{row['project_id']} already has the live task-manager "
+                               f"{other[0]['session_id']} (tmux {other[0]['tmux']})", current=other[0])
+    if before is not None and all(before.get(k) == v for k, v in fields.items()):
+        return Result(before, sid, before, before, changed=False)
+    after = store.upsert_driven_session(conn, sid, **fields)
+    return Result(after, sid, before, after)
 
 
 # ---------------------------------------------------------------- compaction hand-offs (§5.5)
