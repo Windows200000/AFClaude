@@ -195,7 +195,7 @@ class WindowPing(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(set(self.pings()), {schedule.start_key(NIGHT), schedule.start_key(S2)})
 
-    def test_failed_request_alerts_without_pausing(self):
+    def test_failed_request_only_logged(self):
         self.reply = subprocess.CompletedProcess([], 1, "", "boom")
         d = self.start()
         self.assertTrue(d["go"])
@@ -203,39 +203,42 @@ class WindowPing(unittest.TestCase):
         rec = self.pings()[schedule.start_key(NIGHT)]
         self.assertEqual(rec["status"], "request-failed")
         self.assertIn("rc=1", rec["error"])
-        self.assertEqual([s for s, _ in self.alerts], ["window-start ping failed"])
+        self.assertEqual(self.alerts, [])                                # D-280: a log line only
         self.assertEqual(self.sleeps, [])
         self.assertFalse(failstop.paused()["paused"])
 
-    def test_timeout_alerts(self):
+    def test_timeout_only_logged(self):
         self.reply = subprocess.TimeoutExpired(["claude"], ka.WINDOW_PING_TIMEOUT)
         self.start()
         self.assertEqual(self.pings()[schedule.start_key(NIGHT)]["status"], "request-failed")
-        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.alerts, [])
 
     def test_unexpected_error_never_blocks_the_start(self):
         self.reply = RuntimeError("bridge exploded")
-        d = self.start()
+        with mock.patch.object(ka, "log", wraps=ka.log) as logged:
+            d = self.start()
+        self.assertTrue(any("ERROR: window-start ping failed" in c.args[0] and "RuntimeError" in c.args[0]
+                            for c in logged.call_args_list))
         self.assertTrue(d["go"])
         self.assertIn(schedule.start_key(NIGHT), ka.load_deferred())
-        self.assertIn("RuntimeError", self.alerts[0][1])
+        self.assertEqual(self.alerts, [])
         self.assertFalse(failstop.paused()["paused"])
 
-    def test_window_not_opened_alerts(self):
+    def test_window_not_opened_only_logged(self):
         self.after = None                                                # still no session window after it
         self.start()
         rec = self.pings()[schedule.start_key(NIGHT)]
         self.assertEqual(rec["status"], "unmatched")
         self.assertFalse(rec["matched"])
-        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.alerts, [])
         self.assertFalse(failstop.paused()["paused"])
 
-    def test_verify_reading_failed_alerts(self):
+    def test_verify_reading_failed_only_logged(self):
         ka.refresh_usage_checked = lambda cwd=ka.HERE, now=None: {"ok": False, "rc": 1, "out": "x",
                                                                      "usage": {"fetched_at": NIGHT}}
         self.start()
         self.assertEqual(self.pings()[schedule.start_key(NIGHT)]["status"], "verify-failed")
-        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.alerts, [])
 
     def test_late_ping_matches_its_floor_but_not_the_schedule(self):
         self.ping_at = NIGHT + timedelta(minutes=12)

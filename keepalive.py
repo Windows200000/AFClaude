@@ -1592,9 +1592,9 @@ def run_pace_text(sid, stall, now, u):
 # window_ping off, or a second time for the same session-window start (the keepalive state's
 # "window_pings", keyed by schedule.start_key). Each ping is recorded there with the session reset
 # read WINDOW_PING_VERIFY_AFTER later and whether it is the request time floored to 10 min + 5 h,
-# and a progress note says so. A ping that fails or doesn't open the window as expected alerts
-# but does not pause automation (task-manager choice, flagged): the start's own decision is
-# already made and stored, and a pause would hold the run planned later in the same window.
+# and a progress note says so. A ping that fails or doesn't open the window as expected is only
+# logged (an ERROR line in the app log + its record; no alert, no pause: D-280, the owner's named
+# exception to D-235); the start's own decision is already made and stored.
 
 WINDOW_PING_TIMEOUT = 120                        # seconds for the request
 WINDOW_PING_VERIFY_AFTER = timedelta(seconds=90)  # then read the session reset again
@@ -1634,10 +1634,9 @@ def record_window_ping(key, rec):
 
 
 def _ping_problem(subject, detail):
-    """A ping that failed or didn't open the window as expected: an ERROR line and an alert, no
-    pause (see the section comment)."""
+    """A ping that failed or didn't open the window as expected: an ERROR line in the app log
+    only, no alert, no pause (D-280)."""
     log(f"ERROR: {subject}: {detail}")
-    alert(subject, detail)
 
 
 def window_ping(sid, now, key, u, why, args):
@@ -1704,11 +1703,11 @@ def window_ping(sid, now, key, u, why, args):
 
 def window_ping_after(sid, now, key, u, why, args):
     """window_ping at the end of a session-window start pass. Never raises: the start's own
-    decision is already stored, so an unexpected error in the ping is logged and alerted (no pause,
-    see the section comment) and the start goes on. -> window_ping's result, or None."""
+    decision is already stored, so an unexpected error in the ping is logged only (D-280: no
+    alert, no pause) and the start goes on. -> window_ping's result, or None."""
     try:
         return window_ping(sid, now, key, u, why, args)
-    except Exception as e:   # noqa: BLE001 - reported (ERROR line + alert), never blocks the start
+    except Exception as e:   # noqa: BLE001 - logged (ERROR line, D-280), never blocks the start
         _ping_problem("window-start ping failed", f"{key}: {type(e).__name__}: {e}"[:500])
         return None
 
