@@ -15,7 +15,10 @@ imports it, and builds what the task-manager reads:
     by D-NNN: ...)", e.g. the early M-003) -- import_file's "no_status" always lists every entry
     with no Status line, title marker or not, so the rest (plain, no marker) stay visible too, since
     DECISIONS.md is never edited here to add one. Idempotent: an unchanged entry writes nothing, so
-    an unchanged file is a no-op (no audit row). It runs every 10 min with the docs import
+    an unchanged file is a no-op (no audit row) -- but an entry whose text is unchanged while a
+    derived field (e.g. state) now comes out different, because the derivation logic itself
+    changed, is still updated ("restated": store.put_decision_entry / DECISION_DERIVED_FIELDS).
+    It runs every 10 min with the docs import
     (project_docs.py import --cron), at every SessionStart hook below, and by hand:
         python3 decisions.py import [--file PATH]        (= python3 tasks.py decision import)
   - keywords: the file's Keywords line, plus the task-manager's own additions and removals

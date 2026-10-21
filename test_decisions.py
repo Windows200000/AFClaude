@@ -193,6 +193,35 @@ class Import(Env):
         with open(self.src, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), SOURCE)                                     # the file is never written
 
+    def test_restated_when_derivation_logic_changes(self):
+        # Simulate a stored row left over from before a derivation-logic change (e.g. the
+        # title-marker inference added in state_of): D-001's text is untouched, but its stored
+        # state is stale. A reimport of the unchanged file must correct it (D-242 follow-up bug).
+        self.imp()
+        c = self.conn()
+        try:
+            with store.transaction(c):
+                c.execute("UPDATE decisions SET state = 'superseded' WHERE id = 'D-001'")
+            self.assertEqual(store.get_decision_entry(c, "D-001")["state"], "superseded")
+        finally:
+            c.close()
+        r = self.imp()
+        self.assertEqual(r["restated"], {"D-001": ["state"]})
+        self.assertEqual((r["added"], r["changed"], r["removed"]), ([], [], []))
+        self.assertEqual(r["unchanged"], 4)                                        # the other 4 entries
+        c = self.conn()
+        try:
+            self.assertEqual(store.get_decision_entry(c, "D-001")["state"], "active")   # corrected
+        finally:
+            c.close()
+        a = self.audit("decision.import")[0]                                       # newest first
+        self.assertEqual(a["after"]["restated"], {"D-001": ["state"]})
+        self.assertEqual(len(self.audit("decision.import")), 2)                    # a real audit row
+        r = self.imp()                                                             # now truly unchanged
+        self.assertEqual(r["restated"], {})
+        self.assertEqual(r["unchanged"], 5)
+        self.assertEqual(len(self.audit("decision.import")), 2)                    # still no new row
+
     def test_change_remove_move(self):
         self.imp()
         text = SOURCE.replace('"deploy it now"', '"deploy it today"')               # D-004 changed

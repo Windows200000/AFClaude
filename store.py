@@ -3152,10 +3152,18 @@ def _decision_fts_put(conn: sqlite3.Connection, d: Mapping[str, Any]) -> None:
                   d.get("words") or "", d["body"]))
 
 
+# fields that can change without the entry's text changing -- derived from the text by code that
+# can itself change (e.g. state_of's title-marker inference, D-242 follow-up): body and section
+# are excluded (body changing is 'changed'; section alone is 'moved', with ord).
+DECISION_DERIVED_FIELDS = tuple(k for k in DECISION_FIELDS if k not in ("body", "section"))
+
+
 def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) -> tuple[str, Row | None]:
     """Insert or update one decision from the source (fields DECISION_FIELDS + id, keywords, ord),
     leaving the task-manager's keyword changes alone. -> (outcome, the row before): 'added',
-    'changed' (the entry text differs), 'moved' (only its position/section), 'unchanged'."""
+    'changed' (the entry text differs), 'restated' (the text is the same but a derived field, e.g.
+    state, comes out different -- the derivation logic changed, not the source), 'moved' (only its
+    position/section), 'unchanged'."""
     did = decision_id(e["id"])
     if e["state"] not in DECISION_STATES:
         raise ValueError(f"{did}: state must be one of {'|'.join(DECISION_STATES)}")
@@ -3175,6 +3183,11 @@ def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) 
                      "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
                      [*vals, kw, sha, int(e["ord"]), now, now, by, did])
         outcome = "changed"
+    elif any(cur.get(k) != e.get(k) for k in DECISION_DERIVED_FIELDS):
+        conn.execute(f"UPDATE decisions SET {', '.join(k + ' = ?' for k in DECISION_FIELDS)}, keywords = ?, "
+                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                     [*vals, kw, sha, int(e["ord"]), now, now, by, did])
+        outcome = "restated"
     elif cur["ord"] != int(e["ord"]) or cur["section"] != e.get("section"):
         conn.execute("UPDATE decisions SET ord = ?, section = ? WHERE id = ?", (int(e["ord"]), e.get("section"), did))
         return "moved", cur

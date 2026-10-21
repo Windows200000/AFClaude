@@ -1611,7 +1611,10 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     from a title marker like "SUPERSEDED" -- the list still names them all, so the plain ones stay
     visible without editing DECISIONS.md). Refused (decisions.SourceError): a file without entries
     or with a duplicate id, and one that would remove more than half of the stored entries
-    (force=True allows that)."""
+    (force=True allows that). An entry whose text is byte-for-byte the same as what's stored but
+    whose derived fields (e.g. state) now come out different -- the derivation logic changed, not
+    DECISIONS.md -- is 'restated': updated, with an audit row naming the fields that changed. A
+    truly unchanged entry still writes nothing."""
     import decisions as dec
     src = os.path.abspath(store._text(path, "path", required=True))
     try:
@@ -1629,6 +1632,7 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
                               "check the file, or import with force")
     added: list[str] = []
     changed: dict[str, str] = {}
+    restated: dict[str, list[str]] = {}
     moved = 0
     for n, e in enumerate(entries):
         row = dict(e.row(), ord=n)
@@ -1638,17 +1642,19 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
         elif outcome == "changed" and old is not None:
             changed[e.id] = "\n".join(difflib.unified_diff(old["body"].split("\n"), e.body.split("\n"),
                                                            lineterm="", n=0))
+        elif outcome == "restated" and old is not None:
+            restated[e.id] = [k for k in store.DECISION_DERIVED_FIELDS if old.get(k) != row.get(k)]
         elif outcome == "moved":
             moved += 1
     removed = {i: store.delete_decision_entry(conn, i)["body"] for i in gone}
     no_status = [e.id for e in entries if not e.has_status]   # visible without editing DECISIONS.md
     result = {"file": src, "sha256": sha, "entries": len(entries), "added": added, "changed": list(changed),
-              "removed": list(removed), "moved": moved, "no_status": no_status,
-              "unchanged": len(entries) - len(added) - len(changed) - moved}
+              "restated": restated, "removed": list(removed), "moved": moved, "no_status": no_status,
+              "unchanged": len(entries) - len(added) - len(changed) - len(restated) - moved}
     after = {"sha256": sha, "entries": len(entries), "added": added, "changed": changed,
-             "removed": list(removed), "moved": moved}
+             "restated": restated, "removed": list(removed), "moved": moved}
     return Result(result, os.path.basename(src), {"removed_text": removed}, after,
-                  changed=bool(added or changed or removed or moved))
+                  changed=bool(added or changed or restated or removed or moved))
 
 
 def _keyword(value: Any) -> str:
