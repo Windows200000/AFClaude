@@ -980,6 +980,8 @@ def runner_schedule(job):
     if job.daily is not None:
         t = datetime.now(UTC).replace(hour=job.daily[0], minute=job.daily[1], second=0, microsecond=0)
         return f"daily {t:%H:%M} UTC", f"daily {t.astimezone(ka.BERLIN):%H:%M %Z}"
+    if job.at_jobs:
+        return "each at-job's minute", "each at-job's minute"
     return "each session-window start", "each session-window start"
 
 

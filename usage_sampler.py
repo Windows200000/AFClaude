@@ -345,8 +345,9 @@ def track_cycle(usage, t, tag):
                 continue
             at_time = when.astimezone(UTC).strftime("%Y%m%d%H%M")
             cmd = f"python3 {os.path.join(HERE, 'usage_sampler.py')} --tag {label} >> {os.path.join(DATA, 'sampler.log')} 2>&1\n"
-            r = subprocess.run(["at", "-t", at_time], input=cmd, text=True, capture_output=True,
-                               env=dict(ka.SCRUBBED_ENV, TZ="UTC"))
+            # a sample a runner restart cut off is taken again (phase 3a S4): it only reads and records
+            r = subprocess.run(["at", "--on-interrupt", "rerun", "-t", at_time], input=cmd, text=True,
+                               capture_output=True, env=dict(ka.SCRUBBED_ENV, TZ="UTC"))
             ok = ok and r.returncode == 0
             c.setdefault("at_jobs", []).append({label: when.isoformat(), "rc": r.returncode,
                                                 "out": (r.stderr or r.stdout).strip()[-120:]})

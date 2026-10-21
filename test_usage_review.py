@@ -173,8 +173,8 @@ class ScheduleOnce(Base):
         self.assertTrue(res["ok"])
         self.assertEqual(len(self.calls), 1)
         argv, cmd = self.calls[0]["argv"], self.calls[0]["input"]
-        self.assertEqual(argv[:2], ["at", "-t"])
-        self.assertEqual(argv[2], "202610151400")
+        self.assertEqual(argv[:4], ["at", "--on-interrupt", "fail", "-t"])   # a review start: never rerun (S4)
+        self.assertEqual(argv[4], "202610151400")
         self.assertIn("usage_review.py --only stage-eta --now", cmd)
         self.assertEqual(self.calls[0]["env"]["TZ"], "UTC")
         self.assertEqual(res["at_utc"], datetime(2026, 10, 15, 14, 0, tzinfo=UTC).isoformat())
@@ -183,7 +183,7 @@ class ScheduleOnce(Base):
     def test_winter_time_is_cet(self):
         # 15.12.2026 16:00 Europe/Berlin (CET, UTC+1) = 15:00 UTC
         ur.schedule_once("stage-eta", "2026-12-15 16:00", now=NOW)
-        self.assertEqual(self.calls[0]["argv"][2], "202612151500")
+        self.assertEqual(self.calls[0]["argv"][4], "202612151500")
 
     def test_bad_time_is_rejected_without_calling_at(self):
         res = ur.schedule_once("stage-eta", "not a time", now=NOW)
@@ -489,7 +489,11 @@ class Transcripts(Base):
 
     def at_jobs(self):
         """(UTC time, command) of every at job spooled."""
-        return [(argv[2], cmd) for argv, cmd in self.at_calls]
+        return [(argv[argv.index("-t") + 1], cmd) for argv, cmd in self.at_calls]
+
+    def at_policies(self):
+        """(--on-interrupt, command) of every at job spooled (phase 3a S4)."""
+        return [(argv[argv.index("--on-interrupt") + 1], cmd) for argv, cmd in self.at_calls]
 
 
 class QuotaGate(Transcripts):
@@ -759,6 +763,14 @@ class Chain(Transcripts):
         self.assertEqual(ur.chain_pass(ur.load(), self.now), "paused")
         self.assertEqual(ur.load()["chain"]["session"], sid)
         self.assertEqual(self.at_calls, [])
+
+    def test_a_chain_step_is_rerun_after_a_restart_a_review_start_is_not(self):
+        """S4: the runner reruns an interrupted chain step (its state is in st["chain"]); a one-off
+        review start cut off mid-way is an error (D-257), the at-shim's default."""
+        ur.spool_chain_step(T0)
+        ur.spool_review("usage", T0, 1)
+        self.assertEqual([(p, "--chain-step" in c, "--only usage" in c) for p, c in self.at_policies()],
+                         [("rerun", True, False), ("fail", False, True)])
 
     def test_a_pending_chain_step_job_is_not_spooled_twice(self):
         job = {"id": "chainstep01", "at": T0.isoformat(), "cmd": "python3 usage_review.py --chain-step\n", "cwd": "/"}

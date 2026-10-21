@@ -29,6 +29,11 @@ While automation is already paused, a failure whose subject is already in the pa
 only logged (a cron job failing every 15 min alerts once per pause); a new subject is appended
 to the reason and alerted. Keep `subject` stable (no times or numbers; those go in `detail`).
 
+A process run for the resident runner whose failure the runner would otherwise report (an at-job's
+shell command, phase 3a S4: runner_jobs.py can't see a fail() inside it) gets REPORTS_ENV, a file
+path: fail() appends "<component>: <subject>" to it, and the runner records the failure as reported
+by the handler instead of alerting a second time.
+
 A DB that can't be written can't record the pause: the DB-error path (D-171) then holds every
 start anyway (store.db_gate) and the alert goes to data/ALERTS.fallback.md; fail() logs that the
 pause was not stored.
@@ -51,6 +56,7 @@ sys.path.insert(0, HERE)
 BERLIN = ZoneInfo("Europe/Berlin")
 RESUME_CMD = "python3 tasks.py automation resume"
 REASON_MAX = 1500        # the stored reason (actions.REASON_MAX is the hard limit)
+REPORTS_ENV = "AFCLAUDE_FAILSTOP_REPORTS"   # a file each fail() appends its subject to (module doc)
 LogFn = Callable[[str], Any]
 AlertFn = Callable[[str, str], Any]
 
@@ -159,6 +165,7 @@ def fail(component: str, subject: str, detail: str = "", *, log: Optional[LogFn]
         log(f"ERROR: {component}: {subject}" + (f": {detail[:500]}" if detail else ""))
     except Exception:   # noqa: BLE001
         pass
+    _note_report(component, subject)
     pid: Optional[int] = None
     name: Optional[str] = None
     if pause:
@@ -214,6 +221,19 @@ def fail(component: str, subject: str, detail: str = "", *, log: Optional[LogFn]
         except Exception:   # noqa: BLE001
             pass
     return out
+
+
+def _note_report(component: str, subject: str) -> None:
+    """This failure into the REPORTS_ENV file, when the runner gave one (module doc). Never raises:
+    a note that can't be written is logged to stderr (the runner then reports the failure too)."""
+    path = os.environ.get(REPORTS_ENV)
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{component}: {' '.join(subject.split())}\n")
+    except OSError as e:
+        _stderr_log(f"failstop: the report note for the runner could not be written ({type(e).__name__}: {e})")
 
 
 class Failed(Exception):

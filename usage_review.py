@@ -298,14 +298,16 @@ def note_postponed(st, now, what, until, why, attempt):
 
 # ---------------------------------------------------------------- at jobs
 
-def spool(when, args):
+def spool(when, args, rerun=False):
     """An at-shim job (docker/at_shim.py, its row in the DB's scheduled_jobs) that runs
-    `usage_review.py <args>` at `when` (on the minute). -> dict(ok, at_utc, rc, out)."""
+    `usage_review.py <args>` at `when` (on the minute). rerun: the resident runner runs it again
+    when a restart cut it off (a chain step: its state is in st["chain"] and it runs under lock());
+    else that is an error (a review start cut off mid-way, D-257). -> dict(ok, at_utc, rc, out)."""
     when = when.astimezone(UTC)
     log_file = os.path.join(os.environ.get("KEEPALIVE_STATE_DIR", HERE), "keepalive.log")
     cmd = f"cd {HERE} && python3 usage_review.py {args} >> {log_file} 2>&1\n"
-    r = subprocess.run(["at", "-t", when.strftime("%Y%m%d%H%M")], input=cmd, text=True, capture_output=True,
-                       env=dict(ka.SCRUBBED_ENV, TZ="UTC"))
+    r = subprocess.run(["at", "--on-interrupt", "rerun" if rerun else "fail", "-t", when.strftime("%Y%m%d%H%M")],
+                       input=cmd, text=True, capture_output=True, env=dict(ka.SCRUBBED_ENV, TZ="UTC"))
     return {"ok": r.returncode == 0, "at_utc": when.isoformat(), "rc": r.returncode,
             "out": (r.stderr or r.stdout).strip()[-300:]}
 
@@ -330,7 +332,7 @@ def spool_chain_step(when):
     spooled is an error (D-235). -> the at result, None if one was pending."""
     if any(CHAIN_STEP_ARG in (j.get("cmd") or "") for j in runner_state.jobs("pending")):
         return None
-    r = spool(when, CHAIN_STEP_ARG)
+    r = spool(when, CHAIN_STEP_ARG, rerun=True)
     if not r["ok"]:
         raise failstop.Failed("the review chain's next step could not be scheduled", json.dumps(r))
     return r
