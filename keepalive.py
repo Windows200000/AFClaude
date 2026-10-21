@@ -9,6 +9,8 @@ an active user is re-decided by the watcher before the next start, D-018) and ea
 slot start (D-020). A session-window start that passes the budget rule fires late in its session
 window, at its end - the session % it can use / measured fill rate x run_start_factor (D-274,
 "Run timing" below; the watcher fires it), or at once when the run before is still going. A start
+whose run begins later or is held sends one tiny context-free request while no Claude session
+window is open, so that window opens on the schedule (D-277, "Window-start ping" below). A start
 that fires continues the task-manager session with
 
     ka_resume.sh --session <full-uuid> --message "<continue msg>"   (tmux, no --bg)
@@ -1410,7 +1412,9 @@ def window_start_pass(sid, now, args):
     decides again. A FIRE dropped for a DB pause (handle_fire -> db_paused) is postponed the same
     way (db_paused's docstring): nothing else makes this start due again before then. Paused
     automation (D-234/D-235) skips the start (a progress note says so); a failed usage reading
-    is an error (fresh_usage: alert + pause). -> the decision dict."""
+    is an error (fresh_usage: alert + pause). A start whose run begins later (planned late,
+    postponed) or not at all (held) then pings Claude once so its session window opens on the
+    schedule (D-277, window_ping_after). -> the decision dict."""
     if automation_paused(f"the session-window start {berlin(now)}", sid):
         d = {"go": False, "reason": f"PAUSED: automation is paused ({paused_reason(sid)})", "postpone": False}
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}; clear it with "
@@ -1446,6 +1450,7 @@ def window_start_pass(sid, now, args):
             defer_window_start(key, sid, timing["start"], d["reason"], timing["end"], planned=True)
             progress_note(f"window-start {berlin(now)}: the gate passed, the run starts at {berlin(timing['start'])} "
                           f"(D-274: {timing['reason']} {berlin(timing['end'])}); {d['reason']}")
+            window_ping_after(sid, now, key, u, f"the run starts at {_hm(timing['start'])}", args)
             return dict(d, planned=timing["start"])
         stall = {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
                  "start_at": schedule.latest_session_start(now) or now, "run_end": session_window_end(now),
@@ -1464,12 +1469,15 @@ def window_start_pass(sid, now, args):
     elif defer:
         defer_window_start(key, sid, d["recheck_at"], d["reason"], deadline)
         progress_note(f"window-start {berlin(now)}: postponed to {berlin(d['recheck_at'])}, {d['reason']}")
+        window_ping_after(sid, now, key, u, f"the start is postponed to {_hm(d['recheck_at'])}", args)
     elif d.get("postpone") and d.get("recheck_at") and not args.now:
         progress_note(f"window-start {berlin(now)}: not resumed, postponed past the night's next session-window "
                       f"start ({berlin(d['recheck_at'])} >= {berlin(deadline)}), skipped to the next "
                       f"session-window start {berlin(schedule.next_session_start(now))} (D-202); {d['reason']}")
+        window_ping_after(sid, now, key, u, "the start is held (postponed past the next start)", args)
     else:
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
+        window_ping_after(sid, now, key, u, "the gate held", args)
     return d
 
 
@@ -1568,6 +1576,140 @@ def run_pace_text(sid, stall, now, u):
     if fillup.chained(run_end=end, claude_reset=claude_reset, next_start=nxt):
         text += " " + load_prompt("run_chain").format(next=_hm(nxt), until=_hm(nxt + fillup.CACHE_HOUR))
     return text
+
+
+# ---------------------------------------------------------------- window-start ping (D-277)
+# D-277 (owner): "The ping can just be a separate session with no context. But check that that
+# little usage actually starts window." A session-window start whose run begins later (planned late,
+# D-274; postponed) or not at all (the gate held) would leave the Claude session window closed until
+# the run or the owner opens one at some other time, so it no longer lines up with the schedule's
+# starts (and chained runs, D-274, miss their fresh window). One tiny context-free request (POKE_ARGV:
+# Haiku, no tools, no session file) right in the start's cron pass opens it: checked from the
+# sampler's data (21.10.), a request while no session window is open opens one at the request time
+# floored to 10 min + 5 h, /usage reads alone don't; so it must go out within the start's first
+# 10 min. Not sent while a session window is open (no effect), when the run fires at once (it opens
+# the window itself), for --now, while paused (the start returns before), with the setting
+# window_ping off, or a second time for the same session-window start (the keepalive state's
+# "window_pings", keyed by schedule.start_key). Each ping is recorded there with the session reset
+# read WINDOW_PING_VERIFY_AFTER later and whether it is the request time floored to 10 min + 5 h,
+# and a progress note says so. A ping that fails or doesn't open the window as expected is only
+# logged (an ERROR line in the app log + its record; no alert, no pause: D-280, the owner's named
+# exception to D-235); the start's own decision is already made and stored.
+
+WINDOW_PING_TIMEOUT = 120                        # seconds for the request
+WINDOW_PING_VERIFY_AFTER = timedelta(seconds=90)  # then read the session reset again
+WINDOW_PING_SLACK = timedelta(minutes=1)         # reset times jitter by milliseconds
+WINDOW_PINGS_KEPT = 30                           # st["window_pings"]: the last pings
+
+
+def floor_ping(t):
+    """The start Claude gives a session window opened by a request at t: t floored to 10 min."""
+    return t - timedelta(minutes=t.minute % 10, seconds=t.second, microseconds=t.microsecond)
+
+
+def window_ping_skip(now, u, args):
+    """Why the window-start ping is not sent at `now` on the usage reading `u` (None: send it)."""
+    if getattr(args, "now", False):
+        return "a manual start (--now)"
+    if not afclaude_config.setting("window_ping"):
+        return "the setting window_ping is off"
+    reset = ((u or {}).get("session") or {}).get("resets_at")
+    if reset is not None and reset > now:
+        return f"a session window is open until {_hm(reset)}"
+    return None
+
+
+def record_window_ping(key, rec):
+    """The ping of the session-window start `key` in the keepalive state's "window_pings" (merged
+    into the DB's state; the last WINDOW_PINGS_KEPT). -> stored."""
+    disk = load_state()
+    pings = disk.setdefault("window_pings", {})
+    pings[key] = _jsonable(rec)
+    for k in sorted(pings, key=lambda k: str((pings[k] or {}).get("at")))[:-WINDOW_PINGS_KEPT]:
+        pings.pop(k, None)
+    ok = save_state(disk)
+    if not ok:
+        log(f"window-ping record {key} not stored in the DB (kept in data/ALERTS.fallback.md)")
+    return ok
+
+
+def _ping_problem(subject, detail):
+    """A ping that failed or didn't open the window as expected: an ERROR line in the app log
+    only, no alert, no pause (D-280)."""
+    log(f"ERROR: {subject}: {detail}")
+
+
+def window_ping(sid, now, key, u, why, args):
+    """D-277: at the session-window start `key` (decided at `now` on the usage reading `u`; `why`:
+    the start's outcome), send the context-free ping if no session window is open, then read the
+    session reset WINDOW_PING_VERIFY_AFTER later. Dry-run logs only. -> the record, or None when
+    nothing was sent."""
+    skip = window_ping_skip(now, u, args)
+    if skip:
+        log(f"window-ping {key}: not sent, {skip}")
+        return None
+    if key in (load_state().get("window_pings") or {}):
+        log(f"window-ping {key}: not sent, already sent for this session-window start")
+        return None
+    if not getattr(args, "arm", False):
+        log(f"WOULD PING (dry-run) {key}: no session window open, {why}")
+        return None
+    start = schedule.latest_session_start(now) or now
+    at = _now()
+    rec = {"session": sid, "at": at, "why": why, "window_start": start, "status": "sending"}
+    record_window_ping(key, rec)    # claimed before the request: this start never pings twice
+    log(f"window-ping {key}: no session window open, {why}: sending the ping")
+    try:
+        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=HERE, env=SCRUBBED_ENV, timeout=WINDOW_PING_TIMEOUT)
+        o = json.loads(r.stdout or "{}")
+        problem = None if r.returncode == 0 and not o.get("is_error") else \
+            f"rc={r.returncode} is_error={o.get('is_error')} result={str(o.get('result'))[:80]!r} " \
+            f"stderr={(r.stderr or '').strip()[:200]!r}"
+        rec["cost_usd"] = o.get("total_cost_usd")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:   # ValueError: no JSON, no bridge shape
+        problem = f"{type(e).__name__}: {e}"
+    if problem:
+        rec.update(status="request-failed", error=problem[:300])
+        record_window_ping(key, rec)
+        _ping_problem("window-start ping failed", f"{key} at {berlin(at)}: {problem[:300]}")
+        progress_note(f"window-ping {berlin(at)}: the request failed ({problem[:120]}); the session window may "
+                      f"open off the schedule (D-277)")
+        return rec
+    _sleep(WINDOW_PING_VERIFY_AFTER.total_seconds())
+    res = refresh_usage_checked(now=_now())
+    if not res.get("ok") or not res.get("usage"):
+        rec.update(status="verify-failed", error=usage_failure_detail(res)[:300])
+        record_window_ping(key, rec)
+        _ping_problem("window-start ping: the usage reading after it failed", f"{key}: {rec['error']}")
+        progress_note(f"window-ping {berlin(at)}: sent, but the usage reading after it failed (D-277)")
+        return rec
+    reset = ((res["usage"] or {}).get("session") or {}).get("resets_at")
+    expected = floor_ping(at) + afclaude_config.SESSION_LENGTH
+    rec.update(resets_at=reset, expected=expected,
+               matched=reset is not None and abs(reset - expected) <= WINDOW_PING_SLACK,
+               on_schedule=reset is not None and abs(reset - (start + afclaude_config.SESSION_LENGTH)) <= WINDOW_PING_SLACK)
+    rec["status"] = "ok" if rec["matched"] else "unmatched"
+    record_window_ping(key, rec)
+    line = (f"window-ping {berlin(at)} ({why}): {'opened' if rec['matched'] else 'did NOT open'} the session "
+            f"window as expected: it resets {_hm(reset) if reset else 'n/a'}, expected {_hm(expected)}"
+            + ("" if rec["on_schedule"] else f", not the schedule's {_hm(start + afclaude_config.SESSION_LENGTH)}")
+            + " (D-277)")
+    log(line)
+    progress_note(line)
+    if not rec["matched"]:
+        _ping_problem("window-start ping did not open the session window as expected", line)
+    return rec
+
+
+def window_ping_after(sid, now, key, u, why, args):
+    """window_ping at the end of a session-window start pass. Never raises: the start's own
+    decision is already stored, so an unexpected error in the ping is logged only (D-280: no
+    alert, no pause) and the start goes on. -> window_ping's result, or None."""
+    try:
+        return window_ping(sid, now, key, u, why, args)
+    except Exception as e:   # noqa: BLE001 - logged (ERROR line, D-280), never blocks the start
+        _ping_problem("window-start ping failed", f"{key}: {type(e).__name__}: {e}"[:500])
+        return None
 
 
 # ---------------------------------------------------------------- postponed window start
