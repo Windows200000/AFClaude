@@ -24,7 +24,7 @@ imports it, and builds what the task-manager reads:
   - keywords: the file's Keywords line, plus the task-manager's own additions and removals
     (`tasks.py decision keywords D-NNN add|remove KW...`, action decision.keywords, D-242). Those are
     kept apart from the file's list, so a re-import never undoes them.
-  - the TLDR (D-242): every current decision (not done, not superseded) as one line, id + title
+  - the TLDR (D-242): every current decision (not done, expired or superseded) as one line, id + title
     (+ the status when it isn't plain "active"). The repo's SessionStart hook injects it after a
     compaction and in a brand-new conversation (sources compact, startup, clear; not resume, and so
     not a run's continue), importing the file first so it is current:
@@ -49,7 +49,9 @@ import sqlite3
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -73,6 +75,7 @@ FIELDS = {"type": "type", "date": "date", "status": "status", "supersedes": "sup
           "scope": "scope"}
 STATES = ("active", "partial", "done", "superseded")
 CURRENT = ("active", "partial")                      # what the TLDR and a default find show
+BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active until" date is Berlin time
 
 
 class SourceError(ValueError):
@@ -109,19 +112,50 @@ class Entry:
 TITLE_SUPERSEDED_RE = re.compile(r"\bsuperseded\b", re.IGNORECASE)
 
 
-def state_of(status: Optional[str], title: Optional[str] = None) -> str:
+# "active until 2026-10-22 19:00 (one-off, D-278)": current until then (a date alone: to its end)
+UNTIL_RE = re.compile(r"active until (\d)")
+UNTIL_DATE_RE = re.compile(r"active until (\d{4}-\d{2}-\d{2})(?:[ T](\d{1,2}:\d{2}))?(?!\d)")
+
+
+def until_of(status: str) -> Optional[datetime]:
+    """The end of an "active until YYYY-MM-DD[ HH:MM]" Status (Berlin time; a date alone ends at
+    the next midnight), or None when the Status isn't that. "active until" followed by anything
+    but a valid date (e.g. a typo'd one) raises SourceError: the entry's lifetime can't be told."""
+    s = status.strip().lower()
+    if not UNTIL_RE.match(s):
+        return None
+    m = UNTIL_DATE_RE.match(s)
+    try:
+        if m is None:
+            raise ValueError("no YYYY-MM-DD[ HH:MM] date")
+        if m.group(2):
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M").replace(tzinfo=BERLIN)
+        return datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=BERLIN) + timedelta(days=1)
+    except ValueError as e:
+        raise SourceError(f"Status {status.strip()!r}: 'active until' needs a valid date "
+                          f"(YYYY-MM-DD or YYYY-MM-DD HH:MM, Berlin time): {e}") from e
+
+
+def state_of(status: Optional[str], title: Optional[str] = None, now: Optional[datetime] = None) -> str:
     """The status line -> active | partial | done | superseded. Anything that isn't plainly done
     or (fully) superseded counts as current: 'active (to build)', 'pending clarification', a
-    missing status. A handful of early manager entries (M-001..M-010) have no Status line at all;
-    when one of those also names its own fate in the title ("... (SUPERSEDED by D-NNN: ...)", e.g.
-    M-003) that marker decides instead of defaulting to active (`import_file`'s "no_status" list
-    still names every entry with no Status line, marked or not, so the rest stay visible too)."""
+    missing status. 'expired ...' (a one-off whose moment passed, D-278) counts as done, and so
+    does 'active until <date>' once that date (Berlin time) is past `now` (default: the current
+    time; the stored state follows at the next import, every 10 min and at each session start,
+    as a "restated" entry). A handful of early manager entries (M-001..M-010) have no Status line
+    at all; when one of those also names its own fate in the title ("... (SUPERSEDED by D-NNN:
+    ...)", e.g. M-003) that marker decides instead of defaulting to active (`import_file`'s
+    "no_status" list still names every entry with no Status line, marked or not, so the rest stay
+    visible too)."""
     s = (status or "").strip().lower()
     if s.startswith("partially superseded"):
         return "partial"
     if s.startswith("superseded"):
         return "superseded"
-    if s.startswith("done"):
+    if s.startswith("done") or s.startswith("expired"):
+        return "done"
+    until = until_of(s)
+    if until is not None and (now or datetime.now(BERLIN)) >= until:
         return "done"
     if not s and title and TITLE_SUPERSEDED_RE.search(title):
         return "superseded"
@@ -200,7 +234,8 @@ def read_source(path: str) -> tuple[str, str]:
 
 
 def check_entries(entries: list[Entry], path: str) -> None:
-    """Refuse a source that can't be right: no entries, a duplicate id, an entry without a title."""
+    """Refuse a source that can't be right: no entries, a duplicate id, an entry without a title,
+    an "active until" Status without a valid date (until_of)."""
     if not entries:
         raise SourceError(f"{path}: no '### D-NNN' / '### M-NNN' entries")
     seen: set[str] = set()
@@ -210,6 +245,10 @@ def check_entries(entries: list[Entry], path: str) -> None:
         seen.add(e.id)
         if not e.title:
             raise SourceError(f"{path}: {e.id} has no title")
+        try:
+            until_of(e.status or "")
+        except SourceError as err:
+            raise SourceError(f"{path}: {e.id}: {err}") from err
 
 
 # ---------------------------------------------------------------- import
