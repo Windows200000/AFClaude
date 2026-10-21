@@ -745,6 +745,9 @@ SETTINGS: dict[str, Setting] = {
     "run_start_factor": _num(1.5, 0.0, 5.0, "Run timing (D-274): a night run starts at its session window's "
                              "end - the session % it can use / measured fill rate x this factor, so it ends at "
                              "the window's end (0 = at the session-window start, as before)", "budget"),
+    "window_ping": _flag(True, "Window-start ping (D-277): at a session-window start whose run starts later or is "
+                         "held, while no Claude session window is open, one tiny context-free Haiku request opens "
+                         "it, so the session windows line up with the schedule", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
     "compaction_enabled": _flag(True, "Compaction (D-144/D-233/D-238): the watcher compacts the task-manager "
@@ -1986,7 +1989,8 @@ class StateComponent:
 
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
-    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions")),
+    StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions",
+                                                      "window_pings")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),
