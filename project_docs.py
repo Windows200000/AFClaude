@@ -23,6 +23,7 @@ Hand edits of PROGRESS.md / GOALS.md / EXCEPTIONS.md stay possible (the owner an
 edit them directly): the importer takes them in, on a schedule (docker/crontab, every 10 min,
 `import --cron`) and as the first step of every export:
     python3 project_docs.py import [--cron]     (= python3 store.py import-docs; idempotent, files untouched)
+(--cron also imports the repo's DECISIONS.md into the decision store first: decisions.cron_import, D-242.)
 It reads every file and runs doc.sync for it (actor runner:import): an unchanged file is a no-op
 (or "DB ahead" when the DB moved on), an appended one adds its new entries, an in-place edit is
 one 'replace' entry keeping the unchanged entries; when the file and the DB both changed since
@@ -378,10 +379,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
     try:
         if args.cmd == "import" and args.cron:
+            import decisions          # the repo's DECISIONS.md too (D-242), in the same 10-min pass
+            dcode, dline = decisions.cron_import(args.db, args.repo)
+            if dline:
+                print(dline)
             code, line = cron_import(args.db, args.repo, args.reviews_dir, args.project)
             if line:
                 print(line)
-            return code
+            return max(code, dcode)
         if args.cmd == "import":
             r = import_all(args.db, args.repo, args.reviews_dir, args.project, force=args.force)
             print(json.dumps(r, indent=1, ensure_ascii=False))

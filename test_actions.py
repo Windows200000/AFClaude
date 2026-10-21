@@ -1019,6 +1019,10 @@ class LogRetention(Base):
 class EveryAction(Base):
     def test_every_registered_action_writes_one_audit_row(self):
         self.stall(SID)
+        src = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)     # a synthetic decision source
+        self.addCleanup(os.remove, src.name)
+        with src:
+            src.write("### D-001 A decision\n- **Keywords:** k\n- **Status:** active\n")
         script = [
             ("task.add", {"title": "t", "project": "P"}), ("task.ask", {"question": "q?"}),
             ("task.edit", {"task_id": 1, "description": "d"}), ("task.priority", {"task_id": 1, "priority": "low"}),
@@ -1060,6 +1064,8 @@ class EveryAction(Base):
             ("inbox.post", {"text": "x", "session_id": SID}),
             ("inbox.fail", {"message_id": 3, "error": "Haiku timed out"}),
             ("inbox.retry", {"message_id": 3}),
+            ("decision.import", {"path": src.name}),
+            ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):

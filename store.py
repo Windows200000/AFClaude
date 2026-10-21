@@ -673,12 +673,54 @@ CREATE TABLE IF NOT EXISTS prompt_defaults (
 );
 """
 
+# ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
+# owner / task-manager decision, mirrored from DECISIONS.md (the source the task-manager edits for
+# now; actions.decision_import, audited) with the full entry text and its fields. keywords is the
+# source's Keywords line; keywords_added / keywords_removed are the task-manager's own changes
+# (actions.decision_keywords, D-242), kept apart so a re-import never undoes them (the effective
+# set: decision_keywords()). decisions_fts (FTS5, when the SQLite build has it: has_decisions_fts) is
+# the full-text index over it, kept in step by the write functions below; without FTS5 a lookup
+# uses LIKE. Additive, no schema_version bump (as prompt_defaults).
+DECISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decisions (
+    id               TEXT PRIMARY KEY,      -- D-NNN | M-NNN, as in the source
+    title            TEXT NOT NULL,
+    type             TEXT,                  -- owner | manager decision | task-manager (as written)
+    date             TEXT,                  -- as written
+    status           TEXT,                  -- the Status line as written
+    state            TEXT NOT NULL CHECK (state IN ('active', 'partial', 'done', 'superseded')),
+    supersedes       TEXT,
+    keywords         TEXT NOT NULL DEFAULT '[]',   -- JSON list: the source's Keywords line
+    keywords_added   TEXT NOT NULL DEFAULT '[]',   -- JSON list: added by the task-manager
+    keywords_removed TEXT NOT NULL DEFAULT '[]',   -- JSON list (lower case): source keywords it dropped
+    summary          TEXT,
+    words            TEXT,                  -- the owner's words, verbatim
+    source           TEXT,
+    scope            TEXT,
+    interpretation   TEXT,                  -- the (task-)manager's reading, not binding
+    section          TEXT,                  -- the source's "## " heading above the entry
+    body             TEXT NOT NULL,         -- the full entry text, heading line included
+    body_sha256      TEXT NOT NULL,
+    ord              INTEGER NOT NULL,      -- position in the source
+    imported_at      TEXT NOT NULL,         -- when this body was imported (changed, not every run)
+    updated_at       TEXT NOT NULL,
+    updated_by       TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS decisions_ord ON decisions(ord);
+"""
+DECISIONS_FTS = ("CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(id UNINDEXED, title, keywords, "
+                 "summary, words, body, tokenize = 'porter unicode61')")
+DECISION_STATES = ("active", "partial", "done", "superseded")
+DECISION_ID_RE = re.compile(r"^[DM]-\d{1,5}$")
+
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
 # read is detectable whoever wrote: actions.py, the dispatcher, or an older checkout.
 # Created after COLUMNS (the column must exist). recursive_triggers is off, so the
 # trigger's own UPDATE doesn't fire it again.
 VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
-             "settings": "key", "prompt_overrides": "name", "inbox_messages": "id", "project_pauses": "project_id"}
+             "settings": "key", "prompt_overrides": "name", "inbox_messages": "id", "project_pauses": "project_id",
+             "decisions": "id"}
 VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
@@ -909,7 +951,9 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(RUNNER_RUNS_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
+    conn.executescript(DECISIONS_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
+        _init_decisions_fts(conn)
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
                      (DEFAULT_ACCOUNT, "this installation's Claude account", now_iso()))
         for table, cols in COLUMNS.items():
@@ -3026,6 +3070,206 @@ def doc_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {f"{r[0]}/{r[1]}": int(r[2]) for r in conn.execute(
         "SELECT p.name, d.name, COUNT(e.id) FROM docs d JOIN projects p ON p.id = d.project_id "
         "LEFT JOIN doc_entries e ON e.doc_id = d.id GROUP BY d.id ORDER BY p.name, d.name")}
+
+
+# ---------------------------------------------------------------- the decision store (D-242)
+#
+# DECISIONS_SCHEMA above. The reads, the lookup (find_decision_entries) and the raw writes;
+# actions.py (decision.import, decision.keywords) is the only caller of the writes.
+
+DECISION_FIELDS = ("title", "type", "date", "status", "state", "supersedes", "summary", "words", "source",
+                   "scope", "interpretation", "section", "body")
+
+
+def _init_decisions_fts(conn: sqlite3.Connection) -> None:
+    """Create decisions_fts if this SQLite build has FTS5 (else lookups use LIKE), and rebuild it
+    when it is out of step with the table (first created on a database that already had rows)."""
+    try:
+        conn.execute(DECISIONS_FTS)
+    except sqlite3.OperationalError as e:
+        if "fts5" in str(e):        # "no such module: fts5": this build has no FTS5
+            return
+        raise
+    n = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+    if conn.execute("SELECT COUNT(*) FROM decisions_fts").fetchone()[0] != n:
+        conn.execute("DELETE FROM decisions_fts")
+        for r in conn.execute("SELECT * FROM decisions").fetchall():
+            _decision_fts_put(conn, _decision_dict(r))
+
+
+def has_decisions_fts(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'decisions_fts'").fetchone() is not None
+
+
+def _decision_dict(r: sqlite3.Row) -> Row:
+    d = dict(r)
+    for k in ("keywords", "keywords_added", "keywords_removed"):
+        d[k] = json.loads(d[k] or "[]")
+    d["effective_keywords"] = decision_keywords(d)
+    return d
+
+
+def decision_keywords(d: Mapping[str, Any]) -> list[str]:
+    """The effective keywords: the source's, minus the ones the task-manager removed, plus the ones
+    it added (case-insensitive, no duplicates)."""
+    removed = {str(k).lower() for k in d.get("keywords_removed") or []}
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in list(d.get("keywords") or []) + list(d.get("keywords_added") or []):
+        kl = str(k).lower()
+        if kl not in removed and kl not in seen:
+            seen.add(kl)
+            out.append(str(k))
+    return out
+
+
+def decision_id(value: object) -> str:
+    """'d-012' -> 'D-012' (upper-cased); ValueError unless it looks like D-NNN / M-NNN."""
+    s = _text(value, "decision id", required=True).strip().upper()
+    if not DECISION_ID_RE.match(s):
+        raise ValueError(f"not a decision id: {value!r} (D-NNN or M-NNN)")
+    return s
+
+
+def get_decision_entry(conn: sqlite3.Connection, decision: object) -> Row | None:
+    r = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id(decision),)).fetchone()
+    return _decision_dict(r) if r is not None else None
+
+
+def list_decision_entries(conn: sqlite3.Connection, states: Iterable[str] | None = None) -> list[Row]:
+    """Every decision (or those in `states`), in source order."""
+    rows = [_decision_dict(r) for r in conn.execute("SELECT * FROM decisions ORDER BY ord, id")]
+    if states is None:
+        return rows
+    want = set(states)
+    return [r for r in rows if r["state"] in want]
+
+
+def _decision_fts_put(conn: sqlite3.Connection, d: Mapping[str, Any]) -> None:
+    conn.execute("DELETE FROM decisions_fts WHERE id = ?", (d["id"],))
+    conn.execute("INSERT INTO decisions_fts(id, title, keywords, summary, words, body) VALUES (?, ?, ?, ?, ?, ?)",
+                 (d["id"], d["title"], ", ".join(decision_keywords(d)), d.get("summary") or "",
+                  d.get("words") or "", d["body"]))
+
+
+def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) -> tuple[str, Row | None]:
+    """Insert or update one decision from the source (fields DECISION_FIELDS + id, keywords, ord),
+    leaving the task-manager's keyword changes alone. -> (outcome, the row before): 'added',
+    'changed' (the entry text differs), 'moved' (only its position/section), 'unchanged'."""
+    did = decision_id(e["id"])
+    if e["state"] not in DECISION_STATES:
+        raise ValueError(f"{did}: state must be one of {'|'.join(DECISION_STATES)}")
+    body = str(e["body"])
+    sha = sha256_text(body)
+    kw = json.dumps(list(e.get("keywords") or []), ensure_ascii=False)
+    cur = get_decision_entry(conn, did)
+    now = now_iso()
+    vals = [e.get(k) for k in DECISION_FIELDS]
+    if cur is None:
+        conn.execute(f"INSERT INTO decisions(id, {', '.join(DECISION_FIELDS)}, keywords, body_sha256, ord, "
+                     f"imported_at, updated_at, updated_by) VALUES ({', '.join('?' * (len(DECISION_FIELDS) + 7))})",
+                     [did, *vals, kw, sha, int(e["ord"]), now, now, by])
+        outcome = "added"
+    elif cur["body_sha256"] != sha or cur["keywords"] != list(e.get("keywords") or []):
+        conn.execute(f"UPDATE decisions SET {', '.join(k + ' = ?' for k in DECISION_FIELDS)}, keywords = ?, "
+                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+                     [*vals, kw, sha, int(e["ord"]), now, now, by, did])
+        outcome = "changed"
+    elif cur["ord"] != int(e["ord"]) or cur["section"] != e.get("section"):
+        conn.execute("UPDATE decisions SET ord = ?, section = ? WHERE id = ?", (int(e["ord"]), e.get("section"), did))
+        return "moved", cur
+    else:
+        return "unchanged", cur
+    if has_decisions_fts(conn):
+        new = get_decision_entry(conn, did)
+        assert new is not None
+        _decision_fts_put(conn, new)
+    return outcome, cur
+
+
+def delete_decision_entry(conn: sqlite3.Connection, decision: object) -> Row:
+    """Remove a decision that left the source. -> the row as it was."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    conn.execute("DELETE FROM decisions WHERE id = ?", (cur["id"],))
+    if has_decisions_fts(conn):
+        conn.execute("DELETE FROM decisions_fts WHERE id = ?", (cur["id"],))
+    return cur
+
+
+def set_decision_keywords(conn: sqlite3.Connection, decision: object, added: Sequence[str],
+                          removed: Sequence[str], by: str) -> Row:
+    """Store the task-manager's keyword changes of one decision. -> the row after."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    conn.execute("UPDATE decisions SET keywords_added = ?, keywords_removed = ?, updated_at = ?, updated_by = ? "
+                 "WHERE id = ?", (json.dumps(list(added), ensure_ascii=False),
+                                  json.dumps(sorted({k.lower() for k in removed}), ensure_ascii=False),
+                                  now_iso(), by, cur["id"]))
+    after = get_decision_entry(conn, cur["id"])
+    assert after is not None
+    if has_decisions_fts(conn):
+        _decision_fts_put(conn, after)
+    return after
+
+
+def _kw_forms(s: str) -> set[str]:
+    """'Night-Windows' -> {'night windows', 'night window'}: lower case, - and _ as spaces, and
+    without a plural s on the last word."""
+    words = [w for w in re.split(r"[-_\s]+", s.lower()) if w]
+    if not words:
+        return set()
+    out = {" ".join(words)}
+    if len(words[-1]) > 3 and words[-1].endswith("s"):
+        out.add(" ".join(words[:-1] + [words[-1][:-1]]))
+    return out
+
+
+def _kw_match(term: str, keyword: str) -> bool:
+    """A term matches a keyword when it is the keyword or a whole-word part of it (forms as _kw_forms)."""
+    for t in _kw_forms(term):
+        for k in _kw_forms(keyword):
+            if t == k or f" {t} " in f" {k} ":
+                return True
+    return False
+
+
+def find_decision_entries(conn: sqlite3.Connection, terms: Sequence[str],
+                          states: Iterable[str] | None = None) -> list[Row]:
+    """The decisions matching any of `terms`, best first: those with a matching keyword (most
+    matched terms first), then those whose text matches (FTS5 rank when the index exists, else
+    LIKE, most matched terms first). Each row gets "match" ('keyword' | 'text') and "matched"
+    (the terms that hit its keywords, for a keyword match)."""
+    terms = [" ".join(str(t).split()) for t in terms if str(t).strip()]
+    if not terms:
+        raise ValueError("find needs at least one keyword")
+    rows = list_decision_entries(conn, states)
+    text_rank: dict[str, float] = {}
+    if has_decisions_fts(conn):
+        q = " OR ".join('"' + t.replace('"', " ") + '"' for t in terms)
+        for i, (did,) in enumerate(conn.execute(
+                "SELECT id FROM decisions_fts WHERE decisions_fts MATCH ? ORDER BY bm25(decisions_fts)", (q,))):
+            text_rank.setdefault(did, float(i))
+    else:
+        for r in rows:
+            hay = " ".join(str(r.get(k) or "") for k in ("title", "summary", "words", "body")).lower()
+            hay += " " + " ".join(r["effective_keywords"]).lower()
+            n = sum(1 for t in terms if t.lower() in hay)
+            if n:
+                text_rank[r["id"]] = -n + r["ord"] / 1e6
+    hits: list[tuple[tuple[float, ...], Row]] = []
+    for r in rows:
+        matched = [t for t in terms if any(_kw_match(t, k) for k in r["effective_keywords"])]
+        rank = text_rank.get(r["id"])
+        if matched:
+            hits.append(((0, -len(matched), rank if rank is not None else 1e9, r["ord"]),
+                         dict(r, match="keyword", matched=matched)))
+        elif rank is not None:
+            hits.append(((1, 0, rank, r["ord"]), dict(r, match="text", matched=[])))
+    hits.sort(key=lambda h: h[0])
+    return [h[1] for h in hits]
 
 
 # ---------------------------------------------------------------- the DB error path (§7.8, D-171)
