@@ -1,11 +1,12 @@
 # Prompts
 
-Every prompt AFClaude sends lives here, so the dashboard can show and edit them later. These files are the defaults.
+Every prompt AFClaude sends lives here, so the dashboard can show and edit them later. These files are the defaults. `prompts.py` is their registry (phase 4a): each file's variables (system ones the sender fills, per-project ones a project's values fill, D-197) and its senders; every sender loads them through it, and `test_prompts.py` keeps the registry, the files and this table in step.
 
 | file | used for | placeholders |
 |---|---|---|
 | `continue.md` | continue message for a resumed AFClaude session: the task-manager at a session-window start or last-stretch slot start (keepalive.py), an approved stalled session in the AFClaude repo (dispatcher.py) | `{reason}`, `{progress}` |
 | `fillup.md` | the fill-up run (D-212): continue message for the task-manager shortly before the session reset of a session window whose run stopped early (keepalive.py fillup_pass) | `{reason}`, `{progress}`, `{remaining}`, `{reset}` |
+| `last_mile.md` | the continue message of a last-stretch slot start (keepalive.py, the slots before the weekly reset): the remaining weekly quota would expire unused | `{reason}`, `{progress}` |
 | `run_pace.md` | D-274/D-275: inserted after the continue of every start (session-window start, planned or postponed start, last-stretch slot, fill-up; keepalive.run_pace_text): pace the work to fill the session window and finish only within its last hour | `{end}`, `{last_hour}` |
 | `run_chain.md` | D-274: follows `run_pace.md` when the next start comes right at this run's end (fillup.chained): keep going about an hour into the next session window once its continue arrives, so the prompt cache stays warm | `{next}`, `{until}` |
 | `session_end_save.md` | the save prompt right before a compaction (D-144/D-233/D-238, design §5.5): typed into the task-manager when the watcher compacts it (a run ended, or 50 min idle), before the `/compact` (keepalive.py save_before_compaction); the keep-alive waits for the new hand-off in the DB | `{why}` (keepalive.TRIGGER_TEXT), `{session}`, `{tasks}` |

@@ -70,7 +70,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 ## 5. Steps
 
 **P1: registry, project variables, migrate step (built on `phase4`).**
-- **Build:** `prompts.py` (§3.1; mypy --strict); `prompt_vars` + store functions; `prompt_var.set/reset/migrate`; CLI `prompts.py list|show|render|vars|set-var|reset-var|migrate`; the four loaders call `prompts.default` (`keepalive.load_prompt`, `nightly_tasks._prompt`, `actions.prompt_default`, `usage_sampler.HAIKU_PROMPT`). No template uses a project variable yet; the entrypoint does not run `migrate` yet.
+- **Build:** `prompts.py` (§3.1; mypy --strict); `prompt_vars` + store functions; `prompt_var.set/reset/migrate`; CLI `prompts.py list|show|render|vars|set-var|reset-var|migrate`; the four loaders call `prompts.default` (`keepalive.load_prompt`, `nightly_tasks._prompt`, `inbox.prompt`, `usage_sampler.HAIKU_PROMPT`). No template uses a project variable yet; the entrypoint does not run `migrate` yet.
 - **Tests:** the registry against the files; strict render; the actions (validation, audit, owner-only for autonomous MCP, version); migrate twice (second a no-op, a set value kept); a before/after test that renders every prompt kind and every sender path (session messages with every flag, hook parts, compaction texts, run pacing, inbox texts, nightly briefs, usage review one-offs, Haiku prompts) through a frozen copy of the old loaders and through the new code, byte-identical.
 - **Done when:** suites, `test_typing`, `test_mcp_server`, `check_public` green. Deploy: imports only (no restart needed beyond the usual).
 - **Risk:** a sender that builds a prompt outside these paths. The test enumerates the call sites by `grep`; any new one fails it.

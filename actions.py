@@ -57,7 +57,6 @@ import json
 import os
 import re
 import sqlite3
-import string
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping
@@ -72,6 +71,7 @@ import afclaude_config  # noqa: E402
 import schedule  # noqa: E402
 import manager_launch  # noqa: E402
 import remote_control  # noqa: E402
+import prompts  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
@@ -1059,13 +1059,7 @@ def prompt_default(name: object) -> str:
         raise store.NotFound(f"no prompt {name}") from None
 
 
-def placeholders(text: str) -> set[str] | None:
-    """The {placeholder} names of a str.format template; None if it isn't one (unbalanced braces)."""
-    try:
-        return {f.split(".")[0].split("[")[0]
-                for _literal, f, _spec, _conv in string.Formatter().parse(text) if f is not None}
-    except ValueError:
-        return None
+placeholders = prompts.placeholders     # the {placeholder} names of a template (None: unbalanced braces)
 
 
 def check_prompt(name: object, body: object) -> str:
@@ -1090,7 +1084,7 @@ def check_prompt(name: object, body: object) -> str:
 
 
 def prompt_text(conn: sqlite3.Connection, name: str) -> str:
-    """What a sender should use: the override if there is one, else the file (phase 3 wires it in)."""
+    """What a sender should use: the override if there is one, else the file (phase 4a P4 wires it in)."""
     o = store.get_prompt_override(conn, name)
     if o and o["body"] is not None:
         body: str = o["body"]
@@ -1211,6 +1205,56 @@ def prompt_defaults_sync(conn: sqlite3.Connection, ctx: Ctx) -> Result:
         store.mark_override_base_outdated(conn, o["name"], outdated)
     after = {"changed": changed, "total_files": len(files), "code_version": code_version}
     return Result(after, "prompt_defaults", None, after, changed=bool(changed))
+
+
+# ---------------------------------------------------------------- project prompt variables (D-197)
+# Prompts are system-wide (D-193); a project only fills the variables prompts.PROJECT_VARS declares
+# (prompts.py, phase 4a P1). Owner-only for now: D-197 gives them to the project's managers and
+# editors, which the roles of phase 5a bring; an autonomous session never sets them.
+
+def _prompt_var_audit(project: store.Row, row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    return None if row is None else {"project": project["name"], "name": row["name"], "value": row["value"]}
+
+
+@action("prompt_var.set", "prompt_var", owner_only=True)
+def prompt_var_set(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, value: Any,
+                   version: Any = None) -> Result:
+    prompts.check_var(name, value)
+    p = store._project_row(conn, project)
+    row = store.get_prompt_var(conn, p["id"], name)
+    _check_version(row, version, f"prompt variable {name} of {p['name']}")
+    target = f"{p['id']}:{name}"
+    if row is not None and row["value"] == value:
+        return Result(row, target, None, None, changed=False)
+    after = store.put_prompt_var(conn, p["id"], name, value, ctx.actor)
+    return Result(after, target, _prompt_var_audit(p, row), _prompt_var_audit(p, after))
+
+
+@action("prompt_var.reset", "prompt_var", owner_only=True)
+def prompt_var_reset(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, version: Any = None) -> Result:
+    """Back to the variable's declared default (value NULL; the row and its version stay)."""
+    prompts.check_var(name)
+    p = store._project_row(conn, project)
+    row = store.get_prompt_var(conn, p["id"], name)
+    _check_version(row, version, f"prompt variable {name} of {p['name']}")
+    target = f"{p['id']}:{name}"
+    if row is None or row["value"] is None:
+        return Result(row, target, None, None, changed=False)
+    after = store.put_prompt_var(conn, p["id"], name, None, ctx.actor)
+    return Result(after, target, _prompt_var_audit(p, row), _prompt_var_audit(p, after))
+
+
+@action("prompt_var.migrate", "prompt_var", owner_only=True)
+def prompt_var_migrate(conn: sqlite3.Connection, ctx: Ctx) -> Result:
+    """The migrate step (prompts.py migrate): the seeds of the project at this checkout
+    (prompts.CHECKOUT_SEED), each only where that project never had a row for it, so a value
+    someone set or reset stays. Idempotent: a second run writes nothing (no audit row)."""
+    plan = prompts.migrate_plan(conn)
+    for w in plan:
+        prompts.check_var(w["name"], w["value"])
+        store.put_prompt_var(conn, w["project_id"], w["name"], w["value"], ctx.actor)
+    after = {"seeded": plan}
+    return Result(after, plan[0]["project_id"] if plan else None, None, after, changed=bool(plan))
 
 
 # ---------------------------------------------------------------- execution requests (§4.6)
