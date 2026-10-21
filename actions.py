@@ -860,10 +860,11 @@ SETTINGS: dict[str, Setting] = {
                               "it is killed and fails (D-234), unless the job sets its own", "automation"),
     # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
     # test_runner checks it), so an inner timeout, with its own clear error, always fires first
-    "runner_timeout_window_start": _num(70, 70, 720, "Runner: minutes a session-window start may take (its "
-                                        "waits for a compaction, the resume and its verification) before it "
-                                        "is killed and fails (D-234)", "automation"),
-    # at most 30 for now: keepalive.py --window-start acts only within CRON_STEP (30 min) of a start
+    "runner_timeout_window_start": _num(80, 80, 720, "Runner: minutes a session-window start may take (its "
+                                        "waits for a compaction, the resume and its verification, or the "
+                                        "window-start ping and its check) before it is killed and fails (D-234)",
+                                        "automation"),
+    # at most 30: a start missed by more than 30 min is an error, never started late (D-257)
     "runner_start_catchup": _num(30, 0, 30, "Runner: a session-window start the runner missed (down at that "
                                  "time) still runs when it is back within this many minutes; a later one is "
                                  "an error that pauses automation (missed start, D-257)", "automation"),
@@ -2649,7 +2650,7 @@ class StateComponent:
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions",
-                                                      "window_pings")),
+                                                      "window_pings", "window_starts")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),

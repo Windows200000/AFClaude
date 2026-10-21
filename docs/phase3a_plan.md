@@ -221,8 +221,8 @@ At boot, after taking the lock:
   - `RUNNER_OWNS` is empty; the jobs whose code exists today are defined (`stall_scan`, `sampler`, `dispatcher`, `quickview`, `docs_import`, `prune_logs`, `usage_review`, `window_start`), plus a new daily `prune_runs` (the `runner_runs` retention). The watcher passes, at-jobs and the inbox jobs come with S4, S6 and S7.
   - The watcher check at boot applies only once the runner owns a watcher pass (S6): in S2-S5 the watcher runs beside it by design.
   - A boot lifts a drain (the deploy that drained the old runner is done; the new one catches up). `runner.py undrain` lifts one by hand.
-  - `runner_start_catchup` is at most 30 min for now: `keepalive.py --window-start` itself acts only within `CRON_STEP` of a start (S5 can lift both).
-  - The window start's outer timeout (default 70 min) has the sum of its inner timeouts + 5 min as its lower bound (`runner_jobs.window_start_inner`, checked against keepalive's source by `test_runner`).
+  - `runner_start_catchup` is at most 30 min for now: `keepalive.py --window-start` itself acts only within `CRON_STEP` of a start (S5 can lift both; S5 lifted the `CRON_STEP` check for the runner's child and kept the 30 min, D-257).
+  - The window start's outer timeout (default 70 min; 80 min since S5, with the window-start ping) has the sum of its inner timeouts + 5 min as its lower bound (`runner_jobs.window_start_inner`, checked against keepalive's source by `test_runner`).
 
 **S2: the runner live, owning only new jobs.**
 - **Build:**
@@ -286,6 +286,16 @@ At boot, after taking the lock:
   - the decision lines (`FIRE`/`HOLD`/`POSTPONE`) are of the same kind as cron's;
   - a DST test at the runner level (the DST transition gives the next start).
 - **Risk:** the postponed path still runs in the watcher during this step. That is fine: it is the same split as today.
+- **As built:**
+  - Built on main's `keepalive.window_start_pass` as it is (main merged into the branch first): the run timing (D-274/D-275: a start whose gate passed is planned late in its window, or chained at once, `run_start_factor`) and the window-start ping (D-277/D-280: a start whose run begins later or is held pings Claude while no session window is open; a failed ping is only logged) are unchanged and run inside the runner's child. The planned late start and a postponed one are still fired by the watcher (`keepalive.deferred`), as the risk above says.
+  - `RUNNER_OWNS` + `window_start`; the */30 `--window-start` line is gone from `docker/crontab`; `docker/crontab.legacy` keeps it. The job row's `next_due` is `schedule.next_session_start`, so the loop wakes at the start and starts it at its second (`Due.at` = the start).
+  - **The child:** `runner_jobs.py window_start --key K` runs the legacy line's command plus `--start-key K` (a handler argument `{key}`). `keepalive.py --window-start --start-key K` (new `window_start_cli`) checks that K is still the current session-window start (else `SystemExit`: the runner reports it, alert + pause) and does not apply cron's 30-min slot check (the runner owns the timing and the catch-up, so a start caught up at 29:59 is not dropped silently by a child that starts a second later).
+  - **One decision per start, shared with the legacy line:** whoever comes first (the runner's child or cron's `--window-start`) claims the start's key in the keepalive state's new split part `window_starts` (`{at, by}`, the last 60 kept) before `window_start_pass`; a later caller for the same start only logs "decided already". The runner's `_settled` reads these claims too, so after a rollback to `legacy` and back the starts cron decided (also a HOLD, which leaves no `handled` key) are not "missed starts" (D-257). `--now` never claims.
+  - **Catch-up:** `runner_start_catchup` stays at most 30 min (a start missed by more is an alert + pause and never started late, D-257); the S1 boot logic is unchanged.
+  - **Timeout:** the ping adds its request (`WINDOW_PING_TIMEOUT`, 2 min), its wait (`WINDOW_PING_VERIFY_AFTER`, 90 s) and a second usage refresh to the inner waits; both paths are summed (79 min), so `runner_timeout_window_start` is now 80 min (default and lower bound; was 70).
+  - **Check:** the shadow is empty since S5 (no cron job with a runner counterpart is left). `runner.py window-report [--hours 48]` replaces it for the "Done when": each session-window start in the range needs its `window_start` run started within 2 s and ended `ok`, and the keep-alive's `window-start: FIRE|HOLD|POSTPONE…` decision line within 10 min; a decision line at no start is a mismatch. Exit 1 on any mismatch.
+  - **Tests:** the DST nights at the runner level (25.10.2026 fall back: 23:00 CEST, then 03:00 CET, then 23:00 CET; 29.03.2026 spring forward: 23:00 CET, then 05:00 CEST, then 23:00 CEST), the wake and the start at its second, the legacy line vs the handler, a start decided in `legacy` neither run nor missed, the claim in both orders, a stale key, the catch-up not cut by the cron slot, the report.
+  - **Deploys:** from S5 on, a restart during a start is an alert + pause (D-257): every deploy runs `runner.py drain` first and is not done within 30 min of a session-window start.
 
 **S6: the watcher passes.**
 - **Build:**

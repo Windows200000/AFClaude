@@ -7,6 +7,7 @@
                                           waits until none is running (exit 0), else exit 1
     python3 runner.py undrain             lift a drain (a deploy that did not happen)
     python3 runner.py wake                re-read the DB now (what the senders do after a write)
+    python3 runner.py window-report [--hours H]   S5: each session-window start vs its run and decision
 
 One asyncio loop: read the due times, wait for the earliest of them, a wake datagram
 (data/run/runner.sock) or a child's exit, start what is due, repeat; a 60-s longest sleep is the
@@ -45,8 +46,18 @@ Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) move
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
 (stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
-docs_import, prune_logs, usage_review). S4: the at-jobs; cron still runs the window start, the
-watcher watchdog and the inbox API watchdog.
+docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts; cron still
+runs the watcher watchdog and the inbox API watchdog.
+
+Window starts (S5, the job "window_start"): a keyed run at each session-window start, to the second
+(schedule.next_session_start is the job row's next_due; key schedule.start_key), as
+`keepalive.py --window-start --start-key KEY` (keepalive's window_start_pass unchanged: its run
+timing, D-274/D-275, and its window-start ping, D-277/D-280). A start is settled by its run row or
+by the keep-alive's own records (handled, a postponed start, its "window_starts" claim, which cron's
+legacy line writes too), so neither the runner nor a legacy rollback decides one start twice. A
+start the runner was not up for runs late only within runner_start_catchup (30 min); later it is a
+missed start (alert + pause, D-257), never started late. `runner.py window-report` checks the
+starts of the last nights against the runner's runs and the keep-alive's decision lines.
 
 At-jobs (S4, the job "at"): every pending scheduled_jobs row (stored by `at -t`, which then wakes
 the runner) is a keyed run `at <id>` at its run_at: its run claims the job in its own begin
@@ -62,7 +73,9 @@ Shadow (S2-S7, §5 S2): for every job cron still runs, the runner logs when it W
 (data/runner_shadow.log, component runner_shadow), waking at that time as it would for its own
 job; `runner.py shadow-report` compares those lines with cron's actual starts (supercronic's
 lines, which the entrypoint copies to data/cron_runs.log) and, for the window starts, with the
-keep-alive's decision lines.
+keep-alive's decision lines. Since S5 no job with a runner counterpart is left in docker/crontab
+(the watcher and inbox API watchdogs have none), so the shadow is empty; window-report replaces it
+for the window starts.
 
 Until S8 supercronic is the container's main schedule and this runner runs beside it:
     python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
@@ -200,7 +213,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),
     Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
     Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
-    Job("window_start", 70, window_start=True, paused="handler", on_interrupt="fail", session=True,
+    Job("window_start", 80, window_start=True, paused="handler", on_interrupt="fail", session=True,
         cron_tag="AFClaude window-start"),
     # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
     Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail", cron_tag="AFClaude at-shim",
@@ -210,9 +223,10 @@ JOBS: dict[str, Job] = {j.name: j for j in (
 # here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
 # stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
 # cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them). S4: the
-# at-jobs (the */1 `at --run-due` line is gone; legacy keeps it).
+# at-jobs (the */1 `at --run-due` line is gone; legacy keeps it). S5: the session-window starts (the
+# */30 `--window-start` line is gone; legacy keeps it).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
-                                         "docs_import", "prune_logs", "usage_review", "at"})
+                                         "docs_import", "prune_logs", "usage_review", "at", "window_start"})
 
 
 # ---------------------------------------------------------------- paths, log, small helpers
@@ -613,13 +627,15 @@ class Runner:
 
     def _settled(self, job: Job, key: str) -> bool:
         """The keyed run (job, key) was decided already: a run row (for a job that never reruns an
-        interrupted run, also an interrupted one), or the keep-alive's own dedup (handled, or a
-        postponed start) for a window start (the runner and a legacy rollback share it)."""
+        interrupted run, also an interrupted one), or the keep-alive's own dedup for a window start
+        (handled, its "window_starts" claim, a postponed start; the runner and a legacy rollback
+        share it)."""
         rows = store.key_runs(self.conn, job.name, key)
         if any(job.on_interrupt == "fail" or r["status"] != "interrupted" for r in rows):
             return True
         if job.window_start:
-            if actions._state_json(["handled", key]) in store.state_rows(self.conn, "keepalive"):
+            ka = store.state_rows(self.conn, "keepalive")
+            if actions._state_json(["handled", key]) in ka or actions._state_json(["window_starts", key]) in ka:
                 return True
             if actions._state_json([key]) in store.state_rows(self.conn, "keepalive.deferred"):
                 return True
@@ -1359,6 +1375,52 @@ def shadow_report(shadow: list[ShadowEntry], cron: list[tuple[str, datetime]], d
     return out, len(bad)
 
 
+def window_report(starts: list[tuple[datetime, str]], runs: list[store.Row], decisions: list[tuple[datetime, str]],
+                  *, since: datetime, until: datetime, tolerance: float = SHADOW_TOLERANCE) -> tuple[list[str], int]:
+    """S5's check (docs/phase3a_plan.md §5 S5, "Done when"): every session-window start between
+    since and until (`starts`: (time, schedule.start_key)) has the runner's window_start run under
+    its key, started within `tolerance` of the start (to the second) and ended ok, and the
+    keep-alive's decision line (FIRE / HOLD / POSTPONE ..., the kind cron's runs logged) within
+    DECISION_WINDOW after it; a decision line at no start is a mismatch too. -> (report lines,
+    number of mismatches)."""
+    tol = timedelta(seconds=tolerance)
+    st = [(t, k) for t, k in starts if since <= t <= until]
+    by_key = {str(r["key"]): r for r in runs if r.get("key")}
+    out = [f"window starts vs the runner's runs, {_iso(since)} .. {_iso(until)} (tolerance {tolerance:g} s)"]
+    bad: list[str] = []
+    for t, key in st:
+        r = by_key.get(key)
+        d = next((w for x, w in decisions if t <= x <= t + DECISION_WINDOW), None)
+        began = _parse_text(r["started_at"]) if r else None
+        lag = f"{(began - t).total_seconds():+.3f} s" if began else "-"
+        out.append(f"  {_hm_berlin(t)} {key:<34} run {r['id'] if r else '-'} {r['status'] if r else 'none':<11} "
+                   f"start {lag:>10}  decision {d or 'none'}")
+        if r is None:
+            bad.append(f"MISMATCH {key}: no window_start run for the start at {_iso(t)}")
+            continue
+        if r["status"] == "skipped":
+            bad.append(f"MISMATCH {key}: not started ({r['error'] or 'skipped'})")
+            continue
+        if began is None or abs(began - t) > tol:
+            bad.append(f"MISMATCH {key}: started {lag} from its start {_iso(t)} (more than {tolerance:g} s)")
+        if r["status"] != "ok":
+            bad.append(f"MISMATCH {key}: its run {r['id']} ended {r['status']}")
+        if d is None:
+            bad.append(f"MISMATCH {key}: the keep-alive logged no window-start decision within {DECISION_WINDOW}")
+    for x, w in decisions:
+        if since <= x <= until and not any(t <= x <= t + DECISION_WINDOW for t, _ in st):
+            bad.append(f"MISMATCH: the keep-alive decided {w} at {_iso(x)}, at no session-window start")
+    out.extend(bad[:50])
+    if len(bad) > 50:
+        out.append(f"... and {len(bad) - 50} more")
+    out.append(f"{len(bad)} mismatch(es)" if bad else f"OK: {len(st)} start(s), each run at its second and decided")
+    return out, len(bad)
+
+
+def _hm_berlin(t: datetime) -> str:
+    return t.astimezone(BERLIN).strftime("%a %d.%m. %H:%M %Z")
+
+
 def _read_lines(path: str) -> list[str]:
     if path == "-":
         return sys.stdin.read().splitlines()
@@ -1399,6 +1461,23 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
         os.close(fd)
 
 
+def _window_report_cli(conn: Any, args: argparse.Namespace) -> int:
+    until = _utcnow()
+    since = until - timedelta(hours=args.hours)
+    cfg = schedule.load()
+    starts = [(t, schedule.start_key(t, cfg)) for t, _ in schedule.session_slots(since - TINY, until, cfg)]
+    runs = [r for r in store.recent_runs(conn, 1000, "window_start")
+            if (_parse_text(r["started_at"]) or until) >= since - DECISION_WINDOW]
+    try:
+        decisions = parse_decisions(_read_lines(args.decisions_log or runner_jobs.log_path("window_start")))
+    except OSError as e:
+        print(f"window-report: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    lines, bad = window_report(starts, runs, decisions, since=since, until=until, tolerance=args.tolerance)
+    print("\n".join(lines))
+    return 1 if bad else 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="The AFClaude resident runner (phase 3a).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1419,6 +1498,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--shadow-log", default=None, help="the shadow lines (default data/runner_shadow.log)")
     r.add_argument("--decisions-log", default=None, help="the keep-alive's log (default data/keepalive/keepalive.log)")
     r.add_argument("--tolerance", type=float, default=SHADOW_TOLERANCE, help="seconds (default 2)")
+    w = sub.add_parser("window-report", help="S5: each session-window start against the runner's run and the "
+                                             "keep-alive's decision line (exit 1 on a mismatch)")
+    w.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
+    w.add_argument("--decisions-log", default=None, help="the keep-alive's log (default data/keepalive/keepalive.log)")
+    w.add_argument("--tolerance", type=float, default=SHADOW_TOLERANCE, help="seconds (default 2)")
     args = ap.parse_args(argv)
     if args.cmd == "serve":
         return serve()
@@ -1449,6 +1533,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1 if bad else 0
     conn = store.connect()
     try:
+        if args.cmd == "window-report":
+            return _window_report_cli(conn, args)
         if args.cmd == "status":
             st = status(conn)
             if args.json:

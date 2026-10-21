@@ -60,7 +60,8 @@ EXIT_USAGE = 2
 class Handler:
     """A job's existing code: `script` (in the repo) run with `args` as its cron line runs it.
     log: its log file under the data dir (the cron line's redirect); lock: its flock file under
-    the data dir, or None. "{session}" in args is $AFCLAUDE_MANAGER_SESSION (as in the crontab)."""
+    the data dir, or None. "{session}" in args is $AFCLAUDE_MANAGER_SESSION (as in the crontab),
+    "{key}" the run's key (a keyed run: the window start's schedule.start_key, S5)."""
     script: str
     args: tuple[str, ...]
     log: str
@@ -75,8 +76,10 @@ HANDLERS: dict[str, Handler] = {
     "docs_import": Handler("project_docs.py", ("import", "--cron"), "docs_import.log", ".docs_import.lock"),
     "prune_logs": Handler("store.py", ("prune-logs",), "prune_logs.log", ".prune_logs.lock"),
     "usage_review": Handler("usage_review.py", (), "keepalive/keepalive.log"),
-    "window_start": Handler("keepalive.py", ("--session", "{session}", "--window-start", "--arm", "--take-over-idle"),
-                            "keepalive/keepalive.log"),
+    # S5: the start the runner planned (--start-key: keepalive refuses it unless it is still the current
+    # one, and claims it in its "window_starts", the dedup it shares with cron's legacy line)
+    "window_start": Handler("keepalive.py", ("--session", "{session}", "--window-start", "--start-key", "{key}",
+                                             "--arm", "--take-over-idle"), "keepalive/keepalive.log"),
 }
 # Jobs whose code is a function here, not a script: name -> (log file, function -> note).
 FUNCTIONS: dict[str, tuple[str, Callable[[], str]]] = {}
@@ -111,13 +114,16 @@ FUNCTIONS["prune_runs"] = ("prune_logs.log", prune_runs)
 # keepalive.py --window-start, worst case: the usage refresh (/usage, the token-refresh request,
 # /usage again), the preflight (agents list, tmux checks), the owner-typing check, the wait for a
 # running compaction (COMPACT_LOCK_WAIT), the take-over of an idle holder (stop + TAKE_OVER_WAIT),
-# the resume and its verification (VERIFY_TIMEOUT). The host calls' timeouts are literals in
-# keepalive.py: (function, seconds of one call, calls); test_runner checks them against the source.
+# the resume and its verification (VERIFY_TIMEOUT); or, for a start that does not fire at once, the
+# window-start ping (D-277: its request, WINDOW_PING_TIMEOUT; the wait, WINDOW_PING_VERIFY_AFTER; a
+# second usage refresh). Both paths are summed (the safe side). The host calls' timeouts are literals
+# in keepalive.py: (function, seconds of one call, calls); test_runner checks them against the source.
 WINDOW_START_HOST_CALLS: tuple[tuple[str, int, int], ...] = (
-    ("refresh_usage", 120, 2), ("poke_auth", 180, 1), ("agent_entries", 60, 1), ("tmux_has", 30, 1),
+    ("refresh_usage", 120, 4), ("poke_auth", 180, 2), ("agent_entries", 60, 1), ("tmux_has", 30, 1),
     ("tmux_pids", 30, 1), ("owner_typing", 30, 2), ("fire", 60, 1), ("fire", 120, 1),
 )
-WINDOW_START_CONSTANTS = ("COMPACT_LOCK_WAIT", "VERIFY_TIMEOUT", "TAKE_OVER_WAIT")
+WINDOW_START_CONSTANTS = ("COMPACT_LOCK_WAIT", "VERIFY_TIMEOUT", "TAKE_OVER_WAIT", "WINDOW_PING_TIMEOUT",
+                          "WINDOW_PING_VERIFY_AFTER")
 OUTER_MARGIN = timedelta(minutes=5)
 
 
@@ -282,11 +288,14 @@ def _lock(name: str) -> Optional[int]:
     return fd
 
 
-def _argv(h: Handler) -> list[str]:
+def _argv(h: Handler, key: Optional[str] = None) -> list[str]:
     session = os.environ.get("AFCLAUDE_MANAGER_SESSION", "")
     if "{session}" in h.args and not session:
         raise RuntimeError("AFCLAUDE_MANAGER_SESSION is not set (the task-manager session the job acts on)")
-    return [os.path.join(HERE, h.script)] + [session if a == "{session}" else a for a in h.args]
+    if "{key}" in h.args and not key:
+        raise RuntimeError(f"{h.script}: this job needs --key (its run's key)")
+    subst = {"{session}": session, "{key}": key or ""}
+    return [os.path.join(HERE, h.script)] + [subst.get(a, a) for a in h.args]
 
 
 def run(job: str, key: Optional[str] = None) -> int:
@@ -318,7 +327,7 @@ def run(job: str, key: Optional[str] = None) -> int:
     note = ""
     try:
         if h is not None:
-            argv = _argv(h)
+            argv = _argv(h, key)
             saved = sys.argv
             sys.argv = argv
             try:

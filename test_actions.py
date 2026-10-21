@@ -583,7 +583,7 @@ class SettingActions(Base):
                           "runner_timeout_dispatcher": 20.0, "runner_timeout_quickview": 2.0,
                           "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
                           "runner_timeout_prune_runs": 10.0, "runner_timeout_usage_review": 30.0, "runner_timeout_at": 30.0,
-                          "runner_timeout_window_start": 70.0, "runner_start_catchup": 30.0,
+                          "runner_timeout_window_start": 80.0, "runner_start_catchup": 30.0,
                           "runner_runs_retention_days": 30.0, "restore_starts_paused": True,
                           "auth_idle_timeout_min": 30, "auth_absolute_lifetime_h": 12,
                           "auth_remember_device_days": 7, "auth_reauth_window_min": 10,

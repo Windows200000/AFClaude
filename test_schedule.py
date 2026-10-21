@@ -134,10 +134,11 @@ class DefaultWindow(unittest.TestCase):
 
 
 class CronFiring(unittest.TestCase):
-    """docker/crontab runs --window-start every 30 min; due_session_start acts once per start."""
+    """docker/crontab.legacy (the legacy mode; phase 3a S5 moved the starts to the runner) runs
+    --window-start every 30 min; due_session_start acts once per start."""
 
     def crontab_step(self):
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "crontab")) as fh:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "crontab.legacy")) as fh:
             line = next(x for x in fh if x.rstrip().endswith("# AFClaude window-start"))
         minute, hour = line.split()[:2]
         self.assertEqual((minute, hour), ("*/30", "*"))

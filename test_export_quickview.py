@@ -409,8 +409,10 @@ class ScheduleSection(unittest.TestCase):
         out = self.entries("on", "crontab")
         cron = [e for e in out if e["owner"] == "cron"]
         mine = {e.get("job"): e for e in out if e["owner"] == "runner"}
-        self.assertTrue(any("window-start" in e["what"] for e in cron))
+        self.assertTrue(any("watcher watchdog" in e["what"] for e in cron))
         self.assertFalse(any("usage sampler" in e["what"] for e in cron))   # S3: the runner's now
+        self.assertFalse(any("window-start" in e["what"] for e in cron))    # S5: the runner's now
+        self.assertEqual(mine["window_start"]["what"], "AFClaude window-start")
         self.assertEqual(set(mine) - {None}, set(runner.RUNNER_OWNS))
         self.assertIsNotNone(mine[None]["heartbeat_berlin"])
         s = mine["sampler"]

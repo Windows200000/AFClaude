@@ -8,15 +8,11 @@
 # dispatcher, the quickview export, the docs import, the log retention and the hourly usage review
 # (their lines are gone from here; runner.JOBS has their cadences, runner_jobs.HANDLERS their
 # commands, logs and flocks). S4: the at-jobs (scheduled_jobs, stored by `at -t`): the runner runs
-# each at its minute as a tracked child; the */1 `at --run-due` line is gone. docker/crontab.legacy
-# is this file as it was before S2 (the rollback mode AFCLAUDE_SCHEDULER=legacy, which keeps every
-# line, `at --run-due` among them).
-# WINDOW-START: every 30 min (the window starts are on the 30-min grid of window_days, D-030);
-# keepalive.py --window-start exits at once unless a session-window start of the configured
-# windows is due in this slot (schedule.due_session_start: start + k x session_hours in window_tz,
-# per weekday, also on the DST nights; D-148/D-202/D-203), and each start acts once (its dedup key,
-# schedule.start_key).
-*/30 * * * * cd $AFCLAUDE_DIR && python3 keepalive.py --session $AFCLAUDE_MANAGER_SESSION --window-start --arm --take-over-idle >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude window-start
+# each at its minute as a tracked child; the */1 `at --run-due` line is gone. S5: the session-window
+# starts (`keepalive.py --window-start --start-key`, to the second at each start); the */30
+# `--window-start` line is gone. docker/crontab.legacy is this file as it was before S2 (the
+# rollback mode AFCLAUDE_SCHEDULER=legacy, which keeps every line, `at --run-due` and the */30
+# window-start among them).
 7,22,37,52 * * * * [ -e $AFCLAUDE_DIR/PAUSED ] || $AFCLAUDE_DIR/docker/start_watcher.sh >/dev/null 2>>$KEEPALIVE_STATE_DIR/watchdog.log # AFClaude watcher watchdog (no-op if running)
 # INBOX API WATCHDOG: inbox_api.py serve (the message box to the task-manager, D-241) is started by the
 # entrypoint; this starts it again if it died, and alerts that it was not running.
