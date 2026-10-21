@@ -84,6 +84,7 @@ import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
 import manager_launch  # D-260: a project's task-manager model / effort
+import remote_control  # D-269: Remote Control per session category
 
 BERLIN = ZoneInfo("Europe/Berlin")
 UTC = timezone.utc
@@ -963,11 +964,13 @@ def launch_for(session_id, name=None, model=None):
     return {**LAUNCH, **({"name": name} if name else {}), **({"model": model} if model else {}), **project}
 
 
-def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
+def fire(session_id, cwd, message, plan, new=False, name=None, model=None, category=remote_control.TASK_MANAGER):
     """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg).
     name/model override LAUNCH's for this launch; a project's task-manager launch overrides both
-    (launch_for, D-260). It is resolved first, so a failure there changes nothing."""
+    (launch_for, D-260); `category` picks the Remote Control setting (D-269). Both are resolved
+    first, so a failure there changes nothing."""
     launch = launch_for(session_id, name, model)
+    remote = remote_control.launch_flags(category)
     if plan.startswith("take-over:"):
         pids = [int(x) for x in plan.split(":", 1)[1].split(",")]
         for pid in pids:
@@ -995,6 +998,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None):
             cmd += [f"--{k}", v]
     if new:
         cmd.append("--new")
+    cmd += remote
     r = host.run_on_host(cmd, env=SCRUBBED_ENV, timeout=120)
     return r.returncode, r.stdout, r.stderr
 

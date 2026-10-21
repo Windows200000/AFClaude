@@ -227,6 +227,24 @@ class Stalled(Base):
         self.assertEqual(len(self.resume_calls()), 1)
         self.assertTrue(any("already continued" in s for s in rep["skip"]))
 
+    def test_remote_control_follows_the_continue_setting(self):
+        """D-269: a continue uses the "continue" category's Remote Control setting, not another's."""
+        self.stalled_session(sid(1), prefix="x1")
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        for key in ("remote_control_task_manager", "remote_control_continue"):
+            self.addCleanup(testenv.set_setting, key, None)
+        testenv.set_setting("remote_control_task_manager", False)
+        self.run_pass()
+        self.assertNotIn("--no-remote-control", self.resume_calls()[0])
+        testenv.set_setting("remote_control_continue", False)
+        self.stalled_session(sid(2), prefix="x2")
+        self.scan()
+        store.decide_session(self.conn, sid(2), "continue")
+        self.run_pass()
+        self.assertEqual(self.resumed_sessions(), [sid(1), sid(2)])
+        self.assertIn("--no-remote-control", self.resume_calls()[1])
+
     def test_waits_for_the_reset_then_continues_any_time(self):
         """D-206: an approved stall continues right at its reset (+ grace) at any time of day."""
         self.stalled_session(sid(1))

@@ -8,7 +8,7 @@ is rejected. Every call is logged to data/host_exec.log.
 
 Allowed (exact shapes):
   ka_resume.sh --session <uuid> --message <text> [--cwd <dir under ROOT>] [--name <t>]
-               [--model <m>] [--effort low|medium|high|xhigh|max] [--new]
+               [--model <m>] [--effort low|medium|high|xhigh|max] [--new] [--no-remote-control]
   claude agents --json [--all]
   claude -p --no-session-persistence --permission-mode dontAsk /usage
   claude -p --model haiku <only the flags usage_sampler.py / notify.py use>   (prompt on stdin)
@@ -105,7 +105,7 @@ def check_ka_resume(args):
     seen = {}
     while i < len(args):
         a = args[i]
-        if a == "--new":
+        if a in ("--new", "--no-remote-control"):   # flags without a value (--no-remote-control: D-269)
             i += 1
             continue
         if a not in allowed or i + 1 >= len(args):
