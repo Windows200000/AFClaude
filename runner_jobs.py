@@ -5,9 +5,10 @@
 
 runner.py starts one of these per run, in its own process group, with a timeout. It runs the
 job's existing code the way its cron line does: the same script with the same arguments (runpy,
-so the script's own `__main__` error handling runs too), its stdout appended to the same log file,
-and the same `flock -n` lock where the cron line has one. On its ORIGINAL stdout (the runner's
-pipe) it prints one JSON result line: {"status": "ok"|"skipped", "next_due": ISO|null, "note": text}.
+so the script's own `__main__` error handling runs too) in the repo directory, its stdout appended
+to the same log file, and the same `flock -n` lock where the cron line has one. On its ORIGINAL
+stdout (the runner's pipe) it prints one JSON result line: {"status": "ok"|"skipped", "next_due":
+ISO|null, "note": text}.
 Its stderr stays the runner's pipe: the runner appends it to the job's log file (cron's 2>&1) and
 keeps the tail of a failed run in runner_runs.error.
 
@@ -19,8 +20,9 @@ Exit codes (runner.py records the run by them):
   other  failed without a report (a crash, a non-zero exit, an unknown job, a missing setting):
          the runner reports it (failstop.fail, D-234/D-235)
 
-The window start's inner timeouts (window_start_inner) are here too: the runner's outer timeout
-for it must exceed their sum (actions.SETTINGS runner_timeout_window_start; test_runner).
+The window start's inner timeouts (window_start_inner) and the ticks' (tick_inner, S3) are here
+too: the runner's outer timeout for each must exceed their sum (actions.SETTINGS runner_timeout_*;
+test_runner), so a slow run within its own limits is never killed by the runner.
 """
 from __future__ import annotations
 
@@ -126,6 +128,54 @@ def window_start_min_timeout() -> timedelta:
     return sum(window_start_inner().values(), timedelta(0)) + OUTER_MARGIN
 
 
+# ---- the ticks' inner timeouts (S3: a tick's outer timeout is above their sum + TICK_MARGIN)
+#
+# One run's worst case, every host call hitting its own timeout: (module, function, seconds of one
+# call, calls), plus the module constants it waits for. test_runner checks each (module, function,
+# seconds) against a literal `timeout=` in that function's source, and each tick's default timeout
+# (runner.JOBS, actions.SETTINGS) against the sum. The jobs not listed (docs_import, prune_logs,
+# prune_runs, stall_scan) only read and write the DB.
+TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
+    # the usage refresh with its one token-refresh retry (keepalive.refresh_usage_checked), the usage
+    # cache, `claude agents`, the hourly Haiku judgements (budgeted for two active sessions)
+    "sampler": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
+                ("host", "usage_cache", 30, 1), ("usage_sampler", "agents_snapshot", 60, 1),
+                ("usage_sampler", "haiku_judgement", 180, 2)),
+    # one approved stalled continue (usage refresh, preflight, resume) and one tmux clean-up
+    "dispatcher": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
+                   ("keepalive", "agent_entries", 60, 1), ("keepalive", "tmux_alive", 30, 1),
+                   ("keepalive", "tmux_pids", 30, 1), ("host", "proc_snapshot", 30, 1),
+                   ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
+                   ("dispatcher", "tmux_alive", 30, 1), ("dispatcher", "kill_tmux", 30, 1)),
+    # the usage refresh and one review start (the resume), after its lock wait (TICK_CONSTANTS)
+    "usage_review": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
+                     ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
+                     ("keepalive", "tmux_alive", 30, 1)),
+    "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_alive", 30, 1)),
+}
+TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
+}
+TICK_MARGIN = timedelta(minutes=1)
+
+
+def tick_inner(job: str) -> dict[str, timedelta]:
+    """{what: worst-case time} of one run of the tick `job` (TICK_HOST_CALLS, TICK_CONSTANTS)."""
+    out: dict[str, timedelta] = {}
+    for mod, name in TICK_CONSTANTS.get(job, ()):
+        v = getattr(importlib.import_module(mod), name)
+        out[f"{mod}.{name}"] = v if isinstance(v, timedelta) else timedelta(seconds=float(v))
+    for mod, fn, secs, calls in TICK_HOST_CALLS.get(job, ()):
+        k = f"{mod}.{fn}"
+        out[k] = out.get(k, timedelta(0)) + timedelta(seconds=secs * calls)
+    return out
+
+
+def tick_min_timeout(job: str) -> timedelta:
+    """The least outer timeout of the tick `job`: its inner timeouts + TICK_MARGIN."""
+    return sum(tick_inner(job).values(), timedelta(0)) + TICK_MARGIN
+
+
 # ---- running one job
 
 class _Reports:
@@ -189,6 +239,7 @@ def run(job: str, key: Optional[str] = None) -> int:
     if job not in HANDLERS and job not in FUNCTIONS:
         print(f"runner_jobs: unknown job {job!r}", file=sys.stderr)
         return EXIT_USAGE
+    os.chdir(HERE)          # the cron lines' `cd $AFCLAUDE_DIR`
     out = _redirect_stdout(log_path(job))
     h = HANDLERS.get(job)
     if h is not None and h.lock is not None and _lock(h.lock) is None:

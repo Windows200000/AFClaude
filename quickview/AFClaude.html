@@ -220,7 +220,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   </section>
 
   <section>
-    <h2>Scheduled (cron, tagged AFClaude)</h2>
+    <h2>Scheduled (runner and cron, tagged AFClaude)</h2>
     <div id="cron"></div>
   </section>
 
@@ -789,8 +789,19 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
 
   function renderCron(s) {
     $("cron").innerHTML = (s.cron || []).map(function (c) {
-      return '<div class="sess"><code>' + esc(c.schedule_berlin || c.schedule_utc) + "</code> " + esc(c.what) + "</div>";
-    }).join("") || '<p class="mut">No AFClaude cron entries.</p>';
+      var who = '<span class="mut">' + esc(c.owner || "cron") + "</span> ";
+      if (c.error) return '<div class="sess">' + who + esc(c.what) + ': <span class="bad">' + esc(c.error) + "</span></div>";
+      if (c.owner === "runner" && !c.job) {   // the runner itself: its loop heartbeat
+        return '<div class="sess">' + who + esc(c.what) + ' <span class="mut">heartbeat ' +
+          esc(c.heartbeat_berlin || "never") + (c.heartbeat_age_s != null ? " (" + esc(c.heartbeat_age_s) + " s ago)" : "") + "</span></div>";
+      }
+      var extra = "";
+      if (c.owner === "runner") {
+        extra = ' <span class="mut">next ' + esc(c.next_due_berlin || "–") + ", last " + esc(c.last_status || "–") +
+          (c.consecutive_failures ? ' <span class="bad">(' + esc(c.consecutive_failures) + " failed in a row)</span>" : "") + "</span>";
+      }
+      return '<div class="sess">' + who + "<code>" + esc(c.schedule_berlin || c.schedule_utc) + "</code> " + esc(c.what) + extra + "</div>";
+    }).join("") || '<p class="mut">No AFClaude schedule entries.</p>';
   }
 
   function docList(el, list, titleKey) {
