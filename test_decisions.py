@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from datetime import datetime, timezone
+from unittest import mock
 import unittest
 
 import testenv  # noqa: F401  (hermetic DB/config; before any AFClaude module)
@@ -139,8 +141,28 @@ class Parse(unittest.TestCase):
         for status, state in (("active", "active"), ("active (to build)", "active"), (None, "active"),
                               ("pending clarification", "active"), ("superseded by D-3", "superseded"),
                               ("partially superseded by D-9", "partial"), ("done/expired", "done"),
-                              ("Done (2026-10-01)", "done")):
+                              ("Done (2026-10-01)", "done"), ("expired (one-off, D-278)", "done"),
+                              ("Expired", "done"),
+                              ("active; one-off part expired: \"go now\" (D-278)", "active"),
+                              ("active until the next review", "active")):         # no date: plain active
             self.assertEqual(dec.state_of(status), state, status)
+
+    def test_active_until(self):
+        # D-278: a pending one-off is current until its date (Berlin time), then counts as done.
+        st = "active until 2026-10-22 19:00 (one-off, D-278)"
+        before = datetime(2026, 10, 22, 18, 59, tzinfo=dec.BERLIN)
+        at = datetime(2026, 10, 22, 19, 0, tzinfo=dec.BERLIN)
+        self.assertEqual(dec.state_of(st, now=before), "active")
+        self.assertEqual(dec.state_of(st, now=at), "done")
+        self.assertEqual(dec.state_of(st, now=datetime(2026, 10, 22, 17, 0, tzinfo=timezone.utc)), "done")  # = 19:00 CEST
+        day = "Active until 2026-10-22"                                             # a date alone: to its end
+        self.assertEqual(dec.state_of(day, now=datetime(2026, 10, 22, 23, 59, tzinfo=dec.BERLIN)), "active")
+        self.assertEqual(dec.state_of(day, now=datetime(2026, 10, 23, 0, 0, tzinfo=dec.BERLIN)), "done")
+        self.assertEqual(dec.state_of("active until 2999-01-01"), "active")         # default now: the clock
+        self.assertEqual(dec.state_of("active until 2001-01-01"), "done")
+        for bad in ("active until 2026-13-01", "active until 2026-10-22 25:00", "active until 22.10.2026"):
+            with self.assertRaisesRegex(dec.SourceError, "needs a valid date"):
+                dec.state_of(bad)
 
     def test_title_marker_only_when_no_status_line(self):
         # M-003-like: no Status line, but the title names its own fate (D-242 follow-up).
@@ -388,6 +410,59 @@ class Find(Env):
 
 
 class Tldr(Env):
+    def test_expired_and_lapsed_one_offs_are_not_current(self):
+        # D-278: an expired one-off and an "active until" whose date passed drop out of the TLDR;
+        # one still before its date stays.
+        self.write(SOURCE + textwrap.dedent('''
+            ### D-005 Go now
+            - **Type:** owner · **Status:** expired (one-off, D-278)
+
+            ### D-006 Use up the week before the reset
+            - **Type:** owner · **Status:** active until 2001-01-01 19:00 (one-off, D-278)
+
+            ### D-007 Use up the next week too
+            - **Type:** owner · **Status:** active until 2999-01-01 19:00 (one-off, D-278)
+            '''))
+        self.imp()
+        c = self.conn()
+        try:
+            ids = [ln.split(" ", 1)[0] for ln in dec.tldr_lines(c)]
+            self.assertEqual(store.get_decision_entry(c, "D-005")["state"], "done")
+            self.assertEqual(store.get_decision_entry(c, "D-006")["state"], "done")
+        finally:
+            c.close()
+        self.assertEqual(ids, ["D-001", "D-003", "M-001", "D-007"])
+
+    def test_lapsed_until_is_restated_on_the_next_import(self):
+        # The stored state follows the clock at the next import (cron every 10 min, session start).
+        self.write(SOURCE + "\n### D-005 Until the reset\n- **Status:** active until 2026-10-22 19:00\n")
+        clock = [datetime(2026, 10, 22, 18, 0, tzinfo=dec.BERLIN)]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0].astimezone(tz)
+        with mock.patch.object(dec, "datetime", Clock):
+            self.imp()
+            c = self.conn()
+            try:
+                self.assertEqual(store.get_decision_entry(c, "D-005")["state"], "active")
+            finally:
+                c.close()
+            clock[0] = datetime(2026, 10, 22, 19, 5, tzinfo=dec.BERLIN)
+            r = self.imp()
+        self.assertEqual(r["restated"], {"D-005": ["state"]})
+        c = self.conn()
+        try:
+            self.assertEqual(store.get_decision_entry(c, "D-005")["state"], "done")
+        finally:
+            c.close()
+
+    def test_bad_until_date_fails_the_import(self):
+        self.write(SOURCE + "\n### D-005 Typo\n- **Status:** active until 2026-10-32\n")
+        with self.assertRaisesRegex(dec.SourceError, "D-005: Status .*needs a valid date"):
+            self.imp()
+
     def test_lines_and_parts(self):
         self.imp()
         c = self.conn()
