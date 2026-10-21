@@ -12,6 +12,7 @@ import asyncio
 import fcntl
 import json
 import os
+import shutil
 import signal
 import socket
 import sqlite3
@@ -65,6 +66,7 @@ class FakeSpawner:
 class Base(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="afc-runner-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         self.conn = store.connect(os.path.join(self.tmp, "t.db"), create=True)
         self.addCleanup(self.conn.close)
         self.fails, self.logs = [], []

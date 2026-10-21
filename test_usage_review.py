@@ -50,6 +50,7 @@ class Base(unittest.TestCase):
         testenv.unpause()            # a failure in an earlier test paused automation (D-234/D-235)
         self.addCleanup(testenv.unpause)
         finalize_records()           # an earlier test's started reviews are not this test's
+        self.addCleanup(ka.LAUNCH.update, dict(ka.LAUNCH))   # run_once sets the review's model/effort there
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {"fire": ka.fire, "alert": ka.alert, "log": ka.log, "progress_note": ka.progress_note,
                       "state": ur.STATE, "subprocess_run": ur.subprocess.run, "fresh_usage": ka.fresh_usage,

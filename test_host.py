@@ -7,6 +7,7 @@ here kills, launches or appends to a real file."""
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,7 @@ class SshArgv(unittest.TestCase):
 class RunOnHost(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
         self.rec = os.path.join(self.d, "rec.json")
         with open(os.path.join(self.d, "ssh"), "w") as fh:   # records its last arg + stdin
             fh.write("#!/bin/sh\nfor last; do :; done\n"
@@ -183,7 +185,9 @@ class Whitelist(unittest.TestCase):
         self.assertEqual(run_host_exec("append-note ALERTS.md", b"\xff\xfe").returncode, 126)
 
     def test_read_only_shapes_accepted(self):
-        log = os.path.join(tempfile.mkdtemp(), "host_exec.log")
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        log = os.path.join(d, "host_exec.log")
         r = run_host_exec("tmux-has ka-00000000", log=log)
         self.assertNotEqual(r.returncode, 126)
         r = run_host_exec("tmux-panes ka-00000000", log=log)
