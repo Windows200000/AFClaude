@@ -379,6 +379,7 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     msg = " ".join(" ".join(parts).split())
     sid = sid or str(uuid.uuid4())
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
+    tmux = ka.claim_tmux(sid, "review", actor="runner:usage_review")   # its readable name, stored first (3b S2)
     rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude {which} review (one-off) {d}",
                            category=ka.remote_control.REVIEW)   # D-269
     ok = rc == 0 and out.strip().startswith("started")
@@ -387,7 +388,7 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     record_review(sid, (which,), now, ok, rc, True, **(record or {}))
     if ok:
         ka.log(f"one-off {which} review started: {sid}")
-        ka.progress_note(f"one-off {which} review started: session {sid} (Opus medium, tmux ka-{sid[:8]})")
+        ka.progress_note(f"one-off {which} review started: session {sid} (Opus medium, tmux {tmux})")
     else:
         fail_stop(f"one-off {which} review launch failed", f"rc={rc} out={out.strip()} err={err.strip()[-500:]}")
     return ok
@@ -499,7 +500,7 @@ def review_death(sid, now):
     (keepalive.stall_status, the reset from the notice) or another API error; a worker agent
     failed (its task notification; at a usage limit or not); the session ended its turn
     (keepalive.session_idle) on an answer, with no agent running; or, quiet for
-    keepalive.SUBAGENT_QUIET, its tmux session ka-<id8> is gone. No transcript yet: None (the
+    keepalive.SUBAGENT_QUIET, its tmux session (its stored name) is gone. No transcript yet: None (the
     deadlines catch a session that never starts). A failed host call raises (an error).
     -> None | {"kind": "limit", "limit": weekly/session/..., "reset", "why"} | {"kind": "dead", "why"}."""
     path = ka.transcript_path(sid)
@@ -523,7 +524,7 @@ def review_death(sid, now):
     if last and last.get("type") == "assistant" and ka.session_idle(path, now) and not agent_running(path, now):
         return {"kind": "dead", "why": "the session ended its turn without the report and with no agent running"}
     if session_idle(sid, now, idle=ka.SUBAGENT_QUIET) and not ka.tmux_alive(sid):
-        return {"kind": "dead", "why": f"its tmux session {ka.tmux_name(sid)} is gone"}
+        return {"kind": "dead", "why": f"its tmux session {ka.tmux_label(sid)} is gone"}
     return None
 
 
@@ -554,7 +555,7 @@ def handle_death(st, now, rec, death):
     label = review_label(rec)
     limit = death["kind"] == "limit"
     done = finish_review(sid, "limit" if limit else "died", now, why=death["why"]) or rec
-    detail = f"session {sid} (tmux {ka.tmux_name(sid)}), attempt {attempt}: {death['why']}"
+    detail = f"session {sid} (tmux {ka.tmux_label(sid)}), attempt {attempt}: {death['why']}"
     if not limit:
         fail_stop("a review session died", f"{label} review, {detail}")
     elif attempt >= MAX_ATTEMPTS:

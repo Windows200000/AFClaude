@@ -2448,6 +2448,68 @@ def own_session_add(conn: sqlite3.Connection, session_id: object, *, actor: str,
     return store.retrying(run, conn)
 
 
+# ---------------------------------------------------------------- readable tmux names (phase 3b S2)
+#
+# driven.name: a driven session's tmux name in its driven_sessions row (docs/phase3b_plan.md §3.2,
+# D-147): every launcher stores the name before ka_resume.sh runs (keepalive.claim_tmux), the
+# one-time rename of a live tmux session updates it (keepalive.rename_tmux, D-281), and a row
+# whose tmux session is gone is ended (its name free again). The tmux names are names.py's. Only
+# the phase 3b kinds (names.KINDS); a new task-manager row is not made here (it needs its project:
+# 3b S1's backfill and creation helper). S1's driven.set covers the same fields: once it is
+# merged, the callers switch to it (it also needs a way to make an ended row live again).
+
+def _driven_tmux(value: Any) -> str:
+    import names
+    name = store._text(value, "tmux", required=True)
+    if not names.TMUX_RE.match(name):
+        raise ValueError(f"tmux must be ka-<8 hex> or afc-<[a-z0-9-], at most 36>, got {name!r}")
+    return name
+
+
+@action("driven.name", "driven_session")
+def driven_name(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, tmux: Any = None, kind: Any = None,
+                ended: Any = None) -> Result:
+    """Set a driven session's tmux name (`tmux`), its kind (names.KINDS; a new row needs both) and
+    whether it is live (`ended` True: ended now, its name free; False: live again). A live name
+    belongs to one row. A row of another kind ('own', legacy rows) is not changed here, and a
+    task-manager row stays one. The runners' step, not for MCP callers."""
+    import names
+    _runner_only(ctx, "driven.name")
+    sid = store._session_id(session_id)
+    before = store.get_driven_session(conn, sid)
+    if before is not None and before["kind"] not in names.KINDS:
+        raise ValueError(f"the row of {sid} is of kind {before['kind']!r}: driven.name changes only "
+                         f"{'|'.join(names.KINDS)} rows")
+    fields: dict[str, Any] = {}
+    if tmux is not None:
+        fields["tmux"] = _driven_tmux(tmux)
+    if kind is not None:
+        fields["kind"] = store._enum(kind, names.KINDS, "kind")
+    if ended is not None:
+        if not isinstance(ended, bool):
+            raise ValueError(f"ended must be true or false, got {ended!r}")
+        if ended != (before is not None and before["ended_at"] is not None):
+            fields["ended_at"] = store.now_iso() if ended else None
+    if before is None:
+        if "tmux" not in fields or "kind" not in fields:
+            raise ValueError(f"a new driven session needs kind and tmux ({sid})")
+        if fields["kind"] == "task-manager":
+            raise ValueError("a new task-manager row needs its project (3b S1), not driven.name")
+    elif before["kind"] != fields.get("kind", before["kind"]) and "task-manager" in (before["kind"], fields["kind"]):
+        raise ValueError(f"the row of {sid} is a {before['kind']} row: it stays one")
+    row = dict(before or {}, **fields)
+    if row.get("ended_at") is None:
+        other = conn.execute("SELECT session_id, kind FROM driven_sessions WHERE tmux=? AND ended_at IS NULL "
+                             "AND session_id<>? ORDER BY session_id", (row["tmux"], sid)).fetchone()
+        if other is not None:
+            raise Conflict(f"tmux {row['tmux']} is the live name of {other[0]} ({other[1]})",
+                           current=store.get_driven_session(conn, str(other[0])))
+    if before is not None and all(before.get(k) == v for k, v in fields.items()):
+        return Result(before, sid, before, before, changed=False)
+    after = store.upsert_driven_session(conn, sid, **fields)
+    return Result(after, sid, before, after)
+
+
 # ---------------------------------------------------------------- the resident runner (phase 3a)
 #
 # runner.py's writes (docs/phase3a_plan.md §3.3): its job rows (runner_jobs), its run records

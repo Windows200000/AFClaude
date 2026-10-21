@@ -101,7 +101,7 @@ FUNCTIONS["prune_runs"] = ("prune_logs.log", prune_runs)
 # the resume and its verification (VERIFY_TIMEOUT). The host calls' timeouts are literals in
 # keepalive.py: (function, seconds of one call, calls); test_runner checks them against the source.
 WINDOW_START_HOST_CALLS: tuple[tuple[str, int, int], ...] = (
-    ("refresh_usage", 120, 2), ("poke_auth", 180, 1), ("agent_entries", 60, 1), ("tmux_alive", 30, 1),
+    ("refresh_usage", 120, 2), ("poke_auth", 180, 1), ("agent_entries", 60, 1), ("tmux_has", 30, 1),
     ("tmux_pids", 30, 1), ("owner_typing", 30, 2), ("fire", 60, 1), ("fire", 120, 1),
 )
 WINDOW_START_CONSTANTS = ("COMPACT_LOCK_WAIT", "VERIFY_TIMEOUT", "TAKE_OVER_WAIT")

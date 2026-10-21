@@ -101,6 +101,8 @@ class Fire(Base):
         self.runs = []
         ka.host.run_on_host = lambda argv, **k: self.runs.append(argv) or types.SimpleNamespace(
             returncode=0, stdout="started", stderr="")
+        testenv.tmux_row(SID, "afc-p-task-manager")                      # the stored tmux names (3b S2)
+        testenv.tmux_row(OTHER, "afc-stall-x-abcd", kind="stall")
 
     def tearDown(self):
         ka.host.run_on_host, launch = self.old
@@ -110,16 +112,26 @@ class Fire(Base):
 
     def flags(self):
         argv = self.runs[-1]
-        return {a[2:]: argv[i + 1] for i, a in enumerate(argv) if a in ("--model", "--effort", "--name")}
+        return {a[2:]: argv[i + 1] for i, a in enumerate(argv) if a in ("--model", "--effort", "--name", "--tmux")}
 
     def test_default_launch(self):
+        """The stored tmux name goes along; no --name (ka_resume.sh: the Remote Control name is the
+        tmux name, 3b S2)."""
         ka.fire(SID, "/tmp", "go", "resume")
-        self.assertEqual(self.flags(), {"model": "claude-opus-5-5", "effort": "high", "name": ka.LAUNCH["name"]})
+        self.assertEqual(self.flags(), {"model": "claude-opus-5-5", "effort": "high", "tmux": "afc-p-task-manager"})
+
+    def test_no_stored_name_aborts_before_any_host_call(self):
+        """3b S2 (D-235): a session without its driven_sessions row is an error, never a ka- guess."""
+        third = "abcdef03-0000-4000-8000-000000000003"
+        with self.assertRaisesRegex(ka.NoTmuxName, "abcdef03 has no driven_sessions row"):
+            ka.fire(third, "/tmp", "go", "take-over:42")
+        self.assertEqual(self.runs, [])
 
     def test_project_launch_wins(self):
         self.project("P", model="claude-sonnet-5-5", effort="xhigh")
         ka.fire(SID, "/tmp", "go", "resume", name="mgr", model="claude-opus-5")   # e.g. the dispatcher's
-        self.assertEqual(self.flags(), {"model": "claude-sonnet-5-5", "effort": "xhigh", "name": "mgr"})
+        self.assertEqual(self.flags(), {"model": "claude-sonnet-5-5", "effort": "xhigh", "name": "mgr",
+                                        "tmux": "afc-p-task-manager"})
         ka.fire(OTHER, "/tmp", "go", "resume", model="claude-opus-5")             # not a task-manager
         self.assertEqual(self.flags()["model"], "claude-opus-5")
         self.do("project.manager_launch", project="P", model="default")           # back to LAUNCH's model

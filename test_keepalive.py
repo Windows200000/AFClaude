@@ -395,7 +395,7 @@ class BudgetWiring(unittest.TestCase):
         import export_quickview as eq
         oldq = (ka.read_usage_cache, eq.watcher_running, ka.tmux_alive, eq.limits_block, eq.usage_review)
         ka.read_usage_cache = lambda: self.u()
-        eq.watcher_running, ka.tmux_alive = (lambda: False), (lambda sid: False)
+        eq.watcher_running, ka.tmux_alive = (lambda: False), (lambda sid, name=None: False)
         eq.limits_block, eq.usage_review = (lambda: {}), (lambda: None)
         try:
             q = eq.keepalive_and_usage(now)
@@ -803,7 +803,7 @@ class BudgetWiring(unittest.TestCase):
         ka.budget_eval = lambda u, now: {"go": True, "postpone": False, "recheck_at": None,
                                          "reason": "CONTINUE: test", "text": "budget t"}
         ka.fresh_usage = lambda n, force=False: self.u()
-        ka.tmux_alive, ka.tmux_pids, ka.registry_holders = (lambda s: True), (lambda s: {300}), (lambda s: [])
+        ka.tmux_alive, ka.tmux_pids, ka.registry_holders = (lambda s, n=None: True), (lambda s, n=None: {300}), (lambda s: [])
         ka.fire = lambda sid, cwd, msg, plan, new=False, **k: calls.append((plan, new)) or (0, "sent-keys", "")
         ka.verify_reply = lambda path, since, timeout=None: {"message": {"model": "claude-opus-5-5"}}
         ka.agent_entries = lambda s: []
@@ -1047,7 +1047,7 @@ class RealTranscripts(unittest.TestCase):
 class FakeProcHolders(unittest.TestCase):
     """preflight against a fake /proc + ~/.claude/sessions (paths injected): rc-server
     children are detected by --sdk-url or entrypoint sdk-cli, and any live registry
-    holder of the uuid that is not our tmux ka-<id8> process blocks a send/resume."""
+    holder of the uuid that is not our tmux session's process blocks a send/resume."""
     SID = "9da84efe-c1ec-516d-9a86-4ecca2aec1f3"
     CHILD = ["/h/.local/share/claude/versions/2.1.283", "--print", "--sdk-url",
              "https://api.anthropic.com/v1/code/sessions/cse_01X", "--session-id", "cse_01X"]
@@ -1065,8 +1065,8 @@ class FakeProcHolders(unittest.TestCase):
         ka.PROC_DIR, ka.SESSIONS_DIR = self.proc, self.sess
         ka.PROJECTS_DIR = os.path.dirname(self.proj)
         self.tmux, self.panes, self.rows = False, set(), []
-        ka.tmux_alive = lambda s: self.tmux
-        ka.tmux_pids = lambda s: set(self.panes)
+        ka.tmux_alive = lambda s, name=None: self.tmux
+        ka.tmux_pids = lambda s, name=None: set(self.panes)
         ka.agent_entries = lambda s: list(self.rows)
         ka.TAKE_OVER_IDLE = False
 
@@ -1362,6 +1362,7 @@ class DryRunLoop(unittest.TestCase):
     dry-run. `claude` is shadowed by a stub on PATH that records calls and
     fails loudly on anything resume-like."""
     def test_dry_run_never_resumes(self):
+        testenv.tmux_row(SID)            # its stored tmux name (3b S2)
         with tempfile.TemporaryDirectory() as d:
             write_transcript(d, SID, [USER, REPLY, STALL] + TRAILING)
             bindir = os.path.join(d, "bin")
@@ -1375,7 +1376,8 @@ class DryRunLoop(unittest.TestCase):
             env = dict(os.environ, KEEPALIVE_PROJECTS_DIR=d, KEEPALIVE_STATE_DIR=d,
                        KEEPALIVE_PROGRESS_FILE=os.path.join(d, "P.md"))
             # stub must win over the real claude even inside SCRUBBED_ENV's PATH
-            code = ("import keepalive as ka, sys;"
+            code = ("import notify; notify.push = lambda text: 'test: push not sent';"   # never a real push
+                    "import keepalive as ka, sys;"
                     f"ka.SCRUBBED_ENV['PATH']={bindir!r}+':'+ka.SCRUBBED_ENV['PATH'];"
                     "from datetime import datetime,timezone;"
                     "ka.LAUNCH.clear();"

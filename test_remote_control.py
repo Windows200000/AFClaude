@@ -98,6 +98,7 @@ class Fire(Base):
     the category is off, and an invalid setting aborts before anything runs on the host."""
     def setUp(self):
         super().setUp()
+        testenv.tmux_row(SID)                                          # its stored tmux name (3b S2)
         self.old = ka.host.run_on_host
         self.runs = []
         ka.host.run_on_host = lambda argv, **k: self.runs.append(argv) or types.SimpleNamespace(
@@ -139,21 +140,22 @@ class KaResume(unittest.TestCase):
                 fh.write('#!/bin/sh\ncase "$1" in has-session) exit 1;; esac\nexit 0\n')
             os.chmod(tmux, 0o755)
             env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"], HOME=d, KA_TRUST_ROOT=d)
-            r = subprocess.run(["bash", os.path.join(d, "ka_resume.sh"), "--session", SID, "--message", "go",
-                                "--cwd", d, *extra], env=env, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(["bash", os.path.join(d, "ka_resume.sh"), "--session", SID, "--tmux", "afc-rc-test",
+                                "--message", "go", "--cwd", d, *extra], env=env, capture_output=True, text=True,
+                               timeout=60)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("started ka-abcdef01", r.stdout)
-            with open(os.path.join(d, "run", "ka-abcdef01.sh")) as fh:
+            self.assertIn("started afc-rc-test", r.stdout)                 # run/<tmux name>.sh (3b S2)
+            with open(os.path.join(d, "run", "afc-rc-test.sh")) as fh:
                 return [ln for ln in fh.read().splitlines() if " claude " in ln][0]
 
     def test_default_has_remote_control(self):
         line = self.launch_line()
-        self.assertIn(" --resume abcdef01-0000-4000-8000-000000000001 --remote-control --name ka-abcdef01 ", line)
+        self.assertIn(" --resume abcdef01-0000-4000-8000-000000000001 --remote-control --name afc-rc-test ", line)
 
     def test_no_remote_control(self):
         line = self.launch_line("--new", "--no-remote-control")
         self.assertNotIn("--remote-control", line)
-        self.assertIn(" --session-id abcdef01-0000-4000-8000-000000000001 --name ka-abcdef01 ", line)
+        self.assertIn(" --session-id abcdef01-0000-4000-8000-000000000001 --name afc-rc-test ", line)
 
 
 class HostBridge(unittest.TestCase):
@@ -168,9 +170,11 @@ class HostBridge(unittest.TestCase):
         os.environ.pop("AFCLAUDE_HOST_EXEC_LOG", None)
 
     def test_flag_accepted(self):
-        self.he.check_ka_resume(["--session", SID, "--message", "go", rcs.NO_RC_FLAG, "--new"])   # no exit
+        self.he.check_ka_resume(["--session", SID, "--tmux", "ka-abcdef01", "--message", "go", rcs.NO_RC_FLAG,
+                                 "--new"])   # no exit
         with self.assertRaises(SystemExit):
-            self.he.check_ka_resume(["--session", SID, "--message", "go", "--remote-control", "off"])
+            self.he.check_ka_resume(["--session", SID, "--tmux", "ka-abcdef01", "--message", "go",
+                                     "--remote-control", "off"])
 
 
 class Export(Base):

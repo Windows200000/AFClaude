@@ -96,6 +96,28 @@ class BridgeArgv(unittest.TestCase):
         with self.assertRaises(ValueError):
             host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=Claude:"])
 
+    def test_readable_names_and_rename(self):
+        """3b S2: the readable afc-... names next to today's ka-<id8>, and the one-time rename."""
+        n = "afc-afclaude-task-manager"
+        self.assertEqual(host.bridge_argv(["tmux", "has-session", "-t", "=" + n]), ["tmux-has", n])
+        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", f"={n}:"]), ["tmux-capture", n])
+        self.assertEqual(host.bridge_argv(["tmux", "list-panes", "-s", "-t", "=afc-review-2", "-F", "#{pane_pid}"]),
+                         ["tmux-panes", "afc-review-2"])
+        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=ka-0123abcd", n]),
+                         ["tmux-rename", "ka-0123abcd", n])
+        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=" + n, "ka-0123abcd"]),
+                         ["tmux-rename", n, "ka-0123abcd"])           # the rollback (plan §3.4)
+        for bad in ("=afc-a;b", "=afc-a b", "=afc-Upper", "=afc-" + "x" * 37, "=afc-", "=afc-x\n", "=afc-x:"):
+            with self.assertRaises(ValueError, msg=bad):
+                host.bridge_argv(["tmux", "has-session", "-t", bad])
+        for argv in (["tmux", "rename-session", "-t", "ka-0123abcd", n],          # no exact-match "="
+                     ["tmux", "rename-session", "-t", "=ka-0123abcd", "=" + n],
+                     ["tmux", "rename-session", "-t", "=ka-0123abcd", "Claude"],
+                     ["tmux", "rename-session", "-t", "=Claude", n],
+                     ["tmux", "rename-session", "-t", "=ka-0123abcd", n, "x"]):
+            with self.assertRaises(ValueError, msg=argv):
+                host.bridge_argv(argv)
+
     def test_bridge_only_shapes_pass(self):
         for argv in (["kill-claude", "123"], ["claude-env", "123"], ["proc-snapshot"], ["usage-cache"],
                      ["append-note", "PROGRESS.md"], ["append-note", "ALERTS.md"]):
@@ -179,6 +201,39 @@ class Whitelist(unittest.TestCase):
                     "claude -p --model haiku --dangerously-skip-permissions"):
             self.assertEqual(run_host_exec(cmd).returncode, 126, cmd)
 
+    def test_readable_names(self):
+        """3b S2: every tmux verb takes ka-<8 hex> or afc-<[a-z0-9-], at most 36>, and nothing else;
+        tmux-rename takes two such names. (Accepted names here are ones no tmux session has: tmux
+        just exits 1.)"""
+        ok = ("ka-00000000", "afc-s2-whitelist-test-none", "afc-" + "x" * 36)
+        for verb in ("tmux-has", "tmux-panes", "tmux-clients", "tmux-capture", "tmux-kill"):
+            for name in ok:
+                r = run_host_exec(f"{verb} {name}")
+                self.assertNotEqual(r.returncode, 126, (verb, name, r.stderr))
+            for bad in ("afc-a\\;id", "'afc-a b'", "afc-Upper", "afc-" + "x" * 37, "afc-", "afc-x.y", "Claude",
+                        "'afc-x\n'", "afc-x afc-y", ""):
+                self.assertEqual(run_host_exec(f"{verb} {bad}").returncode, 126, (verb, bad))
+        r = run_host_exec("tmux-rename afc-s2-whitelist-test-none afc-s2-whitelist-test-none2")
+        self.assertNotEqual(r.returncode, 126, r.stderr)
+        for bad in ("tmux-rename afc-s2-whitelist-test-none", "tmux-rename afc-a Claude",
+                    "tmux-rename Claude afc-a", "tmux-rename afc-a afc-b afc-c", "tmux-rename afc-a 'afc-b;id'"):
+            self.assertEqual(run_host_exec(bad).returncode, 126, bad)
+
+    def test_ka_resume_needs_a_tmux_name(self):
+        """3b S2: ka_resume.sh is allowed only with --tmux <a tmux name> (checked, not run)."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("host_exec_s2", HOST_EXEC)
+        he = importlib.util.module_from_spec(spec)
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
+            spec.loader.exec_module(he)
+            sid = "abcdef01-0000-4000-8000-000000000001"
+            for name in ("ka-abcdef01", "afc-afclaude-task-manager"):
+                he.check_ka_resume(["--session", sid, "--tmux", name, "--message", "go", "--new"])   # no exit
+            for bad in ([], ["--tmux", "../x"], ["--tmux", "afc-A"], ["--tmux", "afc-x\n"], ["--tmux"],
+                        ["--tmux", "afc-" + "x" * 37]):
+                with self.assertRaises(SystemExit, msg=bad):
+                    he.check_ka_resume(["--session", sid, "--message", "go", *bad])
+
     def test_append_note_limits(self):
         self.assertEqual(run_host_exec("append-note PROGRESS.md", b"x" * (16 * 1024 + 1)).returncode, 126)
         self.assertEqual(run_host_exec("append-note ALERTS.md", b"a\0b").returncode, 126)
@@ -212,7 +267,10 @@ class Whitelist(unittest.TestCase):
                 (["tmux", "list-panes", "-s", "-t", "=ka-00000000", "-F", "#{pane_pid}"], None),
                 (["tmux", "list-clients", "-t", "=ka-00000000", "-F", "#{client_activity}"], None),
                 (["tmux", "capture-pane", "-e", "-p", "-t", "=ka-00000000:"], None),
-                (["tmux", "kill-session", "-t", "=ka-00000000"], None)):   # no such session: tmux exits 1
+                (["tmux", "kill-session", "-t", "=ka-00000000"], None),   # no such session: tmux exits 1
+                (["tmux", "has-session", "-t", "=afc-s2-whitelist-test-none"], None),
+                (["tmux", "capture-pane", "-e", "-p", "-t", "=afc-s2-whitelist-test-none:"], None),
+                (["tmux", "rename-session", "-t", "=afc-s2-whitelist-test-none", "afc-s2-whitelist-test-x"], None)):
             r = run_host_exec(shlex.join(host.bridge_argv(argv)))
             self.assertNotEqual(r.returncode, 126, (argv, r.stderr))
 

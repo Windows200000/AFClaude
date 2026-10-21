@@ -13,7 +13,7 @@ set -uo pipefail
 DIR="$(dirname "$(readlink -f "$0")")"
 CWD="$DIR/probe"; mkdir -p "$CWD"
 SID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-T="ka-${SID:0:8}"
+T="afc-e2e-test-${SID:0:8}"     # ka_resume.sh --tmux (3b S2: the caller names the tmux session)
 fail() { echo "FAIL: $*"; tmux kill-session -t "$T" 2>/dev/null; python3 "$DIR/notify.py" "e2e tmux test FAILED: $*" "session $SID"; exit 1; }
 cleanup() { tmux kill-session -t "$T" 2>/dev/null; }
 trap cleanup EXIT
@@ -43,7 +43,7 @@ EOF
 
 # Remote Control per the "test" session category's setting (D-269); an unreadable or invalid one stops here
 RC_FLAGS="$(python3 "$DIR/remote_control.py" flags test)" || fail "remote_control setting for test sessions"
-common=(--session "$SID" --cwd "$CWD" --model haiku --effort low --name "AFClaude e2e test (test, tmux killed after)" $RC_FLAGS)
+common=(--session "$SID" --tmux "$T" --cwd "$CWD" --model haiku --effort low --name "AFClaude e2e test (test, tmux killed after)" $RC_FLAGS)
 echo "1/3 new session $SID"
 "$DIR/ka_resume.sh" "${common[@]}" --new --message "AFClaude e2e test. Reply with only: e2e-ok1" || fail "launch"
 wait_reply e2e-ok1 45 || fail "no reply to new-session prompt"

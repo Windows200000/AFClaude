@@ -70,6 +70,20 @@ def set_setting(key, value, db=None):
         conn.close()
 
 
+def tmux_row(session_id, tmux=None, kind="task-manager", db=None):
+    """A live driven_sessions row naming the session's tmux session (3b S2: keepalive.tmux_name
+    reads it; a launcher stores it, a task-manager's comes from its project, 3b S1), written
+    around actions.py as a backfill would. tmux: default today's ka-<id8>. -> the name."""
+    name = tmux or "ka-" + session_id[:8]
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        with store.transaction(conn):
+            store.upsert_driven_session(conn, session_id, kind=kind, tmux=name, ended_at=None)
+    finally:
+        conn.close()
+    return name
+
+
 def put_raw(key, value, db=None):
     """Write a settings row AROUND actions.py (no validation): what a broken or newer writer
     could leave behind; the runners must ignore an invalid one."""

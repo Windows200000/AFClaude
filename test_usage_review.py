@@ -55,7 +55,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.saved = {"fire": ka.fire, "alert": ka.alert, "log": ka.log, "progress_note": ka.progress_note,
                       "state": ur.STATE, "subprocess_run": ur.subprocess.run, "fresh_usage": ka.fresh_usage,
-                      "projects": ka.PROJECTS_DIR, "tmux_alive": ka.tmux_alive}
+                      "projects": ka.PROJECTS_DIR, "tmux_alive": ka.tmux_alive, "claim_tmux": ka.claim_tmux}
         self.fires = []
         self.alerts = []
         self.at_calls = []
@@ -67,7 +67,9 @@ class Base(unittest.TestCase):
         ka.progress_note = lambda line: None
         ka.fresh_usage = lambda now, force=False, display=False: self.usage
         ka.PROJECTS_DIR = os.path.join(self.tmp.name, "projects")    # no transcript unless a test writes one
-        ka.tmux_alive = lambda sid: True
+        ka.tmux_alive = lambda sid, name=None: True
+        self.claims = []             # 3b S2: the review's tmux name, stored before its launch
+        ka.claim_tmux = lambda sid, kind, **k: self.claims.append((sid, kind, len(self.fires), k)) or "afc-review"
         ur.STATE = os.path.join(self.tmp.name, "usage_review_state.json")
         ur.subprocess.run = lambda argv, input=None, **k: self.at_calls.append((argv, input)) or type(  # noqa: A002
             "R", (), {"returncode": 0, "stdout": "", "stderr": "job x at y"})()
@@ -77,6 +79,7 @@ class Base(unittest.TestCase):
                                                         self.saved["log"], self.saved["progress_note"])
         ka.fresh_usage, ka.PROJECTS_DIR, ka.tmux_alive = (self.saved["fresh_usage"], self.saved["projects"],
                                                           self.saved["tmux_alive"])
+        ka.claim_tmux = self.saved["claim_tmux"]
         ur.STATE = self.saved["state"]
         ur.subprocess.run = self.saved["subprocess_run"]
         self.tmp.cleanup()
@@ -96,6 +99,7 @@ class RunOnce(Base):
         self.assertTrue(new)
         self.assertIn("one-off", k.get("name", ""))
         self.assertEqual(k.get("category"), "review")             # its Remote Control setting (D-269)
+        self.assertEqual(self.claims, [(sid, "review", 0, {"actor": "runner:usage_review"})])   # named before the fire
         # only the one-off prompt + guard_respect + manager: never the regular usage_review.md
         # brief, and the owner's verbatim D-220/D-221 concerns are in it
         self.assertNotIn("periodic usage-model review", msg)
@@ -696,9 +700,10 @@ class Chain(Transcripts):
         self.transcript(sid, [entry("user", T0), entry("assistant", t, stop="tool_use")],
                         age=timedelta(minutes=10), now=t + timedelta(minutes=10))
         self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=10)), "waiting")   # tmux alive
-        ka.tmux_alive = lambda s: False
+        ka.tmux_alive = lambda s, name=None: False
+        testenv.tmux_row(sid, "afc-review-7", kind="review")
         self.assertEqual(ur.chain_pass(ur.load(), t + timedelta(minutes=10)), "dead")
-        self.assertIn("tmux", self.rec(sid)["why"])
+        self.assertIn("its tmux session afc-review-7 is gone", self.rec(sid)["why"])
         self.assertTrue(self.paused())
 
     def test_still_running_after_the_timeout_is_an_error(self):
