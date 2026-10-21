@@ -40,8 +40,24 @@ records the clean exit. A watchdog thread exits the process (70) when the loop's
 older than 5 min (a wedged loop; Docker's restart policy then restarts the container).
 
 Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) moves jobs from
-docker/crontab into it step by step (test_runner checks they never overlap). Empty in S1: the
-runner is built and tested but owns nothing live yet.
+docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
+live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
+(stall_scan, prune_runs); cron still runs the rest.
+
+Shadow (S2-S7, §5 S2): for every job cron still runs, the runner logs when it WOULD start it
+(data/runner_shadow.log, component runner_shadow), waking at that time as it would for its own
+job; `runner.py shadow-report` compares those lines with cron's actual starts (supercronic's
+lines, which the entrypoint copies to data/cron_runs.log) and, for the window starts, with the
+keep-alive's decision lines.
+
+Until S8 supercronic is the container's main schedule and this runner runs beside it:
+    python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
+                                 unless one runs (an alert + pause when it had stopped without a
+                                 crash or unclean exit its own boot reports, D-235/D-257); a
+                                 running one whose heartbeat is stale is an alert + pause too
+    python3 runner.py stop       SIGTERM to the running runner and wait for its clean exit (the
+                                 entrypoint's TERM trap: tini signals only the entrypoint shell)
+    python3 runner.py shadow-report [--hours H]   the shadow comparison (exit 1 on a mismatch)
 """
 from __future__ import annotations
 
@@ -53,14 +69,16 @@ import importlib
 import json
 import math
 import os
+import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
@@ -90,9 +108,9 @@ STOP_GRACE = 80.0                         # SIGTERM of the runner: running runs 
 STAGGER = timedelta(seconds=5)            # boot catch-up: the missed interval jobs start this far apart
 DRAIN_MARGIN = timedelta(minutes=5)
 DRAIN_POLL = 5.0
-EXIT_CRASH = 1
 EXIT_LOCKED = 2
 EXIT_REPORTED = runner_jobs.EXIT_REPORTED
+EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail): `ensure` does not alert again
 TINY = timedelta(microseconds=1)
 # The keep-alive watcher's passes (S6). The runner refuses to start next to a running watcher only
 # once it owns one of them: until then (S2-S5) the watcher runs beside it by design (§4).
@@ -105,14 +123,14 @@ WATCHER_ONE_SHOT = frozenset({"--window-start", "--plan-fillup-test", "--decide"
 class Job:
     """One runner job (docs/phase3a_plan.md §3.2).
     timeout_min: the default of its setting runner_timeout_<name> (test_runner keeps them equal);
-    every / daily: an interval tick on the UTC grid (every k x `every` from midnight) / once a day
-    at (hour, minute) UTC; window_start: a keyed run at each session-window start (schedule.py,
-    key schedule.start_key); paused: while automation is paused it "runs", the "handler" checks
-    (and runs anyway here), or the runner "skip"s it; on_interrupt: a run cut off by a restart is
-    rerun or "fail"s (alert + pause, D-257); session: it types into the task-manager session (a
-    drain holds it); pause_on_failure: False = a failure alerts only (D-239.3); cron_tag: its
-    docker/crontab line's tag (the cut-over check); argv: the child's command instead of
-    runner_jobs.py (tests)."""
+    every / daily: an interval tick on the UTC grid (every k x `every` from midnight, shifted by
+    `offset`) / once a day at (hour, minute) UTC; window_start: a keyed run at each session-window
+    start (schedule.py, key schedule.start_key); paused: while automation is paused it "runs",
+    the "handler" checks (and runs anyway here), or the runner "skip"s it; on_interrupt: a run cut
+    off by a restart is rerun or "fail"s (alert + pause, D-257); session: it types into the
+    task-manager session (a drain holds it); pause_on_failure: False = a failure alerts only
+    (D-239.3); cron_tag: its docker/crontab line's tag (the cut-over check, the shadow); argv: the
+    child's command instead of runner_jobs.py (tests); offset: see every."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
@@ -124,6 +142,7 @@ class Job:
     pause_on_failure: bool = True
     cron_tag: Optional[str] = None
     argv: Optional[tuple[str, ...]] = None
+    offset: timedelta = timedelta(0)
 
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
@@ -132,15 +151,19 @@ class Job:
             raise ValueError(f"{self.name}: exactly one of every / daily / window_start")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
+        if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
+            raise ValueError(f"{self.name}: an offset needs an interval longer than it")
 
     @property
     def keyed(self) -> bool:
         return self.window_start
 
 
-MIN = timedelta(minutes=1)
+SEC, MIN = timedelta(seconds=1), timedelta(minutes=1)
 JOBS: dict[str, Job] = {j.name: j for j in (
-    Job("stall_scan", 2, every=3 * MIN),
+    # 90 s off the minute: never at the same second as the quickview's and the dispatcher's scans
+    # (cron starts every line on a whole minute), so the three don't contend for the DB at once
+    Job("stall_scan", 2, every=3 * MIN, offset=90 * SEC),
     Job("sampler", 10, every=15 * MIN, cron_tag="AFClaude usage sampler"),
     Job("dispatcher", 8, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
     Job("quickview", 2, every=3 * MIN, pause_on_failure=False, cron_tag="AFClaude quickview export"),
@@ -152,8 +175,9 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         cron_tag="AFClaude window-start"),
 )}
 # What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
-# here and removes their cron lines in the same commit). S1: nothing yet.
-RUNNER_OWNS: frozenset[str] = frozenset()
+# here and removes their cron lines in the same commit). S2: the new jobs only, which have no cron
+# line: the stall_scan tick and the daily prune of the runner's own run records.
+RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs"})
 
 
 # ---------------------------------------------------------------- paths, log, small helpers
@@ -201,14 +225,27 @@ def _parse(s: object) -> Optional[datetime]:
     return store.parse_iso(s) if isinstance(s, str) and s else None
 
 
+def _parse_text(s: object) -> Optional[datetime]:
+    """_parse for text read from a log (a line that is not ours: None)."""
+    try:
+        return _parse(s)
+    except ValueError:
+        return None
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _iso_ms(dt: datetime) -> str:
+    """UTC ISO to the millisecond, 'Z' (the shadow lines)."""
+    return dt.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def next_tick(job: Job, now: datetime) -> datetime:
     """The job's first tick strictly after `now` (UTC grid / daily time)."""
     if job.every is not None:
-        day = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        day = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + job.offset
         step = job.every.total_seconds()
         k = math.floor((now - day).total_seconds() / step) + 1
         return day + timedelta(seconds=k * step)
@@ -225,11 +262,15 @@ def _signal_group(pid: int, sig: int) -> None:
 
 def wake(path: Optional[str] = None) -> bool:
     """Tell the runner to re-read the DB (one datagram). Never blocks or raises: if the runner
-    is down a warning goes to stderr (its stale heartbeat is what alerts). -> sent."""
+    is down a warning goes to stderr (its stale heartbeat is what alerts). -> sent.
+    A full queue counts as sent: the runner has wakes waiting already (the container's
+    net.unix.max_dgram_qlen is 10, a host's often 512)."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
             s.setblocking(False)
             s.sendto(b"w", path or sock_path())
+        return True
+    except BlockingIOError:
         return True
     except OSError as e:
         sys.stderr.write(f"runner wake not sent ({type(e).__name__}: {e}); the runner re-reads the DB "
@@ -305,7 +346,7 @@ class Runner:
                  boot_id: Optional[str] = None, log_fn: Optional[Callable[[str], None]] = None,
                  fail: Optional[FailFn] = None, paused: Optional[Callable[[], dict[str, Any]]] = None,
                  schedule_cfg: Optional[schedule.Config] = None, sock: Optional[str] = None,
-                 stop_grace: float = STOP_GRACE) -> None:
+                 stop_grace: float = STOP_GRACE, shadow: Optional[Callable[[str], None]] = None) -> None:
         self.conn = conn
         self.jobs = dict(JOBS if jobs is None else jobs)
         self.owns = frozenset(RUNNER_OWNS if owns is None else owns)
@@ -333,6 +374,12 @@ class Runner:
         self.beat_mono = time.monotonic()
         self.logged: set[str] = set()
         self.reruns: list[tuple[str, str]] = []
+        # the shadow (S2-S7): the jobs cron still runs that have a cron line, and when this runner
+        # would start each next (in memory: a restart only starts the comparison afresh)
+        self.shadow = shadow
+        self.shadow_jobs = [j for n, j in sorted(self.jobs.items()) if j.cron_tag and n not in self.owns] \
+            if shadow is not None else []
+        self.shadow_next: dict[str, datetime] = {}
 
     # ---- small parts
 
@@ -533,6 +580,33 @@ class Runner:
         self.ws_anchor = pending[0] - TINY      # until its run row exists (a drain may hold it)
         return Due(job, pending[1], pending[0])
 
+    # ---- the shadow (S2-S7)
+
+    def _shadow_due(self, job: Job, now: datetime) -> Optional[datetime]:
+        if job.window_start:
+            return schedule.next_session_start(now, self.schedule_cfg())
+        return next_tick(job, now)
+
+    def shadow_pass(self, now: datetime) -> None:
+        """For each job cron still runs: when its time has come, a shadow line `<job> [<key>] due
+        <time> at <now>` (what this runner would start, to the millisecond), then its next time.
+        A window start's next time is re-read every pass (the window settings can change)."""
+        write = self.shadow
+        if write is None:
+            return
+        for job in self.shadow_jobs:
+            due = self.shadow_next.get(job.name)
+            if due is not None and due <= now:
+                key = f" {schedule.start_key(due, self.schedule_cfg())}" if job.window_start else ""
+                write(f"{job.name}{key} due {_iso_ms(due)} at {_iso_ms(now)}")
+                due = None
+            if due is None or job.window_start:
+                nxt = self._shadow_due(job, now)
+                if nxt is None:
+                    self.shadow_next.pop(job.name, None)
+                else:
+                    self.shadow_next[job.name] = nxt
+
     # ---- runs
 
     def start(self, due: Due, now: datetime) -> Optional[int]:
@@ -652,12 +726,14 @@ class Runner:
     # ---- the loop
 
     def sleep_for(self, now: datetime) -> float:
-        """Seconds until the earliest due time of an owned job (at most MAX_SLEEP)."""
+        """Seconds until the earliest due time of an owned job or a shadow time (at most MAX_SLEEP)."""
         best = MAX_SLEEP
         for name in self.owns:
             nd = self._next_due(name)
             if nd is not None and name not in self.tasks:
                 best = min(best, max(0.0, (nd - now).total_seconds()))
+        for t in self.shadow_next.values():
+            best = min(best, max(0.0, (t - now).total_seconds()))
         return best
 
     def request_stop(self) -> None:
@@ -712,6 +788,7 @@ class Runner:
                     self.scans += 1
                     for due in self.plan(now):
                         self.start(due, now)
+                    self.shadow_pass(now)
                     delay = self.sleep_for(now)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.wake_event.wait(), delay)
@@ -782,20 +859,31 @@ def _is_watcher(argv: list[str]) -> bool:
             and not WATCHER_ONE_SHOT & set(argv))
 
 
-def local_watchers() -> list[int]:
-    """Pids of keep-alive watchers in this container / host (/proc)."""
-    out: list[int] = []
-    for d in os.listdir("/proc") if os.path.isdir("/proc") else []:
+def _proc_argvs(proc: str = "/proc") -> Iterable[tuple[int, list[str]]]:
+    """(pid, argv) of every process in this container / host (a zombie has an empty argv)."""
+    for d in os.listdir(proc) if os.path.isdir(proc) else []:
         if not d.isdigit():
             continue
         try:
-            with open(f"/proc/{d}/cmdline", "rb") as fh:
+            with open(os.path.join(proc, d, "cmdline"), "rb") as fh:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
         except OSError:
             continue
-        if _is_watcher(argv):
-            out.append(int(d))
-    return out
+        yield int(d), argv
+
+
+def local_watchers() -> list[int]:
+    """Pids of keep-alive watchers in this container / host (/proc)."""
+    return [pid for pid, argv in _proc_argvs() if _is_watcher(argv)]
+
+
+def _is_serve(argv: list[str]) -> bool:
+    return any(a.endswith("runner.py") and argv[i + 1:i + 2] == ["serve"] for i, a in enumerate(argv[:4]))
+
+
+def runner_pids(proc: str = "/proc") -> list[int]:
+    """Pids of live `runner.py serve` processes (not this one; not a zombie)."""
+    return [pid for pid, argv in _proc_argvs(proc) if pid != os.getpid() and _is_serve(argv)]
 
 
 def host_watchers() -> list[int]:
@@ -831,7 +919,9 @@ def status(conn: Any, now: Optional[datetime] = None) -> dict[str, Any]:
     jobs = []
     for name, job in JOBS.items():
         r = rows.get(name) or {}
-        jobs.append({"job": name, "owned": name in RUNNER_OWNS, "next_due": r.get("next_due"),
+        jobs.append({"job": name, "owned": name in RUNNER_OWNS,
+                     "owner": "runner" if name in RUNNER_OWNS else "cron" if job.cron_tag else None,
+                     "next_due": r.get("next_due"),
                      "last_status": r.get("last_status"), "last_ok_at": r.get("last_ok_at"),
                      "consecutive_failures": r.get("consecutive_failures", 0)})
     st = actions.runner_state_get(conn)
@@ -850,7 +940,7 @@ def print_status(s: dict[str, Any]) -> None:
     print(f"boot: {str(b.get('boot_id', '-'))[:8]} pid {b.get('pid', '-')} since {b.get('started_at', '-')}; "
           f"clean exit: {s['clean_exit']}; drain: {s['drain']['until'] if s['drain'] else 'none'}")
     for j in s["jobs"]:
-        print(f"  {j['job']:<13} {'owned' if j['owned'] else 'cron ':<5} next {j['next_due'] or '-':<21} "
+        print(f"  {j['job']:<13} {j['owner'] or '-':<6} next {j['next_due'] or '-':<24} "
               f"last {j['last_status'] or '-':<9} ok {j['last_ok_at'] or '-':<21} fails {j['consecutive_failures']}")
     for r in s["running"]:
         print(f"running: run {r['id']} {r['job']} {r['key'] or ''} since {r['started_at']} pid {r['pid']}")
@@ -895,6 +985,270 @@ def undrain(conn: Any) -> None:
     wake()
 
 
+# ---------------------------------------------------------------- beside supercronic (S2-S7): ensure, stop, the shadow
+
+ENSURE_SETTLE = 5.0                       # ensure: a runner it started that exits within this did not start
+STALE_BEAT = timedelta(minutes=10)        # ensure: a running runner's heartbeat older than this is an error
+SHADOW = "runner_shadow"                  # the shadow lines' component (runner_state.LOG_FILES)
+CRON_RUNS = "cron_runs.log"               # supercronic's job-start lines, copied by docker/entrypoint.sh
+SHADOW_TOLERANCE = 2.0                    # seconds between a shadow time and cron's start that still match
+DECISION_WINDOW = timedelta(minutes=10)   # a window start's decision line comes within this of it
+
+
+def _spawn_serve() -> Any:
+    """`runner.py serve`, detached (its own session, parent: tini), its output to data/runner.log
+    (never the caller's stdout: supercronic would wait for the pipe to close)."""
+    path = runner_state.live_path(COMPONENT, runner_state.LOG_FILES)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as out:
+        return subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "serve"], stdout=out,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                                cwd=HERE)
+
+
+def _ensure_lock() -> Optional[int]:
+    path = os.path.join(run_dir(), ".ensure.lock")
+    os.makedirs(run_dir(), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def ensure(*, connect: Callable[[], Any] = store.connect, pids: Callable[[], list[int]] = runner_pids,
+           spawn: Callable[[], Any] = _spawn_serve,
+           settle: float = ENSURE_SETTLE, clock: Callable[[], datetime] = _utcnow,
+           sleep: Callable[[float], object] = time.sleep, fail: FailFn = failstop.fail,
+           log_fn: Callable[[str], None] = log) -> int:
+    """The temporary cron watchdog (docker/crontab */5, S2 until S8). A runner runs: its heartbeat
+    must be fresh (else an alert + pause: its watchdog thread should have ended it). None runs: it
+    starts one detached and reports what nobody else reports (D-235): a runner that stopped
+    without a crash it reported or an unclean exit its new boot reports (D-257), or one that does
+    not start. -> 0."""
+    lock = _ensure_lock()
+    if lock is None:
+        return 0                    # another ensure is at it
+    try:
+        conn = connect()
+        try:
+            running = pids()
+            st = actions.runner_state_get(conn)
+            if running:
+                row = store.get_runner_job(conn, actions.RUNNER_ROW)
+                beat = _parse(row["heartbeat_at"]) if row else None
+                b = st.get("boot")
+                since = _parse_text(b.get("started_at")) if isinstance(b, dict) else None
+                now = clock()
+                if (beat is None or now - beat > STALE_BEAT) and (since is None or now - since > STALE_BEAT):
+                    fail(COMPONENT, "the runner's heartbeat is stale",
+                         f"runner pid {', '.join(map(str, running))} runs, but its loop's last heartbeat is "
+                         f"{_iso(beat) if beat else 'none'} (more than {STALE_BEAT} ago); its watchdog thread "
+                         "should have ended it. Look at data/runner.log; restart the container if it hangs",
+                         log=log_fn)
+                return 0
+        finally:
+            conn.close()
+        proc = spawn()
+        deadline = time.monotonic() + settle
+        rc = proc.poll()
+        while rc is None and time.monotonic() < deadline:
+            sleep(0.2)
+            rc = proc.poll()
+        prev = st.get("boot") if isinstance(st.get("boot"), dict) else None
+        crashed = st.get("crashed") if isinstance(st.get("crashed"), dict) else None
+        if rc == EXIT_LOCKED:
+            log_fn("ensure: another runner took the lock meanwhile")
+        elif rc == EXIT_REPORTED:
+            log_fn(f"ensure: the runner it started (pid {proc.pid}) exited at once; it reported why itself")
+        elif rc is not None:
+            fail(COMPONENT, "the runner did not start",
+                 f"`runner.py serve` (pid {proc.pid}) exited {rc} within {settle:g} s; see data/runner.log",
+                 log=log_fn)
+        elif prev is not None and st.get("clean_exit") is not True:
+            why = ("its crash (reported then)" if crashed is not None and crashed.get("boot_id") == prev.get("boot_id")
+                   else "an unclean exit (its new boot reports it)")
+            log_fn(f"ensure: the runner was not running after {why}; started again (pid {proc.pid})")
+        else:
+            fail(COMPONENT, "the runner was not running",
+                 f"the watchdog (runner.py ensure) started it again (pid {proc.pid}); the previous runner "
+                 + (f"(boot {str(prev.get('boot_id'))[:8]}) had exited cleanly, i.e. it was stopped while the "
+                    "container ran" if prev is not None else "never booted (the entrypoint's start failed?)")
+                 + "; see data/runner.log", log=log_fn)
+        return 0
+    finally:
+        os.close(lock)
+
+
+def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runner_pids,
+         sleep: Callable[[float], object] = time.sleep, out: Callable[[str], object] = print) -> int:
+    """SIGTERM to every running `runner.py serve`, then wait until they are gone (a stopping runner
+    gives its running runs up to STOP_GRACE). The entrypoint's TERM trap: tini signals only its
+    child, the entrypoint shell, which keeps supercronic AND the runner (whoever started it).
+    -> 0 stopped (or none ran), 1 still running after wait_s."""
+    targets = pids()
+    if not targets:
+        out("runner: none running")
+        return 0
+    for pid in targets:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + wait_s
+    while True:
+        left = sorted(set(targets) & set(pids()))
+        if not left:
+            out(f"runner: stopped (pid {', '.join(map(str, targets))})")
+            return 0
+        if time.monotonic() >= deadline:
+            out(f"runner: still running after {wait_s:g} s (pid {', '.join(map(str, left))})")
+            return 1
+        sleep(0.2)
+
+
+def shadow_log(line: str) -> None:
+    """A shadow line: data/runner_shadow.log + app_log (component runner_shadow). Never raises."""
+    text = f"[{datetime.now(BERLIN):%Y-%m-%d %H:%M:%S %Z}] {line}"
+    path = runner_state.live_path(SHADOW, runner_state.LOG_FILES)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError as e:
+        sys.stderr.write(f"runner shadow log: {type(e).__name__}: {e}\n")
+    runner_state.log_lines(SHADOW, text)
+
+
+_SHADOW_RE = re.compile(r"\] (?P<job>[a-z][a-z0-9_]*)(?: (?P<key>\S+))? due (?P<due>\S+) at (?P<at>\S+)\s*$")
+_CRON_RE = re.compile(r'time="(?P<t>[^"]+)".*\bmsg=starting\b')
+_DECISION_RE = re.compile(r"\] window-start: (?P<word>[A-Z]+)")
+
+
+@dataclass(frozen=True)
+class ShadowEntry:
+    job: str
+    key: Optional[str]
+    due: datetime
+    at: datetime
+
+
+def parse_shadow(lines: Iterable[str]) -> list[ShadowEntry]:
+    out: list[ShadowEntry] = []
+    for ln in lines:
+        m = _SHADOW_RE.search(ln)
+        due, at = (_parse_text(m.group("due")), _parse_text(m.group("at"))) if m else (None, None)
+        if m and due is not None and at is not None:
+            out.append(ShadowEntry(m.group("job"), m.group("key"), due, at))
+    return out
+
+
+def parse_cron(lines: Iterable[str], jobs: dict[str, Job]) -> list[tuple[str, datetime]]:
+    """(job, start) of supercronic's `msg=starting` lines whose command carries a job's cron tag."""
+    tags = [(j.cron_tag, n) for n, j in jobs.items() if j.cron_tag]
+    out: list[tuple[str, datetime]] = []
+    for ln in lines:
+        m = _CRON_RE.search(ln)
+        t = _parse_text(m.group("t")) if m else None
+        if t is None:
+            continue
+        for tag, name in tags:
+            if f"# {tag}" in ln:
+                out.append((name, t))
+                break
+    return out
+
+
+def parse_decisions(lines: Iterable[str]) -> list[tuple[datetime, str]]:
+    """(time, FIRE|HOLD|POSTPONE...) of the keep-alive's window-start decision lines (not the
+    postponed rechecks: those come from the watcher, not from a start)."""
+    out: list[tuple[datetime, str]] = []
+    for ln in lines:
+        m = _DECISION_RE.search(ln)
+        ts = runner_state.line_ts(ln) if m else None
+        t = _parse_text(ts) if m and ts else None
+        if m and t is not None:
+            out.append((t, m.group("word")))
+    return out
+
+
+def shadow_report(shadow: list[ShadowEntry], cron: list[tuple[str, datetime]], decisions: list[tuple[datetime, str]],
+                  *, since: datetime, until: datetime, jobs: Optional[dict[str, Job]] = None,
+                  tolerance: float = SHADOW_TOLERANCE) -> tuple[list[str], int]:
+    """The shadow (when the runner would have started each job cron runs) against cron's actual
+    starts between since and until. An interval job: every shadow time has a cron start within
+    `tolerance` and every cron start a shadow time, as long as the runner ran then (its shadow lines
+    of that job on both sides); a window start: a cron start within `tolerance` (to the second) and
+    the keep-alive's decision line after it, and no decision line without a shadow start while the
+    runner ran. -> (report lines, number of mismatches)."""
+    js = JOBS if jobs is None else jobs
+    tol = timedelta(seconds=tolerance)
+    sh = [e for e in shadow if since <= e.due <= until]
+    cr = [(n, t) for n, t in cron if since <= t <= until]
+    out = [f"shadow vs cron, {_iso(since)} .. {_iso(until)} (tolerance {tolerance:g} s)"]
+    bad: list[str] = []
+    for name in sorted({e.job for e in sh} | {n for n, _ in cr}):
+        job = js.get(name)
+        mine = sorted((e for e in sh if e.job == name), key=lambda e: e.due)
+        theirs = sorted(t for n, t in cr if n == name)
+        used: set[int] = set()
+        matched, worst, lag = 0, 0.0, 0.0
+        decided: list[str] = []
+        for e in mine:
+            hit = next((i for i, t in enumerate(theirs) if i not in used and abs(t - e.due) <= tol), None)
+            lag = max(lag, (e.at - e.due).total_seconds())
+            if hit is None:
+                bad.append(f"MISMATCH {name}{' ' + e.key if e.key else ''}: the runner's time {_iso_ms(e.due)} has "
+                           "no cron start")
+                continue
+            used.add(hit)
+            matched += 1
+            worst = max(worst, abs((theirs[hit] - e.due).total_seconds()))
+            if job is not None and job.window_start:
+                d = next((w for t, w in decisions if e.due <= t <= e.due + DECISION_WINDOW), None)
+                decided.append(f"{_iso(e.due)} {d or 'no decision line'}")
+                if d is None:
+                    bad.append(f"MISMATCH {name} {e.key}: cron started at {_iso(e.due)} but the keep-alive logged no "
+                               "window-start decision")
+        if job is not None and job.window_start:
+            # cron runs every 30 min and acts only at a start: a decision line is what must match
+            for t, w in decisions:
+                if not since <= t <= until or any(e.due <= t <= e.due + DECISION_WINDOW for e in mine):
+                    continue
+                if any(abs(x.at - t) <= DECISION_WINDOW for x in sh):
+                    bad.append(f"MISMATCH {name}: the keep-alive decided {w} at {_iso(t)}; the runner foresaw "
+                               "no start then")
+            out.append(f"  {name:<13} shadow {len(mine):>4}  matched {matched:>4}  max |cron-due| {worst:.0f} s  "
+                       f"runner lag max {lag:.3f} s" + (f"; {', '.join(decided)}" if decided else ""))
+            continue
+        step = job.every if job is not None and job.every is not None else timedelta(days=1)
+        extra = 0
+        for i, t in enumerate(theirs):
+            if i in used:
+                continue
+            before = any(t - step - tol <= e.due < t for e in mine)
+            after = any(t < e.due <= t + step + tol for e in mine)
+            if before and after:
+                extra += 1
+                bad.append(f"MISMATCH {name}: cron started at {_iso(t)}; the runner had no time for it")
+        out.append(f"  {name:<13} shadow {len(mine):>4}  cron {len(theirs):>4}  matched {matched:>4}  "
+                   f"max |cron-due| {worst:.0f} s  runner lag max {lag:.3f} s"
+                   + (f"  ({len(theirs) - matched - extra} cron start(s) while the runner was not running)"
+                      if len(theirs) - matched - extra else ""))
+    out.extend(bad[:50])
+    if len(bad) > 50:
+        out.append(f"... and {len(bad) - 50} more")
+    out.append(f"{len(bad)} mismatch(es)" if bad else "OK: the shadow times match cron's starts")
+    return out, len(bad)
+
+
+def _read_lines(path: str) -> list[str]:
+    if path == "-":
+        return sys.stdin.read().splitlines()
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read().splitlines()
+
+
 # ---------------------------------------------------------------- serve, CLI
 
 def serve(owns: Optional[frozenset[str]] = None) -> int:
@@ -910,7 +1264,7 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
     runner: Optional[Runner] = None
     try:
         conn = store.connect()
-        runner = Runner(conn, owns=o)
+        runner = Runner(conn, owns=o, shadow=shadow_log)
         r = runner
         Watchdog(lambda: r.beat_mono).start()
         runner.boot()
@@ -939,11 +1293,43 @@ def main(argv: Optional[list[str]] = None) -> int:
                                                                  "session-run timeout + 5)")
     sub.add_parser("undrain", help="lift a drain")
     sub.add_parser("wake", help="make the runner re-read the DB now")
+    sub.add_parser("ensure", help="cron watchdog (S2-S7): start the runner unless one runs, check its heartbeat")
+    sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the entrypoint's TERM trap)")
+    r = sub.add_parser("shadow-report", help="the shadow times against cron's actual starts (exit 1 on a mismatch)")
+    r.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
+    r.add_argument("--cron-log", default=None, help=f"supercronic's lines (default data/{CRON_RUNS}; - = stdin, "
+                                                     "e.g. `docker logs afclaude 2>&1`)")
+    r.add_argument("--shadow-log", default=None, help="the shadow lines (default data/runner_shadow.log)")
+    r.add_argument("--decisions-log", default=None, help="the keep-alive's log (default data/keepalive/keepalive.log)")
+    r.add_argument("--tolerance", type=float, default=SHADOW_TOLERANCE, help="seconds (default 2)")
     args = ap.parse_args(argv)
     if args.cmd == "serve":
         return serve()
     if args.cmd == "wake":
         return 0 if wake() else 1
+    if args.cmd == "stop":
+        return stop()
+    if args.cmd == "ensure":
+        try:
+            return ensure()
+        except Exception as e:   # noqa: BLE001 - the watchdog itself failed: report it (D-235)
+            failstop.fail(COMPONENT, "the runner watchdog failed", f"{type(e).__name__}: {e}\n"
+                          f"{traceback.format_exc()[-1500:]}", log=log)
+            return EXIT_REPORTED
+    if args.cmd == "shadow-report":
+        until = _utcnow()
+        data = runner_state.data_dir()
+        try:
+            shadow = parse_shadow(_read_lines(args.shadow_log or runner_state.live_path(SHADOW, runner_state.LOG_FILES)))
+            cron = parse_cron(_read_lines(args.cron_log or os.path.join(data, CRON_RUNS)), JOBS)
+            decisions = parse_decisions(_read_lines(args.decisions_log or runner_jobs.log_path("window_start")))
+        except OSError as e:
+            print(f"shadow-report: {type(e).__name__}: {e}", file=sys.stderr)
+            return 2
+        lines, bad = shadow_report(shadow, cron, decisions, since=until - timedelta(hours=args.hours), until=until,
+                                   tolerance=args.tolerance)
+        print("\n".join(lines))
+        return 1 if bad else 0
     conn = store.connect()
     try:
         if args.cmd == "status":

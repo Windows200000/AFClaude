@@ -84,6 +84,7 @@ LOG_FILES: dict[str, str] = {
     "host_exec": "host_exec.log",
     "at_shim": "at_shim.log",
     "runner": "runner.log",          # the resident runner (phase 3a, runner.py): written and dual-written by it
+    "runner_shadow": "runner_shadow.log",   # its shadow of the jobs cron still runs (phase 3a S2-S7)
 }
 OWN_FILE = "own_sessions.txt"
 SPOOL_DIR = "at_spool"

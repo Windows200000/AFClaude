@@ -15,6 +15,9 @@ services:
     image: afclaude-manager:latest
     container_name: afclaude
     restart: unless-stopped
+    # a `docker stop` reaches the runner through the entrypoint (runner.py stop): its running runs get
+    # up to 80 s (runner.STOP_GRACE) to end before it records its clean exit (phase 3a S2)
+    stop_grace_period: 90s
     environment:
       AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
       AFCLAUDE_MANAGER_SESSION: ${AFCLAUDE_MANAGER_SESSION:?set in docker/.env}
