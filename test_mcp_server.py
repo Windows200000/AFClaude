@@ -17,6 +17,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import afclaude_config  # noqa: E402
 import mcp_server as ms  # noqa: E402
 import store  # noqa: E402
 from mcp import types  # noqa: E402
@@ -48,16 +49,25 @@ class Env(unittest.TestCase):
         os.makedirs(os.path.join(self.work, "sub"))
         self._env = dict(os.environ)
         self._cwd = os.getcwd()
+        config = os.path.join(t, "afclaude.json")
+        with open(config, "w") as fh:     # synthetic manager_session: no code default any more (D-235)
+            json.dump({"manager_session": SID}, fh)
         os.environ.update(AFCLAUDE_DB=self.db, AFCLAUDE_PROJECTS_DIR=self.projects_dir,
-                          CLAUDE_CODE_SESSION_ID=CALLER)
+                          AFCLAUDE_CONFIG=config, CLAUDE_CODE_SESSION_ID=CALLER)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
         os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # the tests act as the owner's session
+        # afclaude_config.CONFIG_FILE was already bound (at `import mcp_server` above, before any
+        # setUp runs): the env var alone is too late in-process, unlike the Stdio class below,
+        # which spawns a fresh subprocess that reads it at its own import time.
+        self._config_file = afclaude_config.CONFIG_FILE
+        afclaude_config.CONFIG_FILE = config
         store.connect(self.db, create=True).close()    # like a real install's setup: the DB already
                                                         # exists before the MCP server ever connects
         os.chdir(self.work)
 
     def tearDown(self):
         os.chdir(self._cwd)
+        afclaude_config.CONFIG_FILE = self._config_file
         os.environ.clear()
         os.environ.update(self._env)
         self.tmp.cleanup()
@@ -474,9 +484,12 @@ class Stdio(unittest.TestCase):
         self.work = os.path.join(t, "StdioProj")
         os.makedirs(self.work)
         os.makedirs(os.path.join(t, "transcripts"))
+        config = os.path.join(t, "afclaude.json")
+        with open(config, "w") as fh:     # synthetic manager_session: no code default any more (D-235)
+            json.dump({"manager_session": SID}, fh)
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "AFCLAUDE"))}
         env.update(AFCLAUDE_DB=self.db, AFCLAUDE_PROJECTS_DIR=os.path.join(t, "transcripts"),
-                   CLAUDE_CODE_SESSION_ID=CALLER)
+                   AFCLAUDE_CONFIG=config, CLAUDE_CODE_SESSION_ID=CALLER)
         store.connect(self.db, create=True).close()    # like a real install's setup: the DB already
                                                         # exists before the MCP server ever connects
         self.params = StdioServerParameters(command=sys.executable, args=[os.path.join(HERE, "mcp_server.py")],

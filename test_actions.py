@@ -16,6 +16,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (hermetic: a temp DB, config and data dir; before the AFClaude
+                                   # imports, so a plain `discover` run -- this file sorts first --
+                                   # does not bind afclaude_config.CONFIG_FILE to the live repo path)
 import actions  # noqa: E402
 import afclaude_config  # noqa: E402
 import store  # noqa: E402
@@ -93,7 +96,9 @@ class Base(unittest.TestCase):
         store._utcnow = self.clock
         actions.OWN_LIST = os.path.join(t, "own_sessions.txt")
         actions.PROMPTS_DIR = os.path.join(t, "prompts")
-        afclaude_config.CONFIG_FILE = os.path.join(t, "afclaude.json")    # no local file: code defaults
+        afclaude_config.CONFIG_FILE = os.path.join(t, "afclaude.json")    # tunables: code defaults
+        with open(afclaude_config.CONFIG_FILE, "w") as fh:    # identity only: manager_session has no
+            json.dump({"manager_session": SID}, fh)           # code default any more (D-235)
         os.makedirs(actions.PROMPTS_DIR)
         with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
             fh.write("Continue ({reason}). Progress: {progress}. Literal {{braces}}.\n")

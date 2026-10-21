@@ -8,7 +8,10 @@ re-reads per loop (schedule.py reads the window settings on every call). If the 
 and returns the code default (the full DB error path is phase 2a step 3, §7.8 / D-171).
 
 Machine identity stays in the local file data/afclaude.json (gitignored; or $AFCLAUDE_CONFIG;
-template afclaude.example.json): manager_session, trust_root, the dashboard block.
+template afclaude.example.json): manager_session, trust_root, the dashboard block. manager_session
+has no code default (D-235): a missing one raises ConfigError, which callers that run under cron
+(dispatcher, keepalive, usage_report, export_quickview) turn into an alert/pause (or, for a display
+path like quickview, D-239: show the error) instead of crashing silently on every run.
 
 One-time import (phase 2a): tunables still found in data/afclaude.json, data/dispatcher.json
 or (the pacing keys) the user model are imported into the DB on first use through
@@ -235,11 +238,17 @@ def pacing_params() -> dict[str, Any]:
 
 
 # ---- machine identity (dashboard design §7.3), the local file. Committed template with
-# placeholders: afclaude.example.json. The LEGACY_* values are what the code had hardcoded
-# before; they apply only while the local file does not set the key.
+# placeholders: afclaude.example.json. LEGACY_TRUST_ROOT is what the code had hardcoded before;
+# it applies only while the local file does not set trust_root. manager_session has no such
+# fallback any more (D-235): a host-specific session id does not belong in this public file, so a
+# missing manager_session is a config error, not a silently-used default.
 EXAMPLE_FILE = os.path.join(HERE, "afclaude.example.json")
-LEGACY_MANAGER_SESSION = "f2897285-dd97-49d9-b29a-2334b4753dee"
 LEGACY_TRUST_ROOT = "/mnt/BlockVolume/Claude"
+
+
+class ConfigError(ValueError):
+    """A required machine-identity value is missing from the local config file (D-235: no
+    silent fallback to a baked-in default)."""
 
 
 def _read_json(path: str) -> dict:
@@ -268,8 +277,14 @@ def _text(key: str, legacy: str) -> str:
 
 
 def manager_session() -> str:
-    """Session id of the AFClaude manager (keep-alive target; the dispatcher never touches it)."""
-    return _text("manager_session", LEGACY_MANAGER_SESSION)
+    """Session id of the AFClaude manager (keep-alive target; the dispatcher never touches it).
+    Raises ConfigError if the local file (CONFIG_FILE, or $AFCLAUDE_CONFIG) has no manager_session
+    (D-235: no baked-in fallback for host-specific data)."""
+    v = identity("manager_session")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    raise ConfigError(f"manager_session is not set in {CONFIG_FILE} (see afclaude.example.json); "
+                      "set it to this machine's AFClaude manager session id")
 
 
 def trust_root() -> str:

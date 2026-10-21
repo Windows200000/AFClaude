@@ -75,8 +75,17 @@ LOG_FILE = os.path.join(DATA_DIR, "dispatcher.log")
 LOCK_FILE = os.path.join(DATA_DIR, ".dispatcher.lock")
 CONFIG_FILE = os.path.join(DATA_DIR, "dispatcher.json")
 # The AFClaude task-manager session (continued by keepalive.py at each session-window start);
-# same source as export_quickview.py's SELF_SESSION (data/afclaude.json manager_session).
-MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
+# same source as export_quickview.py's SELF_SESSION (data/afclaude.json manager_session). A
+# missing manager_session must not crash the import (every pass, every 10 min, with no alert):
+# MANAGER_SESSION is None and load_config() below raises failstop.Failed, which main() turns
+# into the usual alert + pause (D-235) and aborts the pass before anything (e.g. cleanup(),
+# which must never mistake the task-manager's own tmux session for an orphan) runs on it.
+MANAGER_SESSION_ERROR = None
+try:
+    MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
+except afclaude_config.ConfigError as e:
+    MANAGER_SESSION = None
+    MANAGER_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
 TMUX_RE = re.compile(r"ka-[0-9a-f]{8}")
 
 # data/dispatcher.json: session ids only (machine identity, D-146)
@@ -127,6 +136,8 @@ def log(msg):
 def load_config(path=None, overrides=None):
     """The pass's config: the session ids of data/dispatcher.json (or `path`), the tunables from
     the DB settings (afclaude_config.settings: DB value, else the code default), then `overrides`."""
+    if MANAGER_SESSION is None:   # D-235: no fallback; the pass must not run without knowing it
+        raise failstop.Failed("manager_session not configured", MANAGER_SESSION_ERROR or "")
     s = afclaude_config.settings(*SETTING_KEYS.values())   # first: it imports the file's old tunables once
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
