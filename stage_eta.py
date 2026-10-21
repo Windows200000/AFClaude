@@ -12,9 +12,11 @@ required/(total available-user usage)".
                            task.update, MCP afclaude_update_task, tasks.py edit --sessions; the
                            task-manager may set it, D-185; the stage-ETA review tunes it),
                         2. else the default from history: the median session windows per finished
-                           stage (AFClaude's runs in data/afclaude_runs.jsonl, run_metrics, spread
-                           over the stages that were in progress during each run), once at least
-                           MIN_HISTORY stages have a measurement,
+                           stage (AFClaude's runs in data/afclaude_runs.jsonl, run_metrics, and the
+                           owner's design chats (D-264/D-266: a stage's cost = run + design-chat usage
+                           within its started..done window; pacing.design_intervals, weekly % / the
+                           full session's weekly %), each spread over the stages that were in
+                           progress at the time), once at least MIN_HISTORY stages have a measurement,
                         3. else FALLBACK_SESSIONS (one full session window per stage).
     available capacity  AFClaude's session windows as the night gate would actually allow them
                         (D-141, D-202/D-203, D-020), with pacing's forecast of the user's use (the
@@ -26,11 +28,17 @@ required/(total available-user usage)".
                         stretch fills what is left (100 - weekly % - the user's forecast during it)
                         in its slot starts; later weeks the same from 0%. A session window's
                         weekly cost = ratio x 100 (limit_ratio.preferred_ratio via pacing).
+                        Design chats (D-266): the gate's forecast is the user's other use + the
+                        design chats (pacing.forecast_gate, so the gate stays protective), and the
+                        design chats are AFClaude work too: their steady weekly amount (D-264,
+                        pacing.forecast_design) / the full session's weekly % is capacity, one
+                        "design" slot per day.
     ETA                 the stages' cumulative sessions laid onto those slots in order: stage k is
                         done in the slot where the capacity reaches the sum of stages 1..k.
 
 Summary rate (the tooltip): sessions/day = the capacity of a full typical week / 7, next to the
-owner's formula as written: (100 - the user's forecast week) / the weekly % of one session window.
+owner's formula as written: (100 - the user's forecast week) / the weekly % of one session window,
+with the user's forecast = the other use only (D-266: design chats are AFClaude's).
 
 predict() is pure (stages + Gate in, a JSON-ready dict out). gather() reads the live inputs
 (the task store, pacing's ratio/forecast/threshold, the schedule settings, the run history).
@@ -66,6 +74,8 @@ WEEK = timedelta(days=7)
 DAY = timedelta(days=1)
 FALLBACK_SESSIONS = 1.0     # session windows per stage without an estimate or enough history
 MIN_HISTORY = 3             # measured finished stages before the history default is used
+MIN_WINDOW = timedelta(minutes=30)   # a shorter started..done window (closed at once) has no measurement:
+                                     # one 15-min design-chat sample would be its whole "cost"
 MAX_WEEKS = 26              # horizon: a stage beyond it is "?" (unknown)
 EPS = 1e-9
 DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
@@ -74,7 +84,7 @@ RUNS_FILE = os.path.join(DATA_DIR, "afclaude_runs.jsonl")
 OPEN = ("pending", "in_progress", "blocked")
 KINDS = ("task",)           # questions and backlog projects are not worked as stages
 
-Forecast = Callable[[datetime, datetime], float]   # the user's forecast weekly % in [a, b)
+Forecast = Callable[[datetime, datetime], float]   # the user's (other) forecast weekly % in [a, b)
 
 
 @dataclass(frozen=True)
@@ -89,9 +99,12 @@ class Stage:
 @dataclass(frozen=True)
 class Gate:
     """What the night gate sees (pacing.decide's inputs): the weekly % now and its reset, the
-    session/weekly ratio, the reserve threshold (resolved to a %), the user's forecast (None = the
-    straight line), the schedule, the last-stretch setting and pacing_min_gap; the live session
-    window (its % and reset) if one is open. sources = where each input came from (the tooltip)."""
+    session/weekly ratio, the reserve threshold (resolved to a %), the user's forecast of the
+    other use (None = the straight line), the schedule, the last-stretch setting and
+    pacing_min_gap; the live session window (its % and reset) if one is open; design_week = the
+    design chats' steady weekly % (D-264/D-266: in the gate's forecast and AFClaude capacity) and
+    design_forecast = pacing's forecast of them (None: design_week spread evenly).
+    sources = where each input came from (the tooltip)."""
     weekly_pct: Optional[float]
     resets_at: Optional[datetime]
     ratio: float
@@ -103,6 +116,8 @@ class Gate:
     session_pct: Optional[float] = None
     session_resets_at: Optional[datetime] = None
     sources: Mapping[str, str] = field(default_factory=dict)
+    design_week: float = 0.0
+    design_forecast: Optional[Forecast] = None
 
 
 @dataclass(frozen=True)
@@ -110,7 +125,7 @@ class Slot:
     """AFClaude capacity: `sessions` session windows (<= 1) starting at `at`."""
     at: datetime
     sessions: float
-    kind: str        # night | last_stretch
+    kind: str        # night | last_stretch | design
 
 
 # ------------------------------------------------------------------ pacing (reused, not duplicated)
@@ -130,19 +145,34 @@ def _no_usage(a: datetime, b: datetime) -> float:
     return 0.0
 
 
+def _design(g: Gate, a: datetime, b: datetime) -> float:
+    """The design chats' forecast weekly % in [a, b) (pacing.forecast_design; without it the
+    steady amount design_week spread evenly)."""
+    if g.design_forecast is not None:
+        return g.design_forecast(a, b)
+    return g.design_week * max((b - a) / WEEK, 0.0)
+
+
+def gate_forecast(g: Gate) -> Forecast:
+    """What the night gate adds (pacing.forecast_gate): the user's other use + the design chats."""
+    fc = g.forecast or _no_usage
+    return lambda a, b: fc(a, b) + _design(g, a, b)
+
+
 # ------------------------------------------------------------------ estimates
 
 def history_default(done: Sequence[tuple[datetime, datetime]],
                     runs: Sequence[tuple[datetime, datetime, float]]) -> tuple[Optional[float], int]:
     """Median session windows per finished stage. done = (started, done) per finished stage; runs =
-    (start, end, session windows used = session % / 100) per AFClaude run. A run's sessions are
-    split evenly over the finished stages whose [started, done] overlaps it; a stage no run
-    overlapped (done interactively) has no measurement. -> (median | None below MIN_HISTORY, n)."""
+    (start, end, session windows used) per AFClaude run (session % / 100) and per design-chat
+    interval (D-264: weekly % / the full session's weekly %). A span's sessions are split evenly
+    over the finished stages whose [started, done] overlaps it; a stage nothing overlapped, or one
+    started and done within MIN_WINDOW, has no measurement. -> (median | None below MIN_HISTORY, n)."""
     per = [0.0] * len(done)
     for r0, r1, used in runs:
         if used <= 0:
             continue
-        hit = [i for i, (a, b) in enumerate(done) if a <= r1 and b >= r0 and b > a]
+        hit = [i for i, (a, b) in enumerate(done) if a <= r1 and b >= r0 and b - a >= MIN_WINDOW]
         for i in hit:
             per[i] += used / len(hit)
     measured = [x for x in per if x > 0]
@@ -218,16 +248,25 @@ def _week(g: Gate, t0: datetime, w0: float, reset: datetime, fc: Forecast, live:
 
 def capacity_slots(g: Gate, now: datetime, until: datetime) -> list[Slot]:
     """AFClaude's predicted session windows from now until `until`, week by week (the current week
-    from the weekly % now, later weeks from 0%). [] if the weekly usage is unknown or stale."""
+    from the weekly % now, later weeks from 0%), plus the design chats' (D-266): their steady
+    weekly % as one "design" slot at the end of each day from now. Sorted by time. [] if the
+    weekly usage is unknown or stale."""
     if g.weekly_pct is None or g.resets_at is None or g.resets_at <= now:
         return []
-    fc = g.forecast or _no_usage
+    fc = gate_forecast(g)
     out: list[Slot] = []
     t0, w0, reset, live = now, float(g.weekly_pct), g.resets_at, True
     while t0 < until:
         out += _week(g, t0, w0, reset, fc, live)
         t0, w0, reset, live = reset, 0.0, reset + WEEK, False
-    return [s for s in out if s.at < until]
+    full = _full_session_cost(g.ratio)
+    if g.design_week > EPS and full > 0:
+        day = g.design_week / 7.0 / full
+        at = now + DAY
+        while at < until:
+            out.append(Slot(at, day, "design"))
+            at += DAY
+    return sorted((s for s in out if s.at < until), key=lambda s: s.at)
 
 
 # ------------------------------------------------------------------ prediction
@@ -257,7 +296,7 @@ def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[f
     req = sessions_for(stages, default)
     total = sum(x for _, x, _ in req)
     full = _full_session_cost(g.ratio)
-    fc = g.forecast or _no_usage
+    fc = g.forecast or _no_usage          # the user's other use (D-266)
     srcs = {k: sum(1 for _, _, s in req if s == k) for k in ("estimate", "history", "fallback")}
     a: dict[str, Any] = {
         "sessions_total": _r(total), "ratio": _r(g.ratio, 4), "full_session_cost": _r(full, 1),
@@ -265,7 +304,9 @@ def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[f
         "fallback_sessions": FALLBACK_SESSIONS, "default_info": default_info, "estimate_sources": srcs,
         "order": "execution order: priority level, project rank, stage", "sources": dict(g.sources),
         "sessions_per_day": None, "gate_sessions_per_week": None, "formula_sessions_per_week": None,
-        "this_week_sessions": None, "user_forecast_week": None}
+        "this_week_sessions": None, "user_forecast_week": None,
+        "design_forecast_week": _r(g.design_week, 1), "design_sessions_per_week": None,
+        "night_sessions_per_week": None}
     out: dict[str, Any] = {"status": "ok", "reason": None, "now": _iso(now), "stages": [], "assumptions": a}
     unknown = g.weekly_pct is None or g.resets_at is None or g.resets_at <= now
     slots: list[Slot] = []
@@ -273,9 +314,11 @@ def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[f
         typ0 = g.resets_at
         slots = capacity_slots(g, now, max(now + max_weeks * WEEK, typ0 + WEEK + timedelta(seconds=1)))
         week = sum(s.sessions for s in slots if typ0 <= s.at < typ0 + WEEK)
+        design = sum(s.sessions for s in slots if typ0 <= s.at < typ0 + WEEK and s.kind == "design")
         user = fc(typ0, typ0 + WEEK) if g.forecast is not None else None
         a.update(this_week_sessions=_r(sum(s.sessions for s in slots if s.at < typ0)),
                  gate_sessions_per_week=_r(week), sessions_per_day=_r(week / 7, 3),
+                 design_sessions_per_week=_r(design), night_sessions_per_week=_r(week - design),
                  user_forecast_week=_r(user, 1),
                  formula_sessions_per_week=_r(max(100.0 - (user or 0.0), 0.0) / full) if full > 0 else None)
         slots = [s for s in slots if s.at < now + max_weeks * WEEK]
@@ -328,8 +371,9 @@ def assumptions_text(result: Mapping[str, Any]) -> str:
     src = a.get("estimate_sources") or {}
     d = a.get("default_sessions")
     return (f"ETA = cumulative sessions / AFClaude capacity (D-213): ~{a.get('sessions_per_day')} session windows/day "
-            f"({a.get('gate_sessions_per_week')}/week the night gate + last stretch allow; owner's formula "
-            f"(100 - user forecast {a.get('user_forecast_week')}%) / {a.get('full_session_cost')}% per session = "
+            f"({a.get('gate_sessions_per_week')}/week: {a.get('night_sessions_per_week')} the night gate + last stretch "
+            f"allow + {a.get('design_sessions_per_week')} design chats ({a.get('design_forecast_week')}%/week, D-266); "
+            f"owner's formula (100 - other user forecast {a.get('user_forecast_week')}%) / {a.get('full_session_cost')}% per session = "
             f"{a.get('formula_sessions_per_week')}/week; this week {a.get('this_week_sessions')} left). "
             f"Ratio {a.get('ratio')}, threshold {a.get('threshold')}%. Estimates: {src.get('estimate', 0)} set, "
             f"{src.get('history', 0)} history{f' ({d})' if d is not None else ''}, {src.get('fallback', 0)} fallback ({a.get('fallback_sessions')} "
@@ -406,9 +450,10 @@ def score(log_rows: Iterable[Mapping[str, Any]], done: Mapping[int, datetime],
 def usage_split(samples: Iterable[Mapping[str, Any]],
                 runs: Sequence[tuple[datetime, datetime, float]]) -> dict[str, dict[str, float]]:
     """The weekly % per usage cycle (keyed by its reset date) in three categories (D-221, a
-    measurement for the review; the capacity model does not use it): "run" = the sample interval
+    measurement for the review; the forecast and the capacity use pacing's equivalent split,
+    pacing.design_intervals, D-266): "run" = the sample interval
     overlaps an AFClaude run, "design" = AFClaude sessions' own activity outside runs (the owner's
-    task-manager chats; today user usage), "other" = other sessions on this host plus usage with no
+    task-manager chats; AFClaude usage, D-266), "other" = other sessions on this host plus usage with no
     host activity (other devices). A mixed interval is split by own vs other weighted tokens.
     Samples without a weekly_pct_delta (before the token split existed) are skipped."""
     out: dict[str, dict[str, float]] = {}
@@ -476,7 +521,9 @@ def gate_inputs(usage: Optional[Mapping[str, Any]], now: datetime) -> Gate:
     ratio, rsrc = cast(Callable[[], tuple[float, str]], pacing.ratio_info)()
     rates, fsrc = cast(Callable[..., tuple[Optional[list[float]], str]], pacing.profile)(None, now)
     fu = cast(Callable[[Optional[list[float]], datetime, datetime], float], pacing.forecast_user)
+    fd = cast(Callable[[Optional[list[float]], datetime, datetime], float], pacing.forecast_design)
     fc: Optional[Forecast] = None if rates is None else (lambda a, b: float(fu(rates, a, b)))
+    dfc: Optional[Forecast] = None if rates is None else (lambda a, b: float(fd(rates, a, b)))
     setting, tsrc = afclaude_config.reserve_threshold_setting()
     thr, thr_src = cast(Callable[[float, Any], tuple[float, str]], pacing.threshold_for)(ratio, setting)
     params, _ = cast(Callable[[], tuple[dict[str, Any], str]], pacing.load_params)()
@@ -486,7 +533,20 @@ def gate_inputs(usage: Optional[Mapping[str, Any]], now: datetime) -> Gate:
     return Gate(float(wp) if isinstance(wp, (int, float)) else None, reset, ratio, thr, fc, schedule.load(),
                 afclaude_config.last_mile_setting(), float(params.get("min_gap", 1.0)),
                 float(sp) if isinstance(sp, (int, float)) else None, sreset,
-                {"ratio": rsrc, "forecast": fsrc, "threshold": thr_src if setting == "auto" else tsrc})
+                {"ratio": rsrc, "forecast": fsrc, "threshold": thr_src if setting == "auto" else tsrc},
+                float(getattr(rates, "design_week", 0.0) or 0.0), dfc)
+
+
+def design_sessions(ratio: float) -> list[tuple[datetime, datetime, float]]:
+    """(start, end, session windows) of the owner's design chats per sample interval (D-264/D-266:
+    pacing.design_intervals over the samples, weekly % / the full session's weekly %)."""
+    import pacing
+    full = _full_session_cost(ratio)
+    rows = cast(Callable[..., list[dict[str, Any]]], pacing.tail_rows)(max_bytes=pacing.LONG_BYTES)   # sorted
+    iv = cast(Callable[..., list[tuple[datetime, datetime, float]]], pacing.design_intervals)(
+        rows, cast(Callable[[], list[datetime]], pacing.fire_times)(),
+        cast(Callable[[], list[dict[str, Any]]], pacing.run_rows)())
+    return [(a, b, d / full) for a, b, d in iv if d > 0] if full > 0 else []
 
 
 def gather(conn: sqlite3.Connection, usage: Optional[Mapping[str, Any]], now: Optional[datetime] = None,
@@ -497,10 +557,11 @@ def gather(conn: sqlite3.Connection, usage: Optional[Mapping[str, Any]], now: Op
         runs = run_sessions(runs_path)
     except Exception:   # noqa: BLE001 - no run history: the fallback
         runs = []
-    default, n = history_default([(a, b) for _, a, b in done_stages(conn)], runs)
-    info = (f"median of {n} measured finished stages" if default is not None else
+    g = gate_inputs(usage, now)
+    default, n = history_default([(a, b) for _, a, b in done_stages(conn)], runs + design_sessions(g.ratio))
+    info = (f"median of {n} measured finished stages (runs + design chats, D-264)" if default is not None else
             f"{n} measured finished stage(s) < {MIN_HISTORY}: fallback {FALLBACK_SESSIONS:g} session/stage")
-    return predict(open_stages(conn), gate_inputs(usage, now), now, default, info)
+    return predict(open_stages(conn), g, now, default, info)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
