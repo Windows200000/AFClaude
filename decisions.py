@@ -10,9 +10,13 @@ imports it, and builds what the task-manager reads:
     importer reads it (never writes it) and mirrors it into the table: one row per "### D-NNN" or
     "### M-NNN" entry (the drift log's DR-NN entries and other headings are not decisions), with
     the fields of its "**Name:** value" lines (Type, Date, Status, Supersedes, Summary, Keywords,
-    Owner's words, Source, Scope, Interpretation) and the full entry text. Idempotent: an unchanged
-    entry writes nothing, so an unchanged file is a no-op (no audit row). It runs every 10 min with
-    the docs import (project_docs.py import --cron), at every SessionStart hook below, and by hand:
+    Owner's words, Source, Scope, Interpretation) and the full entry text. An entry with no Status
+    line defaults to "active" (state_of), unless its title itself names the fate ("... (SUPERSEDED
+    by D-NNN: ...)", e.g. the early M-003) -- import_file's "no_status" always lists every entry
+    with no Status line, title marker or not, so the rest (plain, no marker) stay visible too, since
+    DECISIONS.md is never edited here to add one. Idempotent: an unchanged entry writes nothing, so
+    an unchanged file is a no-op (no audit row). It runs every 10 min with the docs import
+    (project_docs.py import --cron), at every SessionStart hook below, and by hand:
         python3 decisions.py import [--file PATH]        (= python3 tasks.py decision import)
   - keywords: the file's Keywords line, plus the task-manager's own additions and removals
     (`tasks.py decision keywords D-NNN add|remove KW...`, action decision.keywords, D-242). Those are
@@ -91,14 +95,24 @@ class Entry:
 
     def row(self) -> dict[str, Any]:
         d = asdict(self)
-        d["state"] = state_of(self.status)
+        d["state"] = state_of(self.status, self.title)
         return d
 
+    @property
+    def has_status(self) -> bool:
+        return bool((self.status or "").strip())
 
-def state_of(status: Optional[str]) -> str:
+
+TITLE_SUPERSEDED_RE = re.compile(r"\bsuperseded\b", re.IGNORECASE)
+
+
+def state_of(status: Optional[str], title: Optional[str] = None) -> str:
     """The status line -> active | partial | done | superseded. Anything that isn't plainly done
     or (fully) superseded counts as current: 'active (to build)', 'pending clarification', a
-    missing status."""
+    missing status. A handful of early manager entries (M-001..M-010) have no Status line at all;
+    when one of those also names its own fate in the title ("... (SUPERSEDED by D-NNN: ...)", e.g.
+    M-003) that marker decides instead of defaulting to active (`import_file`'s "no_status" list
+    still names every entry with no Status line, marked or not, so the rest stay visible too)."""
     s = (status or "").strip().lower()
     if s.startswith("partially superseded"):
         return "partial"
@@ -106,6 +120,8 @@ def state_of(status: Optional[str]) -> str:
         return "superseded"
     if s.startswith("done"):
         return "done"
+    if not s and title and TITLE_SUPERSEDED_RE.search(title):
+        return "superseded"
     return "active"
 
 

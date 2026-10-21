@@ -551,6 +551,49 @@ class Mapping(Repo):
             cm.load_mapping(self.write("mod.py:added maybe D-1\n"))
 
 
+class DecisionsDB(unittest.TestCase):
+    """load_decisions_db (D-242 follow-up): decisions default to the DB store; keywords are the
+    effective set (source Keywords line plus the task-manager's own additions/removals)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="manifest-decdb-")
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.db = os.path.join(self.tmp, "afclaude.db")
+        conn = store.connect(self.db, create=True)
+
+        def put(id_, title, status, state, keywords, ord_):
+            store.put_decision_entry(conn, {
+                "id": id_, "title": title, "type": "owner", "date": None, "status": status,
+                "state": state, "supersedes": None, "summary": None, "words": None, "source": None,
+                "scope": None, "interpretation": None, "section": "", "keywords": keywords,
+                "body": f"### {id_} {title}\n", "ord": ord_,
+            }, "cli")
+        with store.transaction(conn):
+            put("D-900", "Inbox for owner messages", "active", "active", ["inbox", "triage"], 0)
+            put("D-905", "Old box rule", "superseded by D-906", "superseded", ["box"], 1)
+            store.set_decision_keywords(conn, "D-900", ["owner-mail"], [], "cli")
+        conn.close()
+
+    def test_reads_state_and_effective_keywords(self):
+        by_id = {d.id: d for d in cm.load_decisions_db(self.db)}
+        self.assertEqual(set(by_id), {"D-900", "D-905"})
+        self.assertEqual(by_id["D-900"].status, "active")
+        self.assertIn("owner-mail", by_id["D-900"].keywords)        # the task-manager's own addition
+        self.assertTrue(cm.active(by_id["D-900"]))
+        self.assertEqual(by_id["D-905"].status, "superseded")
+        self.assertFalse(cm.active(by_id["D-905"]))
+
+    def test_missing_db_raises(self):
+        with self.assertRaises(cm.ManifestError):
+            cm.load_decisions_db(os.path.join(self.tmp, "none.db"))
+
+    def test_empty_db_raises(self):
+        empty = os.path.join(self.tmp, "empty.db")
+        store.connect(empty, create=True).close()
+        with self.assertRaises(cm.ManifestError):
+            cm.load_decisions_db(empty)
+
+
 class Audit(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="manifest-db-")
@@ -666,6 +709,21 @@ class Cli(Repo):
         code, _, err = self.run_main("HEAD~1..HEAD", "--decisions", self.decisions_path, "--since",
                                      "2026-10-14", "--db", os.path.join(self.tmp, "none.db"))
         self.assertEqual(code, 2)
+
+    def test_no_decisions_flag_reads_the_db(self):
+        # D-242 follow-up: --decisions omitted -> the DB at --db, not DECISIONS.md next to the script.
+        with mock.patch.object(cm, "load_decisions_db", return_value=[]) as fake, \
+             mock.patch.object(cm, "load_decisions") as unused:
+            code, _, _ = self.run_main("HEAD~1..HEAD", "--sections", "1", "--db", "/some/afclaude.db")
+        self.assertEqual(code, 0)
+        fake.assert_called_once_with("/some/afclaude.db")
+        unused.assert_not_called()
+
+    def test_explicit_decisions_flag_skips_the_db(self):
+        with mock.patch.object(cm, "load_decisions_db") as fake:
+            code, _, _ = self.run_main("HEAD~1..HEAD", "--sections", "1", "--decisions", self.decisions_path)
+        self.assertEqual(code, 0)
+        fake.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1606,9 +1606,12 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     new entries added, changed ones rewritten (the task-manager's keyword changes kept), entries
     no longer in the file removed. Idempotent: an unchanged file changes nothing (no audit row).
     The audit row names the ids and holds a line diff of each changed entry and the full text of
-    each removed one (D-158: every change in the audit log). Refused (decisions.SourceError): a
-    file without entries or with a duplicate id, and one that would remove more than half of
-    the stored entries (force=True allows that)."""
+    each removed one (D-158: every change in the audit log). The result's "no_status" names every
+    entry with no Status line (decisions.state_of defaults those to "active", or infers a state
+    from a title marker like "SUPERSEDED" -- the list still names them all, so the plain ones stay
+    visible without editing DECISIONS.md). Refused (decisions.SourceError): a file without entries
+    or with a duplicate id, and one that would remove more than half of the stored entries
+    (force=True allows that)."""
     import decisions as dec
     src = os.path.abspath(store._text(path, "path", required=True))
     try:
@@ -1638,8 +1641,9 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
         elif outcome == "moved":
             moved += 1
     removed = {i: store.delete_decision_entry(conn, i)["body"] for i in gone}
+    no_status = [e.id for e in entries if not e.has_status]   # visible without editing DECISIONS.md
     result = {"file": src, "sha256": sha, "entries": len(entries), "added": added, "changed": list(changed),
-              "removed": list(removed), "moved": moved,
+              "removed": list(removed), "moved": moved, "no_status": no_status,
               "unchanged": len(entries) - len(added) - len(changed) - moved}
     after = {"sha256": sha, "entries": len(entries), "added": added, "changed": changed,
              "removed": list(removed), "moved": moved}
