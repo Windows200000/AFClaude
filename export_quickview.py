@@ -60,7 +60,15 @@ AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # legacy (frozen): jobs 
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
 # This manager's own session/tmux (data/afclaude.json manager_session, as usage_report.py).
-SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manager_session()
+# A display path (D-239): a missing manager_session must not crash the export (no page update,
+# no alert, every 3 min); it is shown on the page instead (status.json self_session_error), and
+# every SELF_SESSION-dependent field below degrades to unknown rather than raising.
+try:
+    SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manager_session()
+    SELF_SESSION_ERROR = None
+except afclaude_config.ConfigError as e:
+    SELF_SESSION = None
+    SELF_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 # D-211: the step key (as build_stages() keys steps, e.g. "6a") from which a non-blocking owner
@@ -683,7 +691,11 @@ def next_run_block(u, now, decision=None):
 
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
-    out = {"watcher": watcher_running(), "tmux_ka_exists": ka.tmux_alive(SELF_SESSION),
+    try:
+        tmux_ka_exists = ka.tmux_alive(SELF_SESSION) if SELF_SESSION else None   # None = unknown (D-239)
+    except Exception:   # noqa: BLE001 - advisory: unknown, not raised
+        tmux_ka_exists = None
+    out = {"watcher": watcher_running(), "tmux_ka_exists": tmux_ka_exists,
            **window_info(now)}
     nr = next_review_block()
     out["next_usage_review_berlin"] = nr["at_berlin"]
@@ -916,6 +928,7 @@ def main():
     status = {
         "generated_at": now.isoformat(),
         "generated_berlin": bstr(now),
+        "self_session_error": SELF_SESSION_ERROR,  # D-239: shown, never crashes the export
         "automation": automation_block(),
         "manager_launch": manager_launch_block(),
         "remote_control": remote_control_block(),

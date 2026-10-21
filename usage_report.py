@@ -55,7 +55,6 @@ UTC = timezone.utc
 BERLIN = ka.BERLIN
 DATA = os.path.join(HERE, "data")
 REPORTS_FILE = os.path.join(DATA, "usage_reports.jsonl")
-DEFAULT_SESSION = afclaude_config.manager_session()   # data/afclaude.json manager_session
 RUNNING_MAX_AGE = 300  # seconds since last transcript entry -> still "running"
 
 
@@ -352,7 +351,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip(),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--session", help="session UUID (default $CLAUDE_CODE_SESSION_ID, "
-                                       f"else {DEFAULT_SESSION})")
+                                       "else the AFClaude manager session, data/afclaude.json)")
     ap.add_argument("--since", help="only count usage after this ISO timestamp")
     ap.add_argument("--last", action="store_true", help="only count usage since the "
                                                           "previous --record'ed report")
@@ -361,7 +360,8 @@ def main(argv=None):
     ap.add_argument("--record", action="store_true", help="append a row to the usage reports (the DB)")
     args = ap.parse_args(argv)
 
-    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or DEFAULT_SESSION
+    # lazy (D-235): manager_session() raises if unconfigured, but only when actually needed
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or afclaude_config.manager_session()
 
     since = None
     if args.since:

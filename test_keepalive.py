@@ -1028,8 +1028,9 @@ class RealTranscripts(unittest.TestCase):
         self.assertEqual(s["reset_from_text"], Z("2026-09-25T17:00:00Z"))
 
     def test_latest_entrypoint_real(self):
-        # the manager (tmux, old sdk-cli entries from a former --bg start) vs an rc thread
-        for sid, want in (("f2897285-dd97-49d9-b29a-2334b4753dee", "cli"),
+        # the manager (tmux, old sdk-cli entries from a former --bg start) vs an rc thread; real
+        # transcripts of this machine, so a machine without one just skips it (if not p: continue)
+        for sid, want in (("11111111-1111-4111-8111-111111111111", "cli"),
                           ("9da84efe-c1ec-516d-9a86-4ecca2aec1f3", "sdk-cli")):
             p = ka.transcript_path(sid)
             if not p:

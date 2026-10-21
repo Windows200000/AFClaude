@@ -4,9 +4,12 @@ Points the DB ($AFCLAUDE_DB), the local config ($AFCLAUDE_CONFIG) and the data d
 ($AFCLAUDE_DATA_DIR, $DISPATCHER_DATA_DIR) at a fresh temp directory, so a test run in
 the main checkout never reads the live settings or triggers the one-time settings import
 on the live data/ (afclaude_config). The temp DB starts empty (every setting = its code
-default); set_setting() / clear_settings() change it.
+default); set_setting() / clear_settings() change it. $AFCLAUDE_CONFIG gets a synthetic
+manager_session (SID) so afclaude_config.manager_session() does not raise ConfigError in a
+test that doesn't set up its own identity (D-235: manager_session has no code default any more).
 """
 import atexit
+import json
 import os
 import shutil
 import sys
@@ -19,6 +22,10 @@ atexit.register(shutil.rmtree, DIR, True)
 os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=os.path.join(DIR, "afclaude.json"),
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
+
+SID = "00000000-0000-4000-8000-000000000001"   # synthetic manager_session (not a real session anywhere)
+with open(os.environ["AFCLAUDE_CONFIG"], "w") as _fh:
+    json.dump({"manager_session": SID}, _fh)
 
 import store  # noqa: E402
 import actions  # noqa: E402
