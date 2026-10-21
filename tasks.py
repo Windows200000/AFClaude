@@ -44,6 +44,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            at the error it names); --project: that project's pause
                                            only; --all: the install-wide one and every project's
     tasks.py automation pause [REASON] [--project P]   pause every runner (or one project's) by hand
+    tasks.py driven list [--all]           the sessions AFClaude drives (phase 3b): kind, tmux name, project
+    tasks.py driven check                  rows vs. the task-managers and the live tmux sessions (exit 1
+                                           on a mismatch; the backfill is `store.py import-driven`)
     tasks.py doc list [--project P]        the project's docs in the DB (phase 2d, project_docs.py)
     tasks.py doc show NAME [--project P] [--entries N]   a doc's text (--entries: its newest entries)
     tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
@@ -80,6 +83,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -549,6 +553,8 @@ def run(conn, args):
         run_decision(conn, args)
     elif c == "automation":
         run_automation(conn, args)
+    elif c == "driven":
+        return run_driven(conn, args) or 0
     elif c == "inbox" and args.inbox_cmd:
         run_inbox_messages(conn, args)
     elif c == "inbox":
@@ -653,6 +659,22 @@ def run_automation(conn, args):
                           + [failstop.resume_cmd(pp["name"]) for pp in st["projects"]])
               + (f" (or all at once: {failstop.RESUME_CMD} --all)" if len(st["projects"]) + st["paused"] > 1 else ""))
     return None
+
+
+def run_driven(conn, args):
+    """Phase 3b (driven.py): the driven sessions and their tmux names; check compares them with the
+    projects and the live tmux sessions (exit 1 on a problem, or when tmux can't be asked)."""
+    import driven
+    if args.driven_cmd == "list":
+        rows = driven.describe(conn, include_ended=args.all)
+        return dump(rows) if args.json else driven.print_rows(rows)
+    try:
+        rep = driven.check(conn)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+        print(f"error: tmux could not be asked ({type(e).__name__}: {e})", file=sys.stderr)
+        return 1
+    dump(rep) if args.json else driven.print_check(rep)
+    return 0 if rep["ok"] else 1
 
 
 def parser():
@@ -784,6 +806,12 @@ def parser():
     q.add_argument("reason", nargs="?", help="why (shown in the quickview)")
     q.add_argument("--project", help="pause only this project's runs (name, directory or id)")
     p.set_defaults(json=False)
+    p = sub.add_parser("driven", help="the sessions AFClaude drives and their tmux names (phase 3b): list | check")
+    dvs = p.add_subparsers(dest="driven_cmd", required=True)
+    q = dvs.add_parser("list", parents=[js], help="the live rows: session, kind, tmux name, project")
+    q.add_argument("--all", action="store_true", help="the ended ones too")
+    dvs.add_parser("check", parents=[js], help="rows vs. the projects' task-managers and the live tmux sessions "
+                                               "(exit 1 on a mismatch)")
     p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
     ds = p.add_subparsers(dest="doc_cmd", required=True)
     q = ds.add_parser("list", parents=[js], help="the project's docs")
