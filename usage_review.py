@@ -359,7 +359,7 @@ def schedule_once(which, at_str, now=None):
 
 # ---------------------------------------------------------------- launches
 
-def run_once(st, now, which, extra=None, record=None):
+def run_once(st, now, which, extra=None, record=None, sid=None):
     """A one-off review of just `which` (one ONLY_PROMPTS key: "stage-eta" or "usage"), fired
     right away in its OWN fresh session: its own prompt (not the regular periodic one; "usage"
     is the exception -- it reuses prompts/usage_review.md verbatim, since the one-off usage
@@ -368,14 +368,16 @@ def run_once(st, now, which, extra=None, record=None):
     the ETA review's pointer at the usage review's result) -- never used for a solo run. Logged
     under st["one_off_runs"] -- separate from st["runs"]/next_run_at, so it never touches or
     delays the monthly schedule. `record`: extra fields of its usage_reviews record (attempt,
-    chain, after_report). The quota check is the caller's (start_one_off, the chain). -> ok."""
+    chain, after_report). `sid`: use this session id instead of generating one (the D-228 ETA
+    leg fixes it before the launch so a restart mid-launch can recognize this same session,
+    chain_eta_launching_step). The quota check is the caller's (start_one_off, the chain). -> ok."""
     local = now.astimezone(ka.BERLIN)
     d = local.date().isoformat()
     since = st["runs"][-1]["at"][:10] if st.get("runs") else "2026-09-26"
     brief = ka.load_prompt(ONLY_PROMPTS[which]).format(date=d, since=since, report=report_doc(now))
     parts = [brief] + ([extra] if extra else []) + [ka.load_prompt("guard_respect"), ka.load_prompt("manager")]
     msg = " ".join(" ".join(parts).split())
-    sid = str(uuid.uuid4())
+    sid = sid or str(uuid.uuid4())
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
     rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude {which} review (one-off) {d}",
                            category=ka.remote_control.REVIEW)   # D-269
@@ -665,8 +667,14 @@ def chain_usage_step(st, c, now):
 def chain_eta_step(st, c, now):
     """The chain's ETA leg: not before its not_before (a postponement or a limit retry); the quota
     check (short: postponed, a chain step at the point with quota); then the SEPARATE fresh ETA
-    session, its brief pointed at the usage review's report. The pending step is cleared before
-    the launch, so a crash after it never fires the leg twice. -> "waiting" | "postponed" |
+    session, its brief pointed at the usage review's report. Fix of the gap found building 3a S4:
+    the pending step used to be cleared BEFORE the launch, so a restart hitting mid-launch (the
+    outcome of run_once() unknown: it may have fired or not) left no trace, and the next
+    --chain-step found no chain at all -- nothing ever reported it. Now the session id is fixed
+    first and the step recorded as "stage-eta-launching" (with it) before run_once() runs; it is
+    cleared only once run_once() has returned (ok or not: either way its own record/alert already
+    covers it). A restart in between leaves "stage-eta-launching" in the state, which
+    chain_eta_launching_step() recovers from on the next pass. -> "waiting" | "postponed" |
     "eta_started" | "eta_failed"."""
     nb = datetime.fromisoformat(c["not_before"]) if c.get("not_before") else None
     if nb and now < nb:
@@ -680,21 +688,66 @@ def chain_eta_step(st, c, now):
         spool_chain_step(q["until"])
         return "postponed"
     report = c["report"]
+    attempt = c.get("attempt", 1)
+    sid = str(uuid.uuid4())
+    st["chain"] = {"step": "stage-eta-launching", "report": report, "attempt": attempt, "launch_sid": sid,
+                   "since": c.get("since"), "recovered_retry": c.get("recovered_retry", False)}
+    save_checked(st, "the review chain's ETA launch (pending)")
     extra = ka.load_prompt("stage_eta_review_once_after_usage").format(
         report=f"the review doc {report} in the AFClaude DB (`python3 tasks.py doc show {report}`)")
+    ok = run_once(st, now, "stage-eta", extra=extra, sid=sid,
+                  record={"attempt": attempt, "chain": "stage-eta", "after_report": report})
     st["chain"] = None      # None, never deleted: the usage_review state never deletes a key
-    save_checked(st, "the review chain's ETA launch")
-    ok = run_once(st, now, "stage-eta", extra=extra,
-                  record={"attempt": c.get("attempt", 1), "chain": "stage-eta", "after_report": report})
     save(st)
     return "eta_started" if ok else "eta_failed"
+
+
+def chain_eta_launching_step(st, c, now):
+    """Recovery for a stale "stage-eta-launching" step (chain_eta_step's gap fix): found on a
+    later pass (its own --chain-step job, or the hourly backstop after a restart) because the
+    launch in progress was never cleared, so run_once()'s outcome is unknown. Checks what actually
+    happened: a usage_reviews record for `launch_sid` exists (run_once() reached record_review(),
+    ok or not -- either way already handled, alerted/tracked on its own) or the session itself
+    exists (its transcript or tmux session: run_once() reached ka.fire() but the process died
+    before recording it, so the record is backfilled here so normal tracking, track_reviews, picks
+    it up) -> the launch did happen, done. Neither found and this is the first recovery -> the
+    earlier call is known to have never recorded anything, so retrying is safe: a fresh launch,
+    same report and attempt. Neither found on a recovery retry already -> visibly an error
+    (fail-stop, D-234/D-235/D-282): a stray session might still exist and needs a human look before
+    the state is cleared. -> "recovered" | "lost" | whatever chain_eta_step's retry returns."""
+    sid, report, attempt = c.get("launch_sid"), c["report"], c.get("attempt", 1)
+    rec = review_record(sid) if sid else None
+    if rec is None and sid and (ka.transcript_path(sid) or ka.tmux_alive(sid)):
+        rec = record_review(sid, ("stage-eta",), now, True, 0, True,
+                            attempt=attempt, chain="stage-eta", after_report=report)
+        ka.log(f"usage review: the review chain's ETA launch (session {sid}) survived a restart with no "
+               f"record; backfilled, now tracked normally")
+    if rec is not None:
+        st["chain"] = None
+        save_checked(st, "the recovered review chain launch")
+        return "recovered"
+    if c.get("recovered_retry"):
+        st["chain"] = None
+        save_checked(st, "the lost review chain launch")
+        fail_stop("a review chain's ETA launch was lost in a restart",
+                  f"report {report}, attempt {attempt}: no session {sid} and no record found after "
+                  f"retrying the launch once; check by hand for a stray session before clearing this")
+        return "lost"
+    ka.log(f"usage review: the review chain's ETA launch (session {sid}) was interrupted by a restart "
+           f"with no trace of it; retrying once")
+    st["chain"] = {"step": "stage-eta", "report": report, "attempt": attempt, "not_before": None,
+                   "since": c.get("since"), "recovered_retry": True}
+    save_checked(st, "the review chain's ETA retry after a lost launch")
+    return chain_eta_step(st, st["chain"], now)
 
 
 def chain_pass(st, now):
     """One pass over the pending D-228 chain (st["chain"]): from its own at job (--chain-step,
     every CHAIN_POLL) and from every hourly cron run (the backstop after a restart), under lock().
     While automation is paused it waits (no at job: the hourly run picks it up once the pause is
-    cleared). -> what happened (None: no chain)."""
+    cleared). A step "stage-eta-launching" found here (chain_eta_step's own launch never cleared
+    it: a restart hit mid-launch) is chain_eta_launching_step's recovery, not a fresh ETA launch.
+    -> what happened (None: no chain)."""
     c = st.get("chain")
     if not c:
         return None
@@ -707,7 +760,10 @@ def chain_pass(st, now):
         r = chain_usage_step(st, c, now)
         if r != "finished":
             return r
-    return chain_eta_step(st, st["chain"], now)
+        c = st["chain"]
+    if c["step"] == "stage-eta-launching":
+        return chain_eta_launching_step(st, c, now)
+    return chain_eta_step(st, c, now)
 
 
 # ---------------------------------------------------------------- the monthly review (D-254)

@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -777,6 +778,95 @@ class Chain(Transcripts):
         finally:
             sys.argv = old_argv
         self.assertEqual(len(self.fires), 2)
+        self.assertIsNone(ur.load()["chain"])
+
+
+class ChainEtaLaunchRestart(Transcripts):
+    """Fix of the gap found building 3a S4: the ETA leg's launch used to clear st["chain"] BEFORE
+    calling run_once(), so a restart during the launch (the process killed, run_once() never
+    returning) lost all trace of it -- the next --chain-step found no chain and nothing reported
+    it. Simulated here by making the launch (ka.fire, inside run_once) raise as if the process had
+    been killed outright: chain_eta_step's "stage-eta-launching" step is never reached by its own
+    cleanup, so it survives into the next chain_pass (the "restart"), which must recover it.
+    Not a Chain subclass: ka.tmux_alive is stubbed True by default (Base.setUp, right for the
+    other Chain tests' already-running sessions) but a "lost" launch's session id was never used
+    for anything, so these tests stub it False -- as a real tmux_alive would for an id that was
+    never spawned."""
+    now = T0 + timedelta(minutes=30)
+
+    def ready_for_eta(self):
+        """A chain with its usage leg finished, about to launch the ETA leg (as Chain.start() +
+        a finished usage transcript, without pulling in Chain's unrelated tests)."""
+        st = ur.load()
+        self.assertTrue(ur.start_chain(st, T0))
+        sid = st["chain"]["session"]
+        self.at_calls.clear()
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=10))])
+        self.reports.add("review:2026-10-15")
+        self.fires.clear()      # only the ETA leg's own fire (or lack of it) matters from here
+        ka.tmux_alive = lambda sid: False     # a launch id with no real tmux session (the default norm)
+
+    def crash_the_launch(self):
+        ka.fire = lambda *a, **k: (_ for _ in ()).throw(OSError("killed mid-launch"))
+        with self.assertRaises(OSError):
+            ur.chain_pass(ur.load(), self.now)
+
+    def restore_fire(self):
+        ka.fire = lambda sid, cwd, msg, plan, new=False, **k: self.fires.append(
+            (sid, msg, plan, new, k)) or (0, "started", "")
+
+    def test_a_crash_during_the_launch_leaves_a_recoverable_step(self):
+        self.ready_for_eta()
+        self.crash_the_launch()
+        st = ur.load()
+        self.assertEqual(st["chain"]["step"], "stage-eta-launching")
+        self.assertIn("launch_sid", st["chain"])
+        self.assertEqual(self.fires, [])             # ka.fire blew up before recording anything
+
+    def test_a_lost_launch_with_no_trace_of_it_retries_once(self):
+        self.ready_for_eta()
+        self.crash_the_launch()
+        lost_sid = ur.load()["chain"]["launch_sid"]
+        self.restore_fire()                          # "restart": the next pass launches cleanly
+        self.assertEqual(ur.chain_pass(ur.load(), self.now + timedelta(minutes=1)), "eta_started")
+        self.assertEqual(len(self.fires), 1)
+        new_sid = self.fires[0][0]
+        self.assertNotEqual(new_sid, lost_sid)
+        self.assertIsNone(ur.review_record(lost_sid))     # the lost attempt never got a record
+        r = ur.review_record(new_sid)
+        self.assertEqual((r["chain"], r["after_report"]), ("stage-eta", "review:2026-10-15"))
+        self.assertIsNone(ur.load()["chain"])
+        self.assertEqual(self.alerts, [])             # a clean retry, not an error (D-282)
+
+    def test_a_lost_launch_whose_session_exists_is_backfilled_not_doubled(self):
+        """ka.fire actually ran (a session/tmux exists) but the process died before record_review():
+        the session is real, so it must be picked up, not re-launched a second time."""
+        self.ready_for_eta()
+        st = ur.load()
+        sid = str(uuid.uuid4())
+        st["chain"] = {"step": "stage-eta-launching", "report": "review:2026-10-15", "attempt": 1,
+                       "launch_sid": sid, "since": T0.isoformat(), "recovered_retry": False}
+        ur.save_checked(st, "test setup")
+        self.transcript(sid, [entry("user", self.now)])    # the session exists: ka.fire DID run
+        self.assertIsNone(ur.review_record(sid))
+        self.assertEqual(ur.chain_pass(ur.load(), self.now + timedelta(minutes=1)), "recovered")
+        r = ur.review_record(sid)
+        self.assertIsNotNone(r)
+        self.assertEqual((r["chain"], r["after_report"], r["status"]), ("stage-eta", "review:2026-10-15", "started"))
+        self.assertIsNone(ur.load()["chain"])
+        self.assertEqual(self.fires, [])              # no second launch: the real one is tracked instead
+        self.assertEqual(self.alerts, [])
+
+    def test_a_second_lost_launch_with_no_trace_is_an_error(self):
+        self.ready_for_eta()
+        st = ur.load()
+        sid = str(uuid.uuid4())
+        st["chain"] = {"step": "stage-eta-launching", "report": "review:2026-10-15", "attempt": 1,
+                       "launch_sid": sid, "since": T0.isoformat(), "recovered_retry": True}
+        ur.save_checked(st, "test setup")
+        self.assertEqual(ur.chain_pass(ur.load(), self.now), "lost")
+        self.assertTrue(self.paused())
+        self.assertIn("lost in a restart", self.alerts[-1][0])
         self.assertIsNone(ur.load()["chain"])
 
 
