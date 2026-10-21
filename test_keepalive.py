@@ -40,7 +40,9 @@ setcfg = testenv.setcfg     # the DB settings for a test: the code defaults, the
 def setUpModule():
     # the budget tests below pin the linear rule; BudgetWiring tests the budget model.
     # Hermetic: no real samples (the last mile's ratio = the default), no real deferral file.
-    setcfg(usage_model="linear")
+    # run_start_factor 0: the starts here fire at the session-window start (the late start of
+    # D-274 is tested in test_run_timing.py)
+    setcfg(usage_model="linear", run_start_factor=0)
     budget.SAMPLES_FILE = os.path.join(_CFG_DIR.name, "no_samples.jsonl")
     ka.DEFER_FILE = os.path.join(_CFG_DIR.name, "deferred.json")
     ka.FILLUP_FILE = os.path.join(_CFG_DIR.name, "fillup.json")   # the fill-up plan (D-212)
@@ -302,11 +304,11 @@ class BudgetWiring(unittest.TestCase):
 
     def tearDown(self):
         (self.bm.SAMPLES_FILE, self.bm.decide, ka.DEFER_FILE, ka.STATE_FILE, ka.PROGRESS_FILE) = self._old
-        setcfg(usage_model="linear")
+        setcfg(usage_model="linear", run_start_factor=0)
         self.tmp.cleanup()
 
     def setcfg(self, **kw):
-        setcfg(**kw)
+        setcfg(**{"run_start_factor": 0, **kw})      # starts fire at the session-window start (D-274 off)
 
     def samples(self, now, prompt_minutes_ago=None, week=15.0, own_prompt_minutes_ago=None, minutes=300):
         """Sampler rows every 15 min up to `now` (weekly `week`%); one prompt in a non-AFClaude
@@ -874,10 +876,10 @@ class LastMile(unittest.TestCase):
         self.setcfg()
 
     def tearDown(self):
-        setcfg(usage_model="linear")
+        setcfg(usage_model="linear", run_start_factor=0)
 
     def setcfg(self, **kw):
-        setcfg(usage_model="linear", **kw)
+        setcfg(**{"usage_model": "linear", "run_start_factor": 0, **kw})
 
     def test_default_is_auto(self):
         self.assertEqual(self.ac.last_mile_setting(), "auto")

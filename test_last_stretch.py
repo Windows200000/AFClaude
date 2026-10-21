@@ -140,6 +140,7 @@ class Callers(Env):
         self.assertEqual(ka.parse_ts(defs[ka.schedule.start_key(NIGHT)]["recheck_at"]),
                          NIGHT + ka.OWNER_BUSY_RECHECK)
         decision["last_mile"] = False                         # a night-gate start: no owner check
+        testenv.set_setting("run_start_factor", 0)            # (fires at the start, not late: D-274)
         self.result = None
         ka.save_deferred({})
         ka.window_start_pass(SID, NIGHT, args)

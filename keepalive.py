@@ -6,7 +6,10 @@ Runs begin only at STARTS (D-205): each session-window start of the night window
 --window-start every 30 min, acting only when a start is due: 23:00 and 04:00 for the default
 23:00 x 2, generally start + k x session_hours per weekday, schedule.py, D-202/D-203; a start postponed for
 an active user is re-decided by the watcher before the next start, D-018) and each last-stretch
-slot start (D-020). A start that passes the budget rule continues the task-manager session with
+slot start (D-020). A session-window start that passes the budget rule fires late in its session
+window, at its end - the session % it can use / measured fill rate x run_start_factor (D-274,
+"Run timing" below; the watcher fires it), or at once when the run before is still going. A start
+that fires continues the task-manager session with
 
     ka_resume.sh --session <full-uuid> --message "<continue msg>"   (tmux, no --bg)
 
@@ -1386,7 +1389,8 @@ def last_mile_pass(sid, now, st, args):
             if d.get("postpone") else now + LAST_MILE_RECHECK
     fired = handle_fire(sid, {"uuid": key, "timestamp": now, "prompt": "last_mile", "budget": d["text"],
                               "headroom": d.get("headroom"), "owner_check": True,
-                              "start_at": _round_reset(w["resets_at"]) - slot * afclaude_config.SESSION_LENGTH},
+                              "start_at": _round_reset(w["resets_at"]) - slot * afclaude_config.SESSION_LENGTH,
+                              "run_end": _round_reset(w["resets_at"]) - (slot - 1) * afclaude_config.SESSION_LENGTH},
                         d["reason"], st, args)
     return now + OWNER_BUSY_RECHECK if fired == OWNER_BUSY else None
 
@@ -1432,10 +1436,21 @@ def window_start_pass(sid, now, args):
             progress_note(f"window-start {berlin(now)}: not resumed, the forecast log failed (automation paused)")
             return dict(d, go=False, reason=f"HOLD: forecast log failed ({type(e).__name__})")
     if d["go"]:
+        try:     # D-274: the gate decided WHETHER; the timing decides WHEN (late in the window)
+            timing = None if args.now else run_timing(sid, now, u, d)
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): the start is aborted
+            fail_stop("run timing failed at a session-window start", f"{type(e).__name__}: {e}")
+            progress_note(f"window-start {berlin(now)}: not resumed, the run timing failed (automation paused)")
+            return dict(d, go=False, reason=f"HOLD: run timing failed ({type(e).__name__})")
+        if timing and timing["start"] > now + TIMING_SLACK:
+            defer_window_start(key, sid, timing["start"], d["reason"], timing["end"], planned=True)
+            progress_note(f"window-start {berlin(now)}: the gate passed, the run starts at {berlin(timing['start'])} "
+                          f"(D-274: {timing['reason']} {berlin(timing['end'])}); {d['reason']}")
+            return dict(d, planned=timing["start"])
         stall = {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
-                 "start_at": schedule.latest_session_start(now) or now,
+                 "start_at": schedule.latest_session_start(now) or now, "run_end": session_window_end(now),
                  "owner_check": bool(d.get("last_mile")) and not args.now}   # D-259
-        fired = handle_fire(sid, stall, "window start, " + d["reason"], load_state(), args)
+        fired = handle_fire(sid, stall, "window start, " + _timing_why(timing) + d["reason"], load_state(), args)
         if fired in ("db_paused", OWNER_BUSY) and not args.now:
             why = "database problem" if fired == "db_paused" else "the owner is typing into or holds the session"
             recheck_at = now + (DB_PAUSE_RECHECK if fired == "db_paused" else OWNER_BUSY_RECHECK)
@@ -1458,6 +1473,103 @@ def window_start_pass(sid, now, args):
     return d
 
 
+# ---------------------------------------------------------------- run timing (D-274, D-275)
+# D-274 (owner): "Change it so normal windows alao start at about windowend-filluptim*1.5 or similar
+# and make it explicit to not stop until an hour of next window, if immediately after, so no context
+# reread if 2 runs in same night". D-275: "Work at a pace to fillup each session, but finish less than
+# 1hour before session end to avoid cache rereads." A session-window start whose gate passed fires at
+# window end - remaining / rate x run_start_factor (fillup.run_start; the watcher fires it from the
+# postponed-start entry, the gate re-checked then), or at once when the run before is still going
+# (chained). Every start's continue says to pace the work to the window's end (run_pace.md) and, when
+# the next start follows right after, to keep going about an hour into it (run_chain.md).
+
+TIMING_SLACK = timedelta(minutes=1)    # a planned start this close is due now
+
+
+def session_window_end(t):
+    """The end of the session window (schedule.py) a start at t belongs to: its session-window
+    start + session_hours; None outside a window."""
+    c = schedule.load()
+    s = schedule.latest_session_start(t, c)
+    return s + c.session if s is not None else None
+
+
+def run_timing(sid, now, u, d):
+    """D-274: when the session-window start whose gate passed (`d`, on the usage `u`) fires. ->
+    fillup.run_start's plan for its session window (start = the window's end - remaining / rate x
+    run_start_factor), with chained=True and start=now when a run of this session is still going
+    and the session window it uses lasts the whole window (the warm cache: D-274's "2 runs in same
+    night"); None when the start fires at once without a plan (run_start_factor 0; the last
+    stretch, which fills the week, D-020/D-259; outside a window). A failure raises."""
+    import fillup
+    factor = float(afclaude_config.setting("run_start_factor"))
+    end = session_window_end(now)
+    if factor <= 0 or d.get("last_mile") or end is None:
+        return None
+    sess = (u or {}).get("session") or {}
+    p = fillup.run_start(now=now, window_start=schedule.latest_session_start(now) or now, window_end=end,
+                         session_pct=sess.get("percent"), session_reset=sess.get("resets_at"),
+                         rows=_fillup_rows(), factor=factor, ratio=_fillup_ratio(), headroom=d.get("headroom"))
+    if not p["resets_inside"] and run_active(sid, now) is not None:
+        p.update(start=now, chained=True, reason="the run before is still going: chained onto it at once")
+    return p
+
+
+def _timing_why(timing):
+    if not timing:
+        return ""
+    return "chained onto the running run (D-274), " if timing.get("chained") else \
+        f"planned late (D-274: {timing['reason']}), "
+
+
+def next_start_after(sid, now, u=None):
+    """The next start that types into this session after `now`: a planned or postponed
+    session-window start (pending_deferral), the next session-window start, the next last-stretch
+    slot start; or None."""
+    cands = [pending_deferral(sid, now), schedule.next_session_start(now), last_mile_next_start(now, u)]
+    later = [t for t in cands if t is not None and t > now + TIMING_SLACK]
+    return min(later) if later else None
+
+
+def planned_next_start(sid, now, u, rows, ratio):
+    """D-274: when the next session-window start is expected to fire (the fill-up's "a start
+    continues this window anyway"): a planned / postponed one's recheck, else the next
+    session-window start's planned start on today's usage (run_start_factor 0: the start)."""
+    import fillup
+    p = pending_deferral(sid, now)
+    if p is not None and p > now:
+        return p
+    s = schedule.next_session_start(now)
+    factor = float(afclaude_config.setting("run_start_factor"))
+    end = session_window_end(s) if s is not None else None
+    if s is None or end is None or factor <= 0:
+        return s
+    sess = (u or {}).get("session") or {}
+    return fillup.run_start(now=s, window_start=s, window_end=end, session_pct=sess.get("percent"),
+                            session_reset=sess.get("resets_at"), rows=rows, factor=factor, ratio=ratio,
+                            headroom=None)["start"]
+
+
+def _hm(t):
+    return t.astimezone(BERLIN).strftime("%H:%M %Z")
+
+
+def run_pace_text(sid, stall, now, u):
+    """D-274/D-275: the pacing lines of a start's continue: fill the session window and finish
+    only in its last hour (run_pace.md; the window's end: stall["run_end"], else the end of the
+    live session window or now + one session length), and when the next start follows this run
+    right away (fillup.chained), keep going about an hour into it (run_chain.md)."""
+    import fillup
+    reset = ((u or {}).get("session") or {}).get("resets_at")
+    claude_reset = reset if reset and reset > now else now + afclaude_config.SESSION_LENGTH
+    end = stall.get("run_end") or claude_reset
+    text = load_prompt("run_pace").format(end=_hm(end), last_hour=_hm(end - fillup.CACHE_HOUR))
+    nxt = next_start_after(sid, now, u)
+    if fillup.chained(run_end=end, claude_reset=claude_reset, next_start=nxt):
+        text += " " + load_prompt("run_chain").format(next=_hm(nxt), until=_hm(nxt + fillup.CACHE_HOUR))
+    return text
+
+
 # ---------------------------------------------------------------- postponed window start
 
 DEFER_FILE = os.path.join(STATE_DIR, "keepalive_deferred.json")
@@ -1471,15 +1583,19 @@ def save_deferred(d):
     runner_state.save("keepalive.deferred", d, DEFER_FILE)
 
 
-def defer_window_start(key, sid, recheck_at, reason, deadline=None):
-    """The session-window-start decision was a POSTPONE (the user was active, ...): the watcher
+def defer_window_start(key, sid, recheck_at, reason, deadline=None, planned=False):
+    """The session-window-start decision was a POSTPONE (the user was active, ...) or the gate
+    passed and the run starts late in its session window (planned=True, D-274): the watcher
     re-decides at recheck_at, still once per session-window start (same dedup key), and only
-    before `deadline` (the night's next session-window start, D-202)."""
+    before `deadline` (the night's next session-window start, D-202; for a planned start the
+    session window's end)."""
     d = {k: v for k, v in load_deferred().items() if k == key}   # older starts are over
     d[key] = {"session": sid, "recheck_at": recheck_at.astimezone(UTC).isoformat(), "reason": reason,
               "deferred_at": datetime.now(UTC).isoformat()}
     if deadline is not None:
         d[key]["deadline"] = deadline.astimezone(UTC).isoformat()
+    if planned:
+        d[key]["planned"] = True
     save_deferred(d)
 
 
@@ -1534,13 +1650,31 @@ def deferred_window_start_pass(sid, now, st, args):
         return None
     d = budget_eval(u, now)
     log(f"window-start (postponed): {d['reason']}")
-    deadline = schedule.postpone_deadline(now)
+    # the deadline stored with the entry: the night's next session-window start, or for a start
+    # planned late in its session window (D-274) that window's end
+    deadline = parse_ts(ent.get("deadline")) or schedule.postpone_deadline(now)
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
     if d["go"]:
+        try:     # D-274: still WHEN, on the numbers of now (the owner may have used the session)
+            timing = run_timing(sid, now, u, d)
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): the start is aborted
+            defs.pop(key, None)
+            save_deferred(defs)
+            fail_stop("run timing failed at a postponed session-window start", f"{type(e).__name__}: {e}")
+            progress_note(f"window-start (postponed) {berlin(now)}: not resumed, the run timing failed "
+                          "(automation paused)")
+            return None
+        if timing and timing["start"] > now + TIMING_SLACK:
+            ent.update(recheck_at=timing["start"].astimezone(UTC).isoformat(), reason=d["reason"], planned=True,
+                       deadline=timing["end"].astimezone(UTC).isoformat())
+            save_deferred(defs)
+            return timing["start"]
         fired = handle_fire(sid, {"uuid": key, "timestamp": now, "budget": d["text"], "headroom": d.get("headroom"),
                                   "start_at": schedule.latest_session_start(now) or now,
+                                  "run_end": session_window_end(now),
                                   "owner_check": bool(d.get("last_mile"))},   # D-259
-                            "window start (postponed), " + d["reason"], st, args)
+                            "window start (" + ("planned" if ent.get("planned") else "postponed") + "), "
+                            + _timing_why(timing) + d["reason"], st, args)
         if fired in ("db_paused", OWNER_BUSY):
             recheck_at = now + (DB_PAUSE_RECHECK if fired == "db_paused" else OWNER_BUSY_RECHECK)
             if recheck_at < deadline:
@@ -1778,11 +1912,12 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         # a session in this repo has its standing rules from the SessionStart hook: only a pointer (D-225)
         return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}", progress=PROGRESS_FILE,
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
+    pace = run_pace_text(sid, stall, datetime.now(UTC), usage_cache_checked())   # D-274/D-275
     held, held_ids = inbox_held(sid)     # D-244: held "now" inbox messages go along, to be answered
     notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
     # D-254/D-261: a night start (not a last-stretch slot or a fill-up) names the due nightly tasks
     tasks, task_names = nightly_tasks_due(cwd) if stall.get("prompt", "continue") == "continue" else (None, [])
-    msg = build(with_notes(with_notes(with_notes(stall.get("insert"), held), notes), tasks))
+    msg = build(with_notes(with_notes(with_notes(with_notes(stall.get("insert"), pace), held), notes), tasks))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -1925,13 +2060,14 @@ def fillup_decision(sid, now, usage=None):
     active, recheck = (False, None)
     if s["fillup_enabled"] and reset and reset > now:
         active, recheck = _fillup_user(now, last_stretch, s)
+    rows, ratio = _fillup_rows(), _fillup_ratio()
     return {**fillup.decide(
         now=now, session_pct=sess.get("percent"), session_reset=reset, weekly_pct=w.get("percent"),
-        handled=st.get("handled") or {}, rows=_fillup_rows(), ratio=_fillup_ratio(),
+        handled=st.get("handled") or {}, rows=rows, ratio=ratio,
         enabled=bool(s["fillup_enabled"]), factor=float(s["fillup_factor"]), paused=bool(s["automation_paused"]),
         run_active=run_active(sid, now, st) is not None, limit_hit=bool(reset) and _limit_hit_in(sid, reset),
         in_night=bool(reset) and schedule.in_window(probe), in_last_stretch=last_stretch,
-        next_start=schedule.next_session_start(now), user_active=active, user_recheck=recheck,
+        next_start=planned_next_start(sid, now, u, rows, ratio), user_active=active, user_recheck=recheck,
         budget_fallback=lambda: budget_eval(u, now).get("headroom")), "in_last_stretch": last_stretch}
 
 
@@ -1947,6 +2083,7 @@ def _fire_fillup(sid, now, d, args, test=False):
              "budget": (f"budget for this run: the rest of this session window (~{float(d['remaining']):.0f}% "
                         f"session" + (f", ~{d['cost']:.1f}% weekly)" if d.get("cost") is not None else ")")),
              "fields": {"remaining": f"{float(d['remaining']):.0f}", "reset": d["reset"].astimezone(BERLIN).strftime("%H:%M %Z")},
+             "run_end": d["reset"],
              "owner_check": bool(d.get("in_last_stretch"))}   # D-259: no yield there, only the owner check
     log(f"{what}: FIRE {d['key']}")
     return handle_fire(sid, stall, f"{what}, session window resets {berlin(d['reset'])}", load_state(), args)

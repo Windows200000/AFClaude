@@ -562,6 +562,7 @@ class SettingActions(Base):
                           "pacing_min_gap": 1.0, "pacing_session_cap": 85.0, "pacing_last_mile_yield": False,
                           "projection_threshold": 90.0, "cutoff_after_window_hours": 2.0,
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
+                          "run_start_factor": 1.5,
                           "compaction_enabled": True, "ui_chat_reset_hours": 5.0,
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,

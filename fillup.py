@@ -19,14 +19,29 @@ D-202 says runs begin only at session-window starts: the fill-up is the owner's 
 exception (D-212); it continues a run's own session window, it never opens a new one.
 
 Not when: fillup_enabled is false; automation_paused; the run reached the session limit (D-204);
-the reset is outside the night window and not in the last stretch; a session-window start falls
-strictly before the reset by more than the fill-up duration (that start would itself use this
-same session window, so a separate fill-up is unneeded) -- a start at or after the reset opens a
+the reset is outside the night window and not in the last stretch; the next session-window start
+fires (its planned time, D-274: keepalive.planned_next_start) strictly before the reset by more
+than the fill-up duration (that start would itself use this same session window, so a separate
+fill-up is unneeded) -- a start at or after the reset opens a
 NEW session window and does not excuse the fill-up (D-219); the weekly cost exceeds what is left
 of the run's budget; the owner is active (D-018: wait for idle, but never past the reset); too
 close to the reset.
 
 decide() is pure; keepalive.fillup_pass() gathers its inputs and fires through handle_fire.
+
+Run timing (D-274/D-275), the same rate model for the normal runs. D-274 (owner, verbatim): "Change
+it so normal windows alao start at about windowend-filluptim*1.5 or similar and make it explicit to
+not stop until an hour of next window, if immediately after, so no context reread if 2 runs in same
+night". The gate (D-141) still decides WHETHER a session window runs; run_start() decides WHEN:
+    remaining  = the session % the run can use before the session window's end: 100 - session % of
+                 a live session window that lasts to that end, else 100 (a fresh one opens with the
+                 run), at most the run's weekly budget / the session-to-week ratio
+    start      = window end - remaining / rate x run_start_factor (default 1.5), not before the
+                 session-window start or now (factor 0: at the session-window start, as before)
+chained() says whether the next start follows a run immediately (D-274's "2 runs in same night"):
+it is due within CHAIN_GAP of the run's end and the session window the run uses resets by then, so
+the run is told to keep going about an hour into it (the prompt cache stays warm) and that start
+continues the run at once instead of starting late (keepalive.run_timing).
 """
 from __future__ import annotations
 
@@ -46,6 +61,8 @@ SESSION_LENGTH = timedelta(hours=5)     # afclaude_config.SESSION_LENGTH
 RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # keepalive.RUN_RESULTS
 KEY_PREFIX = "fillup-"
 TEST_PREFIX = "fillup-test-"
+CHAIN_GAP = timedelta(minutes=15)       # D-274: a start this close to a run's end follows it immediately
+CACHE_HOUR = timedelta(hours=1)         # the prompt cache's lifetime: a chained run goes on this long
 _BUDGET_RE = re.compile(r"budget for this run \+?(?:about \+)?([\d.]+)")
 
 
@@ -219,3 +236,37 @@ def decide_test(*, now: datetime, test: Mapping[str, Any], handled: Mapping[str,
     if paused:
         return dict(base, status="hold", reason="automation_paused", recheck_at=now + timedelta(minutes=1))
     return dict(base, status="fire", reason="due (TEST)")
+
+
+def run_start(*, now: datetime, window_start: datetime, window_end: datetime, session_pct: Optional[float],
+              session_reset: Optional[datetime], rows: Sequence[Any], factor: float, ratio: Optional[float],
+              headroom: Optional[float]) -> dict[str, Any]:
+    """D-274 (pure): when a normal run starts in the session window [window_start, window_end):
+    window_end - remaining / rate x factor, not before window_start or now. -> dict start, end,
+    remaining, rate, rate_src, time_min, factor, src (where `remaining` comes from), resets_inside
+    (a live session window resets inside this one, before window_end - CHAIN_GAP: a chained start
+    would only find its rest) and reason (one line for the log / progress note)."""
+    live = session_reset is not None and session_pct is not None and session_reset > now
+    resets_inside = bool(live and session_reset is not None and session_reset < window_end - CHAIN_GAP)
+    if live and not resets_inside:
+        remaining, src = max(100.0 - float(session_pct or 0.0), 0.0), "left of the live session window"
+    else:
+        remaining, src = 100.0, "a fresh session window"
+    if headroom is not None and ratio and ratio > 0 and headroom / ratio < remaining:
+        remaining, src = max(headroom / ratio, 0.0), "the run's weekly budget"
+    rate, rate_src = fill_rate(rows)
+    t = fill_time(remaining, rate)
+    start = max(window_end - t * factor, window_start, now) if factor > 0 else max(window_start, now)
+    return {"start": start, "end": window_end, "remaining": remaining, "src": src, "rate": rate,
+            "rate_src": rate_src, "time_min": t.total_seconds() / 60, "factor": factor,
+            "resets_inside": resets_inside,
+            "reason": (f"~{remaining:.0f}% ({src}) at {rate:.1f} %/h ({rate_src}) = {t.total_seconds() / 60:.0f} min"
+                       f" x {factor:g} before the session window's end")}
+
+
+def chained(*, run_end: datetime, claude_reset: datetime, next_start: Optional[datetime]) -> bool:
+    """D-274 (pure): the next start follows the run that ends at run_end immediately: it is due
+    within CHAIN_GAP of that end, and the session window the run uses (resetting at claude_reset)
+    resets by then, so that start gets a fresh session window and continues the run at once."""
+    return (next_start is not None and abs(next_start - run_end) <= CHAIN_GAP
+            and claude_reset <= next_start + CHAIN_GAP)
