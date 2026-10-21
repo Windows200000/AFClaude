@@ -1595,6 +1595,106 @@ def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: 
                               replaced=keep < len(chunks)), target, before, after, changed=True)
 
 
+# ---------------------------------------------------------------- the decision store (D-242, phase 4b)
+
+KEYWORD_MAX = 60
+
+
+@action("decision.import", "decision")
+def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = False) -> Result:
+    """Mirror DECISIONS.md (`path`, read only) into the decisions table (decisions.py parses it):
+    new entries added, changed ones rewritten (the task-manager's keyword changes kept), entries
+    no longer in the file removed. Idempotent: an unchanged file changes nothing (no audit row).
+    The audit row names the ids and holds a line diff of each changed entry and the full text of
+    each removed one (D-158: every change in the audit log). Refused (decisions.SourceError): a
+    file without entries or with a duplicate id, and one that would remove more than half of
+    the stored entries (force=True allows that)."""
+    import decisions as dec
+    src = os.path.abspath(store._text(path, "path", required=True))
+    try:
+        text, sha = dec.read_source(src)
+    except (OSError, UnicodeDecodeError) as err:
+        raise dec.SourceError(f"can't read {src}: {err}") from err
+    entries = dec.parse(text)
+    dec.check_entries(entries, src)
+    have = {r["id"]: r for r in store.list_decision_entries(conn)}
+    ids = {e.id for e in entries}
+    gone = [i for i in have if i not in ids]
+    if have and len(gone) * 2 > len(have) and force is not True:
+        raise dec.SourceError(f"{src}: the import would remove {len(gone)} of {len(have)} decisions "
+                              f"({', '.join(gone[:10])}{' ...' if len(gone) > 10 else ''}); "
+                              "check the file, or import with force")
+    added: list[str] = []
+    changed: dict[str, str] = {}
+    moved = 0
+    for n, e in enumerate(entries):
+        row = dict(e.row(), ord=n)
+        outcome, old = store.put_decision_entry(conn, row, ctx.actor)
+        if outcome == "added":
+            added.append(e.id)
+        elif outcome == "changed" and old is not None:
+            changed[e.id] = "\n".join(difflib.unified_diff(old["body"].split("\n"), e.body.split("\n"),
+                                                           lineterm="", n=0))
+        elif outcome == "moved":
+            moved += 1
+    removed = {i: store.delete_decision_entry(conn, i)["body"] for i in gone}
+    result = {"file": src, "sha256": sha, "entries": len(entries), "added": added, "changed": list(changed),
+              "removed": list(removed), "moved": moved,
+              "unchanged": len(entries) - len(added) - len(changed) - moved}
+    after = {"sha256": sha, "entries": len(entries), "added": added, "changed": changed,
+             "removed": list(removed), "moved": moved}
+    return Result(result, os.path.basename(src), {"removed_text": removed}, after,
+                  changed=bool(added or changed or removed or moved))
+
+
+def _keyword(value: Any) -> str:
+    k = " ".join(store._text(value, "keyword", required=True).split())
+    if len(k) > KEYWORD_MAX or "," in k:
+        raise ValueError(f"a keyword is at most {KEYWORD_MAX} characters, without commas: {value!r}")
+    return k
+
+
+@action("decision.keywords", "decision")
+def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any, keywords: Any,
+                      version: Any = None) -> Result:
+    """Add or remove keywords of one decision (D-242: the task-manager keeps them current, e.g.
+    when a lookup missed or a topic was renamed). Stored apart from the source's Keywords line
+    (store.decision_keywords), so a re-import keeps them. Removing a keyword the decision doesn't
+    have is an error; adding one it has is a no-op."""
+    store._enum(op, ("add", "remove"), "op")
+    words = [_keyword(k) for k in (keywords if isinstance(keywords, list) else [keywords])]
+    if not words:
+        raise ValueError("keywords: at least one")
+    cur = store.get_decision_entry(conn, decision)
+    if cur is None:
+        raise store.NotFound(f"no decision {decision}")
+    _check_version(cur, version, f"decision {cur['id']}")
+    source = {k.lower() for k in cur["keywords"]}
+    added = list(cur["keywords_added"])
+    removed = list(cur["keywords_removed"])
+    for k in words:
+        kl = k.lower()
+        in_added = [a for a in added if a.lower() == kl]
+        if op == "add":
+            if kl in removed:
+                removed.remove(kl)
+            elif kl not in source and not in_added:
+                added.append(k)
+        elif in_added:
+            added = [a for a in added if a.lower() != kl]
+        elif kl in source and kl not in removed:
+            removed.append(kl)
+        else:
+            raise ValueError(f"{cur['id']} has no keyword {k!r} (its keywords: {', '.join(cur['effective_keywords'])})")
+    before = {"keywords": cur["effective_keywords"]}
+    if (added, sorted(removed)) == (cur["keywords_added"], sorted(cur["keywords_removed"])):
+        return Result({"id": cur["id"], "keywords": cur["effective_keywords"], "version": cur["version"]},
+                      cur["id"], before, before, changed=False)
+    after = store.set_decision_keywords(conn, cur["id"], added, removed, ctx.actor)
+    return Result({"id": after["id"], "keywords": after["effective_keywords"], "version": after["version"]},
+                  after["id"], before, {"keywords": after["effective_keywords"]})
+
+
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)
 #
 # Append-only telemetry rows (usage samples, the weekly series, session windows, the forecast

@@ -1491,6 +1491,8 @@ class SessionRules(unittest.TestCase):
             hooks = json.load(fh)["hooks"]["SessionStart"]
         parts = []
         for group in hooks:
+            if not any("keepalive.py" in h["command"] for h in group["hooks"]):
+                continue                                             # e.g. the decisions TLDR (D-242)
             matched = {m.strip() for m in group["matcher"].replace(",", "|").split("|")}
             self.assertLessEqual({"startup", "resume", "compact", "clear"}, matched)
             for h in group["hooks"]:

@@ -39,7 +39,7 @@ COPY . ${AFCLAUDE_DIR}
 # /host/repo, incl. the local backlog/ briefs); PROGRESS.md and ALERTS.md are appended to through the bridge.
 # data/ is a read-write mount of the host repo's data/.
 RUN set -eux; cd "${AFCLAUDE_DIR}"; \
-    for f in PROGRESS.md ALERTS.md OPEN_QUESTIONS.md BACKLOG.md GOALS.md EXCEPTIONS.md README.md PAUSED; do \
+    for f in PROGRESS.md ALERTS.md OPEN_QUESTIONS.md BACKLOG.md GOALS.md EXCEPTIONS.md README.md DECISIONS.md PAUSED; do \
       rm -f "$f"; ln -s "/host/repo/$f" "$f"; \
     done; \
     rm -rf backlog; ln -s /host/repo/backlog backlog; \

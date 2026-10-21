@@ -26,6 +26,26 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "startup|compact|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/decisions.py\" hook --part 1 --of 3",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/decisions.py\" hook --part 2 --of 3",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/decisions.py\" hook --part 3 --of 3",
+            "timeout": 30
+          }
+        ]
       }
     ]
   },

@@ -29,7 +29,7 @@ SID2 = "00000000-0000-4000-8000-000000000002"
 CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
-                  "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc"}
+                  "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions"}
 
 
 def run(coro):
@@ -421,6 +421,50 @@ class Docs(Env):
                          {(f"mcp:{CALLER}", "doc.append"), (f"mcp:{CALLER}", "doc.set")})
 
 
+DECISIONS_SRC = """## Budget
+
+### D-001 Night runs fill the week
+- **Type:** owner
+- **Keywords:** budget, night-window
+- **Owner's words:** "fill it at night"
+- **Status:** active
+
+### D-002 Old cap
+- **Keywords:** budget
+- **Status:** superseded by D-001
+"""
+
+
+class Decisions(Env):
+    def test_decisions_tool(self):
+        """afclaude_decisions (D-242): find lists ids + topic keywords only unless full (D-176); show expands."""
+        import decisions
+        src = os.path.join(self.tmp.name, "DECISIONS.md")
+        with open(src, "w") as fh:
+            fh.write(DECISIONS_SRC)
+        decisions.import_file(src, self.db, actor="cli", via="cli")
+        r = run(ms.afclaude_decisions("find", keywords=["night window"]))
+        self.assertEqual(r["hits"], [{"id": "D-001", "state": "active", "keywords": ["budget", "night-window"]}])
+        self.assertIn("expand an entry", r["note"])
+        self.assertNotIn("fill it at night", json.dumps(r))                   # no rule text without full
+        r = run(ms.afclaude_decisions("find", keywords=["budget"], full=True))
+        self.assertEqual([h["id"] for h in r["hits"]], ["D-001"])              # D-002 is superseded
+        self.assertIn('"fill it at night"', r["hits"][0]["entry"])
+        self.assertNotIn("note", r)
+        old, ms.DECISION_HITS = ms.DECISION_HITS, 1
+        try:
+            r = run(ms.afclaude_decisions("find", keywords=["budget"], all=True))
+        finally:
+            ms.DECISION_HITS = old
+        self.assertEqual(sorted([h["id"] for h in r["hits"]] + r["more"]), ["D-001", "D-002"])
+        r = run(ms.afclaude_decisions("show", id="d-002"))
+        self.assertEqual((r["id"], r["state"]), ("D-002", "superseded"))
+        with self.assertRaisesRegex(ToolError, "no decision D-009"):
+            asyncio.run(ms.afclaude_decisions("show", id="D-009"))
+        with self.assertRaisesRegex(ToolError, "at least one keyword"):
+            asyncio.run(ms.afclaude_decisions("find"))
+
+
 class Stdio(unittest.TestCase):
     """Spawn the server like Claude Code does (stdio, initialize handshake) on a temp DB."""
     def setUp(self):
@@ -471,7 +515,7 @@ class Stdio(unittest.TestCase):
         schema = {t.name: t.input_schema for t in tools}
         self.assertEqual(schema["afclaude_add_task"]["required"], ["title"])
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
-        self.assertLess(size, 12000, f"tool list is {size} bytes")
+        self.assertLess(size, 13000, f"tool list is {size} bytes")   # 12000 until afclaude_decisions (D-242)
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

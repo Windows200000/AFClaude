@@ -549,5 +549,43 @@ async def afclaude_doc(action: Literal["list", "show", "append", "set"], name: O
         conn.close()
 
 
+DECISION_HITS = 10           # entries a find returns (the rest: their ids under "more")
+EXPAND_NOTICE = ("Topic keywords only: expand an entry (full=true, or action show) and read it before acting "
+                 "on it or passing it on (D-176).")
+
+
+def decision_full(d: Mapping[str, Any]) -> dict[str, Any]:
+    return compact({"id": d["id"], "title": d["title"], "state": d["state"], "status": d["status"],
+                    "keywords": d["effective_keywords"], "entry": d["body"]})
+
+
+@tool("The owner's decisions (D-242). find (keywords; all: also done/superseded): ids and topic keywords "
+      "only, NOT enough to act on: expand (full=true, or show) before acting. show (id D-NNN): the full entry.",
+      read_only=True)
+async def afclaude_decisions(action: Literal["find", "show"], keywords: Optional[list[str]] = None,
+                             id: Optional[str] = None, full: bool = False, all: bool = False) -> str:
+    conn = db()
+    try:
+        if action == "show":
+            if not id:
+                raise ValueError("show needs id")
+            d = store.get_decision_entry(conn, id)
+            if d is None:
+                raise store.NotFound(f"no decision {id}")
+            return out(decision_full(d))
+        hits = store.find_decision_entries(conn, keywords or [], None if all else ("active", "partial"))
+        shown = hits[:DECISION_HITS]
+        res: dict[str, Any] = {"hits": [decision_full(d) if full else
+                                        {"id": d["id"], "state": d["state"], "keywords": d["effective_keywords"]}
+                                        for d in shown]}
+        if len(hits) > len(shown):
+            res["more"] = [d["id"] for d in hits[len(shown):]]
+        if not full:
+            res["note"] = EXPAND_NOTICE
+        return out(res)
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     server.run("stdio")

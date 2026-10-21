@@ -52,6 +52,15 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py doc import [--repo DIR] [--project P] [--force]   take hand edits of the files into the DB (also every 10 min)
     tasks.py doc export [--repo DIR] [--project P] [--check]   regenerate PROGRESS.md, GOALS.md,
                                            EXCEPTIONS.md from the DB (D-181; run before committing)
+    tasks.py decision tldr [--all]         the owner's decisions in the DB (D-242, decisions.py): one
+                                           line per current one (--all: done/superseded too)
+    tasks.py decision find KW... [--all] [--limit N]   full entries matching any keyword or phrase
+                                           (keyword matches first, then full-text hits; default 10)
+    tasks.py decision show ID              one decision's full entry (D-NNN / M-NNN)
+    tasks.py decision keywords ID add|remove KW...   keep a decision's keywords current (audited;
+                                           kept apart from DECISIONS.md's Keywords line)
+    tasks.py decision import [--file F] [--force]   DECISIONS.md into the DB now (also every 10 min
+                                           and at each compaction; the file is never written)
 
 Tasks are the stages of a project; projects form a ranked list. Execution
 order: every high stage (by project rank, then stage), then every medium one,
@@ -328,6 +337,56 @@ def run_handoff(conn, args):
         print("   " + store.render_handoff(h))
 
 
+def decision_out(d):
+    """A decision's full entry, plus the keywords in the DB when the task-manager changed them."""
+    print(d["body"])
+    if d["keywords_added"] or d["keywords_removed"]:
+        print(f"- (keywords in the DB: {', '.join(d['effective_keywords'])})")
+
+
+def run_decision(conn, args):
+    import decisions
+    dc = args.decision_cmd
+    if dc == "import":
+        r = decisions.import_file(args.file, actor="cli", via="cli", force=args.force, conn=conn)
+        if args.json:
+            return dump(r)
+        parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r[k]]
+        return print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
+                     + (f" ({r['moved']} moved)" if r["moved"] else ""))
+    if dc == "tldr":
+        rows = store.list_decision_entries(conn, None if args.all else decisions.CURRENT)
+        if args.json:
+            return dump([{"id": d["id"], "title": d["title"], "state": d["state"], "status": d["status"]}
+                         for d in rows])
+        return print(decisions.tldr_text([decisions.tldr_line(d) for d in rows]))
+    if dc == "show":
+        d = store.get_decision_entry(conn, args.id)
+        if d is None:
+            raise store.NotFound(f"no decision {args.id}")
+        return dump(d) if args.json else decision_out(d)
+    if dc == "keywords":
+        r = act(conn, "decision.keywords", decision=args.id, op=args.op, keywords=args.keywords)
+        return dump(r) if args.json else print(f"{r['id']} keywords: {', '.join(r['keywords'])}")
+    hits = store.find_decision_entries(conn, args.keywords, None if args.all else decisions.CURRENT)
+    shown = hits if args.limit == 0 else hits[:args.limit]
+    if args.json:
+        return dump({"hits": shown, "more": len(hits) - len(shown)})
+    if not hits:
+        return print(f"no {'' if args.all else 'current '}decision matches {' / '.join(args.keywords)}"
+                     + ("" if args.all else " (--all: also done and superseded ones)"))
+    for n, d in enumerate(shown):
+        if n:
+            print()
+        how = f"keywords: {', '.join(d['matched'])}" if d["match"] == "keyword" else "text match"
+        print(f"=== {d['id']} ({how})")
+        decision_out(d)
+    if len(hits) > len(shown):
+        print(f"\n({len(hits) - len(shown)} more matches not shown: "
+              + ", ".join(d["id"] for d in hits[len(shown):]) + "; --limit 0 shows all)")
+    return None
+
+
 def doc_project(conn, p):
     """--project for the doc commands: a name or directory, default this directory's project."""
     ref = project_ref(p) if p else os.getcwd()
@@ -482,6 +541,8 @@ def run(conn, args):
         run_handoff(conn, args)
     elif c == "doc":
         return run_doc(conn, args) or 0
+    elif c == "decision":
+        run_decision(conn, args)
     elif c == "automation":
         run_automation(conn, args)
     elif c == "inbox" and args.inbox_cmd:
@@ -744,6 +805,25 @@ def parser():
     q.add_argument("--repo", help="the project's directory (default: this repo)")
     q.add_argument("--project", help="project name (default: the project of --repo)")
     q.add_argument("--check", action="store_true", help="report only, write nothing")
+    p = sub.add_parser("decision", help="the owner's decisions in the DB (D-242): tldr | find | show | keywords | import")
+    dcs = p.add_subparsers(dest="decision_cmd", required=True)
+    q = dcs.add_parser("tldr", parents=[js], help="one line per current decision: id, title, [state]")
+    q.add_argument("--all", action="store_true", help="also the done and superseded ones")
+    q = dcs.add_parser("find", parents=[js], help="the full entries matching keywords (keyword matches "
+                                                  "first, then full-text hits)")
+    q.add_argument("keywords", nargs="+", help="keywords or phrases (quote a phrase); any may match")
+    q.add_argument("--all", action="store_true", help="also the done and superseded ones")
+    q.add_argument("--limit", type=int, default=10, help="entries shown (default 10; 0 = all)")
+    q = dcs.add_parser("show", parents=[js], help="one decision's full entry")
+    q.add_argument("id", help="D-NNN or M-NNN")
+    q = dcs.add_parser("keywords", parents=[js], help="add or remove keywords of a decision (audited)")
+    q.add_argument("id", help="D-NNN or M-NNN")
+    q.add_argument("op", choices=("add", "remove"))
+    q.add_argument("keywords", nargs="+", help="one or more keywords (quote one with spaces)")
+    q = dcs.add_parser("import", parents=[js], help="import DECISIONS.md now (also every 10 min and at "
+                                                    "each compaction; the file is not changed)")
+    q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")
+    q.add_argument("--force", action="store_true", help="allow removing more than half of the decisions")
     return ap
 
 
