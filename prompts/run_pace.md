@@ -1,0 +1,1 @@
+Pace (D-274/D-275): work at a pace that fills this session window, which ends at {end}, and finish only within its last hour (from {last_hour}), not earlier: an early stop leaves the window unused, and a later start then re-reads the whole context (the prompt cache lasts an hour). The session stop and the run's budget still end the run.

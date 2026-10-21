@@ -742,6 +742,9 @@ SETTINGS: dict[str, Setting] = {
                             "budget"),
     "fillup_factor": _num(1.10, 1.0, 3.0, "Fill-up start = session reset - (100 - session %) / measured fill "
                           "rate x this factor (D-212)", "budget"),
+    "run_start_factor": _num(1.5, 0.0, 5.0, "Run timing (D-274): a night run starts at its session window's "
+                             "end - the session % it can use / measured fill rate x this factor, so it ends at "
+                             "the window's end (0 = at the session-window start, as before)", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
     "compaction_enabled": _flag(True, "Compaction (D-144/D-233/D-238): the watcher compacts the task-manager "

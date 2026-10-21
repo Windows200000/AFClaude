@@ -23,7 +23,8 @@ made during the flow goes in only after its READY (inbox_worker.manager_active, 
 A "now" message that can't be typed in (the owner holds the session or is typing, a compaction, a
 usage limit) is held and tried again while the hold lasts, at most until the next session-window
 start (D-244, hold_deadline): that start's message takes it along (held_insert, keepalive's
-_fire_start), marked as needing an answer; still not out by then is an error.
+_fire_start), marked as needing an answer; still not out by then is an error. A start whose gate
+passed fires late in its session window (D-274): the hold then lasts until that planned start.
 
 A failed triage or delivery is an error on the message (D-235/D-244: shown on the dashboard,
 logged, alerted, and automation paused until the owner clears it; never delivered silently, never
@@ -46,6 +47,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
 
@@ -177,8 +179,23 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
 def hold_deadline(since: datetime, cfg: schedule.Config | None = None) -> datetime | None:
     """D-244: a "now" message held since `since` waits at most until the first session-window start
     after it (schedule.next_session_start): that start's message takes it along, else it is an
-    error (inbox_worker.hold). None: no window at all (nothing to wait for: an error too)."""
-    return schedule.next_session_start(since, cfg)
+    error (inbox_worker.hold). None: no window at all (nothing to wait for: an error too).
+    D-274: when the keep-alive planned that start for later in its session window (the gate
+    passed, the run fires late), the planned time instead (planned_start)."""
+    start = schedule.next_session_start(since, cfg)
+    if start is None:
+        return None
+    return planned_start(start, cfg) or start
+
+
+def planned_start(start: datetime, cfg: schedule.Config | None = None) -> datetime | None:
+    """D-274: the time the keep-alive planned the session-window start `start` for (its entry in
+    the runner state 'keepalive.deferred' marked planned: keepalive.defer_window_start), or None."""
+    ent = runner_state.load("keepalive.deferred").get(schedule.start_key(start, cfg))
+    if not isinstance(ent, dict) or not ent.get("planned"):
+        return None
+    t = _ts(ent.get("recheck_at"))
+    return t if t is not None and t > start else None
 
 
 def hold_until(m: dict[str, Any], cfg: schedule.Config | None = None) -> datetime | None:
