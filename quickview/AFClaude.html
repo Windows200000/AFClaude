@@ -561,7 +561,9 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   function renderInput(s) {
     var n = s.needs_input || {}, out = [];
     (n.open_questions || []).forEach(function (q) {
-      out.push('<div class="item"><div class="src">OPEN_QUESTIONS.md</div>' + md(q) + "</div>");
+      var text = (q && typeof q === "object") ? q.text : q;
+      var warn = (q && q.warning) ? '<div class="warn">⚠ ' + esc(q.warning) + "</div>" : "";
+      out.push('<div class="item">' + md(text) + warn + "</div>");
     });
     (n.blocked_tasks || []).forEach(function (t) {
       out.push('<div class="item"><div class="src">blocked task' + (t.project ? " · " + esc(t.project) : "") +

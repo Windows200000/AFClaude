@@ -70,6 +70,74 @@ class BuildStages(unittest.TestCase):
                 store.DB_PATH, qv.STAGES_PROJECT = old_path, old_proj
 
 
+class OpenQuestions(unittest.TestCase):
+    """D-279: an open question must reach the UI whole, not cut to its first line, and an item
+    that is mainly a pointer to a .md file gets a visible warning instead of passing silently."""
+
+    def test_split_keeps_continuation_and_nested_items_with_one_item(self):
+        md = ("# Open questions\n\n"
+              "- **3b open questions:** see docs/phase3b_plan.md for details.\n"
+              "  1. question one?\n"
+              "  2. question two?\n"
+              "- A plain single-line question?\n")
+        items = qv._split_open_questions(md)
+        self.assertEqual(len(items), 2)
+        text0 = qv._open_question_text(items[0])
+        self.assertIn("question one?", text0)
+        self.assertIn("question two?", text0)
+        self.assertEqual(qv._open_question_text(items[1]), "A plain single-line question?")
+
+    def test_nested_item_with_real_content_gets_no_warning(self):
+        md = ("- **3b:** see docs/phase3b_plan.md for details.\n"
+              "  1. question one?\n"
+              "  2. question two?\n")
+        items = qv._split_open_questions(md)
+        self.assertIsNone(qv._open_question_warning(items[0]))
+
+    def test_md_pointer_only_item_gets_a_warning(self):
+        md = "- See docs/phase3b_plan.md for details.\n"
+        items = qv._split_open_questions(md)
+        self.assertEqual(len(items), 1)
+        self.assertIsNotNone(qv._open_question_warning(items[0]))
+
+    def test_md_mentioned_alongside_real_question_gets_no_warning(self):
+        md = ("- Should the design doc at docs/dashboard_design.md move into phase 4? "
+              "Recommended: yes, once phase 3b ships.\n")
+        items = qv._split_open_questions(md)
+        self.assertIsNone(qv._open_question_warning(items[0]))
+
+    def test_needs_input_reads_full_item_through_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_here = qv.HERE
+            qv.HERE = d
+            try:
+                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
+                    fh.write("- **3b open questions:** see docs/phase3b_plan.md for details.\n"
+                              "  1. question one?\n  2. question two?\n")
+                out = qv.needs_input()
+                self.assertEqual(len(out["open_questions"]), 1)
+                q = out["open_questions"][0]
+                self.assertIn("question one?", q["text"])
+                self.assertIn("question two?", q["text"])
+                self.assertNotIn("warning", q)
+                self.assertEqual(out["count"], 1)
+            finally:
+                qv.HERE = old_here
+
+    def test_needs_input_flags_a_pointer_only_item(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_here = qv.HERE
+            qv.HERE = d
+            try:
+                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
+                    fh.write("- See docs/phase3b_plan.md for details.\n")
+                out = qv.needs_input()
+                self.assertEqual(len(out["open_questions"]), 1)
+                self.assertIn("warning", out["open_questions"][0])
+            finally:
+                qv.HERE = old_here
+
+
 class DocsFromTheDb(unittest.TestCase):
     """PROGRESS/GOALS/ALERTS/EXCEPTIONS come from the project docs in the DB (design §7.7: the
     runners' notes and the alerts are only there); the file only when the DB has no such doc."""

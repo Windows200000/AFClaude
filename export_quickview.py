@@ -311,10 +311,70 @@ def eta_summary(eta):
 
 # ---------------------------------------------------------------- other sources
 
+_MD_FILE_RE = re.compile(r"\b[\w./-]*\.md\b")
+_MD_POINTER_WORDS_RE = re.compile(r"\b(see|cf\.?|details?( in)?|refer to|in)\b", re.IGNORECASE)
+
+
+def _split_open_questions(oq_md):
+    """Top-level '- ' items of OPEN_QUESTIONS.md, each as its list of raw lines (the first line
+    with the leading '- ' stripped). A line is part of the current item unless it starts a new
+    top-level item (a '-' with no leading indentation); indented continuation lines and nested
+    numbered/bulleted sub-items (D-279: a multi-line item must not collapse to its first line)
+    stay with it."""
+    items, cur = [], None
+    for line in oq_md.splitlines():
+        if re.match(r"^-\s+\S", line):
+            if cur is not None:
+                items.append(cur)
+            cur = [re.sub(r"^-\s+", "", line).rstrip()]
+        elif cur is not None:
+            cur.append(line.rstrip())
+        # lines before the first top-level item (title, blank, comments) aren't an item
+    if cur is not None:
+        items.append(cur)
+    return items
+
+
+def _open_question_text(lines):
+    """lines (as from _split_open_questions) joined into markdown: the header line, then - if
+    there are continuation lines - a blank line and the continuation dedented to its own
+    shallowest indent, so a nested list under it still parses as a list rather than being eaten
+    as lazy paragraph continuation."""
+    head, rest = lines[0], lines[1:]
+    while rest and rest[-1].strip() == "":
+        rest.pop()
+    if not rest:
+        return head
+    indents = [len(l) - len(l.lstrip()) for l in rest if l.strip()]
+    cut = min(indents) if indents else 0
+    rest = ["" if not l.strip() else l[cut:] for l in rest]
+    return head + "\n\n" + "\n".join(rest)
+
+
+def _open_question_warning(lines):
+    """D-279 safety net: flag an item whose only real content is a pointer to a .md file (the
+    original bug - a header naming a doc with the actual questions left out of OPEN_QUESTIONS.md
+    entirely) so it's caught instead of silently showing an empty-looking item."""
+    full = " ".join(l.strip() for l in lines if l.strip())
+    if not _MD_FILE_RE.search(full):
+        return None
+    rest = _MD_FILE_RE.sub("", full)
+    rest = _MD_POINTER_WORDS_RE.sub("", rest)
+    rest = re.sub(r"[\s:.,()*_\-]+", "", rest)
+    if len(rest) < 20:
+        return "points mainly to a file instead of stating the question here"
+    return None
+
+
 def needs_input():
     oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
-    open_questions = [re.sub(r"^\s*-\s*", "", l).strip()
-                      for l in oq_md.splitlines() if re.match(r"^\s*-\s", l)]
+    open_questions = []
+    for lines in _split_open_questions(oq_md):
+        q = {"text": _open_question_text(lines)}
+        warning = _open_question_warning(lines)
+        if warning:
+            q["warning"] = warning
+        open_questions.append(q)
     try:
         conn = store.connect()
         import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
