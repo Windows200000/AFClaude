@@ -566,6 +566,8 @@ class SettingActions(Base):
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
+                          "remote_control_task_manager": True, "remote_control_review": True,
+                          "remote_control_continue": True, "remote_control_test": True,
                           "log_retention_days": 30.0, "log_retention_overrides": {},
                           "runner_timeout_stall_scan": 2.0, "runner_timeout_sampler": 10.0,
                           "runner_timeout_dispatcher": 8.0, "runner_timeout_quickview": 2.0,

@@ -71,6 +71,7 @@ import store  # noqa: E402
 import afclaude_config  # noqa: E402
 import schedule  # noqa: E402
 import manager_launch  # noqa: E402
+import remote_control  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
@@ -758,6 +759,12 @@ SETTINGS: dict[str, Setting] = {
                                            "automation"),
     "cleanup_idle_hours": _num(2, 0.25, 168, "Dispatcher: a tmux session it started is closed after it was "
                                "idle this long after its last turn", "automation"),
+    # --- Remote Control per session category (D-269, remote_control.py): applied when a session is
+    # started or resumed (ka_resume.sh --no-remote-control when off); default on = the launch before D-269
+    **{remote_control.PREFIX + cat: _flag(remote_control.DEFAULT, f"Remote Control (claude --remote-control, "
+                                          f"D-269) for {covers}; applies at the session's next start or "
+                                          f"resume", "automation")
+       for cat, covers in remote_control.CATEGORIES.items()},
     # --- app_log retention (phase 2d part 2, D-161: everything in the DB; D-130: never drop
     # usage/telemetry data -- this prunes only the app_log lines). A daily cron run of
     # `python3 store.py prune-logs` deletes rows older than the retention through actions.log_prune

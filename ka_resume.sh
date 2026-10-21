@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Continue a Claude Code session WITHOUT --bg (bg sessions get retired by the
 # daemon after 60 min idle and inherit the daemon's env). The session lives in a
-# detached tmux session named ka-<first 8 of uuid>, as a normal interactive,
-# Remote-Control-visible process whose env is exactly what this script sets.
+# detached tmux session named ka-<first 8 of uuid>, as a normal interactive process
+# (Remote-Control-visible unless --no-remote-control) whose env is exactly what this script sets.
 #
 #   ka_resume.sh --session <full-uuid> --message <text> [--cwd DIR] [--name NAME]
-#                [--model M] [--effort E] [--new]
+#                [--model M] [--effort E] [--new] [--no-remote-control]
 #
 # - tmux session already running  -> type the message into it (send-keys)
 # - otherwise                      -> start `claude --resume <uuid> ... "<msg>"` in tmux
-#   (--new: start a brand-new session with --session-id <uuid> instead of resuming)
+#   (--new: start a brand-new session with --session-id <uuid> instead of resuming;
+#    --no-remote-control: start it without --remote-control, the session category's setting,
+#    D-269 / remote_control.py; a live tmux session keeps what it was started with)
 set -euo pipefail
 DIR="$(dirname "$(readlink -f "$0")")"
-SID="" MSG="" CWD=/mnt/BlockVolume/Claude NAME="" MODEL=claude-opus-5-5 EFFORT=high NEW=0
+SID="" MSG="" CWD=/mnt/BlockVolume/Claude NAME="" MODEL=claude-opus-5-5 EFFORT=high NEW=0 RC=(--remote-control)
 while [ $# -gt 0 ]; do
   case "$1" in
     --session) SID="$2"; shift 2;;
@@ -22,6 +24,7 @@ while [ $# -gt 0 ]; do
     --model) MODEL="$2"; shift 2;;
     --effort) EFFORT="$2"; shift 2;;
     --new) NEW=1; shift;;
+    --no-remote-control) RC=(); shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -85,7 +88,7 @@ mkdir -p "$DIR/run"
   # message tells the session to read the guard hooks and respect them anyway.
   printf 'XDG_RUNTIME_DIR=%q PATH=%q CLAUDE_GUARD_DISABLE=1 ' "/run/user/$(id -u)" "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"
   printf 'claude'
-  printf ' %q' "${START[@]}" --remote-control --name "$NAME" --model "$MODEL" --effort "$EFFORT" \
+  printf ' %q' "${START[@]}" ${RC[@]+"${RC[@]}"} --name "$NAME" --model "$MODEL" --effort "$EFFORT" \
     --permission-mode "$MODE" "--allowedTools=$ALLOW" -- "$MSG"
   echo
 } >"$RUN"

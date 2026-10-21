@@ -93,6 +93,7 @@ class RunOnce(Base):
         self.assertEqual(plan, "resume")
         self.assertTrue(new)
         self.assertIn("one-off", k.get("name", ""))
+        self.assertEqual(k.get("category"), "review")             # its Remote Control setting (D-269)
         # only the one-off prompt + guard_respect + manager: never the regular usage_review.md
         # brief, and the owner's verbatim D-220/D-221 concerns are in it
         self.assertNotIn("periodic usage-model review", msg)
