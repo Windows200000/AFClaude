@@ -157,7 +157,7 @@ def load_samples(path=SAMPLES):
 
 def build_pairs(rows):
     """Consecutive-sample deltas within the same session window and weekly
-    cycle. One dict per usable pair:
+    cycle; a pair across a one-off reset (§3.5, _one_off) is left out. One dict per usable pair:
       t0, t1 (datetime), d_session, d_weekly (float, percentage points),
       own_tokens, other_tokens (weighted), weekly_resets (rounded datetime,
       i.e. which weekly cycle this pair belongs to)."""
@@ -176,7 +176,7 @@ def build_pairs(rows):
             "t": t, "sp": s["percent"], "wp": w["percent"],
             "sr": _round_reset(s["resets_at"]), "wr": _round_reset(w["resets_at"]),
         }
-        if prev and prev["sr"] == cur["sr"] and prev["wr"] == cur["wr"]:
+        if prev and prev["sr"] == cur["sr"] and prev["wr"] == cur["wr"] and not _one_off(prev, cur):
             act = r.get("activity") or {}
             pairs.append({
                 "t0": prev["t"], "t1": cur["t"],
@@ -271,14 +271,28 @@ def _points(rows):
     return pts
 
 
+def one_off_drop(prev_pct, cur_pct):
+    """The one-off reset rule (§3.5) for two consecutive readings of one meter whose rounded reset
+    time is the same (the caller checks that; a scheduled reset moves it): the reading is
+    >= RESET_DROP below the previous one."""
+    return cur_pct <= prev_pct - RESET_DROP
+
+
+def meter_rise(prev_pct, cur_pct):
+    """The rise of a meter between two consecutive readings with the same rounded reset time:
+    after a one-off reset (one_off_drop) the meter restarted at 0, so the reading itself; else
+    the increase (never negative)."""
+    return float(cur_pct) if one_off_drop(prev_pct, cur_pct) else max(float(cur_pct) - float(prev_pct), 0.0)
+
+
 def _one_off(prev, cur):
     """The meters ("weekly", "session") that were reset outside their schedule between two
     consecutive readings: the meter dropped by >= RESET_DROP while its rounded reset time
     stayed the same (a scheduled reset moves the reset time)."""
     out = []
-    if prev["wr"] is not None and prev["wr"] == cur["wr"] and cur["wp"] <= prev["wp"] - RESET_DROP:
+    if prev["wr"] is not None and prev["wr"] == cur["wr"] and one_off_drop(prev["wp"], cur["wp"]):
         out.append("weekly")
-    if prev["sr"] is not None and prev["sr"] == cur["sr"] and cur["sp"] <= prev["sp"] - RESET_DROP:
+    if prev["sr"] is not None and prev["sr"] == cur["sr"] and one_off_drop(prev["sp"], cur["sp"]):
         out.append("session")
     return out
 
@@ -818,7 +832,7 @@ def estimate_time_split(rows, spans, current_weekly_resets, now=None):
         if w.get("percent") is None or _round_reset(w.get("resets_at")) != current_weekly_resets:
             continue
         wp = float(w["percent"])
-        if last_w is not None and wp <= last_w - RESET_DROP:     # one-off reset: the meter restarted at 0
+        if last_w is not None and one_off_drop(last_w, wp):     # one-off reset: the meter restarted at 0
             events.append({"at": _iso(t), "from_pct": last_w, "to_pct": wp})
             prev_w = 0.0
         last_w = wp

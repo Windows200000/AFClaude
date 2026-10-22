@@ -65,6 +65,13 @@ class ComputeRun(unittest.TestCase):
         self.assertEqual(r["trajectory"][0], [15.0, 20, 73])
         self.assertEqual(r["readings"], 6)
 
+    def test_weekly_delta_across_a_one_off_reset(self):
+        """§3.5: the weekly meter drops 90 -> 3 during the run with its reset time unchanged:
+        the delta = 80 -> 90 plus 0 -> 6, the end % = the meter at the end."""
+        reads = [rd(-5, 0, 80), rd(15, 20, 85), rd(30, 40, 90), rd(45, 60, 3), rd(60, 70, 6)]
+        r = rm.compute_run(run(), reads, every(0, 60), [], now=M(300))
+        self.assertEqual((r["weekly_start_pct"], r["weekly_end_pct"], r["weekly_delta"]), (80, 6, 16))
+
     def test_full_fill_from_readings_without_a_notice(self):
         reads = [rd(-5, 0, 70), rd(30, 50, 76), rd(60, 90, 82), rd(75, 100, 84)]
         r = rm.compute_run(run(), reads, None, [], now=M(300))

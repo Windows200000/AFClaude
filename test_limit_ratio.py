@@ -76,6 +76,20 @@ class BuildPairs(unittest.TestCase):
         pairs = lr.build_pairs([r1, r2])
         self.assertEqual(pairs, [])
 
+    def test_one_off_reset_is_skipped(self):
+        """§3.5: the weekly meter drops 100 -> 8 with its reset time unchanged (and the session
+        meter with it or not): no pair across the drop (no negative d_weekly)."""
+        t1, t2 = T0 + timedelta(minutes=15), T0 + timedelta(minutes=30)
+        pairs = lr.build_pairs([row(T0, 10, 98), row(t1, 12, 100), row(t2, 14, 8)])
+        self.assertEqual([(p["d_session"], p["d_weekly"]) for p in pairs], [(2, 2)])
+
+    def test_meter_rise(self):
+        self.assertEqual(lr.meter_rise(40, 43), 3.0)
+        self.assertEqual(lr.meter_rise(40, 39), 0.0)        # a 1-point wobble: no rise, no reset
+        self.assertEqual(lr.meter_rise(100, 8), 8.0)        # a one-off reset: risen from 0
+        self.assertTrue(lr.one_off_drop(40, 38))
+        self.assertFalse(lr.one_off_drop(40, 38.5))
+
     def test_weekly_reset_boundary_is_skipped(self):
         r1 = row(T0, 10, 99, week_reset=WEEK_RESET)
         r2 = row(T0 + timedelta(minutes=15), 12, 2, week_reset=WEEK_RESET2)

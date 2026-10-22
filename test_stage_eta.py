@@ -333,6 +333,27 @@ class UsageSplitTest(unittest.TestCase):
         self.assertEqual(se.usage_split(rows, runs),
                          {"2026-10-15": {"run": 3.0, "design": 3.0, "other": 3.0}})
 
+    def test_one_off_reset_counts_the_rise_from_0(self) -> None:
+        """§3.5 (the reset of 21.10.): the meter drops 100 -> 8 with its reset time unchanged; the
+        sampler has no delta for that reading, the split counts it as 8 (risen from 0), like
+        pacing.cycle_totals."""
+        t0 = datetime(2026, 10, 21, 22, tzinfo=timezone.utc)
+        reset = "2026-10-22 16:59:59.500000+00:00"
+
+        def smp(m: int, wp: float, d: "float | None") -> dict:
+            t = t0 + timedelta(minutes=m)
+            return {"at": t.isoformat(), "since": (t - timedelta(minutes=15)).isoformat(),
+                    "usage": {"weekly": {"percent": wp, "resets_at": reset},
+                              "session": {"percent": 50.0, "resets_at": "2026-10-22 01:00:00+00:00"}},
+                    "weekly_pct_delta": d, "own_w_tokens": 0, "other_w_tokens": 0}
+        rows = [smp(0, 98, 13), smp(15, 100, 2), smp(30, 8, None), smp(45, 14, 6)]
+        self.assertEqual(se.usage_split(rows, []), {"2026-10-22": {"run": 0.0, "design": 0.0, "other": 29.0}})
+        # a scheduled reset (the reset time moves) is not a one-off reset: no delta, nothing counted
+        rows[2]["usage"]["weekly"]["resets_at"] = "2026-10-29 17:00:00+00:00"
+        rows[3]["usage"]["weekly"]["resets_at"] = "2026-10-29 17:00:00+00:00"
+        self.assertEqual(se.usage_split(rows, []), {"2026-10-22": {"run": 0.0, "design": 0.0, "other": 15.0},
+                                                    "2026-10-29": {"run": 0.0, "design": 0.0, "other": 6.0}})
+
 
 if __name__ == "__main__":
     unittest.main()

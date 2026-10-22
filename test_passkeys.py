@@ -285,5 +285,30 @@ class Assertion(unittest.TestCase):
         self.assert_refused(self.check(self.stored(aaguid=ZERO), lst=lst, counter=6), "model_not_usable", True)
 
 
+
+@unittest.skipIf(bool(SKIP), SKIP)
+class FactorRule(unittest.TestCase):
+    """6b's factors in 6a's factor rule (dashboard/auth/factors.py)."""
+
+    def test_table(self):
+        from dashboard.auth import factors
+        table = [
+            (("passkey_hw",), True), (("oidc",), True), (("passkey_synced",), False),
+            (("passkey_synced", "totp"), True), (("passkey_synced", "password"), True),
+            (("passkey_synced", "recovery_code"), True),
+            (("passkey_synced", "passkey_synced"), False),     # two synced passkeys of one user count once
+        ]
+        for done, complete in table:
+            with self.subTest(done=done):
+                self.assertEqual(factors.is_complete(done), complete)
+                self.assertEqual(factors.is_complete(done, step_up=True), complete)
+
+    def test_remembered_device_after_a_synced_passkey(self):
+        from dashboard.auth import factors
+        self.assertTrue(factors.is_complete(["passkey_synced"], remembered_device=True))
+        self.assertFalse(factors.is_complete(["passkey_synced"], remembered_device=True, step_up=True))
+        self.assertFalse(factors.is_complete([], remembered_device=True))
+
+
 if __name__ == "__main__":
     unittest.main()
