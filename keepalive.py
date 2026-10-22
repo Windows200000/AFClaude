@@ -1734,7 +1734,10 @@ def window_start_cli(sid, now, args):
     if prev is not None:
         log(f"window-start {key}: decided already at {prev.get('at')} (by the {prev.get('by', '?')}); not again")
         return None
-    return window_start_pass(sid, now, args)
+    d = window_start_pass(sid, now, args)
+    if want:      # the runner: a start planned late or postponed is its deferred_start act (S6), at once
+        plan_deferred_act(sid, now)
+    return d
 
 
 # ---------------------------------------------------------------- run timing (D-274, D-275)
@@ -3604,6 +3607,330 @@ def _compact_now(sid, path, d, rec, head):
         fail_stop(f"no reply from {sid[:8]} to its hand-off after the compaction",
                   f"none within {VERIFY_TIMEOUT} of the message")
     return None
+
+
+# ---------------------------------------------------------------- the passes as runner jobs (phase 3a S6)
+# docs/phase3a_plan.md §5 S6. The watcher (run(), the legacy mode) calls each pass's plan and act step in
+# its loop (watch_pass, last_mile_pass, deferred_window_start_pass, fillup_pass, watch_run_usage,
+# compaction_pass). The resident runner calls the same steps as jobs (`runner_jobs.py <job> [--key K]` ->
+# runner_pass). Its ticks only read and plan, so a rerun is safe: `watch` (every 60 s: the detection and
+# the plan steps of the last stretch, the postponed / planned starts and the fill-up), `compaction_check`
+# (60 s) and `run_readings` (5 min). What types into the session is an act run of its own (last_stretch,
+# deferred_start, fillup, compaction) at the time its plan step stored: the plan step writes
+# acts.<job> = {key: the pass's dedup key, at, run: the run's key} into the runner state 'keepalive.watch'
+# (store_act); the runner wakes at `at` and starts the act under `run` (runner.planned_act); the act
+# re-plans first (still the same dedup key, still due) and then acts as the watcher does, with the
+# watcher's dedup (handled, compactions: a rollback to legacy starts nothing twice). An act cut off by a
+# restart is never rerun (D-257: its run key is settled). The watcher's in-memory timing is stored
+# instead: a HOLD's recheck, the owner-busy retry and a planned start are the act's `at`; the next
+# last-stretch slot start and the fill-up's usage refresh ahead of its start are the watch tick's
+# next_due. Its log-once memory (MEMO) is kept in the same state between the runs. The watcher's STOP
+# and PAUSED files hold the runner's passes too (until S9 retires them, D-235's automation_paused stays
+# the switch for everything else).
+
+WATCH_FILE = None        # the runner state 'keepalive.watch' lives in the DB only (never a file)
+PAUSED_FILE = os.path.join(HERE, "PAUSED")   # start_watcher.sh: keeps the watcher stopped
+ACT_JOBS = ("last_stretch", "deferred_start", "fillup", "compaction")
+RUN_KEY_RE = re.compile(r"[^A-Za-z0-9_.:+-]")
+RUN_KEY_MAX = 128
+SESSION_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_STOP_LINE = None        # runner_pass: why the passes are held (STOP / PAUSED), logged when it changes
+MEMO = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
+
+
+def load_watch():
+    return runner_state.load("keepalive.watch", WATCH_FILE, {"acts": {}, "memo": {}})
+
+
+def save_watch(d):
+    if not runner_state.save("keepalive.watch", d, WATCH_FILE):
+        log("the passes' runner state (keepalive.watch) was not saved (recorded in data/ALERTS.fallback.md)")
+
+
+def act_run_key(key, at):
+    """The run key of the act for the dedup key `key` at `at` (runner_runs: one run per key)."""
+    tail = "." + at.astimezone(UTC).strftime("%Y%m%dT%H%M%S")
+    return RUN_KEY_RE.sub("_", str(key))[:RUN_KEY_MAX - len(tail)] + tail
+
+
+def _act_entry(key, at, run=None):
+    return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at)}
+
+
+def store_act(job, key, at, now, hold=False):
+    """A plan step's result for the act job `job`: the dedup key and the time it is due (None: no
+    act; the stored one is dropped). An act due now that is pending already (the same key, its time
+    come, not run yet: an act always rewrites or drops its entry when it ends) keeps its time and so
+    its run key: a plan each minute never plans it twice. An act due now with none pending is due at
+    `now` (a new run key: a retry after an act that did not start it). hold: a stored act of the same
+    key keeps its time whatever it is (a HOLD's recheck the act returned). -> the stored time or None."""
+    doc = load_watch()
+    acts = doc.setdefault("acts", {})
+    cur = acts.get(job) if isinstance(acts.get(job), dict) else None
+    if key is None or at is None:
+        if job in acts:
+            acts.pop(job)
+            save_watch(doc)
+        return None
+    cur_at = parse_ts(cur.get("at")) if cur is not None and cur.get("key") == key else None
+    if cur_at is not None and (hold or cur_at == at or (at <= now and cur_at <= now)):
+        return cur_at
+    if at <= now:
+        at = now
+    acts[job] = _act_entry(key, at)
+    save_watch(doc)
+    return at
+
+
+def _act_done(job, key, run, nxt, now):
+    """An act ended: its entry is dropped (nxt None) or due again at `nxt` (never under the run key
+    that just ran), unless a plan step replaced it meanwhile."""
+    doc = load_watch()
+    acts = doc.setdefault("acts", {})
+    cur = acts.get(job)
+    if isinstance(cur, dict) and cur.get("run") != run:
+        return
+    if nxt is None:
+        if job in acts:
+            acts.pop(job)
+            save_watch(doc)
+        return
+    run2 = act_run_key(key, nxt)
+    if run2 == run:
+        run2 = act_run_key(f"{key}.", max(nxt, now))
+    acts[job] = _act_entry(key, nxt, run2)
+    save_watch(doc)
+
+
+def _memo_get():
+    g = globals()
+    return {"_PAUSE_LOGGED": {("*" if k is None else k): v for k, v in g["_PAUSE_LOGGED"].items()},
+            "_FILLUP_BUSY": {k: v.astimezone(UTC).isoformat() for k, v in g["_FILLUP_BUSY"].items()},
+            **{n: g[n] for n in MEMO if n not in ("_PAUSE_LOGGED", "_FILLUP_BUSY")}}
+
+
+def memo_load(doc):
+    """The passes' log-once memory (MEMO) from the runner state into this process. -> its encoded
+    form (memo_save writes what changed)."""
+    g = globals()
+    memo = doc.get("memo") or {}
+    for n in MEMO:
+        if n not in memo:
+            continue
+        v = memo[n]
+        if n == "_PAUSE_LOGGED":
+            v = {(None if k == "*" else k): r for k, r in (v or {}).items()}
+        elif n == "_FILLUP_BUSY":
+            v = {k: parse_ts(t) for k, t in (v or {}).items() if t}
+        g[n] = v
+    return _memo_get()
+
+
+def memo_save(doc, before):
+    now = _memo_get()
+    changed = {n: v for n, v in now.items() if v != before.get(n)}
+    if changed:
+        doc.setdefault("memo", {}).update(changed)
+        save_watch(doc)
+
+
+def watcher_stopped():
+    """Why the watcher's passes are held (the STOP or PAUSED file, as for the watcher), else None."""
+    for path, what in ((STOP_FILE, "STOP"), (PAUSED_FILE, "PAUSED")):
+        if os.path.exists(path):
+            return f"the watcher's {what} file is present ({path})"
+    return None
+
+
+def plan_deferred_act(sid, now, st=None):
+    """The plan step of the postponed / planned start as an act (deferred_plan): due at its
+    recheck time (+ WAKE_SLACK, as the watcher woke for it)."""
+    p = deferred_plan(sid, now, st if st is not None else load_state())
+    if p is None:
+        return store_act("deferred_start", None, None, now)
+    due = parse_ts(p[1].get("recheck_at")) or now
+    return store_act("deferred_start", p[0], due + WAKE_SLACK, now)
+
+
+def _fillup_act_at(d, due, fire_now):
+    """When the fill-up's act is due (its plan `d`, the time to look again `due`): a start that is
+    due or planned (at it, + WAKE_SLACK), the retry after the owner was busy; None: no act (the
+    watch tick decides again at `due`)."""
+    planned = d.get("status") == "wait" and due is not None and due == d.get("start")
+    if fire_now or planned:
+        return (d.get("start") or due) + WAKE_SLACK
+    if d.get("status") == "fire" and due is not None:    # the owner was busy (OWNER_BUSY): the retry
+        return due
+    return None
+
+
+def _fillup_plan_any(sid, now):
+    """fillup_plan, or a --plan-fillup-test entry's plan. -> (decision, due, fire now)."""
+    test = load_fillup().get("test")
+    if isinstance(test, dict) and test.get("session") == sid:
+        d = fillup_test_plan(sid, now, test)
+        return d, d.get("recheck_at"), d["status"] == "fire"
+    return fillup_plan(sid, now)
+
+
+def watch_tick(sid, now, args):
+    """The runner's `watch` job: the detection (watch_pass) and the plan steps of the last stretch,
+    the postponed / planned start and the fill-up (their acts stored, store_act). Each part's
+    failure is reported as the watcher reports it (fail_stop) and the others still run. -> the
+    result, next_due: the next last-stretch slot start, the fill-up's prefetch or recheck time."""
+    st = load_state()
+    nxt = []
+    try:
+        lm = last_mile_next_start(now)
+        if lm is not None:
+            nxt.append(lm + WAKE_SLACK)
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the other parts go on
+        fail_stop("last-stretch slot time failed", f"{type(e).__name__}: {e}")
+    try:
+        watch_pass(sid, now, st)
+        p = last_stretch_plan(sid, now, st)
+        store_act("last_stretch", p and p["key"], p and now, now, hold=True)
+    except Exception as e:   # noqa: BLE001
+        fail_stop(f"watcher pass failed: {type(e).__name__}", str(e)[:500])
+    try:
+        plan_deferred_act(sid, now, st)
+    except Exception as e:   # noqa: BLE001
+        fail_stop(f"postponed window-start pass failed: {type(e).__name__}", str(e)[:500])
+    try:
+        d, due, fire_now = _fillup_plan_any(sid, now)
+        at = _fillup_act_at(d, due, fire_now)
+        store_act("fillup", d.get("key") if at else None, at, now)
+        start = d.get("start")
+        if at is not None and not fire_now and isinstance(start, datetime) and start - FILLUP_PREFETCH > now:
+            nxt.append(start - FILLUP_PREFETCH)          # refresh the usage ahead of the start
+        elif at is None and isinstance(due, datetime):
+            nxt.append(due + WAKE_SLACK)                  # decide again then (a hold, a wait)
+    except Exception as e:   # noqa: BLE001
+        fail_stop("fill-up pass failed", f"{type(e).__name__}: {e}")
+    later = [t for t in nxt if t > now]
+    return {"status": "ok", "note": "", "next_due": min(later).astimezone(UTC).isoformat() if later else None}
+
+
+def compaction_check_tick(sid, now, args):
+    """The runner's `compaction_check` job: the check (compaction_plan); a compaction due is
+    stored as the `compaction` act."""
+    try:
+        d, ready = compaction_plan(sid, now, args)
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235), reported as the watcher did
+        fail_stop(f"compaction pass failed: {type(e).__name__}", str(e)[:500])
+        return {"status": "ok", "note": "the check failed"}
+    store_act("compaction", d.key if ready else None, now if ready else None, now, hold=True)
+    return {"status": "ok", "note": d.reason if d is not None else ""}
+
+
+def run_readings_tick(sid, now, args):
+    """The runner's `run_readings` job (D-207; watch_run_usage reports its own failure)."""
+    watch_run_usage(sid, now)
+    return {"status": "ok", "note": ""}
+
+
+TICKS = {"watch": watch_tick, "compaction_check": compaction_check_tick, "run_readings": run_readings_tick}
+
+
+def _act_last_stretch(sid, now, args, key):
+    st = load_state()
+    p = last_stretch_plan(sid, now, st)
+    if p is None or p["key"] != key:
+        return None, f"last stretch {key}: nothing due any more (handled, or another slot)"
+    nxt = last_stretch_act(sid, now, st, args, p)
+    return nxt, f"last stretch {key}: " + (f"checks again {berlin(nxt)}" if nxt else "decided")
+
+
+def _act_deferred_start(sid, now, args, key):
+    st = load_state()
+    p = deferred_plan(sid, now, st)
+    if p is None or p[0] != key:
+        return None, f"start {key}: no postponed or planned start for it any more"
+    key, ent, defs = p
+    due = parse_ts(ent.get("recheck_at")) or now
+    if now < due:
+        return due + WAKE_SLACK, f"start {key}: not due before {berlin(due)}"
+    nxt = deferred_act(sid, now, st, args, key, ent, defs)
+    return (nxt + WAKE_SLACK if nxt else None), f"start {key}: " + (f"again at {berlin(nxt)}" if nxt else "decided")
+
+
+def _act_fillup(sid, now, args, key):
+    test = load_fillup().get("test")
+    if isinstance(test, dict) and test.get("session") == sid:
+        d = fillup_test_plan(sid, now, test)
+        if d.get("key") != key:
+            return None, f"fill-up {key}: not planned any more"
+        if d["status"] == "fire":
+            fillup_test_act(sid, now, args, test, d)
+            return None, f"fill-up {key}: fired (TEST)"
+        return _fillup_act_at(d, d.get("recheck_at"), False), f"fill-up {key}: {d['status']} (TEST)"
+    d, due, fire_now = fillup_plan(sid, now)
+    if d.get("key") != key:
+        return None, f"fill-up {key}: not planned any more ({d['status']}: {d.get('reason')})"
+    if fire_now:
+        nxt = fillup_act(sid, now, args, d)
+        return nxt, f"fill-up {key}: " + (f"the owner was busy, again at {berlin(nxt)}" if nxt else "decided")
+    return _fillup_act_at(d, due, False), f"fill-up {key}: {d['status']}: {d.get('reason')}"
+
+
+def _act_compaction(sid, now, args, key):
+    d, ready = compaction_plan(sid, now, args)
+    if ready is None or d.key != key:
+        return None, f"compaction {key}: not due any more ({d.reason if d is not None else 'off or paused'})"
+    compaction_act(sid, d, *ready)
+    return None, f"compaction {key}: done (see the log)"
+
+
+ACTS = {"last_stretch": _act_last_stretch, "deferred_start": _act_deferred_start, "fillup": _act_fillup,
+        "compaction": _act_compaction}
+
+
+def run_act(job, run, sid, now, args):
+    """The runner's act job `job` under its run key `run`: only while it is still the stored act
+    (a plan step may have replaced it), re-planned and acted on by ACTS[job]; its entry is then
+    rewritten or dropped (_act_done)."""
+    cur = (load_watch().get("acts") or {}).get(job)
+    if not isinstance(cur, dict) or cur.get("run") != run:
+        note = f"{job} {run}: not run, its plan changed since (now {cur.get('run') if isinstance(cur, dict) else 'none'})"
+        log(note)
+        return {"status": "ok", "note": note}
+    nxt, note = ACTS[job](sid, now, args, cur["key"])
+    _act_done(job, cur["key"], run, nxt, now)
+    return {"status": "ok", "note": note}
+
+
+def runner_pass(job, key=None):
+    """runner_jobs.py's entry for the watcher's passes (the section comment): the tick `job`, or the
+    act `job` under its run key `key`, on the task-manager session $AFCLAUDE_MANAGER_SESSION, armed
+    (as the watcher ran). -> {status ok|skipped, note, next_due}. A missing session or key raises."""
+    global _STOP_LINE
+    sid = os.environ.get("AFCLAUDE_MANAGER_SESSION") or ""
+    if not re.fullmatch(SESSION_RE, sid):
+        raise RuntimeError(f"AFCLAUDE_MANAGER_SESSION must be the FULL session UUID, got {sid!r}")
+    if job not in TICKS and job not in ACTS:
+        raise RuntimeError(f"unknown keep-alive pass {job!r}")
+    if job in ACTS and not key:
+        raise RuntimeError(f"the act {job} needs its run key")
+    afclaude_config.LOG = log
+    doc = load_watch()
+    before = memo_load(doc)
+    try:
+        why = watcher_stopped()
+        if why:
+            if why != _STOP_LINE:
+                log(f"keep-alive passes held: {why}")
+                _STOP_LINE = why
+            return {"status": "skipped", "note": why}
+        if _STOP_LINE is not None:
+            log("keep-alive passes run again: the watcher's STOP / PAUSED file is gone")
+            _STOP_LINE = None
+        args = argparse.Namespace(session=sid, arm=True, now=False, once=True, take_over_idle=False, start_key=None)
+        now = _now()
+        if job in TICKS:
+            return TICKS[job](sid, now, args)
+        return run_act(job, key, sid, now, args)
+    finally:
+        memo_save(doc, before)
 
 
 def load_backlog():

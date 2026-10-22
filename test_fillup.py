@@ -377,6 +377,83 @@ class ExactTiming(unittest.TestCase):
             ka.last_mile_hours = old
 
 
+class FillupThroughTheRunner(ExactTiming):
+    """Phase 3a S6: the fill-up with the resident runner as the caller. The `watch` tick plans it
+    (the act stored at its start, the tick's next_due at the usage refresh ahead of it); the act
+    starts at the start (+ WAKE_SLACK, as the watcher woke) and fires within seconds of the plan,
+    on the usage refreshed ahead (no /usage call at the start)."""
+    def setUp(self):
+        super().setUp()
+        self.old_defer = ka.DEFER_FILE
+        ka.DEFER_FILE = os.path.join(self.tmp.name, "deferred.json")
+        self.addCleanup(setattr, ka, "DEFER_FILE", self.old_defer)
+        testenv.clear_watch()
+        self.addCleanup(testenv.clear_watch)
+        self.start = RESET - timedelta(minutes=5.5)
+
+    # the watcher's own tests of ExactTiming are not repeated here
+    test_sleep_seconds = test_fillup_pass_returns_the_planned_start = None
+    test_usage_refreshed_ahead_then_fires_at_start_without_waiting_for_usage = None
+    test_stale_usage_at_the_start_is_refreshed_first = test_watcher_fires_the_fillup_at_its_start = None
+    test_watcher_fires_a_test_fillup_at_its_start = test_watcher_wakes_at_a_last_stretch_slot_start = None
+    test_last_mile_next_start = None
+
+    def tick(self, now):
+        self.clock = Clock(now)
+        return testenv.runner_pass(ka, "watch", now=now, session=self.SID)
+
+    def act(self, now):
+        self.clock = Clock(now)
+        return testenv.runner_act(ka, "fillup", now=now, session=self.SID)
+
+    def test_planned_then_fired_at_its_start_on_usage_refreshed_ahead(self):
+        res = self.tick(self.start - timedelta(minutes=30))
+        a = testenv.act_of(ka, "fillup")
+        self.assertEqual((a["key"], ka.parse_ts(a["at"])), (fillup.key(RESET), self.start + ka.WAKE_SLACK))
+        self.assertEqual(ka.parse_ts(res["next_due"]), self.start - ka.FILLUP_PREFETCH)
+        self.assertEqual(self.refreshes, [])                           # far from the start: the cache
+        self.tick(self.start - ka.FILLUP_PREFETCH + timedelta(seconds=15))
+        self.assertEqual(self.refreshes, [self.start - ka.FILLUP_PREFETCH + timedelta(seconds=15)])
+        self.assertEqual(testenv.act_of(ka, "fillup"), a)              # the same act
+        ka.fresh_usage = lambda now, force=False: self.fail("no /usage call at the start: numbers are fresh")
+        self.act(ka.parse_ts(a["at"]))
+        self.assertEqual([k for _, k in self.fired], [fillup.key(RESET)])
+        late = (self.fired[0][0] - self.start).total_seconds()
+        self.assertTrue(0 <= late <= 2, late)
+        self.assertIsNone(testenv.act_of(ka, "fillup"))
+
+    def test_the_owner_busy_retry_is_stored(self):
+        t = self.start + timedelta(seconds=10)
+        self.tick(t)
+        a = testenv.act_of(ka, "fillup")
+        self.assertLessEqual(ka.parse_ts(a["at"]), t)                  # due: at once
+        fire, recheck = ka.handle_fire, ka.OWNER_BUSY_RECHECK
+        ka.handle_fire = lambda *x: ka.OWNER_BUSY
+        ka.OWNER_BUSY_RECHECK = timedelta(minutes=1)         # retried before the session reset is too close
+        self.addCleanup(setattr, ka, "OWNER_BUSY_RECHECK", recheck)
+        try:
+            self.act(t)
+        finally:
+            ka.handle_fire = fire
+        retry = testenv.act_of(ka, "fillup")
+        self.assertEqual(ka.parse_ts(retry["at"]), t + ka.OWNER_BUSY_RECHECK)
+        self.tick(t + timedelta(seconds=30))                           # the memory of the busy owner: kept
+        self.assertEqual(testenv.act_of(ka, "fillup"), retry)
+        self.act(ka.parse_ts(retry["at"]))
+        self.assertEqual(len(self.fired), 1)
+
+    def test_a_test_fillup_fires_at_its_start(self):
+        start = RESET - timedelta(minutes=3, seconds=1)
+        ka.save_fillup({"test": {"session": self.SID, "key": fillup.test_key(RESET), "start": start.isoformat(),
+                                 "reset": RESET.isoformat(), "remaining": 3.0}})
+        self.tick(start - timedelta(minutes=35))
+        a = testenv.act_of(ka, "fillup")
+        self.assertEqual(ka.parse_ts(a["at"]), start + ka.WAKE_SLACK)
+        self.act(start + ka.WAKE_SLACK)
+        self.assertEqual([k for _, k in self.fired], [fillup.test_key(RESET)])
+        self.assertNotIn("test", ka.load_fillup())
+
+
 class StopSetting(unittest.TestCase):
     def test_manager_prompt_reads_setting(self):
         testenv.set_setting("session_stop_pct", 90)

@@ -1069,6 +1069,131 @@ CAPTURE_TITLED = ("\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mWaiting for \x1b[1m1\
 CAPTURE_UNKNOWN = "Welcome back\n$ \n"
 
 
+# ---------------------------------------------------------------- the same through the runner (phase 3a S6)
+
+class ThroughTheRunner:
+    """The compaction tests again with the resident runner as the caller: its compaction_check tick
+    (keepalive.runner_pass in a fresh process) stores the act, then the runner starts the act under
+    its run key (another fresh process). The decision a test sees is the check's. The runner's passes
+    are always armed (as the watcher ran), so the dry-run test is the watcher's only."""
+    def setUp(self):
+        super().setUp()
+        testenv.clear_watch()
+        self.addCleanup(testenv.clear_watch)
+        self.checks = []
+        plan = ka.compaction_plan
+
+        def spy(sid, now, args):
+            out = plan(sid, now, args)
+            self.checks.append(out[0])
+            return out
+        ka.compaction_plan = spy
+        self.addCleanup(setattr, ka, "compaction_plan", plan)
+
+    def compact(self, args=None, now=None):
+        if args is not None and not getattr(args, "arm", False):
+            self.skipTest("the runner's passes are always armed")
+        t = now or datetime.now(UTC)
+        self.checks.clear()
+        res = testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
+        self.assertEqual(res["status"], "ok")
+        d = self.checks[0]
+        act = testenv.act_of(ka, "compaction")
+        if act is not None:
+            self.assertEqual(act["key"], d.key)
+            testenv.runner_act(ka, "compaction", now=t, session=SID)
+            self.assertIsNone(testenv.act_of(ka, "compaction"))          # the act ended: its entry is dropped
+        recs = ka.load_state().get("compactions") or {}
+        return d, (recs.get(d.key) if d is not None and d.key else None)
+
+
+class CompactWhenIdleRunner(ThroughTheRunner, CompactWhenIdle):
+    def test_the_owner_holding_it_or_no_live_tmux_session(self):
+        """As the watcher's; any other preflight problem is reported by the check itself (fail_stop),
+        as run() reports it."""
+        for problem, why in ((f"{ka.RC_HELD} thread (pid [7]); ...", "the owner holds the session"),
+                             (None, "not live in its tmux session (plan resume)")):
+            ka.preflight = (lambda sid, p=problem: (False, [p], None)) if problem else \
+                (lambda sid: (True, [], "resume"))
+            d, rec = self.compact()
+            self.assertIn(why, d.reason)
+            self.assertIsNone(rec)
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.paused()["paused"])
+        ka.preflight = lambda sid: (False, ["host process info unavailable (OSError: x)"], None)
+        res = testenv.runner_pass(ka, "compaction_check", now=datetime.now(UTC), session=SID)
+        self.assertEqual(res["note"], "the check failed")
+        self.assertIn("compaction pass failed: RuntimeError", self.paused()["reason"])
+        self.assertIsNone(testenv.act_of(ka, "compaction"))
+        self.assertEqual(self.sent, [])
+
+
+class CompactAtRunEndRunner(ThroughTheRunner, CompactAtRunEnd):
+    pass
+
+
+class CompactionFailuresRunner(ThroughTheRunner, CompactionFailures):
+    def test_a_busy_session_after_the_check(self):
+        """Mid-turn when the save prompt is due (after the check tick and the act's own check)."""
+        old = ka.session_idle
+        calls = []
+
+        def idle(path, now=None):
+            calls.append(1)
+            return len(calls) <= 2                                            # the two checks only
+        ka.session_idle = idle
+        ka.COMPACT_IDLE_WAIT = timedelta(0)
+        try:
+            d, rec = self.compact()
+        finally:
+            ka.session_idle = old
+        self.assert_failed(rec, "the session was still mid-turn", [])
+
+
+class RunnerActs(ThroughTheRunner, Env):
+    def test_a_check_due_stores_the_act_and_a_changed_plan_is_not_run(self):
+        t = datetime.now(UTC)
+        testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
+        act = testenv.act_of(ka, "compaction")
+        self.assertEqual(act["key"], self.checks[0].key)
+        self.assertEqual(ka.parse_ts(act["at"]), t)
+        testenv.runner_pass(ka, "compaction_check", now=t + timedelta(minutes=1), session=SID)   # a minute on: still pending
+        self.assertEqual(testenv.act_of(ka, "compaction"), act)                     # same run key: never twice
+        res = testenv.runner_pass(ka, "compaction", "compact-other.20261005T000000", now=t, session=SID)
+        self.assertIn("its plan changed", res["note"])
+        self.assertEqual(self.sent, [])
+        testenv.runner_act(ka, "compaction", now=t + timedelta(minutes=1), session=SID)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_the_lock_held_by_a_start_drops_the_act_and_the_next_check_plans_again(self):
+        t = datetime.now(UTC)
+        testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
+        first = testenv.act_of(ka, "compaction")
+        lock = ka.session_lock(SID)
+        try:
+            testenv.runner_act(ka, "compaction", now=t, session=SID)
+        finally:
+            ka.release_lock(lock)
+        self.assertIsNone(testenv.act_of(ka, "compaction"))
+        testenv.runner_pass(ka, "compaction_check", now=t + timedelta(minutes=1), session=SID)
+        again = testenv.act_of(ka, "compaction")
+        self.assertNotEqual(again["run"], first["run"])                              # a new run key
+        testenv.runner_act(ka, "compaction", now=t + timedelta(minutes=1), session=SID)
+        self.assertEqual(ka.load_state()["compactions"][again["key"]]["status"], "compacted")
+
+    def test_a_hold_is_logged_once_across_the_runs(self):
+        self.idle_transcript(idle=timedelta(minutes=30))
+        lines = []
+        old = ka.log
+        ka.log = lines.append
+        try:
+            for k in range(3):
+                testenv.runner_pass(ka, "compaction_check", now=self.now + timedelta(seconds=k), session=SID)
+        finally:
+            ka.log = old
+        self.assertEqual(len([ln for ln in lines if "idle 30 min" in ln]), 1, lines)
+
+
 class OwnerTyping(unittest.TestCase):
     def test_pane_input(self):
         self.assertEqual(ka.pane_input(CAPTURE_IDLE), ("box", ""))            # a dimmed suggestion

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Offline tests for docker/start_watcher.sh and the entrypoint's watcher start (the container
-watcher comes back right after a rebuild, not only at the next :07/:22/:37/:52 watchdog), and the
-entrypoint's scheduler modes (phase 3a S2): `on` runs the resident runner beside supercronic and
-passes a `docker stop` on to both; `legacy` runs supercronic with docker/crontab.legacy only.
+watcher comes back right after a rebuild, not only at the next :07/:22/:37/:52 watchdog: the
+legacy mode), and the entrypoint's scheduler modes (phase 3a S2): `on` runs the resident runner
+beside supercronic and passes a `docker stop` on to both, and since S6 starts no watcher (the
+runner runs its passes); `legacy` runs supercronic with docker/crontab.legacy and the watcher.
 
 Hermetic: the scripts run from a temp AFCLAUDE_DIR with a fake host.py (the bridge's process
 list), a fake keepalive.py (records its argv), a fake runner.py and supercronic (record their
@@ -201,20 +202,26 @@ class StartWatcher(unittest.TestCase):
             out, err = p.communicate()
         return out, err
 
-    def test_entrypoint_starts_the_watcher_at_once_when_the_scheduler_is_on(self):
+    def test_entrypoint_starts_the_watcher_at_once_in_the_legacy_mode(self):
         # supercronic is not on this machine: the exec fails, the backgrounded start still runs
-        out, _ = self.entrypoint("on", wait=10)
-        self.assertIn("scheduler ON", out)
+        out, _ = self.entrypoint("legacy", wait=10)
+        self.assertIn("scheduler LEGACY", out)
         self.assertEqual(self.started(wait=5), [f"--session {SID} --arm"])
+
+    def test_entrypoint_on_starts_no_watcher(self):
+        # phase 3a S6: the runner runs the watcher's passes
+        out, _ = self.entrypoint("on", wait=5)
+        self.assertIn("scheduler ON", out)
+        self.assertEqual(self.started(wait=1.5), [])
 
     def test_entrypoint_off_starts_nothing(self):
         out, _ = self.entrypoint("off", wait=1.5)
         self.assertIn("scheduler OFF", out)
         self.assertEqual(self.started(wait=0.5), [])
 
-    def test_entrypoint_on_but_paused_starts_nothing(self):
+    def test_entrypoint_legacy_but_paused_starts_nothing(self):
         open(os.path.join(self.d, "PAUSED"), "w").close()
-        self.entrypoint("on", wait=10)
+        self.entrypoint("legacy", wait=10)
         self.assertEqual(self.started(wait=1.5), [])
 
     def lines(self, name, want=None, wait=5.0):

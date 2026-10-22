@@ -864,6 +864,24 @@ SETTINGS: dict[str, Setting] = {
                                         "waits for a compaction, the resume and its verification, or the "
                                         "window-start ping and its check) before it is killed and fails (D-234)",
                                         "automation"),
+    # the keep-alive watcher's passes (phase 3a S6): the ticks are above their handlers' inner timeouts
+    # + 1 min (runner_jobs.TICK_HOST_CALLS); an act's lower bound is the sum of its inner timeouts + 5 min
+    # (runner_jobs.act_min_timeout; test_runner checks both)
+    "runner_timeout_watch": _num(12, 0.5, 720, "Runner: minutes a keep-alive watch pass (limit detection, the "
+                                 "plans of the last stretch, the postponed starts and the fill-up) may take "
+                                 "before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_run_readings": _num(10, 0.5, 720, "Runner: minutes a run reading (the usage during a run, "
+                                        "D-207) may take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_compaction_check": _num(6, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
+                                            "before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_last_stretch": _num(80, 80, 720, "Runner: minutes a last-stretch slot start may take before "
+                                        "it is killed and fails (D-234)", "automation"),
+    "runner_timeout_deferred_start": _num(80, 80, 720, "Runner: minutes a postponed or planned session-window "
+                                          "start may take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_fillup": _num(80, 80, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
+                                  "killed and fails (D-234)", "automation"),
+    "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
+                                      "back, D-238) may take before it is killed and fails (D-234)", "automation"),
     # at most 30: a start missed by more than 30 min is an error, never started late (D-257)
     "runner_start_catchup": _num(30, 0, 30, "Runner: a session-window start the runner missed (down at that "
                                  "time) still runs when it is back within this many minutes; a later one is "
@@ -2653,6 +2671,9 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
                                                       "window_pings", "window_starts")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
+    # the watcher passes under the resident runner (phase 3a S6): acts = the act run each pass's plan
+    # step planned ({key, at, run}, one row per job), memo = the log-once memory of the pass children
+    StateComponent("keepalive.watch", "runner:keepalive", ("acts", "memo")),
     StateComponent("keepalive.usage_refresh", "runner:keepalive", ("window_start",)),
     StateComponent("dispatcher", "runner:dispatcher", ("sessions", "handled", "starts", "alerted", "rc_held")),
     StateComponent("sampler", "runner:sampler", ("offsets", "sessions")),

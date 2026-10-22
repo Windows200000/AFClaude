@@ -32,6 +32,7 @@ import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before 
 import actions  # noqa: E402
 import runner  # noqa: E402
 import runner_jobs  # noqa: E402
+import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
 
@@ -200,7 +201,8 @@ class Tables(Base):
         for name, job in runner.JOBS.items():
             if job.cron_tag and name not in runner.RUNNER_OWNS:
                 self.assertTrue(any(job.cron_tag in ln for ln in cron), f"{name}: no cron line tagged {job.cron_tag!r}")
-        self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS) | {runner_jobs.AT_JOB})
+        self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS)
+                         | set(runner_jobs.PASSES) | {runner_jobs.AT_JOB})
 
     def test_the_legacy_crontab_runs_every_job_and_no_runner(self):
         def lines(name):
@@ -806,10 +808,10 @@ class Shadow(Base):
     def test_shadow_lines_for_the_jobs_cron_runs(self):
         lines = []
         self.now = START - 2 * MIN
-        r = self.runner(owns={"stall_scan"}, shadow=lines.append)
+        r = self.runner(owns={"stall_scan", "watch"}, shadow=lines.append)
         self.assertEqual([j.name for j in r.shadow_jobs],
                          ["dispatcher", "docs_import", "prune_logs", "quickview", "sampler", "usage_review",
-                          "window_start"])            # cron's jobs; not the owned stall scan, not prune_runs
+                          "window_start"])            # cron's jobs; not the owned stall scan / watch, not prune_runs
         r.shadow_pass(self.now)
         self.assertEqual(lines, [])
         self.assertEqual(r.shadow_next["quickview"], START)
@@ -1010,7 +1012,7 @@ class SimpleTicks(Base):
 
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start"}
-                                                       | set(S3_TICKS)))          # + S4, S5
+                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):
@@ -1019,8 +1021,8 @@ class SimpleTicks(Base):
             tag = runner.JOBS[name].cron_tag
             self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
             self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        # + the runner watchdog, - the at-shim (S4), - the window start (S5)
-        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 1)
+        # + the runner watchdog, - the at-shim (S4), - the window start (S5), - the watcher watchdog (S6)
+        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 2)
 
     def test_each_tick_runs_what_its_cron_line_ran(self):
         """Registration: the handler has the legacy line's script, arguments, log file and flock."""
@@ -1679,3 +1681,140 @@ class WindowStartClaim(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- S6: the keep-alive watcher's passes
+
+class WatcherPasses(Base):
+    """S6: the watcher's passes as runner jobs: the ticks (watch, run_readings, compaction_check)
+    and the planned acts (last_stretch, deferred_start, fillup, compaction) at the time their plan
+    step stored (runner state 'keepalive.watch', acts.<job>), each under its run key once; a cut-off
+    act fails (D-257) and is never rerun; a drain holds it; the legacy mode keeps the watcher."""
+    AT = START + 3 * 60 * MIN + 17 * SEC
+
+    def store_act(self, job, at, key="fillup-2026-10-20T02:00:00+00:00", run=None):
+        ent = {"key": key, "at": runner._iso(at), "run": run or f"{key}.{at:%Y%m%dT%H%M%S}"}
+        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {job: ent}}, mode="file",
+                           actor="runner:keepalive", via="runner")
+        return ent["run"]
+
+    def test_s6_owns_the_passes_the_crontabs_and_the_watcher_check(self):
+        self.assertLessEqual(runner.WATCHER_PASSES, runner.RUNNER_OWNS)
+        self.assertEqual(set(runner_jobs.PASSES), set(runner.WATCHER_PASSES))
+        self.assertIsNotNone(runner.watcher_conflict(runner.RUNNER_OWNS, local=lambda: [5], on_host=lambda: []))
+        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
+        self.assertFalse(any("start_watcher.sh" in ln for ln in cron))
+        self.assertEqual(len([ln for ln in legacy if "start_watcher.sh" in ln]), 1)
+        for name in runner.WATCHER_PASSES:
+            job = runner.JOBS[name]
+            self.assertEqual(runner_jobs.log_path(name), os.path.join(runner_state.data_dir(), "keepalive",
+                                                                     "keepalive.log"))
+            if job.planned:
+                self.assertEqual((job.on_interrupt, job.session, job.paused), ("fail", True, "handler"), name)
+            else:
+                self.assertEqual(job.on_interrupt, "rerun", name)
+        self.assertEqual(runner.JOBS["watch"].paused, "runs")           # detection runs while paused
+
+    def test_the_act_timeouts_exceed_their_inner_timeouts(self):
+        for name in runner_jobs.START_ACTS + ("compaction",):
+            with self.subTest(name):
+                least = runner_jobs.act_min_timeout(name)
+                self.assertGreaterEqual(timedelta(minutes=runner.JOBS[name].timeout_min), least)
+                self.assertGreaterEqual(timedelta(minutes=actions.SETTINGS[actions.RUNNER_TIMEOUT + name].bounds[0]),
+                                        least)
+        self.assertGreater(runner_jobs.act_min_timeout("compaction"), timedelta(minutes=45))   # 4 waits of 10 min, ...
+        with open(os.path.join(HERE, "keepalive.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        fire = next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "fire")
+        found = {n.value.value for n in ast.walk(fire) if isinstance(n, ast.keyword) and n.arg == "timeout"
+                 and isinstance(n.value, ast.Constant)}
+        for fn, secs, _ in runner_jobs.COMPACTION_HOST_CALLS:
+            self.assertIn(secs, found, fn)
+
+    async def test_a_planned_act_runs_at_its_time_under_its_run_key_once(self):
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        run = self.store_act("fillup", self.AT)
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.next_due("fillup"), self.AT.replace(microsecond=0))
+        self.assertEqual(r.sleep_for(self.AT - 30 * SEC), 30.0)          # it wakes at the act's second
+        self.now = self.AT
+        due, = r.plan(self.now)
+        self.assertEqual((due.job.name, due.key), ("fillup", run))
+        await self.run_due(r, due)
+        self.assertEqual(self.spawner.calls, [("fillup", run, 4800.0)])
+        self.assertEqual(r.plan(self.now + MIN), [])                    # its run key ran: never twice
+        self.assertIsNone(self.next_due("fillup"))
+        self.assertEqual(self.runs("fillup")[0]["key"], run)
+
+    async def test_an_interrupted_act_fails_and_is_not_rerun(self):
+        self.prev_boot(self.AT - MIN)
+        run = self.store_act("compaction", self.AT, key="compact-2026-10-19T23:00:00+00:00")
+        rid, _ = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="compaction", key=run, timeout_s=3600,
+                                   actor="runner:compaction", via="runner", session=True, rerun=False)
+        self.now = self.AT + MIN
+        r = self.runner(owns={"compaction"})
+        r.boot()
+        self.assertEqual(self.subjects(), ["compaction interrupted by a runner restart"])
+        self.assertTrue(self.fails[0][3])                                # alert + pause (D-257)
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.spawner.calls, [])
+
+    async def test_a_drain_holds_an_act_until_it_is_lifted(self):
+        r = self.runner(owns={"deferred_start"})
+        r.boot()
+        actions.runner_state_put(self.conn, {"drain": {"until": runner._iso(datetime.now(UTC) + timedelta(days=1))}},
+                                 actor="cli", via="cli")
+        self.store_act("deferred_start", self.AT, key="window-start-2026-10-20")
+        self.now = self.AT
+        due, = r.plan(self.now)
+        self.assertIsNone(r.start(due, self.now))
+        self.assertTrue(any("drained" in ln for ln in self.logs))
+        runner.undrain(self.conn)
+        due, = r.plan(self.now + MIN)
+        await self.run_due(r, due)
+        self.assertEqual([c[0] for c in self.spawner.calls], ["deferred_start"])
+
+    def test_a_stored_act_that_is_not_valid_alerts_once(self):
+        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {"fillup": {"key": "k", "at": "soon"}}},
+                           mode="file", actor="runner:keepalive", via="runner")
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(r.plan(self.now + MIN), [])
+        self.assertEqual(self.subjects(), ["a planned act is not valid"])
+
+    def test_the_ticks_result_next_due_moves_the_tick_earlier(self):
+        r = self.runner(owns={"watch"})
+        r.boot()
+        due, = r.plan(self.next_due("watch"))
+        self.now = self.next_due("watch")
+        run_id = actions.run_begin(self.conn, boot_id=r.boot_id, job="watch", key=None, timeout_s=720,
+                                   actor="runner:watch", via="runner")[0]
+        soon = self.now + 20 * SEC
+        line = json.dumps({"status": "ok", "next_due": runner._iso(soon), "note": ""})
+        actions.runner_job_set(self.conn, "watch", actor="runner", via="runner",
+                               next_due=runner._iso(self.now + MIN))
+        r.finish(due.job, None, run_id, runner.ChildOutcome(0, line + "\n", "", False), 720, 1.0)
+        self.assertEqual(self.next_due("watch"), soon)
+
+
+class PassChild(unittest.TestCase):
+    """runner_jobs.py <pass>: keepalive.runner_pass in the child, its status and next_due in the
+    result line, its output in the keep-alive's log."""
+    def run_pass(self, job, ret, key=None):
+        code = PRELUDE + ("import json, keepalive, runner_jobs as r; "
+                          f"keepalive.runner_pass = lambda job, key: print('pass', job, key) or {ret!r}; "
+                          f"sys.exit(r.main([{job!r}] + ([\"--key\", {key!r}] if {key!r} else [])))")
+        return subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True, text=True, timeout=60)
+
+    def test_the_result_line_carries_status_and_next_due(self):
+        p = self.run_pass("watch", {"status": "ok", "note": "n", "next_due": "2026-10-20T01:00:00Z"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout), {"status": "ok", "next_due": "2026-10-20T01:00:00Z", "note": "n"})
+        with open(runner_jobs.log_path("watch")) as fh:
+            self.assertIn("pass watch None", fh.read())
+        p = self.run_pass("fillup", {"status": "skipped", "note": "STOP"}, key="fillup-x.20261020T010000")
+        self.assertEqual(json.loads(p.stdout)["status"], "skipped")
+        with open(runner_jobs.log_path("fillup")) as fh:
+            self.assertIn("pass fillup fillup-x.20261020T010000", fh.read())
