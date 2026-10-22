@@ -6,7 +6,7 @@ Binding inputs: D-070 (built from scratch, not from the quickview), D-071 (optio
 
 ## 0. Already decided
 
-- **No new Python dependency.** Everything 6a needs is already in the `.venv` through `mcp==2.2.0`: Starlette 1.7.0 (app, routing, `StaticFiles`, `TrustedHostMiddleware`, `TestClient`), uvicorn 0.54.0, pydantic 2.13.5 (request/response models, `extra="forbid"`, JSON Schema), jsonschema 4.26 (contract validation in tests), cryptography 50.0.1 (Argon2id with PHC strings, RFC 6238 TOTP, AES-GCM). They are only transitive today; W10 pins them directly with hashes (§9.8).
+- **No new Python dependency.** Everything 6a needs is already in the `.venv` through `mcp==2.2.0`: Starlette 1.7.0 (app, routing, `StaticFiles`, `TestClient`), uvicorn 0.54.0, pydantic 2.13.5 (request/response models, `extra="forbid"`, JSON Schema), jsonschema 4.26 (contract validation in tests), cryptography 50.0.1 (Argon2id with PHC strings, RFC 6238 TOTP, AES-GCM). They are only transitive today; W10 pins them directly with hashes (§9.8).
 - **The schema is pydantic models, published as OpenAPI 3.1.** The design asks for "request and response shapes declared once, in Python (typed, checked by mypy --strict)" and a generated JSON Schema. Pydantic models are that declaration (mypy checks them without a plugin; `extra="forbid"` rejects unknown request fields, §8), and `models_json_schema` emits JSON Schema 2020-12. The document is OpenAPI 3.1 (a standard wrapper whose schemas are plain JSON Schema 2020-12), committed as `dashboard/schema.json` and served as `/api/v1/schema.json` behind login.
 - **TS types from our own small generator** over the JSON Schema subset pydantic emits (objects, required, enums/consts, arrays, unions, nullables, refs, maps); any other construct is a generation error, never a guessed type. Checked first: `openapi-typescript` and `json-schema-to-typescript` (npm packages with their own dependency trees; the design keeps the npm tree to five packages and says "no codegen package"), `pydantic-to-typescript` (a Python wrapper that shells out to `json-schema-to-typescript`), `datamodel-code-generator` (the other direction). About 150 lines of our own code are smaller than any of them.
 - **Sessions are our own server-side rows**, not Starlette's `SessionMiddleware` (a signed client-side cookie: not revocable, not listable in F11, no idle timeout without trusting the client). `starsessions` / `starlette-session` were checked: extra dependencies for the ~150 lines that a table plus actions.py need anyway.
@@ -17,7 +17,7 @@ Binding inputs: D-070 (built from scratch, not from the quickview), D-071 (optio
 - **Every CSRF failure is a 403 `forbidden`**, including a non-JSON content type (8b's curl check expects 403 for a form post).
 - **Error codes** are §8's list plus `not_found`, `method_not_allowed`, `payload_too_large`, `unavailable` (the DB is down, §7.8) and `internal` (§8 says "codes such as"). An unexpected exception is a 500 `internal` with a fixed message; the traceback goes to the server log only.
 - **`health` is public and minimal:** `{status: ok | unavailable, db: ok | <the DBError kind>}` from `store.health()`; 503 when the DB is not healthy (the red banner of §7.8 reads it). No path, no version, no host detail.
-- **`Host` is checked** (Starlette's `TrustedHostMiddleware`, the host of `AFCLAUDE_PUBLIC_URL`): a localhost-bound app reached through a tunnel is otherwise open to DNS rebinding.
+- **`Host` is checked** against the host of `AFCLAUDE_PUBLIC_URL` (a localhost-bound app reached through a tunnel is otherwise open to DNS rebinding), in our own outermost middleware rather than Starlette's `TrustedHostMiddleware`, which answers in plain text, outside the error shape and the security headers.
 - **Unknown `/api/…` paths are a JSON 404**; every other GET path is the app shell (the router decides), so a typo in an API call never returns HTML.
 - **Runs on Python 3.12 only** (the `.venv` and the image; the host's system Python is 3.9): its tests run with `.venv/bin/python -m unittest test_dashboard`, like `test_mcp_server`.
 - **Nothing listens before W10/8b.** W1–W9 provide `dashboard.app.create_app()` and tests (Starlette's `TestClient`, in-process, no port). No serve command is run on the host; the `afclaude web` service comes with the image (W10) and is deployed only at 8b (D-072/D-157).
@@ -42,7 +42,7 @@ Binding inputs: D-070 (built from scratch, not from the quickview), D-071 (optio
 
 | need | chosen | also checked |
 |---|---|---|
-| web framework, static files, host check, test client | Starlette (in the `.venv`) | FastAPI (pulls its own dependency tree; its OpenAPI generator is what we write in W2 anyway, with less control over the error shape) |
+| web framework, static files, test client | Starlette (in the `.venv`) | FastAPI (pulls its own dependency tree; its OpenAPI generator is what we write in W2 anyway, with less control over the error shape) |
 | request/response models, JSON Schema | pydantic v2 (in the `.venv`) | `TypedDict` + hand validation (no schema generation, every check by hand), msgspec / attrs + cattrs (new dependencies) |
 | JSON Schema → TS | own generator (§0) | openapi-typescript, json-schema-to-typescript, pydantic-to-typescript, datamodel-code-generator |
 | contract validation in tests | jsonschema (in the `.venv`) | — |
@@ -107,8 +107,8 @@ On every response: the CSP of §9.8 (`default-src 'none'; script-src 'self'; sty
 
 ## 5. Steps
 
-**W1: API skeleton (built on `phase6a`).**
-- **Build:** `dashboard/` (§3.1) with `app.py`, `errors.py`, `security.py`, `routes.py`; the endpoint table (§3.2), the write path up to the handler (§3.3, without the CSRF token and roles, which need W5), the headers (§3.4), `TrustedHostMiddleware`, the app shell and `/assets/` from a built `dist/` (missing `index.html` = `create_app` refuses to start), JSON 404/405/500 in the one error shape, `GET /api/v1/health`. The modules join the mypy list.
+**W1: API skeleton (built on `phase6a`: 36 tests in `test_dashboard.py` with W2).**
+- **Build:** `dashboard/` (§3.1) with `app.py`, `errors.py`, `security.py`, `routes.py`; the endpoint table (§3.2), the write path up to the handler (§3.3, without the CSRF token and roles, which need W5), the headers (§3.4), the Host check, the app shell and `/assets/` from a built `dist/` (missing `index.html` = `create_app` refuses to start), JSON 404/405/500 in the one error shape, `GET /api/v1/health`. The modules join the mypy list.
 - **Tests:** `test_dashboard.py`: deny by default (every non-public endpoint 401s without a session; the public list is exactly the allowed one); the error shape on 401/403/404/405/413/422/500/503 with no traceback or input echo; the write guard (form post, `text/plain`, missing or foreign `Origin`, `Sec-Fetch-Site: cross-site` → 403; JSON same-origin passes); body cap counted on a body without `Content-Length`; unknown fields → 422; idempotency key required and validated; the headers and CSP on the shell, the API and an error; asset caching vs `no-store`; wrong `Host` refused; `health` 200/503 with only the kind.
 - **Done when:** `test_dashboard`, `test_typing`, `check_public` green. Deploy: none (nothing imports it).
 - **Risk:** Starlette's own 404/405 for unmatched routes bypass the shape unless handled; the tests hit them.
