@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Tests for dashboard/ (phase 6a W1/W2, docs/phase6a_plan.md): the endpoint table (deny by
-default), the error shape on every error path, the write guard, the body and idempotency rules,
-the headers and CSP, the Host check, the app shell and assets, health, and the generated schema
-and TS types (stale = fail; every API response in these tests is validated against the committed
-schema.json).
+"""Tests for dashboard/ (phase 6a W1/W2, docs/phase6a_plan.md; 6c R0, docs/phase6c_plan.md §3.2):
+the endpoint table (deny by default), the error shape on every error path, the write guard, the
+body and idempotency rules, path and query parameters, paging, the visibility hook, SanitizedHtml,
+the response cap, the headers and CSP, the Host check, the app shell and assets, health, and the
+generated schema and TS types (stale = fail; every API response in these tests is validated
+against the committed schema.json).
 
 Needs the project venv (Starlette, pydantic; Python 3.12):
     .venv/bin/python -m unittest test_dashboard
@@ -11,11 +12,13 @@ Needs the project venv (Starlette, pydantic; Python 3.12):
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+from typing import Literal
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,14 +38,14 @@ if SKIP:
 else:
     import testenv  # noqa: E402,F401  (temp DB first)
     import jsonschema  # noqa: E402
-    from pydantic import JsonValue  # noqa: E402
+    from pydantic import Field, JsonValue, ValidationError  # noqa: E402
     from starlette.testclient import TestClient  # noqa: E402
 
     import store  # noqa: E402
     from dashboard import codegen, routes, security  # noqa: E402
-    from dashboard.api_types import Model  # noqa: E402
+    from dashboard.api_types import Model, PageParams, Params, SanitizedHtml  # noqa: E402
     from dashboard.app import create_app  # noqa: E402
-    from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply  # noqa: E402
+    from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply, Visibility  # noqa: E402
 
     with open(codegen.SCHEMA_PATH, encoding="utf-8") as _fh:
         SCHEMA = json.load(_fh)
@@ -84,6 +87,63 @@ else:
         return Reply(EchoResponse(text="", n=0, key=None, user=None))
 
 
+    async def too_big(call: Call) -> Reply:
+        return Reply(EchoResponse(text="x" * routes.RESPONSE_MAX, n=0, key=None, user=None))
+
+
+    class ItemParams(Params):
+        id: int
+        state: Literal["open", "done"] | None = None
+        own: bool = False
+        q: str | None = None
+
+
+    class ItemResponse(Model):
+        id: int
+        state: Literal["open", "done"] | None
+        own: bool
+        q: str | None
+
+
+    async def item(call: Call) -> Reply:
+        p = call.typed_params(ItemParams)
+        return Reply(ItemResponse(id=p.id, state=p.state, own=p.own, q=p.q))
+
+
+    class LogParams(PageParams):
+        limit: int = Field(default=3, ge=1, le=5)
+
+
+    class LogPage(Model):
+        ids: list[int]
+        next_before: int | None
+
+
+    async def log_page(call: Call) -> Reply:
+        p = call.typed_params(LogParams)
+        rows = [i for i in range(10, 0, -1) if p.before is None or i < p.before][:p.limit + 1]
+        shown, next_before = routes.page(rows, p.limit, lambda r: r)
+        return Reply(LogPage(ids=shown, next_before=next_before))
+
+
+    class VisibleResponse(Model):
+        all_projects: bool
+        ids: list[int]
+
+
+    async def visible(call: Call) -> Reply:
+        v = await call.visible_projects()
+        return Reply(VisibleResponse(all_projects=v.all_projects, ids=sorted(v.project_ids)))
+
+
+    class HtmlResponse(Model):
+        html: SanitizedHtml
+
+
+    async def html_from_str(call: Call) -> Reply:
+        return Reply(HtmlResponse(html="<b>x</b>"))     # a plain string: refused (500)
+
+
     TEST_ENDPOINTS = ENDPOINTS + (
         Endpoint("echo", "POST", "/api/v1/test/echo", "session", EchoRequest, EchoResponse, echo, "echo",
                  idempotent=True),
@@ -92,6 +152,12 @@ else:
         Endpoint("boom", "GET", "/api/v1/test/boom", "session", None, EchoResponse, boom, "bug"),
         Endpoint("wrong_model", "GET", "/api/v1/test/wrong", "session", None, EchoResponse, wrong_model, "bug"),
         Endpoint("db_down", "GET", "/api/v1/test/db", "session", None, EchoResponse, db_down, "db"),
+        Endpoint("too_big", "GET", "/api/v1/test/big", "session", None, EchoResponse, too_big, "bug"),
+        Endpoint("item", "GET", "/api/v1/test/items/{id}", "session", None, ItemResponse, item, "item",
+                 params=ItemParams),
+        Endpoint("log", "GET", "/api/v1/test/log", "session", None, LogPage, log_page, "paged", params=LogParams),
+        Endpoint("visible", "GET", "/api/v1/test/visible", "session", None, VisibleResponse, visible, "visible"),
+        Endpoint("html_str", "GET", "/api/v1/test/html", "session", None, HtmlResponse, html_from_str, "bug"),
     )
 
 
@@ -115,7 +181,11 @@ class Checked:
 
     def validate(self, method, path, r):
         comps = self.schema["components"]
-        op = self.schema["paths"].get(path, {}).get(method.lower())
+        path = path.split("?", 1)[0]
+        op = None
+        for template, ops in self.schema["paths"].items():
+            if re.fullmatch(re.sub(r"\\\{[^/]*?\\\}", "[^/]+", re.escape(template)), path):
+                op = ops.get(method.lower())
         if op is not None and str(r.status_code) in op["responses"]:
             ref = op["responses"][str(r.status_code)]["content"]["application/json"]["schema"]
         else:
@@ -134,6 +204,7 @@ class Checked:
 class Base(unittest.TestCase):
     endpoints = TEST_ENDPOINTS
     signed_in = False
+    visible = None          # a visibility hook to inject (5a's roles fill it later)
 
     def setUp(self):
         self.dist = tempfile.mkdtemp(prefix="afc-dist-")
@@ -146,7 +217,8 @@ class Base(unittest.TestCase):
 
         async def auth(request):
             return Principal(user_id=7) if self.signed_in else None
-        self.app = create_app(PUBLIC, self.dist, auth, db_path=testenv.DB, endpoints=self.endpoints)
+        extra = {"visible_projects": self.visible} if self.visible else {}
+        self.app = create_app(PUBLIC, self.dist, auth, db_path=testenv.DB, endpoints=self.endpoints, **extra)
         raw = TestClient(self.app, base_url=PUBLIC, raise_server_exceptions=False)
         self.c = Checked(raw, test_schema() if self.endpoints is TEST_ENDPOINTS else SCHEMA, self)
 
@@ -330,6 +402,152 @@ class Body(Base):
         self.assertError(self.c.get("/api/v1/health?x=1"), 400, "validation")
 
 
+class Parameters(Base):
+    """Path and query parameters (docs/phase6c_plan.md §3.2, R0)."""
+    signed_in = True
+
+    def assertBad(self, path, loc=None, secret="SECRETVALUE"):
+        r = self.c.get(path)
+        self.assertError(r, 422, "validation")
+        self.assertNotIn(secret, r.text)
+        if loc is not None:
+            self.assertEqual([f["loc"] for f in r.json()["error"]["details"]["fields"]], [loc], r.text)
+        return r
+
+    def test_path_int_and_query_types(self):
+        r = self.c.get("/api/v1/test/items/42")
+        self.assertEqual(r.json(), {"id": 42, "state": None, "own": False, "q": None})
+        r = self.c.get("/api/v1/test/items/7?state=done&own=true&q=a%20b")
+        self.assertEqual(r.json(), {"id": 7, "state": "done", "own": True, "q": "a b"})
+        self.assertEqual(self.c.get("/api/v1/test/items/7?own=false").json()["own"], False)
+
+    def test_bad_values_are_422_without_echo(self):
+        self.assertBad("/api/v1/test/items/1.5", "id", secret="1.5")
+        self.assertBad("/api/v1/test/items/true", "id", secret="true")
+        self.assertBad("/api/v1/test/items/SECRETVALUE", "id")
+        self.assertBad("/api/v1/test/items/1?own=1", "own")
+        self.assertBad("/api/v1/test/items/1?own=SECRETVALUE", "own")
+        self.assertBad("/api/v1/test/items/1?own=", "own")
+        self.assertBad("/api/v1/test/items/1?state=SECRETVALUE", "state")
+
+    def test_unknown_parameter(self):
+        self.assertBad("/api/v1/test/items/1?sneaky=SECRETVALUE", "sneaky")
+        r = self.assertBad("/api/v1/test/items/1?%3Cscript%3E=1", "?")
+        self.assertNotIn("script", r.text)
+
+    def test_repeated_parameter(self):
+        r = self.assertBad("/api/v1/test/items/1?q=SECRETVALUE&q=b", "q")
+        self.assertEqual(r.json()["error"]["details"]["fields"][0]["type"], "repeated")
+        self.assertBad("/api/v1/test/items/1?id=2", "id")
+
+    def test_query_length_cap(self):
+        self.assertError(self.c.get("/api/v1/test/items/1?q=" + "x" * routes.QUERY_MAX), 400, "validation")
+
+    def test_an_endpoint_without_params_still_refuses_a_query(self):
+        for q in ("x=1", "x", "limit=1&before=2"):
+            self.assertError(self.c.get("/api/v1/test/visible?" + q), 400, "validation")
+
+    def test_parameters_after_the_session_check(self):
+        self.signed_in = False
+        self.assertError(self.c.get("/api/v1/test/items/x?sneaky=1"), 401, "unauthenticated")
+
+    def test_params_model_rules(self):
+        for bad in ("x: list[str]", "x: float", "x: int | str", "X: int", "x: Literal[1, 2]"):
+            with self.subTest(field=bad), self.assertRaises(TypeError):
+                exec(f"class P(Params):\n    {bad}\n", {"Params": Params, "Literal": Literal})
+
+    def test_endpoint_path_placeholders(self):
+        cases = [("/api/v1/x/{id:int}", ItemParams),     # no convertor: the params model coerces
+                 ("/api/v1/x/{id}", None),                 # a placeholder needs params
+                 ("/api/v1/x/{own}", ItemParams),          # a bool can't be a path parameter
+                 ("/api/v1/x/{q}", ItemParams),            # nor an optional field
+                 ("/api/v1/x/{nope}", ItemParams)]
+        for path, params in cases:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                Endpoint("x", "GET", path, "session", None, ItemResponse, item, "x", params=params)
+
+
+class Paging(Base):
+    signed_in = True
+
+    def test_pages_by_cursor(self):
+        seen, before = [], None
+        while True:
+            r = self.c.get("/api/v1/test/log" + (f"?before={before}" if before else ""))
+            self.assertEqual(r.status_code, 200, r.text)
+            seen += r.json()["ids"]
+            before = r.json()["next_before"]
+            if before is None:
+                break
+        self.assertEqual(seen, list(range(10, 0, -1)))
+        self.assertEqual(self.c.get("/api/v1/test/log?limit=5&before=6").json(), {"ids": [5, 4, 3, 2, 1],
+                                                                                 "next_before": None})
+
+    def test_limit_and_cursor_bounds(self):
+        for q in ("limit=6", "limit=0", "before=0", "limit=-1", "before=1.5"):
+            with self.subTest(q=q):
+                self.assertError(self.c.get("/api/v1/test/log?" + q), 422, "validation")
+
+    def test_page_helper(self):
+        self.assertEqual(routes.page([5, 4, 3], 3, lambda r: r), ([5, 4, 3], None))
+        self.assertEqual(routes.page([5, 4, 3, 2], 3, lambda r: r), ([5, 4, 3], 3))
+        self.assertEqual(routes.page([], 3, lambda r: r), ([], None))
+        with self.assertRaises(ValueError):
+            routes.page([5, 4, 3, 2, 1], 3, lambda r: r)
+
+    def test_page_params_defaults(self):
+        p = PageParams.model_validate({})
+        self.assertEqual((p.limit, p.before), (50, None))
+
+
+class VisibilityHook(Base):
+    signed_in = True
+
+    def test_without_5a_a_handler_asking_fails_loudly(self):
+        with self.assertLogs("afclaude.web", "ERROR"):
+            self.assertError(self.c.get("/api/v1/test/visible"), 500, "internal")
+
+    def test_injected_hook(self):
+        async def hook(principal):
+            return Visibility(all_projects=False, project_ids=frozenset({principal.user_id, 3}))
+        self.visible = hook
+        self.setUp()
+        self.assertEqual(self.c.get("/api/v1/test/visible").json(), {"all_projects": False, "ids": [3, 7]})
+        v = Visibility(all_projects=False, project_ids=frozenset({3}))
+        self.assertTrue(v.allows(3))
+        self.assertFalse(v.allows(4))
+        self.assertTrue(Visibility(all_projects=True).allows(4))
+
+
+class ResponseRules(Base):
+    signed_in = True
+
+    def test_response_over_the_cap_is_a_bug(self):
+        with self.assertLogs("afclaude.web", "ERROR"):
+            self.assertError(self.c.get("/api/v1/test/big"), 500, "internal")
+
+    def test_sanitized_html_refuses_a_plain_string(self):
+        with self.assertLogs("afclaude.web", "ERROR"):
+            self.assertError(self.c.get("/api/v1/test/html"), 500, "internal")
+        with self.assertRaises(ValidationError):
+            SanitizedHtml("<b>x</b>")
+        with self.assertRaises(ValidationError):
+            SanitizedHtml.model_validate("<b>x</b>")
+
+    def test_only_the_renderer_makes_sanitized_html(self):
+        makers = re.compile(r"SanitizedHtml\.(model_construct|construct)\b|SanitizedHtml\.__new__")
+        found = []
+        for root, dirs, files in os.walk(HERE):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "data", "__pycache__")]
+            for name in files:
+                path = os.path.join(root, name)
+                if name.endswith(".py") and not name.startswith("test_"):
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        if makers.search(fh.read()):
+                            found.append(os.path.relpath(path, HERE))
+        self.assertEqual(found, [os.path.join("dashboard", "markdown.py")])
+
+
 class Headers(Base):
     def check_security_headers(self, r):
         h = r.headers
@@ -452,7 +670,12 @@ class Codegen(unittest.TestCase):
 
         async def h(call):
             return Reply(Fixture(req="", kind="x", items=[], pair=(1, "a"), names={}, either=1, raw=None))
-        eps = (Endpoint("fix", "PUT", "/api/v1/fix/{id:int}", "session", Req, Fixture, h, "fixture", idempotent=True),)
+        class FixParams(Params):
+            id: int
+            mode: Literal["a", "b"] | None = None
+
+        eps = (Endpoint("fix", "PUT", "/api/v1/fix/{id}", "session", Req, Fixture, h, "fixture", idempotent=True,
+                        params=FixParams),)
         doc = codegen.openapi(eps)
         ts = codegen.typescript(doc, eps)
         for part in ("/**\n * Doc line.\n */\nexport interface Fixture {",
@@ -466,10 +689,46 @@ class Codegen(unittest.TestCase):
                      "  readonly raw: JsonValue;",
                      "  readonly flag: boolean;",
                      "export interface Req {\n  readonly x: number;\n  readonly y?: string;\n}",   # a request may omit it
-                     'fix: { method: "PUT", path: "/api/v1/fix/{id:int}", access: "session", idempotent: true },',
-                     "readonly fix: { readonly request: Req; readonly response: Fixture };"):
+                     'fix: { method: "PUT", path: "/api/v1/fix/{id}", access: "session", idempotent: true },',
+                     "readonly fix: { readonly params: FixParams; readonly request: Req; readonly response: Fixture };",
+                     'export interface FixParams {\n  readonly id: number;\n  readonly mode?: "a" | "b" | null;\n}'):
             self.assertIn(part, ts)
-        self.assertEqual(doc["paths"]["/api/v1/fix/{id:int}"]["put"]["parameters"][0]["name"], "Idempotency-Key")
+        params = doc["paths"]["/api/v1/fix/{id}"]["put"]["parameters"]
+        self.assertEqual([(p["name"], p["in"], p["required"]) for p in params],
+                         [("Idempotency-Key", "header", True), ("id", "path", True), ("mode", "query", False)])
+
+    def test_parameters_match_the_models(self):
+        doc = test_schema()
+        for ep in TEST_ENDPOINTS:
+            op = doc["paths"][ep.path][ep.method.lower()]
+            params = [p for p in op.get("parameters", []) if p["in"] != "header"]
+            if ep.params is None:
+                self.assertEqual(params, [], ep.name)
+                self.assertNotIn("x-params", op)
+                continue
+            fields = ep.params.model_fields
+            self.assertEqual([p["name"] for p in params], list(fields), ep.name)
+            for p in params:
+                in_path = "{" + p["name"] + "}" in ep.path
+                self.assertEqual(p["in"], "path" if in_path else "query")
+                self.assertEqual(p["required"], in_path or fields[p["name"]].is_required())
+            comp = doc["components"]["schemas"][op["x-params"]["$ref"].rsplit("/", 1)[1]]
+            self.assertEqual({p["name"]: p["schema"] for p in params}, comp["properties"])
+        ts = codegen.typescript(doc, TEST_ENDPOINTS)
+        self.assertIn("readonly item: { readonly params: ItemParams; readonly request: null; "
+                      "readonly response: ItemResponse };", ts)
+        self.assertIn("export interface LogParams {\n  readonly limit?: number;\n  readonly before?: number | null;\n}", ts)
+
+    def test_sanitized_html_is_a_branded_string(self):
+        self.assertEqual(SCHEMA["components"]["schemas"]["SanitizedHtml"]["x-brand"], "SanitizedHtml")
+        self.assertEqual(SCHEMA["components"]["schemas"]["SanitizedHtml"]["type"], "string")
+        with open(codegen.TS_PATH, encoding="utf-8") as fh:
+            self.assertIn('export type SanitizedHtml = string & { readonly __brand: "SanitizedHtml" };', fh.read())
+        doc = codegen.openapi((Endpoint("h", "GET", "/api/v1/h", "session", None, HtmlResponse, html_from_str, "h"),))
+        self.assertIn("readonly html: SanitizedHtml;", codegen.typescript(doc, ()))
+        for bad in ({"type": "integer", "x-brand": "X"}, {"type": "string", "x-brand": 1}):
+            with self.subTest(schema=bad), self.assertRaises(codegen.UnsupportedSchema):
+                codegen.ts_type(bad)
 
     def test_unsupported_constructs_are_errors(self):
         for schema in ({"type": "object"}, {"not": {"type": "string"}}, {"type": "array"},

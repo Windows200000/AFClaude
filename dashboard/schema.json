@@ -128,7 +128,13 @@
     "title": "HealthResponse",
     "type": "object"
    },
-   "JsonValue": {}
+   "JsonValue": {},
+   "SanitizedHtml": {
+    "description": "HTML rendered from markdown on the server and allowlist-sanitised (dashboard.markdown.render(),\ndocs/phase6c_plan.md §0, design §9.8): the only HTML a response may carry. Validation always\nrefuses, so a handler can't pass a plain string where a response field is SanitizedHtml; render()\nis the only place that makes one (model_construct, checked by a test). The schema names it with\n`x-brand`, and the generated TS type is branded, so the frontend's one raw-HTML sink takes\nnothing else. Responses only: never a request field.",
+    "title": "SanitizedHtml",
+    "type": "string",
+    "x-brand": "SanitizedHtml"
+   }
   }
  },
  "info": {

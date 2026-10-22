@@ -1,7 +1,9 @@
 """The API schema and the frontend's TS types, generated from api_types.py + routes.ENDPOINTS
 (design §4 "API types", D-209; docs/phase6a_plan.md W2). No codegen package: pydantic emits the
 JSON Schema, and the TS generator below covers exactly the subset pydantic emits for our models;
-any other construct is an error, never a guessed type.
+any other construct is an error, never a guessed type. An endpoint's Params model becomes its
+OpenAPI `parameters` (path or query, by the path's placeholders) and the `params` of its TS entry;
+a schema with `x-brand` (api_types.SanitizedHtml) becomes a branded TS type.
 
   python -m dashboard.codegen           write dashboard/schema.json and dashboard/web/src/api/types.gen.ts
   python -m dashboard.codegen --check   exit 1 when a committed file differs from a fresh generation
@@ -18,9 +20,10 @@ import sys
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel
 from pydantic.json_schema import JsonSchemaMode, models_json_schema
 
-from dashboard.api_types import ErrorResponse, Model
+from dashboard.api_types import ErrorResponse, SanitizedHtml
 from dashboard.errors import ERROR_CODES
 
 if TYPE_CHECKING:
@@ -38,6 +41,8 @@ _ANNOTATIONS = frozenset({"title", "description", "default", "examples", "format
                           "minItems", "maxItems", "uniqueItems", "readOnly", "writeOnly", "deprecated"})
 _STRUCTURE = frozenset({"$ref", "anyOf", "oneOf", "const", "enum", "type", "items", "properties", "required",
                         "additionalProperties", "prefixItems"})
+BRAND = "x-brand"     # a named type the frontend can't make from a plain value (api_types.SanitizedHtml)
+PATH_PARAM_RE = re.compile(r"\{([^{}]*)\}")
 JSON_VALUE_TS = ("string | number | boolean | null | readonly JsonValue[] | "
                  "{ readonly [key: string]: JsonValue }")
 
@@ -50,15 +55,19 @@ class UnsupportedSchema(ValueError):
 
 def openapi(endpoints: Sequence[Endpoint]) -> dict[str, Any]:
     """The OpenAPI 3.1 document of `endpoints` (schemas: JSON Schema 2020-12 from pydantic)."""
-    wanted: list[tuple[type[Model], JsonSchemaMode]] = []
+    wanted: list[tuple[type[BaseModel], JsonSchemaMode]] = []
     for ep in endpoints:
         if ep.request is not None:
             wanted.append((ep.request, "validation"))
+        if ep.params is not None:
+            wanted.append((ep.params, "validation"))
         wanted.append((ep.response, "serialization"))
     wanted.append((ErrorResponse, "serialization"))
+    wanted.append((SanitizedHtml, "serialization"))     # always generated: the frontend's HTML sink takes it
     unique = list(dict.fromkeys(wanted))
     refs, top = models_json_schema(unique, ref_template=REF)
     error_ref = refs[(ErrorResponse, "serialization")]
+    defs: dict[str, Any] = top.get("$defs", {})
 
     def content(ref: Any) -> dict[str, Any]:
         return {"application/json": {"schema": ref}}
@@ -72,14 +81,31 @@ def openapi(endpoints: Sequence[Endpoint]) -> dict[str, Any]:
                               "responses": responses}
         if ep.request is not None:
             op["requestBody"] = {"required": True, "content": content(refs[(ep.request, "validation")])}
+        parameters: list[dict[str, Any]] = []
         if ep.idempotent:
-            op["parameters"] = [{"name": "Idempotency-Key", "in": "header", "required": True,
-                                 "schema": {"type": "string", "format": "uuid"}}]
+            parameters.append({"name": "Idempotency-Key", "in": "header", "required": True,
+                               "schema": {"type": "string", "format": "uuid"}})
+        if ep.params is not None:
+            ref = refs[(ep.params, "validation")]
+            op["x-params"] = ref
+            parameters += _parameters(ep, defs[ref["$ref"].rsplit("/", 1)[1]])
+        if parameters:
+            op["parameters"] = parameters
         paths.setdefault(ep.path, {})[ep.method.lower()] = op
     return {"openapi": "3.1.0",
             "info": {"title": "AFClaude dashboard API", "version": "1"},
             "paths": paths,
-            "components": {"schemas": top.get("$defs", {})}}
+            "components": {"schemas": defs}}
+
+
+def _parameters(ep: Endpoint, schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """The OpenAPI parameters of `ep`'s Params model (its component `schema`): a field named by a
+    placeholder of the path is a path parameter (always required), every other one a query parameter."""
+    in_path = set(PATH_PARAM_RE.findall(ep.path))
+    required = set(schema.get("required", []))
+    return [{"name": name, "in": "path" if name in in_path else "query",
+             "required": name in in_path or name in required, "schema": sub}
+            for name, sub in schema["properties"].items()]
 
 
 def schema_text(doc: dict[str, Any]) -> str:
@@ -103,9 +129,15 @@ def ts_type(schema: Any, indent: str = "") -> str:
     """The TS type of one JSON Schema (the subset pydantic emits for our models)."""
     if not isinstance(schema, dict):
         raise UnsupportedSchema(f"not a schema: {schema!r}")
-    unknown = set(schema) - _ANNOTATIONS - _STRUCTURE
+    unknown = set(schema) - _ANNOTATIONS - _STRUCTURE - {BRAND}
     if unknown:
         raise UnsupportedSchema(f"unsupported JSON Schema keywords {sorted(unknown)}")
+    if BRAND in schema:
+        brand = schema[BRAND]
+        base = ts_type({k: v for k, v in schema.items() if k != BRAND}, indent)
+        if not isinstance(brand, str) or base != "string":
+            raise UnsupportedSchema(f"{BRAND} needs a string schema and a name, got {schema!r}")
+        return f"string & {{ readonly __brand: {json.dumps(brand)} }}"
     if not set(schema) & _STRUCTURE:
         return "JsonValue"                               # {} (pydantic's JsonValue / Any)
     if "$ref" in schema:
@@ -197,8 +229,10 @@ def typescript(doc: dict[str, Any], endpoints: Sequence[Endpoint]) -> str:
     for ep in endpoints:
         op = doc["paths"][ep.path][ep.method.lower()]
         req = ts_type(op["requestBody"]["content"]["application/json"]["schema"]) if ep.request else "null"
+        par = ts_type(op["x-params"]) if ep.params else "null"
         res = ts_type(op["responses"][str(ep.statuses[0])]["content"]["application/json"]["schema"])
-        out.append(f"  readonly {ep.name}: {{ readonly request: {req}; readonly response: {res} }};")
+        out.append(f"  readonly {ep.name}: {{ readonly params: {par}; readonly request: {req}; "
+                   f"readonly response: {res} }};")
     out += ["}", ""]
     return "\n".join(out)
 
