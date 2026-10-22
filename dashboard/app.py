@@ -27,7 +27,8 @@ from starlette.types import ASGIApp
 
 from dashboard import codegen
 from dashboard.errors import ApiError, error_response, internal
-from dashboard.routes import ENDPOINTS, AppContext, Authenticator, Endpoint, check_table, endpoint_app
+from dashboard.routes import (ENDPOINTS, AppContext, Authenticator, Endpoint, VisibleProjects, check_table,
+                              endpoint_app, no_grants)
 from dashboard.security import PublicUrl, SecurityMiddleware
 
 log = logging.getLogger("afclaude.web")
@@ -35,8 +36,9 @@ ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
 
 def create_app(public_url: str, static_dir: str, authenticate: Authenticator, *, db_path: str | None = None,
-               endpoints: Sequence[Endpoint] = ENDPOINTS) -> ASGIApp:
-    """The app. Refuses to start (raises) on a bad public URL, a broken endpoint table or a
+               endpoints: Sequence[Endpoint] = ENDPOINTS, visible_projects: VisibleProjects = no_grants) -> ASGIApp:
+    """The app (`visible_projects`: which projects a principal may see, 5a's roles; until then
+    tests inject it, routes.no_grants). Refuses to start (raises) on a bad public URL, a broken endpoint table or a
     missing frontend build: an app that would answer wrongly never comes up (D-235)."""
     public = PublicUrl.parse(public_url)
     table = tuple(endpoints)
@@ -48,7 +50,7 @@ def create_app(public_url: str, static_dir: str, authenticate: Authenticator, *,
                                 "build dashboard/web first")
     with open(index_path, "rb") as fh:
         shell_html = fh.read()
-    ctx = AppContext(public=public, db_path=db_path, schema=codegen.openapi(table))
+    ctx = AppContext(public=public, db_path=db_path, schema=codegen.openapi(table), visible_projects=visible_projects)
     known = [(compile_path(ep.path)[0], ep.method) for ep in table]
 
     async def shell(request: Request) -> Response:

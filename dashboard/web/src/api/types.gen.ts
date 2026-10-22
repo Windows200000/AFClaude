@@ -50,6 +50,16 @@ export interface HealthResponse {
   readonly db: string;
 }
 
+/**
+ * HTML rendered from markdown on the server and allowlist-sanitised (dashboard.markdown.render(),
+ * docs/phase6c_plan.md §0, design §9.8): the only HTML a response may carry. Validation always
+ * refuses, so a handler can't pass a plain string where a response field is SanitizedHtml; render()
+ * is the only place that makes one (model_construct, checked by a test). The schema names it with
+ * `x-brand`, and the generated TS type is branded, so the frontend's one raw-HTML sink takes
+ * nothing else. Responses only: never a request field.
+ */
+export type SanitizedHtml = string & { readonly __brand: "SanitizedHtml" };
+
 export const ENDPOINTS = {
   health: { method: "GET", path: "/api/v1/health", access: "public", idempotent: false },
   api_schema: { method: "GET", path: "/api/v1/schema.json", access: "session", idempotent: false },
@@ -57,6 +67,6 @@ export const ENDPOINTS = {
 export type EndpointName = keyof typeof ENDPOINTS;
 
 export interface EndpointTypes {
-  readonly health: { readonly request: null; readonly response: HealthResponse };
-  readonly api_schema: { readonly request: null; readonly response: ApiSchemaResponse };
+  readonly health: { readonly params: null; readonly request: null; readonly response: HealthResponse };
+  readonly api_schema: { readonly params: null; readonly request: null; readonly response: ApiSchemaResponse };
 }
