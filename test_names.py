@@ -126,9 +126,14 @@ class DrivenSetForS2(Base):
 
 
 class FakeTmux:
-    """host.run_on_host for tmux calls: `alive` names, `clients` attached ones, renames recorded."""
-    def __init__(self, alive=(), clients=()):
+    """host.run_on_host for tmux calls: `alive` names, `clients` attached ones, renames recorded.
+    `noisy`: rename-session targets that rename successfully but (like a real tmux run outside
+    any client, D-281 incident 2026-10-22) exit 1 with "no current client". `broken`: targets
+    that print the identical rc=1/"no current client" but do NOT actually rename anything -- a
+    fix must tell the two apart from tmux's own state, not from rc or the message text."""
+    def __init__(self, alive=(), clients=(), noisy=(), broken=()):
         self.alive, self.clients, self.calls = set(alive), set(clients), []
+        self.noisy, self.broken = set(noisy), set(broken)
 
     def __call__(self, argv, **k):
         self.calls.append(argv)
@@ -139,9 +144,14 @@ class FakeTmux:
         if verb == "list-clients":
             return types.SimpleNamespace(returncode=0, stdout="1700000000\n" if target in self.clients else "",
                                          stderr="")
-        if verb == "rename-session" and target in self.alive:
-            self.alive = (self.alive - {target}) | {argv[-1]}
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if verb == "rename-session":
+            noisy_err = types.SimpleNamespace(returncode=1, stdout="", stderr="no current client\n")
+            if target in self.broken:
+                return noisy_err                                   # rc=1, nothing actually renamed
+            if target in self.alive:
+                self.alive = (self.alive - {target}) | {argv[-1]}
+                return noisy_err if target in self.noisy else types.SimpleNamespace(returncode=0, stdout="",
+                                                                                     stderr="")
         return types.SimpleNamespace(returncode=1, stdout="", stderr="no such session")
 
 
@@ -252,6 +262,41 @@ class Rename(Base):
         actions.perform = boom
         self.addCleanup(setattr, actions, "perform", old)
         with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to ka-abcdef01: rc=0"):
+            ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
+        self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
+        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+
+    def test_rc1_no_current_client_but_renamed_is_success(self):
+        """D-281 incident 2026-10-22 05:16: tmux renamed the session but exited 1 with "no
+        current client" (no attached terminal). Success must be decided from tmux state."""
+        self.tmux.noisy.add("ka-abcdef01")
+        self.assertEqual(ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager"), SID)
+        self.assertEqual(self.tmux.alive, {"afc-afclaude-task-manager"})
+        self.assertEqual(ka.tmux_name(SID), "afc-afclaude-task-manager")
+
+    def test_rc1_no_current_client_and_not_renamed_is_a_failure(self):
+        """Same rc and stderr text, but tmux's state shows nothing moved: a real failure, and
+        the row must not be touched (the bug this fixes: rc/message alone can't tell these apart)."""
+        self.tmux.broken.add("ka-abcdef01")
+        with self.assertRaisesRegex(RuntimeError,
+                                    "tmux rename-session ka-abcdef01 afc-afclaude-task-manager failed rc=1"):
+            ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
+        self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
+        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+
+    def test_rollback_rc1_no_current_client_is_reported_accurately(self):
+        """The rollback rename (after a failed row update) can hit the same noisy rc=1; it must
+        still be recognized as a successful rollback, not reported as a second failure."""
+        old = actions.perform
+
+        def boom(conn, name, params=None, **k):
+            if name == "driven.set":
+                raise store.DBError("disk I/O error", "io")
+            return old(conn, name, params, **k)
+        actions.perform = boom
+        self.addCleanup(setattr, actions, "perform", old)
+        self.tmux.noisy.add("afc-afclaude-task-manager")       # the rollback renames new -> old
+        with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to ka-abcdef01: rc=1"):
             ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
         self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
         self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")

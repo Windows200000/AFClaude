@@ -880,15 +880,25 @@ def rename_tmux(old, new, actor="cli", via="cli"):
         if lock is None:
             raise ValueError(f"{sid[:8]} is busy (a start, compaction or inbox delivery holds its lock)")
         r = host.run_on_host(["tmux", "rename-session", "-t", "=" + old, new], timeout=30)
-        if r.returncode != 0:
+        # tmux can rename successfully and still exit 1 with "no current client" (no terminal
+        # attached, e.g. a forced-command / cron run); rc alone lies, so success is decided
+        # from tmux's own state (incident 2026-10-22 05:16).
+        if not (tmux_has(new) and not tmux_has(old)):
             raise RuntimeError(f"tmux rename-session {old} {new} failed rc={r.returncode}: "
                                f"{(r.stderr or '').strip()[:200]}")
+        if r.returncode != 0:
+            log(f"tmux rename-session {old} {new}: rc={r.returncode} "
+                f"({(r.stderr or '').strip()[:200]!r}) but verified renamed")
         try:
             actions.perform(conn, "driven.set", {"session_id": sid, "tmux": new}, actor=actor, via=via)
         except Exception as e:
             back = host.run_on_host(["tmux", "rename-session", "-t", "=" + new, old], timeout=30)
-            raise RuntimeError(f"the row of {sid[:8]} was not renamed ({type(e).__name__}: {e}); tmux renamed "
-                               f"back to {old}: rc={back.returncode}") from e
+            if tmux_has(old) and not tmux_has(new):
+                raise RuntimeError(f"the row of {sid[:8]} was not renamed ({type(e).__name__}: {e}); tmux "
+                                   f"renamed back to {old}: rc={back.returncode}") from e
+            raise RuntimeError(f"the row of {sid[:8]} was not renamed ({type(e).__name__}: {e}); tmux "
+                               f"rename-back to {old} ALSO failed rc={back.returncode}: "
+                               f"{(back.stderr or '').strip()[:200]}") from e
         log(f"tmux {old} renamed to {new} (session {sid[:8]}, row updated)")
         return sid
     finally:
