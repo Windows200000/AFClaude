@@ -338,7 +338,7 @@ class UsageSplitTest(unittest.TestCase):
         sampler has no delta for that reading, the split counts it as 8 (risen from 0), like
         pacing.cycle_totals."""
         t0 = datetime(2026, 10, 21, 22, tzinfo=timezone.utc)
-        reset = "2026-10-22 16:59:59.5+00:00"
+        reset = "2026-10-22 16:59:59.500000+00:00"
 
         def smp(m: int, wp: float, d: "float | None") -> dict:
             t = t0 + timedelta(minutes=m)
