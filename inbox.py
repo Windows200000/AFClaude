@@ -26,6 +26,10 @@ start (D-244, hold_deadline): that start's message takes it along (held_insert, 
 _fire_start), marked as needing an answer; still not out by then is an error. A start whose gate
 passed fires late in its session window (D-274): the hold then lasts until that planned start.
 
+A triage call refused at the account's usage limit (session or weekly) is no error yet (D-244): the
+message waits, untriaged and shown as held, until the limit's reset (retry_after), then it is
+triaged again once; failing again then is an error.
+
 A failed triage or delivery is an error on the message (D-235/D-244: shown on the dashboard,
 logged, alerted, and automation paused until the owner clears it; never delivered silently, never
 dropped; the owner retries it).
@@ -65,6 +69,15 @@ NEWLINE = " ⏎ "             # a line break of the owner's text in a one-line s
 
 class TriageError(Exception):
     """The triage call failed or gave no usable verdict."""
+
+
+class TriageLimit(TriageError):
+    """The triage call was refused at the account's usage limit (D-244): `kind` (session, weekly,
+    or "" for a plain "hit your limit") and the limit notice it printed (with its reset time, if any)."""
+    def __init__(self, kind: str, notice: str) -> None:
+        super().__init__(f"the account is at its {kind + ' ' if kind else ''}usage limit: {notice.strip()[:200]}")
+        self.kind = kind
+        self.notice = notice
 
 
 def prompt(name: str) -> str:
@@ -200,7 +213,10 @@ def planned_start(start: datetime, cfg: schedule.Config | None = None) -> dateti
 
 
 def hold_until(m: dict[str, Any], cfg: schedule.Config | None = None) -> datetime | None:
-    """The deadline of a held message (hold_deadline of its hold_since), else None."""
+    """The deadline of a held message (hold_deadline of its hold_since; a held triage: its
+    retry_after, the usage limit's reset), else None."""
+    if m.get("hold") and m.get("retry_after"):
+        return _ts(m["retry_after"])
     since = _ts(m.get("hold_since")) if m.get("hold") else None
     return hold_deadline(since, cfg) if since is not None else None
 
@@ -276,13 +292,14 @@ def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[s
 
 def state(m: dict[str, Any]) -> str:
     """What the box shows for the message (D-246): sorting (Haiku has not answered yet), sending
-    ("now", being typed in), held, delivered (waiting for the answer): the loading animation;
+    ("now", being typed in), held (also a triage waiting for a usage limit's reset, D-244),
+    delivered (waiting for the answer): the loading animation;
     noted: a checkmark; answered: the chat; error: a red mark and Retry; included: gone (D-248)."""
     if m["status"] != "pending":
         return str(m["status"])
-    if not m["verdict"]:
-        return "sorting"
-    return "held" if m["hold"] else "sending"
+    if m["hold"]:
+        return "held"
+    return "sending" if m["verdict"] else "sorting"
 
 
 def tip(m: dict[str, Any], until: datetime | None = None) -> str:
@@ -292,6 +309,8 @@ def tip(m: dict[str, Any], until: datetime | None = None) -> str:
         return f"Sent {berlin(m['created_at'], VIEW_FMT)} · sorting"
     if st == "sending":
         return f"Passing it on to the task-manager · sent {berlin(m['created_at'], VIEW_FMT)}"
+    if st == "held" and not m["verdict"]:
+        return f"Held: {m['hold']}" + (f" · sorted after {until.astimezone(BERLIN).strftime(VIEW_FMT)}" if until else "")
     if st == "held":
         return f"Held: {m['hold']}" + (f" · goes out with the window start {until.astimezone(BERLIN).strftime(VIEW_FMT)} "
                                        "at the latest" if until else "")

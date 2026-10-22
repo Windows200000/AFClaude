@@ -1596,7 +1596,29 @@ def inbox_triage(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, verdict: A
     after = store.update_inbox(conn, before["id"], ("pending",), verdict=verdict,
                                verdict_reason=_short(reason, "reason", INBOX_REASON_MAX),
                                triaged_at=store.now_iso(), triage_cost_usd=cost_usd, triage_usage=usage,
-                               status="noted" if verdict == "note" else "pending")
+                               status="noted" if verdict == "note" else "pending",
+                               hold=None, hold_since=None, retry_after=None)   # a triage hold is over
+    return _inbox_change(before, after)
+
+
+@action("inbox.triage_hold", "inbox")
+def inbox_triage_hold(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, reason: Any, retry_after: Any) -> Result:
+    """The triage call hit the account's usage limit (D-244): the message stays pending and
+    untriaged, held until `retry_after` (the limit's reset, an ISO time), then triaged again once."""
+    _runner_only(ctx, "a triage hold")
+    text = store._text(retry_after, "retry_after", required=True)
+    try:
+        at = store.parse_iso(text)
+    except ValueError:
+        at = None
+    if at is None or at.tzinfo is None:
+        raise ValueError(f"retry_after must be an ISO time with a zone, got {retry_after!r}")
+    before = store.inbox_row(conn, message_id)
+    if before["status"] != "pending" or before["verdict"] is not None:
+        raise store.InvalidTransition(f"inbox message #{before['id']} is not waiting for its triage "
+                                      f"(status {before['status']}, verdict {before['verdict']})")
+    after = store.update_inbox(conn, before["id"], ("pending",), hold=_short(reason, "reason", INBOX_REASON_MAX),
+                               hold_since=before["hold_since"] or store.now_iso(), retry_after=store.iso(at))
     return _inbox_change(before, after)
 
 
@@ -1659,7 +1681,8 @@ def inbox_fail(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, error: Any) 
     _runner_only(ctx, "a failure")
     before = store.inbox_row(conn, message_id)
     after = store.update_inbox(conn, before["id"], ("pending", "delivered"), status="error",
-                               error=_short(error, "error", INBOX_ERROR_MAX), error_at=store.now_iso(), hold=None)
+                               error=_short(error, "error", INBOX_ERROR_MAX), error_at=store.now_iso(), hold=None,
+                               retry_after=None)
     return _inbox_change(before, after)
 
 
@@ -1670,7 +1693,7 @@ def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
     before = store.inbox_row(conn, message_id)
     status = "noted" if before["verdict"] == "note" else "pending"
     after = store.update_inbox(conn, before["id"], ("error",), status=status, error=None, error_at=None,
-                               hold=None, hold_since=None)
+                               hold=None, hold_since=None, retry_after=None)
     return _inbox_change(before, after)
 
 

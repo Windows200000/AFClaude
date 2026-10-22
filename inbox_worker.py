@@ -8,6 +8,15 @@ shape docker/host_exec.py whitelists, so inside the container it runs on the hos
 bridge, where the Claude CLI's login is), prompts/inbox_triage.md. Its cost and usage are kept on
 the message.
 
+A triage call refused at the account's usage limit (D-244; the notice `claude -p` prints as its
+result or on stderr, matched like keepalive.stall_info does a session's: "You've hit your session
+limit · resets 2pm (Europe/Berlin)"; session, weekly or a plain "hit your limit") is held, not an
+error: the message stays pending and untriaged, shown as held, with retry_after = the limit's reset
+(the notice's reset time, else for a session or weekly limit the usage cache's resets_at; none: an
+error). No call is made before retry_after + TRIAGE_RETRY_MARGIN; then the triage runs once more
+(the activity check first, as for every triage), and any failure then, the limit again included, is
+an error. Every other triage failure is an error at once.
+
 No triage while the task-manager is active (D-252): a message whose session has a keep-alive run
 going (keepalive.run_active, D-224), a turn or a subagent running (keepalive.compaction_busy_reason)
 or a request in its transcript within ACTIVE_WINDOW (compact_timing.scan) is "now" without the
@@ -54,6 +63,7 @@ an error.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -81,6 +91,8 @@ ACTOR = "runner:inbox"
 DATA = os.path.join(HERE, "data")
 POLL = 30                                 # seconds between passes (a held message is tried again)
 TRIAGE_TIMEOUT = 120                      # seconds for the Haiku call
+TRIAGE_RETRY_MARGIN = timedelta(minutes=2)  # a triage held at a usage limit is tried again this long after its reset
+LIMIT_KINDS = ("session", "weekly", "")     # the usage limits a triage waits for ("": a plain "hit your limit")
 ACTIVE_WINDOW = timedelta(minutes=10)     # D-252: a request this recent: the task-manager is active, no triage
 # a held "now" message is an error this long after its deadline (the next session-window start) if
 # that start did not take it along: the cron checks a start within CRON_STEP after it, the start
@@ -123,8 +135,35 @@ def failed(conn: Any, m: dict[str, Any], subject: str, detail: str) -> None:
 
 # ---------------------------------------------------------------- triage
 
+def limit_notice(returncode: int, stdout: str, stderr: str) -> tuple[str, str] | None:
+    """A failed `claude -p` call (exit code != 0 or an error result) refused at a usage limit: its
+    result (the JSON) or stderr is the limit notice (keepalive.LIMIT_TEXT_RE, as stall_info reads
+    a session's) -> (kind: session | weekly | "" for a plain one, the notice), else None (also
+    for a limit the triage can't wait for: a spend limit, ...)."""
+    texts = [stderr]
+    failed = returncode != 0
+    try:
+        out = json.loads(stdout)
+    except ValueError:
+        out = None
+    if isinstance(out, dict):
+        failed = failed or bool(out.get("is_error"))
+        if isinstance(out.get("result"), str):
+            texts.insert(0, out["result"])
+    if not failed:
+        return None
+    for t in texts:
+        m = ka.LIMIT_TEXT_RE.search(t or "")
+        if m:
+            word = m.group("kind").strip().lower()
+            kind = "weekly" if "week" in word else "session" if "session" in word else word
+            return (kind, t.strip()) if kind in LIMIT_KINDS else None
+    return None
+
+
 def triage_call(text: str) -> dict[str, Any]:
-    """One Haiku call -> inbox.parse_triage's dict; a failed call raises inbox.TriageError."""
+    """One Haiku call -> inbox.parse_triage's dict; a failed call raises inbox.TriageError, one
+    refused at a usage limit inbox.TriageLimit (limit_notice)."""
     try:
         r = host.run_on_host(ka.POKE_ARGV, input=inbox.triage_prompt(text), cwd=DATA, env=ka.SCRUBBED_ENV,
                              timeout=TRIAGE_TIMEOUT)
@@ -132,7 +171,46 @@ def triage_call(text: str) -> dict[str, Any]:
         raise inbox.TriageError(f"claude -p timed out after {TRIAGE_TIMEOUT} s") from None
     except (OSError, ValueError) as e:
         raise inbox.TriageError(f"claude -p could not run: {type(e).__name__}: {e}") from None
+    hit = limit_notice(r.returncode, r.stdout or "", r.stderr or "")
+    if hit:
+        raise inbox.TriageLimit(*hit)
     return inbox.parse_triage(r.returncode, r.stdout or "", r.stderr or "")
+
+
+def limit_reset(e: inbox.TriageLimit, now: datetime) -> datetime | None:
+    """When the usage limit `e` resets: the notice's reset time, else (a session or weekly limit)
+    the usage cache's resets_at of that limit; None: neither is after `now`. An unreadable usage
+    cache raises (D-235)."""
+    reset = ka.parse_reset_text(e.notice, now)
+    if reset is not None and reset > now:
+        return reset
+    if e.kind not in ("session", "weekly"):
+        return None
+    reset = ((ka.usage_cache_checked() or {}).get(e.kind) or {}).get("resets_at")
+    return reset if reset is not None and reset > now else None
+
+
+def triage_hold(conn: Any, m: dict[str, Any], e: inbox.TriageLimit, now: datetime) -> str | None:
+    """The triage call hit the account's usage limit (D-244): hold the message until the limit's
+    reset (inbox.triage_hold). No reset to wait for (none in the notice nor the usage cache, or
+    the cache unreadable) is an error. -> "held", or None (failed: the message shows the error)."""
+    try:
+        reset = limit_reset(e, now)
+    except Exception as x:   # noqa: BLE001 - an error on the message (D-235), never a guessed wait
+        failed(conn, m, "inbox message triage failed", f"{e}; and its reset could not be read: {type(x).__name__}: {x}")
+        return None
+    if reset is None:
+        failed(conn, m, "inbox message triage failed", f"{e}; no reset time to wait for (the notice nor the usage cache)")
+        return None
+    why = (f"the account is at its {e.kind + ' ' if e.kind else ''}usage limit: sorted after its reset "
+           f"{reset.astimezone(inbox.BERLIN).strftime('%d.%m. %H:%M')}")
+    try:
+        _act(conn, "inbox.triage_hold", message_id=m["id"], reason=why, retry_after=store.iso(reset))
+    except store.InvalidTransition as x:      # answered or changed meanwhile: nothing to hold
+        log(f"inbox #{m['id']}: triage hold not stored ({x})")
+        return None
+    log(f"inbox #{m['id']}: triage held: {why}")
+    return "held"
 
 
 def load_state() -> Any:
@@ -214,9 +292,16 @@ def manager_active(sid: str, now: datetime) -> str | None:
 
 def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | None:
     """Sort one message: "now" without a Haiku call while its task-manager is active (D-252),
-    else the Haiku verdict. -> its verdict, or None (failed: the message shows the error)."""
+    else the Haiku verdict. A call refused at the account's usage limit holds the message until
+    the limit's reset (triage_hold, D-244); after that reset it is sorted once more, and a failure
+    then (the limit again too) is an error. -> its verdict, "held" (waiting for the reset), or None
+    (failed: the message shows the error)."""
+    now = now or datetime.now(UTC)
+    retry = store.parse_iso(m.get("retry_after"))
+    if retry is not None and now < retry + TRIAGE_RETRY_MARGIN:
+        return "held"
     try:
-        active = manager_active(m["session_id"], now or datetime.now(UTC))
+        active = manager_active(m["session_id"], now)
     except Exception as e:   # noqa: BLE001 - an error on the message (D-235/D-244), never a triage instead
         failed(conn, m, "inbox activity check failed", f"{type(e).__name__}: {e}")
         return None
@@ -227,6 +312,12 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
         try:
             t = triage_call(m["text"])
         except inbox.TriageError as e:
+            if retry is not None:
+                failed(conn, m, "inbox message triage failed after the usage limit's reset",
+                       f"held until {ka.berlin(retry)}, sorted again: {e}")
+                return None
+            if isinstance(e, inbox.TriageLimit):
+                return triage_hold(conn, m, e, now)
             failed(conn, m, "inbox message triage failed", str(e))
             return None
     try:
