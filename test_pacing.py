@@ -489,6 +489,54 @@ class Predictor(unittest.TestCase):
         rates, _ = pm.fit_profile(part + cur, [], now, params=P)
         self.assertIsNone(rates.week_total)
 
+    def one_off(self, rows, k):
+        """The rows with a one-off reset before rows[k]: the meter restarts at 0 there (same reset time)."""
+        base = rows[k - 1]["usage"]["weekly"]["percent"]
+        return rows[:k] + [dict(x, usage={"weekly": dict(x["usage"]["weekly"], percent=round(
+            x["usage"]["weekly"]["percent"] - base, 4))}) for x in rows[k:]]
+
+    def test_one_off_reset_cycle_total_is_the_sum_of_segments(self):
+        """docs/usage_split_plan.md §3.5: a closed cycle with a one-off reset counts the rise before
+        the drop plus the rise after it (the forecast's weekly budget); the rate profile too."""
+        old = self.week(tue_rate=0.0, other_rate=0.3)
+        final = old[-1]["usage"]["weekly"]["percent"]
+        reset = self.one_off(old, 300)
+        self.assertLess(reset[-1]["usage"]["weekly"]["percent"], final - 20)
+        self.assertAlmostEqual(pm.cycle_totals(reset)[self.OLD][0], final, places=3)
+        self.assertAlmostEqual(pm.cycle_totals(old)[self.OLD][0], final, places=3)   # no reset: the last reading
+        now = self.OLD + timedelta(days=2)
+        cur = [row(self.OLD + timedelta(minutes=15 * (i + 1)), round(0.0125 * (i + 1), 4), reset=R) for i in range(192)]
+        P = {"shrink_hours": 0.0, "budget_weight": 0.5}
+        plain, _ = pm.fit_profile(old + cur, [], now, params=P)
+        rates, _ = pm.fit_profile(reset + self.one_off(cur, 180), [], now, params=P)   # 2.25 -> 0.0125
+        self.assertAlmostEqual(rates.week_total, plain.week_total, places=3)
+        self.assertAlmostEqual(rates.used, plain.used, places=3)        # the open cycle's use so far too
+        self.assertAlmostEqual(sum(rates), sum(plain), places=3)        # the rise after the drop is counted
+        # the interval across the drop: the reading after it is the rise since the reset
+        iv = pm._intervals(reset[299:301], [])
+        self.assertAlmostEqual(iv[0][2], reset[300]["usage"]["weekly"]["percent"], places=6)
+
+    def test_cycle_split_counts_design_chats_as_afclaude(self):
+        """The quickview's split (D-266): run / design / other of the open cycle, design chats on AFClaude's side."""
+        sonnet = lambda n: {"tokens": {"claude-sonnet-5": {"out": n, "think": 0}}}   # noqa: E731
+        t0 = self.OLD
+        ws = [(4, None, None), (10, sonnet(100), None), (12, None, sonnet(100)), (15, None, None),
+              (2, sonnet(50), sonnet(50)), (6, None, None)]   # a one-off reset before the 5th reading
+        rows = [row(t0 + timedelta(minutes=15 * (i + 1)), w, reset=R, own=o, other=x) for i, (w, o, x) in enumerate(ws)]
+        spans = [(t0 + timedelta(minutes=20), t0 + timedelta(minutes=25))]   # a run inside 4 -> 10
+        sp = pm.cycle_split(rows, spans, R)
+        self.assertEqual((sp["status"], sp["method"]), ("ok", "pacing"))
+        self.assertEqual((sp["run_pct"], sp["design_pct"], sp["other_pct"]), (6.0, 1.0, 2.0 + 3.0 + 1.0 + 4.0))
+        self.assertEqual(sp["other_unseen_pct"], 3.0 + 4.0)
+        self.assertEqual(sp["total_pct"], 21.0)                         # 15 before the drop + 6 since
+        self.assertEqual(sp["uncovered_pct"], 4.0)                      # 0 -> 4 before the first reading
+        self.assertAlmostEqual(sp["own_share"], 7.0 / 17.0)
+        sp = pm.cycle_split(rows, [], R)                                # no run: 4 -> 10 is a design chat
+        self.assertEqual((sp["run_pct"], sp["design_pct"]), (0.0, 7.0))
+        self.assertAlmostEqual(sp["own_share"], 7.0 / 17.0)                 # still AFClaude's
+        self.assertEqual(pm.cycle_split(rows, None, R)["status"], "insufficient_data")
+        self.assertEqual(pm.cycle_split(rows, [], None)["status"], "insufficient_data")
+
     def test_own_other_tokens(self):
         import usage_sampler
         act = {"own": {"tokens": {"claude-opus-5-5": {"out": 10, "think": 5, "cache_r": 999},
