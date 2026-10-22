@@ -47,6 +47,16 @@ is the only copy, data/session_windows.jsonl is a frozen legacy file). `preferre
 is that estimate once MIN_WINDOWS usable windows exist, else the old median
 (flagged). The old `ratio` fields are unchanged.
 
+One-off resets (docs/usage_split_plan.md §3.5): a meter that drops by >= RESET_DROP points
+while its rounded reset time stays the same was reset outside its schedule (as the owner's
+one-off reset of 21./22.10.2026). reset_events() lists them; a window across one is split into
+segments like a weekly reset (the interval across the drop dropped), the time split restarts its
+running maximum at 0 there (the meter restarts from 0: the reading after the drop is the rise
+since the reset), and the events are recorded in the weekly cycle records (`reset_events`,
+record_reset_events). The snapshot also carries pacing's three-way split of the week
+(`attribution.week_split`: run / design chats / other use, pacing.cycle_split, D-266), which the
+quickview shows as AFClaude vs the owner.
+
 Sparse data is reported honestly: any estimate backed by fewer than
 MIN_PAIRS usable pairs comes back as status "insufficient_data" rather than
 a number.
@@ -236,6 +246,7 @@ MIN_WINDOWS = 5             # usable windows needed before the per-window ratio 
 DIST_MAX = 30               # most recent windows listed in the snapshot's distribution
 WINDOW_RECORD_VERSION = 1
 SESSION_WINDOWS = os.path.join(DATA, "session_windows.jsonl")  # never pruned
+RESET_DROP = 2.0            # a meter this many points below its previous reading, same reset time: a one-off reset
 
 
 def _points(rows):
@@ -256,7 +267,46 @@ def _points(rows):
                     "own": weighted_tokens((act.get("own") or {}).get("tokens")),
                     "other": weighted_tokens((act.get("other") or {}).get("tokens"))})
     pts.sort(key=lambda p: p["t"])
+    _mark_resets(pts)
     return pts
+
+
+def _one_off(prev, cur):
+    """The meters ("weekly", "session") that were reset outside their schedule between two
+    consecutive readings: the meter dropped by >= RESET_DROP while its rounded reset time
+    stayed the same (a scheduled reset moves the reset time)."""
+    out = []
+    if prev["wr"] is not None and prev["wr"] == cur["wr"] and cur["wp"] <= prev["wp"] - RESET_DROP:
+        out.append("weekly")
+    if prev["sr"] is not None and prev["sr"] == cur["sr"] and cur["sp"] <= prev["sp"] - RESET_DROP:
+        out.append("session")
+    return out
+
+
+def _mark_resets(pts):
+    """Number the stretches between one-off resets: each point gets `epoch` (+1 after every
+    reset event) and the point after a drop `resets` (the meters reset before it)."""
+    epoch = 0
+    for prev, cur in zip([None] + pts[:-1], pts):
+        meters = _one_off(prev, cur) if prev else []
+        if meters:
+            epoch += 1
+            cur["resets"] = meters
+        cur["epoch"] = epoch
+
+
+def reset_events(rows):
+    """The one-off resets in sample rows (any order), oldest first: {meter, at (the first reading
+    after the drop), prev_at, resets_at (the meter's rounded reset time, unchanged), from_pct,
+    to_pct}. Stale rows are skipped (their meters are not readings)."""
+    out = []
+    pts = _points(rows)
+    for prev, cur in zip(pts, pts[1:]):
+        for m in cur.get("resets") or ():
+            k = "w" if m == "weekly" else "s"
+            out.append({"meter": m, "at": _iso(cur["t"]), "prev_at": _iso(prev["t"]),
+                        "resets_at": _iso(cur[k + "r"]), "from_pct": prev[k + "p"], "to_pct": cur[k + "p"]})
+    return out
 
 
 def _iso(dt):
@@ -286,43 +336,52 @@ def window_record(key, pts, pre=None):
     deltas are summed. Only the interval between the last old-cycle and the
     first new-cycle sample (one sampling step, its weekly delta unknowable) is
     dropped, and the rounding error counts the extra readings. Excluding such
-    windows outright would throw away up to 5 h of good data per week.
+    windows outright would throw away up to 5 h of good data per week. A one-off
+    reset inside the window (a meter drop with the same reset time, _mark_resets)
+    splits it the same way (flag "one_off_reset_split").
 
     Saturation: once a meter reads 100% it stops tracking (the weekly meter sat
-    at 100 while the session meter still rose), so the window is cut at the
-    last sample before any meter reached 100 (flag "capped")."""
+    at 100 while the session meter still rose), so each segment is cut at the
+    last sample before any meter reached 100 (flag "capped"); a segment after a
+    reset tracks again."""
     start = key - SESSION_LEN
     flags = []
     pts = list(pts)
     base_kind = "first_sample"
-    if (pre and pre["sr"] is None and pre["sp"] == 0 and pts and pre["wr"] == pts[0]["wr"]
+
+    def seg_key(p):
+        return p["wr"], p.get("epoch", 0)
+
+    if (pre and pre["sr"] is None and pre["sp"] == 0 and pts and seg_key(pre) == seg_key(pts[0])
             and pre["t"] > start - SESSION_LEN and pre["t"] <= start + timedelta(minutes=1)):
         pts = [dict(pre, exact_session=True)] + pts
         base_kind = "idle_pre_sample"
     # coverage is judged on what was observed, before any saturation cut
     # (a capped window is cut on purpose, it isn't missing data)
     observed = (pts[-1]["t"] - pts[0]["t"]) if pts else timedelta(0)
-    if pts and len({p["wr"] for p in pts}) > 1:   # minus the dropped straddling interval(s)
+    if pts and len({seg_key(p) for p in pts}) > 1:   # minus the dropped straddling interval(s)
         observed = sum((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)
-                        if pts[i]["wr"] == pts[i + 1]["wr"]), timedelta(0))
-    # cut at saturation
-    cut = None
-    for i, p in enumerate(pts):
-        if p["sp"] >= CAP_PCT or p["wp"] >= CAP_PCT:
-            cut = i
-            break
-    if cut is not None:
-        flags.append("capped")
-        pts = pts[:cut]
-    # segments by weekly cycle
+                        if seg_key(pts[i]) == seg_key(pts[i + 1])), timedelta(0))
+    # segments by weekly cycle and one-off reset
     segs = []
     for p in pts:
-        if segs and segs[-1][-1]["wr"] == p["wr"]:
+        if segs and seg_key(segs[-1][-1]) == seg_key(p):
             segs[-1].append(p)
         else:
             segs.append([p])
-    if len(segs) > 1:
+    if len({p["wr"] for p in pts}) > 1:
         flags.append("weekly_reset_split")
+    if len({p.get("epoch", 0) for p in pts}) > 1:
+        flags.append("one_off_reset_split")
+    # cut each segment at saturation
+    for i, seg in enumerate(segs):
+        cut = next((j for j, p in enumerate(seg) if p["sp"] >= CAP_PCT or p["wp"] >= CAP_PCT), None)
+        if cut is not None:
+            segs[i] = seg[:cut]
+            if "capped" not in flags:
+                flags.append("capped")
+    segs = [seg for seg in segs if seg]
+    pts = [p for seg in segs for p in seg]
     ds = dw = es = ew = 0.0
     var_s = var_w = 0.0
     covered = timedelta(0)
@@ -342,7 +401,11 @@ def window_record(key, pts, pre=None):
         other += sum(p["other"] for p in seg[1:])
         seg_out.append({"first_at": _iso(a["t"]), "last_at": _iso(b["t"]), "weekly_resets_at": _iso(a["wr"]),
                         "d_session": d_s, "d_weekly": d_w})
-    max_gap = max((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)), default=timedelta(0))
+        if a.get("epoch"):
+            seg_out[-1]["reset_epoch"] = a["epoch"]   # the number of one-off resets before it (_mark_resets)
+    # within the segments (an interval across a reset is dropped, and a cut leaves no gap)
+    max_gap = max((seg[i + 1]["t"] - seg[i]["t"] for seg in segs for i in range(len(seg) - 1)),
+                  default=timedelta(0))
     if max_gap > GAP_FLAG:
         flags.append("gap")
     cov_frac = observed / SESSION_LEN
