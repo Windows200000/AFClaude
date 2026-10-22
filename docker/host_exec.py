@@ -169,7 +169,25 @@ def main():
     elif head == "tmux-capture" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "capture-pane", "-e", "-p", "-t", "=" + args[0] + ":"]
     elif head == "tmux-rename" and len(args) == 2 and TMUX.match(args[0]) and TMUX.match(args[1]):
-        cmd = ["tmux", "rename-session", "-t", "=" + args[0], args[1]]
+        old, new = args
+        cmd = ["tmux", "rename-session", "-t", "=" + old, new]
+        log(f"OK {shlex.join(cmd)}")
+        r = subprocess.run(cmd, env=ENV, cwd=ROOT, capture_output=True, text=True)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        # tmux can rename successfully and still exit 1 with "no current client" (no terminal
+        # attached to a forced-command/cron run): verify from tmux's own state, not rc (D-281,
+        # incident 2026-10-22 05:16).
+        renamed = subprocess.run(["tmux", "has-session", "-t", "=" + new], env=ENV, cwd=ROOT,
+                                 capture_output=True).returncode == 0 and \
+            subprocess.run(["tmux", "has-session", "-t", "=" + old], env=ENV, cwd=ROOT,
+                           capture_output=True).returncode != 0
+        if renamed:
+            if r.returncode != 0:
+                log(f"tmux-rename {old} {new}: rc={r.returncode} {r.stderr.strip()[:200]!r} but verified renamed")
+            return 0
+        log(f"tmux-rename {old} {new} FAILED rc={r.returncode}: {r.stderr.strip()[:200]!r}")
+        return r.returncode or 1
     elif head == "proc-snapshot" and not args:
         sys.stdout.write(json.dumps(proc_snapshot()) + "\n")
         log("OK proc-snapshot")
