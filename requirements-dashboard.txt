@@ -1,0 +1,8 @@
+# The dashboard's Python dependencies that are not in the tree through mcp yet
+# (docs/phase6b_plan.md §0, §5 P1). Install into the repo's .venv (Python 3.12):
+#   .venv/bin/pip install --require-hashes -r requirements-dashboard.txt
+# Pinned with hashes; 6a W10's requirements.txt takes these lines over when it is built.
+# fido2 needs cryptography <52 (50.0.1 in the tree through mcp).
+fido2==2.2.1 \
+    --hash=sha256:ed397da981b9ab133da6ead7309e41f924b566b749956129efe286fae097749f \
+    --hash=sha256:85787428a94c3f8eaf72f0ff30afba983b559a1b1b795c93318c81b4ad4062c4
