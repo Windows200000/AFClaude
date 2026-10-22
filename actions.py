@@ -59,6 +59,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, TypeVar
@@ -824,6 +825,11 @@ SETTINGS: dict[str, Setting] = {
                                  "an error that pauses automation (missed start, D-257)", "automation"),
     "runner_runs_retention_days": _num(30, 1, 3650, "Runner: days of run records (runner_runs) kept before the "
                                        "runner's daily prune deletes them", "storage"),
+    # --- backup / restore (phase 5c, docs/phase5c_plan.md; backup.py). Read from the RESTORED database
+    # by install.restored, so it is the value the install had when the backup was made.
+    "restore_starts_paused": _flag(True, "A restored install starts with automation paused (D-173) and the "
+                                   "reason \"restored from a backup of <time>: check and resume\"",
+                                   "storage"),
 }
 RUNNER_TIMEOUT = "runner_timeout_"
 
@@ -994,6 +1000,82 @@ def automation_set_project(conn: sqlite3.Connection, ctx: Ctx, project: Any, pau
             "reason": cur["reason"] if cur else None, "version": cur["version"] if cur else 0,
             "updated_at": cur["updated_at"] if cur else None, "updated_by": cur["updated_by"] if cur else None}
     return Result(view, pr["id"], old, new if cur is not None else old)
+
+
+# ---------------------------------------------------------------- installation identity (phase 5c)
+
+RESTORE_SOURCE_KEYS = ("install_id", "install_epoch", "created_at", "app_version", "schema_version",
+                       "bundle_sha256", "kind")
+
+
+def install_epoch(conn: sqlite3.Connection) -> int:
+    """meta.install_epoch (absent = 0): bumped by every restore (install.restored), so the bundles
+    and processes of the install before it can be told apart from the one after it."""
+    raw = store.get_meta(conn, "install_epoch")
+    if raw is None:
+        return 0
+    if not raw.isdigit():
+        raise ValueError(f"meta.install_epoch is not a non-negative integer: {raw!r}")
+    return int(raw)
+
+
+def _restore_source(source: Any) -> dict[str, Any]:
+    """The bundle a restore came from (backup.py's manifest summary): exactly RESTORE_SOURCE_KEYS."""
+    if not isinstance(source, dict) or set(source) != set(RESTORE_SOURCE_KEYS):
+        raise ValueError(f"source must be an object with exactly {', '.join(RESTORE_SOURCE_KEYS)}")
+    for k in ("install_id", "created_at", "bundle_sha256", "kind"):
+        if not isinstance(source[k], str) or not source[k] or len(source[k]) > 200:
+            raise ValueError(f"source.{k} must be a non-empty string")
+    for k in ("install_epoch", "schema_version"):
+        if isinstance(source[k], bool) or not isinstance(source[k], int) or source[k] < 0:
+            raise ValueError(f"source.{k} must be a non-negative integer")
+    if source["app_version"] is not None and not isinstance(source["app_version"], str):
+        raise ValueError("source.app_version must be a string or null")
+    return dict(source)
+
+
+@action("install.stamp", "install", owner_only=True)
+def install_stamp(conn: sqlite3.Connection, ctx: Ctx) -> Result:
+    """Give a database that predates the install marker its meta.install_id (store.init stamps one
+    only on a brand-new database; backup.py refuses to bundle a database without one). A one-off:
+    a database that already has an id is a ValueError, never re-stamped. -> {install_id}."""
+    have = store.get_meta(conn, "install_id")
+    if have is not None:
+        raise ValueError(f"this database already has install_id {have}: nothing to stamp")
+    iid = uuid.uuid4().hex
+    store.set_meta(conn, "install_id", iid)
+    store.set_meta(conn, "install_stamped_at", store.now_iso())
+    return Result({"install_id": iid}, iid, {"install_id": None}, {"install_id": iid})
+
+
+@action("install.restored", "install", owner_only=True)
+def install_restored(conn: sqlite3.Connection, ctx: Ctx, source: Any) -> Result:
+    """Mark this (just restored) database as a restore of `source` (backup.py restore, design
+    §11.3): install_epoch + 1, meta.restored_from / restored_at, and, when restore_starts_paused
+    is on (D-173, read from this database), automation paused with the reason "restored from a
+    backup of <time>: check and resume" (a pause the backup already carried is kept in the reason).
+    -> {install_id, install_epoch, restored_from, paused, reason}."""
+    src = _restore_source(source)
+    iid = store.get_meta(conn, "install_id")
+    if iid != src["install_id"]:
+        raise ValueError(f"the database's install_id {iid} is not the bundle's {src['install_id']}")
+    old_epoch = install_epoch(conn)
+    epoch = max(old_epoch, src["install_epoch"]) + 1
+    old_from = store.get_meta(conn, "restored_from")
+    store.set_meta(conn, "install_epoch", epoch)
+    store.set_meta(conn, "restored_from", json.dumps(src, sort_keys=True))
+    store.set_meta(conn, "restored_at", store.now_iso())
+    paused = _bool(get_setting(conn, "automation_paused"))
+    reason: str | None = get_setting(conn, "automation_paused_reason") or None
+    if _bool(get_setting(conn, "restore_starts_paused")):
+        why = f"restored from a backup of {src['created_at']}: check and resume (D-173)"
+        if paused and reason:
+            why = f"{why}; paused at backup time: {reason}"
+        reason = automation_set(conn, ctx, True, why[:REASON_MAX]).result["reason"]
+        paused = True
+    out = {"install_id": iid, "install_epoch": epoch, "restored_from": src, "paused": paused, "reason": reason}
+    return Result(out, iid, {"install_epoch": old_epoch, "restored_from": old_from},
+                  {"install_epoch": epoch, "restored_from": src, "paused": paused})
 
 
 def _fresh_group(days: Mapping[str, Any]) -> str:

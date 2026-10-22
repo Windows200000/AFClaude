@@ -33,6 +33,7 @@ Binding inputs: D-161 (everything in the DB; a backup and a move give a clean, c
 ## 2. Measurements (22.10., read-only consistent copy of the live DB)
 
 - Backup API copy: **0.16 s, 49.0 MB** (11,960 pages of 4 KB, 26 free); `integrity_check` ok in 0.23 s; gzip -6: **10.3 MB** in 1.0 s. 50 tables; `app_log` 79k rows (mostly the 13.10. import).
+- B1 on a copy of that snapshot (after `stamp`): `create` 4.6 s (snapshot, VACUUM, gzip, its own verify) → a **9.6 MB** bundle; `verify` 0.7 s; `restore` 1.8 s.
 - Write rate (last 7 days): ~250–750 `app_log`, ~100–480 `audit_log`, 96 samples and 96 Haiku judgements per day, i.e. on the order of 1,000 write transactions a day. At a few changed 4-KB pages each that is roughly 5–25 MB of WAL a day before Litestream's compression and compaction, so the 7-day archive should be the DB snapshot plus well under 200 MB, in line with design §11.1. B4 measures it on the live system.
 
 ## 3. Design details
