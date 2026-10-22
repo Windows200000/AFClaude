@@ -292,13 +292,16 @@ def family_winner(conn, members):
 
 # ---------------------------------------------------------------- helpers
 
-def tmux_alive(name):
-    return host.run_on_host(["tmux", "has-session", "-t", "=" + name], timeout=30).returncode == 0
-
-
 def kill_tmux(name):
+    """tmux kill-session `name` on the host -> (rc, stderr) of the kill. tmux can kill the session
+    and still exit 1 with "no current client" (no terminal attached, as in the rename incident
+    2026-10-22 05:16), so rc decides nothing: success is the session being gone (ka.tmux_has).
+    Still there, or the has-session check fails: raises (D-235)."""
     r = host.run_on_host(["tmux", "kill-session", "-t", "=" + name], timeout=30)
-    return r.returncode, (r.stderr or "").strip()
+    err = (r.stderr or "").strip()
+    if ka.tmux_has(name):
+        raise RuntimeError(f"tmux kill-session {name} failed, the session still runs: rc={r.returncode} {err[:200]}")
+    return r.returncode, err
 
 
 def is_afclaude_cwd(cwd):
@@ -542,7 +545,7 @@ class Pass:
 
     def cleanup_one(self, sid, s, name, never, excluded):
         """cleanup() for one tracked session; a host call that fails raises."""
-        if not tmux_alive(name):
+        if not ka.tmux_has(name):
             s["status"] = "ended"
             s["ended_at"] = store.iso(self.now)
             self.end_row(sid, name)
@@ -588,15 +591,13 @@ class Pass:
         if not self.arm:
             log(f"WOULD KILL (dry-run) tmux {name}: {why}")
             return
-        rc, err = kill_tmux(name)
-        log(f"CLEANUP killed tmux {name} ({why}) rc={rc}{' ' + err if err else ''}")
-        if rc == 0:
-            s["status"] = "cleaned"
-            s["cleaned_at"] = store.iso(self.now)
-            s["cleaned_why"] = why
-            self.end_row(sid, name)
-        else:
-            raise RuntimeError(f"tmux kill-session rc={rc}: {err}")
+        rc, err = kill_tmux(name)        # raises unless the session is gone
+        log(f"CLEANUP killed tmux {name} ({why})"
+            + (f" rc={rc} {err[:200]!r} but verified gone" if rc != 0 else ""))
+        s["status"] = "cleaned"
+        s["cleaned_at"] = store.iso(self.now)
+        s["cleaned_why"] = why
+        self.end_row(sid, name)
 
     def end_row(self, sid, name):
         """The session's tmux session `name` is gone: its stall / review / request row ends (the

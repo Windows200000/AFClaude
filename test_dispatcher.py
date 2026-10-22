@@ -89,12 +89,18 @@ case "$*" in *agents*) echo '[]';; esac
 exit 0
 """
 STUB_TMUX = """#!/bin/sh
-# alive.txt holds the names of the fake tmux sessions that exist
+# alive.txt holds the names of the fake tmux sessions that exist; a name in alive.txt.stuck
+# survives kill-session (exit 1), one in alive.txt.nocli is killed but tmux still exits 1 with
+# "no current client" (as rename-session did in the 2026-10-22 05:16 incident)
 echo "$@" >> {calls}
 name=$(echo "$3" | sed 's/^=//')
 case "$1" in
   has-session) grep -qx "$name" {alive} 2>/dev/null; exit $?;;
-  kill-session) grep -vx "$name" {alive} > {alive}.tmp; mv {alive}.tmp {alive}; exit 0;;
+  kill-session)
+    if grep -qx "$name" {alive}.stuck 2>/dev/null; then echo "can't kill $name" >&2; exit 1; fi
+    grep -vx "$name" {alive} > {alive}.tmp; mv {alive}.tmp {alive}
+    if grep -qx "$name" {alive}.nocli 2>/dev/null; then echo "no current client" >&2; exit 1; fi
+    exit 0;;
 esac
 exit 1
 """
@@ -665,15 +671,27 @@ class FailStop(Base):
     def test_a_failed_clean_up_pauses_and_the_others_go_on(self):
         self.track(sid(1)); self.idle(sid(1), 180)
         self.track(sid(2)); self.idle(sid(2), 180)
-        real = dp.kill_tmux
-        dp.kill_tmux = lambda name: (1, "no server") if name == tname(sid(1)) else real(name)
-        try:
-            self.run_pass()
-        finally:
-            dp.kill_tmux = real
-        self.assertEqual(self.killed(), [tname(sid(2))])
+        with open(self.alive + ".stuck", "w") as fh:                 # sid(1)'s session survives the kill
+            fh.write(tname(sid(1)) + "\n")
+        self.run_pass()
+        self.assertEqual(self.killed(), [tname(sid(1)), tname(sid(2))])
         self.assertEqual(self.st["sessions"][sid(1)]["status"], "running")
+        self.assertEqual(self.st["sessions"][sid(2)]["status"], "cleaned")
+        self.assertIsNone(store.get_driven_session(self.conn, sid(1))["ended_at"])
         self.assertIn(f"dispatcher clean-up of {tname(sid(1))} failed: RuntimeError", self.paused()["reason"])
+
+    def test_a_kill_with_rc_1_no_current_client_is_a_success(self):
+        # tmux killed it but exited 1 "no current client": judged by has-session, not rc
+        self.track(sid(1)); self.idle(sid(1), 180)
+        with open(self.alive + ".nocli", "w") as fh:
+            fh.write(tname(sid(1)) + "\n")
+        self.run_pass()
+        self.assertEqual(self.killed(), [tname(sid(1))])
+        self.assertEqual(self.st["sessions"][sid(1)]["status"], "cleaned")
+        self.assertIsNotNone(store.get_driven_session(self.conn, sid(1))["ended_at"])
+        self.assertEqual(self.alerts, [])
+        self.assertFalse(self.paused()["paused"])
+        self.assertTrue(any("no current client" in x and "verified gone" in x for x in self.logs), self.logs)
 
     def test_host_process_list_unavailable_stops_the_pass(self):
         import failstop
@@ -904,6 +922,37 @@ class Holders(Base):
         rep = self.run_pass(arm=False, take_over_idle=True)          # dry-run: no SIGTERM to a fake pid
         self.assertEqual([(c["sid"], c["plan"]) for c in rep["continue"]], [(sid(1), "take-over:200")])
         self.assertEqual(self.resume_calls(), [])
+
+
+class KillTmux(unittest.TestCase):
+    """kill_tmux judges by tmux's state (has-session), never by kill-session's rc."""
+    def run_kill(self, kill_rc, kill_err, has_rc):
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append(argv[1])
+            rc, err = (kill_rc, kill_err) if argv[1] == "kill-session" else (has_rc, "")
+            return subprocess.CompletedProcess(argv, rc, "", err)
+        with mock.patch.object(dp.host, "run_on_host", side_effect=fake):
+            try:
+                return dp.kill_tmux("afc-t-00000001")
+            finally:
+                self.assertEqual(calls, ["kill-session", "has-session"])
+
+    def test_rc_1_no_current_client_but_gone_is_a_success(self):
+        self.assertEqual(self.run_kill(1, "no current client\n", 1), (1, "no current client"))
+
+    def test_rc_0_and_gone_is_a_success(self):
+        self.assertEqual(self.run_kill(0, "", 1), (0, ""))
+
+    def test_still_running_after_the_kill_raises(self):
+        for kill_rc in (0, 1):
+            with self.assertRaisesRegex(RuntimeError, "still runs: rc=%d" % kill_rc):
+                self.run_kill(kill_rc, "", 0)
+
+    def test_a_failed_has_session_check_raises(self):
+        with self.assertRaisesRegex(OSError, "has-session afc-t-00000001 failed rc=255"):
+            self.run_kill(1, "no current client", 255)
 
 
 class Store(unittest.TestCase):
