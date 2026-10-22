@@ -15,8 +15,11 @@ serves at /afclaude/:
                 phase with its cumulative ETA from stage_eta.py, D-213, which also
                 logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
-                decision, needs-your-input (OPEN_QUESTIONS.md + task-store
-                inbox), the owner's message box to the task-manager (counts only:
+                decision, the newest progress log entries (the progress doc's appends
+                in the DB, progress_log), needs-your-input (OPEN_QUESTIONS.md, each item
+                one markdown string, + task-store inbox), page_version (the published
+                page's stamp: a page that doesn't match is an old copy and says so),
+                the owner's message box to the task-manager (counts only:
                 the page reads the messages from the inbox API, D-241), AFClaude cron entries, the task-manager's context (D-237:
                 size, cache expiry, the next re-read's cost, per owner message re-read
                 yes/no and est. cost without its text, a daily split; the compaction
@@ -36,6 +39,7 @@ Also publishes the page itself (quickview/AFClaude.html -> AFClaude.html, D-253)
 Run from cron every few minutes (via flock); each file is replaced atomically.
 """
 import glob
+import hashlib
 import json
 import os
 import re
@@ -167,13 +171,28 @@ def write_atomic(name, data):
     os.replace(tmp, path)
 
 
-def publish_page():
-    """D-253: copy the page to OUT/AFClaude.html, so ovm3 proxies the current page instead of a copy
-    made by hand. A page that can't be read raises (the export fails, never publishes without it)."""
+# Stamped into the published page (its version: the source's sha256, 12 hex): status.json carries the
+# same version, so a copy that isn't the current page (e.g. served from elsewhere instead of proxied,
+# D-253) shows a banner instead of rendering new data with old code.
+PAGE_VERSION_MARK = "__AFC_PAGE_VERSION__"
+
+
+def read_page():
+    """D-253: (page text with its version stamped in, version). A page that can't be read or has no
+    stamp raises (the export fails, never publishes without it)."""
     with open(PAGE, encoding="utf-8") as fh:
         page = fh.read()
-    if "status.json" not in page:
-        raise ValueError(f"{PAGE} does not look like the quickview page (no status.json in it)")
+    if "status.json" not in page or PAGE_VERSION_MARK not in page:
+        raise ValueError(f"{PAGE} does not look like the quickview page (no status.json or version mark in it)")
+    version = hashlib.sha256(page.encode("utf-8")).hexdigest()[:12]
+    return page.replace(PAGE_VERSION_MARK, version), version
+
+
+def publish_page(page=None):
+    """D-253: write the (stamped) page to OUT/AFClaude.html, so ovm3 proxies the current page instead
+    of a copy made by hand."""
+    if page is None:
+        page = read_page()[0]
     write_atomic("AFClaude.html", page)
 
 
@@ -374,15 +393,16 @@ def _open_question_warning(lines):
     return None
 
 
+def _open_question_md(lines):
+    """One open question as one markdown string (D-279: in full); a warning goes into the text."""
+    text = _open_question_text(lines)
+    warning = _open_question_warning(lines)
+    return text + "\n\n**⚠ " + warning + "**" if warning else text
+
+
 def needs_input():
     oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
-    open_questions = []
-    for lines in _split_open_questions(oq_md):
-        q = {"text": _open_question_text(lines)}
-        warning = _open_question_warning(lines)
-        if warning:
-            q["warning"] = warning
-        open_questions.append(q)
+    open_questions = [_open_question_md(lines) for lines in _split_open_questions(oq_md)]
     try:
         conn = store.connect()
         import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
@@ -401,6 +421,40 @@ def needs_input():
             "error": err,
             # user rule 29.09.: only real questions + blocked tasks; stalled sessions are not shown here
             "count": len(open_questions) + len(blocked)}
+
+
+PROGRESS_ENTRIES = 8   # the newest progress log entries the page shows
+PROGRESS_ENTRY_CHARS = 300   # D-082: short lines; the full log is the PROGRESS.md doc
+
+
+def progress_log():
+    """The newest appends to this project's progress doc in the DB (where `tasks.py doc append
+    progress` and the runners write), newest first: at_berlin, by, text (the first line, cut short).
+    A display path: a DB error is shown on the page, never raised."""
+    try:
+        conn = store.connect()
+        try:
+            p = store.get_project(conn, HERE)
+            d = store.get_doc(conn, p["id"], "progress") if p is not None else None
+            rows = store.doc_entries(conn, d["id"], 4 * PROGRESS_ENTRIES) if d is not None else []
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001 - shown on the page, never breaks the export
+        return {"entries": [], "error": f"{type(e).__name__}: {str(e)[:300]}"}
+    out = []
+    for r in reversed(rows):
+        if r["op"] != "append":
+            continue   # a replace rewrites the whole doc: not a log entry
+        lines = [l.strip() for l in r["body"].splitlines() if l.strip()]
+        if not lines:
+            continue
+        text = re.sub(r"^-\s+", "", lines[0])
+        if len(lines) > 1 or len(text) > PROGRESS_ENTRY_CHARS:
+            text = text[:PROGRESS_ENTRY_CHARS].rstrip() + " …"
+        out.append({"at_berlin": bstr(ka.parse_ts(r["ts"])), "by": r["author"], "text": text})
+        if len(out) == PROGRESS_ENTRIES:
+            break
+    return {"entries": out, "error": None}
 
 
 def inbox_block():
@@ -957,6 +1011,7 @@ def main():
         "remote_control": remote_control_block(),
         "keepalive": keepalive_and_usage(now),
         "context": context_block(now),
+        "progress_log": progress_log(),
         "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
         "stages": stages(ka.read_usage_cache(), now),
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
@@ -967,8 +1022,9 @@ def main():
         "docs": docs,
         "prompts": prompts,
     }
+    page, status["page_version"] = read_page()
     write_atomic("status.json", json.dumps(status, indent=1, ensure_ascii=False, default=str))
-    publish_page()   # after the data, so a page that reads a new field finds it
+    publish_page(page)   # after the data, so a page that reads a new field finds it
 
 
 if __name__ == "__main__":

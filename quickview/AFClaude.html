@@ -37,6 +37,10 @@ section h2 { font-size: 19px; margin-bottom: 12px; display: flex; align-items: c
 .goals .done .t { color: #9ca3af; text-decoration: line-through; }
 .goals .cur .t { color: #fff; font-weight: 600; }
 .goals .blocked .t { color: #f59e0b; }
+.plog { list-style: none; margin-bottom: 10px; }
+.plog li { padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.06); overflow-wrap: anywhere; }
+.plog li:last-child { border-bottom: none; }
+.plog .when { color: #9ca3af; font-size: 12px; margin-right: 6px; }
 .tick { width: 1.2em; }
 .tag { font-size: 11px; background: #7e22ce; color: #fff; border-radius: 4px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
@@ -155,6 +159,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   </header>
   <div id="error" class="err" hidden></div>
   <div id="budget-error" class="err" hidden></div>
+  <div id="page-stale" class="err" hidden></div>
   <section id="paused" class="paused" hidden aria-live="polite">
     <h2 id="paused-title">Automation is PAUSED</h2>
     <div id="paused-install">
@@ -199,6 +204,9 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   <section>
     <h2>Progress</h2>
     <div id="phases" class="phases"></div>
+    <h3 class="sub">Latest log entries</h3>
+    <ul id="plog" class="plog"></ul>
+    <h3 class="sub">Goals</h3>
     <ol id="goals" class="goals"></ol>
   </section>
 
@@ -227,6 +235,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
 (function () {
   "use strict";
   var BASE = "/private/AFClaude-data/";
+  var PAGE_VERSION = "__AFC_PAGE_VERSION__";   // stamped by the export (read_page); status.json has the current one
   var $ = function (id) { return document.getElementById(id); };
 
   function esc(s) {
@@ -424,6 +433,25 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     }).join("") || '<li class="mut">No goals found in GOALS.md.</li>';
   }
 
+  // the newest appends to the progress doc (tasks.py doc append progress, the runners' notes), newest first
+  function renderProgressLog(s) {
+    var p = s.progress_log || {};
+    $("plog").innerHTML = (p.error ? '<li class="bad">Progress log: ' + esc(p.error) + "</li>" : "") +
+      ((p.entries || []).map(function (e) {
+        return '<li><span class="when">' + esc(e.at_berlin || "?") + (e.by ? " · " + esc(e.by) : "") + "</span>" +
+          esc(e.text) + "</li>";
+      }).join("") || (p.error ? "" : '<li class="mut">No progress entries yet.</li>'));
+  }
+
+  // a page whose stamp isn't the export's current one is an old copy (served from somewhere other
+  // than the export, D-253, or a tab that was never reloaded): say so instead of rendering quietly
+  function renderPageVersion(s) {
+    var stale = !!s.page_version && s.page_version !== PAGE_VERSION;
+    $("page-stale").hidden = !stale;
+    $("page-stale").textContent = stale ? "This page is an old copy (version " + PAGE_VERSION + ", current " +
+      s.page_version + "). Reload it; if this stays, the website serves its own copy instead of proxying the export's page." : "";
+  }
+
   var ST_ICON = { "done": '<span class="ok">✓</span>', "in_progress": '<span class="warn">◐</span>',
     "pending": "○", "blocked": '<span class="bad">✗</span>', "cancelled": "–" };
   var ST_TEXT = { "done": "done", "in_progress": "in progress", "pending": "pending", "blocked": "blocked", "cancelled": "cancelled" };
@@ -570,9 +598,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   function renderInput(s) {
     var n = s.needs_input || {}, out = [];
     (n.open_questions || []).forEach(function (q) {
-      var text = (q && typeof q === "object") ? q.text : q;
-      var warn = (q && q.warning) ? '<div class="warn">⚠ ' + esc(q.warning) + "</div>" : "";
-      out.push('<div class="item">' + md(text) + warn + "</div>");
+      out.push('<div class="item">' + md(q) + "</div>");   // one markdown string per question, in full (D-279)
     });
     (n.blocked_tasks || []).forEach(function (t) {
       out.push('<div class="item"><div class="src">blocked task' + (t.project ? " · " + esc(t.project) : "") +
@@ -737,7 +763,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
       $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
       $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
-      renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
+      renderPageVersion(s); renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderProgressLog(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
       docList($("docs"), s.docs, "title");
       docList($("prompts"), s.prompts, "name");
     }).catch(function (e) {

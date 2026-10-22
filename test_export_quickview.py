@@ -117,9 +117,10 @@ class OpenQuestions(unittest.TestCase):
                 out = qv.needs_input()
                 self.assertEqual(len(out["open_questions"]), 1)
                 q = out["open_questions"][0]
-                self.assertIn("question one?", q["text"])
-                self.assertIn("question two?", q["text"])
-                self.assertNotIn("warning", q)
+                self.assertIsInstance(q, str)
+                self.assertIn("question one?", q)
+                self.assertIn("question two?", q)
+                self.assertNotIn("⚠", q)
                 self.assertEqual(out["count"], 1)
             finally:
                 qv.HERE = old_here
@@ -133,9 +134,42 @@ class OpenQuestions(unittest.TestCase):
                     fh.write("- See docs/phase3b_plan.md for details.\n")
                 out = qv.needs_input()
                 self.assertEqual(len(out["open_questions"]), 1)
-                self.assertIn("warning", out["open_questions"][0])
+                self.assertIn("⚠ points mainly to a file", out["open_questions"][0])
             finally:
                 qv.HERE = old_here
+
+    def test_bold_title_items_are_whole_strings(self):
+        """The '[object Object]' report: every item is one markdown string (a page that renders the
+        item as text shows it), with its bold title, text and options in full."""
+        long = "word " * 120
+        md = ("# Open questions\n\n"
+              "- **Decision list, what each line shows (phase 4b):** " + long + "(a) the title only; "
+              "(b) the title plus the rule; (c) the rule only. Recommended: (b).\n"
+              "- **A second way in (phase 6b)** You can add a code. (a) yes; (b) no. Recommended: (a).\n")
+        with tempfile.TemporaryDirectory() as d:
+            old_here = qv.HERE
+            qv.HERE = d
+            try:
+                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
+                    fh.write(md)
+                out = qv.needs_input()
+            finally:
+                qv.HERE = old_here
+        qs = out["open_questions"]
+        self.assertEqual(len(qs), 2)
+        self.assertTrue(all(isinstance(q, str) for q in qs))
+        self.assertEqual(qs[0], "**Decision list, what each line shows (phase 4b):** " + long +
+                         "(a) the title only; (b) the title plus the rule; (c) the rule only. Recommended: (b).")
+        self.assertIn("**A second way in (phase 6b)** You can add a code.", qs[1])
+        self.assertTrue(qs[1].endswith("Recommended: (a)."))
+        json.dumps(out)   # what status.json carries
+
+    def test_page_renders_each_question_as_markdown_text(self):
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        body = page[page.index("function renderInput(s)"):page.index("(n.blocked_tasks")]
+        self.assertIn("md(q)", body)
+        self.assertNotIn(".text", body)
 
 
 class DocsFromTheDb(unittest.TestCase):
@@ -164,6 +198,63 @@ class DocsFromTheDb(unittest.TestCase):
                 self.assertEqual(qv.doc_source("README.md", os.path.join(d, "README.md")), (None, None))
             finally:
                 qv.HERE = old_here
+
+
+class ProgressLog(unittest.TestCase):
+    """The page shows the newest progress entries (the doc's appends in the DB, where `tasks.py doc
+    append progress` and the runners write), newest first, short; not an old Status line."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        old = qv.HERE
+        self.addCleanup(lambda: setattr(qv, "HERE", old))
+        qv.HERE = self.tmp.name
+        testenv.notes_project(self.tmp.name)
+        self.project = "notes-" + os.path.basename(self.tmp.name)
+
+    def _do(self, name, text, actor="cli"):
+        conn = store.connect()
+        try:
+            actions.perform(conn, name, {"project": self.project, "name": "progress", "text": text},
+                            actor=actor, via="cli")
+        finally:
+            conn.close()
+
+    def test_no_doc_yet(self):
+        self.assertEqual(qv.progress_log(), {"entries": [], "error": None})
+
+    def test_newest_first_short_and_only_appends(self):
+        self._do("doc.set", "# log\n\n## Status 01.10. old resume point\n")
+        for i in range(qv.PROGRESS_ENTRIES + 2):
+            self._do("doc.append", f"- 10:{i:02d} step {i}\n")
+        self._do("doc.append", "- 11:00 " + "x" * 400 + "\n")
+        self._do("doc.append", "- 11:05 [keepalive.py] a note\n  with a second line\n", actor="runner:keepalive")
+        out = qv.progress_log()
+        self.assertIsNone(out["error"])
+        es = out["entries"]
+        self.assertEqual(len(es), qv.PROGRESS_ENTRIES)
+        self.assertEqual(es[0]["text"], "11:05 [keepalive.py] a note …")
+        self.assertEqual(es[0]["by"], "runner:keepalive")
+        self.assertTrue(es[1]["text"].startswith("11:00 xxx") and es[1]["text"].endswith(" …"))
+        self.assertLessEqual(len(es[1]["text"]), qv.PROGRESS_ENTRY_CHARS + 2)
+        self.assertEqual(es[2]["text"], f"10:{qv.PROGRESS_ENTRIES + 1:02d} step {qv.PROGRESS_ENTRIES + 1}")
+        self.assertEqual(es[2]["by"], "cli")
+        self.assertIsNotNone(es[2]["at_berlin"])
+        self.assertFalse(any("Status" in e["text"] for e in es))
+
+    def test_db_error_is_shown_not_raised(self):
+        from unittest import mock
+        with mock.patch.object(qv.store, "connect", side_effect=RuntimeError("db locked")):
+            out = qv.progress_log()
+        self.assertEqual(out["entries"], [])
+        self.assertIn("db locked", out["error"])
+
+    def test_page_renders_the_log_in_the_progress_section(self):
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        sec = page[page.index("<h2>Progress</h2>"):]
+        self.assertLess(sec.index('id="plog"'), sec.index('id="goals"'))
+        self.assertIn("renderProgressLog(s);", page[page.index("function load()"):])
 
 
 class PreviewMarker(unittest.TestCase):
@@ -795,8 +886,13 @@ class PublishPage(unittest.TestCase):
             fh.write("old page")
         qv.publish_page()
         out = os.path.join(self.tmp.name, "AFClaude.html")
+        stamped, version = qv.read_page()
         with open(PAGE_FILE, encoding="utf-8") as a, open(out, encoding="utf-8") as b:
-            self.assertEqual(a.read(), b.read())
+            src, pub = a.read(), b.read()
+        self.assertEqual(pub, stamped)
+        self.assertEqual(pub, src.replace(qv.PAGE_VERSION_MARK, version))
+        self.assertNotIn(qv.PAGE_VERSION_MARK, pub)
+        self.assertIn('var PAGE_VERSION = "' + version + '"', pub)
         self.assertEqual(os.stat(out).st_mode & 0o777, 0o644)
         self.assertEqual([f for f in os.listdir(self.tmp.name) if f.startswith(".tmp-")], [])
 
@@ -811,6 +907,10 @@ class PublishPage(unittest.TestCase):
         open(qv.PAGE, "w").close()
         with self.assertRaises(ValueError):
             qv.publish_page()
+        with open(qv.PAGE, "w") as fh:
+            fh.write("<script>get('status.json')</script>")   # no version mark: can't say it's current
+        with self.assertRaises(ValueError):
+            qv.publish_page()
         with open(out) as fh:
             self.assertEqual(fh.read(), "old page")
 
@@ -820,7 +920,8 @@ class PublishPage(unittest.TestCase):
         written = []
         real = qv.write_atomic
         blocks = {n: mock.DEFAULT for n in ("automation_block", "keepalive_and_usage", "context_block", "parse_goals",
-                                             "stages", "latest_decision", "needs_input", "inbox_block", "cron_entries")}
+                                             "stages", "latest_decision", "needs_input", "inbox_block", "cron_entries",
+                                             "progress_log")}
         with mock.patch.multiple(qv, all_docs=lambda: [], doc_source=lambda n, s: ("", None), **blocks), \
                 mock.patch.object(qv.ka, "read_usage_cache", return_value=None), \
                 mock.patch.object(qv.glob, "glob", return_value=[]), \
@@ -829,7 +930,18 @@ class PublishPage(unittest.TestCase):
                 getattr(qv, n).return_value = {}
             qv.main()
         self.assertEqual(written, ["status.json", "AFClaude.html"])
+        with open(os.path.join(self.tmp.name, "status.json")) as a, \
+                open(os.path.join(self.tmp.name, "AFClaude.html"), encoding="utf-8") as b:
+            version = json.load(a)["page_version"]
+            self.assertIn('var PAGE_VERSION = "' + version + '"', b.read())   # the page and the data agree
         self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "AFClaude.html")))
+
+    def test_page_flags_an_old_copy(self):
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        self.assertIn('var PAGE_VERSION = "' + qv.PAGE_VERSION_MARK + '"', page)
+        self.assertIn("s.page_version !== PAGE_VERSION", page)
+        self.assertIn("renderPageVersion(s);", page[page.index("function load()"):])
 
     def test_nginx_serves_html_as_html(self):
         with open(os.path.join(os.path.dirname(PAGE_FILE), "nginx.conf"), encoding="utf-8") as fh:
