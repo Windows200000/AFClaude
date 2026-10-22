@@ -6,3 +6,10 @@
 fido2==2.2.1 \
     --hash=sha256:ed397da981b9ab133da6ead7309e41f924b566b749956129efe286fae097749f \
     --hash=sha256:85787428a94c3f8eaf72f0ff30afba983b559a1b1b795c93318c81b4ad4062c4
+
+# 6b P5 (docs/phase6b_plan.md §0, §3.6): OIDC login (dashboard/auth/oidc.py). Both pure Python,
+# both need only cryptography (>=45.0.1).
+authlib==1.9.1 \
+    --hash=sha256:8b9be8b1e5174dcbf5520e984f1a22dc2edae5b6e40a61d4cedbf86b97e9e69b
+joserfc==1.7.7 \
+    --hash=sha256:06979cfbab78bc802f14c0358f32969826cc26720e13cb38926ffdc86bc0cb2c
