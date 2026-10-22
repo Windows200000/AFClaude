@@ -365,7 +365,15 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     } else if (th.error) {
       out.push(tile("Reserve threshold", "–", '<div class="mut">' + esc(th.error) + "</div>"));
     }
-    if (lim.share_status === "ok" && lim.share_method === "time") {
+    if (lim.share_status === "ok" && lim.share_method === "pacing") {
+      out.push(tile("AFClaude vs you (week)",
+        Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",
+        '<div class="mut">AFClaude: runs ' + lim.run_pct_week + " + design chats " + lim.design_pct_week +
+          " pts / you: other use " + lim.other_pct_week + " pts (of " + lim.total_pct_week + " pts this week" +
+          (lim.uncovered_pct_week ? ", " + lim.uncovered_pct_week + " pts not covered by samples" : "") + ")</div>" +
+        (lim.other_unseen_pct_week ? '<div class="mut">' + lim.other_unseen_pct_week +
+          " pts with no tokens on this host (other devices / claude.ai)</div>" : "")));
+    } else if (lim.share_status === "ok" && lim.share_method === "time") {
       out.push(tile("AFClaude runs vs you (week)",
         Math.round(lim.own_share_week * 100) + "% / " + Math.round(lim.user_share_week * 100) + "%",
         '<div class="mut">weekly % used during AFClaude’s autonomous runs (' + lim.own_pct_week + " pts, " +
