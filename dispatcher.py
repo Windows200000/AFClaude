@@ -606,8 +606,8 @@ class Pass:
                 or row["kind"] not in ("stall", "review", "request"):
             return
         import actions
-        actions.perform(self.conn, "driven.name", {"session_id": sid, "ended": True}, actor="dispatcher",
-                        via="runner")
+        actions.perform(self.conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
+                        actor="dispatcher", via="runner")
 
     def run(self):
         # the install-wide pause only: the stalled sessions it continues are no AFClaude project's

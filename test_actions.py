@@ -1080,8 +1080,6 @@ class EveryAction(Base):
             ("inbox.retry", {"message_id": 3}),
             ("decision.import", {"path": src.name}),
             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
-            ("driven.name", {"session_id": "00000000-0000-4000-8000-0000000000d1", "tmux": "afc-review",
-                             "kind": "review"}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):

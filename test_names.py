@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Readable tmux names (phase 3b S2, D-147): names.py (pure), the driven.name action, and the
+"""Readable tmux names (phase 3b S2, D-147): names.py (pure), driven.set as S2 uses it, and the
 keep-alive's lookup / claim / one-time rename (D-281) against a temp DB and a fake tmux."""
 import os
 import sys
@@ -82,63 +82,47 @@ class Base(unittest.TestCase):
         self.addCleanup(self.conn.close)
 
     def do(self, actor="keepalive", via="runner", **params):
-        return actions.perform(self.conn, "driven.name", params, actor=actor, via=via)
+        return actions.perform(self.conn, "driven.set", params, actor=actor, via=via)
 
     def row(self, sid):
         return store.get_driven_session(self.conn, sid)
 
+    def project(self, name="P"):
+        return int(store.add_project(self.conn, name)["id"])
 
-class DrivenName(Base):
-    """driven.name: S2's writer of the stored names (audited; S1's driven.set replaces it)."""
-    def test_new_row_rename_end_and_reopen(self):
-        r = self.do(session_id=SID, tmux="afc-review", kind="review")
-        self.assertEqual((r["kind"], r["tmux"], r["ended_at"]), ("review", "afc-review", None))
-        self.do(session_id=SID, tmux="afc-review-2")
-        self.do(session_id=SID, ended=True)
+
+class DrivenSetForS2(Base):
+    """driven.set (3b S1) as S2's launchers use it: a stored name, ended, and live again (`live`)."""
+    def test_end_and_live_again(self):
+        self.do(session_id=SID, tmux="afc-review", kind="review")
+        self.do(session_id=SID, ended_at="2026-10-21T10:00:00Z")
         self.assertIsNotNone(self.row(SID)["ended_at"])
-        self.do(session_id=SID, ended=False)
+        self.do(session_id=SID, live=True)
         self.assertIsNone(self.row(SID)["ended_at"])
-        self.do(session_id=SID, tmux="afc-review-2")                       # no change: no audit row
+        self.do(session_id=SID, live=True)                                 # already live: no audit row
         audit = [tuple(a) for a in self.conn.execute(
             "SELECT actor, via, action FROM audit_log WHERE target_id=? ORDER BY id", (SID,))]
-        self.assertEqual(audit, [("keepalive", "runner", "driven.name")] * 4)
+        self.assertEqual(audit, [("keepalive", "runner", "driven.set")] * 3)
 
-    def test_a_live_name_belongs_to_one_row(self):
+    def test_live_again_only_with_a_free_name(self):
         self.do(session_id=SID, tmux="afc-review", kind="review")
-        with self.assertRaisesRegex(actions.Conflict, "afc-review is the live name of"):
-            self.do(session_id=SID2, tmux="afc-review", kind="review")
-        self.do(session_id=SID, ended=True)
+        self.do(session_id=SID, ended_at="2026-10-21T10:00:00Z")
         self.do(session_id=SID2, tmux="afc-review", kind="review")         # free once ended
-        with self.assertRaises(actions.Conflict):
-            self.do(session_id=SID, ended=False)                           # and not live twice
+        with self.assertRaisesRegex(actions.Conflict, "afc-review is the live name of"):
+            self.do(session_id=SID, live=True)                             # and not live twice
+        self.do(session_id=SID, tmux="afc-review-2", live=True)
 
-    def test_validation(self):
-        for params, err in (({"tmux": "afc-review"}, "needs kind and tmux"),
-                            ({"kind": "review"}, "needs kind and tmux"),
-                            ({"tmux": "afc-Review", "kind": "review"}, "tmux must be"),
-                            ({"tmux": "afc-a;b", "kind": "review"}, "tmux must be"),
-                            ({"tmux": "afc-review", "kind": "task"}, "kind must be"),
-                            ({"tmux": "afc-review", "kind": "review", "ended": "yes"}, "ended must be"),
-                            ({"tmux": "afc-p-task-manager", "kind": "task-manager"}, "needs its project")):
+    def test_live_validation(self):
+        self.do(session_id=SID, tmux="afc-review", kind="review")
+        for params, err in (({"live": False}, "live must be true"), ({"live": "yes"}, "live must be true"),
+                            ({"live": True, "ended_at": "2026-10-21T10:00:00Z"}, "contradict")):
             with self.assertRaisesRegex(ValueError, err, msg=params):
                 self.do(session_id=SID, **params)
-        with self.assertRaisesRegex(ValueError, "full session UUID"):
-            self.do(session_id="abcdef01", tmux="afc-review", kind="review")
-        self.assertIsNone(self.row(SID))
 
-    def test_rows_it_does_not_touch(self):
-        actions.own_session_add(self.conn, SID, actor="cli", via="cli")
-        with self.assertRaisesRegex(ValueError, "kind 'own'"):
-            self.do(session_id=SID, tmux="afc-x", kind="review")
-        testenv.tmux_row(SID2)                                             # a task-manager row (3b S1)
-        with self.assertRaisesRegex(ValueError, "stays one"):
-            self.do(session_id=SID2, kind="review")
-        self.do(session_id=SID2, tmux="afc-p-task-manager")                # its name may change (the rename)
-        self.assertEqual(self.row(SID2)["kind"], "task-manager")
-
-    def test_not_for_mcp(self):
-        with self.assertRaisesRegex(actions.Forbidden, "driven.name"):
-            self.do(actor="mcp:x", via="mcp", session_id=SID, tmux="afc-review", kind="review")
+    def test_the_names_regex_is_names_py(self):
+        self.assertIs(actions.TMUX_RE, names.TMUX_RE)
+        self.assertEqual(actions.DRIVEN_KINDS, names.KINDS)
+        self.assertIsNone(actions.TMUX_RE.match("afc-review\n"))           # \Z: no trailing newline
 
 
 class FakeTmux:
@@ -196,7 +180,7 @@ class Lookup(Base):
         tmux.alive = {"afc-review", "afc-review-2"}                        # SID2's and SID's reviews run
         self.assertEqual(ka.claim_tmux(SID3, "review"), "afc-review-3")
         tmux.alive = set()
-        self.do(session_id=SID3, ended=True)
+        self.do(session_id=SID3, ended_at="2026-10-21T10:00:00Z")
         self.assertEqual(ka.claim_tmux(SID3, "review"), "afc-review")     # SID2's row ends (its tmux is gone)
         self.assertIsNotNone(self.row(SID2)["ended_at"])
         self.assertIsNone(self.row(SID3)["ended_at"])
@@ -221,7 +205,7 @@ class Rename(Base):
         self.old = ka.host.run_on_host
         self.addCleanup(setattr, ka.host, "run_on_host", self.old)
         self.tmux = ka.host.run_on_host = FakeTmux(alive={"ka-abcdef01"})
-        testenv.tmux_row(SID)
+        testenv.tmux_row(SID, project_id=self.project("AFClaude"))
 
     def test_rename_and_back(self):
         self.assertEqual(ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager"), SID)
@@ -229,7 +213,7 @@ class Rename(Base):
         self.assertEqual(ka.tmux_name(SID), "afc-afclaude-task-manager")
         audit = self.conn.execute("SELECT actor, action, before, after FROM audit_log WHERE target_id=?",
                                   (SID,)).fetchall()
-        self.assertEqual([(a[0], a[1]) for a in audit], [("cli", "driven.name")])
+        self.assertEqual([(a[0], a[1]) for a in audit], [("cli", "driven.set")])
         self.assertIn("ka-abcdef01", audit[0][2])
         ka.rename_tmux("afc-afclaude-task-manager", "ka-abcdef01")        # the rollback before reverting S2
         self.assertEqual((self.tmux.alive, ka.tmux_name(SID)), ({"ka-abcdef01"}, "ka-abcdef01"))
@@ -262,7 +246,7 @@ class Rename(Base):
         old = actions.perform
 
         def boom(conn, name, params=None, **k):
-            if name == "driven.name":
+            if name == "driven.set":
                 raise store.DBError("disk I/O error", "io")
             return old(conn, name, params, **k)
         actions.perform = boom

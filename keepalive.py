@@ -809,10 +809,12 @@ def claim_tmux(session_id, kind, project=None, title=None, arm=True, actor="keep
         else:
             name = _free_tmux(conn, session_id, row["kind"] if row else kind, project, title, arm, actor)
         if arm and (row is None or row["tmux"] != name or row["ended_at"] is not None):
-            params = {"session_id": session_id, "tmux": name, "ended": False}
+            params = {"session_id": session_id, "tmux": name}
             if row is None:
                 params["kind"] = kind
-            actions.perform(conn, "driven.name", params, actor=actor, via="runner")
+            elif row["ended_at"] is not None:
+                params["live"] = True
+            actions.perform(conn, "driven.set", params, actor=actor, via="runner")
         return name
     finally:
         if own:
@@ -824,6 +826,7 @@ def _free_tmux(conn, session_id, kind, project, title, arm, actor):
     and no running tmux session has."""
     import actions
     import names
+    import store
     taken = set()
     while True:
         name = names.tmux_name(kind, project=project, title=title, sid=session_id, taken=taken)
@@ -833,7 +836,7 @@ def _free_tmux(conn, session_id, kind, project, title, arm, actor):
                 return name
             if holder[1] != "task-manager":      # its tmux session is gone: the row ends, the name is free
                 if arm:
-                    actions.perform(conn, "driven.name", {"session_id": holder[0], "ended": True},
+                    actions.perform(conn, "driven.set", {"session_id": holder[0], "ended_at": store.now_iso()},
                                     actor=actor, via="runner")
                 log(f"tmux {name}: the row of {holder[0][:8]} ({holder[1]}) ended, its tmux session is gone")
                 return name
@@ -881,7 +884,7 @@ def rename_tmux(old, new, actor="cli", via="cli"):
             raise RuntimeError(f"tmux rename-session {old} {new} failed rc={r.returncode}: "
                                f"{(r.stderr or '').strip()[:200]}")
         try:
-            actions.perform(conn, "driven.name", {"session_id": sid, "tmux": new}, actor=actor, via=via)
+            actions.perform(conn, "driven.set", {"session_id": sid, "tmux": new}, actor=actor, via=via)
         except Exception as e:
             back = host.run_on_host(["tmux", "rename-session", "-t", "=" + new, old], timeout=30)
             raise RuntimeError(f"the row of {sid[:8]} was not renamed ({type(e).__name__}: {e}); tmux renamed "

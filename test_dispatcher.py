@@ -254,7 +254,7 @@ class Stalled(Base):
                                                                        None))
         self.assertEqual(self.st["sessions"][sid(1)]["tmux"], row["tmux"])
         audit = self.conn.execute("SELECT actor, action FROM audit_log WHERE target_id=?", (sid(1),)).fetchall()
-        self.assertIn(("dispatcher", "driven.name"), [tuple(a) for a in audit])
+        self.assertIn(("dispatcher", "driven.set"), [tuple(a) for a in audit])
         self.assertEqual(ka.claim_tmux(sid(1), "stall", title="another title", conn=self.conn), row["tmux"])
 
     def test_a_taken_name_gets_a_suffix(self):

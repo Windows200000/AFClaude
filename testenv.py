@@ -70,15 +70,17 @@ def set_setting(key, value, db=None):
         conn.close()
 
 
-def tmux_row(session_id, tmux=None, kind="task-manager", db=None):
+def tmux_row(session_id, tmux=None, kind="task-manager", db=None, project_id=None):
     """A live driven_sessions row naming the session's tmux session (3b S2: keepalive.tmux_name
     reads it; a launcher stores it, a task-manager's comes from its project, 3b S1), written
-    around actions.py as a backfill would. tmux: default today's ka-<id8>. -> the name."""
+    around actions.py as a backfill would. tmux: default today's ka-<id8>; project_id: a
+    task-manager row's project (needed for a later driven.set on it). -> the name."""
     name = tmux or "ka-" + session_id[:8]
     conn = store.connect(db or store.DB_PATH)
     try:
         with store.transaction(conn):
-            store.upsert_driven_session(conn, session_id, kind=kind, tmux=name, ended_at=None)
+            store.upsert_driven_session(conn, session_id, kind=kind, tmux=name, ended_at=None,
+                                        **({"project_id": project_id} if project_id is not None else {}))
     finally:
         conn.close()
     return name
