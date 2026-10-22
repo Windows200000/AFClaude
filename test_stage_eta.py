@@ -340,7 +340,7 @@ class UsageSplitTest(unittest.TestCase):
         t0 = datetime(2026, 10, 21, 22, tzinfo=timezone.utc)
         reset = "2026-10-22 16:59:59.5+00:00"
 
-        def smp(m: int, wp: float, d: float | None) -> dict:
+        def smp(m: int, wp: float, d: "float | None") -> dict:
             t = t0 + timedelta(minutes=m)
             return {"at": t.isoformat(), "since": (t - timedelta(minutes=15)).isoformat(),
                     "usage": {"weekly": {"percent": wp, "resets_at": reset},
