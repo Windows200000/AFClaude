@@ -40,6 +40,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import limit_ratio
 import telemetry
 import usage_stale
 
@@ -372,20 +373,26 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
         if t95 is None:
             t95_est = _r(max(0.0, 95.0 - start_session) / rate * 60)
 
-    # -- weekly
+    # -- weekly (a one-off reset during the run, limit_ratio.one_off_drop: the meter restarted at
+    #    0, the delta = the rise before it + the rise after it; end_weekly = the meter at the end)
     end_weekly = None
     weekly_reset = False
+    seg_start, closed, last = start_weekly, 0.0, start_weekly
     for r in traj:
         if r.get("weekly") is None:
             continue
         if wr0 and r.get("weekly_resets_at") and abs(r["weekly_resets_at"] - wr0) > RESET_JUMP:
             weekly_reset = True
             break
+        if seg_start is not None and last is not None and limit_ratio.one_off_drop(last, r["weekly"]):
+            closed += (last if end_weekly is None else max(end_weekly, last)) - (seg_start or 0.0)
+            seg_start, end_weekly = 0.0, None
         end_weekly = r["weekly"] if end_weekly is None else max(end_weekly, r["weekly"])
+        last = r["weekly"]
     if reason == "limit" and limit_kind == "weekly" and not weekly_reset:
         end_weekly = 100.0
-    weekly_delta = end_weekly - start_weekly if (end_weekly is not None and start_weekly is not None
-                                                 and not weekly_reset) else None
+    weekly_delta = closed + end_weekly - seg_start if (end_weekly is not None and seg_start is not None
+                                                       and not weekly_reset) else None
 
     # -- AFClaude vs user tokens while the run went (the sampler intervals overlapping it; the
     #    first and last one also hold a little before / after the run)

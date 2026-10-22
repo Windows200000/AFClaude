@@ -278,6 +278,15 @@ class Activity(unittest.TestCase):
         self.assertAlmostEqual(pm.minutes_since_user(self.NOW, self.rows(w=31)), 15)
         self.assertAlmostEqual(pm.minutes_since_user(self.NOW, self.rows(w=31, own={"assistant_turns": 5})), 120)
 
+    def test_rise_after_a_one_off_reset(self):
+        """§3.5: 100 -> 8 with the reset time unchanged is a rise of 8 (another device); a
+        scheduled reset (the reset time moves) is not."""
+        t = self.NOW
+        self.assertTrue(pm.user_signal(row(t, 8), row(t - timedelta(minutes=15), 100)))
+        self.assertFalse(pm.user_signal(row(t, 8, own={"assistant_turns": 3}), row(t - timedelta(minutes=15), 100)))
+        self.assertFalse(pm.user_signal(row(t, 1, reset=R + timedelta(days=7)), row(t - timedelta(minutes=15), 100)))
+        self.assertFalse(pm.user_signal(row(t, 99), row(t - timedelta(minutes=15), 100)))
+
     def test_unknown_and_malformed(self):
         self.assertIsNone(pm.minutes_since_user(self.NOW, []))
         self.assertIsNone(pm.minutes_since_user(self.NOW, self.rows()[:-3]))

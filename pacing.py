@@ -235,14 +235,19 @@ TURNS = ("assistant_turns", "subagent_turns")
 
 def user_signal(row, prev):
     """True if this interval shows the user OUTSIDE AFClaude: activity in a non-AFClaude session
-    (activity.other), or a weekly-% rise without local turns (another device / claude.ai).
-    Prompts in AFClaude's own sessions (activity.own) do not count."""
+    (activity.other), or a weekly-% rise without local turns (another device / claude.ai; after
+    a one-off reset the reading itself, limit_ratio.meter_rise). Prompts in AFClaude's own
+    sessions (activity.own) do not count."""
     a = _dict(row.get("activity"))
     own, oth = _dict(a.get("own")), _dict(a.get("other"))
     if _count(oth, "human_prompts") or any(_count(oth, k) for k in TURNS):
         return True
     w, pw = _weekly(row).get("percent"), (_weekly(prev).get("percent") if prev else None)
-    return _num(w) and _num(pw) and w > pw and not any(_count(own, k) for k in TURNS)
+    if not (_num(w) and _num(pw)) or any(_count(own, k) for k in TURNS):
+        return False
+    rr = _round_reset(_weekly(row).get("resets_at"))
+    same = rr is not None and rr == _round_reset(_weekly(prev).get("resets_at"))
+    return (limit_ratio.meter_rise(pw, w) if same else w - pw) > 0
 
 
 def minutes_since_user(now, rows=None):
@@ -492,7 +497,7 @@ def _intervals(rows, fires, runs=None, spans=None):
         if _round_reset(_weekly(p).get("resets_at")) != cyc or not timedelta(0) < t1 - t0 <= timedelta(hours=1):
             continue
         pw, cw = float(_weekly(p)["percent"]), float(_weekly(c)["percent"])
-        dw = cw if cw <= pw - limit_ratio.RESET_DROP else max(cw - pw, 0.0)
+        dw = limit_ratio.meter_rise(pw, cw)
         auto = any(a < t1 and t0 < b for a, b in spans)
         own, oth = tok.get(id(c), (0.0, 0.0))
         design = 0.0 if auto or own + oth <= 0 else dw * own / (own + oth)
@@ -514,7 +519,7 @@ def cycle_totals(rows):
             continue
         wp = float(w["percent"])
         done = out.get(c, (0.0, None))[0] - (prev.get(c) or 0.0)   # the closed segments' sum
-        if c in prev and wp <= prev[c] - limit_ratio.RESET_DROP:
+        if c in prev and limit_ratio.one_off_drop(prev[c], wp):
             done += prev[c]
         out[c], prev[c] = (done + wp, r), wp
     return out
