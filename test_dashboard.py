@@ -8,6 +8,7 @@ schema.json).
 Needs the project venv (Starlette, pydantic; Python 3.12):
     .venv/bin/python -m unittest test_dashboard
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -19,69 +20,79 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import testenv  # noqa: E402,F401  (temp DB first)
-import jsonschema  # noqa: E402
-from pydantic import JsonValue  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
-
-import store  # noqa: E402
-from dashboard import codegen, routes, security  # noqa: E402
-from dashboard.api_types import Model  # noqa: E402
-from dashboard.app import create_app  # noqa: E402
-from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply  # noqa: E402
-
+# The dashboard needs Python 3.12 with the .venv's web stack (in the image through mcp, so the
+# container's python3 runs these too); under another interpreter every test here is skipped (with the reason),
+# like test_typing without mypy, so a combined `python3 -m unittest discover` stays green.
+_MISSING = [m for m in ("starlette", "pydantic", "jsonschema") if importlib.util.find_spec(m) is None]
+SKIP = (f"needs Python 3.12 with {', '.join(_MISSING) or 'the web stack'} (not {sys.executable}): "
+        "run with .venv/bin/python -m unittest test_dashboard") if _MISSING or sys.version_info < (3, 12) else ""
 PUBLIC = "https://afc.example.test"
 ORIGIN = PUBLIC
 KEY = "0b7e2a0c-5d1e-4c55-9a0f-3b8c1d2e4f60"
-with open(codegen.SCHEMA_PATH, encoding="utf-8") as _fh:
-    SCHEMA = json.load(_fh)
+
+if SKIP:
+    ENDPOINTS = TEST_ENDPOINTS = ()   # placeholders: every TestCase below is skipped
+else:
+    import testenv  # noqa: E402,F401  (temp DB first)
+    import jsonschema  # noqa: E402
+    from pydantic import JsonValue  # noqa: E402
+    from starlette.testclient import TestClient  # noqa: E402
+
+    import store  # noqa: E402
+    from dashboard import codegen, routes, security  # noqa: E402
+    from dashboard.api_types import Model  # noqa: E402
+    from dashboard.app import create_app  # noqa: E402
+    from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply  # noqa: E402
+
+    with open(codegen.SCHEMA_PATH, encoding="utf-8") as _fh:
+        SCHEMA = json.load(_fh)
 
 
-# --- test-only endpoints (writes, a bug, a DB failure) -------------------------------------------
+    # --- test-only endpoints (writes, a bug, a DB failure) -------------------------------------------
 
-class EchoRequest(Model):
-    text: str
-    n: int = 0
-
-
-class EchoResponse(Model):
-    text: str
-    n: int
-    key: str | None
-    user: int | None
+    class EchoRequest(Model):
+        text: str
+        n: int = 0
 
 
-async def echo(call: Call) -> Reply:
-    body = call.json_body(EchoRequest)
-    return Reply(EchoResponse(text=body.text, n=body.n, key=call.idempotency_key,
-                              user=call.principal.user_id if call.principal else None))
+    class EchoResponse(Model):
+        text: str
+        n: int
+        key: str | None
+        user: int | None
 
 
-async def boom(call: Call) -> Reply:
-    raise RuntimeError("secret internal detail /some/path")
+    async def echo(call: Call) -> Reply:
+        body = call.json_body(EchoRequest)
+        return Reply(EchoResponse(text=body.text, n=body.n, key=call.idempotency_key,
+                                  user=call.principal.user_id if call.principal else None))
 
 
-async def wrong_model(call: Call) -> Reply:
-    return Reply(EchoRequest(text="x"))
+    async def boom(call: Call) -> Reply:
+        raise RuntimeError("secret internal detail /some/path")
 
 
-async def db_down(call: Call) -> Reply:
-    raise store.DBUnavailable("database disk full: /secret/path/afclaude.db", "disk_full")
+    async def wrong_model(call: Call) -> Reply:
+        return Reply(EchoRequest(text="x"))
 
 
-async def nothing(call: Call) -> Reply:
-    return Reply(EchoResponse(text="", n=0, key=None, user=None))
+    async def db_down(call: Call) -> Reply:
+        raise store.DBUnavailable("database disk full: /secret/path/afclaude.db", "disk_full")
 
 
-TEST_ENDPOINTS = ENDPOINTS + (
-    Endpoint("echo", "POST", "/api/v1/test/echo", "session", EchoRequest, EchoResponse, echo, "echo",
-             idempotent=True),
-    Endpoint("echo_plain", "POST", "/api/v1/test/echo_plain", "session", EchoRequest, EchoResponse, echo, "echo"),
-    Endpoint("no_body", "DELETE", "/api/v1/test/no_body", "session", None, EchoResponse, nothing, "no body"),
-    Endpoint("boom", "GET", "/api/v1/test/boom", "session", None, EchoResponse, boom, "bug"),
-    Endpoint("wrong_model", "GET", "/api/v1/test/wrong", "session", None, EchoResponse, wrong_model, "bug"),
-    Endpoint("db_down", "GET", "/api/v1/test/db", "session", None, EchoResponse, db_down, "db"),
-)
+    async def nothing(call: Call) -> Reply:
+        return Reply(EchoResponse(text="", n=0, key=None, user=None))
+
+
+    TEST_ENDPOINTS = ENDPOINTS + (
+        Endpoint("echo", "POST", "/api/v1/test/echo", "session", EchoRequest, EchoResponse, echo, "echo",
+                 idempotent=True),
+        Endpoint("echo_plain", "POST", "/api/v1/test/echo_plain", "session", EchoRequest, EchoResponse, echo, "echo"),
+        Endpoint("no_body", "DELETE", "/api/v1/test/no_body", "session", None, EchoResponse, nothing, "no body"),
+        Endpoint("boom", "GET", "/api/v1/test/boom", "session", None, EchoResponse, boom, "bug"),
+        Endpoint("wrong_model", "GET", "/api/v1/test/wrong", "session", None, EchoResponse, wrong_model, "bug"),
+        Endpoint("db_down", "GET", "/api/v1/test/db", "session", None, EchoResponse, db_down, "db"),
+    )
 
 
 def test_schema():
@@ -119,6 +130,7 @@ class Checked:
         return self.request("POST", path, **kw)
 
 
+@unittest.skipIf(bool(SKIP), SKIP)
 class Base(unittest.TestCase):
     endpoints = TEST_ENDPOINTS
     signed_in = False
@@ -400,6 +412,7 @@ class ApiSchema(Base):
         self.assertEqual(r.json(), SCHEMA)
 
 
+@unittest.skipIf(bool(SKIP), SKIP)
 class Codegen(unittest.TestCase):
     def test_committed_files_are_fresh(self):
         self.assertEqual(codegen.stale(), [], "run: .venv/bin/python -m dashboard.codegen")
