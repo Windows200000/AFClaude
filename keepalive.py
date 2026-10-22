@@ -3894,7 +3894,13 @@ def run_act(job, run, sid, now, args):
         note = f"{job} {run}: not run, its plan changed since (now {cur.get('run') if isinstance(cur, dict) else 'none'})"
         log(note)
         return {"status": "ok", "note": note}
-    nxt, note = ACTS[job](sid, now, args, cur["key"])
+    try:
+        nxt, note = ACTS[job](sid, now, args, cur["key"])
+    except Exception:
+        # it failed (the runner reports it: alert + pause): dropped, so once the owner cleared the pause
+        # the next plan decides again, as the watcher's next pass would (a cut-off act stays: D-257)
+        _act_done(job, cur["key"], run, None, now)
+        raise
     _act_done(job, cur["key"], run, nxt, now)
     return {"status": "ok", "note": note}
 
@@ -3920,6 +3926,8 @@ def runner_pass(job, key=None):
             if why != _STOP_LINE:
                 log(f"keep-alive passes held: {why}")
                 _STOP_LINE = why
+            if job in ACTS:     # not started: dropped, so a plan once the file is gone plans it anew (a new run key)
+                _act_done(job, None, key, None, _now())
             return {"status": "skipped", "note": why}
         if _STOP_LINE is not None:
             log("keep-alive passes run again: the watcher's STOP / PAUSED file is gone")

@@ -1441,7 +1441,17 @@ class PassesThroughTheRunner(unittest.TestCase):
             os.unlink(f)
         self.assertEqual(len([ln for ln in self.logs if "keep-alive passes held" in ln]), 2)
         self.assertEqual(self.tick(self.NIGHT + timedelta(minutes=2))["status"], "ok")
-        self.assertIsNotNone(testenv.act_of(ka, "deferred_start"))
+        a = testenv.act_of(ka, "deferred_start")
+        open(ka.STOP_FILE, "w").close()                    # an act due while held: not run, dropped
+        self.assertEqual(self.act("deferred_start", ka.parse_ts(a["at"]))["status"], "skipped")
+        self.assertIsNone(testenv.act_of(ka, "deferred_start"))
+        os.unlink(ka.STOP_FILE)
+        t = ka.parse_ts(a["at"]) + timedelta(minutes=1)
+        self.tick(t)                                       # planned anew (a new run key), then fired
+        b = testenv.act_of(ka, "deferred_start")
+        self.assertNotEqual(b["run"], a["run"])
+        self.act("deferred_start", t)
+        self.assertEqual([k for k, _ in self.fired], [schedule.start_key(self.NIGHT)])
 
     def test_a_failing_part_is_reported_and_the_others_still_plan(self):
         def boom(sid, now):
@@ -1452,6 +1462,21 @@ class PassesThroughTheRunner(unittest.TestCase):
         self.tick(self.NIGHT + timedelta(minutes=1))
         self.assertIn("watcher pass failed: ValueError", afclaude_config.automation_pause()["reason"])
         self.assertIsNotNone(testenv.act_of(ka, "deferred_start"))
+
+    def test_a_failing_act_is_dropped_and_planned_anew(self):
+        self.last_stretch()
+        t = self.R - timedelta(hours=4)
+        self.tick(t)
+        a = testenv.act_of(ka, "last_stretch")
+
+        def boom(u, now, display=False):
+            raise ValueError("budget model broken")
+        ka.budget_eval = boom
+        with self.assertRaises(ValueError):                 # the runner reports it (alert + pause)
+            self.act("last_stretch", t)
+        self.assertIsNone(testenv.act_of(ka, "last_stretch"))
+        self.tick(t + timedelta(minutes=1))
+        self.assertNotEqual(testenv.act_of(ka, "last_stretch")["run"], a["run"])
 
     def test_the_session_must_be_given(self):
         with self.assertRaisesRegex(RuntimeError, "FULL session UUID"):

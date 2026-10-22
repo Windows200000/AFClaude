@@ -46,8 +46,16 @@ Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) move
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
 (stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
-docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts; cron still
-runs the watcher watchdog and the inbox API watchdog.
+docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts. S6: the
+keep-alive watcher's passes (no watcher runs beside it any more); cron still runs the inbox API
+watchdog.
+
+Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
+`run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
+`fillup` and `compaction` are `planned` jobs: a keyed run at the time the pass's plan step stored in
+the keep-alive's runner state (PLANS_COMPONENT, acts.<job> = {key, at, run}; planned_act), under its
+run key once (a run row settles it); a session run (a drain holds it), a cut-off one is an alert +
+pause and never reruns (D-257). The job row's next_due is that time while it is ahead.
 
 Window starts (S5, the job "window_start"): a keyed run at each session-window start, to the second
 (schedule.next_session_start is the job row's next_due; key schedule.start_key), as
