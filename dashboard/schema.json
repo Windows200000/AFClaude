@@ -1,0 +1,209 @@
+{
+ "components": {
+  "schemas": {
+   "ApiSchemaResponse": {
+    "additionalProperties": false,
+    "description": "GET /api/v1/schema.json (session): the OpenAPI 3.1 document of this API (codegen.openapi()).",
+    "properties": {
+     "components": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/JsonValue"
+      },
+      "title": "Components",
+      "type": "object"
+     },
+     "info": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/JsonValue"
+      },
+      "title": "Info",
+      "type": "object"
+     },
+     "openapi": {
+      "const": "3.1.0",
+      "title": "Openapi",
+      "type": "string"
+     },
+     "paths": {
+      "additionalProperties": {
+       "$ref": "#/components/schemas/JsonValue"
+      },
+      "title": "Paths",
+      "type": "object"
+     }
+    },
+    "required": [
+     "openapi",
+     "info",
+     "paths",
+     "components"
+    ],
+    "title": "ApiSchemaResponse",
+    "type": "object"
+   },
+   "ErrorBody": {
+    "additionalProperties": false,
+    "properties": {
+     "code": {
+      "enum": [
+       "unauthenticated",
+       "step_up_required",
+       "forbidden",
+       "not_found",
+       "method_not_allowed",
+       "conflict",
+       "validation",
+       "payload_too_large",
+       "rate_limited",
+       "maintenance",
+       "unavailable",
+       "internal"
+      ],
+      "title": "Code",
+      "type": "string"
+     },
+     "details": {
+      "anyOf": [
+       {
+        "additionalProperties": {
+         "$ref": "#/components/schemas/JsonValue"
+        },
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Details"
+     },
+     "message": {
+      "title": "Message",
+      "type": "string"
+     }
+    },
+    "required": [
+     "code",
+     "message",
+     "details"
+    ],
+    "title": "ErrorBody",
+    "type": "object"
+   },
+   "ErrorResponse": {
+    "additionalProperties": false,
+    "description": "Every error response (any 4xx/5xx) of every endpoint.",
+    "properties": {
+     "error": {
+      "$ref": "#/components/schemas/ErrorBody"
+     }
+    },
+    "required": [
+     "error"
+    ],
+    "title": "ErrorResponse",
+    "type": "object"
+   },
+   "HealthResponse": {
+    "additionalProperties": false,
+    "description": "GET /api/v1/health (public, no secrets): `db` is \"ok\" or the kind of the database problem\n(store.health(): missing, read_only, disk_full, corrupt, schema_too_new, ...).",
+    "properties": {
+     "db": {
+      "title": "Db",
+      "type": "string"
+     },
+     "status": {
+      "enum": [
+       "ok",
+       "unavailable"
+      ],
+      "title": "Status",
+      "type": "string"
+     }
+    },
+    "required": [
+     "status",
+     "db"
+    ],
+    "title": "HealthResponse",
+    "type": "object"
+   },
+   "JsonValue": {}
+  }
+ },
+ "info": {
+  "title": "AFClaude dashboard API",
+  "version": "1"
+ },
+ "openapi": "3.1.0",
+ "paths": {
+  "/api/v1/health": {
+   "get": {
+    "operationId": "health",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HealthResponse"
+        }
+       }
+      },
+      "description": "Is the backend usable (the database writable and intact)? 503 when not."
+     },
+     "503": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HealthResponse"
+        }
+       }
+      },
+      "description": "Is the backend usable (the database writable and intact)? 503 when not."
+     },
+     "default": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "error (the one error shape, §8)"
+     }
+    },
+    "summary": "Is the backend usable (the database writable and intact)? 503 when not.",
+    "x-access": "public"
+   }
+  },
+  "/api/v1/schema.json": {
+   "get": {
+    "operationId": "api_schema",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ApiSchemaResponse"
+        }
+       }
+      },
+      "description": "This API's OpenAPI 3.1 document."
+     },
+     "default": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "error (the one error shape, §8)"
+     }
+    },
+    "summary": "This API's OpenAPI 3.1 document.",
+    "x-access": "session"
+   }
+  }
+ }
+}

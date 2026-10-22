@@ -7,6 +7,7 @@ Needs the project venv (the SDK wants Python >= 3.10):
     .venv/bin/python -m unittest test_mcp_server
 """
 import asyncio
+import importlib.util
 import json
 import os
 import sys
@@ -18,12 +19,18 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import afclaude_config  # noqa: E402
-import mcp_server as ms  # noqa: E402
 import store  # noqa: E402
-from mcp import types  # noqa: E402
-from mcp.client import Client  # noqa: E402
-from mcp.client.stdio import StdioServerParameters  # noqa: E402
-from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+
+# The MCP SDK lives in the .venv (Python >= 3.10); under another interpreter every test here is
+# skipped with the reason, so a combined `python3 -m unittest discover` stays green.
+SKIP = "" if importlib.util.find_spec("mcp") is not None else (
+    f"the MCP SDK is not installed for {sys.executable}: run with .venv/bin/python -m unittest test_mcp_server")
+if not SKIP:
+    import mcp_server as ms  # noqa: E402
+    from mcp import types  # noqa: E402
+    from mcp.client import Client  # noqa: E402
+    from mcp.client.stdio import StdioServerParameters  # noqa: E402
+    from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 
 SID = "00000000-0000-4000-8000-000000000001"
 SID2 = "00000000-0000-4000-8000-000000000002"
@@ -37,6 +44,7 @@ def run(coro):
     return json.loads(asyncio.run(coro))
 
 
+@unittest.skipIf(bool(SKIP), SKIP)
 class Env(unittest.TestCase):
     """Temp DB, empty transcripts root, a caller cwd, a fake session id."""
     def setUp(self):
@@ -475,6 +483,7 @@ class Decisions(Env):
             asyncio.run(ms.afclaude_decisions("find"))
 
 
+@unittest.skipIf(bool(SKIP), SKIP)
 class Stdio(unittest.TestCase):
     """Spawn the server like Claude Code does (stdio, initialize handshake) on a temp DB."""
     def setUp(self):
