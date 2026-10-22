@@ -12,7 +12,12 @@
                 fido_mds_root_r46.der), the cache record, which models count as hardware
   passkeys.py   the passkey policy over fido2's types (6b P2): classify a registration (hardware /
                 synced / refused) and check an assertion (UV, BE/BS, sign counter, revoked models)
+  oidc.py       OIDC login (6b P5, the only Authlib importer): provider discovery, the JWKS cache,
+                the authorization request (state, nonce, PKCE S256), the callback and token
+                request, ID-token validation, userinfo, the amr/acr second-factor rule
+  oidc_groups.py  the group map setting and the grants a login's groups give (no DB)
 
-Built so far: W6's and 6b P1/P2's pure parts (no tables, no endpoints, no sessions). Python 3.12
-with cryptography (in the .venv through mcp) and fido2 (requirements-dashboard.txt), mypy --strict.
+Built so far: W6's and 6b P1/P2/P5's pure parts (no tables, no endpoints, no sessions). Python 3.12
+with cryptography and httpx2 (in the .venv through mcp), fido2, Authlib and joserfc
+(requirements-dashboard.txt), mypy --strict.
 """
