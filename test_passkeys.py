@@ -101,6 +101,16 @@ class Classify(unittest.TestCase):
                     self.check(self.classify(*kit.SoftAuthenticator(AAGUID, self.ca).register(**kw), lst=lst),
                                "refused", "mds_problem_status")
 
+    def test_unparseable_entry(self):
+        # an entry fido2 can't parse: the model is unknown (synced), but a revoked one stays refused
+        for statuses, kind, reason in ((("FIDO_CERTIFIED_L1",), "synced", "not_in_mds"),
+                                       (("FIDO_CERTIFIED_L1", "REVOKED"), "refused", "mds_problem_status")):
+            with self.subTest(statuses=statuses):
+                lst = mds_list([kit.entry(aaguid=kit.uuid_str(AAGUID), roots=[kit.der(self.ca.root)],
+                                          statuses=statuses, drop=("attachmentHint",))])
+                self.assertEqual(len(lst.skipped), 1)
+                self.check(self.classify(*kit.SoftAuthenticator(AAGUID, self.ca).register(), lst=lst), kind, reason)
+
     def test_invalid_attestation_signature(self):
         self.check(self.classify(*kit.SoftAuthenticator(AAGUID, self.ca).register(tamper=True)),
                    "refused", "attestation_invalid")

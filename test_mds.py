@@ -158,15 +158,32 @@ class VerifyBlob(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.refused("payload_malformed",
                              kit.make_blob({}, self.pki.leaf_key, self.pki.x5c, raw_payload=raw))
-        broken = kit.payload([kit.entry(aaguid=AAGUID, drop=("keyProtection",))])
-        self.refused("payload_malformed", kit.make_blob(broken, self.pki.leaf_key, self.pki.x5c))
+        for body in (kit.payload(["not an object"]), {k: v for k, v in kit.payload([]).items() if k != "nextUpdate"},
+                     dict(kit.payload([]), no="many")):
+            with self.subTest(body=body):
+                self.refused("payload_malformed", kit.make_blob(body, self.pki.leaf_key, self.pki.x5c))
 
-    def test_mds31_statement_without_uv_details_and_attachment_hint(self):
-        # live since 2026: passkey-provider statements (e.g. a password manager's) leave both out
-        body = kit.payload([kit.entry(aaguid=AAGUID, drop=("userVerificationDetails", "attachmentHint"),
-                                      key_protection=("software",), multi_device="explicit")])
+    def test_unparseable_entry_skipped_as_warning(self):
+        # live since 2026: a passkey-provider statement (a password manager's) leaves out two fields
+        # fido2 2.2.1 requires; that entry is left out (unknown model), the rest of the list stands
+        other = "22222222-2222-2222-2222-222222222222"
+        body = kit.payload([kit.entry(aaguid=AAGUID),
+                            kit.entry(aaguid=other, drop=("userVerificationDetails", "attachmentHint"),
+                                      key_protection=("software",), multi_device="explicit",
+                                      description="Some Password Manager"),
+                            kit.entry(key_ids=[b"\x44" * 20], drop=("keyProtection",),
+                                      statuses=("FIDO_CERTIFIED", "REVOKED"))])
         vb = self.verify(kit.make_blob(body, self.pki.leaf_key, self.pki.x5c))
-        self.assertEqual(vb.payload.entries[0].metadata_statement.key_protection, ["software"])
+        self.assertEqual([str(e.aaguid) for e in vb.payload.entries], [AAGUID])
+        self.assertEqual([(s.aaguid, s.description, s.problem_statuses) for s in vb.skipped],
+                         [(other, "Some Password Manager", ()), (None, "Test Security Key", ("REVOKED",))])
+        self.assertIn("TypeError", vb.skipped[0].reason)
+        self.assertEqual(vb.skipped[1].key_ids, ("44" * 20,))
+        lst = mds.load_record(mds.to_record(vb, NOW))      # the warnings come back with the cached list
+        self.assertEqual(lst.skipped, vb.skipped)
+        self.assertEqual(lst.skipped_for(mds.Aaguid.parse(other)), vb.skipped[0])
+        self.assertEqual(lst.skipped_for(mds.Aaguid.NONE, [b"\x44" * 20]), vb.skipped[1])
+        self.assertIsNone(lst.skipped_for(mds.Aaguid.parse(AAGUID)))
 
 
 @unittest.skipIf(bool(SKIP), SKIP)
@@ -330,6 +347,7 @@ class Refresh(unittest.TestCase):
     def test_new(self):
         res = self.refresh(stored=299)
         self.assertEqual((res.outcome, res.serial, res.record.serial, res.record.entry_count), ("new", 300, 300, 1))
+        self.assertEqual(res.skipped, ())
         self.assertEqual(self.alerts, [])
 
     def test_unchanged(self):

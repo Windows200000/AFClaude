@@ -24,6 +24,7 @@ from typing import Literal, Optional, Sequence
 import fido2.attestation  # noqa: F401  (registers every attestation format with Attestation.for_type)
 from fido2.attestation.base import (Attestation, AttestationType, InvalidAttestation, UnsupportedType,
                                     UntrustedAttestation)
+from cryptography import x509
 from fido2.mds3 import MdsAttestationVerifier, MetadataBlobPayloadEntry
 from fido2.webauthn import Aaguid, AttestationObject, AuthenticatorData
 
@@ -101,6 +102,11 @@ def _x5c(attestation: AttestationObject) -> list[bytes]:
     return list(chain)
 
 
+def _key_ids(attestation: AttestationObject) -> list[bytes]:
+    return [x509.SubjectKeyIdentifier.from_public_key(x509.load_der_x509_certificate(c).public_key()).digest
+            for c in _x5c(attestation)]
+
+
 def _lookup(attestation: AttestationObject, aaguid: Aaguid,
             mds_list: mds.MdsList) -> tuple[Optional[MetadataBlobPayloadEntry], Optional[bytes]]:
     """The MDS entry the authenticator claims: by AAGUID, or (zero AAGUID) by the attestation
@@ -149,6 +155,13 @@ def classify(attestation: AttestationObject, client_data_hash: bytes, mds_list: 
         return result("refused", "attestation_invalid")
     if entry is not None and mds.problem_statuses(entry):
         return result("refused", "mds_problem_status", entry, key_id)
+    if entry is None:   # a model whose entry fido2 couldn't parse is unknown, but a revoked one stays refused
+        try:
+            skipped = mds_list.skipped_for(cred.aaguid, _key_ids(attestation))
+        except ValueError:
+            return result("refused", "attestation_invalid")
+        if skipped is not None and skipped.problem_statuses:
+            return result("refused", "mds_problem_status")
 
     if be:
         return result("synced", "backup_eligible", entry, key_id)

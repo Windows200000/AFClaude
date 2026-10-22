@@ -6,7 +6,8 @@ authenticator models count as hardware-bound.
   verify_blob()  the JWS: the x5c chain is path-validated with `cryptography` to the pinned
                  GlobalSign Root R46 (fido_mds_root_r46.der, its SHA-256 below), with validity
                  dates, as a TLS server certificate for the MDS host; then the signature with the
-                 leaf key (ES256 / RS256 only); then the payload through fido2's data model
+                 leaf key (ES256 / RS256 only); then the payload through fido2's data model (an
+                 entry fido2 can't parse is skipped and kept as a warning: SkippedEntry)
   check_serial() the blob's serial against the stored one: lower = a rollback (refused), equal =
                  nothing new, higher = store it
   refresh()      the three together; any failure alerts and raises (D-235), nothing is returned
@@ -22,6 +23,7 @@ stored serial and the last fetch time and returns the record to store.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import binascii
 import hashlib
 import json
@@ -30,7 +32,7 @@ import time
 import zlib
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import httpx2
 from cryptography import x509
@@ -71,10 +73,6 @@ USABLE_NEWEST = frozenset(
 HARDWARE_PROTECTION = frozenset({"hardware", "secure_element", "tee"})
 # MDS 3.1 marks passkey providers whose credentials sync; never hardware, whatever keyProtection says.
 SYNCING = frozenset({"explicit", "implicit"})
-# MDS 3.1 statements of passkey providers may leave these out; fido2 2.2.1 still requires them,
-# and the policy here reads neither. Only these two get an empty default; every other parse error
-# refuses the whole blob.
-STATEMENT_LIST_DEFAULTS = ("userVerificationDetails", "attachmentHint")
 
 AlertFn = Callable[[str, str], object]
 ALERT_SUBJECT = "FIDO metadata refresh failed"   # stable (failstop: no numbers in the subject)
@@ -154,6 +152,7 @@ class VerifiedBlob:
     payload_json: bytes      # the JWS payload, verified
     payload: MetadataBlobPayload
     chain: tuple[str, ...]   # the validated path, leaf first (subjects, for the log)
+    skipped: tuple[SkippedEntry, ...]   # entries left out (warnings)
 
 
 def _b64url(part: bytes, what: str) -> bytes:
@@ -163,23 +162,60 @@ def _b64url(part: bytes, what: str) -> bytes:
         raise MdsError("malformed", f"{what} is not base64url") from exc
 
 
-def parse_payload(payload_json: bytes) -> MetadataBlobPayload:
+@dataclass(frozen=True)
+class SkippedEntry:
+    """An entry fido2 could not parse (e.g. an MDS 3.1 passkey-provider statement without
+    userVerificationDetails / attachmentHint, which fido2 2.2.1 still requires): left out of the
+    list, so its model counts as unknown (never hardware). Kept as a warning of the verified list.
+    `problem_statuses` is read from the raw reports, so a revoked model stays refused."""
+    aaguid: Optional[str]
+    key_ids: tuple[str, ...]
+    description: Optional[str]
+    reason: str
+    problem_statuses: tuple[str, ...]
+
+
+_PROBLEM_VALUES = frozenset(s.value for s in PROBLEM_STATUSES)
+
+
+def _skipped(raw: dict[str, Any], exc: Exception) -> SkippedEntry:
+    statement = raw.get("metadataStatement")
+    description = statement.get("description") if isinstance(statement, dict) else None
+    key_ids = raw.get("attestationCertificateKeyIdentifiers")
+    reports = raw.get("statusReports")
+    statuses = {r.get("status") for r in reports if isinstance(r, dict)} if isinstance(reports, list) else set()
+    return SkippedEntry(
+        aaguid=str(raw["aaguid"]).lower() if isinstance(raw.get("aaguid"), str) else None,
+        key_ids=tuple(str(k).lower() for k in key_ids) if isinstance(key_ids, list) else (),
+        description=str(description) if description is not None else None,
+        reason=f"{type(exc).__name__}: {exc}"[:300],
+        problem_statuses=tuple(sorted(str(v) for v in statuses if v in _PROBLEM_VALUES)))
+
+
+def parse_payload(payload_json: bytes) -> tuple[MetadataBlobPayload, tuple[SkippedEntry, ...]]:
+    """The payload through fido2's model. An entry fido2 can't parse is skipped (returned as a
+    warning); anything else malformed (not JSON, no/nextUpdate/entries wrong, an entry that is not
+    an object) refuses the whole blob."""
     try:
         data = json.loads(payload_json)
     except ValueError as exc:
         raise MdsError("payload_malformed", f"payload is not JSON: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
         raise MdsError("payload_malformed", "payload has no entries list")
-    for entry in data["entries"]:
-        statement = entry.get("metadataStatement") if isinstance(entry, dict) else None
-        if isinstance(statement, dict):
-            for key in STATEMENT_LIST_DEFAULTS:
-                statement.setdefault(key, [])
+    good: list[MetadataBlobPayloadEntry] = []
+    skipped: list[SkippedEntry] = []
+    for raw in data["entries"]:
+        if not isinstance(raw, dict):
+            raise MdsError("payload_malformed", f"an entry is a {type(raw).__name__}, not an object")
+        try:
+            good.append(MetadataBlobPayloadEntry.from_dict(raw))
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            skipped.append(_skipped(raw, exc))
     try:
-        payload = MetadataBlobPayload.from_dict(data)
+        payload = MetadataBlobPayload.from_dict({**data, "entries": []})
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         raise MdsError("payload_malformed", f"{type(exc).__name__}: {exc}") from exc
-    return payload
+    return dataclasses.replace(payload, entries=good), tuple(skipped)
 
 
 def _verify_signature(leaf: x509.Certificate, alg: str, signed: bytes, signature: bytes) -> None:
@@ -235,10 +271,10 @@ def verify_blob(blob: bytes, *, now: datetime, root: Optional[x509.Certificate] 
 
     _verify_signature(certs[0], str(alg), parts[0] + b"." + parts[1], _b64url(parts[2], "signature"))
     payload_json = _b64url(parts[1], "payload")
-    payload = parse_payload(payload_json)
+    payload, skipped = parse_payload(payload_json)
     return VerifiedBlob(serial=payload.no, next_update=payload.next_update,
                         sha256=hashlib.sha256(blob).hexdigest(), payload_json=payload_json,
-                        payload=payload, chain=tuple(c.subject.rfc4514_string() for c in path))
+                        payload=payload, chain=tuple(c.subject.rfc4514_string() for c in path), skipped=skipped)
 
 
 def check_serial(new: int, stored: Optional[int]) -> Literal["new", "unchanged"]:
@@ -277,6 +313,7 @@ class MdsList:
     next_update: date
     verified_at: datetime
     payload: MetadataBlobPayload
+    skipped: tuple[SkippedEntry, ...] = ()   # the list's warnings (entries fido2 couldn't parse)
     _aaguids: dict[Aaguid, MetadataBlobPayloadEntry] = field(init=False, repr=False, compare=False)
     _key_ids: dict[bytes, MetadataBlobPayloadEntry] = field(init=False, repr=False, compare=False)
 
@@ -296,6 +333,15 @@ class MdsList:
 
     def by_key_id(self, key_id: bytes) -> Optional[MetadataBlobPayloadEntry]:
         return self._key_ids.get(key_id)
+
+    def skipped_for(self, aaguid: Optional[Aaguid], key_ids: Sequence[bytes] = ()) -> Optional[SkippedEntry]:
+        """The skipped entry this model would have matched (by AAGUID, else by key identifier)."""
+        for sk in self.skipped:
+            if aaguid and sk.aaguid == str(aaguid):
+                return sk
+            if not aaguid and any(k.hex() in sk.key_ids for k in key_ids):
+                return sk
+        return None
 
     def by_chain(self, chain: Sequence[bytes]) -> tuple[Optional[MetadataBlobPayloadEntry], Optional[bytes]]:
         """The entry whose attestationCertificateKeyIdentifiers lists a key of `chain` (zero
@@ -327,11 +373,11 @@ def load_record(record: CacheRecord, verified_at: Optional[datetime] = None) -> 
         payload_json = zlib.decompress(record.payload_z)
     except zlib.error as exc:
         raise MdsError("cache_corrupt", f"payload of serial {record.serial}: {exc}") from exc
-    payload = parse_payload(payload_json)
+    payload, skipped = parse_payload(payload_json)
     if payload.no != record.serial:
         raise MdsError("cache_corrupt", f"payload serial {payload.no} != record serial {record.serial}")
     return MdsList(serial=record.serial, next_update=record.next_update,
-                   verified_at=utc(verified_at or record.fetched_at), payload=payload)
+                   verified_at=utc(verified_at or record.fetched_at), payload=payload, skipped=skipped)
 
 
 # --- which entries count -------------------------------------------------------------------------
@@ -384,6 +430,7 @@ class RefreshResult:
     verify_seconds: float
     record: Optional[CacheRecord]    # only for "new"
     chain: tuple[str, ...]
+    skipped: tuple[SkippedEntry, ...]   # warnings: entries left out of the list
 
 
 def _notify_alert(subject: str, body: str) -> object:
@@ -413,4 +460,4 @@ def refresh(*, stored_serial: Optional[int], last_fetched_at: Optional[datetime]
         raise
     record = to_record(verified, now) if outcome == "new" else None
     return RefreshResult(outcome=outcome, serial=verified.serial, fetched_at=utc(now), verify_seconds=seconds,
-                         record=record, chain=verified.chain)
+                         record=record, chain=verified.chain, skipped=verified.skipped)
