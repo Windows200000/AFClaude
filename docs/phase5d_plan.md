@@ -1,0 +1,120 @@
+# Phase 5d: the working root, AFClaude's own Claude config dir and the Claude data export (implementation plan)
+
+Plan for design §10.4, §11.2, §11.3, §11.5 (the parts 5e uses) / §13 step 5d: the working root chosen at setup with no default, AFClaude's own `CLAUDE_CONFIG_DIR` (verified on the host first), the setup CLI that chooses both and provisions the config dir, the `claude/` part of the export with a generated reinstate guide, the whitelisted restore into a new root with a path map, and the post-restore validation. The dashboard views (wizard, F10 export) follow in 6a/7b. Plan only; each step in §5 is one worker branch. 5e (this install's move) is not part of 5d: it runs these steps for real.
+
+Binding inputs: D-165 (export of the required Claude data with a reinstate guide; AFClaude and its task-managers in their own directory chosen at first startup, not the standard one; this install's move validates the export, incl. permission-bypass files and the `CLAUDE.md` workaround; the addendum: the move carries only what the export carries, gaps are fixed in the export), D-174 (credentials in the export by default, shown in red, can be unticked), D-173 (AFClaude's sessions get their own `CLAUDE_CONFIG_DIR`, the shared default dir as fallback; a restored install starts paused), D-180 / D-187 (data folder and working folder: no defaults, both chosen at setup, with an optional restore), D-161 (a backup or move gives a clean, complete continue), D-181 (no file exports of DB content besides the public build log and the bundles), D-051 (AFClaude marks its own dirs trusted), D-217 (every permission AFClaude needs is in the repo), D-044 / D-047 (guard-hook bypass with the rules in context; auto / dontAsk modes), D-042 / D-269 (Remote Control per session category), D-229 (setup asks the Claude plan), D-195 (setup registers this host as a machine and offers a grant), D-209 (mypy --strict for export and restore), D-235 / D-282 / D-283 (fail fast), D-007 (§2).
+
+## 0. Already decided
+
+- **The config dir is separate** (D-173), at `<working root>/.claude-afclaude`: derived from the working root, not a second choice. Not in the data dir: that dir is mounted into `afclaude-web`, which must never see Claude credentials (design §9.8). Not `<root>/.claude` (that would be the root's project settings). The shared default dir stays the fallback (setting `claude_config_mode = shared`) if X0 finds a blocker, and is the mode of this install until 5e.
+- **Always an absolute path** for `CLAUDE_CONFIG_DIR`: a `~`-prefixed value is not expanded for the credentials file (a known Claude Code bug), so the setting refuses anything but an absolute, normalised path.
+- **Credentials = the `/login` credentials file** (`<config>/.credentials.json`) plus the account block of the config's `.claude.json`. `claude setup-token`'s one-year token is not used: it can't start Remote Control sessions (D-042/D-269).
+- **Separate mode exports the config dir minus a fixed exclude list** (design §10.4 "a filtered copy of one directory, caches excluded"): new state files Claude Code adds later go along by default; the exclude list names only caches and runtime files (§3.4). **Shared mode** (5e's source) selects by session and path instead.
+- **Transcripts are kept long enough to resume.** Claude Code deletes transcripts older than `cleanupPeriodDays` (default 30). AFClaude's own `settings.json` sets it from a new DB setting `claude_transcript_retention_days` (default 90, range 30–3650); the task-manager's transcript is appended every run, so it never ages out while in use.
+- **This install keeps running until 5e.** D-187's "no default" is met by recording its current launch root explicitly: X1's deploy step writes `working_root` = the workspace root `ka_resume.sh` and `trust_root` use today, with `claude_config_mode = shared` and the marker `working_root_origin = legacy` (audited, a deploy-step action for AFClaude's task-manager like 5a §0's list). A new install has no value and starts no session until setup chose one. The host check warns on `legacy` until 5e replaces it.
+- **Writes into Claude's files only through the host kit** (5b §3.2): AFClaude's own config dir and the working root, nothing else. The owner's interactive config is never edited (the setup prints the lines the owner runs).
+- **Encryption and passphrase** are 5c's (B2 and its question 1); the export is the 5c bundle with a `claude/` part, `kind = export`.
+- **Fail fast** (D-235): a selection that doesn't match the manifest, a file that changed during the copy, a restore target that isn't empty, a failed validation: abort with the reason, alert, the install stays paused; never a partial export that looks complete.
+
+## 1. Today (as-is inventory)
+
+| what | where | state |
+|---|---|---|
+| working root | none; AFClaude's sessions run under the shared workspace root, beside projects AFClaude doesn't manage; `trust_root` in the local `data/afclaude.json` (a hard-coded legacy fallback in `afclaude_config.py`); `ka_resume.sh` defaults its cwd and `KA_TRUST_ROOT` to that root | no setting, no setup step |
+| config dir | the shared default `~/.claude` and `~/.claude.json`; 12 project dirs, the largest ~360 MB of transcripts; `cleanupPeriodDays` not set (30-day sweep) | AFClaude's and the owner's sessions mixed; `ka_resume.sh` starts sessions with `env -i …`, so a `CLAUDE_CONFIG_DIR` would have to be passed explicitly |
+| credentials | one login for both: `.credentials.json` in the shared dir, the account block in `~/.claude.json` | — |
+| trust (D-051) | `ka_resume.sh` marks the launch cwd trusted in `~/.claude.json` inside the trust root; `trust_dirs.sh`, run once by the owner | — |
+| permissions (D-216/D-217) | repo `.claude/settings.json` (allow rules, SessionStart hook); per-launch flags and `CLAUDE_GUARD_DISABLE=1` in `ka_resume.sh`; user level: MCP registration, the delegation reminder hook, trust; the guard hooks are the owner's own, in the workspace root's settings | listed in the README's Permissions section |
+| `CLAUDE.md` | the workspace root's file forbids unasked changes, with the carve-out for autonomous AFClaude agents (D-103); a user-level one | no AFClaude-owned `CLAUDE.md` |
+| readers of Claude files | stall scan, keepalive (idle, compaction marker, preflight `sessions/`), sampler, `compact_timing.py`: all on the shared dir (through 5b §3.4's batch reads after K4) | one config dir assumed |
+| `driven_sessions` | session, tmux, kind, project, RC url | no `config_dir`, no cwd |
+| backup | 5c B1: the DB bundle, restore into an empty dir, epoch, `restored_from` | no `claude/` part, no guide |
+| Claude Code | 2.1.303 on this host | has `claude auth status` (JSON, names the config dir), `--resume` by id across every project dir and by transcript path, `claude purge --dry-run <dir>` |
+
+## 2. Existing options checked (D-007)
+
+- **`CLAUDE_CONFIG_DIR`** is the documented way to keep a second login with its own settings, history and plugins ("Log in with multiple accounts"); every `~/.claude` path moves under it, credentials included. Known issues: the `~` expansion bug above; reports of local `.claude/` dirs still being created (harmless: project dirs). Where `.claude.json` lives under it and whether Remote Control, `/usage`, `claude agents` and `claude doctor` honour it is X0's spike (design §10.4 "unknowns").
+- **Export/import tooling:** Claude Code has no export command. Community approaches (dotfile managers, profile-switch scripts that copy whole config dirs, sync gists) copy directories wholesale; none selects one tool's sessions out of a shared dir, which 5e needs. The official per-project state list is `claude purge --dry-run <dir>` (transcripts, memory, task lists, file history, the project's `.claude.json` entry, history lines): X4 uses it as the completeness cross-check (everything it lists for an AFClaude project dir is in the export or on the exclude list with a reason), never to delete anything.
+- **Credentials:** the `/login` file vs `setup-token` (above). OAuth refresh tokens rotate, so one credentials file used on two hosts at once logs one of them out; the export's red warning says so (D-174), and 5c B6's move fence keeps the old install from running.
+- **Resume after a move:** `--resume <id>` searches every project dir of the config dir (since 2.1.223) and accepts the absolute transcript path, so a renamed project dir may not need rewriting inside the transcripts; X0 checks it, 5e proves it with real sessions.
+- **Copy mechanism:** a tar stream over the bridge (Python `tarfile` on both ends) instead of rsync or a mount: the bridge stays a whitelist of fixed commands, and the runner has no standing access to the credentials.
+
+## 3. Design details
+
+### 3.1 Settings and session plumbing
+- New settings (section Host, owner only): `working_root` (no default; absolute; must exist and be writable through the kit; refused: `/`, the home dir, the data dir or anything inside it, a path inside another configured root; warnings at setup: transcripts of sessions AFClaude didn't start under it, an ancestor `CLAUDE.md`), `claude_config_mode` (`separate` | `shared`), `claude_transcript_retention_days`, `owner_session_continuation` (default on: the owner's approved stalled sessions keep being resumed with the default dir, F2), `claude_plan` (D-229, asked at setup), `working_root_origin` (`setup` | `restore` | `legacy`, read-only).
+- `driven_sessions` gains `config_dir` and `cwd` (additive). Every launch writes both; `ka_resume.sh` gets `--config-dir` and passes `CLAUDE_CONFIG_DIR` through its `env -i` line; trust marking writes that config dir's `.claude.json`; the trust root is the working root (separate mode) or the legacy root.
+- Project dirs: `<root>/<project-slug>`, `projects.path` validated under the root for new projects (4a's per-project prompt variables use it); existing paths outside the root stay valid only while `working_root_origin = legacy`.
+- The kit's `host.json` lists both config dirs (AFClaude's, and the owner's default dir while `owner_session_continuation` is on) and the root; 5b §3.4's readers take the config dir from the session's row.
+
+### 3.2 AFClaude's config dir (provisioning, X2)
+- Templates in the repo (`claude_home/`, D-217): `settings.json` (the SessionStart rules hook and the delegation reminder through the host wrapper, `cleanupPeriodDays` from the setting, no allow rules beyond what the README lists), the user-level `CLAUDE.md` (AFClaude's autonomy rules: what D-103's carve-out says, without host paths), the root's `CLAUDE.md` (the working root's rules for every AFClaude session).
+- The config's `.claude.json` gets, by key-level merge: `mcpServers.afclaude` (the stdio form through `docker exec`, identified as the driven session, not as a machine), `projects[<root>]` and `projects[<root>/<slug>]` with `hasTrustDialogAccepted` (D-051).
+- The guard hooks: per question §6.1.
+- Applied by one kit command `claude-config apply` with a JSON spec computed in the container: whole-file writes only for the template files inside the config dir and the root's `CLAUDE.md`; key-level merges only for the keys above; anything else refused. Idempotent; the host check compares the result with the spec (drift = warn, a missing hook = fail).
+- The login is the owner's: the setup prints `CLAUDE_CONFIG_DIR=<dir> claude auth login` and waits for `claude auth status` (exit 0, `authMethod = claude.ai`, `configDirectory` = the dir).
+
+### 3.3 Setup (`afclaude setup`, X3; the dashboard wizard in 6a uses the same steps)
+Order (design §10.4): the data dir is chosen before the containers start (5c B7) → new install or restore (5c B7) → host checks (5b K6) → **working root** (an empty answer is refused; no prefilled path) → config mode → Claude plan → provision the config dir → owner signs in → trust and permissions → register this host as a machine and offer a grant (5a, D-195) → time zone. The state of each step is in `meta.setup_state`, so an interrupted setup resumes where it stopped. The runner refuses every session start (fail fast, one alert) while `working_root` is unset or setup is unfinished. The restore branch asks for the working root as well, showing the bundle's old one for reference only (D-187).
+
+### 3.4 The `claude/` part of the export (X4)
+- **Separate mode:** the whole config dir minus the exclude list (with each reason in code): `cache/`, `paste-cache/`, `image-cache/`, `shell-snapshots/`, `session-env/`, `debug/`, `backups/`, `statsig/`, `logs/`, `todos/` (legacy or caches), `sessions/` (running-session markers), `remote-settings*`, `policy-limits*`, `stats-cache.json`, `daemon.log`, lock files. Plus the root's `CLAUDE.md`. Credentials (`.credentials.json`, the `.claude.json` account block) only when ticked (default on, D-174).
+- **Shared mode** (5e): per AFClaude session from `driven_sessions` and the task-manager registry: `projects/<encoded cwd>/<sid>.jsonl`, `<sid>/subagents/`, `<sid>/tool-results/`, `file-history/<sid>/`; per AFClaude project dir: `projects/<encoded>/memory/`; from `.claude.json`: `mcpServers.afclaude`, the AFClaude paths' `projects[…]` entries, the account block when credentials are ticked; the settings and hook files AFClaude needs. The owner confirms the session and project list before the copy (design §11.5).
+- **Cross-check:** for every project dir in the selection, `claude purge --dry-run` (through the kit, read-only) must list nothing outside the export and the exclude list; anything else fails the export with the item named (D-165's addendum: the export is extended, nothing is moved by hand).
+- **Copy:** the container computes the list; kit command `claude-export` validates every path (inside the allowed config dir or root, no symlink escape), streams a tar to stdout and a sha256 per file; a file whose size or mtime changed during the read is re-read once, then the export fails. Members land under `claude/config/…` and `claude/root/…`; the manifest gets a `claude` section (mode, old config dir, old root, credentials yes/no, Claude Code version, every file with sha256 and size). Running sessions: the export of a move happens after the save prompt and the pause (design §11.4); a plain export copies live transcripts as they are (their last line may be mid-turn; the manifest says when).
+- **Guide:** `GUIDE.md` in the bundle, generated from the manifest (design §11.3 steps 1–9 with this bundle's values: Claude Code version, whether credentials are inside, the project repos with their remotes, the old root for reference); `afclaude export guide BUNDLE` prints it.
+
+### 3.5 Restore and the path map (X5)
+- `afclaude restore BUNDLE --into <data dir> --working-root <dir>` (5c's restore plus this part): the root must be empty or new; the config dir under it must not exist. Path map `old root → new root` (and, from a shared-mode bundle, each old project path → `<new root>/<slug>`): the encoded project-dir names, the `.claude.json` `projects` keys, `projects.path` and `driven_sessions.cwd` in the restored DB, the kit's `host.json`. Transcript contents are not rewritten unless X0 shows `--resume` needs it; if it does, the rewrite is one JSON field per line (`cwd`), recorded with new checksums in the manifest's restore record.
+- Kit command `claude-restore`: reads the tar from stdin, writes only under the new config dir and the root, refuses existing files; then `claude-config apply` (X2) re-applies the templates (the bundle's settings win where the spec allows both, and the difference is listed).
+- Credentials not in the bundle: the guide's sign-in step, checked by `claude auth status` before validation.
+- Project repos: cloned from their remotes by the owner (the guide lists them; a project without a remote comes as a `git bundle`, design §11.2).
+
+### 3.6 Post-restore validation (X6)
+Every manifest file present on the host with its checksum (kit `claude-verify`, sha256 only, no contents); all host checks incl. X7's; the end-to-end session (5b K6, with the restored config dir); for each task-manager, its transcript found by id under the new config dir (the real `--resume` is the first continue after the owner resumes; one that fails falls to the hand-off path of design §11.3 step 9 and is reported, not hidden). The install stays paused (D-173) until validation passed and the owner resumed; a failure names the item and keeps it paused.
+
+### 3.7 Host checks added (X7, on 5b's framework)
+Working root exists, writable, trusted; `working_root_origin = legacy` (warn); no restricting ancestor `CLAUDE.md` above the root, the root's `CLAUDE.md` present; config dir: `claude auth status` with that dir, `claude doctor` with that dir (settings errors, RC eligibility), the provisioned files match the spec, `cleanupPeriodDays` set; the guard hooks present and (per §6.1) current; the owner's default dir logged in while `owner_session_continuation` is on.
+
+## 4. Order and dependencies
+
+- **Before X1:** 5b K2 (kit, `host.json`) and K4 (batch reads through the kit); 3b's `driven_sessions.project_id` and task-manager registry (merged); `ka_resume.sh` and `keepalive.py` are live code: X1 is built in a worktree and deployed between runs.
+- X0 has no dependency (throwaway dirs; one owner sign-in, §7). X1 → X2 → X3; X4 needs X1 and 5c B1 (bundle); X5 needs X4 and 5c B7 (restore at setup); X6 needs X5 and 5b K6; X7 with X2 (needs K6). Encryption of the bundle: 5c B2 (and its question 1) before any export with credentials leaves the host.
+- 5a A1 before X3's machine-registration step; 4a P-steps (per-project variables) before X1 changes `projects.path` rules.
+- **5e** runs X3 (setup with restore) on this host with a shared-mode export of today's install; everything it finds missing goes back into X4/X5 (D-165's addendum).
+
+## 5. Steps
+
+**X0: `CLAUDE_CONFIG_DIR` spike (no live change).**
+- **Build:** two throwaway config dirs and a throwaway root in scratch space: where `.claude.json`, credentials, `projects/`, `sessions/` land; settings and hooks loaded from the dir (`/status`, `claude doctor`); an MCP server registered there and seen by `claude mcp list`; trust flags honoured (no prompt in a launched tmux session); `claude agents --json` and the kit's process lookups find sessions of that dir; after the owner's sign-in into the first dir: `claude auth status`, `/usage` (the usage cache in that dir's `.claude.json`), Remote Control (`--remote-control --name`) appears in the app; a copied credentials file in the second dir while the first is used (does one get logged out, and when); `--resume` of a transcript after its project dir was renamed (by id, by path); `cleanupPeriodDays` honoured from the dir's settings.
+- **Done when:** the results replace design §10.4's "unknowns" row; a blocker → `claude_config_mode` stays `shared` for new installs too, and the owner is told why.
+- **Risk:** the throwaway login is a second sign-in of the owner's account; it is logged out and its dir deleted at the end.
+
+**X1: settings, root and config-dir plumbing.**
+- **Build:** §3.1's settings (validation in `actions.SETTINGS`); `driven_sessions.config_dir`/`cwd`; `ka_resume.sh --config-dir`, trust in that dir; the readers per session config dir; the deploy-step action that records this install's legacy root (`install.legacy_root`).
+- **Tests:** each refusal of the root validation; a launch carries `CLAUDE_CONFIG_DIR` through `env -i` (stub tmux); trust written to the right `.claude.json`; no start while `working_root` is unset (alert once); legacy root accepted only with its marker.
+- **Done when:** suites, `test_typing`, `check_public` green; one night on the live install with the legacy root recorded and no behaviour change.
+- **Risk:** a launch path that misses the config dir would start a session in the wrong dir: a test enumerates every `KA_RESUME` call site.
+
+**X2: config dir provisioning.** §3.2; `claude_home/` templates; kit `claude-config apply`; the guard hooks per §6.1. **Tests:** apply on a fixture dir twice (idempotent); refused paths and keys; drift detection; the rendered `settings.json` contains no host path. **Done when:** a provisioned throwaway dir passes X0's checks. **Risk:** a template change reaching running sessions mid-run: applied only at setup, restore, or by an explicit `afclaude setup --reapply` between runs.
+
+**X3: setup CLI.** §3.3 incl. the Claude plan (D-229: the setting and the per-plan defaults table for weekly limit, session length and models; measured values replace them) and the resume of an interrupted setup. **Tests:** a full new-install run against stubs; every step refuses to skip ahead; an empty root answer refused; the restore branch asks for the root; interrupted and resumed. **Done when:** a new install on throwaway dirs (separate container project, staging data dir, no live data) reaches "ready, paused".
+
+**X4: the `claude/` export.** §3.4 in `export.py` (mypy --strict), `afclaude export [--no-credentials] [--shared-selection]`, kit `claude-export`, the purge cross-check, the guide. **Tests:** fixture config dirs in both modes: only AFClaude's sessions in shared mode (a foreign session in the same project dir stays out), excludes applied, credentials on and off (the account block follows the tick), the cross-check catches a planted unknown file, a file changing during the read, a symlink pointing out of the dir, manifest complete; the guide renders from a manifest. **Done when:** an export of a throwaway install verifies (5c's verify extended to the `claude` section).
+
+**X5: restore with the path map.** §3.5; `restore --working-root`, kit `claude-restore`. **Tests:** round trip on fixture dirs (every file back with its checksum under the new root, encoded names mapped, `.claude.json` keys mapped, DB paths mapped); a non-empty target refused; a bundle path escaping the target refused; shared-mode bundle into separate mode. **Done when:** export → restore between two throwaway installs on this host, then X6 passes.
+
+**X6: post-restore validation.** §3.6; the result stored in `meta` and shown by `afclaude status`. **Tests:** a missing file, a wrong checksum, a logged-out dir, a failing host check: each keeps the install paused with the item named.
+
+**X7: host checks for root and config.** §3.7 on 5b's framework. **Tests:** each check ok/warn/fail against stub kit output.
+
+**X8: docs.** Design §10.4 (the spike's results, the config dir location, the legacy marker), §11.2 (the file list as built), §11.3 (the restore command), §13 5d status; README Permissions (what lives in `claude_home/`), file table (`export.py`, the templates); mypy list.
+
+## 6. Questions for the owner
+
+1. **Your safety hooks in AFClaude's own folder.** Today the safety hooks that stop risky commands come from your own settings in the folder where AFClaude works; AFClaude's sessions switch them off but keep their rules in mind, as you decided. In its own folder AFClaude needs these hooks too, or its sessions lose those rules. Options: (a) setup copies your current hook scripts into AFClaude's folder; they go along with every export and move, and AFClaude warns when your originals change so you can copy them again; (b) AFClaude's settings point at your original files; your edits apply to AFClaude at once, but AFClaude then depends on files outside its own folder that an export can't carry. Recommendation: (a).
+
+## 7. Owner steps (no decision needed)
+
+- X0: sign in once into a throwaway Claude folder (one `claude auth login` line, printed by the spike), and again at the end to sign it out.
+- X3/5e: sign in AFClaude's own Claude folder at setup (the printed line), and clone the project repos the guide lists after a restore on a new host.
