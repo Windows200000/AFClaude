@@ -517,7 +517,8 @@ class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "project.manager_launch",
-                  "prompt_var.set", "prompt_var.reset", "prompt_var.migrate"}   # D-197: the people set them (5a)
+                  "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
+                  "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -581,7 +582,7 @@ class SettingActions(Base):
                           "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
                           "runner_timeout_prune_runs": 10.0, "runner_timeout_usage_review": 15.0,
                           "runner_timeout_window_start": 70.0, "runner_start_catchup": 30.0,
-                          "runner_runs_retention_days": 30.0})
+                          "runner_runs_retention_days": 30.0, "restore_starts_paused": True})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -1080,9 +1081,17 @@ class EveryAction(Base):
             ("inbox.retry", {"message_id": 3}),
             ("decision.import", {"path": src.name}),
             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
+            ("install.restored", {"source": {"install_id": store.get_meta(self.conn, "install_id"),
+                                             "install_epoch": 0, "created_at": "2026-10-22T03:00:00.000Z",
+                                             "app_version": None, "schema_version": store.SCHEMA_VERSION,
+                                             "bundle_sha256": "0" * 64, "kind": "backup"}}),
+            ("install.stamp", {}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):
+            if name == "install.stamp":         # a one-off for a database that predates the marker
+                self.conn.execute("DELETE FROM meta WHERE key='install_id'")
+                self.conn.commit()
             self.do(name, actor="owner", via="dashboard", idem=f"every-{i:04d}", **params)
             rows = self.audit()
             self.assertEqual(len(rows), i, name)
