@@ -24,7 +24,9 @@ one pass per invocation does:
   3. Cleanup (unchanged): tmux sessions the dispatcher started (tracked in its state) that
      finished (their task is done/blocked/cancelled and the session is idle, or idle for > 2 h
      after an end_turn), and are not stalled, get their tmux session killed (logged). Nothing
-     else is ever killed, and never the task-manager's tmux session.
+     else is ever killed, and never the task-manager's tmux session. The tmux names are the ones
+     stored with the sessions (3b S2: driven_sessions, readable afc-... names, no name pattern);
+     a gone or killed session's stall row is ended (its name free again).
 
 Phase 3b (not built): with several task-managers, the session-window start picks the project by
 rank/priority and continues ITS task-manager; that selection belongs to the start
@@ -52,7 +54,6 @@ import fcntl
 import glob
 import json
 import os
-import re
 import subprocess
 import sys
 import traceback
@@ -86,7 +87,6 @@ try:
 except afclaude_config.ConfigError as e:
     MANAGER_SESSION = None
     MANAGER_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
-TMUX_RE = re.compile(r"ka-[0-9a-f]{8}")
 
 # data/dispatcher.json: session ids only (machine identity, D-146)
 DEFAULTS = {
@@ -366,10 +366,10 @@ class Pass:
     def skip(self, what, why):
         self.report["skip"].append(f"{what}: {why}")
 
-    def track(self, sid, **info):
+    def track(self, sid, tmux, **info):
         prev = self.st["sessions"].get(sid, {})
         own_tmux = info.pop("own_tmux")
-        self.st["sessions"][sid] = dict(prev, **info, tmux=ka.tmux_name(sid), status="running",
+        self.st["sessions"][sid] = dict(prev, **info, tmux=tmux, status="running",
                                         own_tmux=own_tmux or (prev.get("own_tmux") and prev.get("status") == "running"),
                                         sent_at=store.iso(self.now), verified=None)
 
@@ -433,7 +433,17 @@ class Pass:
         cwd = session_cwd(self.conn, sid)
         if not cwd:
             return self.skip(label, "no existing working directory recorded; not resumable")
-        ok, problems, plan = ka.preflight(sid)
+        try:   # its readable tmux name (3b S2), stored before the launch (armed)
+            tmux = ka.claim_tmux(sid, "stall", title=r.get("title"), arm=self.arm, actor="dispatcher",
+                                 conn=self.conn)
+        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
+            if self.arm:
+                self.st["handled"][key] = {"at": store.iso(self.now), "result": "name-error",
+                                           "error": f"{type(e).__name__}: {e}"[:300]}
+                alert_once(self.st, f"name:{key}", f"dispatcher did NOT continue {sid[:8]}: no tmux name",
+                           f"{type(e).__name__}: {e}"[:500])
+            return self.skip(label, f"no tmux name: {type(e).__name__}: {e}"[:300])
+        ok, problems, plan = ka.preflight(sid, tmux)
         if not ok and problems and problems[0].startswith(ka.RC_HELD):
             # the user has it open in the Remote Control app: skip, retry next pass, log once per stall
             self.skip(label, "skipped, " + problems[0])
@@ -460,11 +470,13 @@ class Pass:
         else:                                         # the user's own session: neutral, on its own model
             msg = ka.session_message("continue_foreign", manager=False, reason=reason_txt, context="")
             model = session_model(sid)
-        name = r.get("title") or ka.tmux_name(sid)
-        entry = {"sid": sid, "plan": plan, "cwd": cwd, "reason": detail, "model": model or ka.LAUNCH["model"]}
+        name = r.get("title") or tmux                 # the Remote Control display name: the owner's title
+        entry = {"sid": sid, "plan": plan, "cwd": cwd, "reason": detail, "model": model or ka.LAUNCH["model"],
+                 "tmux": tmux}
         if not self.arm:
             self.report["continue"].append(entry)
-            log(f"WOULD CONTINUE (dry-run) {sid[:8]} plan={plan} cwd={cwd} name={name!r} model={entry['model']}: "
+            log(f"WOULD CONTINUE (dry-run) {sid[:8]} plan={plan} cwd={cwd} tmux={tmux} name={name!r} "
+                f"model={entry['model']}: "
                 f"{msg[:160]!r}...")
             return
         try:
@@ -487,7 +499,7 @@ class Pass:
                        f"plan={plan} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
             return
         tracked = self.st["sessions"].get(sid, {})
-        self.track(sid, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
+        self.track(sid, tmux, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
                    own_tmux=plan != "send-keys" or tracked.get("own_tmux", False))
 
     # -- 2. verification of earlier continues, 3. cleanup
@@ -508,13 +520,20 @@ class Pass:
                            f"kind={s.get('kind')} task={s.get('task_id')} tmux={s['tmux']}")
 
     def cleanup(self, excluded):
-        never = {ka.tmux_name(MANAGER_SESSION)} | {ka.tmux_name(x) for x in excluded}
+        """By the names stored with the tracked sessions (3b S2: no name pattern): never a
+        task-manager's tmux session or one of the excluded sessions (their stored names)."""
+        rows = store.driven_sessions(self.conn)
+        never = {r["tmux"] for r in rows if r["tmux"] and (r["kind"] == "task-manager"
+                                                           or r["session_id"] in excluded
+                                                           or r["session_id"] == MANAGER_SESSION)}
+        stored = {r["session_id"]: r for r in rows}
         for sid, s in self.st["sessions"].items():
             if s.get("status") != "running":
                 continue
             name = s.get("tmux") or ""
-            if not TMUX_RE.fullmatch(name) or name != ka.tmux_name(sid):
-                continue
+            row = stored.get(sid)
+            if not name or (row is not None and row["tmux"] != name):
+                continue                 # no name, or the session's row names another one: not ours to touch
             try:
                 self.cleanup_one(sid, s, name, never, excluded)
             except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the other sessions go on
@@ -526,6 +545,7 @@ class Pass:
         if not tmux_alive(name):
             s["status"] = "ended"
             s["ended_at"] = store.iso(self.now)
+            self.end_row(sid, name)
             t = store.get_task(self.conn, s["task_id"]) if s.get("task_id") else None
             log(f"session {sid[:8]} ({name}) is gone" + (f"; task #{t['id']} is {t['status']}" if t else ""))
             if t and t["status"] == "in_progress":
@@ -574,8 +594,20 @@ class Pass:
             s["status"] = "cleaned"
             s["cleaned_at"] = store.iso(self.now)
             s["cleaned_why"] = why
+            self.end_row(sid, name)
         else:
             raise RuntimeError(f"tmux kill-session rc={rc}: {err}")
+
+    def end_row(self, sid, name):
+        """The session's tmux session `name` is gone: its stall / review / request row ends (the
+        name is free again; 3b S2). Armed only; a task-manager's row stays."""
+        row = store.get_driven_session(self.conn, sid)
+        if not self.arm or row is None or row["tmux"] != name or row["ended_at"] is not None \
+                or row["kind"] not in ("stall", "review", "request"):
+            return
+        import actions
+        actions.perform(self.conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
+                        actor="dispatcher", via="runner")
 
     def run(self):
         # the install-wide pause only: the stalled sessions it continues are no AFClaude project's

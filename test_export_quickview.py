@@ -749,6 +749,27 @@ class UsageTiles(unittest.TestCase):
         self.assertIn("usage_error", out)
 
 
+class TmuxTile(unittest.TestCase):
+    """3b S2: the task-manager's tmux tile shows its stored name; none stored, or a failed tmux
+    check, is shown as an error, never as a computed ka- name."""
+    def setUp(self):
+        testenv.fresh_db(self)
+        self.old = qv.ka.tmux_has
+        self.addCleanup(setattr, qv.ka, "tmux_has", self.old)
+
+    def test_tile(self):
+        self.assertEqual(qv.tmux_block(), {"tmux_name": None, "tmux_ka_exists": None,
+                                           "tmux_error": "no stored tmux name (driven_sessions)"})
+        testenv.tmux_row(qv.SELF_SESSION, "afc-afclaude-task-manager")
+        qv.ka.tmux_has = lambda name: name == "afc-afclaude-task-manager"
+        self.assertEqual(qv.tmux_block(), {"tmux_name": "afc-afclaude-task-manager", "tmux_ka_exists": True})
+
+        def down(name):
+            raise OSError("bridge down")
+        qv.ka.tmux_has = down
+        self.assertEqual(qv.tmux_block()["tmux_error"], "tmux check failed: bridge down")
+
+
 class PublishPage(unittest.TestCase):
     """D-253: every export publishes the page next to status.json; nginx serves it as HTML."""
     def setUp(self):

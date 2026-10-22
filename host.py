@@ -12,11 +12,13 @@ whitelist. So every host call is mapped onto one of those shapes here:
 
   claude ...                              -> claude ...        (whitelisted forms only)
   <repo>/ka_resume.sh ...                 -> ka_resume.sh ...
-  tmux has-session -t =ka-xxxxxxxx        -> tmux-has ka-xxxxxxxx
-  tmux list-panes -s -t =ka-xxxxxxxx -F #{pane_pid} -> tmux-panes ka-xxxxxxxx
-  tmux kill-session -t =ka-xxxxxxxx       -> tmux-kill ka-xxxxxxxx
-  tmux list-clients -t =ka-xxxxxxxx -F #{client_activity} -> tmux-clients ka-xxxxxxxx
-  tmux capture-pane -e -p -t =ka-xxxxxxxx: -> tmux-capture ka-xxxxxxxx   (the compaction's owner-typing check)
+  tmux has-session -t =NAME               -> tmux-has NAME
+  tmux list-panes -s -t =NAME -F #{pane_pid} -> tmux-panes NAME
+  tmux kill-session -t =NAME              -> tmux-kill NAME
+  tmux list-clients -t =NAME -F #{client_activity} -> tmux-clients NAME
+  tmux capture-pane -e -p -t =NAME:       -> tmux-capture NAME   (the compaction's owner-typing check)
+  tmux rename-session -t =NAME NEW        -> tmux-rename NAME NEW   (the one-time rename, D-281)
+  (NAME, NEW: a tmux session name, ka-<8 hex> or afc-<[a-z0-9-], at most 36>, names.TMUX_RE)
   os.kill(pid, SIGTERM)                   -> kill-claude <pid>   (claude pids only)
   /proc/<pid>/environ                     -> claude-env <pid>    (CLAUDE* lines, claude pids only)
   /proc/<pid>/{stat,cmdline} (preflight)  -> proc-snapshot       (ppid + start of every pid, argv of
@@ -36,8 +38,10 @@ import signal
 import subprocess
 import time
 
-TMUX_NAME = re.compile(r"^=?(ka-[0-9a-f]{8})$")
-TMUX_PANE = re.compile(r"^=(ka-[0-9a-f]{8}):$")     # capture-pane's target: the session's current pane
+# names.TMUX_RE with the target's "=" (exact match) and capture-pane's ":" (the current pane)
+TMUX_NAME = re.compile(r"^=?(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")
+TMUX_PANE = re.compile(r"^=(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36}):\Z")
+TMUX_NEW = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
 NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
@@ -82,6 +86,10 @@ def bridge_argv(argv):
                 m = (TMUX_PANE if shape == "tmux-capture" else TMUX_NAME).match(rest[n])
                 if m:
                     return [shape, m.group(1)]
+        if len(rest) == 4 and rest[:2] == ["rename-session", "-t"]:
+            m, new_name = TMUX_NAME.match(rest[2]), TMUX_NEW.match(rest[3])
+            if m and new_name and rest[2].startswith("="):
+                return ["tmux-rename", m.group(1), rest[3]]
     if head in ("kill-claude", "claude-env") and len(rest) == 1 and rest[0].isdigit():
         return argv
     if head in ("proc-snapshot", "usage-cache") and not rest:

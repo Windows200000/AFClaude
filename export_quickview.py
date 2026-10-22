@@ -689,14 +689,27 @@ def next_run_block(u, now, decision=None):
             if e else None}
 
 
+def tmux_block():
+    """The task-manager's tmux session: its stored name (driven_sessions, 3b S2) and whether it
+    runs. Advisory (D-239): no manager session, no stored name or a failed check is shown as
+    unknown (tmux_ka_exists None) with tmux_error, never as a computed name and never raised."""
+    if not SELF_SESSION:
+        return {"tmux_name": None, "tmux_ka_exists": None, "tmux_error": "no manager session configured"}
+    try:
+        name = ka.tmux_name(SELF_SESSION)
+    except ka.NoTmuxName:
+        return {"tmux_name": None, "tmux_ka_exists": None, "tmux_error": "no stored tmux name (driven_sessions)"}
+    except Exception as e:   # noqa: BLE001 - advisory: unknown, not raised (D-239)
+        return {"tmux_name": None, "tmux_ka_exists": None, "tmux_error": f"tmux name unreadable: {e}"[:200]}
+    try:
+        return {"tmux_name": name, "tmux_ka_exists": ka.tmux_has(name)}
+    except Exception as e:   # noqa: BLE001 - advisory: unknown, not raised (D-239)
+        return {"tmux_name": name, "tmux_ka_exists": None, "tmux_error": f"tmux check failed: {e}"[:200]}
+
+
 def keepalive_and_usage(now):
     u = ka.read_usage_cache()
-    try:
-        tmux_ka_exists = ka.tmux_alive(SELF_SESSION) if SELF_SESSION else None   # None = unknown (D-239)
-    except Exception:   # noqa: BLE001 - advisory: unknown, not raised
-        tmux_ka_exists = None
-    out = {"watcher": watcher_running(), "tmux_ka_exists": tmux_ka_exists,
-           **window_info(now)}
+    out = {"watcher": watcher_running(), **tmux_block(), **window_info(now)}
     nr = next_review_block()
     out["next_usage_review_berlin"] = nr["at_berlin"]
     out["next_usage_review_which"] = nr["which"]

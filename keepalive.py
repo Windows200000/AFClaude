@@ -13,7 +13,7 @@ whose run begins later or is held sends one tiny context-free request while no C
 window is open, so that window opens on the schedule (D-277, "Window-start ping" below). A start
 that fires continues the task-manager session with
 
-    ka_resume.sh --session <full-uuid> --message "<continue msg>"   (tmux, no --bg)
+    ka_resume.sh --session <full-uuid> --tmux <its stored name> --message "<continue msg>"   (tmux, no --bg)
 
 (a non-bg resume continues under the same ID and reconnects Remote Control; it
 would only fork if another live process held the session, which preflight refuses).
@@ -134,8 +134,8 @@ TAKE_OVER_IDLE = False  # opt-in: SIGTERM an idle interactive holder (e.g. an op
 # Core AFClaude sessions run on Opus 5.5 with high effort (user rule, 2026-09-26); subagents they
 # spawn may use other models. A project can give its task-manager another model / effort (D-260,
 # manager_launch.py): launch_for() puts that on top of this for the session it manages.
-LAUNCH = {"model": manager_launch.DEFAULT_MODEL, "effort": manager_launch.DEFAULT_EFFORT,
-          "name": "task-manager keep-alive build"}
+# name: the Remote Control display name; None = the session's tmux name (ka_resume.sh, 3b S2).
+LAUNCH = {"model": manager_launch.DEFAULT_MODEL, "effort": manager_launch.DEFAULT_EFFORT, "name": None}
 
 SCRUBBED_ENV = {
     "HOME": os.path.expanduser("~"),
@@ -725,21 +725,175 @@ def job_state(session_id):
         return None
 
 
+class NoTmuxName(LookupError):
+    """A session has no driven_sessions row naming its tmux session (D-235: never a ka- guess)."""
+
+
 def tmux_name(session_id):
-    return f"ka-{session_id[:8]}"
+    """The tmux session name stored in the session's driven_sessions row (phase 3b S2, D-147: the
+    launchers store it before ka_resume.sh runs, claim_tmux; a task-manager's row comes from 3b
+    S1). No row or no name: NoTmuxName, never a name computed from the id."""
+    import store
+    conn = store.connect()
+    try:
+        row = store.get_driven_session(conn, session_id)
+    finally:
+        conn.close()
+    if row is None or not row.get("tmux"):
+        raise NoTmuxName(f"session {session_id[:8]} has no driven_sessions row with its tmux name "
+                         "(a launcher stores it before the launch; a task-manager's comes from its project)")
+    return row["tmux"]
 
 
-def tmux_alive(session_id):
-    return host.run_on_host(["tmux", "has-session", "-t", "=" + tmux_name(session_id)],
-                            timeout=30).returncode == 0
+def tmux_label(session_id):
+    """tmux_name() for a message text only: the stored name, or a note that there is none."""
+    try:
+        return tmux_name(session_id)
+    except NoTmuxName:
+        return "no stored tmux name"
 
 
-def tmux_pids(session_id):
-    """Pane pids of our own tmux session ka-<id8> (empty if none). A failed host call raises
-    (preflight() refuses then)."""
-    r = host.run_on_host(["tmux", "list-panes", "-s", "-t", "=" + tmux_name(session_id), "-F", "#{pane_pid}"],
-                         timeout=30)
+def tmux_has(name):
+    """True if the tmux session `name` runs on the host. tmux exits 1 when it doesn't (or no tmux
+    server runs); anything else (the bridge failed, a denied name) raises (D-235)."""
+    r = host.run_on_host(["tmux", "has-session", "-t", "=" + name], timeout=30)
+    if r.returncode not in (0, 1):
+        raise OSError(f"tmux has-session {name} failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
+    return r.returncode == 0
+
+
+def tmux_alive(session_id, name=None):
+    """True if the session's tmux session (`name`, else its stored name) runs."""
+    return tmux_has(name or tmux_name(session_id))
+
+
+def tmux_pids(session_id, name=None):
+    """Pane pids of our own tmux session (`name`, else the session's stored name; empty if none).
+    A failed host call raises (preflight() refuses then)."""
+    r = host.run_on_host(["tmux", "list-panes", "-s", "-t", "=" + (name or tmux_name(session_id)), "-F",
+                          "#{pane_pid}"], timeout=30)
     return {int(x) for x in r.stdout.split() if x.isdigit()} if r.returncode == 0 else set()
+
+
+def _live_holder(conn, name, session_id):
+    """(session_id, kind) of another session's live driven_sessions row named `name`, or None."""
+    r = conn.execute("SELECT session_id, kind FROM driven_sessions WHERE tmux=? AND ended_at IS NULL "
+                     "AND session_id<>? ORDER BY session_id", (name, session_id)).fetchone()
+    return (str(r[0]), str(r[1])) if r else None
+
+
+def claim_tmux(session_id, kind, project=None, title=None, arm=True, actor="keepalive", conn=None):
+    """The tmux name a launcher starts or continues `session_id` under, stored in its
+    driven_sessions row before ka_resume.sh runs (phase 3b S2, D-147; names.py). A live row keeps
+    its name; a task-manager's row is never made here (3b S1). Otherwise names.tmux_name(kind, ...)
+    with a suffix only when the name is taken: by another session's live row, or by a running tmux
+    session. A live review / stall / request row of another session whose tmux session is gone is
+    ended first (its name is free). arm False (a dry run): the name only, nothing written.
+    `conn`: the caller's connection (the dispatcher's), else one of its own.
+    -> the name. A tmux or DB failure raises (D-235)."""
+    import actions
+    import names
+    import store
+    own = conn is None
+    conn = store.connect() if own else conn
+    try:
+        row = store.get_driven_session(conn, session_id)
+        if row is not None and row["kind"] not in names.KINDS:
+            raise ValueError(f"session {session_id[:8]} has a driven_sessions row of kind {row['kind']!r}: "
+                             "not one AFClaude launches")
+        if row is not None and row.get("tmux") and (row["ended_at"] is None or row["kind"] == "task-manager"):
+            name = row["tmux"]
+        elif kind == "task-manager" or (row is not None and row["kind"] == "task-manager"):
+            raise NoTmuxName(f"task-manager {session_id[:8]} has no stored tmux name (its row comes from "
+                             "its project, 3b S1)")
+        else:
+            name = _free_tmux(conn, session_id, row["kind"] if row else kind, project, title, arm, actor)
+        if arm and (row is None or row["tmux"] != name or row["ended_at"] is not None):
+            params = {"session_id": session_id, "tmux": name}
+            if row is None:
+                params["kind"] = kind
+            elif row["ended_at"] is not None:
+                params["live"] = True
+            actions.perform(conn, "driven.set", params, actor=actor, via="runner")
+        return name
+    finally:
+        if own:
+            conn.close()
+
+
+def _free_tmux(conn, session_id, kind, project, title, arm, actor):
+    """claim_tmux's new name: the first of names.tmux_name's candidates no other live row holds
+    and no running tmux session has."""
+    import actions
+    import names
+    import store
+    taken = set()
+    while True:
+        name = names.tmux_name(kind, project=project, title=title, sid=session_id, taken=taken)
+        holder = _live_holder(conn, name, session_id)
+        if not tmux_has(name):
+            if holder is None:
+                return name
+            if holder[1] != "task-manager":      # its tmux session is gone: the row ends, the name is free
+                if arm:
+                    actions.perform(conn, "driven.set", {"session_id": holder[0], "ended_at": store.now_iso()},
+                                    actor=actor, via="runner")
+                log(f"tmux {name}: the row of {holder[0][:8]} ({holder[1]}) ended, its tmux session is gone")
+                return name
+        taken.add(name)
+
+
+def rename_tmux(old, new, actor="cli", via="cli"):
+    """Rename the live tmux session `old` to `new` and its driven_sessions row with it (D-281: the
+    task-manager's ka-<id8> once, after 3b S2; docs/phase3b_plan.md §3.3, rollback §3.4). Only
+    at a quiet moment: refused while a terminal is attached to it or a start, compaction or inbox
+    delivery holds the session's lock. The row update failing renames the tmux session back.
+    -> the session id. Any problem raises."""
+    import actions
+    import names
+    import store
+    for n in (old, new):
+        if not names.TMUX_RE.match(n or ""):
+            raise ValueError(f"{n!r} is not a tmux name (ka-<8 hex> or afc-<[a-z0-9-], at most 36>)")
+    if old == new:
+        raise ValueError("the new name is the old one")
+    conn = store.connect()
+    lock = None
+    try:
+        rows = [r for r in store.driven_sessions(conn, include_ended=False) if r["tmux"] == old]
+        if len(rows) != 1:
+            raise ValueError(f"{len(rows)} live driven_sessions rows are named {old} (need exactly one)")
+        sid = rows[0]["session_id"]
+        holder = _live_holder(conn, new, sid)
+        if holder:
+            raise ValueError(f"{new} is the live name of {holder[0][:8]} ({holder[1]})")
+        if not tmux_has(old):
+            raise ValueError(f"no tmux session {old} runs")
+        if tmux_has(new):
+            raise ValueError(f"a tmux session {new} already runs")
+        r = host.run_on_host(["tmux", "list-clients", "-t", "=" + old, "-F", "#{client_activity}"], timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(f"tmux list-clients {old} failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
+        if r.stdout.split():
+            raise ValueError(f"a terminal is attached to {old}: rename it at a quiet moment")
+        lock = session_lock(sid)
+        if lock is None:
+            raise ValueError(f"{sid[:8]} is busy (a start, compaction or inbox delivery holds its lock)")
+        r = host.run_on_host(["tmux", "rename-session", "-t", "=" + old, new], timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError(f"tmux rename-session {old} {new} failed rc={r.returncode}: "
+                               f"{(r.stderr or '').strip()[:200]}")
+        try:
+            actions.perform(conn, "driven.set", {"session_id": sid, "tmux": new}, actor=actor, via=via)
+        except Exception as e:
+            back = host.run_on_host(["tmux", "rename-session", "-t", "=" + new, old], timeout=30)
+            raise RuntimeError(f"the row of {sid[:8]} was not renamed ({type(e).__name__}: {e}); tmux renamed "
+                               f"back to {old}: rc={back.returncode}") from e
+        log(f"tmux {old} renamed to {new} (session {sid[:8]}, row updated)")
+        return sid
+    finally:
+        release_lock(lock)
+        conn.close()
 
 
 def pid_alive(pid):
@@ -822,7 +976,7 @@ def registry_holders(session_id):
 
 
 def is_ours(pid, ours, depth=32):
-    """True if `pid` is one of the pane pids `ours` (our tmux ka-<id8>) or runs under one."""
+    """True if `pid` is one of the pane pids `ours` (our tmux session) or runs under one."""
     while pid and depth > 0:
         if pid in ours:
             return True
@@ -883,16 +1037,19 @@ def archived_since_last_message(path):
     return archived
 
 
-def preflight(session_id):
+def preflight(session_id, tmux=None):
     """_preflight(), failing safe (refuse) if the host's process info is unavailable
-    (inside the container it comes over the SSH bridge)."""
+    (inside the container it comes over the SSH bridge) or the session has no stored tmux name.
+    `tmux`: the name its launcher chose (claim_tmux) when it isn't stored yet (a dry run)."""
     try:
-        return _preflight(session_id)
+        return _preflight(session_id, tmux)
+    except NoTmuxName as e:
+        return False, [f"{e}; not touching the session"], None
     except (OSError, ValueError, subprocess.TimeoutExpired) as e:
         return False, [f"host process info unavailable ({type(e).__name__}: {str(e)[:200]}); not touching the session"], None
 
 
-def _preflight(session_id):
+def _preflight(session_id, tmux):
     """-> (ok, problems[], plan). No --bg anymore: the session is continued in
     its tmux session (send-keys) or resumed into a new one. A live process
     elsewhere would make a fresh resume FORK a copy, so (rc / registry checks first):
@@ -903,15 +1060,16 @@ def _preflight(session_id):
                                        user's RC thread): the server, a child of it,
                                        argv with --sdk-url, or registry entrypoint sdk-cli
       - any other live pid in ~/.claude/sessions/*.json on this uuid that is not our
-        tmux ka-<id8> process and not a `claude agents` row -> refuse (OTHER_HELD)
+        tmux session's process (`tmux`, else its stored name) and not a `claude agents` row
+        -> refuse (OTHER_HELD)
       - live bg worker              -> plan 'stop-bg-then-resume'
       - nothing alive, latest user/assistant entry has entrypoint "sdk-cli"
                                     -> refuse (RC_HELD: an idle rc-server/SDK thread)
       - nothing alive               -> plan 'resume'"""
-    in_tmux = tmux_alive(session_id)
-    ours = tmux_pids(session_id) if in_tmux else set()
+    in_tmux = tmux_alive(session_id, tmux)
+    ours = tmux_pids(session_id, tmux) if in_tmux else set()
     # Every live process the session registry says holds this uuid, except our own
-    # tmux ka-<id8> process (and its children).
+    # tmux session's process (and its children).
     reg = sorted(p for p in registry_holders(session_id) if not is_ours(p, ours))
     rows = [] if in_tmux else [a for a in agent_entries(session_id)
                                if pid_alive(a.get("pid")) and not is_ours(a.get("pid"), ours)]
@@ -970,10 +1128,13 @@ def launch_for(session_id, name=None, model=None):
 
 
 def fire(session_id, cwd, message, plan, new=False, name=None, model=None, category=remote_control.TASK_MANAGER):
-    """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg).
-    name/model override LAUNCH's for this launch; a project's task-manager launch overrides both
-    (launch_for, D-260); `category` picks the Remote Control setting (D-269). Both are resolved
-    first, so a failure there changes nothing."""
+    """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg) under the
+    session's stored tmux name (tmux_name: its launcher stored it first, claim_tmux; none is an
+    error). name (the Remote Control display name, default the tmux name) / model override
+    LAUNCH's for this launch; a project's task-manager launch overrides both (launch_for, D-260);
+    `category` picks the Remote Control setting (D-269). All are resolved first, so a failure
+    there changes nothing."""
+    tmux = tmux_name(session_id)
     launch = launch_for(session_id, name, model)
     remote = remote_control.launch_flags(category)
     if plan.startswith("take-over:"):
@@ -996,7 +1157,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None, categ
             raise RuntimeError(f"`claude stop {session_id[:8]}` failed rc={r.returncode}: "
                                f"{(r.stderr or r.stdout or '').strip()[:200]}; not resumed")
         time.sleep(5)
-    cmd = [KA_RESUME, "--session", session_id, "--message", message,
+    cmd = [KA_RESUME, "--session", session_id, "--tmux", tmux, "--message", message,
            "--cwd", cwd]
     for k, v in launch.items():
         if v:
@@ -3128,6 +3289,7 @@ def work_on_project(sel, args):
     if not args.arm:
         log(f"WOULD START (dry-run): new session {sid} for {p['title']!r} cwd={HERE}")
         return
+    claim_tmux(sid, "request", title=p["title"])      # its readable tmux name, stored first (3b S2)
     sent_at = datetime.now(UTC)
     rc, out, err = fire(sid, HERE, msg, "resume", new=True, name=p["title"])
     log(f"STARTED project {p['title']!r} session={sid} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
@@ -3182,10 +3344,16 @@ def main():
                     help="if an idle interactive process (e.g. an open terminal) holds the session, SIGTERM it and resume in tmux")
     ap.add_argument("--model", default=LAUNCH["model"], help="model to relaunch with (tmux resume)")
     ap.add_argument("--effort", default=LAUNCH["effort"], help="effort to relaunch with")
-    ap.add_argument("--name", default=LAUNCH["name"], help="Remote Control display name")
+    ap.add_argument("--name", default=LAUNCH["name"], help="Remote Control display name (default: the tmux name)")
+    ap.add_argument("--rename-tmux", nargs=2, metavar=("OLD", "NEW"),
+                    help="rename a live tmux session and its driven_sessions row (D-281: once, at a quiet moment)")
     args = ap.parse_args()
     if args.session_rules:
         return print_session_rules(args.session_rules)
+    if args.rename_tmux:
+        sid = rename_tmux(*args.rename_tmux)
+        print(f"renamed {args.rename_tmux[0]} to {args.rename_tmux[1]} (session {sid[:8]})")
+        return
     LAUNCH.update(model=args.model, effort=args.effort, name=args.name)
     global TAKE_OVER_IDLE, IGNORE_WINDOW
     afclaude_config.LOG = log            # a settings problem (DB unreadable) lands in this log

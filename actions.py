@@ -71,6 +71,7 @@ import afclaude_config  # noqa: E402
 import schedule  # noqa: E402
 import manager_launch  # noqa: E402
 import remote_control  # noqa: E402
+import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
@@ -1344,9 +1345,10 @@ def request_finish(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, status: 
 # live name (ended_at NULL) belongs to one row; a project has one live task-manager row. The own
 # sessions (kind 'own') keep their own writer, own_session_add.
 
-DRIVEN_KINDS = ("task-manager", "review", "stall", "request")
-# today's ka-<id8> names (until S6) and the readable afc-... ones (§3.2: [a-z0-9-], at most 40 characters)
-TMUX_RE = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})$")
+DRIVEN_KINDS = names.KINDS
+# today's ka-<id8> names (until S6) and the readable afc-... ones (§3.2: [a-z0-9-], at most 40
+# characters): names.py's, the same the bridge accepts (\Z: no trailing newline)
+TMUX_RE = names.TMUX_RE
 
 
 def _tmux_name(value: Any) -> str:
@@ -1358,11 +1360,14 @@ def _tmux_name(value: Any) -> str:
 
 @action("driven.set", "driven_session")
 def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = None, tmux: Any = None,
-               project: Any = None, task_id: Any = None, started_at: Any = None, ended_at: Any = None) -> Result:
+               project: Any = None, task_id: Any = None, started_at: Any = None, ended_at: Any = None,
+               live: Any = None) -> Result:
     """Add or change a driven session's row: kind (DRIVEN_KINDS), tmux (its name), project (name
     or id; required for a task-manager), task_id, started_at, ended_at (ISO times; a set ended_at
-    frees the name). A new row needs kind and tmux. A row of another kind ('own', legacy rows) is
-    not changed here. The runners' step (S2 on), and the backfill's; not for MCP callers."""
+    frees the name), live (true: an ended row is live again, ended_at cleared; S2's launchers when
+    they continue a session whose row ended). A new row needs kind and tmux. A row of another kind
+    ('own', legacy rows) is not changed here. The runners' step (S2 on), and the backfill's; not
+    for MCP callers."""
     _runner_only(ctx, "driven.set")
     sid = store._session_id(session_id)
     before = store.get_driven_session(conn, sid)
@@ -1386,6 +1391,13 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
             except ValueError:
                 raise ValueError(f"{k} must be an ISO time, got {t!r}") from None
             fields[k] = t
+    if live is not None:
+        if live is not True:
+            raise ValueError(f"live must be true (to end a row, give ended_at), got {live!r}")
+        if ended_at is not None:
+            raise ValueError("live and ended_at contradict each other")
+        if before is not None and before["ended_at"] is not None:
+            fields["ended_at"] = None
     if before is None and ("kind" not in fields or "tmux" not in fields):
         raise ValueError(f"a new driven session needs kind and tmux ({sid})")
     row = dict(before or {}, **fields)

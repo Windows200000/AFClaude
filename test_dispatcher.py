@@ -78,6 +78,11 @@ def stall(u, ts, cwd, reset="9pm"):
                         "content": [{"type": "text", "text": f"You've hit your session limit · resets {reset} (UTC)"}]}}
 
 
+def tname(s):
+    """A test session's stored tmux name (3b S2: readable, never computed by the code under test)."""
+    return f"afc-t-{s[:8]}"
+
+
 STUB_CLAUDE = """#!/bin/sh
 echo "$@" >> {calls}
 case "$*" in *agents*) echo '[]';; esac
@@ -96,8 +101,9 @@ exit 1
 STUB_RESUME = """#!/bin/sh
 printf '%s\\n' "$*" >> {calls}
 [ -e {fail} ] && {{ echo "boom" >&2; exit 3; }}
-while [ $# -gt 0 ]; do [ "$1" = --session ] && S="$2"; shift; done
-T="ka-$(echo "$S" | cut -c1-8)"
+T=""
+while [ $# -gt 0 ]; do [ "$1" = --tmux ] && T="$2"; shift; done
+[ -n "$T" ] || {{ echo "need --tmux" >&2; exit 2; }}
 grep -qx "$T" {alive} 2>/dev/null && {{ echo "sent-keys $T"; exit 0; }}
 echo "$T" >> {alive}
 echo "started $T"
@@ -146,7 +152,8 @@ class Base(unittest.TestCase):
         dp.LOCK_FILE, dp.CONFIG_FILE = os.path.join(data, ".lock"), os.path.join(data, "cfg.json")
         dp.keepalive_targets = lambda: set()
         self.own = stalled.OWN_LIST = os.path.join(d, "own_sessions.txt")
-        self.conn = store.connect(os.path.join(d, "t.db"), create=True)
+        self.db = testenv.fresh_db(self)       # the keep-alive's own reads (tmux_name) see the same DB
+        self.conn = store.connect(self.db)
         self.cfg = dp.load_config(os.path.join(d, "none.json"), {"keepalive_sessions": [], "take_over_idle": False})
         self.st = dp.load_state()
 
@@ -226,6 +233,54 @@ class Stalled(Base):
         rep = self.run_pass()
         self.assertEqual(len(self.resume_calls()), 1)
         self.assertTrue(any("already continued" in s for s in rep["skip"]))
+
+    def test_continue_stores_a_readable_name_first(self):
+        """3b S2: the continue chooses the session's tmux name (afc-stall-<title>-<id4>), stores its
+        driven_sessions row before ka_resume.sh runs, and passes it as --tmux; the Remote Control
+        name stays the owner's title. The next continue of the session keeps that name."""
+        self.stalled_session(sid(1))
+        self.scan()
+        conn = store.connect(self.db)
+        with store.transaction(conn):
+            conn.execute("UPDATE sessions SET title='Fix the Überweisung bug' WHERE session_id=?", (sid(1),))
+        conn.close()
+        store.decide_session(self.conn, sid(1), "continue")
+        self.run_pass()
+        call = self.resume_calls()[0]
+        self.assertEqual(call[call.index("--tmux") + 1], "afc-stall-fix-the-uberweisung-bug-0000")
+        self.assertEqual(" ".join(call[call.index("--name") + 1:call.index("--name") + 5]), "Fix the Überweisung bug")
+        row = store.get_driven_session(self.conn, sid(1))
+        self.assertEqual((row["kind"], row["tmux"], row["ended_at"]), ("stall", "afc-stall-fix-the-uberweisung-bug-0000",
+                                                                       None))
+        self.assertEqual(self.st["sessions"][sid(1)]["tmux"], row["tmux"])
+        audit = self.conn.execute("SELECT actor, action FROM audit_log WHERE target_id=?", (sid(1),)).fetchall()
+        self.assertIn(("dispatcher", "driven.set"), [tuple(a) for a in audit])
+        self.assertEqual(ka.claim_tmux(sid(1), "stall", title="another title", conn=self.conn), row["tmux"])
+
+    def test_a_taken_name_gets_a_suffix(self):
+        """3b S2: a name another live row holds, or a running tmux session has: -2; a live stall row
+        whose tmux session is gone gives its name up (ended)."""
+        self.stalled_session(sid(1))
+        self.scan()
+        testenv.tmux_row(sid(8), "afc-stall-0000", kind="stall")             # live, its tmux runs
+        with open(self.alive, "a") as fh:
+            fh.write("afc-stall-0000\nafc-stall-0000-2\n")                 # and one tmux session without a row
+        self.assertEqual(ka.claim_tmux(sid(1), "stall", conn=self.conn), "afc-stall-0000-3")
+        open(self.alive, "w").close()                                      # all gone
+        conn = store.connect(self.db)
+        with store.transaction(conn):
+            conn.execute("DELETE FROM driven_sessions WHERE session_id=?", (sid(1),))
+        conn.close()
+        self.assertEqual(ka.claim_tmux(sid(1), "stall", conn=self.conn), "afc-stall-0000")
+        self.assertIsNotNone(store.get_driven_session(self.conn, sid(8))["ended_at"])
+
+    def test_dry_run_stores_no_name(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        rep = self.run_pass(arm=False)
+        self.assertEqual(rep["continue"][0]["tmux"], "afc-stall-0000")
+        self.assertIsNone(store.get_driven_session(self.conn, sid(1)))
 
     def test_remote_control_follows_the_continue_setting(self):
         """D-269: a continue uses the "continue" category's Remote Control setting, not another's."""
@@ -386,7 +441,7 @@ class NoStarts(Base):
         self.assertEqual(self.resume_calls(), [])
         self.assertTrue(any(f"task #{t['id']}" in x and "D-204" in x for x in rep["skip"]), rep["skip"])
         store.finish_task(self.conn, t["id"], "ok")                 # an old tracked task session
-        self.st["sessions"][s] = {"tmux": ka.tmux_name(s), "status": "ended", "kind": "task"}
+        self.st["sessions"][s] = {"tmux": tname(s), "status": "ended", "kind": "task"}
         rep = self.run_pass()
         self.assertEqual(self.resume_calls(), [])
 
@@ -460,10 +515,11 @@ class NoGate(Base):
 
 class Cleanup(Base):
     def track(self, s, task_id=None, own_tmux=True):
-        self.st["sessions"][s] = {"tmux": ka.tmux_name(s), "status": "running", "own_tmux": own_tmux,
+        self.st["sessions"][s] = {"tmux": tname(s), "status": "running", "own_tmux": own_tmux,
                                   "task_id": task_id, "sent_at": Z(NOW - timedelta(hours=5)), "verified": True}
+        testenv.tmux_row(s, tname(s), kind="stall")                  # its stored name (3b S2)
         with open(self.alive, "a") as fh:
-            fh.write(ka.tmux_name(s) + "\n")
+            fh.write(tname(s) + "\n")
 
     def idle(self, s, minutes):
         self.transcript(s, [user(f"{s}-u", NOW - timedelta(minutes=minutes + 1), self.work),
@@ -492,12 +548,13 @@ class Cleanup(Base):
                                                      reply("s5a", NOW - timedelta(hours=4), self.work, "tool_use")])
         self.track(sid(6), own_tmux=False); self.idle(sid(6), 300)  # only typed into: release, never kill
         with open(self.alive, "a") as fh:                           # untracked + the manager
-            fh.write("ka-99999999\n" + ka.tmux_name(dp.MANAGER_SESSION) + "\n")
+            fh.write("ka-99999999\n" + tname(dp.MANAGER_SESSION) + "\n")
         mgr = dp.MANAGER_SESSION
-        self.st["sessions"][mgr] = {"tmux": ka.tmux_name(mgr), "status": "running", "own_tmux": True}
+        self.st["sessions"][mgr] = {"tmux": tname(mgr), "status": "running", "own_tmux": True}
+        testenv.tmux_row(mgr, tname(mgr))                           # its task-manager row: never killed
         self.idle(mgr, 600)
         rep = self.run_pass()
-        self.assertEqual(sorted(self.killed()), sorted([ka.tmux_name(sid(1)), ka.tmux_name(sid(2))]))
+        self.assertEqual(sorted(self.killed()), sorted([tname(sid(1)), tname(sid(2))]))
         self.assertEqual({c["sid"] for c in rep["cleanup"]}, {sid(1), sid(2)})
         self.assertEqual(self.st["sessions"][sid(1)]["status"], "cleaned")
         self.assertEqual(self.st["sessions"][sid(6)]["status"], "released")
@@ -505,14 +562,31 @@ class Cleanup(Base):
             self.assertEqual(self.st["sessions"][s]["status"], "running")
         alive = open(self.alive).read().split()
         self.assertIn("ka-99999999", alive)
-        self.assertIn(ka.tmux_name(dp.MANAGER_SESSION), alive)
-        self.assertIn(ka.tmux_name(sid(6)), alive)
+        self.assertIn(tname(dp.MANAGER_SESSION), alive)
+        self.assertIn(tname(sid(6)), alive)
+        rows = {r["session_id"]: r for r in store.driven_sessions(self.conn)}   # 3b S2: a killed one's name is free
+        self.assertEqual({s for s, r in rows.items() if r["ended_at"]}, {sid(1), sid(2)})
+        self.assertIsNone(rows[mgr]["ended_at"])
+
+    def test_cleanup_goes_by_the_stored_names_only(self):
+        """3b S2: no name pattern; a tracked name the session's row doesn't hold is left alone,
+        a task-manager's stored name is never killed, whatever its state says."""
+        self.track(sid(1)); self.idle(sid(1), 180)
+        self.track(sid(2)); self.idle(sid(2), 180)
+        testenv.tmux_row(sid(2), "afc-renamed-elsewhere", kind="stall")     # its row names another one
+        self.track(sid(3)); self.idle(sid(3), 180)
+        conn = store.connect(self.db)
+        with store.transaction(conn):
+            store.upsert_driven_session(conn, sid(3), kind="task-manager")   # a task-manager after all
+        conn.close()
+        self.run_pass()
+        self.assertEqual(self.killed(), [tname(sid(1))])
 
     def test_gone_session_with_open_task_alerts(self):
         self.project("p1")
         t = store.add_task(self.conn, "x", project="p1")
         store.start_task(self.conn, t["id"], sid(1))
-        self.st["sessions"][sid(1)] = {"tmux": ka.tmux_name(sid(1)), "status": "running", "own_tmux": True,
+        self.st["sessions"][sid(1)] = {"tmux": tname(sid(1)), "status": "running", "own_tmux": True,
                                        "task_id": t["id"], "verified": True}
         self.run_pass(now=DAY)
         self.run_pass(now=DAY)
@@ -565,7 +639,7 @@ class FailStop(Base):
             rep = self.run_pass()
         self.assertEqual((self.resumed_sessions(), self.killed()), ([], []))
         self.assertIn(f"stalled {sid(1)[:8]}: automation paused (owner looks)", rep["skip"])
-        self.assertIn(f"cleanup {ka.tmux_name(sid(2))}: automation paused (owner looks)", rep["skip"])
+        self.assertIn(f"cleanup {tname(sid(2))}: automation paused (owner looks)", rep["skip"])
         self.assertEqual(self.st["sessions"][sid(2)]["status"], "running")
 
     def test_a_launch_that_raises_is_recorded_and_pauses(self):
@@ -592,14 +666,14 @@ class FailStop(Base):
         self.track(sid(1)); self.idle(sid(1), 180)
         self.track(sid(2)); self.idle(sid(2), 180)
         real = dp.kill_tmux
-        dp.kill_tmux = lambda name: (1, "no server") if name == ka.tmux_name(sid(1)) else real(name)
+        dp.kill_tmux = lambda name: (1, "no server") if name == tname(sid(1)) else real(name)
         try:
             self.run_pass()
         finally:
             dp.kill_tmux = real
-        self.assertEqual(self.killed(), [ka.tmux_name(sid(2))])
+        self.assertEqual(self.killed(), [tname(sid(2))])
         self.assertEqual(self.st["sessions"][sid(1)]["status"], "running")
-        self.assertIn(f"dispatcher clean-up of {ka.tmux_name(sid(1))} failed: RuntimeError", self.paused()["reason"])
+        self.assertIn(f"dispatcher clean-up of {tname(sid(1))} failed: RuntimeError", self.paused()["reason"])
 
     def test_host_process_list_unavailable_stops_the_pass(self):
         import failstop
@@ -627,13 +701,13 @@ class DryRun(Base):
         self.project("p1")
         t = store.add_task(self.conn, "t", project="p1")
         s2 = sid(2)
-        self.st["sessions"][s2] = {"tmux": ka.tmux_name(s2), "status": "running", "own_tmux": True}
+        self.st["sessions"][s2] = {"tmux": tname(s2), "status": "running", "own_tmux": True}
         with open(self.alive, "a") as fh:
-            fh.write(ka.tmux_name(s2) + "\n")
+            fh.write(tname(s2) + "\n")
         self.transcript(s2, [user("d1", NOW - timedelta(hours=4), self.work),
                              reply("d2", NOW - timedelta(hours=3), self.work)])
         before_state = json.dumps(self.st, sort_keys=True)
-        db = os.path.join(self.d, "t.db")
+        db = self.db
         dump = lambda: "\n".join(sqlite3.connect(db).iterdump())  # noqa: E731
         before_db = dump()
         rep = self.run_pass(arm=False)
@@ -659,7 +733,7 @@ class DryRun(Base):
         self.project("p1")
         store.add_task(self.conn, "t", project="p1")
         data = os.path.join(self.d, "clidata")
-        env = dict(os.environ, AFCLAUDE_DB=os.path.join(self.d, "t.db"), DISPATCHER_DATA_DIR=data,
+        env = dict(os.environ, AFCLAUDE_DB=self.db, DISPATCHER_DATA_DIR=data,
                    KEEPALIVE_PROJECTS_DIR=self.proj, KEEPALIVE_KA_RESUME=ka.KA_RESUME,
                    AFCLAUDE_OWN_LIST=self.own, KA_TRUST_ROOT=self.d)
         # stub claude inside SCRUBBED_ENV too, and a fresh usage reading: an approved stall needs no
@@ -683,7 +757,7 @@ class DryRun(Base):
 
     def run_cli_into(self, data, out_path):
         """The CLI like cron runs it: `>> out_path 2>&1`."""
-        env = dict(os.environ, AFCLAUDE_DB=os.path.join(self.d, "t.db"), DISPATCHER_DATA_DIR=data,
+        env = dict(os.environ, AFCLAUDE_DB=self.db, DISPATCHER_DATA_DIR=data,
                    KEEPALIVE_PROJECTS_DIR=self.proj, KEEPALIVE_KA_RESUME=ka.KA_RESUME,
                    AFCLAUDE_OWN_LIST=self.own, KA_TRUST_ROOT=self.d)
         code = ("import sys, keepalive as ka, dispatcher as dp;"
@@ -780,6 +854,10 @@ class Holders(Base):
     def test_preflight(self):
         ka.TAKE_OVER_IDLE = True
         self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
+        ok, problems, plan = ka.preflight(sid(1))
+        self.assertFalse(ok)                                        # 3b S2: no stored tmux name, no guess
+        self.assertIn("no driven_sessions row with its tmux name", problems[0])
+        testenv.tmux_row(sid(1), tname(sid(1)), kind="stall")
         ok, problems, plan = ka.preflight(sid(1))
         self.assertFalse(ok)
         self.assertTrue(problems[0].startswith(ka.RC_HELD))

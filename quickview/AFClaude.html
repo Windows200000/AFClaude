@@ -385,7 +385,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     var w = k.watcher || {};
     out.push(tile("Watcher", w.running ? '<span class="ok">running</span>' : (w.running === false ? '<span class="bad">not running</span>' : "?"),
       w.pids && w.pids.length ? '<div class="mut">pid ' + esc(w.pids.join(", ")) + "</div>" : ""));
-    out.push(tile("tmux ka-f2897285", k.tmux_ka_exists ? '<span class="ok">up</span>' : '<span class="bad">down</span>'));
+    out.push(tile("tmux " + esc(k.tmux_name || "?"), k.tmux_ka_exists ? '<span class="ok">up</span>' : (k.tmux_ka_exists === false ? '<span class="bad">down</span>' : "?"),
+      k.tmux_error ? '<div class="bad">' + esc(k.tmux_error) + "</div>" : ""));
     out.push(tile(k.in_window ? "Window (now)" : "Next window",
       k.in_window ? '<span class="ok">until ' + esc(k.window_end_berlin || "?") + "</span>" : esc(k.next_window_berlin || "?"),
       '<div class="mut">' + esc(k.window_berlin || "") + " " + esc(k.window_tz || "Europe/Berlin") + (k.in_window ? ", next " + esc(k.next_window_berlin || "?") : "") + "</div>"));

@@ -7,20 +7,23 @@ never eval), checked against the whitelist below, and run directly. Everything e
 is rejected. Every call is logged to data/host_exec.log.
 
 Allowed (exact shapes):
-  ka_resume.sh --session <uuid> --message <text> [--cwd <dir under ROOT>] [--name <t>]
+  ka_resume.sh --session <uuid> --tmux <name> --message <text> [--cwd <dir under ROOT>] [--name <t>]
                [--model <m>] [--effort low|medium|high|xhigh|max] [--new] [--no-remote-control]
   claude agents --json [--all]
   claude -p --no-session-persistence --permission-mode dontAsk /usage
   claude -p --model haiku <only the flags usage_sampler.py / notify.py use>   (prompt on stdin)
   claude stop <8 hex>
   kill-claude <pid>        SIGTERM, only if /proc/<pid>/cmdline is a claude process
-  tmux-has ka-<8 hex>      tmux has-session
+  tmux-has <name>          tmux has-session
   claude-env <pid>         the CLAUDE_* lines of /proc/<pid>/environ, claude pids only
-  tmux-panes ka-<8 hex>    tmux list-panes -s -F '#{pane_pid}' (pane pids, read-only)
-  tmux-kill ka-<8 hex>     tmux kill-session (the dispatcher's cleanup of its own sessions)
-  tmux-clients ka-<8 hex>  tmux list-clients -F '#{client_activity}' (read-only: the owner typing in an
+  tmux-panes <name>        tmux list-panes -s -F '#{pane_pid}' (pane pids, read-only)
+  tmux-kill <name>         tmux kill-session (the dispatcher's cleanup of its own sessions)
+  tmux-clients <name>      tmux list-clients -F '#{client_activity}' (read-only: the owner typing in an
                            attached terminal holds a compaction, D-238)
-  tmux-capture ka-<8 hex>  tmux capture-pane -e -p (read-only: a draft in the input box holds a compaction)
+  tmux-capture <name>      tmux capture-pane -e -p (read-only: a draft in the input box holds a compaction)
+  tmux-rename <name> <new>
+                           tmux rename-session (the one-time rename to a readable name, D-281)
+  (<name>: a tmux session name, ka-<8 hex> or afc-<[a-z0-9-], at most 36>: TMUX below, names.py)
   proc-snapshot            JSON {pid: [ppid, starttime, argv|null]} of every process; argv only
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
@@ -41,6 +44,8 @@ LOG = os.environ.get("AFCLAUDE_HOST_EXEC_LOG") or os.path.join(REPO, "data", "ho
 CLAUDE = os.path.expanduser("~/.local/bin/claude")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
+# the tmux session names (names.TMUX_RE; kept here: this file runs alone as the SSH forced command)
+TMUX = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")
 ENV = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", "opc"), "LANG": "C.UTF-8",
        "PATH": os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:/bin",
        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "TERM": "xterm-256color"}
@@ -100,7 +105,7 @@ def proc_snapshot():
 
 
 def check_ka_resume(args):
-    allowed = {"--session", "--message", "--cwd", "--name", "--model", "--effort"}
+    allowed = {"--session", "--tmux", "--message", "--cwd", "--name", "--model", "--effort"}
     i = 0
     seen = {}
     while i < len(args):
@@ -114,6 +119,8 @@ def check_ka_resume(args):
         i += 2
     if not UUID.match(seen.get("--session", "")) or not seen.get("--message"):
         deny("ka_resume needs --session <uuid> --message")
+    if not TMUX.match(seen.get("--tmux", "")):
+        deny("ka_resume needs --tmux <name>")
     cwd = os.path.realpath(seen.get("--cwd", ROOT))
     if cwd != ROOT and not cwd.startswith(ROOT + os.sep):
         deny("ka_resume cwd outside ROOT")
@@ -151,16 +158,18 @@ def main():
         log(f"OK kill-claude {pid}")
         os.kill(pid, signal.SIGTERM)
         return 0
-    elif head == "tmux-has" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+    elif head == "tmux-has" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "has-session", "-t", "=" + args[0]]
-    elif head == "tmux-panes" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+    elif head == "tmux-panes" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "list-panes", "-s", "-t", "=" + args[0], "-F", "#{pane_pid}"]
-    elif head == "tmux-kill" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+    elif head == "tmux-kill" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "kill-session", "-t", "=" + args[0]]
-    elif head == "tmux-clients" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+    elif head == "tmux-clients" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "list-clients", "-t", "=" + args[0], "-F", "#{client_activity}"]
-    elif head == "tmux-capture" and len(args) == 1 and re.match(r"^ka-[0-9a-f]{8}$", args[0]):
+    elif head == "tmux-capture" and len(args) == 1 and TMUX.match(args[0]):
         cmd = ["tmux", "capture-pane", "-e", "-p", "-t", "=" + args[0] + ":"]
+    elif head == "tmux-rename" and len(args) == 2 and TMUX.match(args[0]) and TMUX.match(args[1]):
+        cmd = ["tmux", "rename-session", "-t", "=" + args[0], args[1]]
     elif head == "proc-snapshot" and not args:
         sys.stdout.write(json.dumps(proc_snapshot()) + "\n")
         log("OK proc-snapshot")

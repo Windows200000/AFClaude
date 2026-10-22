@@ -79,7 +79,8 @@ PROJECTS = os.path.expanduser("~/.claude/projects")
 HAIKU_EVERY = timedelta(minutes=55)
 RECENT = timedelta(hours=6)          # sessions shown to Haiku
 OWN_CWD_MARKERS = ("/work/AFClaude", "AFClaude")
-OWN_NAME_RE = re.compile(r"^(ka-|task-manager keep-alive|guard-bypass-test|RC PoC test|"
+# session names of AFClaude's launches: the tmux / Remote Control names (ka-<id8>; afc-..., 3b S2) and older ones
+OWN_NAME_RE = re.compile(r"^(ka-|afc-|task-manager keep-alive|guard-bypass-test|RC PoC test|"
                          r"limit continue test)", re.I)
 
 

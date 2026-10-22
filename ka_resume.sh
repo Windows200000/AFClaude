@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # Continue a Claude Code session WITHOUT --bg (bg sessions get retired by the
 # daemon after 60 min idle and inherit the daemon's env). The session lives in a
-# detached tmux session named ka-<first 8 of uuid>, as a normal interactive process
+# detached tmux session named by --tmux (the caller's stored name, driven_sessions; names.py:
+# ka-<8 hex> or afc-<[a-z0-9-], at most 36>), as a normal interactive process
 # (Remote-Control-visible unless --no-remote-control) whose env is exactly what this script sets.
 #
-#   ka_resume.sh --session <full-uuid> --message <text> [--cwd DIR] [--name NAME]
+#   ka_resume.sh --session <full-uuid> --tmux NAME --message <text> [--cwd DIR] [--name RC-NAME]
 #                [--model M] [--effort E] [--new] [--no-remote-control]
 #
 # - tmux session already running  -> type the message into it (send-keys)
 # - otherwise                      -> start `claude --resume <uuid> ... "<msg>"` in tmux
-#   (--new: start a brand-new session with --session-id <uuid> instead of resuming;
+#   (--name: the Remote Control display name, default the tmux name;
+#    --new: start a brand-new session with --session-id <uuid> instead of resuming; a tmux
+#    session of that name already running is then an error, never typed into;
 #    --no-remote-control: start it without --remote-control, the session category's setting,
 #    D-269 / remote_control.py; a live tmux session keeps what it was started with)
 set -euo pipefail
 DIR="$(dirname "$(readlink -f "$0")")"
-SID="" MSG="" CWD=/mnt/BlockVolume/Claude NAME="" MODEL=claude-opus-5-5 EFFORT=high NEW=0 RC=(--remote-control)
+SID="" T="" MSG="" CWD=/mnt/BlockVolume/Claude NAME="" MODEL=claude-opus-5-5 EFFORT=high NEW=0 RC=(--remote-control)
 while [ $# -gt 0 ]; do
   case "$1" in
     --session) SID="$2"; shift 2;;
+    --tmux) T="$2"; shift 2;;
     --message) MSG="$2"; shift 2;;
     --cwd) CWD="$2"; shift 2;;
     --name) NAME="$2"; shift 2;;
@@ -30,10 +34,13 @@ while [ $# -gt 0 ]; do
 done
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "need full --session uuid" >&2; exit 2; }
 [ -n "$MSG" ] || { echo "need --message" >&2; exit 2; }
-T="ka-${SID:0:8}"
+# the same names as docker/host_exec.py and names.py; also keeps run/<name>.sh inside run/
+[[ "$T" =~ ^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})$ ]] ||
+  { echo "need --tmux ka-<8 hex> or afc-<[a-z0-9-], at most 36>" >&2; exit 2; }
 NAME="${NAME:-$T}"
 
 if tmux has-session -t "=$T" 2>/dev/null; then
+  if [ "$NEW" = 1 ]; then echo "tmux session $T already exists; a --new session is never typed into it" >&2; exit 1; fi
   # "=name" (exact match) is valid for has-session but is read as a pane name by send-keys
   # a failed send-keys is an error the caller sees (exit 1), never a silent "sent" (D-234/D-235)
   tmux send-keys -t "$T" -l "$MSG" || { echo "send-keys to $T failed (text)" >&2; exit 1; }
