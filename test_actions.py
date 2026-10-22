@@ -1077,6 +1077,7 @@ class EveryAction(Base):
             ("inbox.triage", {"message_id": 2, "verdict": "note", "reason": "later"}),
             ("inbox.include", {"message_ids": [2], "by": "window-start-2026-10-09"}),
             ("inbox.post", {"text": "x", "session_id": SID}),
+            ("inbox.triage_hold", {"message_id": 3, "reason": "the session limit", "retry_after": "2026-10-09T14:00:00Z"}),
             ("inbox.fail", {"message_id": 3, "error": "Haiku timed out"}),
             ("inbox.retry", {"message_id": 3}),
             ("decision.import", {"path": src.name}),

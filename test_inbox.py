@@ -2,7 +2,8 @@
 """Offline tests for the owner's message box to the task-manager (D-178, D-186, D-241; inbox.py,
 inbox_worker.py, inbox_api.py): the table and its actions (verbatim text, audit rows without the
 text, the status transitions), the Haiku verdict parser, the worker's failure paths (a failed
-triage is an error + an alert + automation paused and nothing is delivered, D-244), the delivery's
+triage is an error + an alert + automation paused and nothing is delivered, D-244; one at the
+account's usage limit is held until the limit's reset, then sorted once more), the delivery's
 gates (the session lock, the owner holding or typing, a usage limit, an unreadable pane, a failed
 send, the transcript check), a hold until the next session-window start (D-244: the start takes
 the message along, else an error), the noted messages going along with the next start and the
@@ -40,6 +41,16 @@ import test_compaction as tc  # noqa: E402  (its Env: a fake tmux session and tr
 UTC = timezone.utc
 SID = tc.SID
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+LIMIT_NOTICE = "You've hit your session limit · resets 2pm (UTC)"
+
+
+def limit_out(notice=LIMIT_NOTICE):
+    """What `claude -p --output-format json` printed for inbox #30 (22.10., exit code 1): no usage."""
+    return json.dumps({"duration_api_ms": 0, "stop_reason": "stop_sequence", "total_cost_usd": 0,
+                       "usage": {"input_tokens": 0, "output_tokens": 0}, "type": "result", "is_error": True,
+                       "result": notice})
 
 
 def haiku_out(verdict="now", reason="a question", cost=0.0012, raw=None, is_error=False):
@@ -153,6 +164,30 @@ class Actions(DB):
         with self.assertRaises(store.InvalidTransition):
             self.run_("inbox.include", message_ids=[a["id"]], by="again")
 
+    def test_triage_hold_then_triage_or_fail_or_retry(self):
+        """D-244: a triage held at a usage limit: pending, untriaged, retry_after set; the triage
+        clears it; a failure and the owner's retry too."""
+        a, b = self.post("q1"), self.post("q2")
+        h = self.run_("inbox.triage_hold", message_id=a["id"], reason="session limit", retry_after="2026-10-22T14:00:00+00:00")
+        self.assertEqual((h["status"], h["verdict"], h["hold"], h["retry_after"]),
+                         ("pending", None, "session limit", "2026-10-22T14:00:00Z"))
+        self.assertIsNotNone(h["hold_since"])
+        t = self.run_("inbox.triage", message_id=a["id"], verdict="now", reason="q")
+        self.assertEqual((t["hold"], t["hold_since"], t["retry_after"]), (None, None, None))
+        with self.assertRaises(store.InvalidTransition):                      # triaged: no triage hold
+            self.run_("inbox.triage_hold", message_id=a["id"], reason="x", retry_after="2026-10-22T14:00:00Z")
+        for bad in ("soon", "2026-10-22T14:00:00", None):
+            with self.assertRaises(ValueError, msg=bad):
+                self.run_("inbox.triage_hold", message_id=b["id"], reason="x", retry_after=bad)
+        self.run_("inbox.triage_hold", message_id=b["id"], reason="x", retry_after="2026-10-22T14:00:00Z")
+        e = self.run_("inbox.fail", message_id=b["id"], error="limit again")
+        self.assertEqual((e["status"], e["hold"], e["retry_after"]), ("error", None, None))
+        r = actions.perform(self.conn, "inbox.retry", {"message_id": b["id"]}, actor="owner", via="dashboard")
+        self.assertEqual((r["status"], r["verdict"], r["hold_since"], r["retry_after"]), ("pending", None, None, None))
+        with self.assertRaises(actions.Forbidden):
+            actions.perform(self.conn, "inbox.triage_hold", {"message_id": b["id"], "reason": "x",
+                            "retry_after": "2026-10-22T14:00:00Z"}, actor="mcp:x", via="mcp")
+
     def test_retry_of_a_failed_triage_triages_again(self):
         m = self.post()
         self.run_("inbox.fail", message_id=m["id"], error="Haiku timed out")
@@ -187,7 +222,8 @@ class ParseTriage(unittest.TestCase):
 
 # ---------------------------------------------------------------- the worker: triage
 
-class Triage(DB):
+class FakeHaiku(DB):
+    """A fake Haiku call (self.answer) and a fake send (self.fired)."""
     def setUp(self):
         super().setUp()
         self.calls = []
@@ -203,6 +239,8 @@ class Triage(DB):
         host.run_on_host, ka.fire = self._roh, self._fire
         super().tearDown()
 
+
+class Triage(FakeHaiku):
     def test_note(self):
         m = self.post("Goal for later: a dark mode.")
         out = iw.process(self.conn, verify=lambda *a: None)
@@ -278,6 +316,118 @@ class Triage(DB):
         m = self.post()
         iw.process(self.conn, verify=lambda *a: None)
         self.assertIn("not logged in", self.row(m["id"])["error"])
+        self.assertTrue(failstop.paused()["paused"])                          # at once, no hold (D-235)
+        self.assertIsNone(self.row(m["id"])["retry_after"])
+
+
+# ---------------------------------------------------------------- the worker: triage at a usage limit (D-244)
+
+class TriageAtLimit(FakeHaiku):
+    """Inbox #30 (22.10.): the triage call hit the account's session limit and exited 1. Held until
+    the limit's reset, no error, no pause; sorted once more after it; failing then is an error."""
+    NOW = datetime(2026, 10, 22, 9, 53, tzinfo=UTC)
+    RESET = datetime(2026, 10, 22, 14, 0, tzinfo=UTC)
+
+    def limit(self, out=None, rc=1, stderr=""):
+        self.answer = lambda argv, **kw: types.SimpleNamespace(returncode=rc, stdout=limit_out() if out is None else out,
+                                                               stderr=stderr)
+
+    def note(self):
+        self.answer = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=haiku_out("note", "a goal"), stderr="")
+
+    def held(self, m, reset=None):
+        out = iw.process(self.conn, now=self.NOW, verify=lambda *a: None)
+        r = self.row(m["id"])
+        self.assertEqual((out, r["status"], r["verdict"]), ({"held": 1}, "pending", None))
+        self.assertEqual(r["retry_after"], store.iso(reset or self.RESET))
+        self.assertIn("usage limit", r["hold"])
+        self.assertEqual((self.alerts, failstop.paused()["paused"]), ([], False))   # no error, no pause
+        return r
+
+    def test_held_until_the_reset_and_shown_as_held(self):
+        self.limit()
+        m = self.post()
+        r = self.held(m)
+        self.assertIn("session usage limit", r["hold"])
+        self.assertEqual(len(self.calls), 1)
+        for t in (self.NOW + timedelta(hours=1), self.RESET + iw.TRIAGE_RETRY_MARGIN - timedelta(seconds=1)):
+            self.assertEqual(iw.process(self.conn, now=t, verify=lambda *a: None), {"held": 1})
+        self.assertEqual(len(self.calls), 1)                                  # no call before the reset
+        v = [x for x in inbox.view(self.conn, self.NOW)["messages"] if x["id"] == m["id"]][0]
+        until = self.RESET.astimezone(inbox.BERLIN).strftime(inbox.VIEW_FMT)
+        self.assertEqual((v["state"], v["hold_until_berlin"]), ("held", until))
+        self.assertTrue(v["tip"].startswith("Held: ") and v["tip"].endswith(f"sorted after {until}"), v["tip"])
+        self.assertEqual(self.fired, [])
+
+    def test_sorted_after_the_reset(self):
+        self.limit()
+        m = self.post()
+        self.held(m)
+        self.note()
+        out = iw.process(self.conn, now=self.RESET + iw.TRIAGE_RETRY_MARGIN, verify=lambda *a: None)
+        r = self.row(m["id"])
+        self.assertEqual((out, r["status"], r["verdict"], r["hold"], r["retry_after"]), ({"note": 1}, "noted", "note", None, None))
+        self.assertEqual((len(self.calls), self.alerts, failstop.paused()["paused"]), (2, [], False))
+
+    def test_still_failing_after_the_reset_is_an_error_and_pauses(self):
+        for again in (self.limit, lambda: setattr(self, "answer", lambda argv, **kw: types.SimpleNamespace(
+                returncode=0, stdout=haiku_out(raw="hmm"), stderr=""))):
+            testenv.unpause()
+            self.alerts.clear()
+            self.limit()
+            m = self.post()
+            self.held(m)
+            again()
+            out = iw.process(self.conn, now=self.RESET + timedelta(minutes=5), verify=lambda *a: None)
+            r = self.row(m["id"])
+            self.assertEqual((out, r["status"]), ({"failed": 1}, "error"))
+            self.assertIn("after the usage limit's reset", r["error"])
+            self.assertEqual([a[0] for a in self.alerts],
+                             ["AFClaude STOPPED: inbox message triage failed after the usage limit's reset"])
+            self.assertTrue(failstop.paused()["paused"])
+            self.assertEqual(self.fired, [])
+
+    def test_weekly_limit_without_a_reset_in_the_notice_waits_for_the_usage_cache_reset(self):
+        reset = self.NOW + timedelta(days=2)
+        old = ka.usage_cache_checked
+        ka.usage_cache_checked = lambda: {"weekly": {"percent": 100.0, "resets_at": reset}}
+        self.addCleanup(setattr, ka, "usage_cache_checked", old)
+        self.limit(limit_out("You've hit your weekly limit"))
+        m = self.post()
+        self.assertIn("weekly usage limit", self.held(m, reset)["hold"])
+
+    def test_no_reset_to_wait_for_is_an_error(self):
+        for cache in (lambda: None, lambda: {"session": {"percent": 100.0, "resets_at": self.NOW - timedelta(minutes=1)}},
+                      lambda: (_ for _ in ()).throw(OSError("bridge down"))):
+            testenv.unpause()
+            old = ka.usage_cache_checked
+            ka.usage_cache_checked = cache
+            try:
+                self.limit(limit_out("You've hit your session limit"))
+                m = self.post()
+                out = iw.process(self.conn, now=self.NOW, verify=lambda *a: None)
+            finally:
+                ka.usage_cache_checked = old
+            self.assertEqual((out, self.row(m["id"])["status"]), ({"failed": 1}, "error"))
+            self.assertTrue(failstop.paused()["paused"])
+
+    def test_the_notice_on_stderr_counts_too(self):
+        self.limit(out="", stderr=LIMIT_NOTICE)
+        self.held(self.post())
+
+    def test_other_limits_and_quoted_notices_are_no_hold(self):
+        """A spend limit has no reset to wait for (an error at once); a successful call whose answer
+        quotes a limit notice is a normal verdict."""
+        self.assertIsNone(iw.limit_notice(1, limit_out("You've hit your monthly spend limit · resets Nov 1, 12am (UTC)"), ""))
+        self.assertIsNone(iw.limit_notice(0, haiku_out(raw='{"verdict": "now", "reason": "You\'ve hit your session limit?"}'), ""))
+        self.assertEqual(iw.limit_notice(1, limit_out("You've hit your limit · resets 2pm (UTC)"), ""),
+                         ("", "You've hit your limit · resets 2pm (UTC)"))
+        self.assertEqual(iw.limit_notice(0, limit_out(), "")[0], "session")   # is_error with exit code 0
+        self.limit(limit_out("You've hit your monthly spend limit"))
+        m = self.post()
+        self.assertEqual(iw.process(self.conn, now=self.NOW, verify=lambda *a: None), {"failed": 1})
+        self.assertEqual(self.row(m["id"])["status"], "error")
+        self.assertTrue(failstop.paused()["paused"])
 
 
 # ---------------------------------------------------------------- the worker: delivery

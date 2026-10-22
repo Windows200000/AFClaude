@@ -54,7 +54,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                longer matches the current default.
                inbox_messages (D-178/D-241, additive the same way): the owner's messages to the
                task-manager from the dashboard, verbatim, with the Haiku triage and the delivery
-               state (inbox.py, inbox_api.py; written only through actions.py's inbox.* actions).
+               state (inbox.py, inbox_api.py; written only through actions.py's inbox.* actions);
+               its retry_after (COLUMNS, no version bump) holds a triage that hit the account's
+               usage limit until the limit's reset (D-244, inbox_worker.triage).
                project_pauses (D-244, additive the same way): the automation pause of one project
                (an inbox error pauses the project its message was for); the install-wide pause
                stays the settings automation_paused / automation_paused_reason (failstop.py).
@@ -383,7 +385,7 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
     triage_cost_usd REAL,                  -- the triage call's own cost and usage (claude -p JSON)
     triage_usage    TEXT,
     hold            TEXT,                  -- why a "now" message waits (owner typing, a compaction, ...)
-    hold_since      TEXT,
+    hold_since      TEXT,                  -- (retry_after, COLUMNS: a triage held at a usage limit)
     delivered_at    TEXT,
     delivered_via   TEXT,                  -- the send plan (send-keys, resume, ...)
     included_at     TEXT,                  -- a note sent along with a message into the session ...
@@ -781,6 +783,9 @@ COLUMNS = {
     # phase 3b S1 (docs/phase3b_plan.md §3.1): the project of a task-manager row; a request's run
     "driven_sessions": [("project_id", "INTEGER REFERENCES projects(id)")],
     "action_requests": [("run_id", "INTEGER"), ("updated_at", "TEXT")],
+    # D-244: a message whose triage call hit the account's usage limit waits until this time (the
+    # limit's reset), then is triaged again once (inbox_worker.triage)
+    "inbox_messages": [("retry_after", "TEXT")],
 }
 
 SESSION_FIELDS = (
@@ -2960,7 +2965,7 @@ INBOX_STATUSES = ("pending", "delivered", "noted", "included", "answered", "erro
 INBOX_VERDICTS = ("now", "note")
 INBOX_TEXT_MAX = 4000          # characters (a "now" message is typed into tmux in one go)
 INBOX_FIELDS = ("status", "verdict", "verdict_reason", "triaged_at", "triage_cost_usd", "triage_usage",
-                "hold", "hold_since", "delivered_at", "delivered_via", "included_at", "included_by",
+                "hold", "hold_since", "retry_after", "delivered_at", "delivered_via", "included_at", "included_by",
                 "answer", "answered_at", "error", "error_at")
 
 
