@@ -347,6 +347,16 @@ class LimitsBlock(unittest.TestCase):
         self.assertEqual((b["own_pct_week"], b["user_pct_week"], b["user_unseen_pct_week"]), (9.0, 66.0, 12.0))
         self.assertEqual((b["runs_week"], b["run_hours_week"]), (1, 2.5))
         self.assertEqual(b["afc_session_token_share_week"], 0.944)
+        # pacing's three-way split wins (D-266): the design chats are on AFClaude's side
+        snap["attribution"]["week_split"] = {
+            "status": "ok", "method": "pacing", "run_pct": 40.0, "design_pct": 64.54, "other_pct": 26.46,
+            "other_unseen_pct": 15.0, "total_pct": 131.0, "uncovered_pct": 0.0,
+            "own_share": 104.54 / 131.0, "other_share": 26.46 / 131.0}
+        b = qv.limits_from_snapshot(snap)
+        self.assertEqual((b["share_method"], b["own_share_week"], b["user_share_week"]), ("pacing", 0.798, 0.202))
+        self.assertEqual((b["run_pct_week"], b["design_pct_week"], b["other_pct_week"]), (40.0, 64.5, 26.5))
+        self.assertEqual((b["total_pct_week"], b["other_unseen_pct_week"]), (131.0, 15.0))
+        self.assertEqual(b["afc_session_token_share_week"], 0.944)
 
 
 class ThresholdBlock(unittest.TestCase):

@@ -572,6 +572,9 @@ def limits_from_snapshot(snap):
     pref = snap.get("preferred_ratio") or {}
     share = (snap.get("attribution") or {}).get("week_share") or {}
     tok = (snap.get("attribution") or {}).get("week_share_tokens") or {}
+    split = (snap.get("attribution") or {}).get("week_split")
+    if split:   # pacing's three-way split (D-266: design chats are AFClaude's); older snapshots: the time split
+        share = split
 
     def r4(x):
         return round(x, 4) if x is not None else None
@@ -601,6 +604,13 @@ def limits_from_snapshot(snap):
         "user_unseen_pct_week": r1(share.get("user_unseen_pct")),
         "runs_week": share.get("runs_in_cycle"),
         "run_hours_week": r1(share.get("run_hours")),
+        # share_method "pacing" (pacing.cycle_split): AFClaude = runs + design chats, user = other use
+        "run_pct_week": r1(share.get("run_pct")),
+        "design_pct_week": r1(share.get("design_pct")),
+        "other_pct_week": r1(share.get("other_pct")),
+        "other_unseen_pct_week": r1(share.get("other_unseen_pct")),
+        "total_pct_week": r1(share.get("total_pct")),
+        "uncovered_pct_week": r1(share.get("uncovered_pct")),
         "afc_session_token_share_week": r3(tok.get("own_share")) if tok.get("status") == "ok" else None,
         "as_of": snap.get("generated_at"),
         # per-session-window estimate (limit_ratio.estimate_window_ratio) and the

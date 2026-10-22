@@ -27,7 +27,8 @@ Forecast (the predictor): (1 - budget_weight) x the rate forecast + budget_weigh
 budget left. The rate forecast: the user's typical weekly-% rise per hour of the week (Berlin
 weekday x hour) from the last 4 closed weekly cycles, each hour shrunk toward the mean rate
 (shrink_hours pseudo-hours). The weekly budget: the user's typical weekly total (a closed cycle's
-final weekly % minus AFClaude's own rise in it: its runs and the design chats; only cycles the
+final weekly %, with a one-off reset the sum of its segments (cycle_totals), minus AFClaude's own
+rise in it: its runs and the design chats; only cycles the
 samples cover >= BUDGET_MIN_COVERAGE of) minus the user's use so far in the open cycle,
 spread over the rest of it in the shape of the rate forecast. User-only: AFClaude's runs (the
 recorded run rows, else a fire until the next prompt in an AFClaude session or the run going
@@ -75,6 +76,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import limit_ratio
 import schedule
 import runner_state
 import telemetry
@@ -465,12 +467,14 @@ def own_other_tokens(row):
     return float(w[0]), float(w[1])
 
 
-def _intervals(rows, fires, runs=None):
+def _intervals(rows, fires, runs=None, spans=None):
     """-> [(t0, t1, weekly-% rise, auto, cycle, design)] of consecutive samples in one weekly cycle
     (<= 1 h apart); auto = the interval overlaps an autonomous AFClaude run; design = the part of
     the rise outside a run that is the owner's design chats (D-266): rise x own / (own + other)
     weighted tokens of the sample intervals in (t0, t1] (own_other_tokens; no local tokens: 0,
-    another device), 0 inside a run."""
+    another device), 0 inside a run. Across a one-off reset (the meter >= limit_ratio.RESET_DROP
+    below the previous reading, same reset time) the meter restarted at 0: the rise is the reading
+    after the drop. spans = the run spans if the caller has them (else run_spans())."""
     tok, acc = {}, [0.0, 0.0]
     for r in rows:                      # tokens of skipped (stale) rows go to the next kept one
         if not _ts(_dict(r).get("at")):
@@ -480,19 +484,83 @@ def _intervals(rows, fires, runs=None):
         if _num(_weekly(r).get("percent")):
             tok[id(r)], acc = tuple(acc), [0.0, 0.0]
     rows = [r for r in rows if _num(_weekly(r).get("percent")) and _ts(r.get("at"))]
-    spans = run_spans(rows, fires, runs)
+    spans = run_spans(rows, fires, runs) if spans is None else spans
     out = []
     for p, c in zip(rows, rows[1:]):
         t0, t1 = _ts(p["at"]), _ts(c["at"])
         cyc = _round_reset(_weekly(c).get("resets_at"))
         if _round_reset(_weekly(p).get("resets_at")) != cyc or not timedelta(0) < t1 - t0 <= timedelta(hours=1):
             continue
-        dw = max(float(_weekly(c)["percent"]) - float(_weekly(p)["percent"]), 0.0)
+        pw, cw = float(_weekly(p)["percent"]), float(_weekly(c)["percent"])
+        dw = cw if cw <= pw - limit_ratio.RESET_DROP else max(cw - pw, 0.0)
         auto = any(a < t1 and t0 < b for a, b in spans)
         own, oth = tok.get(id(c), (0.0, 0.0))
         design = 0.0 if auto or own + oth <= 0 else dw * own / (own + oth)
         out.append((t0, t1, dw, auto, cyc, design))
     return out
+
+
+def cycle_totals(rows):
+    """-> {cycle: (total weekly %, the last reading's row)}: per weekly cycle, the sum of its
+    segments' rises (§3.5 of docs/usage_split_plan.md): the last reading plus, for every one-off
+    reset in it (a reading >= limit_ratio.RESET_DROP below the previous one), the reading before
+    the drop. Without a one-off reset = the last reading, the cycle's final weekly %. Rows sorted
+    by time; stale rows are skipped."""
+    out, prev = {}, {}
+    for r in rows:
+        w = _weekly(r)
+        c = _round_reset(w.get("resets_at"))
+        if c is None or not _num(w.get("percent")) or not _ts(_dict(r).get("at")):
+            continue
+        wp = float(w["percent"])
+        done = out.get(c, (0.0, None))[0] - (prev.get(c) or 0.0)   # the closed segments' sum
+        if c in prev and wp <= prev[c] - limit_ratio.RESET_DROP:
+            done += prev[c]
+        out[c], prev[c] = (done + wp, r), wp
+    return out
+
+
+def cycle_split(rows, spans, cycle):
+    """pacing's three-way split of one weekly cycle's weekly % (D-266, D-221; _intervals, the
+    numbers the forecast is fitted on): run = intervals overlapping an AFClaude run, design = the
+    owner's design chats outside runs, other = the rest (other sessions on this host, other
+    devices: `other_unseen_pct` = the part in intervals with no local tokens). `total_pct` = the
+    cycle's weekly % so far (cycle_totals, one-off resets summed); `uncovered_pct` = the part no
+    interval covers (before the first reading, gaps > 1 h, a stale stretch). spans = the AFClaude
+    run spans (limit_ratio.load_autonomous_spans); None = unknown: insufficient_data."""
+    if cycle is None:
+        return {"status": "insufficient_data", "method": "pacing", "reason": "no current weekly sample"}
+    if spans is None:
+        return {"status": "insufficient_data", "method": "pacing", "reason": "AFClaude run spans unavailable"}
+    rows = sorted((r for r in rows if _ts(_dict(r).get("at"))), key=lambda r: _ts(r["at"]))
+    run = design = other = unseen = 0.0
+    tok, acc = {}, 0.0                  # local tokens per kept reading's interval, as _intervals
+    for r in rows:
+        acc += sum(own_other_tokens(r))
+        if _num(_weekly(r).get("percent")):
+            tok[_ts(r["at"])], acc = acc, 0.0
+    n = 0
+    for t0, t1, dw, auto, cyc, des in _intervals(rows, [], spans=spans):
+        if cyc != cycle:
+            continue
+        n += 1
+        if auto:
+            run += dw
+            continue
+        design += des
+        other += dw - des
+        if dw > 0 and tok.get(t1, 0.0) <= 0:
+            unseen += dw
+    total = cycle_totals(rows).get(cycle, (0.0, None))[0]
+    covered = run + design + other
+    out = {"method": "pacing", "n_intervals": n, "run_pct": round(run, 2), "design_pct": round(design, 2),
+           "other_pct": round(other, 2), "other_unseen_pct": round(unseen, 2), "total_pct": round(total, 2),
+           "uncovered_pct": round(max(total - covered, 0.0), 2),
+           "note": "pacing's split of the week (D-266): AFClaude = its runs + the design chats; other = "
+                   "the owner's other use (other sessions on this host and other devices)"}
+    if covered <= 0:
+        return dict(out, status="insufficient_data", reason="no weekly % rise this cycle yet")
+    return dict(out, status="ok", own_share=(run + design) / covered, other_share=other / covered)
 
 
 def user_intervals(rows, fires, runs=None):
@@ -586,19 +654,16 @@ def fit_profile(rows, fires, now, runs=None, params=None):
     mean, m = sum(rise) / covered, P["shrink_hours"]
     rates = Profile((rise[k] + m * mean) / (hours[k] + m) if hours[k] + m > 0 else mean for k in range(168))
     rates.design_week, rates.design_weeks = 168.0 * design / covered, len(closed)
-    # the weekly budget: per closed cycle, its final weekly % minus AFClaude's own rise in it
+    # the weekly budget: per closed cycle, its final weekly % (one-off resets summed) minus AFClaude's own rise in it
     # (its runs and the design chats)
-    last = {}
-    for r in rows:
-        c = _round_reset(_weekly(r).get("resets_at"))
-        if c is not None and _num(_weekly(r).get("percent")):
-            last[c] = r
+    ctot = cycle_totals(rows)     # a cycle with a one-off reset: the sum of its segments (§3.5)
+    last = {c: r for c, (_, r) in ctot.items()}
     auto, cov = {}, {}
     for t0, t1, dw, a, cyc, des in iv:
         cov[cyc] = cov.get(cyc, 0.0) + (t1 - t0) / WEEK
         if a or des:
             auto[cyc] = auto.get(cyc, 0.0) + (dw if a else des)
-    totals = [max(float(_weekly(last[c])["percent"]) - auto.get(c, 0.0), 0.0) for c in closed
+    totals = [max(ctot[c][0] - auto.get(c, 0.0), 0.0) for c in closed
               if c in last and c - _ts(last[c]["at"]) <= FINAL_MAX_GAP and cov.get(c, 0.0) >= BUDGET_MIN_COVERAGE]
     info = (f"forecast from {len(closed)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% other user usage; "
             f"design chats {rates.design_week:.1f}%/week (flat mean of {len(closed)} week(s), D-264)")
@@ -614,7 +679,7 @@ def fit_profile(rows, fires, now, runs=None, params=None):
         r = last[c]
         rates.week_total = sum(totals) / len(totals)
         rates.cycle_end, rates.as_of = c, _ts(r["at"])
-        rates.used = max(float(_weekly(r)["percent"]) - auto.get(c, 0.0), 0.0)
+        rates.used = max(ctot[c][0] - auto.get(c, 0.0), 0.0)
         rates.budget_weight = P["budget_weight"]
         info += (f"; weekly budget {rates.week_total:.0f}% (mean of {len(totals)}), used {rates.used:.0f}%, "
                  f"weight {rates.budget_weight:g}")

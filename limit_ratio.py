@@ -47,6 +47,16 @@ is the only copy, data/session_windows.jsonl is a frozen legacy file). `preferre
 is that estimate once MIN_WINDOWS usable windows exist, else the old median
 (flagged). The old `ratio` fields are unchanged.
 
+One-off resets (docs/usage_split_plan.md §3.5): a meter that drops by >= RESET_DROP points
+while its rounded reset time stays the same was reset outside its schedule (as the owner's
+one-off reset of 21./22.10.2026). reset_events() lists them; a window across one is split into
+segments like a weekly reset (the interval across the drop dropped), the time split restarts its
+running maximum at 0 there (the meter restarts from 0: the reading after the drop is the rise
+since the reset), and the events are recorded in the weekly cycle records (`reset_events`,
+record_reset_events). The snapshot also carries pacing's three-way split of the week
+(`attribution.week_split`: run / design chats / other use, pacing.cycle_split, D-266), which the
+quickview shows as AFClaude vs the owner.
+
 Sparse data is reported honestly: any estimate backed by fewer than
 MIN_PAIRS usable pairs comes back as status "insufficient_data" rather than
 a number.
@@ -236,6 +246,7 @@ MIN_WINDOWS = 5             # usable windows needed before the per-window ratio 
 DIST_MAX = 30               # most recent windows listed in the snapshot's distribution
 WINDOW_RECORD_VERSION = 1
 SESSION_WINDOWS = os.path.join(DATA, "session_windows.jsonl")  # never pruned
+RESET_DROP = 2.0            # a meter this many points below its previous reading, same reset time: a one-off reset
 
 
 def _points(rows):
@@ -256,7 +267,46 @@ def _points(rows):
                     "own": weighted_tokens((act.get("own") or {}).get("tokens")),
                     "other": weighted_tokens((act.get("other") or {}).get("tokens"))})
     pts.sort(key=lambda p: p["t"])
+    _mark_resets(pts)
     return pts
+
+
+def _one_off(prev, cur):
+    """The meters ("weekly", "session") that were reset outside their schedule between two
+    consecutive readings: the meter dropped by >= RESET_DROP while its rounded reset time
+    stayed the same (a scheduled reset moves the reset time)."""
+    out = []
+    if prev["wr"] is not None and prev["wr"] == cur["wr"] and cur["wp"] <= prev["wp"] - RESET_DROP:
+        out.append("weekly")
+    if prev["sr"] is not None and prev["sr"] == cur["sr"] and cur["sp"] <= prev["sp"] - RESET_DROP:
+        out.append("session")
+    return out
+
+
+def _mark_resets(pts):
+    """Number the stretches between one-off resets: each point gets `epoch` (+1 after every
+    reset event) and the point after a drop `resets` (the meters reset before it)."""
+    epoch = 0
+    for prev, cur in zip([None] + pts[:-1], pts):
+        meters = _one_off(prev, cur) if prev else []
+        if meters:
+            epoch += 1
+            cur["resets"] = meters
+        cur["epoch"] = epoch
+
+
+def reset_events(rows):
+    """The one-off resets in sample rows (any order), oldest first: {meter, at (the first reading
+    after the drop), prev_at, resets_at (the meter's rounded reset time, unchanged), from_pct,
+    to_pct}. Stale rows are skipped (their meters are not readings)."""
+    out = []
+    pts = _points(rows)
+    for prev, cur in zip(pts, pts[1:]):
+        for m in cur.get("resets") or ():
+            k = "w" if m == "weekly" else "s"
+            out.append({"meter": m, "at": _iso(cur["t"]), "prev_at": _iso(prev["t"]),
+                        "resets_at": _iso(cur[k + "r"]), "from_pct": prev[k + "p"], "to_pct": cur[k + "p"]})
+    return out
 
 
 def _iso(dt):
@@ -286,43 +336,52 @@ def window_record(key, pts, pre=None):
     deltas are summed. Only the interval between the last old-cycle and the
     first new-cycle sample (one sampling step, its weekly delta unknowable) is
     dropped, and the rounding error counts the extra readings. Excluding such
-    windows outright would throw away up to 5 h of good data per week.
+    windows outright would throw away up to 5 h of good data per week. A one-off
+    reset inside the window (a meter drop with the same reset time, _mark_resets)
+    splits it the same way (flag "one_off_reset_split").
 
     Saturation: once a meter reads 100% it stops tracking (the weekly meter sat
-    at 100 while the session meter still rose), so the window is cut at the
-    last sample before any meter reached 100 (flag "capped")."""
+    at 100 while the session meter still rose), so each segment is cut at the
+    last sample before any meter reached 100 (flag "capped"); a segment after a
+    reset tracks again."""
     start = key - SESSION_LEN
     flags = []
     pts = list(pts)
     base_kind = "first_sample"
-    if (pre and pre["sr"] is None and pre["sp"] == 0 and pts and pre["wr"] == pts[0]["wr"]
+
+    def seg_key(p):
+        return p["wr"], p.get("epoch", 0)
+
+    if (pre and pre["sr"] is None and pre["sp"] == 0 and pts and seg_key(pre) == seg_key(pts[0])
             and pre["t"] > start - SESSION_LEN and pre["t"] <= start + timedelta(minutes=1)):
         pts = [dict(pre, exact_session=True)] + pts
         base_kind = "idle_pre_sample"
     # coverage is judged on what was observed, before any saturation cut
     # (a capped window is cut on purpose, it isn't missing data)
     observed = (pts[-1]["t"] - pts[0]["t"]) if pts else timedelta(0)
-    if pts and len({p["wr"] for p in pts}) > 1:   # minus the dropped straddling interval(s)
+    if pts and len({seg_key(p) for p in pts}) > 1:   # minus the dropped straddling interval(s)
         observed = sum((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)
-                        if pts[i]["wr"] == pts[i + 1]["wr"]), timedelta(0))
-    # cut at saturation
-    cut = None
-    for i, p in enumerate(pts):
-        if p["sp"] >= CAP_PCT or p["wp"] >= CAP_PCT:
-            cut = i
-            break
-    if cut is not None:
-        flags.append("capped")
-        pts = pts[:cut]
-    # segments by weekly cycle
+                        if seg_key(pts[i]) == seg_key(pts[i + 1])), timedelta(0))
+    # segments by weekly cycle and one-off reset
     segs = []
     for p in pts:
-        if segs and segs[-1][-1]["wr"] == p["wr"]:
+        if segs and seg_key(segs[-1][-1]) == seg_key(p):
             segs[-1].append(p)
         else:
             segs.append([p])
-    if len(segs) > 1:
+    if len({p["wr"] for p in pts}) > 1:
         flags.append("weekly_reset_split")
+    if len({p.get("epoch", 0) for p in pts}) > 1:
+        flags.append("one_off_reset_split")
+    # cut each segment at saturation
+    for i, seg in enumerate(segs):
+        cut = next((j for j, p in enumerate(seg) if p["sp"] >= CAP_PCT or p["wp"] >= CAP_PCT), None)
+        if cut is not None:
+            segs[i] = seg[:cut]
+            if "capped" not in flags:
+                flags.append("capped")
+    segs = [seg for seg in segs if seg]
+    pts = [p for seg in segs for p in seg]
     ds = dw = es = ew = 0.0
     var_s = var_w = 0.0
     covered = timedelta(0)
@@ -342,7 +401,11 @@ def window_record(key, pts, pre=None):
         other += sum(p["other"] for p in seg[1:])
         seg_out.append({"first_at": _iso(a["t"]), "last_at": _iso(b["t"]), "weekly_resets_at": _iso(a["wr"]),
                         "d_session": d_s, "d_weekly": d_w})
-    max_gap = max((pts[i + 1]["t"] - pts[i]["t"] for i in range(len(pts) - 1)), default=timedelta(0))
+        if a.get("epoch"):
+            seg_out[-1]["reset_epoch"] = a["epoch"]   # the number of one-off resets before it (_mark_resets)
+    # within the segments (an interval across a reset is dropped, and a cut leaves no gap)
+    max_gap = max((seg[i + 1]["t"] - seg[i]["t"] for seg in segs for i in range(len(seg) - 1)),
+                  default=timedelta(0))
     if max_gap > GAP_FLAG:
         flags.append("gap")
     cov_frac = observed / SESSION_LEN
@@ -437,10 +500,39 @@ def merge_windows(stored, derived):
     return [by[k] for k in sorted(by)]
 
 
+def record_reset_events(rows, path):
+    """Add the one-off resets found in `rows` (reset_events) to their weekly cycle records
+    (`reset_events`, the cycle keyed by the weekly reset; telemetry's cycles, usage_sampler.track_cycle
+    keeps the field). Writes only when an event is new; a cycle without a record yet gets
+    track_cycle's empty record (it fills in the rest). -> the newly recorded events."""
+    events = reset_events(rows)
+    if not events:
+        return []
+    cycles = telemetry.read_cycles(path)
+    wr_of = {_iso(p["t"]): p["wr"] for p in _points(rows)}
+    new, changed = [], {}
+    for e in events:
+        key = _iso(wr_of[e["at"]])
+        c = changed.get(key) or dict(cycles.get(key) or {"reset_at": key, "first_seen": e["prev_at"], "samples": 0,
+                                                         "max_pct": 0, "scheduled": False})
+        have = c.get("reset_events") or []
+        if any(h.get("meter") == e["meter"] and h.get("at") == e["at"] for h in have):
+            continue
+        c["reset_events"] = have + [e]
+        changed[key] = c
+        new.append(e)
+    if changed:
+        telemetry.write_cycles({**cycles, **changed}, path)
+    return new
+
+
 def append_new_windows(rows, path=SESSION_WINDOWS, now=None, source="sampler"):
     """Append every completed window found in `rows` that the store (the DB for the live
     path) doesn't have yet (called by the sampler on each run, so a window is recorded on
-    the first run after it ends). Returns (all stored records, newly added)."""
+    the first run after it ends), and record new one-off resets in the weekly cycle records
+    next to it (record_reset_events: the live cycles for the live path, else a side file
+    weekly_cycles.json in the same directory). Returns (all stored records, newly added)."""
+    record_reset_events(rows, os.path.join(os.path.dirname(os.path.abspath(path)), "weekly_cycles.json"))
     stored = load_windows(path)
     have = {w.get("window_end") for w in stored}
     computed_at = (now or datetime.now(UTC)).isoformat()
@@ -697,7 +789,10 @@ def estimate_time_split(rows, spans, current_weekly_resets, now=None):
     to the user (the owner working in parallel elsewhere). Stale readings are skipped, so a rise
     across a stale gap is still counted (split by the gap's overlap with runs). `user_unseen_pct`
     is the user's rise in intervals with no transcript tokens at all on this host (other devices,
-    claude.ai, or a meter lagging an earlier interval)."""
+    claude.ai, or a meter lagging an earlier interval). A one-off reset (the reading >= RESET_DROP
+    below the previous one, same reset time) restarts the running maximum at 0: the reading after
+    the drop is the rise since the reset (listed in `reset_events`; `total_pct` = the sum of the
+    segments' rises, `weekly_pct` = the meter now)."""
     if current_weekly_resets is None:
         return {"status": "insufficient_data", "method": "time", "reason": "no current weekly sample"}
     if spans is None:
@@ -706,7 +801,8 @@ def estimate_time_split(rows, spans, current_weekly_resets, now=None):
     start = current_weekly_resets - WEEK
     grace = [(a, b + RUN_END_GRACE) for a, b in spans]
     merged = combine_spans(fallback=grace)
-    prev_t, prev_w = start, 0.0
+    prev_t, prev_w, last_w = start, 0.0, None
+    events = []
     tok_o = tok_u = 0.0
     own = user = unseen = 0.0
     n = 0
@@ -722,6 +818,10 @@ def estimate_time_split(rows, spans, current_weekly_resets, now=None):
         if w.get("percent") is None or _round_reset(w.get("resets_at")) != current_weekly_resets:
             continue
         wp = float(w["percent"])
+        if last_w is not None and wp <= last_w - RESET_DROP:     # one-off reset: the meter restarted at 0
+            events.append({"at": _iso(t), "from_pct": last_w, "to_pct": wp})
+            prev_w = 0.0
+        last_w = wp
         dw = max(wp - prev_w, 0.0)
         if dw > 0 and t > prev_t:
             frac = min(1.0, _overlap(prev_t, t, merged) / (t - prev_t).total_seconds())
@@ -737,6 +837,7 @@ def estimate_time_split(rows, spans, current_weekly_resets, now=None):
     total = own + user
     in_cycle = [(max(a, start), min(b, now)) for a, b in spans if b > start and a < now]
     out = {"method": "time", "n_readings": n, "weekly_pct": round(prev_w, 1),
+           "total_pct": round(total, 2), "reset_events": events,
            "own_pct": round(own, 2), "user_pct": round(user, 2), "user_unseen_pct": round(unseen, 2),
            "runs_in_cycle": len(in_cycle),
            "run_hours": round(sum((b - a).total_seconds() for a, b in in_cycle) / 3600, 2),
@@ -800,6 +901,9 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None, spa
     share_tok = (estimate_weekly_share(pairs, rates, weekly_resets_now)
                  if weekly_resets_now is not None else {"status": "insufficient_data", "reason": "no current weekly sample"})
     share = estimate_time_split(rows, spans, weekly_resets_now, now=now)
+    import pacing   # here, not at the top: pacing imports this module
+    split3 = pacing.cycle_split([r for r in rows if (_parse_ts(r.get("at")) or now) <= now + timedelta(minutes=1)],
+                                spans, weekly_resets_now)
 
     wins = merge_windows(windows, build_windows(rows, now=now))
     snap = {
@@ -808,7 +912,7 @@ def compute(rows, now=None, trimmed_days=DEFAULT_TRIMMED_DAYS, windows=None, spa
         "windows_per_week": windows_per_week(ratio),
         "windows_left_this_week": windows_left_this_week(ratio, weekly_pct_now),
         "weekly_pct_now": weekly_pct_now,
-        "attribution": {"rates": rates, "week_share": share, "week_share_tokens": share_tok},
+        "attribution": {"rates": rates, "week_share": share, "week_share_tokens": share_tok, "week_split": split3},
         "ratio_windows": estimate_window_ratio(wins, pairs=pairs, now=now, recent_days=trimmed_days),
     }
     pref = preferred_ratio(snap)
@@ -878,6 +982,14 @@ def human_summary(snap):
                      f"({share['own_pct']:g} pts in {share['runs_in_cycle']} run(s), {share['run_hours']:g} h) / "
                      f"user {_fmt_share(share['other_share'])} ({share['user_pct']:g} pts, of which "
                      f"{share['user_unseen_pct']:g} with no local tokens: other devices / claude.ai)")
+    sp = snap["attribution"].get("week_split") or {}
+    if sp.get("status") == "ok":
+        lines.append(f"This week's weekly %, pacing's split (D-266): AFClaude {_fmt_share(sp['own_share'])} "
+                     f"(runs {sp['run_pct']:g} + design chats {sp['design_pct']:g} pts) / other use "
+                     f"{_fmt_share(sp['other_share'])} ({sp['other_pct']:g} pts, {sp['other_unseen_pct']:g} with no "
+                     f"local tokens); {sp['total_pct']:g} pts this cycle, {sp['uncovered_pct']:g} not covered")
+    elif sp:
+        lines.append(f"This week's weekly %, pacing's split: insufficient data ({sp.get('reason') or '?'})")
     tok = snap["attribution"].get("week_share_tokens") or {}
     if tok.get("status") != "ok":
         reason = tok.get("missing_side_rate") or tok.get("reason") or "?"

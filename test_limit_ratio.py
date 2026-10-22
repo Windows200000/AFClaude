@@ -298,6 +298,8 @@ class ComputeSnapshot(unittest.TestCase):
         self.assertAlmostEqual(att["week_share"]["other_share"], 1.0)   # no runs: all user
         self.assertIn("week_share_tokens", att)
         self.assertIn("AFClaude runs vs user", lr.human_summary(snap))
+        self.assertEqual((att["week_split"]["method"], att["week_split"]["status"]), ("pacing", "ok"))
+        self.assertIn("pacing's split", lr.human_summary(snap))
         snap = lr.compute(rows, now=T0 + timedelta(days=1))              # spans unknown
         self.assertEqual(snap["attribution"]["week_share"]["status"], "insufficient_data")
 
@@ -588,6 +590,87 @@ class WindowFile(unittest.TestCase):
             self.assertEqual([w["window_end"][:10] for w in out], ["2026-09-01", "2026-09-26"])
             self.assertEqual(out[1]["source"], "backfill")
             self.assertEqual(len(lr.load_windows(path)), 2)
+
+
+class OneOffReset(unittest.TestCase):
+    """docs/usage_split_plan.md §3.5: a meter that drops by >= RESET_DROP with its reset time unchanged
+    (the owner's one-off reset of 21./22.10.) splits the windows, restarts the time split and is recorded."""
+
+    def window(self):
+        # weekly 50 -> 62 until sample 10, then a one-off reset: 1 -> 7; session rises throughout
+        seq = lambda i: (float(4 * i), float(50 + i) if i <= 10 else float(i - 10))   # noqa: E731
+        return window_rows(seq, week_reset=WEEK_RESET)
+
+    def test_reset_events(self):
+        ev = lr.reset_events(self.window())
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["meter"], ev[0]["from_pct"], ev[0]["to_pct"]), ("weekly", 60.0, 1.0))
+        self.assertEqual(ev[0]["resets_at"], lr._iso(lr._round_reset(WEEK_RESET)))
+        # a 1-point wobble and a scheduled weekly reset (the reset time moves) are no events
+        rows = [srow(W_START + timedelta(minutes=15 * i), 4.0 * i, wp, session_reset=W_END.isoformat(), week_reset=wr)
+                for i, (wp, wr) in enumerate([(50, WEEK_RESET), (49, WEEK_RESET), (51, WEEK_RESET), (2, WEEK_RESET2)], 1)]
+        self.assertEqual(lr.reset_events(rows), [])
+
+    def test_session_one_off_reset(self):
+        seq = lambda i: (float(4 * i) if i <= 8 else float(i - 8), float(40 + i // 2))   # noqa: E731
+        ev = lr.reset_events(window_rows(seq))
+        self.assertEqual([e["meter"] for e in ev], ["session"])
+        w = PerWindow.one(self, window_rows(seq))
+        self.assertIn("one_off_reset_split", w["flags"])
+        self.assertEqual(w["d_session"], 32.0 + (19 - 9))      # 0 -> 32, then 1 -> 11
+
+    def test_window_across_the_drop_is_split_not_excluded(self):
+        w = PerWindow.one(self, self.window())
+        self.assertIn("one_off_reset_split", w["flags"])
+        self.assertNotIn("inconsistent", w["flags"])
+        self.assertTrue(w["usable"])
+        s1, s2 = w["segments"]
+        self.assertEqual((s1["d_weekly"], s2["d_weekly"]), (10.0, 9.0 - 1.0))   # 50 -> 60, then 1 -> 9
+        self.assertEqual(s2["reset_epoch"], 1)
+        self.assertEqual(w["d_weekly"], s1["d_weekly"] + s2["d_weekly"])
+        self.assertEqual(w["d_session"], 40.0 + (76.0 - 44.0))   # the interval across the drop is dropped
+        self.assertEqual(w["err_weekly"], 2.0)
+
+    def test_saturated_segment_cut_later_segment_kept(self):
+        # weekly sits at 100 from sample 5, then a one-off reset at sample 9: the segment after it tracks again
+        seq = lambda i: (float(4 * i), float(min(100, 96 + i)) if i <= 8 else float(i - 8))   # noqa: E731
+        w = PerWindow.one(self, window_rows(seq))
+        self.assertIn("capped", w["flags"])
+        self.assertIn("one_off_reset_split", w["flags"])
+        self.assertEqual(w["weekly_end_pct"], 11.0)
+        self.assertEqual(w["d_weekly"], 3.0 + 10.0)              # 96 -> 99, then 1 -> 11
+
+    def test_time_split_counts_the_rise_after_the_drop(self):
+        ts = TimeSplit()
+        rows = [ts.r(1, 40), ts.r(2, 90), ts.r(3, 100), ts.r(4, 8), ts.r(5, 20), ts.r(6, 31)]
+        s = ts.split(rows, [ts.span(3, 4)])
+        self.assertEqual(s["weekly_pct"], 31.0)
+        self.assertEqual(s["total_pct"], 131.0)                 # 100 before the drop + 31 since
+        # 0 -> 8 across the drop, inside the run; + RUN_END_GRACE's 10 min of the next hour's 12
+        self.assertAlmostEqual(s["own_pct"], 8.0 + 2.0)
+        self.assertAlmostEqual(s["user_pct"], 100.0 + 21.0)
+        self.assertEqual([(e["from_pct"], e["to_pct"]) for e in s["reset_events"]], [(100.0, 8.0)])
+
+    def test_cycle_records_get_the_events(self):
+        import json
+        import tempfile
+        rows = self.window()
+        with tempfile.TemporaryDirectory() as d:
+            cyc = os.path.join(d, "weekly_cycles.json")
+            key = lr._iso(lr._round_reset(WEEK_RESET))
+            with open(cyc, "w") as fh:
+                json.dump({key: {"reset_at": key, "samples": 3, "max_pct": 60, "scheduled": True}}, fh)
+            lr.append_new_windows(rows, path=os.path.join(d, "session_windows.jsonl"), now=W_END + timedelta(minutes=5))
+            with open(cyc) as fh:
+                c = json.load(fh)[key]
+            self.assertEqual((c["samples"], c["max_pct"]), (3, 60))     # track_cycle's fields kept
+            self.assertEqual([(e["meter"], e["to_pct"]) for e in c["reset_events"]], [("weekly", 1.0)])
+            self.assertEqual(lr.record_reset_events(rows, cyc), [])       # already recorded: no write
+            os.remove(cyc)                                                # no record yet: track_cycle's empty one
+            self.assertEqual(len(lr.record_reset_events(rows, cyc)), 1)
+            with open(cyc) as fh:
+                c = json.load(fh)[key]
+            self.assertEqual((c["samples"], c["scheduled"], len(c["reset_events"])), (0, False, 1))
 
 
 def statistics_stdev(xs):
