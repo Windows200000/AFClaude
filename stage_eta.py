@@ -455,11 +455,18 @@ def usage_split(samples: Iterable[Mapping[str, Any]],
     overlaps an AFClaude run, "design" = AFClaude sessions' own activity outside runs (the owner's
     task-manager chats; AFClaude usage, D-266), "other" = other sessions on this host plus usage with no
     host activity (other devices). A mixed interval is split by own vs other weighted tokens.
-    Samples without a weekly_pct_delta (before the token split existed) are skipped."""
+    Samples without a weekly_pct_delta (before the token split existed) are skipped. The first
+    reading after a one-off weekly reset (limit_ratio.reset_events, §3.5 of
+    docs/usage_split_plan.md; the sampler has no delta for it) counts as a rise from 0, as in
+    pacing.cycle_totals."""
+    import limit_ratio
+    samples = list(samples)
+    events = cast(Callable[[list[Mapping[str, Any]]], list[dict[str, Any]]], limit_ratio.reset_events)(samples)
+    restart = {_ts(e.get("at")): float(e["to_pct"]) for e in events if e.get("meter") == "weekly"}
     out: dict[str, dict[str, float]] = {}
     for s in samples:
-        d = s.get("weekly_pct_delta")
         t = _ts(s.get("at"))
+        d = restart.get(t, s.get("weekly_pct_delta"))
         if not isinstance(d, (int, float)) or isinstance(d, bool) or t is None:
             continue
         since = _ts(s.get("since")) or t - timedelta(minutes=15)

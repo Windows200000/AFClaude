@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import afclaude_config  # noqa: E402
+import limit_ratio  # noqa: E402
 import pacing  # noqa: E402
 import schedule  # noqa: E402
 import usage_model  # noqa: E402
@@ -87,7 +88,7 @@ def build_steps(rows, reset, user_until, user_scale=1.0, late_burst_h=0.0):
         if (t - ts(p["at"])) < timedelta(minutes=1):
             continue
         user = t <= user_until
-        dw = max(wk(c)[0] - wk(p)[0], 0.0) if user else 0.0
+        dw = limit_ratio.meter_rise(wk(p)[0], wk(c)[0]) if user else 0.0   # one-off reset: from 0
         ds = max((sess(c) or 0) - (sess(p) or 0), 0.0) if user else 0.0
         steps.append(dict(t=t, dt=(t - ts(p["at"])).total_seconds() / 3600, dw=dw * user_scale, ds=ds * user_scale,
                           act_new=user and pacing.user_signal(c, p),
