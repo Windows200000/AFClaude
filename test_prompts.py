@@ -249,6 +249,7 @@ class SameTextTest(unittest.TestCase):
             out[f"save_text {trigger}"] = ka.save_text(SID, trigger)
             out[f"compact_resume {trigger}"] = ka.compact_resume_text(
                 SID, {"status": "saved", "handoff_id": self.handoff}, trigger)[0]
+        out["save_retry_text"] = ka.save_retry_text(SID, 8)
         for chained in (end, end + timedelta(hours=5)):
             with mock.patch.object(ka, "next_start_after", return_value=chained):
                 out[f"run_pace {chained}"] = ka.run_pace_text(SID, {"run_end": end}, end - timedelta(hours=3),
