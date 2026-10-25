@@ -587,5 +587,32 @@ async def afclaude_decisions(action: Literal["find", "show"], keywords: Optional
         conn.close()
 
 
+
+def notice_brief(n: Mapping[str, Any]) -> dict[str, Any]:
+    return compact({"id": n["id"], "title": n["title"], "text": n["text"], "project": n["project_name"],
+                    "posted": bt(n["created_at"]), "by": n["created_by"], "source": n["source"],
+                    "dismissed": bt(n["dismissed_at"])})
+
+
+@tool("Notices for the owner on the AFClaude dashboard (D-306), shown until dismissed. post: title (one line), "
+      "text (the full content, no file pointers), optional project. list (all: also dismissed).")
+async def afclaude_notice(action: Literal["post", "list"], title: Optional[str] = None, text: Optional[str] = None,
+                          project: Optional[str] = None, all: bool = False, ctx: Optional[Context] = None) -> str:
+    conn = db()
+    try:
+        if action == "list":
+            return out({"notices": [notice_brief(n) for n in store.list_notices(conn, include_dismissed=all)]})
+        params: dict[str, Any] = {"title": title, "text": text}
+        if project is not None and project.strip():
+            ref = await resolve_dir_arg(ctx, project)
+            p = store.get_project(conn, ref)
+            if p is None:
+                raise store.NotFound(f"no project {project!r}")
+            params["project"] = p["id"]
+        return out(notice_brief(act(conn, "notice.post", **params)))
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     server.run("stdio")

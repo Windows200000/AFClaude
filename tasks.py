@@ -64,6 +64,10 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            kept apart from DECISIONS.md's Keywords line)
     tasks.py decision import [--file F] [--force]   DECISIONS.md into the DB now (also every 10 min
                                            and at each compaction; the file is never written)
+    tasks.py notice post --title T --text TEXT|- [--project P]   a notice for the owner on the
+                                           dashboard (D-306), shown until the owner dismisses it
+    tasks.py notice list [--all]           the notices still shown (--all: the dismissed ones too)
+    tasks.py notice dismiss ID             dismiss one (the owner; the dashboard's Dismiss button)
 
 Tasks are the stages of a project; projects form a ranked list. Execution
 order: every high stage (by project rank, then stage), then every medium one,
@@ -555,6 +559,8 @@ def run(conn, args):
         run_automation(conn, args)
     elif c == "driven":
         return run_driven(conn, args) or 0
+    elif c == "notice":
+        run_notice(conn, args)
     elif c == "inbox" and args.inbox_cmd:
         run_inbox_messages(conn, args)
     elif c == "inbox":
@@ -675,6 +681,36 @@ def run_driven(conn, args):
         return 1
     dump(rep) if args.json else driven.print_check(rep)
     return 0 if rep["ok"] else 1
+
+
+def print_notice(n):
+    state = f"dismissed {berlin(n['dismissed_at'])}" if n["dismissed_at"] else "shown"
+    about = f"  [{n['project_name']}]" if n["project_name"] else ""
+    print(f"#{n['id']}  {berlin(n['created_at'])}  {state}{about}  {n['title']}")
+    print("   " + n["text"].replace("\n", "\n   "))
+
+
+def run_notice(conn, args):
+    """D-306: notices for the owner on the dashboard (post, list, dismiss)."""
+    nc = args.notice_cmd
+    if nc == "list":
+        rows = store.list_notices(conn, include_dismissed=args.all)
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print("no notices shown" if not args.all else "no notices")
+        for n in rows:
+            print_notice(n)
+        return None
+    if nc == "post":
+        text = sys.stdin.read() if args.text == "-" else args.text
+        params = {"title": args.title, "text": text}
+        if args.project:
+            params["project"] = doc_project(conn, args.project)["id"]
+        n = act(conn, "notice.post", **params)
+    else:   # dismiss
+        n = act(conn, "notice.dismiss", notice_id=args.id)
+    return dump(n) if args.json else print(f"notice #{n['id']}: {'dismissed' if n['dismissed_at'] else 'posted'}")
 
 
 def parser():
@@ -856,6 +892,17 @@ def parser():
                                                     "each compaction; the file is not changed)")
     q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")
     q.add_argument("--force", action="store_true", help="allow removing more than half of the decisions")
+    p = sub.add_parser("notice", help="notices for the owner on the dashboard (D-306): post | list | dismiss")
+    ns = p.add_subparsers(dest="notice_cmd", required=True)
+    q = ns.add_parser("post", parents=[js], help="post a notice (shown until the owner dismisses it)")
+    q.add_argument("--title", required=True, help=f"one line, at most {store.NOTICE_TITLE_MAX} characters")
+    q.add_argument("--text", required=True, help=f"the full content, at most {store.NOTICE_TEXT_MAX} "
+                                                 "characters; - = stdin")
+    q.add_argument("--project", help="name or directory of the project it is about (default: none)")
+    q = ns.add_parser("list", parents=[js], help="the notices still shown")
+    q.add_argument("--all", action="store_true", help="also the dismissed ones")
+    q = ns.add_parser("dismiss", parents=[js], help="dismiss a notice")
+    q.add_argument("id", type=int)
     return ap
 
 

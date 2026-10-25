@@ -1771,6 +1771,92 @@ def inbox_dismiss(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result
     return _inbox_change(before, after)
 
 
+# ---------------------------------------------------------------- notices for the owner (D-306)
+#
+# A notice is a title and a short text on the dashboard's "Needs your input" section until the owner
+# dismisses it: anything meant for the owner that is not an immediate chat answer. notice.post is the
+# task-manager's (`tasks.py notice post`, MCP afclaude_notice), notice.dismiss the owner's (the inbox
+# API, the CLI). Every review report doc (review:*) writes its own notice (review_notice below, from
+# doc.set and doc.sync), audited as notice.post / notice.update in the doc action's transaction.
+
+REVIEW_SUMMARY_MAX = 1200          # characters of a review's summary in its notice
+REVIEW_SUMMARY_HEADS = re.compile(r"^#{2,6}\s+(tl;?dr|summary|short summary|result|results|conclusions?|findings|"
+                                  r"verdict|outcome)\b", re.I)
+
+
+@action("notice.post", "notice")
+def notice_post(conn: sqlite3.Connection, ctx: Ctx, title: Any, text: Any, project: Any = None) -> Result:
+    """A notice for the owner (D-306): `title`, `text` (the full content, D-279), optionally about
+    one project. It stays on the dashboard until the owner dismisses it."""
+    pid = store._project_row(conn, project)["id"] if project is not None else None
+    n = store.add_notice(conn, title, text, pid, ctx.actor)
+    return Result(n, n["id"], None, n)
+
+
+@action("notice.dismiss", "notice", owner_only=True)
+def notice_dismiss(conn: sqlite3.Connection, ctx: Ctx, notice_id: Any) -> Result:
+    """The owner dismisses a notice: it leaves the dashboard (D-306)."""
+    before = store.notice_row(conn, notice_id)
+    if before["dismissed_at"] is not None:
+        raise store.InvalidTransition(f"notice #{before['id']} is already dismissed")
+    after = store.update_notice(conn, before["id"], dismissed_at=store.now_iso())
+    return Result(after, after["id"], before, after)
+
+
+def review_summary(text: str, fallback_title: str) -> tuple[str, str]:
+    """A review report's (title, short summary) for its notice: the first '# ' heading (else
+    `fallback_title`); the first block (paragraph or list) under a TL;DR / Summary / Results-like
+    heading, else the first block after the title. Cut at a line to REVIEW_SUMMARY_MAX."""
+    lines = text.splitlines()
+    title, start = fallback_title, 0
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            title, start = line[2:].strip() or fallback_title, i + 1
+            break
+        if line.strip():
+            break
+    hit = next((i + 1 for i, line in enumerate(lines) if REVIEW_SUMMARY_HEADS.match(line.strip())), None)
+    block: list[str] = []
+    for line in lines[hit if hit is not None else start:]:
+        if not line.strip():
+            if block:
+                break
+            continue
+        if line.lstrip().startswith("#"):
+            if block:
+                break
+            continue
+        block.append(line.rstrip())
+    summary = "\n".join(block).strip() or "(the report has no summary paragraph)"
+    if len(summary) > REVIEW_SUMMARY_MAX:
+        cut = summary.rfind("\n", 0, REVIEW_SUMMARY_MAX - 2)
+        summary = summary[:cut if cut > 0 else REVIEW_SUMMARY_MAX - 2].rstrip() + " …"
+    return title[:store.NOTICE_TITLE_MAX].replace("\n", " "), summary
+
+
+def review_notice(conn: sqlite3.Connection, ctx: Ctx, project: store.Row, name: str) -> None:
+    """D-306: a review report doc (review:*) was written: post its notice (title and short summary,
+    review_summary), or refresh the one still shown; a dismissed one stays dismissed (a rewrite of
+    the report doesn't bring it back). Its own audit row, in the doc action's transaction."""
+    if not name.startswith("review:"):
+        return
+    doc = store.get_doc(conn, project["id"], name)
+    if doc is None:
+        return
+    title, summary = review_summary(store.doc_render(conn, doc["id"]), name)
+    source = f"{project['name']}/{name}"
+    before = store.notice_by_source(conn, source)
+    if before is None:
+        n = store.add_notice(conn, title, summary, project["id"], ctx.actor, source=source)
+        store.add_audit(conn, ctx.actor, ctx.via, "notice.post", "notice", n["id"], None, n, None)
+        return
+    if before["dismissed_at"] is not None or (before["title"], before["text"]) == (title, summary):
+        return
+    after = store.update_notice(conn, before["id"], title=title, text=summary, updated_at=store.now_iso())
+    b, a = Result(None, None, before, after).audit_pair()
+    store.add_audit(conn, ctx.actor, ctx.via, "notice.update", "notice", after["id"], b, a, None)
+
+
 # ---------------------------------------------------------------- project docs (phase 2d part 2, §7.2, §7.7)
 #
 # PROGRESS / GOALS / EXCEPTIONS / ALERTS / review reports per project (store.DOCS_SCHEMA; the files are
@@ -1824,6 +1910,7 @@ def doc_set(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: A
                       changed=False)
     doc = doc if doc is not None else store.ensure_doc(conn, p["id"], n, ctx.actor)
     eid = store.add_doc_entry(conn, doc["id"], "replace", body, ctx.actor, ctx.via)
+    review_notice(conn, ctx, p, n)
     after = {"entry": eid, "op": "replace", "chars": len(body), "sha256": store.sha256_text(body)}
     return Result(_doc_result(doc, p, entry=eid), f"{p['name']}/{n}", before, after, changed=True)
 
@@ -1944,6 +2031,7 @@ def doc_sync(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any, text: 
                                    keep=keep if replace else 0)
         first = False
     store.set_doc_mark(conn, doc["id"], body, last)
+    review_notice(conn, ctx, p, n)
     after = {"chars": len(store.doc_render(conn, doc["id"])), "entries": keep + len(new), "last_entry": last,
              "kept": keep, "added": len(new), "replaced": keep < len(chunks), "merged": outcome == "merged"}
     return Result(_doc_result(doc, p, outcome=outcome, appended=len(new), kept=keep,

@@ -37,7 +37,8 @@ SID2 = "00000000-0000-4000-8000-000000000002"
 CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
-                  "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions"}
+                  "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions",
+                  "afclaude_notice"}
 
 
 def run(coro):
@@ -439,6 +440,34 @@ class Docs(Env):
                          {(f"mcp:{CALLER}", "doc.append"), (f"mcp:{CALLER}", "doc.set")})
 
 
+
+class Notices(Env):
+    def test_notice_tool(self):
+        """afclaude_notice (D-306): post (audited as the calling session) and list the owner's notices."""
+        c = self.conn()
+        try:
+            store.add_project(c, "Proj", None, self.work)
+        finally:
+            c.close()
+        r = run(ms.afclaude_notice("post", title="Review ready", text="Line 1\nLine 2", project="."))
+        self.assertEqual((r["title"], r["text"], r["project"], r["by"]), ("Review ready", "Line 1\nLine 2", "Proj",
+                                                                           f"mcp:{CALLER}"))
+        run(ms.afclaude_notice("post", title="Not about a project", text="x"))
+        r = run(ms.afclaude_notice("list"))
+        self.assertEqual([(n["title"], n.get("project")) for n in r["notices"]],
+                         [("Review ready", "Proj"), ("Not about a project", None)])
+        with self.assertRaisesRegex(ToolError, "title is required"):
+            asyncio.run(ms.afclaude_notice("post", text="x"))
+        with self.assertRaisesRegex(ToolError, "no project"):
+            asyncio.run(ms.afclaude_notice("post", title="t", text="x", project="Nope"))
+        c = self.conn()
+        try:
+            audit = store.audit_log(c, 5, "notice")
+        finally:
+            c.close()
+        self.assertEqual({(a["actor"], a["action"]) for a in audit}, {(f"mcp:{CALLER}", "notice.post")})
+
+
 DECISIONS_SRC = """## Budget
 
 ### D-001 Night runs fill the week
@@ -537,7 +566,7 @@ class Stdio(unittest.TestCase):
         schema = {t.name: t.input_schema for t in tools}
         self.assertEqual(schema["afclaude_add_task"]["required"], ["title"])
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
-        self.assertLess(size, 13000, f"tool list is {size} bytes")   # 12000 until afclaude_decisions (D-242)
+        self.assertLess(size, 14500, f"tool list is {size} bytes")   # 13000 until afclaude_notice (D-306)
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

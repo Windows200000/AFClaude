@@ -69,6 +69,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                prompt variables prompts.PROJECT_VARS declares (prompts.py; actions.py writes).
                auth_sessions (phase 6a W5, additive the same way, AUTH_SCHEMA): the dashboard's
                browser sessions (dashboard/sessions.py; actions.py's auth.session_* writes).
+               notices (D-306, additive the same way): the owner's dashboard notices (title, text,
+               dismissed_at; actions.py's notice.* writes, inbox.view shows them).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -412,6 +414,26 @@ CREATE TABLE IF NOT EXISTS project_pauses (
     updated_at  TEXT NOT NULL,
     updated_by  TEXT
 );
+
+-- notices for the owner (D-306): a title and a short text on the dashboard's "Needs your input"
+-- section until the owner dismisses it. Posted by the task-manager (`tasks.py notice post`, MCP
+-- afclaude_notice) or written with every review report doc (review:*, source = '<project>/<doc
+-- name>': one notice per report, refreshed while it is shown). Written only through actions.py's
+-- notice.* actions. Additive, no schema_version bump (see the module doc).
+CREATE TABLE IF NOT EXISTS notices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL,         -- the actor
+    project_id   INTEGER REFERENCES projects(id),   -- NULL: not about one project
+    title        TEXT NOT NULL,
+    text         TEXT NOT NULL,         -- the full content (D-279: no pointer to a file)
+    source       TEXT,                  -- '<project>/review:<name>' for a review's notice, else NULL
+    updated_at   TEXT,
+    dismissed_at TEXT,                  -- the owner dismissed it (notice.dismiss)
+    version      INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS notices_source ON notices(source) WHERE source IS NOT NULL;
+CREATE INDEX IF NOT EXISTS notices_open ON notices(dismissed_at, id);
 """
 
 # ---- telemetry (dashboard phase 2c, D-161, §7.2/§7.3): the usage files' rows in the DB.
@@ -784,7 +806,7 @@ DECISION_ID_RE = re.compile(r"^[DM]-\d{1,5}$")
 # trigger's own UPDATE doesn't fire it again.
 VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
              "settings": "key", "prompt_overrides": "name", "inbox_messages": "id", "project_pauses": "project_id",
-             "decisions": "id"}
+             "decisions": "id", "notices": "id"}
 VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
@@ -3160,6 +3182,84 @@ def update_inbox(conn: sqlite3.Connection, msg_id: int, allowed_from: Sequence[s
         conn.execute(f"UPDATE inbox_messages SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
                      (*vals, msg_id))
         out = get_inbox(conn, msg_id)
+    assert out is not None
+    return out
+
+
+
+# ---------------------------------------------------------------- notices (D-306)
+#
+# The notices table above; actions.py (notice.post / notice.dismiss and the review docs' notices)
+# is the only caller of the writes.
+
+NOTICE_TITLE_MAX = 200
+NOTICE_TEXT_MAX = 4000
+NOTICE_FIELDS = ("title", "text", "updated_at", "dismissed_at")
+
+
+def notice_title(value: object) -> str:
+    t = _text(value, "title", required=True)
+    if "\n" in t or len(t) > NOTICE_TITLE_MAX:
+        raise ValueError(f"title must be one line of at most {NOTICE_TITLE_MAX} characters")
+    return t
+
+
+def notice_text(value: object) -> str:
+    t = _text(value, "text", required=True)
+    if len(t) > NOTICE_TEXT_MAX:
+        raise ValueError(f"text is too long ({len(t)} > {NOTICE_TEXT_MAX} characters)")
+    if "\0" in t:
+        raise ValueError("text must not contain NUL characters")
+    return t
+
+
+def get_notice(conn: sqlite3.Connection, notice_id: int) -> Row | None:
+    r = conn.execute("SELECT n.*, p.name AS project_name FROM notices n LEFT JOIN projects p ON p.id = n.project_id "
+                     "WHERE n.id=?", (notice_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def notice_row(conn: sqlite3.Connection, notice_id: object) -> Row:
+    nid = _position(notice_id, "notice id")
+    n = get_notice(conn, nid)
+    if n is None:
+        raise NotFound(f"no notice #{nid}")
+    return n
+
+
+def notice_by_source(conn: sqlite3.Connection, source: str) -> Row | None:
+    r = conn.execute("SELECT id FROM notices WHERE source=?", (source,)).fetchone()
+    return get_notice(conn, int(r[0])) if r else None
+
+
+def add_notice(conn: sqlite3.Connection, title: object, text: object, project_id: int | None, created_by: str,
+               source: str | None = None) -> Row:
+    t, body = notice_title(title), notice_text(text)
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO notices(created_at, created_by, project_id, title, text, source) "
+                           "VALUES (?, ?, ?, ?, ?, ?)", (now_iso(), created_by, project_id, t, body, source))
+        n = get_notice(conn, _rowid(cur))
+    assert n is not None
+    return n
+
+
+def list_notices(conn: sqlite3.Connection, include_dismissed: bool = False, limit: int = 200) -> list[Row]:
+    """The notices the owner has not dismissed (all of them with include_dismissed), oldest first."""
+    where = "" if include_dismissed else " WHERE n.dismissed_at IS NULL"
+    rows = conn.execute("SELECT n.*, p.name AS project_name FROM notices n LEFT JOIN projects p ON p.id = n.project_id"
+                        f"{where} ORDER BY n.id LIMIT {int(limit)}")
+    return [dict(r) for r in rows]
+
+
+def update_notice(conn: sqlite3.Connection, notice_id: int, **fields: object) -> Row:
+    unknown = set(fields) - set(NOTICE_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown notice field(s) {sorted(unknown)}")
+    with transaction(conn):
+        notice_row(conn, notice_id)
+        conn.execute(f"UPDATE notices SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                     (*fields.values(), notice_id))
+        out = get_notice(conn, notice_id)
     assert out is not None
     return out
 

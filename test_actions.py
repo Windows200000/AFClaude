@@ -516,7 +516,7 @@ class SessionActions(Base):
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
-                  "inbox.post", "inbox.retry", "inbox.dismiss", "project.manager_launch",
+                  "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
@@ -1085,6 +1085,8 @@ class EveryAction(Base):
             ("inbox.triage_hold", {"message_id": 3, "reason": "the session limit", "retry_after": "2026-10-09T14:00:00Z"}),
             ("inbox.fail", {"message_id": 3, "error": "Haiku timed out"}),
             ("inbox.retry", {"message_id": 3}),
+            ("notice.post", {"title": "t", "text": "x", "project": "P"}),
+            ("notice.dismiss", {"notice_id": 1}),
             ("decision.import", {"path": src.name}),
             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
             ("install.restored", {"source": {"install_id": store.get_meta(self.conn, "install_id"),
