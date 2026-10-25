@@ -338,16 +338,25 @@ def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[
             "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
 
 
+def notice_view(n: dict[str, Any]) -> dict[str, Any]:
+    """A notice for the owner (D-306) as the questions section shows it."""
+    return {"id": n["id"], "title": n["title"], "text": n["text"], "project": n["project_name"],
+            "source": n["source"], "posted_berlin": berlin(n["created_at"], VIEW_FMT),
+            "updated_berlin": berlin(n["updated_at"], VIEW_FMT) if n["updated_at"] else None}
+
+
 def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
     """What the box shows (D-246/D-248), oldest first: the chat (thread) and the noted messages
     still waiting for the next message into the session (an included one is gone; a noted one
     stays until then, whatever the chat's reset). `chat`: an answer is in view (the box shows it
     as a chat); `busy`: a message is still on its way (the page polls faster). `threads`: every
-    answered message the owner has not dismissed, whatever its age, for the questions section (D-304)."""
+    answered message the owner has not dismissed, whatever its age, for the questions section (D-304);
+    `notices`: every notice the owner has not dismissed, oldest first, for the same section (D-306)."""
     ms = sorted(thread(conn, now) + store.list_inbox(conn, "noted", limit=200), key=lambda m: m["id"])
     cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
     out = [message_view(m, cfg) for m in ms]
     return {"messages": out, "threads": [message_view(m) for m in store.inbox_threads(conn)],
+            "notices": [notice_view(n) for n in store.list_notices(conn)],
             "chat": any(m["answer"] for m in ms),
             "busy": any(m["state"] in BUSY_STATES for m in out),
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}

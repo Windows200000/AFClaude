@@ -33,6 +33,8 @@ section h2 { font-size: 19px; margin-bottom: 12px; display: flex; align-items: c
 .item.thr { display: flex; flex-direction: column; gap: 6px; }
 .thr-end { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .thr-end .t { color: #fecaca; font-size: 13px; }
+/* D-306: a notice for the owner (title, text) stays here until dismissed */
+.item.ntc { border-left-color: #0ea5e9; display: flex; flex-direction: column; gap: 4px; }
 .goals { list-style: none; }
 .goals li { padding: 5px 0; display: flex; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.06); }
 .goals li:last-child { border-bottom: none; }
@@ -607,31 +609,36 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   }
 
   // D-304: the message-box threads the task-manager answered (inbox.view's threads, live from the
-  // inbox API like the box) follow the open questions until the owner dismisses them (inbox.dismiss)
-  var inputHtml = "", inputCount = 0, threads = [], threadErr = "", threadKey = null;
+  // inbox API like the box) follow the open questions until the owner dismisses them (inbox.dismiss);
+  // D-306: so do the notices (inbox.view's notices; Dismiss = notice.dismiss on the same API)
+  var inputHtml = "", inputCount = 0, threads = [], notices = [], threadErr = "", threadKey = null;
+  function noticeItem(n) {
+    var src = (n.source ? "review" : "notice") + (n.project ? " · " + esc(n.project) : "") + " · " +
+      esc(n.updated_berlin || n.posted_berlin);
+    return '<div class="item ntc"><div class="src">' + src + "</div><strong>" + esc(n.title) + "</strong>" + md(n.text) +
+      '<div class="thr-end"><span class="t"></span><button type="button" data-notice="' + n.id + '">Dismiss</button></div></div>';
+  }
   function threadItem(m) {
     return '<div class="item thr"><div class="m-row"><div class="m-me">' + esc(m.text) + '</div></div><div class="m-ai">' +
       md(m.answer) + '</div><div class="thr-end"><span class="t"></span><button type="button" data-dismiss="' + m.id +
       '" data-tip="Answered ' + esc(m.answered_berlin) + '">Dismiss</button></div></div>';
   }
-  function setThreads(list, err) {
-    var key = JSON.stringify([list, err]);
+  function setThreads(list, nlist, err) {
+    var key = JSON.stringify([list, nlist, err]);
     if (key === threadKey) return;         // unchanged: keep the DOM
     threadKey = key;
     threads = list;
+    notices = nlist;
     threadErr = err;
     paintInput();
   }
-  function paintInput() {
-    var html = inputHtml + threads.map(threadItem).join("") +
-      (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
-    $("input").innerHTML = html || '<p class="mut">Nothing open.</p>';
-    Array.prototype.forEach.call($("input").querySelectorAll("button[data-dismiss]"), function (b) {
+  function dismissButtons(attr, path, drop) {
+    Array.prototype.forEach.call($("input").querySelectorAll("button[" + attr + "]"), function (b) {
       b.addEventListener("click", function () {
-        var id = Number(b.getAttribute("data-dismiss"));
+        var id = Number(b.getAttribute(attr));
         b.disabled = true;
-        api("/" + id + "/dismiss", {}).then(function () {
-          setThreads(threads.filter(function (m) { return m.id !== id; }), threadErr);
+        api(path(id), {}).then(function () {
+          drop(id);
           pollMessages(false);
         }).catch(function (e) {
           b.disabled = false;
@@ -639,7 +646,18 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
         });
       });
     });
-    var count = inputCount + threads.length;
+  }
+  function paintInput() {
+    var html = inputHtml + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
+      (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
+    $("input").innerHTML = html || '<p class="mut">Nothing open.</p>';
+    dismissButtons("data-dismiss", function (id) { return "/" + id + "/dismiss"; }, function (id) {
+      setThreads(threads.filter(function (m) { return m.id !== id; }), notices, threadErr);
+    });
+    dismissButtons("data-notice", function (id) { return "/notice/" + id + "/dismiss"; }, function (id) {
+      setThreads(threads, notices.filter(function (n) { return n.id !== id; }), threadErr);
+    });
+    var count = inputCount + notices.length + threads.length;
     $("c-input").textContent = count;
     $("c-input").className = "count" + (count ? "" : " zero");
   }
@@ -721,7 +739,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       if (gen !== msgGen) return null;
       $("msg-text").maxLength = box.max_chars || 4000;
       renderMessages(box);
-      setThreads(box.threads || [], "");
+      setThreads(box.threads || [], box.notices || [], "");
       return box.busy ? 30000 : (box.messages || []).length ? 300000 : 0;
     }).catch(function (e) {
       if (gen !== msgGen) return null;
@@ -730,7 +748,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var why = "Message box unavailable: " + e.message;
       $("msg-log").innerHTML = '<div class="m-err"><span class="t">' + esc(why) + '</span><span class="st s-err" tabindex="0" ' +
         'role="img" aria-label="' + esc(why) + '" data-tip="' + esc(why) + '"></span></div>';
-      setThreads([], why);
+      setThreads([], [], why);
       return 0;
     });
   }

@@ -1064,6 +1064,24 @@ class Endpoint(DB):
         self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{b['id']}/dismiss", {}, key="wrong")[0], 401)
         self.assertEqual(self.call("GET", f"/afclaude/api/inbox/{b['id']}/dismiss")[0], 405)
 
+    def test_notices_and_dismiss(self):
+        """D-306: GET lists the shown notices; POST .../notice/<id>/dismiss runs notice.dismiss (owner, audited)."""
+        with store.transaction(self.conn):
+            self.conn.execute("DELETE FROM notices")
+        n = actions.perform(self.conn, "notice.post", {"title": "Review ready", "text": "the summary"},
+                            actor="cli", via="cli")
+        st, v = self.call("GET")
+        self.assertEqual([(x["id"], x["title"], x["text"]) for x in v["notices"]], [(n["id"], "Review ready", "the summary")])
+        self.assertEqual(self.call("GET", f"/afclaude/api/inbox/notice/{n['id']}/dismiss")[0], 405)
+        self.assertEqual(self.call("POST", f"/afclaude/api/inbox/notice/{n['id']}/dismiss", {}, key="wrong")[0], 401)
+        st, r = self.call("POST", f"/afclaude/api/inbox/notice/{n['id']}/dismiss", {})
+        self.assertEqual((st, r["id"]), (200, n["id"]))
+        audit = store.audit_log(self.conn, 1, "notice", n["id"])[0]
+        self.assertEqual((audit["action"], audit["actor"], audit["via"]), ("notice.dismiss", "owner", "dashboard"))
+        self.assertEqual(self.call("GET")[1]["notices"], [])
+        self.assertEqual(self.call("POST", f"/afclaude/api/inbox/notice/{n['id']}/dismiss", {})[0], 409)
+        self.assertEqual(self.call("POST", "/afclaude/api/inbox/notice/999/dismiss", {})[0], 404)
+
     def test_request_checks(self):
         self.assertEqual(self.call("POST", raw=b"text=hi", ctype="application/x-www-form-urlencoded")[0], 415)
         self.assertEqual(self.call("POST", raw=b"text=hi", ctype="text/plain")[0], 415)
@@ -1151,6 +1169,8 @@ class Quickview(DB):
                   "data-tip", "box.chat", "box.busy", "s-spin", "s-check", "s-err", "Ctrl+Enter"):
             self.assertIn(s, page, s)
         for s in ("box.threads", "data-dismiss", '"/dismiss"', "m.answered_berlin"):   # D-304: answered threads
+            self.assertIn(s, page, s)
+        for s in ("box.notices", "data-notice", '"/notice/"', "n.title", "n.text"):   # D-306: notices
             self.assertIn(s, page, s)
         for s in ("m.verdict_reason", "m.hold", "msg-list", "noted for the next session"):   # D-246: no thread list, no labels
             self.assertNotIn(s, page, s)

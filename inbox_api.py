@@ -10,13 +10,14 @@ nothing new is published and the request has passed nginx's X-AFClaude-Key check
                                          worker triages it (and delivers a "now" one) right away
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200
   POST /afclaude/api/inbox/<id>/dismiss  an answered thread leaves the questions section (D-304) -> 200
+  POST /afclaude/api/inbox/notice/<id>/dismiss   a notice leaves the questions section (D-306) -> 200
 
 Owner-only (the text ends up in the task-manager's session): every request needs the same
 X-AFClaude-Key here too (compared with the key file, read on every request, so a rotated key
 needs no restart; no key file: every request is refused, 503), a POST must be JSON
 (application/json, so a cross-site form can't send one), at most BODY_MAX bytes, and at most
-inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / retry / dismiss, actor
-owner, via dashboard: audited). The worker (inbox_worker.run_forever) runs in the same process.
+inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / retry / dismiss and
+notice.dismiss, actor owner, via dashboard: audited). The worker (inbox_worker.run_forever) runs in the same process.
 
   inbox_api.py serve [--socket PATH]    the server (one per data/: a lock file); the entrypoint
                                          starts it with `ensure --boot`
@@ -56,6 +57,7 @@ KEY_FILE = os.environ.get("AFCLAUDE_INBOX_KEY_FILE", "/run/secrets/afclaude_quic
 KEY_HEADER = "X-AFClaude-Key"
 PREFIX = "/afclaude/api/inbox"
 MSG_RE = re.compile(r"^/afclaude/api/inbox/(\d{1,9})/(retry|dismiss)$")
+NOTICE_RE = re.compile(r"^/afclaude/api/inbox/notice/(\d{1,9})/dismiss$")
 BODY_MAX = 16 * 1024
 ACTOR, VIA = "owner", "dashboard"
 
@@ -172,6 +174,14 @@ class Handler(BaseHTTPRequestHandler):
             log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)")
             self.server.wake.set()
             return 201, inbox.message_view(m)
+        notice = NOTICE_RE.match(path)
+        if notice:
+            if method != "POST":
+                raise HTTPError(405, "method not allowed")
+            self.json_body()
+            n = actions.perform(conn, "notice.dismiss", {"notice_id": int(notice.group(1))}, actor=ACTOR, via=VIA)
+            log(f"notice #{n['id']}: dismissed by the owner")
+            return 200, inbox.notice_view(n)
         hit = MSG_RE.match(path)
         if hit and method == "POST":
             self.json_body()
