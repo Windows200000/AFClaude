@@ -582,7 +582,11 @@ class SettingActions(Base):
                           "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
                           "runner_timeout_prune_runs": 10.0, "runner_timeout_usage_review": 15.0,
                           "runner_timeout_window_start": 70.0, "runner_start_catchup": 30.0,
-                          "runner_runs_retention_days": 30.0, "restore_starts_paused": True})
+                          "runner_runs_retention_days": 30.0, "restore_starts_paused": True,
+                          "auth_idle_timeout_min": 30, "auth_absolute_lifetime_h": 12,
+                          "auth_remember_device_days": 7, "auth_reauth_window_min": 10,
+                          "auth_max_sessions_per_user": 10,
+                          "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15}})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -1087,13 +1091,22 @@ class EveryAction(Base):
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
                                              "bundle_sha256": "0" * 64, "kind": "backup"}}),
             ("install.stamp", {}),
+            ("auth.session_login", {"user_id": 7, "id_sha256": "1" * 64, "csrf_sha256": "2" * 64,
+                                    "factors": ["passkey_hw"]}),
+            ("auth.session_rotate", {"id_sha256": "1" * 64, "new_id_sha256": "3" * 64, "new_csrf_sha256": "4" * 64,
+                                     "authenticated": True}),
+            ("auth.session_logout", {"id_sha256": "3" * 64}),
+            ("auth.session_login", {"user_id": 7, "id_sha256": "5" * 64, "csrf_sha256": "6" * 64,
+                                    "factors": ["oidc"]}),
+            ("auth.session_revoke", {"user_id": 7}),
         ]
         self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
         for i, (name, params) in enumerate(script, 1):
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
                 self.conn.commit()
-            self.do(name, actor="owner", via="dashboard", idem=f"every-{i:04d}", **params)
+            own_session = name.startswith("auth.session_") and name != "auth.session_revoke"   # the user's own
+            self.do(name, actor="user:7" if own_session else "owner", via="dashboard", idem=f"every-{i:04d}", **params)
             rows = self.audit()
             self.assertEqual(len(rows), i, name)
             self.assertEqual((rows[-1]["action"], rows[-1]["request_id"]), (name, f"every-{i:04d}"))

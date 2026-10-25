@@ -67,6 +67,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                driven_sessions backfill is `python3 store.py import-driven` (driven.py).
                prompt_vars (phase 4a, D-197, additive the same way): a project's values of the
                prompt variables prompts.PROJECT_VARS declares (prompts.py; actions.py writes).
+               auth_sessions (phase 6a W5, additive the same way, AUTH_SCHEMA): the dashboard's
+               browser sessions (dashboard/sessions.py; actions.py's auth.session_* writes).
 
 Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -702,6 +704,39 @@ CREATE TABLE IF NOT EXISTS prompt_vars (
 );
 """
 
+# ---- the dashboard's browser sessions (phase 6a W5, docs/phase6a_plan.md §3.5; design §9.5, D-162): one
+# row per LOGGED-IN session, server-side so it is revocable and listable (F11). Only the sha256 of the
+# cookie's 256-bit id is stored, and the sha256 of its CSRF token. A pre-session (an anonymous browser's
+# cookie before login) is stateless (dashboard.sessions: a server-key-signed, expiring token) since a
+# W5 review found the earlier design -- a row per cookieless GET /me -- let an unauthenticated flood
+# hold write locks (D-235: runners fail-stop on DB errors); it never reaches this table. A login, a
+# step-up and a factor change start a new row (the id rotates) and end the old one ('rotated').
+# created_at is the login (a rotated row keeps it: the absolute lifetime counts from the login),
+# authenticated_at the last full authentication (the step-up window). user_id is 5a's users.id (no
+# foreign key until 5a's users table exists). Written only through actions.py (auth.session_* audited;
+# the last_seen touch is the row's own record, no audit row). `kind` stays for a future non-'full' row
+# kind; every row written today is 'full'. Additive, no schema_version bump.
+AUTH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    id_sha256        TEXT NOT NULL UNIQUE,
+    user_id          INTEGER,
+    kind             TEXT NOT NULL CHECK (kind IN ('pre', 'full')),
+    created_at       TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL,         -- written at most once a minute
+    authenticated_at TEXT,
+    factors          TEXT NOT NULL DEFAULT '[]',   -- JSON list of dashboard.auth.factors names
+    csrf_sha256      TEXT NOT NULL,
+    user_agent       TEXT,                  -- a short summary for F11, never used for a decision
+    ended_at         TEXT,
+    end_reason       TEXT CHECK (end_reason IN ('logout', 'rotated', 'revoked', 'evicted', 'idle', 'expired')),
+    CHECK ((kind = 'pre') = (user_id IS NULL)),
+    CHECK ((ended_at IS NULL) = (end_reason IS NULL))
+);
+CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id, ended_at);
+CREATE INDEX IF NOT EXISTS auth_sessions_ended ON auth_sessions(ended_at);
+"""
+
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
 # owner / task-manager decision, mirrored from DECISIONS.md (the source the task-manager edits for
 # now; actions.decision_import, audited) with the full entry text and its fields. keywords is the
@@ -992,6 +1027,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     conn.executescript(PROMPT_VARS_SCHEMA)
     conn.executescript(DECISIONS_SCHEMA)
+    conn.executescript(AUTH_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         _init_decisions_fts(conn)
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
@@ -1376,7 +1412,12 @@ def _utcnow() -> datetime:            # patched by tests
 
 def now_iso() -> str:
     """Current UTC time, always with milliseconds: 2026-09-29T10:00:00.000Z."""
-    dt = _utcnow().astimezone(timezone.utc)
+    return iso_ms(_utcnow())
+
+
+def iso_ms(dt: datetime) -> str:
+    """`dt` as now_iso() writes it (always milliseconds), so the strings compare in time order."""
+    dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
 
 
@@ -2330,6 +2371,68 @@ def put_idempotency(conn: sqlite3.Connection, key: str, actor: str, action: str,
 def prune_idempotency(conn: sqlite3.Connection, older_than: datetime) -> int:
     """Delete keys created before `older_than` (a datetime). -> number deleted."""
     return conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (iso(older_than),)).rowcount
+
+
+AUTH_SESSION_END_REASONS = ("logout", "rotated", "revoked", "evicted", "idle", "expired")
+
+
+def _auth_session(r: sqlite3.Row | None) -> Row | None:
+    return dict(r, factors=_loads(r["factors"])) if r else None
+
+
+def add_auth_session(conn: sqlite3.Connection, id_sha256: str, user_id: int | None, csrf_sha256: str, *,
+                     factors: Sequence[str] = (), user_agent: str | None = None, created_at: str | None = None,
+                     authenticated_at: str | None = None) -> int:
+    """A new session row (kind 'full' with a user, else 'pre'). created_at: the login's time for a
+    rotated row (default now); authenticated_at: the last full authentication (None for a pre-session)."""
+    now = now_iso()
+    cur = conn.execute(
+        "INSERT INTO auth_sessions(id_sha256, user_id, kind, created_at, last_seen_at, authenticated_at, "
+        "factors, csrf_sha256, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (id_sha256, user_id, "pre" if user_id is None else "full", created_at or now, now,
+         authenticated_at, json.dumps(list(factors)), csrf_sha256, user_agent))
+    return _rowid(cur)
+
+
+def get_auth_session(conn: sqlite3.Connection, id_sha256: str) -> Row | None:
+    return _auth_session(conn.execute("SELECT * FROM auth_sessions WHERE id_sha256=?", (id_sha256,)).fetchone())
+
+
+def get_auth_session_by_id(conn: sqlite3.Connection, session_id: int) -> Row | None:
+    return _auth_session(conn.execute("SELECT * FROM auth_sessions WHERE id=?", (session_id,)).fetchone())
+
+
+def open_auth_sessions(conn: sqlite3.Connection, user_id: int) -> list[Row]:
+    """A user's sessions not ended yet (some may be past a lifetime), oldest first."""
+    rows = conn.execute("SELECT * FROM auth_sessions WHERE user_id=? AND ended_at IS NULL ORDER BY created_at, id",
+                        (user_id,))
+    return [r for r in (_auth_session(x) for x in rows) if r is not None]
+
+
+def end_auth_session(conn: sqlite3.Connection, session_id: int, reason: str) -> bool:
+    """End a session (once: an ended one keeps its first end). -> whether it was open."""
+    if reason not in AUTH_SESSION_END_REASONS:
+        raise ValueError(f"unknown session end reason {reason!r}")
+    return conn.execute("UPDATE auth_sessions SET ended_at=?, end_reason=? WHERE id=? AND ended_at IS NULL",
+                        (now_iso(), reason, session_id)).rowcount == 1
+
+
+def touch_auth_session(conn: sqlite3.Connection, session_id: int, seen_before: str) -> bool:
+    """Set last_seen_at to now when the stored one is `seen_before` or older (the once-a-minute
+    rule, kept in the UPDATE so two racing requests write once). -> whether it wrote."""
+    return conn.execute("UPDATE auth_sessions SET last_seen_at=? WHERE id=? AND ended_at IS NULL "
+                        "AND last_seen_at <= ?", (now_iso(), session_id, seen_before)).rowcount == 1
+
+
+def prune_ended_sessions(conn: sqlite3.Connection, ended_before: str, abandoned_before: str) -> int:
+    """Delete sessions past their end plus a short retention (finding 2 of the W5 review): ended
+    (logout, rotation, revocation, idle or expiry having been noticed) with ended_at < `ended_before`,
+    or never explicitly ended but created before `abandoned_before` (a browser that expired and never
+    came back to be noticed; `abandoned_before` is the caller's now - absolute_lifetime - retention, so
+    only a session that is certainly past its lifetime is swept this way). -> number deleted."""
+    return conn.execute(
+        "DELETE FROM auth_sessions WHERE (ended_at IS NOT NULL AND ended_at < ?) "
+        "OR (ended_at IS NULL AND created_at < ?)", (ended_before, abandoned_before)).rowcount
 
 
 def add_run_log(conn: sqlite3.Connection, component: object, decision: object, reason: str | None = None,

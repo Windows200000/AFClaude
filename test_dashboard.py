@@ -45,7 +45,7 @@ else:
     from dashboard import codegen, routes, security  # noqa: E402
     from dashboard.api_types import Model, PageParams, Params, SanitizedHtml  # noqa: E402
     from dashboard.app import create_app  # noqa: E402
-    from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply, Visibility  # noqa: E402
+    from dashboard.routes import ENDPOINTS, Call, Endpoint, Principal, Reply, Session, Visibility  # noqa: E402
 
     with open(codegen.SCHEMA_PATH, encoding="utf-8") as _fh:
         SCHEMA = json.load(_fh)
@@ -200,6 +200,24 @@ class Checked:
         return self.request("POST", path, **kw)
 
 
+CSRF = "test-csrf-token"
+
+
+class FakeSessions:
+    """A SessionBackend for the skeleton's tests: the test's `signed_in` is an owner's session (CSRF
+    token CSRF), otherwise there is none (dashboard.sessions is tested in test_dashboard_sessions)."""
+    def __init__(self, test):
+        self.test = test
+
+    async def authenticate(self, request):
+        if not self.test.signed_in:
+            return None
+        return Session("0" * 64, CSRF, Principal(user_id=7, role="owner"))
+
+    async def start_pre(self, request):
+        raise NotImplementedError("no pre-sessions in these tests")
+
+
 @unittest.skipIf(bool(SKIP), SKIP)
 class Base(unittest.TestCase):
     endpoints = TEST_ENDPOINTS
@@ -215,15 +233,14 @@ class Base(unittest.TestCase):
         with open(os.path.join(self.dist, "assets", "app-abc.js"), "w") as fh:
             fh.write("console.log(1)")
 
-        async def auth(request):
-            return Principal(user_id=7) if self.signed_in else None
         extra = {"visible_projects": self.visible} if self.visible else {}
-        self.app = create_app(PUBLIC, self.dist, auth, db_path=testenv.DB, endpoints=self.endpoints, **extra)
+        self.app = create_app(PUBLIC, self.dist, FakeSessions(self), db_path=testenv.DB, endpoints=self.endpoints,
+                              **extra)
         raw = TestClient(self.app, base_url=PUBLIC, raise_server_exceptions=False)
         self.c = Checked(raw, test_schema() if self.endpoints is TEST_ENDPOINTS else SCHEMA, self)
 
     def write(self, path, body=None, *, headers=None, content=None, method="POST"):
-        h = {"Content-Type": "application/json", "Origin": ORIGIN, "Idempotency-Key": KEY}
+        h = {"Content-Type": "application/json", "Origin": ORIGIN, "Idempotency-Key": KEY, "X-CSRF-Token": CSRF}
         h.update(headers or {})
         h = {k: v for k, v in h.items() if v is not None}
         if content is None:
@@ -238,8 +255,8 @@ class Base(unittest.TestCase):
 
 class RouteTable(Base):
     def test_only_the_allowed_endpoints_are_public(self):
-        self.assertEqual({e.name for e in ENDPOINTS if e.access == "public"}, {"health"})
-        self.assertEqual(routes.PUBLIC_ALLOWED, frozenset({"health"}))
+        self.assertEqual({e.name for e in ENDPOINTS if e.access == "public"}, {"health", "me"})
+        self.assertEqual(routes.PUBLIC_ALLOWED, frozenset({"health", "me"}))
 
     def test_every_session_endpoint_refuses_without_a_session(self):
         for ep in ENDPOINTS:
@@ -378,7 +395,8 @@ class Body(Base):
             for _ in range(security.BODY_MAX // 1000 + 2):
                 yield b" " * 1000
         r = self.c.request("POST", "/api/v1/test/echo", content=chunks(),
-                           headers={"Content-Type": "application/json", "Origin": ORIGIN, "Idempotency-Key": KEY})
+                           headers={"Content-Type": "application/json", "Origin": ORIGIN, "Idempotency-Key": KEY,
+                                    "X-CSRF-Token": CSRF})
         self.assertNotIn("content-length", {k.lower() for k in r.request.headers})
         self.assertError(r, 413, "payload_too_large")
 
@@ -689,7 +707,7 @@ class Codegen(unittest.TestCase):
                      "  readonly raw: JsonValue;",
                      "  readonly flag: boolean;",
                      "export interface Req {\n  readonly x: number;\n  readonly y?: string;\n}",   # a request may omit it
-                     'fix: { method: "PUT", path: "/api/v1/fix/{id}", access: "session", idempotent: true },',
+                     'fix: { method: "PUT", path: "/api/v1/fix/{id}", access: "session", role: "owner", idempotent: true },',
                      "readonly fix: { readonly params: FixParams; readonly request: Req; readonly response: Fixture };",
                      'export interface FixParams {\n  readonly id: number;\n  readonly mode?: "a" | "b" | null;\n}'):
             self.assertIn(part, ts)

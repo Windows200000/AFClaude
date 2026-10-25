@@ -129,6 +129,69 @@
     "type": "object"
    },
    "JsonValue": {},
+   "MeResponse": {
+    "additionalProperties": false,
+    "description": "GET /api/v1/me (public): the signed-in user or null, the session's CSRF token (the client keeps\nit in memory only and sends it as X-CSRF-Token on every write) and the display time zone.",
+    "properties": {
+     "csrf_token": {
+      "title": "Csrf Token",
+      "type": "string"
+     },
+     "time_zone": {
+      "title": "Time Zone",
+      "type": "string"
+     },
+     "user": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/MeUser"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     }
+    },
+    "required": [
+     "user",
+     "csrf_token",
+     "time_zone"
+    ],
+    "title": "MeResponse",
+    "type": "object"
+   },
+   "MeUser": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "title": "Id",
+      "type": "integer"
+     },
+     "role": {
+      "anyOf": [
+       {
+        "enum": [
+         "viewer",
+         "editor",
+         "manager",
+         "owner"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Role"
+     }
+    },
+    "required": [
+     "id",
+     "role"
+    ],
+    "title": "MeUser",
+    "type": "object"
+   },
    "SanitizedHtml": {
     "description": "HTML rendered from markdown on the server and allowlist-sanitised (dashboard.markdown.render(),\ndocs/phase6c_plan.md §0, design §9.8): the only HTML a response may carry. Validation always\nrefuses, so a handler can't pass a plain string where a response field is SanitizedHtml; render()\nis the only place that makes one (model_construct, checked by a test). The schema names it with\n`x-brand`, and the generated TS type is branded, so the frontend's one raw-HTML sink takes\nnothing else. Responses only: never a request field.",
     "title": "SanitizedHtml",
@@ -182,6 +245,35 @@
     "x-access": "public"
    }
   },
+  "/api/v1/me": {
+   "get": {
+    "operationId": "me",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MeResponse"
+        }
+       }
+      },
+      "description": "The signed-in user (null when nobody is), this session's CSRF token (send it as X-CSRF-Token on every write; keep it in memory only) and the display time zone. Starts a pre-session for an anonymous browser."
+     },
+     "default": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ErrorResponse"
+        }
+       }
+      },
+      "description": "error (the one error shape, §8)"
+     }
+    },
+    "summary": "The signed-in user (null when nobody is), this session's CSRF token (send it as X-CSRF-Token on every write; keep it in memory only) and the display time zone. Starts a pre-session for an anonymous browser.",
+    "x-access": "public"
+   }
+  },
   "/api/v1/schema.json": {
    "get": {
     "operationId": "api_schema",
@@ -208,7 +300,8 @@
      }
     },
     "summary": "This API's OpenAPI 3.1 document.",
-    "x-access": "session"
+    "x-access": "session",
+    "x-role": "viewer"
    }
   }
  }

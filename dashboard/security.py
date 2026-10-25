@@ -5,12 +5,16 @@
   security headers and the CSP on every response, errors included. No CORS header is ever sent.
 - write_guard(): the CSRF checks of a write (JSON content type, same Origin, Sec-Fetch-Site), run
   by the dispatcher before the session, the body or the handler. Every failure is a 403
-  "forbidden" (a cross-site form post included). The per-session X-CSRF-Token joins in W5.
+  "forbidden" (a cross-site form post included).
+- csrf_guard(): the per-session X-CSRF-Token of a write (W5), after the session is known.
 - read_body(): the body of a write, at most BODY_MAX bytes, counted while reading (a chunked
   body has no Content-Length to trust).
+- pre_session_ok(): whether `me` (W5) may start a pre-session for this GET, by `Sec-Fetch-Site`
+  (finding 1 of the W5 review: a cross-site trigger must not even reach the token-signing step).
 """
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -21,6 +25,7 @@ from dashboard.errors import ApiError, error_response
 
 BODY_MAX = 64 * 1024     # the largest field is a prompt (16 KB, actions.PROMPT_MAX) plus JSON overhead
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+CSRF_HEADER = "x-csrf-token"
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
 
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
@@ -103,7 +108,8 @@ def _header(scope: Scope, name: bytes) -> str | None:
 
 
 def write_guard(request: Request, public: PublicUrl) -> None:
-    """The CSRF checks of §9.8 for a write (W5 adds the session's X-CSRF-Token). Raises ApiError 403."""
+    """The CSRF checks of §9.8 for a write that need no session (csrf_guard then checks the token).
+    Raises ApiError 403."""
     ctype = request.headers.get("content-type", "")
     mime, _, params = ctype.partition(";")
     charset = params.strip().lower()
@@ -114,6 +120,28 @@ def write_guard(request: Request, public: PublicUrl) -> None:
     site = request.headers.getlist("sec-fetch-site")
     if site and site != ["same-origin"]:
         raise ApiError(403, "forbidden", "cross-site request refused")
+
+
+def pre_session_ok(request: Request) -> bool:
+    """Whether `me` may start a pre-session for this request (finding 1 of the W5 review): accepted
+    when `Sec-Fetch-Site` says `same-origin` (a same-origin fetch) or `none` (a direct navigation --
+    typed URL, bookmark, no initiator) or is absent entirely. Every current browser sends the header
+    on both of those cases, so absent means a client that doesn't send it at all (a health check, a
+    script, an older browser) rather than a cross-site one hiding the fact; refusing those too would
+    turn a hardening check into an availability bug for non-browser callers. `cross-site` and
+    `same-site` are refused: this GET must not mint anything for a request another origin triggered."""
+    site = request.headers.getlist("sec-fetch-site")
+    return not site or site in (["same-origin"], ["none"])
+
+
+def csrf_guard(request: Request, expected: str | None) -> None:
+    """A write's X-CSRF-Token (§9.8): exactly one, equal to the session's token (`expected`; None =
+    the request has no session, so it can carry no token). Raises ApiError 403."""
+    if expected is None:
+        raise ApiError(403, "forbidden", "no session: reload the page")
+    sent = request.headers.getlist(CSRF_HEADER)
+    if len(sent) != 1 or not hmac.compare_digest(sent[0].encode("utf-8"), expected.encode("utf-8")):
+        raise ApiError(403, "forbidden", "missing or wrong CSRF token: reload the page")
 
 
 async def read_body(request: Request, limit: int = BODY_MAX) -> bytes:
