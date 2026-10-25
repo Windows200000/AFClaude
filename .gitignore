@@ -49,3 +49,9 @@ DECISIONS.md
 
 # local-only backlog project briefs (personal requirements; surfaced on the temp dashboard)
 backlog/
+
+# the dashboard frontend's own pinned Node.js (D-292: tools/node.py; never system-wide) and
+# its build output/dependencies; package.json and package-lock.json ARE committed
+dashboard/web/.node/
+dashboard/web/node_modules/
+dashboard/web/dist/
