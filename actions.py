@@ -76,7 +76,9 @@ import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
-ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?)$")
+# user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it)
+ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?"
+                      r"|user:[1-9][0-9]{0,17})$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 IDEMPOTENCY_TTL = timedelta(days=7)
 OWN_LIST = os.environ.get("AFCLAUDE_OWN_LIST", os.path.join(HERE, "data", "own_sessions.txt"))
@@ -101,7 +103,7 @@ class Forbidden(ValueError):
 
 
 class Ctx:
-    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive | runner[:<job>]), via
+    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive | runner[:<job>] | user:<id>), via
     (cli | mcp | dashboard | runner), the idempotency key, and whether the caller
     knows it is an autonomous AFClaude session."""
     def __init__(self, actor: str, via: str, key: str | None = None, autonomous: bool = False) -> None:
@@ -522,7 +524,7 @@ DAYS = schedule.DAYS
 GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
 SESSION_HOURS = afclaude_config.SESSION_LENGTH.total_seconds() / 3600   # 5: one session-limit window
-SECTIONS = ("schedule", "budget", "automation", "storage")
+SECTIONS = ("schedule", "budget", "automation", "storage", "auth")
 
 
 SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, conn) -> normalized value
@@ -645,6 +647,30 @@ def _log_retention_overrides(v: Any, conn: sqlite3.Connection | None = None) -> 
     return out
 
 
+LOGIN_RATE_FIELDS = {"account_failures": (1, 100), "ip_failures": (1, 1000), "window_min": (1, 1440)}
+
+
+def _login_rate(v: Any, conn: sqlite3.Connection | None = None) -> dict[str, int]:
+    """auth_login_rate (design §9.5): {account_failures, ip_failures, window_min}, whole numbers."""
+    if not isinstance(v, dict) or set(v) != set(LOGIN_RATE_FIELDS):
+        raise ValueError(f"must be an object with exactly {', '.join(LOGIN_RATE_FIELDS)}, got {v!r}")
+    out: dict[str, int] = {}
+    for k, (lo, hi) in LOGIN_RATE_FIELDS.items():
+        n = v[k]
+        if isinstance(n, bool) or not isinstance(n, int) or not lo <= n <= hi:
+            raise ValueError(f"{k}: must be a whole number in {lo}..{hi}, got {n!r}")
+        out[k] = n
+    return out
+
+
+def _whole(lo: int, hi: int) -> Callable[[Any, Optional[sqlite3.Connection]], int]:
+    def check(v: Any, conn: sqlite3.Connection | None = None) -> int:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or not lo <= v <= hi:
+            raise ValueError(f"must be a whole number in {lo}..{hi}, got {v!r}")
+        return int(v)
+    return check
+
+
 class Setting:
     """One registry entry (§7.4): the code default (D-169: shipped with the code, never read
     from a file), the check (validates and normalizes a value; a ValueError says why), a
@@ -683,6 +709,10 @@ def _num(default: float, lo: float, hi: float, doc: str, section: str, important
 def _auto_or_num(lo: float, hi: float, doc: str, section: str, important: bool = False) -> Setting:
     return Setting("auto", _hours_or_auto(lo, hi), doc, section=section, kind="auto|number",
                    important=important, bounds=(lo, hi))
+
+
+def _int(default: int, lo: int, hi: int, doc: str, section: str) -> Setting:
+    return Setting(default, _whole(lo, hi), doc, section=section, kind="number", bounds=(lo, hi))
 
 
 def _flag(default: bool, doc: str, section: str, important: bool = False) -> Setting:
@@ -831,6 +861,24 @@ SETTINGS: dict[str, Setting] = {
     "restore_starts_paused": _flag(True, "A restored install starts with automation paused (D-173) and the "
                                    "reason \"restored from a backup of <time>: check and resume\"",
                                    "storage"),
+    # --- auth (design §9.5, D-162: secure defaults that stay out of the way; dashboard/sessions.py and the
+    # login of phase 6a W6 read them). Owner-only like every setting; changing one is a high-impact write
+    # (step-up from 6b).
+    "auth_idle_timeout_min": _int(30, 5, 480, "Dashboard: minutes without a request after which a browser "
+                                  "session ends and the user signs in again", "auth"),
+    "auth_absolute_lifetime_h": _int(12, 1, 168, "Dashboard: hours one login lasts at most, active or not",
+                                     "auth"),
+    "auth_remember_device_days": _int(7, 0, 90, "Dashboard: days a remembered device lets a password login skip "
+                                      "the second factor (never the first factor, never a step-up); 0 = off "
+                                      "(D-179)", "auth"),
+    "auth_reauth_window_min": _int(10, 1, 60, "Dashboard: minutes after a full sign-in within which high-impact "
+                                   "changes need no new authentication (step-up)", "auth"),
+    "auth_max_sessions_per_user": _int(10, 1, 50, "Dashboard: browser sessions one user may have at once; a new "
+                                       "login ends the oldest", "auth"),
+    "auth_login_rate": Setting({"account_failures": 5, "ip_failures": 20, "window_min": 15}, _login_rate,
+                               "Dashboard: failed sign-ins allowed per account and per client address within "
+                               "window_min minutes before exponential backoff (repeated failures alert)",
+                               section="auth", kind="login_rate"),
 }
 RUNNER_TIMEOUT = "runner_timeout_"
 
@@ -1997,6 +2045,221 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
     after = store.set_decision_keywords(conn, cur["id"], added, removed, ctx.actor)
     return Result({"id": after["id"], "keywords": after["effective_keywords"], "version": after["version"]},
                   after["id"], before, {"keywords": after["effective_keywords"]})
+
+
+# ---------------------------------------------------------------- dashboard browser sessions (phase 6a W5)
+#
+# docs/phase6a_plan.md §3.5, design §9.5 (D-162, D-179). dashboard/sessions.py holds the cookie and
+# makes the ids; this is where a session row is written. Login, rotation (step-up, factor change),
+# logout and revocation are audited actions (auth.session_*; the audit row names row ids, never a
+# hash). Two writes are the row's own record, with no audit row (as telemetry, §7.3; an
+# interpretation gate 8a checks): starting a pre-session (an anonymous browser loading the app) and
+# the last_seen touch, at most once a minute per session (auth_session_start_pre,
+# auth_session_touch). A login also ends the user's sessions past a lifetime ('idle' / 'expired')
+# and, at auth_max_sessions_per_user, the oldest ones ('evicted').
+
+# the login factors dashboard.auth.factors knows (test_dashboard_sessions keeps the two equal; actions.py
+# doesn't import the dashboard package, which the live processes never load)
+AUTH_FACTORS = ("password", "totp", "recovery_code", "passkey_hw", "passkey_synced", "oidc")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+USER_AGENT_MAX = 200
+TOUCH_EVERY = timedelta(minutes=1)
+
+
+class AuthLifetimes:
+    """The session settings in force (auth_*), read together. A saved value that fails its check is
+    an error here, never the code default in its place (D-235): the session would otherwise live
+    longer or shorter than the owner set."""
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        def get(key: str) -> int:
+            value, source = effective_setting(conn, key)
+            if source.startswith("invalid"):
+                raise ValueError(f"setting {key} is {source}: fix or reset it")
+            return int(value)
+        self.idle = timedelta(minutes=get("auth_idle_timeout_min"))
+        self.absolute = timedelta(hours=get("auth_absolute_lifetime_h"))
+        self.max_sessions = get("auth_max_sessions_per_user")
+        self.reauth = timedelta(minutes=get("auth_reauth_window_min"))
+        self.remember_device = timedelta(days=get("auth_remember_device_days"))
+
+
+def auth_session_state(row: Mapping[str, Any], lifetimes: AuthLifetimes, now: datetime | None = None) -> str:
+    """'live', 'ended' (ended_at set), 'idle' (no request within auth_idle_timeout_min; last_seen is
+    written once a minute, so up to a minute early) or 'expired' (older than auth_absolute_lifetime_h,
+    counted from the login)."""
+    if row["ended_at"] is not None:
+        return "ended"
+    t = now or store._utcnow()
+    if t - _when(row["created_at"]) > lifetimes.absolute:
+        return "expired"
+    if t - _when(row["last_seen_at"]) > lifetimes.idle:
+        return "idle"
+    return "live"
+
+
+def _when(ts: str) -> datetime:
+    dt = store.parse_iso(ts)
+    if dt is None:
+        raise ValueError("a session row without a time")
+    return dt
+
+
+def _sha256_hex(v: Any, what: str) -> str:
+    if not isinstance(v, str) or not SHA256_RE.match(v):
+        raise ValueError(f"{what} must be a sha256 hex digest")
+    return v
+
+
+def _user_id(v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"user_id must be a positive integer, got {v!r}")
+    return v
+
+
+def _factor_list(v: Any) -> list[str]:
+    if not isinstance(v, list) or not v or len(set(v)) != len(v) or any(f not in AUTH_FACTORS for f in v):
+        raise ValueError(f"factors must be a non-empty list of distinct names from {', '.join(AUTH_FACTORS)}")
+    return list(v)
+
+
+def _user_agent(v: Any) -> str | None:
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError("user_agent must be a string")
+    return v[:USER_AGENT_MAX]
+
+
+def _acting_user(ctx: Ctx, user_id: int) -> None:
+    """A session write about the actor's own session: the actor is that user."""
+    if ctx.actor != f"user:{user_id}":
+        raise Forbidden(f"only user:{user_id} acts on this session (actor {ctx.actor})")
+
+
+def _open_session(conn: sqlite3.Connection, id_sha256: Any) -> store.Row:
+    row = store.get_auth_session(conn, _sha256_hex(id_sha256, "id_sha256"))
+    if row is None:
+        raise store.NotFound("no such session")
+    if row["ended_at"] is not None:
+        raise store.InvalidTransition(f"session {row['id']} has ended ({row['end_reason']})")
+    return row
+
+
+@action("auth.session_login", "auth_session")
+def auth_session_login(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, id_sha256: Any, csrf_sha256: Any,
+                       factors: Any, replaces: Any = None, user_agent: Any = None) -> Result:
+    """A completed login (the factor rule is the caller's, dashboard.auth.factors): a new full session
+    with a fresh id. `replaces`: the id hash of the session this browser had (its pre-session), ended
+    'rotated'. -> {session_id, ended: {row id: reason}}."""
+    uid = _user_id(user_id)
+    _acting_user(ctx, uid)
+    new_hash, csrf = _sha256_hex(id_sha256, "id_sha256"), _sha256_hex(csrf_sha256, "csrf_sha256")
+    done, agent = _factor_list(factors), _user_agent(user_agent)
+    lifetimes = AuthLifetimes(conn)
+    ended: dict[str, str] = {}
+    if replaces is not None:
+        old = store.get_auth_session(conn, _sha256_hex(replaces, "replaces"))
+        if old is not None and store.end_auth_session(conn, old["id"], "rotated"):
+            ended[str(old["id"])] = "rotated"
+    still_open = []
+    for row in store.open_auth_sessions(conn, uid):
+        state = auth_session_state(row, lifetimes)
+        if state in ("idle", "expired"):
+            store.end_auth_session(conn, row["id"], state)
+            ended[str(row["id"])] = state
+        else:
+            still_open.append(row)
+    for row in still_open[:max(0, len(still_open) + 1 - lifetimes.max_sessions)]:
+        store.end_auth_session(conn, row["id"], "evicted")
+        ended[str(row["id"])] = "evicted"
+    sid = store.add_auth_session(conn, new_hash, uid, csrf, factors=done, user_agent=agent,
+                                 authenticated_at=store.now_iso())
+    return Result({"session_id": sid, "ended": ended}, sid, None,
+                  {"user_id": uid, "factors": done, "ended": ended})
+
+
+@action("auth.session_rotate", "auth_session")
+def auth_session_rotate(conn: sqlite3.Connection, ctx: Ctx, id_sha256: Any, new_id_sha256: Any,
+                        new_csrf_sha256: Any, factors: Any = None, authenticated: Any = False) -> Result:
+    """A new id for a live full session (a step-up or a factor change, §3.5): the old row ends
+    'rotated', the new one keeps the login time (the absolute lifetime goes on counting).
+    `factors`: the session's factors from now on (default: unchanged); `authenticated`: this was a
+    full authentication (a step-up), which restarts the re-auth window. -> {session_id}."""
+    row = _open_session(conn, id_sha256)
+    if row["kind"] != "full":
+        raise store.InvalidTransition("a pre-session has no login to rotate")
+    _acting_user(ctx, row["user_id"])
+    if auth_session_state(row, AuthLifetimes(conn)) != "live":
+        raise store.InvalidTransition(f"session {row['id']} is past its lifetime")
+    if not isinstance(authenticated, bool):
+        raise ValueError("authenticated must be true or false")
+    done = row["factors"] if factors is None else _factor_list(factors)
+    store.end_auth_session(conn, row["id"], "rotated")
+    sid = store.add_auth_session(conn, _sha256_hex(new_id_sha256, "new_id_sha256"), row["user_id"],
+                                 _sha256_hex(new_csrf_sha256, "new_csrf_sha256"), factors=done,
+                                 user_agent=row["user_agent"], created_at=row["created_at"],
+                                 authenticated_at=store.now_iso() if authenticated else row["authenticated_at"])
+    return Result({"session_id": sid}, sid, {"session_id": row["id"], "factors": row["factors"]},
+                  {"session_id": sid, "factors": done, "step_up": authenticated})
+
+
+@action("auth.session_logout", "auth_session")
+def auth_session_logout(conn: sqlite3.Connection, ctx: Ctx, id_sha256: Any) -> Result:
+    """The user signs out of this session. -> {session_id}."""
+    row = _open_session(conn, id_sha256)
+    if row["kind"] != "full":
+        raise store.InvalidTransition("a pre-session has no login to sign out of")
+    _acting_user(ctx, row["user_id"])
+    store.end_auth_session(conn, row["id"], "logout")
+    return Result({"session_id": row["id"]}, row["id"], {"ended": None}, {"ended": "logout"})
+
+
+@action("auth.session_revoke", "auth_session")
+def auth_session_revoke(conn: sqlite3.Connection, ctx: Ctx, session_id: Any = None, user_id: Any = None) -> Result:
+    """End one session (F11) or every open session of a user (reset-auth, a removed user). Who may is
+    5a's permission matrix (an owner, or the user for their own). -> {ended: [row ids]}."""
+    if (session_id is None) == (user_id is None):
+        raise ValueError("give exactly one of session_id and user_id")
+    if session_id is not None:
+        if isinstance(session_id, bool) or not isinstance(session_id, int):
+            raise ValueError("session_id must be an integer")
+        row = store.get_auth_session_by_id(conn, session_id)
+        if row is None or row["kind"] != "full":
+            raise store.NotFound(f"no session {session_id}")
+        rows = [row] if row["ended_at"] is None else []
+        target: object = session_id
+    else:
+        rows = store.open_auth_sessions(conn, _user_id(user_id))
+        target = f"user:{user_id}"
+    ended = [r["id"] for r in rows if store.end_auth_session(conn, r["id"], "revoked")]
+    return Result({"ended": ended}, target, {"open": ended}, {"open": []}, changed=bool(ended))
+
+
+def auth_session_start_pre(conn: sqlite3.Connection, id_sha256: str, csrf_sha256: str,
+                           user_agent: str | None = None) -> int:
+    """A pre-session for an anonymous browser (no audit row: the row is its own record). Deletes the
+    pre-sessions idle past auth_idle_timeout_min first, so anonymous loads can't pile up rows.
+    -> the row id."""
+    new_hash, csrf, agent = _sha256_hex(id_sha256, "id_sha256"), _sha256_hex(csrf_sha256, "csrf_sha256"), \
+        _user_agent(user_agent)
+
+    def run() -> int:
+        with store.transaction(conn):
+            idle = AuthLifetimes(conn).idle
+            store.prune_pre_sessions(conn, store.iso_ms(store._utcnow() - idle))
+            return store.add_auth_session(conn, new_hash, None, csrf, user_agent=agent)
+    return store.retrying(run, conn)
+
+
+def auth_session_touch(conn: sqlite3.Connection, session_id: int) -> bool:
+    """last_seen_at = now when it is a minute old or more (no audit row). -> whether it wrote."""
+    if isinstance(session_id, bool) or not isinstance(session_id, int):
+        raise ValueError("session_id must be an integer")
+
+    def run() -> bool:
+        with store.transaction(conn):
+            return store.touch_auth_session(conn, session_id, store.iso_ms(store._utcnow() - TOUCH_EVERY))
+    return store.retrying(run, conn)
 
 
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)

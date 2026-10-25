@@ -79,6 +79,8 @@ def openapi(endpoints: Sequence[Endpoint]) -> dict[str, Any]:
         responses["default"] = {"description": "error (the one error shape, §8)", "content": content(error_ref)}
         op: dict[str, Any] = {"operationId": ep.name, "summary": ep.summary, "x-access": ep.access,
                               "responses": responses}
+        if ep.access == "session":
+            op["x-role"] = ep.role
         if ep.request is not None:
             op["requestBody"] = {"required": True, "content": content(refs[(ep.request, "validation")])}
         parameters: list[dict[str, Any]] = []
@@ -223,7 +225,8 @@ def typescript(doc: dict[str, Any], endpoints: Sequence[Endpoint]) -> str:
     out.append("export const ENDPOINTS = {")
     for ep in endpoints:
         out.append(f"  {ep.name}: {{ method: {json.dumps(ep.method)}, path: {json.dumps(ep.path)}, "
-                   f"access: {json.dumps(ep.access)}, idempotent: {'true' if ep.idempotent else 'false'} }},")
+                   f"access: {json.dumps(ep.access)}, role: {json.dumps(ep.role if ep.access == 'session' else None)}, "
+                   f"idempotent: {'true' if ep.idempotent else 'false'} }},")
     out += ["} as const;", "export type EndpointName = keyof typeof ENDPOINTS;", ""]
     out.append("export interface EndpointTypes {")
     for ep in endpoints:

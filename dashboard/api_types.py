@@ -58,6 +58,23 @@ class HealthResponse(Model):
     db: str
 
 
+# 5a's grant levels and the owner (docs/phase5a_plan.md §3.2), lowest first.
+Role = Literal["viewer", "editor", "manager", "owner"]
+
+
+class MeUser(Model):
+    id: int
+    role: Role | None       # the highest role any grant gives (null = no grant yet)
+
+
+class MeResponse(Model):
+    """GET /api/v1/me (public): the signed-in user or null, the session's CSRF token (the client keeps
+    it in memory only and sends it as X-CSRF-Token on every write) and the display time zone."""
+    user: MeUser | None
+    csrf_token: str
+    time_zone: str
+
+
 class ApiSchemaResponse(Model):
     """GET /api/v1/schema.json (session): the OpenAPI 3.1 document of this API (codegen.openapi())."""
     openapi: Literal["3.1.0"]

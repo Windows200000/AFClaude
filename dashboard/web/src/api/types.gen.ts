@@ -51,6 +51,21 @@ export interface HealthResponse {
 }
 
 /**
+ * GET /api/v1/me (public): the signed-in user or null, the session's CSRF token (the client keeps
+ * it in memory only and sends it as X-CSRF-Token on every write) and the display time zone.
+ */
+export interface MeResponse {
+  readonly user: MeUser | null;
+  readonly csrf_token: string;
+  readonly time_zone: string;
+}
+
+export interface MeUser {
+  readonly id: number;
+  readonly role: "viewer" | "editor" | "manager" | "owner" | null;
+}
+
+/**
  * HTML rendered from markdown on the server and allowlist-sanitised (dashboard.markdown.render(),
  * docs/phase6c_plan.md §0, design §9.8): the only HTML a response may carry. Validation always
  * refuses, so a handler can't pass a plain string where a response field is SanitizedHtml; render()
@@ -61,12 +76,14 @@ export interface HealthResponse {
 export type SanitizedHtml = string & { readonly __brand: "SanitizedHtml" };
 
 export const ENDPOINTS = {
-  health: { method: "GET", path: "/api/v1/health", access: "public", idempotent: false },
-  api_schema: { method: "GET", path: "/api/v1/schema.json", access: "session", idempotent: false },
+  health: { method: "GET", path: "/api/v1/health", access: "public", role: null, idempotent: false },
+  api_schema: { method: "GET", path: "/api/v1/schema.json", access: "session", role: "viewer", idempotent: false },
+  me: { method: "GET", path: "/api/v1/me", access: "public", role: null, idempotent: false },
 } as const;
 export type EndpointName = keyof typeof ENDPOINTS;
 
 export interface EndpointTypes {
   readonly health: { readonly params: null; readonly request: null; readonly response: HealthResponse };
   readonly api_schema: { readonly params: null; readonly request: null; readonly response: ApiSchemaResponse };
+  readonly me: { readonly params: null; readonly request: null; readonly response: MeResponse };
 }
