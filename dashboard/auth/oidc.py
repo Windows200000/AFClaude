@@ -17,7 +17,9 @@ ignores its missing types, nothing of it leaves this module untyped).
                        `amr` / `acr` types, `auth_time` after the flow began for step-up)
   fetch_userinfo()     the userinfo endpoint (plain JSON), its `sub` equal to the ID token's
   groups_claim()       the groups from a claim set (ID token or userinfo)
-  SecondFactorPolicy / check_second_factor()   the `amr` / `acr` rule (owner question 2, §6)
+  SecondFactorPolicy / check_second_factor()   the `amr` / `acr` rule, dormant (D-294: the default
+                                       is `off`, the provider is trusted completely, and this isn't
+                                       offered as a setting)
 
 The three HTTP calls go through httpx2 with a fixed timeout each (D-234), no redirects, a size cap;
 `transport` is injectable (tests use a local fake provider). Every failure raises OidcError with a
@@ -584,6 +586,10 @@ def groups_claim(claims: Mapping[str, Any], claim: str = "groups") -> Optional[f
 
 
 # --- the second-factor rule (owner question 2, docs/phase6b_plan.md §6) --------------------------
+#
+# D-294 (owner, 2026-10-23): trust the OIDC provider completely, no amr/acr check. The default is
+# now `off` and this policy isn't offered as a setting; `all` and `owner` stay as dormant code in
+# case a later decision reinstates them, but nothing in this module selects them anymore.
 
 SecondFactorWhen = Literal["all", "owner", "off"]
 SECOND_FACTOR_WHEN: tuple[SecondFactorWhen, ...] = ("all", "owner", "off")
@@ -592,11 +598,13 @@ SECOND_FACTOR_WHEN: tuple[SecondFactorWhen, ...] = ("all", "owner", "off")
 @dataclass(frozen=True)
 class SecondFactorPolicy:
     """Whether a sign-in through the provider must show that the provider asked for a second
-    factor: `all` (a) every sign-in, `owner` (b, the plan's recommendation and the default until
-    the owner answers) only a sign-in that gives owner rights, `off` (c) never. The provider shows
-    it with one of `amr` (RFC 8176 values; default `mfa`, which Authelia and Authentik send after a
-    second factor) or an `acr` value from `acr` (empty: `acr` not used)."""
-    when: SecondFactorWhen = "owner"
+    factor: `all` (a) every sign-in, `owner` (b, the plan's earlier recommendation and default)
+    only a sign-in that gives owner rights, `off` (c, the default since D-294) never. Dormant:
+    D-294 trusts the provider completely, so this isn't offered as a setting; `all` and `owner`
+    are kept only as dormant code. The provider shows a second factor with one of `amr` (RFC 8176
+    values; default `mfa`, which Authelia and Authentik send after a second factor) or an `acr`
+    value from `acr` (empty: `acr` not used)."""
+    when: SecondFactorWhen = "off"
     amr: frozenset[str] = frozenset({"mfa"})
     acr: frozenset[str] = frozenset()
 

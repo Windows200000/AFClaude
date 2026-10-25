@@ -550,8 +550,9 @@ class SecondFactor(unittest.TestCase):
         return oidc.IdToken(issuer=ISSUER, sub="u", iat=NOW, exp=NOW + 60, auth_time=None, sid=None,
                             amr=tuple(amr), acr=acr, claims={})
 
-    def test_default_is_the_recommendation(self):
-        self.assertEqual(oidc.SecondFactorPolicy().when, "owner")
+    def test_default_is_off(self):
+        """D-294: trust the provider completely, no amr/acr check by default."""
+        self.assertEqual(oidc.SecondFactorPolicy().when, "off")
 
     def test_matrix(self):
         mfa, pwd = self.token(["pwd", "mfa"]), self.token(["pwd"])
