@@ -524,12 +524,21 @@ class Delivery(tc.Env):
 
     def test_held_until_the_next_window_start_then_an_error(self):
         """D-244: no 2 h limit; the hold lasts until the next session-window start (+ START_GRACE for
-        that start to take it along); still pending then: an error, alerted, automation paused."""
+        that start to take it along); still pending then: an error, alerted, automation paused.
+        A fixed clock: hold_since is store.now_iso() wall time, so a real clock made the gap to the
+        next session start (and so this test) depend on the time of day it happened to run -
+        anchored just after a window start on the 2026 DST fall-back night, which also proves
+        hold_until spans the fold (D-031/D-148) rather than using a fixed UTC offset."""
+        since = datetime(2026, 10, 24, 21, 5, tzinfo=UTC)      # 23:05 CEST: just after the window opens
+        old_utcnow = store._utcnow
+        store._utcnow = lambda: since
+        self.addCleanup(setattr, store, "_utcnow", old_utcnow)
         self.typing = "the owner typed in a terminal attached to ka-abcdef01 1 min ago"
         m = self.now_msg()
-        self.assertEqual(self.deliver(m), "held")
-        since = store.parse_iso(self.row(m)["hold_since"])
+        self.assertEqual(self.deliver(m, since), "held")
+        self.assertEqual(store.parse_iso(self.row(m)["hold_since"]), since)
         deadline = schedule.next_session_start(since)
+        self.assertEqual(deadline, datetime(2026, 10, 25, 2, 0, tzinfo=UTC))   # 03:00 CET: across the fold
         self.assertEqual(inbox.hold_until(self.row(m)), deadline)
         view = inbox.message_view(self.row(m))
         self.assertEqual(view["hold_until_berlin"], deadline.astimezone(inbox.BERLIN).strftime("%a %d.%m. %H:%M"))
