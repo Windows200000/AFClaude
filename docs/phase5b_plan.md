@@ -2,7 +2,7 @@
 
 Plan for design §4, §9.7, §9.8 (container isolation), §10.1, §10.2, §10.5, §10.6 / §13 step 5b: one image with three services (web, runner, MCP), a compose file for plain docker and Coolify, the minimal env, the master key, the MCP server in a container with the remote transport and machine-token auth, the host checks as a runner job and a CLI, and the cut-over of this install from today's single container. Sessions stay on the host behind the SSH bridge. Plan only: the held runner branches (3a S2–S6) rewrite `docker/compose.yml`, `docker/crontab` and `docker/entrypoint.sh`, and S7–S9 (not built) finish the job; 5b starts where S9 leaves the container (§4). Each step in §5 is one worker branch.
 
-Binding inputs: D-120 (the container is the manager and bundles everything that isn't machine-specific; the host executes), D-121 (the owner installs the bridge), D-163 (everything in containers incl. the MCP server; Coolify or plain docker; minimal env, the rest in the DB), D-164 (sessions on the host; the dashboard validates tmux, Claude Code, its login and the bridge), D-146 / D-161 (settings and state in the DB), D-180 / D-187 (`AFCLAUDE_DATA` required, no default; built with 5c B7), D-195 / D-198 (machine users; remote MCP over HTTPS at `/mcp` through the proxy, tunnel or VPN only until 8d; on the host the token only identifies), D-209 (mypy --strict for `docker/host_exec.py`, the MCP transport and the key code), D-217 (every permission AFClaude needs is in the repo), D-235 / D-282 / D-283 (fail fast: alert + pause; the pauses become alerts before release; the task-manager clears a pause after investigating), D-257 (deploys drain first; no rebuild within 30 min of a session-window start), D-007 (existing options first, §2).
+Binding inputs: D-120 (the container is the manager and bundles everything that isn't machine-specific; the host executes), D-121 (the owner installs the bridge), D-163 (everything in containers incl. the MCP server; Coolify or plain docker; minimal env, the rest in the DB), D-164 (sessions on the host; the dashboard validates tmux, Claude Code, its login and the bridge), D-146 / D-161 (settings and state in the DB), D-180 / D-187 (`AFCLAUDE_DATA` required, no default; built with 5c B7), D-195 / D-198 (machine users; remote MCP over HTTPS at `/mcp` through the proxy, tunnel or VPN only until 8d; on the host the token only identifies), D-209 (mypy --strict for `docker/host_exec.py`, the MCP transport and the key code), D-217 (every permission AFClaude needs is in the repo), D-235 / D-282 / D-283 (fail fast: alert + pause; the pauses become alerts before release; the task-manager clears a pause after investigating), D-257 (deploys drain first; no rebuild within 30 min of a session-window start), D-007 (existing options first, §2), D-295 (Coolify is checked against its documented rules only, no test deploy; it is plain docker underneath; the guide still tells Coolify users to switch auto-redeploy off).
 
 ## 0. Already decided
 
@@ -14,6 +14,7 @@ Binding inputs: D-120 (the container is the manager and bundles everything that 
 - **The master key** follows design §10.2: `AFCLAUDE_MASTER_KEY` if set, else generated once into `/data/master.key` (mode 0600). Nothing in the DB is encrypted with it in 5b (TOTP seeds and the OIDC secret come with 6a/6b); 5b builds the key handling and the envelope helper, 5c B2 wraps it into bundles.
 - **`AFCLAUDE_PUBLIC_URL` is optional until 6a.** Design §10.2 marks it required; before 6a nothing needs it except the remote MCP registration command, and before 8d there is no public URL (D-157). 6a makes it `:?` in compose.
 - **Fail fast** (D-235): a host check that fails, a service that can't start, a key mismatch: alert + pause (`failstop.fail`, components `hostcheck`, `container`, `masterkey`), never a degraded start. D-282's pre-release step turns them into alerts like every other site.
+- **Coolify gets no test deploy** (D-295, answers question 1): the compose file is checked against Coolify's documented rules only (§2); Coolify is "not special, just a wrapper around docker" in the owner's words, and the owner didn't object to the guide's existing "switch auto-redeploy off" instruction (§3.1, K8). A real Coolify deploy happens only if and when someone actually runs AFClaude there.
 
 ## 1. Today (as-is inventory)
 
@@ -34,7 +35,7 @@ Binding inputs: D-120 (the container is the manager and bundles everything that 
 | Python deps | `pip install mcp==2.2.0` (pulls starlette, uvicorn, `cryptography`); base `python:3.12-slim-bookworm` by tag | no hash pins, no digest pin |
 | quickview | its own nginx container; mounts the repo's `data/quickview` and `data/api` (the inbox socket) by relative path | must follow `AFCLAUDE_DATA` in 5e |
 | host crontab | no AFClaude lines since 01.10. | nothing to retire there |
-| this host | plain docker compose; a reverse proxy container in front of the quickview; no Coolify | Coolify can't be tested here (§6.1) |
+| this host | plain docker compose; a reverse proxy container in front of the quickview; no Coolify | Coolify can't be tested here; checked against its documented rules only (D-295) |
 
 ## 2. Existing options checked (D-007)
 
@@ -134,7 +135,7 @@ Binding inputs: D-120 (the container is the manager and bundles everything that 
 
 ## 6. Questions for the owner
 
-1. **Testing the Coolify setup.** AFClaude's container setup is meant to run on Coolify as well as on plain docker, but this server has no Coolify, so it can only be checked against Coolify's documented rules, not by a real deploy. Options: (a) check against the documented rules only, and deploy on Coolify for real only if you or someone else wants to run it there later; (b) you name a server with Coolify where AFClaude may be deployed once as a test, with empty data, no Claude login and no route from the internet, and removed afterwards. Recommendation: (a) now, (b) before the dashboard goes public, if such a server exists.
+None open. D-295 answers the former question 1: check against Coolify's documented rules only, no test deploy; see §0.
 
 ## 7. Owner steps (no decision needed, listed so they can be planned)
 
