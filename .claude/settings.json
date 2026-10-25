@@ -7,7 +7,9 @@
       "Bash(python3 keepalive.py --run-stopped:*)",
       "Bash(python3 usage_report.py:*)",
       "Bash(claude agents:*)",
-      "mcp__afclaude"
+      "mcp__afclaude",
+      "Bash(python3 tools/deploy.py)",
+      "Bash(python3 tools/deploy.py:*)"
     ]
   },
   "hooks": {
