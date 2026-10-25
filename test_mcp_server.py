@@ -382,7 +382,9 @@ class DBErrors(Env):
 class Handoff(Env):
     def test_handoff_tool(self):
         """afclaude_handoff (D-144): the calling session's own hand-off, structured, in the DB."""
-        r = run(ms.afclaude_handoff("where it stands", done=["a"], next_steps=["b", "c"], open_question_ids=[4]))
+        r = run(ms.afclaude_handoff("where it stands", done=["a"], next_steps=["b", "c"], open_question_ids=[4],
+                                    owner_messages=["do X, verbatim"], in_flight=["branch b1"],
+                                    lessons=["retry first"], working_notes=["run it under .venv"]))
         self.assertEqual((r["session_id"], r["saved"]), (CALLER, "HANDOFF SAVED"))
         c = self.conn()
         try:
@@ -392,6 +394,8 @@ class Handoff(Env):
             c.close()
         self.assertEqual(h["id"], r["id"])
         self.assertEqual(h["body"]["next_steps"], ["b", "c"])
+        self.assertEqual([h["body"][k] for k in ("owner_messages", "in_flight", "lessons", "working_notes")],
+                         [["do X, verbatim"], ["branch b1"], ["retry first"], ["run it under .venv"]])   # D-305
         self.assertEqual((audit["actor"], audit["via"]), (f"mcp:{CALLER}", "mcp"))
         with self.assertRaisesRegex(ToolError, "only its own"):          # not another session's
             asyncio.run(ms.afclaude_handoff("x", session=SID))
@@ -537,7 +541,8 @@ class Stdio(unittest.TestCase):
         schema = {t.name: t.input_schema for t in tools}
         self.assertEqual(schema["afclaude_add_task"]["required"], ["title"])
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
-        self.assertLess(size, 13000, f"tool list is {size} bytes")   # 12000 until afclaude_decisions (D-242)
+        # 12000 until afclaude_decisions (D-242), 13000 until the hand-off's D-305 fields
+        self.assertLess(size, 13800, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

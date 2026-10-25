@@ -99,6 +99,8 @@ PROMPTS: dict[str, Prompt] = {
                                     flat=False),
     "stage_eta_review_once_after_usage": Prompt(("report",), used_by="the chained one-off ETA review"),
     "stage_eta_review_rerun": Prompt(used_by="nightly task brief (the ETA review re-run)", flat=False),
+    "compaction_handoff_review": Prompt(("date", "report"), used_by="one-off compaction vs. hand-off review "
+                                        "(D-305); nightly task brief", flat=False),
     "inbox_triage": Prompt(("text",), used_by="inbox_worker Haiku triage", flat=False),
     "inbox_now": Prompt(("at", "id", "notes", "text"), used_by="inbox_worker: a 'now' message"),
     "inbox_notes": Prompt(("notes",), used_by="inbox notes inserted in the next message"),

@@ -364,7 +364,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
     project_id        INTEGER REFERENCES projects(id),
     created_at        TEXT NOT NULL,
     created_by        TEXT,                -- the writing actor (mcp:<session>, cli, ...)
-    body              TEXT NOT NULL,       -- JSON: summary, done, in_progress, next_steps, open_question_ids, notes
+    body              TEXT NOT NULL,       -- JSON: the fields of handoff_body (D-144, D-305)
     consumed_at       TEXT,
     consumed_by_start TEXT                 -- the start's dedup key (window-start-..., last-mile-...)
 );
@@ -2909,11 +2909,15 @@ def prune_runner_runs(conn: sqlite3.Connection, cutoff: str, *, batch_size: int 
 # and consumes it. One open hand-off per session counts: a newer one supersedes the older ones
 # (consume_handoff closes them too).
 
-HANDOFF_LISTS = ("done", "in_progress", "next_steps")
+# D-305: owner_messages, in_flight, lessons and working_notes carry what only the compaction
+# summary used to hold (the owner's words, exact branch/commit names, errors and their lessons,
+# the know-how used afterwards). Optional on write and read: older hand-offs lack them.
+HANDOFF_LISTS = ("done", "in_progress", "next_steps", "owner_messages", "in_flight", "lessons", "working_notes")
 HANDOFF_KEYS = ("summary",) + HANDOFF_LISTS + ("open_question_ids", "notes")
-HANDOFF_MAX = 8192             # characters of the whole body as JSON
+HANDOFF_MAX = 12000            # characters of the whole body as JSON (~3k tokens, well below a summary)
 HANDOFF_TEXT_MAX = 2000        # summary, notes
 HANDOFF_ITEM_MAX = 500         # one list item
+HANDOFF_OWNER_ITEM_MAX = 1500  # one owner message, verbatim
 HANDOFF_ITEMS_MAX = 30         # items per list (open_question_ids: 50)
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -2925,7 +2929,7 @@ def _session_id(value: object) -> str:
     return sid
 
 
-def _str_list(value: object, what: str) -> list[str]:
+def _str_list(value: object, what: str, item_max: int = HANDOFF_ITEM_MAX) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
@@ -2939,15 +2943,16 @@ def _str_list(value: object, what: str) -> list[str]:
         t = _text(x, f"an item of {what}")
         if t is None:
             continue
-        if len(t) > HANDOFF_ITEM_MAX:
-            raise ValueError(f"an item of {what} is too long ({len(t)} > {HANDOFF_ITEM_MAX} characters)")
+        if len(t) > item_max:
+            raise ValueError(f"an item of {what} is too long ({len(t)} > {item_max} characters)")
         out.append(t)
     return out
 
 
 def handoff_body(value: object) -> dict[str, Any]:
     """Validate + normalize a hand-off body (a dict or its JSON text): summary (required),
-    done / in_progress / next_steps (lists of short strings; a single string is one item),
+    done / in_progress / next_steps / owner_messages (verbatim) / in_flight / lessons /
+    working_notes (lists of short strings; a single string is one item; missing = empty),
     open_question_ids (task ids), notes. Unknown keys and an oversized body are a ValueError."""
     if isinstance(value, str):
         try:
@@ -2972,7 +2977,7 @@ def handoff_body(value: object) -> dict[str, Any]:
     ids = [_position(x, "an open question id") for x in ids_raw]
     body: dict[str, Any] = {"summary": summary}
     for k in HANDOFF_LISTS:
-        body[k] = _str_list(value.get(k), k)
+        body[k] = _str_list(value.get(k), k, HANDOFF_OWNER_ITEM_MAX if k == "owner_messages" else HANDOFF_ITEM_MAX)
     body["open_question_ids"] = ids
     body["notes"] = notes
     if len(json.dumps(body, ensure_ascii=False)) > HANDOFF_MAX:
@@ -3045,15 +3050,22 @@ def consume_handoff(conn: sqlite3.Connection, handoff_id: object, start_key: obj
     return out
 
 
+HANDOFF_LABELS = (("owner_messages", "The owner's messages (verbatim)"), ("in_flight", "In flight"),
+                  ("done", "Done"), ("in_progress", "In progress"), ("next_steps", "Next steps"),
+                  ("lessons", "Lessons from this run"), ("working_notes", "Working notes"))
+
+
 def render_handoff(h: Mapping[str, Any]) -> str:
-    """A hand-off as one line of text (the continue message is typed with tmux send-keys)."""
+    """A hand-off as one line of text (the continue message is typed with tmux send-keys). A
+    field an older hand-off lacks is left out."""
     b = h.get("body") or {}
     parts = [f"Hand-off #{h.get('id')} (written {h.get('created_at')})."]
     parts.append(f"Summary: {b.get('summary')}")
-    for k, label in (("done", "Done"), ("in_progress", "In progress"), ("next_steps", "Next steps")):
+    for k, label in HANDOFF_LABELS:
         items = b.get(k) or []
         if items:
-            parts.append(f"{label}: " + " ".join(f"({i}) {x}" for i, x in enumerate(items, 1)))
+            q = '"' if k == "owner_messages" else ""
+            parts.append(f"{label}: " + " ".join(f"({i}) {q}{x}{q}" for i, x in enumerate(items, 1)))
     ids = b.get("open_question_ids") or []
     if ids:
         parts.append("Open questions (AFClaude tasks): " + ", ".join(f"#{i}" for i in ids))

@@ -487,6 +487,15 @@ class SaveResend(Env):
             self.assertIn(part, text)
         self.assertIn("(the newest one is none,", ka.save_retry_text(SID, 0))
 
+    def test_the_save_prompts_ask_for_the_d305_fields(self):
+        """D-305: both the save prompt and its re-send name every hand-off field (the new ones are
+        what only the compaction summary used to carry), and each is one the store accepts."""
+        for text in (ka.save_text(SID), ka.save_retry_text(SID, 3)):
+            for k in store.HANDOFF_KEYS:
+                self.assertIn(k, text)
+            self.assertNotIn("\n", text)
+        self.assertIn("VERBATIM", ka.save_text(SID))
+
 
 class CompactionFailures(Env):
     """D-234/D-235: every failure or timeout stops the compaction there, is recorded (never retried
