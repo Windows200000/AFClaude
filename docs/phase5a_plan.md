@@ -72,7 +72,7 @@ Binding inputs: D-149 / D-172 (first registration is owner; several owners; owne
 
 ### 3.4 The permission check in the write path
 - Each action declares `perm=Perm(scope, human, task_manager, agent, runner)`:
-  - `scope`: `global`, or a function that finds the target's project (task → `project_id`, doc → project, request → target project or the stalled session's project by cwd, decision → `project_id`, proposal → project, …).
+  - `scope`: `global`, or a function that finds the target's project (task → `project_id`, doc → project, request → target project, decision → `project_id`, proposal → project, …). A stalled session resolves to no project (D-299): its writes (`session.decide`, `session.clear`, `rule.*`, a stall's `continue_now`) are `scope=global`, owner-only, regardless of the session's cwd.
   - `human`: the least role needed (`viewer` never writes; `editor`, `manager`, `owner`); `force=True` marks a forcing write (run-now, a waking message) that editors may not do (D-184/D-190).
   - `task_manager`: `no` | `own_project` | `self_project` (AFClaude's own task-manager only: deploy steps, the install-wide resume).
   - `agent`: `refuse` | `propose` | `direct_if(<predicate>)` (§3.7).
