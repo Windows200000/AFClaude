@@ -516,7 +516,7 @@ class SessionActions(Base):
 class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
-                  "inbox.post", "inbox.retry", "project.manager_launch",
+                  "inbox.post", "inbox.retry", "inbox.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
@@ -1077,6 +1077,7 @@ class EveryAction(Base):
             ("inbox.hold", {"message_id": 1, "reason": "the owner is typing"}),
             ("inbox.deliver", {"message_id": 1, "plan": "send-keys"}),
             ("inbox.reply", {"message_id": 1, "answer": "a"}),
+            ("inbox.dismiss", {"message_id": 1}),
             ("inbox.post", {"text": "a note", "session_id": SID}),
             ("inbox.triage", {"message_id": 2, "verdict": "note", "reason": "later"}),
             ("inbox.include", {"message_ids": [2], "by": "window-start-2026-10-09"}),

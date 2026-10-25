@@ -8,7 +8,8 @@ The owner types a message on the temp dashboard (the quickview page); inbox_api.
   now   it is typed into the task-manager's tmux session at once (D-186: no window, no budget),
         through the keep-alive's own send path and checks (the session lock, preflight's
         owner_holds, owner_typing), with the message id and how to answer
-        (`tasks.py inbox reply <id> "..."`); the answer shows on the dashboard.
+        (`tasks.py inbox reply <id> "..."`); the answer shows on the dashboard: in the box's chat for
+        ui_chat_reset_hours, and in the questions section until the owner dismisses it (D-304).
   note  it waits in the DB; the next message the keep-alive sends into the session (a run's
         continue, a fill-up, the message after a compaction, or a "now" message) lists the
         noted ones verbatim and marks them included, so the session never wakes (and re-reads
@@ -341,11 +342,13 @@ def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any
     """What the box shows (D-246/D-248), oldest first: the chat (thread) and the noted messages
     still waiting for the next message into the session (an included one is gone; a noted one
     stays until then, whatever the chat's reset). `chat`: an answer is in view (the box shows it
-    as a chat); `busy`: a message is still on its way (the page polls faster)."""
+    as a chat); `busy`: a message is still on its way (the page polls faster). `threads`: every
+    answered message the owner has not dismissed, whatever its age, for the questions section (D-304)."""
     ms = sorted(thread(conn, now) + store.list_inbox(conn, "noted", limit=200), key=lambda m: m["id"])
     cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
     out = [message_view(m, cfg) for m in ms]
-    return {"messages": out, "chat": any(m["answer"] for m in ms),
+    return {"messages": out, "threads": [message_view(m) for m in store.inbox_threads(conn)],
+            "chat": any(m["answer"] for m in ms),
             "busy": any(m["state"] in BUSY_STATES for m in out),
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}
 
