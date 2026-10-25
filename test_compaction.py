@@ -31,6 +31,7 @@ NIGHT = datetime(2026, 10, 5, 21, 0, tzinfo=UTC)        # Mon 23:00 Berlin (CEST
 S2 = NIGHT + L                                          # 04:00 Berlin: the second session-window start
 RESET = S2                                              # the 23:00 run's session window resets at 04:00
 SAVE = "[keep-alive] Save your work now"
+RESEND = "[keep-alive] No new hand-off found"
 AFTER = "[keep-alive] This session was compacted"
 _N = [0]
 
@@ -100,6 +101,7 @@ class Env(unittest.TestCase):
         ka.read_usage_cache = lambda: self.usage
         self.compacts = True                                # the fake session compacts on /compact
         self.saves = "write"                                # ... and answers the save prompt (see fake_fire)
+        self.resaves = "silent"                             # ... and its re-send (the same modes)
         self.save_summary = "Fresh state at the compaction."
         ka.fire = self.fake_fire
         self.proj = os.path.join(d, "-proj")
@@ -154,13 +156,14 @@ class Env(unittest.TestCase):
                                   compactMetadata={"trigger": "manual"}),
                             entry("user", now, isCompactSummary=True,
                                   message={"role": "user", "content": "This session is being continued ..."})], "a")
-        elif message.startswith(SAVE):
-            if self.saves == "ignore":
+        elif message.startswith((SAVE, RESEND)):
+            mode = self.saves if message.startswith(SAVE) else self.resaves
+            if mode == "ignore":
                 return 0, "sent-keys ka-abcdef01", ""
             self.write([keepalive_msg(now, message)], "a")
-            if self.saves == "write":
+            if mode == "write":
                 self.handoff(self.save_summary, next_steps=["go on"])
-            if self.saves in ("write", "silent"):
+            if mode in ("write", "silent"):
                 self.write([assistant(now + timedelta(seconds=1), text="HANDOFF SAVED")], "a")
         else:
             self.write([keepalive_msg(now, message), assistant(now + timedelta(seconds=1))], "a")
@@ -443,6 +446,48 @@ class CompactAtRunEnd(Env):
         self.assertEqual(self.sent, [])
 
 
+class SaveResend(Env):
+    """Inbox #37 (22.10.): the session wrote a hand-off on its own, then ended the run; the save
+    prompt five minutes later got "HANDOFF SAVED" pointing at that earlier one, and the compaction
+    failed. The save prompt now asks for a NEW hand-off, and a reply without one gets it re-sent once."""
+    def test_a_reply_pointing_at_an_earlier_handoff_gets_one_resend(self):
+        early = self.handoff("Written before the save prompt.", at=self.now - timedelta(minutes=5))
+        self.saves, self.resaves = "silent", "write"
+        self.save_summary = "Written after the re-send."
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual([m[:len(SAVE)] for _, m in self.sent][:2], [SAVE, RESEND[:len(SAVE)]])
+        save, resend, compact, after = (m for _, m in self.sent)
+        self.assertTrue(resend.startswith(RESEND))
+        self.assertNotIn("\n", resend)
+        for part in (f"#{early['id']}", "written before the save prompt", f'session "{SID}"',
+                     "tasks.py handoff write --session", "HANDOFF SAVED", "only reminder"):
+            self.assertIn(part, resend)
+        self.assertTrue(compact.startswith("/compact "))
+        new = self.latest(unconsumed=False)
+        self.assertGreater(new["id"], early["id"])
+        self.assertIn("Summary: Written after the re-send.", after)
+        self.assertNotIn("Written before the save prompt.", after)
+        steps = rec["steps"]["save"]
+        self.assertEqual((steps["status"], steps["handoff_id"]), ("saved", new["id"]))
+        self.assertGreaterEqual(steps["resent_at"], steps["sent_at"])
+        self.assertFalse(self.paused()["paused"])
+        self.assertEqual(self.alerts, [])
+
+    def test_a_fresh_handoff_needs_no_resend(self):
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted")
+        self.assertFalse(any(m.startswith(RESEND) for _, m in self.sent))
+        self.assertNotIn("resent_at", rec["steps"]["save"])
+
+    def test_the_save_prompt_asks_for_a_new_handoff(self):
+        text = ka.save_text(SID)
+        for part in ("write a NEW short, structured hand-off", "even if you wrote one earlier",
+                     "only a hand-off written after this message counts"):
+            self.assertIn(part, text)
+        self.assertIn("(the newest one is none,", ka.save_retry_text(SID, 0))
+
+
 class CompactionFailures(Env):
     """D-234/D-235: every failure or timeout stops the compaction there, is recorded (never retried
     for the same activity), alerted, and pauses automation."""
@@ -478,9 +523,31 @@ class CompactionFailures(Env):
         self.assertEqual(self.latest()["id"], old["id"])                      # not consumed
 
     def test_a_reply_without_a_handoff(self):
+        """The save prompt is re-sent once; a second reply without one fails (no third prompt)."""
         self.saves = "silent"
         d, rec = self.compact()
-        self.assert_failed(rec, "the session answered the save prompt without writing a hand-off", [SAVE])
+        self.assert_failed(rec, "the session answered the save prompt and its re-send without writing a hand-off",
+                           [SAVE, RESEND])
+        self.assertIn("resent_at", rec["steps"]["save"])
+
+    def test_the_resend_timing_out(self):
+        self.saves, self.resaves = "silent", "ignore"
+        ka.SAVE_TIMEOUT = timedelta(0)
+        d, rec = self.compact()
+        self.assert_failed(rec, "no new hand-off within 10 min of the save prompt (after the save prompt was "
+                                "re-sent: the first reply had no hand-off)", [SAVE, RESEND])
+
+    def test_the_resend_failing_to_send(self):
+        self.saves = "silent"
+
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            if message.startswith(RESEND):
+                self.sent.append((plan, message))
+                return 1, "", "no tmux session"
+            return self.fake_fire(sid, cwd, message, plan)
+        ka.fire = fire
+        d, rec = self.compact()
+        self.assert_failed(rec, "the save prompt could not be sent (after the save prompt was re-sent", [SAVE, RESEND])
 
     def test_save_prompt_send_failure(self):
         def fire(sid, cwd, message, plan, new=False, **kw):

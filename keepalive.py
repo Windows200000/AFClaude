@@ -2509,7 +2509,9 @@ def plan_fillup_test(sid, remaining, args):
 #   1. once the session's turn has ended (up to COMPACT_IDLE_WAIT), types the save prompt
 #      (prompts/session_end_save.md) and waits for the session's NEW hand-off in the DB
 #      (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is written
-#      directly before the compaction (D-233), so it also holds the owner's interactive chats;
+#      directly before the compaction (D-233), so it also holds the owner's interactive chats; a
+#      reply without one (e.g. the session pointing at a hand-off it wrote before the prompt) gets
+#      the save prompt re-sent once, saying no new hand-off was found (session_end_save_retry.md);
 #   2. sends `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
 #      compact_boundary / isCompactSummary entry; up to COMPACT_TIMEOUT);
 #   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md): the session
@@ -2702,11 +2704,18 @@ def save_text(sid, trigger="run-end"):
                                                            why=TRIGGER_TEXT[trigger][0]).split())
 
 
+def save_retry_text(sid, newest):
+    """The save prompt re-sent after a reply without a new hand-off (`newest`: the session's newest
+    hand-off id from before the save prompt, 0 = none)."""
+    return " ".join(load_prompt("session_end_save_retry").format(
+        session=sid, tasks=TASKS_PY, newest=f"#{newest}" if newest else "none").split())
+
+
 SAVE_WHY = {   # why there is no new hand-off: the error says it (D-234)
     "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the compaction "
             "was due, so no save prompt was sent",
     "timeout": f"no new hand-off within {SAVE_TIMEOUT.total_seconds() / 60:g} min of the save prompt",
-    "no-handoff": "the session answered the save prompt without writing a hand-off",
+    "no-handoff": "the session answered the save prompt and its re-send without writing a hand-off",
     "send-failed": "the save prompt could not be sent",
     "db-error": "the hand-offs could not be read",
 }
@@ -2720,10 +2729,13 @@ COMPACT_WHY = {
 def save_before_compaction(sid, cwd, path, trigger="run-end"):
     """D-233: the hand-off is written directly before the compaction. Wait until the session's turn
     ended (else busy), type the save prompt, then wait for a new hand-off row of the session (up to
-    SAVE_TIMEOUT; given up early once the session answered and went idle without one). -> dict
-    status: saved (+ handoff_id) | busy | db-error | send-failed | no-handoff | timeout (the session
-    still working on it or silent: no new row in time), active (the session's last activity before
-    the save prompt), sent_at, error. Only "saved" lets the compaction go on (D-234)."""
+    SAVE_TIMEOUT; given up early once the session answered and went idle without one). A reply
+    without one (e.g. pointing at a hand-off written before the prompt) gets the save prompt re-sent
+    once, saying no new hand-off was found (save_retry_text; a deliberate retry, D-235), with its own
+    SAVE_TIMEOUT. -> dict status: saved (+ handoff_id) | busy | db-error | send-failed | no-handoff
+    (the re-send was answered without one too) | timeout (the session still working on it or
+    silent: no new row in time), active (the session's last activity before the save prompt),
+    sent_at, resent_at (the re-send, if any), error. Only "saved" lets the compaction go on (D-234)."""
     out = {"active": last_activity(path)}
     if not wait_idle(path):
         return dict(out, status="busy")
@@ -2732,15 +2744,30 @@ def save_before_compaction(sid, cwd, path, trigger="run-end"):
     except Exception as e:   # noqa: BLE001 - an error (D-234): no save prompt, the start is aborted
         log(f"compaction: {sid[:8]}'s hand-offs unreadable ({type(e).__name__}: {e}); no save prompt")
         return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
+    res = _await_save(sid, cwd, path, save_text(sid, trigger), before, dict(out), "sent_at")
+    if res["status"] != "no-handoff":
+        return res
+    log(f"compaction: {sid[:8]} answered the save prompt without a new hand-off (newest #{before}, "
+        "from before it); re-sending it once")
+    return _await_save(sid, cwd, path, save_retry_text(sid, before), before, res, "resent_at")
+
+
+def _await_save(sid, cwd, path, text, before, out, at_key):
+    """Type `text` (a save prompt) and wait for a hand-off row of the session newer than `before`
+    (see save_before_compaction). `out` gets the send time under `at_key`. Only a reply newer than
+    the transcript's last entry before the send counts (the re-send: not the first reply again)."""
+    prev = last_activity(path)
     since = datetime.now(UTC)
-    rc, o, err = fire(sid, cwd, save_text(sid, trigger), "send-keys")
-    log(f"compaction: sent the save prompt to {sid[:8]} rc={rc} stdout={o.strip()!r} stderr={err.strip()!r}")
-    out["sent_at"] = since
+    rc, o, err = fire(sid, cwd, text, "send-keys")
+    log(f"compaction: sent the save prompt to {sid[:8]} ({at_key}) rc={rc} stdout={o.strip()!r} "
+        f"stderr={err.strip()!r}")
+    out[at_key] = since
     if rc != 0:
         return dict(out, status="send-failed", rc=rc, error=f"rc={rc} {err.strip()[:300]}".strip())
     deadline = time.time() + SAVE_TIMEOUT.total_seconds()
     while True:
-        done = replied_since(path, since)   # before the DB read: the row is written before the reply
+        # before the DB read: the row is written before the reply
+        done = replied_since(path, since) and (prev is None or (last_activity(path) or prev) > prev)
         try:
             newest = newest_handoff_id(sid)
         except Exception as e:   # noqa: BLE001 - an error (D-234): store.retrying already retried (D-171)
@@ -2807,6 +2834,8 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end"):
         why = SAVE_WHY.get(st, f"save status {st}")
         if st == "timeout" and save.get("still_busy"):
             why += " (the session was still working on it)"
+        if st != "no-handoff" and save.get("resent_at"):
+            why += " (after the save prompt was re-sent: the first reply had no hand-off)"
         raise failstop.Failed(f"no fresh hand-off before the compaction: {why}", save.get("error") or "", rec)
     try:
         comp = compact_session(sid, cwd, path)
