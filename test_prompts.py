@@ -264,7 +264,8 @@ class SameTextTest(unittest.TestCase):
         out["inbox now"] = inbox.now_message({"id": 7, "created_at": "2026-10-21T08:00:00Z", "text": "x\ny"}, "N")
         task = {"name": "t1", "title": "T", "report": "review:t1", "fields": {"date": "2026-10-23", "since": "x",
                                                                               "report": "review:t1"}}
-        for ps in (list(ur.MONTHLY_PROMPTS), ["stage_eta_review_once", "stage_eta_review_rerun"]):
+        for ps in (list(ur.MONTHLY_PROMPTS), ["stage_eta_review_once", "stage_eta_review_rerun"],
+                   ["compaction_handoff_review"]):
             with mock.patch.object(nightly_tasks, "get", return_value=dict(task, prompts=ps)):
                 out[f"nightly brief {ps}"] = nightly_tasks.brief("t1")
         with mock.patch.object(nightly_tasks, "due", return_value=[dict(task, prompts=[])]):

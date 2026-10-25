@@ -967,13 +967,16 @@ class CLI(Base):
         """tasks.py handoff write/show (D-144): the CLI way for a session to save its hand-off."""
         rc, out, _ = self.run_cli("handoff", "show", "--session", SID)
         self.assertEqual((rc, out.strip()), (0, "no hand-off for 00000000"))
-        body = {"summary": "state", "next_steps": ["merge"], "open_question_ids": [3]}
+        body = {"summary": "state", "next_steps": ["merge"], "open_question_ids": [3],
+                "working_notes": ["tests under .venv"]}
         rc, out, _ = self.run_cli("handoff", "write", "--session", SID, "--json", json.dumps(body))
         self.assertEqual(rc, 0)
         self.assertIn("HANDOFF SAVED", out)
         with mock.patch("sys.stdin", io.StringIO(json.dumps({"summary": "newer"}))):
             rc, out, _ = self.run_cli("handoff", "write", "--session", SID, "--json", "-")
         self.assertEqual(rc, 0)
+        rc, out, _ = self.run_cli("handoff", "show", "--all")
+        self.assertIn("Working notes: (1) tests under .venv", out)              # D-305
         rc, out, _ = self.run_cli("handoff", "show", "--session", SID, "--json")
         h = json.loads(out)
         self.assertEqual((h["body"]["summary"], h["created_by"], h["consumed_at"]), ("newer", "cli", None))

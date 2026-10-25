@@ -30,6 +30,12 @@ ETA_CMD = ["add", "eta-review-2026-10-23", "--due", "2026-10-23 22:00",
            "--title", "the stage-ETA review re-run (D-261)", "--report", "review:eta-2026-10-23",
            "--prompt", "stage_eta_review_once", "--prompt", "stage_eta_review_rerun", "--field", "date=2026-10-23"]
 
+# the compaction vs. hand-off review a week on (D-305), as scheduled against the live DB
+COMPACTION_CMD = ["add", "compaction-review-2026-11-01", "--due", "2026-11-01 22:00",
+                  "--title", "compaction vs. hand-off review (D-305)",
+                  "--report", "review:compaction-vs-handoff-2026-11-01",
+                  "--prompt", "compaction_handoff_review", "--field", "date=2026-10-25"]
+
 
 clear_tasks = clear_nightly_tasks
 
@@ -191,6 +197,18 @@ class Cli(Base):
         self.assertEqual(cli("cancel", "eta-review-2026-10-23", "--why", "test")[0], 0)
         self.assertEqual(json.loads(cli("list")[1]), [])
         self.assertIn("eta-review-2026-10-23", cli("list", "--all")[1])
+
+    def test_the_compaction_review_command(self):
+        rc, out, err = cli(*COMPACTION_CMD)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("due from Sun 01.11. 22:00 CET", out)
+        rc, out, err = cli("brief", "compaction-review-2026-11-01")
+        self.assertEqual(rc, 0)
+        for part in ("review doc review:compaction-vs-handoff-2026-11-01", "(one-off, D-305) since 2026-10-25]",
+                     "isCompactSummary", "tasks.py doc set review:compaction-vs-handoff-2026-11-01",
+                     "OPEN_QUESTIONS.md", "python3 compact_timing.py model"):
+            self.assertIn(part, out)
+        self.assertNotIn("{", out.replace("{date}", ""))           # every placeholder filled
 
     def test_bad_input(self):
         with redirect_stderr(io.StringIO()):

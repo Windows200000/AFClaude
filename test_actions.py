@@ -1134,6 +1134,7 @@ class Handoffs(Base):
         self.assertEqual(self.audit()[-1]["action"], "handoff.write")
         h2 = self.do("handoff.write", session_id=SID, body=json.dumps({"summary": "later"}))   # JSON text too
         self.assertEqual(h2["body"], {"summary": "later", "done": [], "in_progress": [], "next_steps": [],
+                                      "owner_messages": [], "in_flight": [], "lessons": [], "working_notes": [],
                                       "open_question_ids": [], "notes": None})
         for bad, msg in (({"done": ["x"]}, "summary is required"), ({"summary": "s", "colour": 1}, "unknown"),
                          ({"summary": "s", "done": [1]}, "must be a string"),
@@ -1182,6 +1183,36 @@ class Handoffs(Base):
             self.do("handoff.write", actor="mcp:" + SID, via="mcp", session_id=SID2, body={"summary": "x"})
         with self.assertRaisesRegex(actions.Forbidden, "runner"):
             self.do("handoff.consume", actor="mcp:" + SID, via="mcp", handoff_id=h["id"], start_key="k")
+
+    def test_d305_fields(self):
+        """D-305: the owner's messages (verbatim, longer items allowed), in flight, lessons and
+        working notes are stored and rendered; a hand-off without them (an older one) renders as before."""
+        msg = "Okay, improve the handoff first.\nThen review in a week. " + "x" * 900
+        body = dict(self.BODY, owner_messages=[msg], in_flight="branch handoff-plus @ abc1234",
+                    lessons=["host python3 is 3.9: run the dashboard tests under .venv"],
+                    working_notes=["python3 change_manifest.py main...<branch> --db data/afclaude.db"])
+        h = self.do("handoff.write", session_id=SID, body=body)
+        self.assertEqual(h["body"]["owner_messages"], [msg])                # verbatim, newline kept in the DB
+        self.assertEqual(h["body"]["in_flight"], ["branch handoff-plus @ abc1234"])
+        text = store.render_handoff(h)
+        self.assertNotIn("\n", text)
+        for part in ('The owner\'s messages (verbatim): (1) "Okay, improve the handoff first. Then review',
+                     "In flight: (1) branch handoff-plus @ abc1234",
+                     "Lessons from this run: (1) host python3 is 3.9",
+                     "Working notes: (1) python3 change_manifest.py main...<branch>"):
+            self.assertIn(part, text)
+        self.assertLess(text.index("The owner's messages"), text.index("Done:"))
+        for bad, msg2 in (({"summary": "s", "owner_messages": ["x" * 1501]}, "too long"),
+                          ({"summary": "s", "lessons": ["x" * 501]}, "too long"),
+                          ({"summary": "s", "working_notes": ["x"] * 31}, "too many"),
+                          ({"summary": "s", "owner_messages": ["x" * 1500] * 9}, "hand-off is too long")):
+            with self.assertRaisesRegex(ValueError, msg2):
+                self.do("handoff.write", session_id=SID, body=bad)
+        old = {"id": 3, "created_at": "2026-10-20T10:00:00Z",
+               "body": {"summary": "old", "done": ["a"], "in_progress": [], "next_steps": [],
+                        "open_question_ids": [], "notes": None}}
+        self.assertEqual(store.render_handoff(old),
+                         "Hand-off #3 (written 2026-10-20T10:00:00Z). Summary: old Done: (1) a")
 
     def test_render_is_one_line(self):
         h = self.do("handoff.write", session_id=SID, body=dict(self.BODY, notes="two\nlines"))

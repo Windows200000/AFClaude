@@ -475,15 +475,21 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
 @tool("Write your compaction hand-off (D-144): when the AFClaude keep-alive asks you to save your work before "
       "a compaction, record a SHORT structured note for your compacted self; it is injected into the continue "
       "message after the compaction. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
-      "short items); open_question_ids (AFClaude task ids of open questions for the user); notes. session: your "
+      "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); lessons; "
+      "working_notes (exact commands, gotchas); open_question_ids (AFClaude task ids of open questions for the "
+      "user); notes. session: your "
       "full session id (default: this session's, when the client passes it). A newer hand-off replaces the "
       "older one. Returns the stored hand-off's id.")
 async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_progress: Optional[list[str]] = None,
-                           next_steps: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
+                           next_steps: Optional[list[str]] = None, owner_messages: Optional[list[str]] = None,
+                           in_flight: Optional[list[str]] = None, lessons: Optional[list[str]] = None,
+                           working_notes: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
                            notes: Optional[str] = None, session: Optional[str] = None,
                            project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
     body: dict[str, Any] = {"summary": summary, "done": done or [], "in_progress": in_progress or [],
-                            "next_steps": next_steps or [], "open_question_ids": open_question_ids or [],
+                            "next_steps": next_steps or [], "owner_messages": owner_messages or [],
+                            "in_flight": in_flight or [], "lessons": lessons or [],
+                            "working_notes": working_notes or [], "open_question_ids": open_question_ids or [],
                             "notes": notes}
     project = await resolve_dir_arg(ctx, project)
     conn = db()

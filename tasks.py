@@ -36,6 +36,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py inbox retry ID                send a failed message again (triage / delivery)
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
+                                           owner_messages, in_flight, lessons, working_notes,
                                            open_question_ids, notes} ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
     tasks.py automation [status]           is automation paused (D-234/D-235), why, since when: the
@@ -826,7 +827,8 @@ def parser():
     q = hs.add_parser("write", help="save a hand-off for your compacted self (prints HANDOFF SAVED)")
     q.add_argument("--session", required=True, help="the writing session (full id or unique prefix)")
     q.add_argument("--json", dest="body", required=True, metavar="BODY",
-                   help="JSON {summary, done, in_progress, next_steps, open_question_ids, notes}; - = stdin")
+                   help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, lessons, "
+                        "working_notes, open_question_ids, notes}; - = stdin")
     q.add_argument("--project", help="name or directory (default: the project the session manages)")
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")

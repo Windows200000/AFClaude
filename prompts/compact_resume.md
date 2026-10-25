@@ -1,1 +1,1 @@
-This session was compacted {when} (D-144/D-238). The hand-off you saved before the compaction: {handoff} Check it against the latest Status line in {progress} (the newer one wins).
+This session was compacted {when} (D-144/D-238). The hand-off you saved before the compaction: {handoff} Check it against the latest Status line in {progress} (the newer one wins). Its owner messages, in-flight names, lessons and working notes are what you knew before the compaction: rely on them instead of working them out again.
