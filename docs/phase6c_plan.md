@@ -1,8 +1,8 @@
 # Phase 6c: read views (implementation plan)
 
-Plan for design §13 step 6c, with the parts of §3 (the top bar, F1–F9, F12, F13), §3.1 (the UX rules, the reserve-threshold UI, stage ETAs), §4 (the `status_snapshot`, a web container that imports no model code, uPlot), §8 (the read endpoints, request polling), §9.8 (`SanitizedHtml`, CSP), §10.8 (RC links), §10.9 (owner previews) and §12 (contract and UI tests) that it builds: one typed read endpoint per view with its pydantic models and contract tests, the TS view over it, the shared read functions and the status snapshot that the temp dashboard and the dashboard both use, server-sanitised markdown, uPlot charts and request-state polling. Each step in §5 is one worker branch; nothing is built yet.
+Plan for design §13 step 6c, with the parts of §3 (the top bar, F1–F9, F12, F13), §3.1 (the UX rules, the reserve-threshold UI, stage ETAs), §4 (the `status_snapshot`, a web container that imports no model code), §8 (the read endpoints, request polling), §9.8 (`SanitizedHtml`, CSP), §10.8 (RC links), §10.9 (owner previews) and §12 (contract and UI tests) that it builds: one typed read endpoint per view with its pydantic models and contract tests, the TS view over it, the shared read functions and the status snapshot that the temp dashboard and the dashboard both use, server-sanitised markdown and request-state polling. Each step in §5 is one worker branch; nothing is built yet.
 
-Binding inputs: D-070 (the dashboard is built from scratch, not from the quickview's page), D-074 (purple accent, vibrant status colours, rigid but sleek), D-075 (only the key settings on the main views), D-083 (needs-input first, never stalls or untitled sessions), D-084 / D-085 (documents and the phase strip surface), D-137 / D-266 (the session/weekly ratio and the usage split, three-way: runs, design chats, other use), D-141 / D-258 (the threshold UI's numbers, computed in code), D-148 (display time zone), D-149 / D-196 (only owners see global settings; viewers see their project's questions read-only), D-161 (everything in the DB), D-166 / D-200 / D-201 / D-224 (show when the next run happens, assuming no more usage, labelled "Holding until"; a stopped run shows the next window), D-176 (decision summaries name the topic only), D-193 / D-197 (prompts system-wide, project variables), D-208 / D-209 (Python API, TS frontend, mypy --strict and TS strict), D-211 (non-blocking previews after every UI step), D-213 (cumulative stage ETAs), D-230 / D-249 (simple numbers, compact times and durations, instant tooltips with a "?" toggle for verbose ones, collapsed minor tasks, the lineup, no filler text), D-235 / D-239 (fail fast; display paths show the error and never pause), D-237 / D-238 (the task-manager's context and re-read cost), D-256 (no audit row per runner write), D-263 / D-279 (owner questions in plain words; questions in full in the UI, never a link to a file), D-268 / D-269 (Remote Control per category, maybe unneeded later), D-007 (existing libraries first).
+Binding inputs: D-070 (the dashboard is built from scratch, not from the quickview's page), D-074 (purple accent, vibrant status colours, rigid but sleek), D-075 (only the key settings on the main views), D-083 (needs-input first, never stalls or untitled sessions), D-084 / D-085 (documents and the phase strip surface), D-137 / D-266 (the session/weekly ratio and the usage split, three-way: runs, design chats, other use), D-141 / D-258 (the threshold UI's numbers, computed in code), D-148 (display time zone), D-149 / D-196 (only owners see global settings; viewers see their project's questions read-only), D-161 (everything in the DB), D-166 / D-200 / D-201 / D-224 (show when the next run happens, assuming no more usage, labelled "Holding until"; a stopped run shows the next window), D-176 (decision summaries name the topic only), D-193 / D-197 (prompts system-wide, project variables), D-208 / D-209 (Python API, TS frontend, mypy --strict and TS strict), D-211 (non-blocking previews after every UI step), D-213 (cumulative stage ETAs), D-230 / D-249 (simple numbers, compact times and durations, instant tooltips with a "?" toggle for verbose ones, collapsed minor tasks, the lineup, no filler text), D-235 / D-239 (fail fast; display paths show the error and never pause), D-237 / D-238 (the task-manager's context and re-read cost), D-256 (no audit row per runner write), D-263 / D-279 (owner questions in plain words; questions in full in the UI, never a link to a file), D-268 / D-269 (Remote Control per category, maybe unneeded later), D-007 (existing libraries first), D-297 (no charts; the two usage lines are enough), D-298 (added users see the usage bars and "Holding until"; the AFClaude/own split, planner and threshold stay owner-only), D-300 (every open question gets its own answer input).
 
 ## 0. Already decided
 
@@ -18,16 +18,17 @@ Binding inputs: D-070 (the dashboard is built from scratch, not from the quickvi
 - **Read access** (*proposal*; 8a checks it against §2):
   - Every list shows only projects the user holds a grant on (5a's `roles.visible_projects`). Viewers get the same cards without controls (D-196).
   - F4 (the window planner), F5 (status), F13 (host) and the threshold panel are owner-only (D-149: global settings, budget, host).
-  - The top bar and F1's usage bars and "Holding until": question 2.
+  - **The top bar and F1's usage bars and "Holding until" are visible to every grant, not owner-only** (D-298, answers question 2): the split between AFClaude and the owner's own use, the window planner and the threshold details stay owner-only as already listed above; without the bars and "Holding until", an added manager, editor or viewer can't tell when their project will be worked on.
   - F12: owners see every row; everyone else sees the rows whose target resolves to a project they hold a grant on (5a's scope resolvers), never auth rows.
   - Stalled sessions outside any project: owners only.
 - **Markdown is rendered on the server and then allowlist-sanitised** (§2), typed `SanitizedHtml` in the schema. That is a named string schema; codegen turns it into a branded TS type that only the API client produces, and the one raw-HTML sink renders it under a Trusted Types policy (§9.8). Rendered as markdown: questions (in full, D-279), docs, hand-off text, review reports. Shown as plain text: prompts, decision words.
-- **uPlot** is the fifth runtime package §4 already lists. R2 adds it with an exact version. Charts get numbers only; axis and series labels are set as text (8c tests "uPlot labels").
+- **No charts** (D-297, answers question 1): the design's two charts (the per-session weekly-limit share, the week's usage split with forecast) are dropped; the two usage lines (session and week) are enough. uPlot is dropped from the runtime package list (back to the four packages of design §4); R2 needs no chart wrapper and no Trusted-Types check for one. The underlying numbers (the measured ratios, the 7-night window preview, the three-way split) stay as read endpoints and render as numbers/table rows, not a plotted series.
 - **F8 follows D-193/D-197:** default, override, the project's variable values and the prompt rendered for that project; no project override (4a P5 corrects §3 F8 and §8's `?project=` meaning).
 - **The pink preview marker (D-211) stays a quickview feature.** The final phase strip has no preview marker.
 - **F4's share is three-way (D-266):** runs and design chats (both AFClaude's) and other use. R12 updates §3 F4's "AFClaude vs user".
 - **Repository documents** (D-084, which the task-manager applied to the future dashboard; *proposal*): the web container can't read repositories (§9.8: data volume only). So the 10-min docs import also mirrors each project's Markdown files, read-only, into `docs` (kind `file`, named by repo path, with the quickview's `all_docs` exclusions). F9 lists them under the project docs.
 - **Paging:** lists take `limit` (capped per endpoint) and `before` (an id cursor); log docs page by entry, newest first. Each response is capped (256 KiB); a doc beyond it pages.
+- **Every question gets its own answer input** (D-300): the write side (an answer form per question) is 7a's, but the `inbox` endpoint's per-question `id` and `version` (§3.1) are what 7a binds each answer input to, so nothing here needs to change for it; F1 stays read-only in 6c (R3) and 7a adds the per-question inputs on top of this shape, not a single combined reply box.
 
 ## 1. Today (as-is inventory)
 
@@ -39,7 +40,7 @@ Binding inputs: D-070 (the dashboard is built from scratch, not from the quickvi
 | F1 overview | usage from the `~/.claude.json` cache (`ka.read_usage_cache`); `pacing.next_run` with `ka.run_active` / `pending_deferral` / `last_mile_next_slot`; `build_stages` over `store.list_tasks`; `stage_eta.gather` | `keepalive_and_usage`, `next_run_block`, `stages`, `eta_result` | the lineup (no function computes it), the D-230 important-task rule, "the current project" | R1, 3b S4 |
 | F2 stalls | `sessions`, `limit_hits`, `session_decisions`, `standing_rules`; `store.stalled_sessions` / `effective_decision`; `stalled.scan` | none (D-083 keeps stalls off the quickview) | a first-prompt snippet; the RC-held reason (dispatcher state) | 3a S2 (`stall_scan` job) |
 | F3 queue | `projects` (rank, priority), `tasks` (stage_seq, priority, estimated_sessions), `store.execution_order` | `stages()` (one project) | the flat order across projects with skip reasons; members | 3b S4, 5a |
-| F4 window | `window_days` / `window_tz` / `session_hours` through `schedule.py`; the limit_ratio snapshot on the latest sample; `usage_session_windows`, `usage_weekly_series` | `window_info`, `limits_block` | 7-night preview with DST nights and the weekly reset; chart series | R1 |
+| F4 window | `window_days` / `window_tz` / `session_hours` through `schedule.py`; the limit_ratio snapshot on the latest sample; `usage_session_windows`, `usage_weekly_series` | `window_info`, `limits_block` | 7-night preview with DST nights and the weekly reset (numbers, no chart, D-297) | R1 |
 | F5 status | `runner_jobs` / `runner_runs` (3a S1); `run_log` (empty: nothing writes it yet); keepalive lines in `app_log`; `usage_reviews`; `scheduled_jobs`, nightly tasks; `stage_eta_log`; `pacing.threshold_info`; `compact_timing.context_block`; `run_metrics`; the fill-up plan | `latest_decision`, `next_review_block`, `threshold_block`, `context_block`, `fill_block`, `fillup_block`, `cron_entries` | `run_log` rows; the review's structured results (§7.7: "not built … with F5"); the ETA review score as data | 3a S2–S6, S9(b); R6 |
 | threshold panel | `pacing.threshold_info()` | `threshold_block` | — | R1 |
 | F6 driven | `driven_sessions` (6 rows: kind, tmux, project; `rc_url` never written), `handoffs` (9 rows); tmux has-session on the host | `tmux_block` (task-manager only) | the RC URL's source; live state | 3b S2, 3c; R7 |
@@ -56,8 +57,9 @@ Binding inputs: D-070 (the dashboard is built from scratch, not from the quickvi
 |---|---|---|
 | markdown → HTML on the server | markdown-it-py (CommonMark; raw HTML off with `html=False`; link schemes checked by `validateLink`; pure Python, maintained) | Python-Markdown (passes raw HTML through by default), mistune (looser CommonMark), commonmark.py (unmaintained) |
 | HTML allowlist sanitiser | nh3 (bindings to the Rust ammonia sanitiser; maintained; wheels for arm64 and amd64) | bleach (deprecated since 2023), html-sanitizer (pulls lxml), an own allowlist over markdown-it's tokens (possible, but §9.8 wants the sanitiser as its own second line) |
-| charts | uPlot (design §4) | — |
 | request polling | own (`setTimeout` with backoff in the client) | server-sent events (§8: only if polling proves too slow) |
+
+No chart library is researched here: D-297 drops both of the design's charts, so uPlot is out of scope for 6c.
 
 Both Python packages are new direct dependencies, pinned with hashes next to 6a W10's `requirements.txt` and covered by `pip-audit`. R2 first confirms maintained wheels for Python 3.12 on both architectures. They are web-side only (`dashboard/markdown.py`); the quickview keeps its client-side marked + DOMPurify.
 
@@ -68,12 +70,12 @@ Both Python packages are new direct dependencies, pinned with hashes next to 6a 
 |---|---|---|---|---|
 | `topbar` | `/api/v1/topbar` | shell | any grant | automation state (install + visible project pauses), runner dot state + detail, tonight's window, predicted week end, inbox count, snapshot age |
 | `inbox` | `/api/v1/inbox` | F1 | per project | questions, forwarded blocked tasks, decision proposals: id, project, kind, title, text (`SanitizedHtml`, in full), asked at, `version`, `can_answer` |
-| `overview` | `/api/v1/overview` | F1 | any grant (usage parts: question 2) | session/week bars with reset times, Holding until, the current project's phase strip with ETAs, the lineup, each visible project's important tasks + the count of the rest |
+| `overview` | `/api/v1/overview` | F1 | any grant (D-298: the usage bars and Holding until are not owner-only) | session/week bars with reset times, Holding until, the current project's phase strip with ETAs, the lineup, each visible project's important tasks + the count of the rest |
 | `queue` | `/api/v1/queue` | F3 | per project | ranked projects with priority, stages by priority with ETA, important tasks + count, the flat execution order with each skip reason, members (5a) |
 | `project_tasks` | `/api/v1/projects/{project}/tasks` | F3 "+N more" | per project | every open task, paged |
 | `task` | `/api/v1/tasks/{id}` | F3 detail | per project | the task, its events, `version` |
 | `stalls` | `/api/v1/stalls?state=&own=` | F2 | per project; owners for the rest | stalled sessions: title or cwd + first prompt, project, kind, reset time, the effective decision and its source; the standing rules |
-| `window` | `/api/v1/window` | F4 | owner | `window_days`, the next 7 windows (start, end, sessions, DST shift), the weekly reset, the measured ratios with their status, chart series |
+| `window` | `/api/v1/window` | F4 | owner | `window_days`, the next 7 windows (start, end, sessions, DST shift), the weekly reset, the measured ratios with their status (numbers only, no chart series, D-297) |
 | `usage` | `/api/v1/usage` | threshold panel (F5; F10 in 7b) | owner | `threshold_info`, the limits section, the next run with kind, reason and predicted end |
 | `status` | `/api/v1/status` | F5 | owner | each runner job (state, last ok, next due), the latest budget decisions, next usage review, the latest review's results, ETA review score, the task-manager's context (D-237/D-238), fill and fill-up, each snapshot section's age, the proposal queue length and oldest (§7.9) |
 | `runs` | `/api/v1/runs?component=&before=` | F5 | owner | a page of `run_log` |
@@ -96,7 +98,7 @@ Both Python packages are new direct dependencies, pinned with hashes next to 6a 
 
 ### 3.3 The snapshot (R1)
 - Table `status_snapshot(section, account_id, computed_at, state ok|error, payload JSON, error, builder, version, PRIMARY KEY (section, account_id))`, added through `store.py`'s migrations. `builder` is the payload format's version.
-- Sections: `usage`, `next_run`, `threshold`, `limits`, `eta` (per stage id + assumptions), `fill`, `fillup`, `context`, `next_review`, `runtime` (tmux alive per driven session; the watcher process until 3a S8), `charts` (bounded series: ≤ 1000 points each).
+- Sections: `usage`, `next_run`, `threshold`, `limits`, `eta` (per stage id + assumptions), `fill`, `fillup`, `context`, `next_review`, `runtime` (tmux alive per driven session; the watcher process until 3a S8). No `charts` section (D-297 drops both charts; the series numbers that would have fed one live in `limits` and `usage` instead, already bounded by those sections' own caps).
 - `status_snapshot.py` (not on the strict list: display code over untyped model modules) builds every section once: `build(now) -> {section: (state, payload | error)}`. `write()` stores them through one registered `actions.py` action (`snapshot.put`, runner actors only, one transaction, no audit row, like D-256's runner rows). The quickview export calls `build` once, writes, then derives `status.json` from the same values. The once-a-day `stage_eta` log stays a side effect of building the `eta` section.
 - Size cap: 64 KiB per section (over it = an error section).
 - `dashboard/snapshot_models.py` holds one pydantic model per section. A contract test builds every section from fixtures and validates it.
@@ -135,7 +137,7 @@ The snapshot side gets `keepalive_and_usage`, `next_run_block`, `runner_state`, 
 ### 3.7 Frontend
 - One file per view under `dashboard/web/src/views/`. Shared components:
   - `Card`, `Chip` (D-074 status colours), `UsageBar` (the only bar, D-230), `HoldingUntil`, `PhaseStrip`, `Lineup`, `TaskList` (important tasks + "+N more");
-  - `SectionError`, `Stale`, `SanitizedHtml`, `Chart` (the uPlot wrapper, collapsed by default per question 1);
+  - `SectionError`, `Stale`, `SanitizedHtml` (no `Chart` component: D-297 drops both charts);
   - 6a's `Tooltip`.
 - `src/tips.ts`: one entry `{short, verbose}` per tooltip key. A test fails on a missing key, and lists every static text node of each view (render-to-string) for gate 8a's no-filler review.
 - Refresh: a view fetches when it opens. The top bar and F1 re-fetch every 60 s while the page is visible. No client cache of truth (§4).
@@ -180,14 +182,13 @@ The snapshot side gets `keepalive_and_usage`, `next_run_block`, `runner_state`, 
 - **Risk:** a slower export from writing the snapshot (one transaction of ~12 rows; measured in the report). A section that silently drifts from the quickview: the golden test covers every block.
 
 **R2: rendering and frontend kit.**
-- **Build:** `dashboard/markdown.py` (markdown-it-py with raw HTML off, links limited to http(s), mailto and relative; then nh3 with a fixed tag/attribute allowlist, `rel="noopener noreferrer"`); the `SanitizedHtml` component with its Trusted Types policy; the TS formatters (§0); the colour tokens per status; `tips.ts`; uPlot in `package.json` and the `Chart` wrapper (text labels only).
+- **Build:** `dashboard/markdown.py` (markdown-it-py with raw HTML off, links limited to http(s), mailto and relative; then nh3 with a fixed tag/attribute allowlist, `rel="noopener noreferrer"`); the `SanitizedHtml` component with its Trusted Types policy; the TS formatters (§0); the colour tokens per status; `tips.ts`. No chart library (D-297): `package.json` stays at the four runtime packages of design §4, not five.
 - **Tests:**
   - an XSS corpus (script, event handlers, `javascript:` and `data:` links, SVG, nested markdown/HTML tricks) → nothing executable survives;
   - the source check still finds no other raw-HTML sink;
-  - formatter tables (DST days, :00 vs :30, every duration unit, `~`);
-  - the chart renders from fixtures with zero CSP violations in a headless browser.
+  - formatter tables (DST days, :00 vs :30, every duration unit, `~`).
 - **Done when:** as R0 plus the TS suite; `npm audit` and `pip-audit` clean.
-- **Risk:** uPlot under Trusted Types, if it writes HTML strings anywhere (its legend is the likely place). The headless test checks it; if it trips, its legend is turned off and our wrapper draws the labels as text.
+- **Risk:** none chart-related (D-297 removes that surface). The markdown/sanitiser pipeline is the remaining XSS-relevant risk, covered by the corpus test above.
 
 **R3: top bar and F1.**
 - **Build:** `topbar`, `inbox`, `overview` (§3.1); the shell's top bar; the F1 view: inbox cards first (D-083), read-only until 7a; then the bars, Holding until, phase strip, lineup and per-project important tasks.
@@ -212,7 +213,7 @@ The snapshot side gets `keepalive_and_usage`, `next_run_block`, `runner_state`, 
 - **Risk:** the snippet holding something private from the owner's own sessions. Those are owner-only, as the transcript itself is.
 
 **R6: F4, F5 and the threshold panel.**
-- **Build:** `window`, `usage`, `status`, `runs`, `reviews`; `usage_review.py results set` and the review prompt's instruction; the views; the two charts per question 1.
+- **Build:** `window`, `usage`, `status`, `runs`, `reviews`; `usage_review.py results set` and the review prompt's instruction; the views (numbers only, no charts, D-297).
 - **Tests:**
   - the 7-night preview over both DST nights;
   - `insufficient data` passed through, never a number;
@@ -254,5 +255,4 @@ The snapshot side gets `keepalive_and_usage`, `next_run_block`, `runner_state`, 
 
 ## 6. Questions for the owner
 
-1. **Charts on the final dashboard.** The design plans two small charts. One shows, session by session, how much of the weekly limit a full 5-hour session uses. The other shows this week's usage so far, split into AFClaude and your own use, with the forecast up to the weekly reset. You asked for very simple numbers. Options: (a) the numbers stay the main content, and each chart sits folded under its number, opened with a tap; (b) no charts, numbers only; (c) the charts always visible. Recommendation: (a).
-2. **What the people you add see of the usage.** The Claude account is yours. Managers, editors and viewers you add see their own projects. Should they also see the session and week usage bars and "Holding until" (when AFClaude next works)? Options: (a) yes, the bars and "Holding until" only, while the split between AFClaude and your own use, the window planner and the threshold details stay owner-only; (b) no usage or timing at all for them. Recommendation: (a); without it they can't tell when their project will be worked on.
+None open. D-297 answers the former question 1 (no charts, numbers only) and D-298 answers the former question 2 (added users see the usage bars and "Holding until"; the split, planner and threshold stay owner-only); see §0.

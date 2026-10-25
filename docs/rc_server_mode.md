@@ -9,7 +9,9 @@ and `~/.claude/sessions/`. No server was started, no session was launched or mes
 Binding inputs: D-042 (every session visible in RC, as if created in RC), D-052 (investigate
 hooking into server mode; "sessions don't expire"), D-268 (the final build may need no RC
 launches; the manager talks through the dashboard), D-269 (RC is a setting per agent category),
-D-045 (no `--bg`), D-047 (permission modes), D-164 (sessions run on the host).
+D-045 (no `--bg`), D-047 (permission modes), D-164 (sessions run on the host), D-288 (the owner
+approved running the live test of §7: run it, noting the time first; pass → build the hook, fail
+→ close goal 11).
 
 ## Verdict: partly
 
@@ -156,7 +158,9 @@ the dispatcher's handling of RC_HELD stalls, independent of `remote_control_cont
 decides how AFClaude *launches* a continue; an injected message launches nothing). If D-268's
 "no RC launches" is adopted, §4.1 still matters, since the owner's own server threads stall too.
 
-## 7. Proposed live test (needs the owner's OK: a throwaway thread appears in the RC list)
+## 7. Proposed live test (owner approved, D-288: run it, note the time first; pass → build §4.1, fail → close goal 11)
+
+A throwaway thread briefly appears in the RC list during the test; stopped and archived at the end (step 4).
 
 1. In a scratch git dir (trusted once by hand), start `claude rc --spawn session --name
    afc-rc-test --permission-mode auto` in a tmux window; note the child's `~/.claude/sessions`
