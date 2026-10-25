@@ -21,8 +21,7 @@ serves at /afclaude/:
                 page's stamp: a page that doesn't match is an old copy and says so),
                 the owner's message box to the task-manager (counts only:
                 the page reads the messages from the inbox API, D-241), AFClaude cron entries, the task-manager's context (D-237:
-                size, cache expiry, the next re-read's cost, per owner message re-read
-                yes/no and est. cost without its text, a daily split; the compaction
+                size, cache expiry, the next re-read's cost, a daily split; the compaction
                 attempts of D-238; compact_timing.context_block), each project's
                 task-manager model / effort (D-260, manager_launch.py; data only, the page
                 has no settings area yet), the Remote Control setting of each session
@@ -527,13 +526,14 @@ COMPACTIONS_SHOWN = 5
 
 def context_block(now):
     """D-237: the task-manager's context (compact_timing.context_block): its size, when its prompt
-    cache expires and what the next message would re-read, per owner message re-read yes/no,
-    tokens and est. session-% / weekly-% (no message text), a daily split (re-reads / warm reads /
+    cache expires and what the next message would re-read, a daily split (re-reads / warm reads /
     writes / output), the cost model's break-even, and the latest compaction attempts (D-238,
-    the keepalive state's "compactions"). A display path: an error is shown, never paused (D-239)."""
+    the keepalive state's "compactions"). The per-message list is dropped: the owner keeps only the
+    daily split (owner, 25.10.). A display path: an error is shown, never paused (D-239)."""
     try:
         import compact_timing
         out = compact_timing.context_block(ka.transcript_path(SELF_SESSION), now)
+        out.pop("messages", None)
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"error": f"{type(e).__name__}: {e}"[:300]}
     try:

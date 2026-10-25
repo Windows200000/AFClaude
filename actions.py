@@ -1580,7 +1580,8 @@ def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_k
 # holds the text as typed and is its only copy (D-241): the audit rows name a text by its size and
 # sha256, never repeat it. inbox.post is the owner's (the dashboard, the CLI); the triage and the
 # delivery steps are the runner's (inbox_api.py's worker, the keep-alive), never MCP's; inbox.reply
-# is the task-manager's answer (`tasks.py inbox reply`).
+# is the task-manager's answer (`tasks.py inbox reply`); inbox.dismiss is the owner's: an answered
+# thread leaves the dashboard's questions section (D-304).
 
 INBOX_REASON_MAX = 300
 INBOX_ERROR_MAX = 1000
@@ -1747,14 +1748,26 @@ def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
 
 @action("inbox.reply", "inbox")
 def inbox_reply(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, answer: Any) -> Result:
-    """The task-manager's answer, shown on the dashboard. A second reply is added below the first."""
+    """The task-manager's answer, shown on the dashboard. A second reply is added below the first and
+    brings a dismissed thread back (D-304)."""
     text = store._text(answer, "answer", required=True)
     if len(text) > store.INBOX_TEXT_MAX:
         raise ValueError(f"answer is too long ({len(text)} > {store.INBOX_TEXT_MAX} characters)")
     before = store.inbox_row(conn, message_id)
     full = f"{before['answer']}\n\n{text}" if before["answer"] else text
     after = store.update_inbox(conn, before["id"], ("pending", "delivered", "noted", "included", "answered"),
-                               status="answered", answer=full, answered_at=store.now_iso(), hold=None)
+                               status="answered", answer=full, answered_at=store.now_iso(), hold=None,
+                               dismissed_at=None)
+    return _inbox_change(before, after)
+
+
+@action("inbox.dismiss", "inbox", owner_only=True)
+def inbox_dismiss(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
+    """The owner dismisses an answered thread: it leaves the dashboard's questions section (D-304)."""
+    before = store.inbox_row(conn, message_id)
+    if before["dismissed_at"] is not None:
+        raise store.InvalidTransition(f"inbox message #{before['id']} is already dismissed")
+    after = store.update_inbox(conn, before["id"], ("answered",), dismissed_at=store.now_iso())
     return _inbox_change(before, after)
 
 

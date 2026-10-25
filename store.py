@@ -820,7 +820,10 @@ COLUMNS = {
     "action_requests": [("run_id", "INTEGER"), ("updated_at", "TEXT")],
     # D-244: a message whose triage call hit the account's usage limit waits until this time (the
     # limit's reset), then is triaged again once (inbox_worker.triage)
-    "inbox_messages": [("retry_after", "TEXT")],
+    "inbox_messages": [("retry_after", "TEXT"),
+                       # D-304: the owner dismissed the answered thread on the dashboard (inbox.dismiss);
+                       # until then it stays in the questions section; a later reply clears it again
+                       ("dismissed_at", "TEXT")],
 }
 
 SESSION_FIELDS = (
@@ -3069,7 +3072,7 @@ INBOX_VERDICTS = ("now", "note")
 INBOX_TEXT_MAX = 4000          # characters (a "now" message is typed into tmux in one go)
 INBOX_FIELDS = ("status", "verdict", "verdict_reason", "triaged_at", "triage_cost_usd", "triage_usage",
                 "hold", "hold_since", "retry_after", "delivered_at", "delivered_via", "included_at", "included_by",
-                "answer", "answered_at", "error", "error_at")
+                "answer", "answered_at", "error", "error_at", "dismissed_at")
 
 
 def inbox_text(value: object) -> str:
@@ -3128,6 +3131,13 @@ def list_inbox(conn: sqlite3.Connection, status: str | Iterable[str] | None = No
         args.append(session_id)
     sql = "SELECT * FROM inbox_messages" + (" WHERE " + " AND ".join(where) if where else "")
     rows = conn.execute(sql + f" ORDER BY id DESC LIMIT {int(limit)}", args)
+    return [_inbox_dict(r) for r in rows]
+
+
+def inbox_threads(conn: sqlite3.Connection, limit: int = 200) -> list[Row]:
+    """The answered messages the owner has not dismissed (D-304), oldest first."""
+    rows = conn.execute("SELECT * FROM inbox_messages WHERE status='answered' AND dismissed_at IS NULL "
+                        f"ORDER BY id LIMIT {int(limit)}")
     return [_inbox_dict(r) for r in rows]
 
 

@@ -155,6 +155,23 @@ class Actions(DB):
         with self.assertRaises(store.InvalidTransition):                      # only a failed one is retried
             actions.perform(self.conn, "inbox.retry", {"message_id": m["id"]}, actor="owner", via="dashboard")
 
+    def test_dismiss_answered_thread(self):
+        """D-304: the owner dismisses an answered thread (audited); only an answered one, once; a later
+        reply brings it back (owner-only: test_actions.Autonomous)."""
+        m = self.post()
+        with self.assertRaises(store.InvalidTransition):                      # not answered yet
+            actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")
+        actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "Yes."}, actor="cli", via="cli")
+        d = actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")
+        self.assertEqual(d["status"], "answered")
+        self.assertIsNotNone(d["dismissed_at"])
+        row = store.audit_log(self.conn, 1, "inbox", m["id"])[0]
+        self.assertEqual((row["action"], row["actor"], row["before"]["dismissed_at"]), ("inbox.dismiss", "owner", None))
+        with self.assertRaises(store.InvalidTransition):                      # already dismissed
+            actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")
+        r = actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "More."}, actor="cli", via="cli")
+        self.assertIsNone(r["dismissed_at"])
+
     def test_include_only_noted(self):
         a, b = self.post("n1"), self.post("n2")
         for m in (a, b):
@@ -1024,6 +1041,29 @@ class Endpoint(DB):
         self.assertEqual((st, r["status"]), (200, "pending"))
         self.assertEqual(self.call("POST", "/afclaude/api/inbox/999/retry", {})[0], 404)
 
+    def test_threads_and_dismiss(self):
+        """D-304: GET lists every answered, undismissed thread, however old; POST .../dismiss removes it."""
+        a, b, c = self.post("q1"), self.post("q2"), self.post("q3")
+        for m in (a, b):
+            self.run_("inbox.reply", message_id=m["id"], answer=f"a{m['id']}")
+        self.conn.execute("UPDATE inbox_messages SET created_at='2026-01-01T00:00:00Z', "
+                          "answered_at='2026-01-01T01:00:00Z' WHERE id=?", (a["id"],))   # long out of the chat
+        self.conn.commit()
+        st, v = self.call("GET")
+        self.assertEqual([(t["id"], t["text"], t["answer"]) for t in v["threads"]],
+                         [(a["id"], "q1", f"a{a['id']}"), (b["id"], "q2", f"a{b['id']}")])
+        self.assertNotIn(a["id"], [x["id"] for x in v["messages"]])
+        self.wake.clear()
+        st, r = self.call("POST", f"/afclaude/api/inbox/{a['id']}/dismiss", {})
+        self.assertEqual((st, r["id"]), (200, a["id"]))
+        self.assertFalse(self.wake.is_set())                                  # nothing for the worker
+        self.assertEqual(store.audit_log(self.conn, 1, "inbox", a["id"])[0]["via"], "dashboard")
+        self.assertEqual([t["id"] for t in self.call("GET")[1]["threads"]], [b["id"]])
+        self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{a['id']}/dismiss", {})[0], 409)
+        self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{c['id']}/dismiss", {})[0], 409)   # unanswered
+        self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{b['id']}/dismiss", {}, key="wrong")[0], 401)
+        self.assertEqual(self.call("GET", f"/afclaude/api/inbox/{b['id']}/dismiss")[0], 405)
+
     def test_request_checks(self):
         self.assertEqual(self.call("POST", raw=b"text=hi", ctype="application/x-www-form-urlencoded")[0], 415)
         self.assertEqual(self.call("POST", raw=b"text=hi", ctype="text/plain")[0], 415)
@@ -1109,6 +1149,8 @@ class Quickview(DB):
         for s in ('id="msg-log"', 'id="msg-form"', 'id="msg-text"', 'id="msg-send"', 'API = BASE + "api/inbox"',
                   '"Content-Type": "application/json"', "data-retry", "/retry", "m.answer", "m.error", "m.state", "m.tip",
                   "data-tip", "box.chat", "box.busy", "s-spin", "s-check", "s-err", "Ctrl+Enter"):
+            self.assertIn(s, page, s)
+        for s in ("box.threads", "data-dismiss", '"/dismiss"', "m.answered_berlin"):   # D-304: answered threads
             self.assertIn(s, page, s)
         for s in ("m.verdict_reason", "m.hold", "msg-list", "noted for the next session"):   # D-246: no thread list, no labels
             self.assertNotIn(s, page, s)

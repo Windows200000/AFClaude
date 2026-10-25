@@ -9,12 +9,13 @@ nothing new is published and the request has passed nginx's X-AFClaude-Key check
   POST /afclaude/api/inbox               {"text": "..."} -> 201, the new message (pending); the
                                          worker triages it (and delivers a "now" one) right away
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200
+  POST /afclaude/api/inbox/<id>/dismiss  an answered thread leaves the questions section (D-304) -> 200
 
 Owner-only (the text ends up in the task-manager's session): every request needs the same
 X-AFClaude-Key here too (compared with the key file, read on every request, so a rotated key
 needs no restart; no key file: every request is refused, 503), a POST must be JSON
 (application/json, so a cross-site form can't send one), at most BODY_MAX bytes, and at most
-inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / inbox.retry, actor
+inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / retry / dismiss, actor
 owner, via dashboard: audited). The worker (inbox_worker.run_forever) runs in the same process.
 
   inbox_api.py serve [--socket PATH]    the server (one per data/: a lock file); the entrypoint
@@ -54,7 +55,7 @@ LOG = os.path.join(DATA, "inbox_api.log")
 KEY_FILE = os.environ.get("AFCLAUDE_INBOX_KEY_FILE", "/run/secrets/afclaude_quickview.key")
 KEY_HEADER = "X-AFClaude-Key"
 PREFIX = "/afclaude/api/inbox"
-RETRY_RE = re.compile(r"^/afclaude/api/inbox/(\d{1,9})/retry$")
+MSG_RE = re.compile(r"^/afclaude/api/inbox/(\d{1,9})/(retry|dismiss)$")
 BODY_MAX = 16 * 1024
 ACTOR, VIA = "owner", "dashboard"
 
@@ -171,12 +172,14 @@ class Handler(BaseHTTPRequestHandler):
             log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)")
             self.server.wake.set()
             return 201, inbox.message_view(m)
-        hit = RETRY_RE.match(path)
+        hit = MSG_RE.match(path)
         if hit and method == "POST":
             self.json_body()
-            m = actions.perform(conn, "inbox.retry", {"message_id": int(hit.group(1))}, actor=ACTOR, via=VIA)
-            log(f"inbox #{m['id']}: retried by the owner")
-            self.server.wake.set()
+            verb = hit.group(2)
+            m = actions.perform(conn, f"inbox.{verb}", {"message_id": int(hit.group(1))}, actor=ACTOR, via=VIA)
+            log(f"inbox #{m['id']}: {'retried' if verb == 'retry' else 'dismissed'} by the owner")
+            if verb == "retry":
+                self.server.wake.set()
             return 200, inbox.message_view(m)
         raise HTTPError(404 if not hit else 405, "not found" if not hit else "method not allowed")
 
