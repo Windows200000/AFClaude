@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tests for the dashboard's browser sessions (phase 6a W5, docs/phase6a_plan.md §3.5; W9's route ×
 role matrix): the auth_* settings, the auth.session_* actions and their audit rows, lifetimes with a
-fake clock (idle, absolute, max sessions, rotation), the pre-session and touch writes without audit
-rows; and, with the web stack, the cookie flags, `me`, the CSRF token (missing, wrong, another
-session's), a revoked session refused at once, and every endpoint × owner / manager / editor /
+fake clock (idle, absolute, max sessions, rotation), the touch write without an audit row, the
+stateless pre-session token (signed, tamper- and expiry-checked, no DB row) and the opportunistic
+prune of sessions past their end plus retention at login; and, with the web stack, the cookie flags,
+`me` (including its Sec-Fetch-Site gate on starting a pre-session), the CSRF token (missing, wrong,
+another session's), a revoked session refused at once, and every endpoint × owner / manager / editor /
 viewer / no grant / machine user / nobody against its declared role.
 
 The actions part runs under any python3; the app part needs the venv (Python 3.12, Starlette):
@@ -103,10 +105,11 @@ class Settings(DbCase):
 
 
 class Actions(DbCase):
-    def test_login_replaces_the_pre_session_and_is_audited(self):
-        actions.auth_session_start_pre(self.conn, h("pre"), h("cpre"), "Firefox")
+    def test_login_is_audited_and_a_stateless_pre_sessions_replaces_hash_is_a_noop(self):
+        """A pre-session is never a row (finding 1 of the W5 review): `replaces` naming one simply
+        matches nothing, so login ends up with nothing of it to end."""
         res = self.login(1, replaces=h("pre"))
-        self.assertEqual(res["ended"], {str(self.row("pre")["id"]): "rotated"})
+        self.assertEqual(res["ended"], {})
         r = self.row(1)
         self.assertEqual((r["kind"], r["user_id"], r["factors"], r["authenticated_at"]),
                          ("full", 7, ["password", "totp"], r["created_at"]))
@@ -114,6 +117,27 @@ class Actions(DbCase):
         self.assertEqual(len(audit), 1)
         self.assertEqual(audit[0]["actor"], "user:7")
         self.assertNotIn(h(1), json.dumps(audit[0]))           # row ids in the audit, never a hash
+
+    def test_login_prunes_sessions_past_their_end_plus_retention(self):
+        """Finding 2 of the W5 review: a session is swept opportunistically at login (as the
+        idempotency-key prune, actions.IDEMPOTENCY_TTL, happens on a write rather than from a
+        periodic job), past actions.SESSION_PRUNE_RETENTION -- both one explicitly ended (logout)
+        and one that silently expired and was never noticed again."""
+        self.login(1, user=8)
+        self.act("auth.session_logout", {"id_sha256": h(1)}, actor="user:8")   # ended_at = T0
+        self.login(2, user=9)                                                   # created_at = T0, never touched
+        self.clock.advance(days=7, minutes=-1)
+        self.login(3, user=10)                                   # just under retention: row 1 survives
+        self.assertIsNotNone(self.row(1))
+        self.clock.advance(minutes=2)
+        n_audits_before = len(store.audit_log(self.conn, 200))
+        self.login(4, user=11)                                   # past retention: row 1 (ended) swept
+        self.assertIsNone(self.row(1))
+        self.assertIsNotNone(self.row(2))                        # not abandoned long enough yet (needs + 12h)
+        self.assertEqual(len(store.audit_log(self.conn, 200)), n_audits_before + 1)   # no audit row of its own
+        self.clock.advance(hours=12)
+        self.login(5, user=12)
+        self.assertIsNone(self.row(2))                           # now past absolute lifetime + retention too
 
     def test_only_the_user_logs_in_as_themself(self):
         with self.assertRaises(actions.Forbidden):
@@ -164,14 +188,6 @@ class Actions(DbCase):
         self.assertTrue(actions.auth_session_touch(self.conn, sid))
         self.assertEqual(self.row(1)["last_seen_at"], store.now_iso())
         self.assertEqual(len(store.audit_log(self.conn, 50)), 1)     # the login's only
-
-    def test_pre_sessions_have_no_audit_row_and_are_pruned(self):
-        actions.auth_session_start_pre(self.conn, h("a"), h("ca"))
-        self.clock.advance(minutes=31)
-        actions.auth_session_start_pre(self.conn, h("b"), h("cb"))
-        self.assertIsNone(self.row("a"))
-        self.assertIsNotNone(self.row("b"))
-        self.assertEqual(store.audit_log(self.conn, 50), [])
 
     def test_rotate(self):
         self.login(1)
@@ -247,6 +263,34 @@ def _dist(test):
 
 
 @unittest.skipIf(bool(SKIP), SKIP)
+class PreToken(unittest.TestCase):
+    """dashboard.sessions' stateless pre-session token in isolation (finding 1 of the W5 review): no
+    DB involved at all."""
+
+    def test_round_trip_tamper_and_expiry(self):
+        now = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+        raw = sessions.new_pre_token(now + timedelta(minutes=30))
+        self.assertRegex(raw, sessions.PRE_TOKEN_RE)
+        self.assertTrue(sessions.pre_token_live(raw, now))
+        self.assertTrue(sessions.pre_token_live(raw, now + timedelta(minutes=29, seconds=59)))
+        self.assertFalse(sessions.pre_token_live(raw, now + timedelta(minutes=30)))     # exactly at expiry: no grace
+        payload, mac = raw.split(".")
+        flipped = payload[:-1] + ("A" if payload[-1] != "A" else "B")
+        tampered = f"{flipped}.{mac}"
+        self.assertRegex(tampered, sessions.PRE_TOKEN_RE)                               # still well-formed...
+        self.assertFalse(sessions.pre_token_live(tampered, now))                        # ...but wrong signature
+        self.assertEqual(sessions.csrf_token(raw), sessions.csrf_token(raw))            # derived, not stored
+        self.assertNotEqual(sessions.csrf_token(raw), sessions.csrf_token(sessions.new_pre_token(now)))
+
+    def test_two_tokens_from_the_same_process_share_a_key(self):
+        now = datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc)
+        expires = now + timedelta(minutes=5)
+        a, b = sessions.new_pre_token(expires), sessions.new_pre_token(expires)
+        self.assertNotEqual(a, b)                 # a fresh random nonce each time
+        self.assertTrue(sessions.pre_token_live(a, now) and sessions.pre_token_live(b, now))
+
+
+@unittest.skipIf(bool(SKIP), SKIP)
 class App(DbCase):
     def setUp(self):
         super().setUp()
@@ -283,18 +327,24 @@ class App(DbCase):
         c.cookies.set(sessions.COOKIE, raw)
         return sessions.csrf_token(raw)
 
-    def test_me_starts_a_pre_session_with_the_cookie_flags(self):
+    def test_me_starts_a_stateless_pre_session_with_the_cookie_flags(self):
+        """Finding 1 of the W5 review: a pre-session is a signed, expiring token, never a row (no
+        write-lock contention from a cookieless flood)."""
         r = self.me()
         body = r.json()
         self.assertEqual((body["user"], body["time_zone"]), (None, "Europe/Berlin"))
         cookie = r.headers["set-cookie"]
-        raw = re.match(r"__Host-afc_session=([A-Za-z0-9_-]{43}); ", cookie).group(1)
-        self.assertEqual(set(cookie.split("; ")[1:]), {"Path=/", "Max-Age=43200", "Secure", "HttpOnly", "SameSite=Lax"})
+        name_value, *flags = cookie.split("; ")
+        raw = name_value.removeprefix("__Host-afc_session=")
+        self.assertRegex(raw, sessions.PRE_TOKEN_RE)
+        self.assertEqual(set(flags), {"Path=/", "Max-Age=1800", "Secure", "HttpOnly", "SameSite=Lax"})
         self.assertEqual(body["csrf_token"], sessions.csrf_token(raw))
-        self.assertEqual(self.store_row(raw)["kind"], "pre")
+        self.assertTrue(sessions.pre_token_live(raw, self.clock.t))
+        self.assertFalse(sessions.pre_token_live(raw, self.clock.t + timedelta(minutes=31)))
+        self.assertIsNone(self.store_row(raw))                       # no row at all: stateless
         with open(self.db, "rb") as fh:
             data = fh.read()
-        self.assertNotIn(raw.encode(), data)                         # only hashes are stored
+        self.assertNotIn(raw.encode(), data)                         # nothing of it is stored
         self.assertNotIn(body["csrf_token"].encode(), data)
         again = self.me()
         self.assertNotIn("set-cookie", again.headers)
@@ -303,11 +353,21 @@ class App(DbCase):
     def store_row(self, raw):
         return store.get_auth_session(self.conn, sessions.id_sha256(raw))
 
+    def test_me_refuses_a_pre_session_for_a_cross_site_request(self):
+        r = self.c.get("/api/v1/me", headers={"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(self.c.get("/api/v1/me", headers={"Sec-Fetch-Site": "same-site"}).status_code, 403)
+        for site in ("same-origin", "none"):
+            self.c.cookies.clear()
+            self.assertEqual(self.c.get("/api/v1/me", headers={"Sec-Fetch-Site": site}).status_code, 200)
+        self.c.cookies.clear()
+        self.assertEqual(self.me().status_code, 200)                 # absent: a non-browser client
+
     def test_login_rotates_the_id_and_me_shows_the_user(self):
         token = self.sign_in()
         self.assertNotEqual(token, sessions.csrf_token(self.pre_raw))
         self.assertNotEqual(self.c.cookies.get(sessions.COOKIE), self.pre_raw)
-        self.assertEqual(self.store_row(self.pre_raw)["end_reason"], "rotated")
+        self.assertIsNone(self.store_row(self.pre_raw))              # the pre-session was never a row
         self.assertEqual(self.me().json()["user"], {"id": 7, "role": "editor"})
 
     def test_csrf_token(self):

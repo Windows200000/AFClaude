@@ -40,7 +40,7 @@ import actions
 import store
 from dashboard.api_types import PARAM_NAME_RE, ApiSchemaResponse, HealthResponse, MeResponse, MeUser, Model, Params, Role
 from dashboard.errors import ApiError, error_response, internal
-from dashboard.security import WRITE_METHODS, PublicUrl, csrf_guard, read_body, write_guard
+from dashboard.security import WRITE_METHODS, PublicUrl, csrf_guard, pre_session_ok, read_body, write_guard
 
 log = logging.getLogger("afclaude.web")
 
@@ -397,9 +397,13 @@ def _display_tz(db_path: str | None) -> str:
 
 async def me(call: Call) -> Reply:
     """Who is signed in (or nobody), this session's CSRF token and the display time zone. An
-    anonymous browser gets a new pre-session (its cookie and token) for the login and setup posts."""
+    anonymous browser gets a new pre-session (its cookie and token) for the login and setup posts,
+    unless Sec-Fetch-Site marks the request as triggered by another site (dashboard.security.
+    pre_session_ok, finding 1 of the W5 review): refused outright, so nothing is even signed for it."""
     session, cookie = call.session, None
     if session is None:
+        if not pre_session_ok(call.request):
+            raise ApiError(403, "forbidden", "cross-site request refused")
         session, cookie = await call.ctx.sessions.start_pre(call.request)
     p = session.principal
     if p is not None and p.kind != "person":

@@ -705,14 +705,17 @@ CREATE TABLE IF NOT EXISTS prompt_vars (
 """
 
 # ---- the dashboard's browser sessions (phase 6a W5, docs/phase6a_plan.md §3.5; design §9.5, D-162): one
-# row per session, server-side so it is revocable and listable (F11). Only the sha256 of the cookie's
-# 256-bit id is stored, and the sha256 of its CSRF token. A pre-session (kind 'pre', no user) carries
-# the CSRF token of the login and setup posts; a login, a step-up and a factor change start a new row
-# (the id rotates) and end the old one ('rotated'). created_at is the login (a rotated row keeps it: the
-# absolute lifetime counts from the login), authenticated_at the last full authentication (the step-up
-# window). user_id is 5a's users.id (no foreign key until 5a's users table exists). Written only
-# through actions.py (auth.session_* audited; the pre-session start and the last_seen touch are the
-# row's own record, no audit row). Additive, no schema_version bump.
+# row per LOGGED-IN session, server-side so it is revocable and listable (F11). Only the sha256 of the
+# cookie's 256-bit id is stored, and the sha256 of its CSRF token. A pre-session (an anonymous browser's
+# cookie before login) is stateless (dashboard.sessions: a server-key-signed, expiring token) since a
+# W5 review found the earlier design -- a row per cookieless GET /me -- let an unauthenticated flood
+# hold write locks (D-235: runners fail-stop on DB errors); it never reaches this table. A login, a
+# step-up and a factor change start a new row (the id rotates) and end the old one ('rotated').
+# created_at is the login (a rotated row keeps it: the absolute lifetime counts from the login),
+# authenticated_at the last full authentication (the step-up window). user_id is 5a's users.id (no
+# foreign key until 5a's users table exists). Written only through actions.py (auth.session_* audited;
+# the last_seen touch is the row's own record, no audit row). `kind` stays for a future non-'full' row
+# kind; every row written today is 'full'. Additive, no schema_version bump.
 AUTH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -731,7 +734,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     CHECK ((ended_at IS NULL) = (end_reason IS NULL))
 );
 CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id, ended_at);
-CREATE INDEX IF NOT EXISTS auth_sessions_pre ON auth_sessions(kind, last_seen_at);
+CREATE INDEX IF NOT EXISTS auth_sessions_ended ON auth_sessions(ended_at);
 """
 
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
@@ -2421,11 +2424,15 @@ def touch_auth_session(conn: sqlite3.Connection, session_id: int, seen_before: s
                         "AND last_seen_at <= ?", (now_iso(), session_id, seen_before)).rowcount == 1
 
 
-def prune_pre_sessions(conn: sqlite3.Connection, seen_before: str) -> int:
-    """Delete pre-sessions last seen before `seen_before` or ended (they record nothing a full
-    session doesn't: no user, no login). -> number deleted."""
-    return conn.execute("DELETE FROM auth_sessions WHERE kind='pre' AND (last_seen_at < ? OR ended_at IS NOT NULL)",
-                        (seen_before,)).rowcount
+def prune_ended_sessions(conn: sqlite3.Connection, ended_before: str, abandoned_before: str) -> int:
+    """Delete sessions past their end plus a short retention (finding 2 of the W5 review): ended
+    (logout, rotation, revocation, idle or expiry having been noticed) with ended_at < `ended_before`,
+    or never explicitly ended but created before `abandoned_before` (a browser that expired and never
+    came back to be noticed; `abandoned_before` is the caller's now - absolute_lifetime - retention, so
+    only a session that is certainly past its lifetime is swept this way). -> number deleted."""
+    return conn.execute(
+        "DELETE FROM auth_sessions WHERE (ended_at IS NOT NULL AND ended_at < ?) "
+        "OR (ended_at IS NULL AND created_at < ?)", (ended_before, abandoned_before)).rowcount
 
 
 def add_run_log(conn: sqlite3.Connection, component: object, decision: object, reason: str | None = None,

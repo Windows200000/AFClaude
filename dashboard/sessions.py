@@ -1,7 +1,7 @@
 """Browser sessions (phase 6a W5, docs/phase6a_plan.md §3.5; design §9.5, §9.8; D-162, D-179).
 
-Server-side rows (store.py's auth_sessions, written through actions.py), so a session is revocable
-at once and listable (F11); the browser holds only the cookie:
+Logged-in sessions are server-side rows (store.py's auth_sessions, written through actions.py), so a
+session is revocable at once and listable (F11); the browser holds only the cookie:
 
   __Host-afc_session=<id>; Path=/; Max-Age=<absolute lifetime>; Secure; HttpOnly; SameSite=Lax
 
@@ -11,23 +11,37 @@ token is derived from the id (HMAC-SHA256 keyed by it), so `me` can hand it out 
 reload without the token being stored; the row keeps its sha256, which each write's X-CSRF-Token
 is checked against through the session. A token from another session never matches.
 
+A pre-session (an anonymous browser's cookie before login) is NOT a row: a W5 review found that a
+row per cookieless GET /me let an unauthenticated flood hold write locks (BEGIN IMMEDIATE) with no
+limit, which the runners' fail-stop on DB errors (D-235) turns into an outage. Instead it is a
+stateless token -- `<payload>.<mac>`, payload = a random nonce plus an expiry, mac = HMAC-SHA256 of
+the payload keyed by a server-only key (_presession_key_bytes) -- verified on read with no DB access
+at all; nothing is stored, nothing to prune. Its CSRF token is derived exactly as a full session's
+(HMAC-SHA256 keyed by the raw cookie value), so the binding is the same: unguessable without having
+seen `me`'s response, and specific to this one token. The caller (routes.me) only starts one when
+Sec-Fetch-Site says the request is same-origin, none, or absent (dashboard.security.pre_session_ok),
+so a cross-site flood never even reaches the signing step.
+
 SessionStore is the app's SessionBackend (routes.py): each request's cookie is looked up (an
-unknown, ended, idle or expired session is no session: refused at once, no grace), last_seen is
-written at most once a minute, and the user is resolved through the `roles` hook (5a's users and
-grants: person or machine, the highest role; until 5a no_roles fails, never a guessed role, D-235).
-login / rotate / logout are what W6's endpoints call. Lifetimes are the auth_* settings
-(actions.AuthLifetimes).
+unknown, ended, idle, expired or tampered/expired-pre-session is no session: refused at once, no
+grace), last_seen is written at most once a minute, and the user is resolved through the `roles`
+hook (5a's users and grants: person or machine, the highest role; until 5a no_roles fails, never a
+guessed role, D-235). login / rotate / logout are what W6's endpoints call. Lifetimes are the auth_*
+settings (actions.AuthLifetimes); a login also prunes sessions past their end plus a short retention
+(actions.SESSION_PRUNE_RETENTION, finding 2 of the same review).
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import sqlite3
+import threading
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
@@ -39,7 +53,16 @@ from dashboard.routes import Principal, Session
 
 COOKIE = "__Host-afc_session"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")      # token_urlsafe(32): 43 characters, no padding
+# a pre-session token: 24 bytes (16-byte nonce + 8-byte expiry, ms since epoch) then a full
+# HMAC-SHA256 tag, both base64url without padding (32 and 43 characters); "." never appears in
+# base64url, so the two shapes can't collide and a lookup can tell them apart without the DB.
+PRE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32}\.[A-Za-z0-9_-]{43}$")
 CSRF_CONTEXT = b"afclaude csrf token v1"
+PRE_CONTEXT = b"afclaude pre-session token v1"
+PRESESSION_KEY_ENV = "AFCLAUDE_PRESESSION_KEY"   # optional override (base64, 32 bytes); see below
+
+_presession_key_lock = threading.Lock()
+_presession_key: bytes | None = None
 
 Roles = Callable[[int], Awaitable[Principal]]
 
@@ -67,7 +90,7 @@ def csrf_sha256(raw: str) -> str:
 
 
 def cookie_header(raw: str, max_age_s: int) -> str:
-    if not ID_RE.match(raw):
+    if not (ID_RE.match(raw) or PRE_TOKEN_RE.match(raw)):
         raise ValueError("not a session id")
     return f"{COOKIE}={raw}; Path=/; Max-Age={max_age_s}; Secure; HttpOnly; SameSite=Lax"
 
@@ -77,9 +100,61 @@ def clear_cookie_header() -> str:
 
 
 def cookie_id(request: Request) -> str | None:
-    """The request's session id, when it carries a well-formed one."""
+    """The request's logged-in session id, when it carries a well-formed one (never a pre-session
+    token: login's `replaces` only ever ends a stored row)."""
     raw = request.cookies.get(COOKIE)
     return raw if raw is not None and ID_RE.match(raw) else None
+
+
+def _presession_key_bytes() -> bytes:
+    """The HMAC key that signs and checks pre-session tokens. AFCLAUDE_PRESESSION_KEY (base64, 32
+    bytes) if set, else a key generated once for this process (not persisted: that would duplicate
+    5b's master-key loader, §10.2, not built yet). A process restart invalidates pre-sessions in
+    flight, which costs nothing -- an anonymous browser gets a fresh one from its next `me` call."""
+    global _presession_key
+    if _presession_key is not None:
+        return _presession_key
+    with _presession_key_lock:
+        if _presession_key is None:
+            env = os.environ.get(PRESESSION_KEY_ENV)
+            if env:
+                key = base64.b64decode(env)
+                if len(key) != 32:
+                    raise ValueError(f"{PRESESSION_KEY_ENV} must decode to 32 bytes of base64")
+                _presession_key = key
+            else:
+                _presession_key = secrets.token_bytes(32)
+    return _presession_key
+
+
+def _pre_b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _pre_b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _pre_mac(payload: bytes) -> bytes:
+    return hmac.new(_presession_key_bytes(), PRE_CONTEXT + payload, hashlib.sha256).digest()
+
+
+def new_pre_token(expires_at: datetime) -> str:
+    """A fresh pre-session token good until `expires_at` (no DB row: see the module docstring)."""
+    payload = secrets.token_bytes(16) + int(expires_at.timestamp() * 1000).to_bytes(8, "big")
+    return f"{_pre_b64(payload)}.{_pre_b64(_pre_mac(payload))}"
+
+
+def pre_token_live(raw: str, now: datetime) -> bool:
+    """Whether `raw` (already matched against PRE_TOKEN_RE) is a correctly signed pre-session token
+    not yet past its expiry. A bad signature and a stale token are refused alike: no session, no
+    grace (as an unknown or expired full session row)."""
+    payload_b64, mac_b64 = raw.split(".")
+    payload = _pre_b64d(payload_b64)
+    if not hmac.compare_digest(_pre_mac(payload), _pre_b64d(mac_b64)):
+        return False
+    expires_at = datetime.fromtimestamp(int.from_bytes(payload[16:24], "big") / 1000, tz=timezone.utc)
+    return now < expires_at
 
 
 def _user_agent(request: Request) -> str | None:
@@ -107,8 +182,15 @@ class SessionStore:
     # --- the SessionBackend of routes.py ----------------------------------------------------------
 
     async def authenticate(self, request: Request) -> Session | None:
-        raw = cookie_id(request)
+        raw = request.cookies.get(COOKIE)
         if raw is None:
+            return None
+        if PRE_TOKEN_RE.match(raw):
+            # stateless: no DB row, no roles hook (a pre-session never has a user)
+            if not pre_token_live(raw, store._utcnow()):
+                return None
+            return Session(id_sha256=id_sha256(raw), csrf_token=csrf_token(raw), principal=None)
+        if not ID_RE.match(raw):
             return None
         row = await run_in_threadpool(self._lookup, raw)
         if row is None:
@@ -138,16 +220,18 @@ class SessionStore:
             conn.close()
 
     async def start_pre(self, request: Request) -> tuple[Session, str]:
-        raw = new_id()
-        max_age = await run_in_threadpool(self._start_pre, raw, _user_agent(request))
+        """A fresh pre-session for an anonymous browser: no row (see the module docstring), good for
+        auth_idle_timeout_min (the setting is still read on every call, as a login's lifetimes are --
+        D-162: a changed setting takes effect at once, not from the next restart)."""
+        idle = await run_in_threadpool(self._pre_idle)
+        raw = new_pre_token(store._utcnow() + idle)
         return Session(id_sha256=id_sha256(raw), csrf_token=csrf_token(raw), principal=None), \
-            cookie_header(raw, max_age)
+            cookie_header(raw, int(idle.total_seconds()))
 
-    def _start_pre(self, raw: str, user_agent: str | None) -> int:
+    def _pre_idle(self) -> timedelta:
         conn = self._connect()
         try:
-            actions.auth_session_start_pre(conn, id_sha256(raw), csrf_sha256(raw), user_agent)
-            return _max_age(conn)
+            return actions.AuthLifetimes(conn).idle
         finally:
             conn.close()
 

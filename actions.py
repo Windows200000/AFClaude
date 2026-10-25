@@ -2050,13 +2050,16 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
 # ---------------------------------------------------------------- dashboard browser sessions (phase 6a W5)
 #
 # docs/phase6a_plan.md §3.5, design §9.5 (D-162, D-179). dashboard/sessions.py holds the cookie and
-# makes the ids; this is where a session row is written. Login, rotation (step-up, factor change),
-# logout and revocation are audited actions (auth.session_*; the audit row names row ids, never a
-# hash). Two writes are the row's own record, with no audit row (as telemetry, §7.3; an
-# interpretation gate 8a checks): starting a pre-session (an anonymous browser loading the app) and
-# the last_seen touch, at most once a minute per session (auth_session_start_pre,
-# auth_session_touch). A login also ends the user's sessions past a lifetime ('idle' / 'expired')
-# and, at auth_max_sessions_per_user, the oldest ones ('evicted').
+# makes the ids; this is where a logged-in session row is written. Login, rotation (step-up, factor
+# change), logout and revocation are audited actions (auth.session_*; the audit row names row ids,
+# never a hash). The last_seen touch is the row's own record, with no audit row (as telemetry, §7.3;
+# an interpretation gate 8a checks), at most once a minute per session (auth_session_touch). A login
+# also ends the user's sessions past a lifetime ('idle' / 'expired'), at auth_max_sessions_per_user the
+# oldest ones ('evicted'), and opportunistically prunes sessions past their end plus a short retention
+# (finding 2 of the W5 review; SESSION_PRUNE_RETENTION, as IDEMPOTENCY_TTL is pruned on a write rather
+# than from a periodic job). A pre-session (an anonymous browser before login) never reaches this
+# table: finding 1 of the same review found that a row per cookieless GET /me let a flood hold write
+# locks (D-235), so it is now a stateless, server-key-signed, expiring token (dashboard.sessions).
 
 # the login factors dashboard.auth.factors knows (test_dashboard_sessions keeps the two equal; actions.py
 # doesn't import the dashboard package, which the live processes never load)
@@ -2064,6 +2067,7 @@ AUTH_FACTORS = ("password", "totp", "recovery_code", "passkey_hw", "passkey_sync
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 USER_AGENT_MAX = 200
 TOUCH_EVERY = timedelta(minutes=1)
+SESSION_PRUNE_RETENTION = timedelta(days=7)
 
 
 class AuthLifetimes:
@@ -2156,6 +2160,9 @@ def auth_session_login(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, id_sha2
     new_hash, csrf = _sha256_hex(id_sha256, "id_sha256"), _sha256_hex(csrf_sha256, "csrf_sha256")
     done, agent = _factor_list(factors), _user_agent(user_agent)
     lifetimes = AuthLifetimes(conn)
+    now = store._utcnow()
+    store.prune_ended_sessions(conn, store.iso_ms(now - SESSION_PRUNE_RETENTION),
+                               store.iso_ms(now - lifetimes.absolute - SESSION_PRUNE_RETENTION))
     ended: dict[str, str] = {}
     if replaces is not None:
         old = store.get_auth_session(conn, _sha256_hex(replaces, "replaces"))
@@ -2233,22 +2240,6 @@ def auth_session_revoke(conn: sqlite3.Connection, ctx: Ctx, session_id: Any = No
         target = f"user:{user_id}"
     ended = [r["id"] for r in rows if store.end_auth_session(conn, r["id"], "revoked")]
     return Result({"ended": ended}, target, {"open": ended}, {"open": []}, changed=bool(ended))
-
-
-def auth_session_start_pre(conn: sqlite3.Connection, id_sha256: str, csrf_sha256: str,
-                           user_agent: str | None = None) -> int:
-    """A pre-session for an anonymous browser (no audit row: the row is its own record). Deletes the
-    pre-sessions idle past auth_idle_timeout_min first, so anonymous loads can't pile up rows.
-    -> the row id."""
-    new_hash, csrf, agent = _sha256_hex(id_sha256, "id_sha256"), _sha256_hex(csrf_sha256, "csrf_sha256"), \
-        _user_agent(user_agent)
-
-    def run() -> int:
-        with store.transaction(conn):
-            idle = AuthLifetimes(conn).idle
-            store.prune_pre_sessions(conn, store.iso_ms(store._utcnow() - idle))
-            return store.add_auth_session(conn, new_hash, None, csrf, user_agent=agent)
-    return store.retrying(run, conn)
 
 
 def auth_session_touch(conn: sqlite3.Connection, session_id: int) -> bool:

@@ -9,6 +9,8 @@
 - csrf_guard(): the per-session X-CSRF-Token of a write (W5), after the session is known.
 - read_body(): the body of a write, at most BODY_MAX bytes, counted while reading (a chunked
   body has no Content-Length to trust).
+- pre_session_ok(): whether `me` (W5) may start a pre-session for this GET, by `Sec-Fetch-Site`
+  (finding 1 of the W5 review: a cross-site trigger must not even reach the token-signing step).
 """
 from __future__ import annotations
 
@@ -118,6 +120,18 @@ def write_guard(request: Request, public: PublicUrl) -> None:
     site = request.headers.getlist("sec-fetch-site")
     if site and site != ["same-origin"]:
         raise ApiError(403, "forbidden", "cross-site request refused")
+
+
+def pre_session_ok(request: Request) -> bool:
+    """Whether `me` may start a pre-session for this request (finding 1 of the W5 review): accepted
+    when `Sec-Fetch-Site` says `same-origin` (a same-origin fetch) or `none` (a direct navigation --
+    typed URL, bookmark, no initiator) or is absent entirely. Every current browser sends the header
+    on both of those cases, so absent means a client that doesn't send it at all (a health check, a
+    script, an older browser) rather than a cross-site one hiding the fact; refusing those too would
+    turn a hardening check into an availability bug for non-browser callers. `cross-site` and
+    `same-site` are refused: this GET must not mint anything for a request another origin triggered."""
+    site = request.headers.getlist("sec-fetch-site")
+    return not site or site in (["same-origin"], ["none"])
 
 
 def csrf_guard(request: Request, expected: str | None) -> None:
