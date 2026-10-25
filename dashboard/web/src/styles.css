@@ -1,0 +1,151 @@
+/* The shell's styling (docs/phase6a_plan.md §3.8). Visual design is D-074/D-230's (final look
+   comes with 6c's real views); this scaffold only sets the tokens and the shell/tooltip
+   mechanics so nothing here needs to change shape later. No inline `style` anywhere in the TS:
+   the CSP (dashboard/security.py) is style-src 'self' only. */
+
+:root {
+  --accent: #7c5cff;        /* D-074: purple main accent */
+  --status-ok: #22c55e;
+  --status-info: #38bdf8;
+  --status-warn: #f59e0b;
+  --status-error: #ef4444;
+  --bg: #0b0b12;
+  --fg: #e8e8f0;
+  --border: #2a2a3a;
+  --tooltip-duration: 120ms;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f7fb;
+    --fg: #16161f;
+    --border: #dcdce8;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, sans-serif;
+}
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.dot {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-ok { color: var(--status-ok); }
+.status-info { color: var(--status-info); }
+.status-warn { color: var(--status-warn); }
+.status-error { color: var(--status-error); }
+
+.badge {
+  display: inline-flex;
+  min-width: 1.2rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.75rem;
+  justify-content: center;
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-link {
+  color: var(--fg);
+  text-decoration: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+}
+
+.nav-link[aria-current="page"] {
+  background: var(--accent);
+  color: white;
+}
+
+.view {
+  padding: 1rem;
+}
+
+.verbose-toggle {
+  margin-left: auto;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.verbose-toggle--on {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+/* Tooltip (D-230): instant, ~120ms fade/scale, dropped under prefers-reduced-motion. */
+.tooltip {
+  position: relative;
+  display: inline-flex;
+}
+
+.tooltip-bubble {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translate(-50%, 2px) scale(0.96);
+  margin-bottom: 0.3rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  background: var(--fg);
+  color: var(--bg);
+  font-size: 0.75rem;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--tooltip-duration) ease, transform var(--tooltip-duration) ease;
+}
+
+.tooltip:hover .tooltip-bubble,
+.tooltip:focus-within .tooltip-bubble,
+.tooltip[data-tooltip-open="true"] .tooltip-bubble {
+  opacity: 1;
+  transform: translate(-50%, 0) scale(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tooltip-bubble {
+    transition: none;
+    transform: translate(-50%, 0) scale(1);
+  }
+}

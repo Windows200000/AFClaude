@@ -1,0 +1,24 @@
+{
+  "name": "afclaude-dashboard-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The dashboard's TypeScript frontend (docs/phase6a_plan.md W3). Built to static files by `npm run build`; served by dashboard/app.py, never its own server (D-208/D-209).",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "preact": "11.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.9.2",
+    "esbuild": "0.28.2",
+    "preact-render-to-string": "6.8.1",
+    "typescript": "7.0.2"
+  }
+}
