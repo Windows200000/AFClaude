@@ -483,7 +483,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     var out = [];
     if (ph.length) {
       out.push('<div class="ph-head"><span class="mut">Dashboard phases</span><span class="mut">' + done + "/" + ph.length + " done" +
-        (eta ? ' · <span class="eta-h" title="' + esc(etaTip) + '">ETA ' + (eta.status === "ok" ? "~" + esc(eta.sessions_per_day) + " sessions/day" : "?") + " ⓘ</span>" : "") +
+        (eta ? ' · <span class="eta-h" title="' + esc(etaTip) + '">ETA ' + (eta.status === "ok" ? "~" + esc(eta.sessions_per_day) + " sessions/day" +
+          (eta.stage_share != null ? " (" + Math.round(eta.stage_share * 100) + "% to stages)" : "") : "?") + " ⓘ</span>" : "") +
         "</span></div>");
       // D-211: the phase whose steps include the preview_from key gets a thin pink outline
       // (distinct from the purple "current" ring) -- owner preview possible from there on.

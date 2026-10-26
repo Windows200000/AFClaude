@@ -211,6 +211,68 @@ class Estimates(unittest.TestCase):
         self.assertEqual(se.history_default(done, [(h(1), h(2), 0.9)]), (0.3, 3))
 
 
+class StageShare(unittest.TestCase):
+    """stage_share() (D-264, 25.10. ETA review): the measured share of runs+design usage that
+    overlaps a stage's active window."""
+
+    def test_share_from_overlap(self):
+        h = lambda x: NOW + timedelta(hours=x)   # noqa: E731
+        windows = [(h(0), h(5))]
+        runs = [(h(1), h(2), 1.0), (h(10), h(11), 1.0)]      # the second doesn't overlap any stage
+        share, staged, total = se.stage_share(windows, runs, NOW, h(24))
+        self.assertAlmostEqual(staged, 1.0)
+        self.assertAlmostEqual(total, 2.0)
+        self.assertAlmostEqual(share, 0.5)
+
+    def test_only_the_part_inside_the_trailing_window_counts(self):
+        h = lambda x: NOW + timedelta(hours=x)   # noqa: E731
+        windows = [(h(-100), h(100))]
+        runs = [(h(-10), h(10), 6.0)]            # half of this run is before window_start = NOW
+        share, staged, total = se.stage_share(windows, runs, NOW, h(100))
+        self.assertAlmostEqual(total, 3.0)
+        self.assertAlmostEqual(staged, 3.0)
+        self.assertAlmostEqual(share, 1.0)
+
+    def test_too_little_measured_usage_is_none(self):
+        h = lambda x: NOW + timedelta(hours=x)   # noqa: E731
+        share, staged, total = se.stage_share([], [(h(0), h(1), 0.5)], NOW, h(24))
+        self.assertIsNone(share)
+        self.assertLess(total, se.MIN_SHARE_SESSIONS)
+
+    def test_no_stage_window_is_zero_share(self):
+        h = lambda x: NOW + timedelta(hours=x)   # noqa: E731
+        runs = [(h(0), h(1), se.MIN_SHARE_SESSIONS)]
+        share, staged, total = se.stage_share([], runs, NOW, h(24))
+        self.assertEqual(share, 0.0)
+        self.assertEqual(staged, 0.0)
+
+
+class StageShareInPredict(unittest.TestCase):
+    """predict(..., share=...): the owner's capacity = sessions/day x the measured stage share."""
+
+    def test_share_scales_capacity_and_pushes_the_eta_out(self):
+        full = se.predict(stages(2.0, 2.0), gate(40.0), NOW)                       # default share 1.0
+        half = se.predict(stages(2.0, 2.0), gate(40.0), NOW, share=0.5, share_info="half, for the test")
+        a_full, a_half = full["assumptions"], half["assumptions"]
+        self.assertEqual(a_full["stage_share"], 1.0)
+        self.assertEqual(a_half["stage_share"], 0.5)
+        self.assertAlmostEqual(a_half["gate_sessions_per_week"], a_full["gate_sessions_per_week"] * 0.5, places=2)
+        self.assertAlmostEqual(a_half["formula_sessions_per_week"], a_full["formula_sessions_per_week"] * 0.5, places=2)
+        self.assertAlmostEqual(a_half["sessions_per_day"], a_full["sessions_per_day"] * 0.5, places=2)
+        self.assertGreater(half["stages"][-1]["eta_days"], full["stages"][-1]["eta_days"])
+        self.assertIn("stage share", se.assumptions_text(half))
+        self.assertIn("half, for the test", se.assumptions_text(half))
+
+    def test_default_share_matches_the_old_behaviour(self):
+        # share defaults to 1.0: identical to predict() before stage_share existed, apart from the
+        # two new assumptions keys
+        r = se.predict(stages(1.0), gate(40.0), NOW)
+        a = r["assumptions"]
+        self.assertAlmostEqual(a["formula_sessions_per_week"], 4.0, places=2)
+        self.assertEqual(a["stage_share"], 1.0)
+        self.assertEqual(a["stage_share_info"], "")
+
+
 class Grouping(unittest.TestCase):
     def test_group_is_its_last_open_stage(self):
         r = se.predict(stages(1.0, 2.0, 1.0), gate(40.0), NOW)
@@ -240,6 +302,59 @@ class Log(unittest.TestCase):
             self.assertAlmostEqual(sc["bias_days"], 2.0, places=2)
             self.assertEqual(sc["overdue"], 2)          # stage 2 is still open after its predicted time
             self.assertEqual(se.score([], {})["n"], 0)
+
+
+class GatherShare(unittest.TestCase):
+    """gather() reads the stage_share setting (D-264: a review-tuned figure, not an automatic
+    trailing-window measurement -- see the docstring on gather() and StageShare below for why);
+    active_stage_windows() feeds stage_share(), the separate --share measurement for the review."""
+
+    def setUp(self):
+        self.conn = store.connect(store.DB_PATH)
+        p = f"Share{id(self)}"
+        act = lambda n, **kw: actions.perform(self.conn, n, kw, actor="cli", via="cli")   # noqa: E731
+        self.act = act
+        self.t1 = act("task.add", title="Dashboard 1: one", project=p)["id"]
+        act("task.start", task_id=self.t1)
+        self.started = se._ts(next(e["ts"] for e in store.task_events(self.conn, self.t1)
+                                   if e["event"] == "started"))
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_active_stage_windows_includes_an_open_stage_up_to_now(self):
+        now = self.started + timedelta(hours=5)
+        windows = se.active_stage_windows(self.conn, now)
+        self.assertEqual(len(windows), 1)
+        a, b = windows[0]
+        self.assertEqual(a, self.started)
+        self.assertEqual(b, now)
+
+    def test_gather_uses_the_stage_share_setting(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs_path = os.path.join(d, "runs.jsonl")
+            open(runs_path, "w").close()
+            now = self.started + timedelta(hours=1)
+            res = se.gather(self.conn, None, now, runs_path=runs_path)
+            self.assertAlmostEqual(res["assumptions"]["stage_share"], 0.45, places=3)   # the code default
+            self.assertIn("setting stage_share", res["assumptions"]["stage_share_info"])
+            testenv.set_setting("stage_share", 20)
+            self.addCleanup(testenv.set_setting, "stage_share", None)
+            res2 = se.gather(self.conn, None, now, runs_path=runs_path)
+            self.assertAlmostEqual(res2["assumptions"]["stage_share"], 0.20, places=3)
+
+    def test_the_overlap_measurement_saturates_with_two_parallel_stages(self):
+        # the reason gather() does NOT use stage_share() live (see its docstring): once a second
+        # stage is also in progress, its open-ended window alone can cover virtually all recent
+        # usage, whatever that usage actually was
+        t2 = self.act("task.add", title="Dashboard 1: two", project="ShareOther")["id"]
+        self.act("task.start", task_id=t2)
+        now = self.started + timedelta(hours=1)
+        runs = [(self.started, now, 3.0)]       # all of it overlaps stage 1's own window already
+        share, staged, total = se.stage_share(se.active_stage_windows(self.conn, now), runs,
+                                              self.started - timedelta(days=1), now)
+        self.assertEqual((staged, total), (total, total))
+        self.assertEqual(share, 1.0)
 
 
 class StoreAndDashboard(unittest.TestCase):
@@ -310,7 +425,7 @@ class StoreAndDashboard(unittest.TestCase):
     def test_page_shows_the_eta(self):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             html = fh.read()
-        for needle in ("etaTip", "eta-c", "p.eta", "t.eta", "sessions/day"):
+        for needle in ("etaTip", "eta-c", "p.eta", "t.eta", "sessions/day", "stage_share", "to stages"):
             self.assertIn(needle, html)
 
 
