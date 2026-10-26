@@ -754,6 +754,10 @@ SETTINGS: dict[str, Setting] = {
     "last_mile_hours": _auto_or_num(0, 168, 'Last stretch before the weekly reset that fills the week to '
                                     '100%: "auto" = min(ceil(session windows of quota left), 2) x '
                                     'session_hours, or hours (0 = off, D-015/D-020)', "budget", important=True),
+    "stage_share": _num(45, 1, 100, "Stage ETAs (D-264, 25.10. review): the % of AFClaude capacity that "
+                        "actually goes into roadmap stages rather than live fixes/overhead; a review-tuned "
+                        "figure (stage_eta.py --share measures a trailing-window estimate for the review)",
+                        "budget"),
     "pacing_idle_min": _num(60, 0, 1440, "Yield to the user: after their last activity AFClaude waits this "
                             "many minutes before it starts (a hold postpones to then)", "budget"),
     "pacing_min_gap": _num(1, 0, 50, "Night gate: no run if the budget for it is at most this many weekly %",

@@ -35,10 +35,30 @@ required/(total available-user usage)".
                         "design" slot per day.
     ETA                 the stages' cumulative sessions laid onto those slots in order: stage k is
                         done in the slot where the capacity reaches the sum of stages 1..k.
+    stage share         (D-264, 25.10. ETA review: capacity all counted as stage work fell the ETA
+                        from 176 d to 41.5 d with zero stages closed, because D-266 counted design
+                        chats as capacity (0.22 -> 0.84 sessions/day); the review measured only
+                        ~45-50% of that week's usage went into stages, the rest into live fixes and
+                        task-manager overhead). The task-manager decided (recorded under D-264):
+                        capacity = measured sessions/day x the measured stage share. gather() reads
+                        that share from the stage_share setting (default 45%, the review's own
+                        figure), the same way a stage's own estimated_sessions is review-tuned: there
+                        is no clean per-stage time log to compute it from automatically (most stages
+                        have no started/done events, several run in parallel with non-stage work, and
+                        the review's figure itself came from reading what the week's usage actually
+                        went into, not from task_events). stage_share()/active_stage_windows() still
+                        measure the trailing-window overlap of runs+design-chat intervals with each
+                        stage's started..done (or started..now) window, as a number for the review to
+                        weigh (`--share`), the same role usage_split()/--split has for design chats
+                        (D-221) -- tried as the live measure instead of the setting, it saturates near
+                        100% whenever more than one stage is in progress at once (the normal case),
+                        since an open stage's window reaches to "now" and so overlaps almost
+                        everything since it started, regardless of what that usage actually was.
 
 Summary rate (the tooltip): sessions/day = the capacity of a full typical week / 7, next to the
 owner's formula as written: (100 - the user's forecast week) / the weekly % of one session window,
-with the user's forecast = the other use only (D-266: design chats are AFClaude's).
+with the user's forecast = the other use only (D-266: design chats are AFClaude's); both are then
+scaled by the stage share (D-264) to the capacity that actually goes into stages.
 
 predict() is pure (stages + Gate in, a JSON-ready dict out). gather() reads the live inputs
 (the task store, pacing's ratio/forecast/threshold, the schedule settings, the run history).
@@ -51,6 +71,7 @@ Phase 2c (telemetry.py): each logged prediction also goes into the DB table stag
     python3 stage_eta.py [--db PATH]            the current prediction (JSON)
     python3 stage_eta.py --score [--db PATH]    the logged predictions vs the real completions
     python3 stage_eta.py --split                the weekly % per usage cycle in three categories (D-221)
+    python3 stage_eta.py --share                the trailing-window stage-share measurement for the review (D-264)
 """
 from __future__ import annotations
 
@@ -77,6 +98,8 @@ MIN_HISTORY = 3             # measured finished stages before the history defaul
 MIN_WINDOW = timedelta(minutes=30)   # a shorter started..done window (closed at once) has no measurement:
                                      # one 15-min design-chat sample would be its whole "cost"
 MAX_WEEKS = 26              # horizon: a stage beyond it is "?" (unknown)
+STAGE_SHARE_WINDOW = timedelta(days=14)   # trailing window the stage share is measured over (D-264)
+MIN_SHARE_SESSIONS = 2.0    # --share: below this much measured runs+design usage, the number isn't meaningful
 EPS = 1e-9
 DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
 LOG_FILE = os.path.join(DATA_DIR, "stage_eta_log.jsonl")
@@ -179,6 +202,32 @@ def history_default(done: Sequence[tuple[datetime, datetime]],
     if len(measured) < MIN_HISTORY:
         return None, len(measured)
     return float(statistics.median(measured)), len(measured)
+
+
+def stage_share(windows: Sequence[tuple[datetime, datetime]],
+                runs: Sequence[tuple[datetime, datetime, float]],
+                window_start: datetime, window_end: datetime) -> tuple[Optional[float], float, float]:
+    """The measured share of AFClaude usage that went into stage work (D-264, 25.10. ETA review):
+    of `runs` (AFClaude runs + design-chat intervals, the same list history_default() takes) within
+    [window_start, window_end), the part that overlaps some stage's active window (`windows`:
+    started..done for a finished stage, started..now for one still open, from task_events) vs. the
+    total. A run/design interval only partly inside [window_start, window_end) counts its
+    overlapping share of `used`. -> (share, staged sessions, total sessions); share is None below
+    MIN_SHARE_SESSIONS of total measured usage (too little data: the caller falls back to the
+    stage_share setting)."""
+    staged = total = 0.0
+    for r0, r1, used in runs:
+        a, b = max(r0, window_start), min(r1, window_end)
+        if b <= a or used <= 0:
+            continue
+        span = (r1 - r0).total_seconds()
+        amt = used * ((b - a).total_seconds() / span if span > 0 else 1.0)
+        total += amt
+        if any(s0 < b and s1 > a for s0, s1 in windows):
+            staged += amt
+    if total < MIN_SHARE_SESSIONS:
+        return None, staged, total
+    return staged / total, staged, total
 
 
 def sessions_for(stages: Sequence[Stage], default: Optional[float]) -> list[tuple[Stage, float, str]]:
@@ -289,10 +338,12 @@ def _r(x: Optional[float], k: int = 2) -> Optional[float]:
 
 
 def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[float] = None,
-            default_info: str = "", max_weeks: int = MAX_WEEKS) -> dict[str, Any]:
-    """The cumulative ETA of each open stage (in the given order). -> {status ok|unknown, reason,
-    stages: [{id, title, project, status, sessions, source, cum_sessions, done_at, eta_days, eta,
-    this_week}], assumptions: {...}}."""
+            default_info: str = "", max_weeks: int = MAX_WEEKS, share: float = 1.0,
+            share_info: str = "") -> dict[str, Any]:
+    """The cumulative ETA of each open stage (in the given order). `share` (D-264) scales AFClaude's
+    capacity down to the part of it that goes into stage work (default 1.0: every session counts, as
+    before stage_share was built). -> {status ok|unknown, reason, stages: [{id, title, project,
+    status, sessions, source, cum_sessions, done_at, eta_days, eta, this_week}], assumptions: {...}}."""
     req = sessions_for(stages, default)
     total = sum(x for _, x, _ in req)
     full = _full_session_cost(g.ratio)
@@ -306,13 +357,14 @@ def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[f
         "sessions_per_day": None, "gate_sessions_per_week": None, "formula_sessions_per_week": None,
         "this_week_sessions": None, "user_forecast_week": None,
         "design_forecast_week": _r(g.design_week, 1), "design_sessions_per_week": None,
-        "night_sessions_per_week": None}
+        "night_sessions_per_week": None, "stage_share": _r(share, 3), "stage_share_info": share_info}
     out: dict[str, Any] = {"status": "ok", "reason": None, "now": _iso(now), "stages": [], "assumptions": a}
     unknown = g.weekly_pct is None or g.resets_at is None or g.resets_at <= now
     slots: list[Slot] = []
     if not unknown and g.resets_at is not None:
         typ0 = g.resets_at
         slots = capacity_slots(g, now, max(now + max_weeks * WEEK, typ0 + WEEK + timedelta(seconds=1)))
+        slots = [Slot(s.at, s.sessions * share, s.kind) for s in slots]     # D-264: the stage share only
         week = sum(s.sessions for s in slots if typ0 <= s.at < typ0 + WEEK)
         design = sum(s.sessions for s in slots if typ0 <= s.at < typ0 + WEEK and s.kind == "design")
         user = fc(typ0, typ0 + WEEK) if g.forecast is not None else None
@@ -320,7 +372,7 @@ def predict(stages: Sequence[Stage], g: Gate, now: datetime, default: Optional[f
                  gate_sessions_per_week=_r(week), sessions_per_day=_r(week / 7, 3),
                  design_sessions_per_week=_r(design), night_sessions_per_week=_r(week - design),
                  user_forecast_week=_r(user, 1),
-                 formula_sessions_per_week=_r(max(100.0 - (user or 0.0), 0.0) / full) if full > 0 else None)
+                 formula_sessions_per_week=_r(max(100.0 - (user or 0.0), 0.0) / full * share) if full > 0 else None)
         slots = [s for s in slots if s.at < now + max_weeks * WEEK]
         if week <= EPS:
             out.update(status="unknown", reason="no AFClaude capacity in a typical week (the night gate passes "
@@ -370,11 +422,15 @@ def assumptions_text(result: Mapping[str, Any]) -> str:
         return f"ETA unknown: {result.get('reason')}"
     src = a.get("estimate_sources") or {}
     d = a.get("default_sessions")
-    return (f"ETA = cumulative sessions / AFClaude capacity (D-213): ~{a.get('sessions_per_day')} session windows/day "
+    share = a.get("stage_share")
+    share_pct = round(share * 100) if isinstance(share, (int, float)) else None
+    return (f"ETA = cumulative sessions / AFClaude capacity (D-213) x stage share (D-264): "
+            f"~{a.get('sessions_per_day')} session windows/day already counts only the {share_pct}% of usage "
+            f"that goes to stage work ({a.get('stage_share_info')}) "
             f"({a.get('gate_sessions_per_week')}/week: {a.get('night_sessions_per_week')} the night gate + last stretch "
             f"allow + {a.get('design_sessions_per_week')} design chats ({a.get('design_forecast_week')}%/week, D-266); "
-            f"owner's formula (100 - other user forecast {a.get('user_forecast_week')}%) / {a.get('full_session_cost')}% per session = "
-            f"{a.get('formula_sessions_per_week')}/week; this week {a.get('this_week_sessions')} left). "
+            f"owner's formula (100 - other user forecast {a.get('user_forecast_week')}%) / {a.get('full_session_cost')}% per session "
+            f"x stage share = {a.get('formula_sessions_per_week')}/week; this week {a.get('this_week_sessions')} left). "
             f"Ratio {a.get('ratio')}, threshold {a.get('threshold')}%. Estimates: {src.get('estimate', 0)} set, "
             f"{src.get('history', 0)} history{f' ({d})' if d is not None else ''}, {src.get('fallback', 0)} fallback ({a.get('fallback_sessions')} "
             f"session/stage); {a.get('sessions_total')} sessions open.")
@@ -506,6 +562,25 @@ def done_stages(conn: sqlite3.Connection) -> list[tuple[int, datetime, datetime]
     return out
 
 
+def active_stage_windows(conn: sqlite3.Connection, now: datetime) -> list[tuple[datetime, datetime]]:
+    """(started, done-or-now) of every stage (task) that has a 'started' event, whatever its current
+    status: a finished stage's real window, one still in progress up to `now`. Feeds stage_share()
+    (D-264): it overlaps these against the runs+design-chat intervals history_default() also uses,
+    since there is no clean per-stage time log (D-213's own note: most stages have no started/done
+    events at all)."""
+    rows = conn.execute("SELECT t.id, t.status, t.done_at, MIN(e.ts) FROM tasks t JOIN task_events e "
+                        "ON e.task_id = t.id AND e.event = 'started' WHERE t.kind = 'task' GROUP BY t.id")
+    out = []
+    for _tid, status, d, s in rows:
+        a = _ts(s)
+        if a is None:
+            continue
+        b = _ts(d) if status == "done" else now
+        if b is not None and b > a:
+            out.append((a, b))
+    return out
+
+
 def run_sessions(path: Optional[str] = None) -> list[tuple[datetime, datetime, float]]:
     """(start, end, session windows used) per AFClaude run (run_metrics rows)."""
     import run_metrics
@@ -558,7 +633,17 @@ def design_sessions(ratio: float) -> list[tuple[datetime, datetime, float]]:
 
 def gather(conn: sqlite3.Connection, usage: Optional[Mapping[str, Any]], now: Optional[datetime] = None,
            runs_path: Optional[str] = None) -> dict[str, Any]:
-    """predict() with the live inputs (read-only)."""
+    """predict() with the live inputs (read-only). The stage share (D-264) comes from the
+    stage_share setting, not stage_share() here: tried as the live measure, it saturates near
+    100% once more than one stage is in progress at a time (the normal case -- the review's own
+    5.10. note: "the stage work ran over five stages in parallel"), because an open stage's window
+    runs to `now` and so overlaps almost everything since it started, whatever that usage actually
+    was. That is the same reason the review's ~45% figure came from a manual read of what the week
+    went into (live fixes vs. stages), not from task_events. stage_share()/active_stage_windows()
+    stay as the trailing-window measurement for the review to weigh against its own read (--share),
+    the same role usage_split()/--split already has for design chats (D-221); the review tunes the
+    setting (like tasks.estimated_sessions) when its own figure moves."""
+    import afclaude_config
     now = now or datetime.now(UTC)
     try:
         runs = run_sessions(runs_path)
@@ -568,7 +653,9 @@ def gather(conn: sqlite3.Connection, usage: Optional[Mapping[str, Any]], now: Op
     default, n = history_default([(a, b) for _, a, b in done_stages(conn)], runs + design_sessions(g.ratio))
     info = (f"median of {n} measured finished stages (runs + design chats, D-264)" if default is not None else
             f"{n} measured finished stage(s) < {MIN_HISTORY}: fallback {FALLBACK_SESSIONS:g} session/stage")
-    return predict(open_stages(conn), g, now, default, info)
+    share = float(afclaude_config.setting("stage_share")) / 100.0
+    share_info = f"{share:.0%} (setting stage_share, D-264: the review's own figure, see --share)"
+    return predict(open_stages(conn), g, now, default, info, share=share, share_info=share_info)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -576,12 +663,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--db", help="SQLite file (default: store.DB_PATH)")
     ap.add_argument("--score", action="store_true", help="score the logged predictions")
     ap.add_argument("--split", action="store_true", help="weekly %% per cycle: run / design / other (D-221)")
+    ap.add_argument("--share", action="store_true", help="trailing-window stage-share measurement for the "
+                    "review (D-264); not what gather() uses (see its docstring)")
     args = ap.parse_args(argv)
     import store
     conn = store.connect(args.db or store.DB_PATH)
     try:
         if args.split:
             print(json.dumps(usage_split([json.loads(ln) for ln in telemetry.rows("usage.sample") if ln.strip()], run_sessions()), indent=1))
+        elif args.share:
+            import pacing
+            now = datetime.now(UTC)
+            ratio, _ = cast(Callable[[], tuple[float, str]], pacing.ratio_info)()
+            all_usage = run_sessions() + design_sessions(ratio)
+            share, staged, measured = stage_share(active_stage_windows(conn, now), all_usage,
+                                                  now - STAGE_SHARE_WINDOW, now)
+            print(json.dumps({"share": _r(share, 3), "staged_sessions": _r(staged), "measured_sessions": _r(measured),
+                              "window_days": STAGE_SHARE_WINDOW.days, "min_share_sessions": MIN_SHARE_SESSIONS},
+                             indent=1))
         elif args.score:
             rows = []
             try:

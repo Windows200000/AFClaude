@@ -332,7 +332,8 @@ def eta_summary(eta):
             "night_sessions_per_week": a.get("night_sessions_per_week"),
             "design_sessions_per_week": a.get("design_sessions_per_week"),
             "user_forecast_week": a.get("user_forecast_week"), "design_forecast_week": a.get("design_forecast_week"),
-            "estimate_sources": a.get("estimate_sources")}
+            "estimate_sources": a.get("estimate_sources"), "stage_share": a.get("stage_share"),
+            "stage_share_info": a.get("stage_share_info")}
 
 
 # ---------------------------------------------------------------- other sources
