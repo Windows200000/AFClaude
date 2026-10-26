@@ -2731,8 +2731,9 @@ def newest_handoff_id(sid):
 
 def inputs_since(path, since):
     """What reached the session after `since` (D-307: after its hand-off was written, so the
-    hand-off may miss it): a prompt (a task notification, the owner's message, a keep-alive
-    message; not a tool result or a meta entry) or a message queued for it or delivered into a
+    hand-off may miss it): a prompt (a task notification, a subagent's hand-back or other peer
+    message, the owner's message, a keep-alive message; not a tool result or another meta entry)
+    or a message queued for it or delivered into a
     running turn (a queue-operation entry). -> [(time, what)], oldest first."""
     out = []
     if not path or not os.path.exists(path):
@@ -2744,16 +2745,16 @@ def inputs_since(path, since):
         if e.get("type") == "queue-operation" and e.get("operation") in ("enqueue", "remove"):
             out.append((ts, "a queued message"))
             continue
-        if e.get("type") != "user" or e.get("isMeta") or e.get("isCompactSummary"):
-            continue
+        kind = (e.get("origin") or {}).get("kind") if isinstance(e.get("origin"), dict) else None
+        if e.get("type") != "user" or e.get("isCompactSummary") or (e.get("isMeta") and kind != "peer"):
+            continue   # a peer message (a subagent's hand-back, SendMessage) is isMeta, but it is input
         content = (e.get("message") or {}).get("content")
         if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
             continue
         text = message_text(e).lstrip()
         if text and not text.startswith("[Request interrupted"):
-            kind = (e.get("origin") or {}).get("kind") if isinstance(e.get("origin"), dict) else None
-            out.append((ts, {"task-notification": "a task notification", "human": "a typed message"}.get(
-                kind, "a message")))
+            out.append((ts, {"task-notification": "a task notification", "human": "a typed message",
+                             "peer": "a subagent's message"}.get(kind, "a message")))
     return sorted(out, key=lambda x: x[0])
 
 

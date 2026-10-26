@@ -188,6 +188,9 @@ class Env(unittest.TestCase):
         if kind == "notification":
             e = entry("user", t, origin={"kind": "task-notification"},
                       message={"role": "user", "content": "<task-notification><task-id>a1</task-id></task-notification>"})
+        elif kind == "handback":
+            e = entry("user", t, isMeta=True, origin={"kind": "peer", "from": "a1", "handback": True},
+                      message={"role": "user", "content": "Another Claude session sent a message: report"})
         else:
             e = entry("queue-operation", t, operation="enqueue", content="<task-notification>")
         self.write([e], "a")
@@ -925,6 +928,16 @@ class MidRunWithSubagents(Env):
         self.assertIn("Summary: Brought up to date in the notification turn.", self.sent[-1][1])
         self.assertEqual(rec["steps"]["save"]["handoff_id"], self.latest(unconsumed=False)["id"])
 
+    def test_a_subagent_hand_back_after_the_handoff_gets_it_asked_for_again(self):
+        """A finished worker reports as a peer message ("Another Claude session sent a message",
+        isMeta): that is input that makes the hand-off out of date too."""
+        self.after_save = [("handback", 2)]
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual([m[:len(REFRESH)] for _, m in self.sent][1], REFRESH)
+        self.assertIn("a subagent's message (from ", self.sent[1][1])
+        self.assertEqual(len(rec["steps"]["save"]["refreshes"]), 1)
+
     def test_a_message_delivered_into_the_save_turn_after_the_handoff_counts_too(self):
         self.after_save = [("queued", 0)]
         d, rec = self.compact()
@@ -970,10 +983,14 @@ class MidRunWithSubagents(Env):
                     entry("queue-operation", t0 + timedelta(seconds=5), operation="remove", content="<task-n"),
                     entry("user", t0 + timedelta(seconds=6), origin={"kind": "task-notification"},
                           message={"role": "user", "content": "<task-notification>late"}),
-                    owner(t0 + timedelta(seconds=7))])
+                    owner(t0 + timedelta(seconds=7)),
+                    entry("user", t0 + timedelta(seconds=8), isMeta=True,     # a subagent's hand-back (peer)
+                          origin={"kind": "peer", "from": "a1", "handback": True},
+                          message={"role": "user", "content": "Another Claude session sent a message:\n"
+                                                              "<agent-message from=\"a1\">done</agent-message>"})])
         self.assertEqual([w for _, w in ka.inputs_since(self.path, t0)],
-                         ["a queued message", "a task notification", "a typed message"])
-        self.assertEqual(ka.inputs_since(self.path, t0 + timedelta(seconds=7)), [])
+                         ["a queued message", "a task notification", "a typed message", "a subagent's message"])
+        self.assertEqual(ka.inputs_since(self.path, t0 + timedelta(seconds=8)), [])
 
 
 # ---------------------------------------------------------------- starts never compact (D-238)
