@@ -74,6 +74,19 @@ class OpenQuestions(unittest.TestCase):
     """D-279: an open question must reach the UI whole, not cut to its first line, and an item
     that is mainly a pointer to a .md file gets a visible warning instead of passing silently."""
 
+    def setUp(self):
+        # needs_input() also counts the DB's blocked tasks and runs stalled.scan over the
+        # transcripts: a DB of its own (no blocked task another test module left in the shared
+        # one) and an empty projects dir (not the real ~/.claude/projects), so its count is
+        # only the OPEN_QUESTIONS.md items written here
+        from unittest import mock
+        testenv.fresh_db(self)
+        projects = tempfile.TemporaryDirectory()
+        self.addCleanup(projects.cleanup)
+        patcher = mock.patch.object(qv.ka, "PROJECTS_DIR", projects.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_split_keeps_continuation_and_nested_items_with_one_item(self):
         md = ("# Open questions\n\n"
               "- **3b open questions:** see docs/phase3b_plan.md for details.\n"
@@ -121,6 +134,7 @@ class OpenQuestions(unittest.TestCase):
                 self.assertIn("question one?", q)
                 self.assertIn("question two?", q)
                 self.assertNotIn("⚠", q)
+                self.assertIsNone(out["error"])
                 self.assertEqual(out["count"], 1)
             finally:
                 qv.HERE = old_here
