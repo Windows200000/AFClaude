@@ -78,6 +78,9 @@ PROMPTS: dict[str, Prompt] = {
     "session_end_save": Prompt(("session", "tasks", "why"), used_by="keepalive save prompt before a compaction"),
     "session_end_save_retry": Prompt(("newest", "session", "tasks"),
                                      used_by="keepalive: the save prompt re-sent once after a reply without a hand-off"),
+    "session_end_save_refresh": Prompt(("handoff", "session", "tasks", "what"),
+                                       used_by="keepalive: the hand-off asked for again when new input reached the "
+                                               "session after it, before /compact (D-307)"),
     "compact": Prompt(used_by="keepalive /compact instruction"),
     "compact_resume": Prompt(("handoff", "progress", "when"), used_by="keepalive, inside compact_after"),
     "compact_after": Prompt(("resume",), used_by="keepalive message after a compaction"),

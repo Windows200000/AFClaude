@@ -2,9 +2,10 @@
 """Offline tests for the compaction of the task-manager (D-144, D-233, D-234, D-238; design §5.5):
 the watcher's compaction_pass compacts when a run ended (D-224) or after 50 min idle, while the
 prompt cache is warm, only at or above the threshold (compaction_threshold_tokens, D-307), and during
-a run once the context passed it (D-307: the run goes on after it); never while a run uses
-the session, a turn or subagent runs or the owner is typing; the save prompt right before the
-/compact (D-233), the fresh hand-off given back and consumed; every failure or timeout on the way
+a run once the context passed it (D-307: the run goes on after it, and background subagents may
+still be working); otherwise never while a run uses the session, a turn or subagent runs or the
+owner is typing; the save prompt right before the /compact (D-233), asked for again when a turn
+(a task notification) made it out of date, the fresh hand-off given back and consumed; every failure or timeout on the way
 (no new hand-off, a busy session, no compaction marker, DB and send failures) is recorded and
 pauses automation (D-234/D-235). Starts never compact any more; they wait for a running one.
 A fake tmux (fire / preflight / owner_typing) and a fake transcript; no real Claude, no tmux."""
@@ -33,6 +34,7 @@ S2 = NIGHT + L                                          # 04:00 Berlin: the seco
 RESET = S2                                              # the 23:00 run's session window resets at 04:00
 SAVE = "[keep-alive] Save your work now"
 RESEND = "[keep-alive] No new hand-off found"
+REFRESH = "[keep-alive] Your hand-off #"
 AFTER = "[keep-alive] This session was compacted"
 _N = [0]
 
@@ -71,7 +73,7 @@ class Env(unittest.TestCase):
              "USAGE_STATE_FILE", "alert", "fire", "preflight", "read_usage_cache", "db_paused",
              "agent_entries", "_limit_hit_in", "fresh_usage", "budget_eval", "COMPACT_TIMEOUT",
              "COMPACT_IDLE_WAIT", "COMPACT_POLL", "SAVE_TIMEOUT", "_fire_usage", "owner_typing", "start_soon",
-             "VERIFY_TIMEOUT", "COMPACT_LOCK_WAIT")
+             "VERIFY_TIMEOUT", "COMPACT_LOCK_WAIT", "COMPACT_TURN_WAIT", "session_idle")
 
     def setUp(self):
         testenv.clear_settings()
@@ -94,6 +96,8 @@ class Env(unittest.TestCase):
         ka.COMPACT_POLL = 0
         ka.VERIFY_TIMEOUT = timedelta(seconds=2)
         self.typing = self.soon = None
+        self.turn = self.turn_polls = 0
+        self.turn_handoff = None
         self.alerts, self.sent = [], []
         self.now = datetime.now(UTC)
         self.usage = {"session": {"percent": 50.0, "resets_at": self.now + timedelta(hours=2)},
@@ -103,6 +107,8 @@ class Env(unittest.TestCase):
         self.compacts = True                                # the fake session compacts on /compact
         self.saves = "write"                                # ... and answers the save prompt (see fake_fire)
         self.resaves = "silent"                             # ... and its re-send (the same modes)
+        self.refreshes = "write"                            # ... and a hand-off asked for again (D-307)
+        self.after_save = []                                # [(input, turn polls)]: what arrives after a hand-off
         self.save_summary = "Fresh state at the compaction."
         ka.fire = self.fake_fire
         self.proj = os.path.join(d, "-proj")
@@ -157,8 +163,9 @@ class Env(unittest.TestCase):
                                   compactMetadata={"trigger": "manual"}),
                             entry("user", now, isCompactSummary=True,
                                   message={"role": "user", "content": "This session is being continued ..."})], "a")
-        elif message.startswith((SAVE, RESEND)):
-            mode = self.saves if message.startswith(SAVE) else self.resaves
+        elif message.startswith((SAVE, RESEND, REFRESH)):
+            mode = {SAVE: self.saves, RESEND: self.resaves, REFRESH: self.refreshes}[
+                next(p for p in (SAVE, RESEND, REFRESH) if message.startswith(p))]
             if mode == "ignore":
                 return 0, "sent-keys ka-abcdef01", ""
             self.write([keepalive_msg(now, message)], "a")
@@ -166,10 +173,39 @@ class Env(unittest.TestCase):
                 self.handoff(self.save_summary, next_steps=["go on"])
             if mode in ("write", "silent"):
                 self.write([assistant(now + timedelta(seconds=1), text="HANDOFF SAVED")], "a")
+            if mode == "write" and self.after_save:
+                self.arrive(*self.after_save.pop(0))
         else:
             self.write([keepalive_msg(now, message), assistant(now + timedelta(seconds=1))], "a")
         self.make_old()
         return 0, "sent-keys ka-abcdef01", ""
+
+    def arrive(self, kind, polls):
+        """Something reaches the session right after its hand-off (D-307): a background subagent's
+        task notification starts a turn that runs for `polls` idle checks (0: a message queued and
+        delivered into the turn that is ending, no turn of its own)."""
+        t = datetime.now(UTC)                                 # after the hand-off's created_at
+        if kind == "notification":
+            e = entry("user", t, origin={"kind": "task-notification"},
+                      message={"role": "user", "content": "<task-notification><task-id>a1</task-id></task-notification>"})
+        else:
+            e = entry("queue-operation", t, operation="enqueue", content="<task-notification>")
+        self.write([e], "a")
+        self.turn = polls
+        real = self.old["session_idle"]
+
+        def idle(path, now=None):
+            if self.turn > 0:
+                self.turn -= 1
+                self.turn_polls += 1
+                if self.turn == 0:                            # the turn ends
+                    if self.turn_handoff:                     # ... having brought the hand-off up to date
+                        self.handoff(self.turn_handoff)
+                    self.write([assistant(datetime.now(UTC), text="merged it")], "a")
+                    self.make_old()
+                return False
+            return real(path, now)
+        ka.session_idle = idle
 
     # ---- helpers
     def handoff(self, summary="state", at=None, **body):
@@ -804,6 +840,140 @@ class CompactionFailures(Env):
                 setattr(ka, n, v)
         self.assertIn("compaction pass failed: ValueError", self.paused()["reason"])
         self.assertEqual(self.sent, [])
+
+
+# ---------------------------------------------------------------- mid-run with subagents running (D-307)
+
+class MidRunWithSubagents(Env):
+    """D-307 follow-up: the task-manager almost always waits on background subagents, so a mid-run
+    compaction goes on while they work, once the session itself is idle at its prompt. A turn that
+    starts after the hand-off (their task notification) is waited for before /compact (bounded,
+    COMPACT_TURN_WAIT), and the hand-off it made out of date is asked for again
+    (session_end_save_refresh.md); a timeout or a hand-off still out of date is an error, as before."""
+    def setUp(self):
+        super().setUp()
+        ka.budget_eval = lambda usage, now, display=False: {"mode": "pacing", "go": True, "reason": "GO",
+                                                            "headroom": 4.0, "text": "budget: +4% weekly"}
+        fire = self.now - timedelta(hours=1)
+        ka.save_state({"handled": {"window-start-x": {
+            "at": fire.isoformat(), "result": "continued-in-place", "session": SID, "prompt": "continue",
+            "reason": "window start, GO", "run_end": (self.now + timedelta(hours=3)).isoformat()}}, "fires": {}})
+        self.write([keepalive_msg(fire), assistant(self.now - timedelta(minutes=6), ctx=200_000, write=4000)])
+        self.make_old()
+        sub = os.path.join(self.path[:-len(".jsonl")], "subagents")   # a background subagent, written just now
+        os.makedirs(sub)
+        open(os.path.join(sub, "agent-a1.jsonl"), "w").close()
+
+    def test_a_running_subagent_does_not_hold_a_mid_run_compaction(self):
+        d, rec = self.compact()
+        self.assertEqual((d.due, d.trigger), (True, "mid-run"), d.reason)
+        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/compact ", AFTER[:9]])
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual(rec["steps"]["save"]["refreshes"], [])
+        # the run-end and idle triggers still wait for it (the subagent is part of the session's work)
+        self.assertEqual(ka.compaction_busy_reason(self.path, datetime.now(UTC)), "a subagent is working")
+        self.assertIsNone(ka.compaction_busy_reason(self.path, datetime.now(UTC), subagents=False))
+
+    def test_the_save_prompt_asks_for_the_subagents_in_flight(self):
+        text = ka.save_text(SID, "mid-run")
+        for part in ("in_flight", "subagent still running in the background with its agent id", "its branch",
+                     "keeps running through the compaction"):
+            self.assertIn(part, text)
+
+    def test_a_notification_turn_after_the_handoff_is_waited_for_then_compacted(self):
+        """The subagent reports back right after the hand-off: its turn runs, the keep-alive waits
+        for it, asks for the hand-off again (the first one lists the subagent as still in flight),
+        then compacts and gives back the current one."""
+        self.after_save = [("notification", 4)]
+        self.save_summary = "Hand-off at the save prompt."
+        first = []
+        orig = self.fake_fire
+
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            if message.startswith(REFRESH):
+                first.append(self.latest(unconsumed=False)["id"])
+                self.save_summary = "Hand-off after the notification."
+            return orig(sid, cwd, message, plan, new, **kw)
+        ka.fire = fire
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        save, refresh, compact, after = (m for _, m in self.sent)
+        self.assertTrue(refresh.startswith(f"{REFRESH}{first[0]} is out of date"), refresh[:60])
+        for part in ("a task notification (from ", f'session "{SID}"', "tasks.py handoff write --session",
+                     "HANDOFF SAVED", "no new work"):
+            self.assertIn(part, refresh)
+        self.assertNotIn("\n", refresh)
+        self.assertTrue(compact.startswith("/compact "))
+        self.assertEqual(self.turn_polls, 4)                                     # waited for the turn's end
+        new = self.latest(unconsumed=False)
+        self.assertGreater(new["id"], first[0])
+        self.assertIn("Summary: Hand-off after the notification.", after)
+        self.assertNotIn("Hand-off at the save prompt.", after)
+        steps = rec["steps"]["save"]
+        self.assertEqual((steps["status"], steps["handoff_id"], len(steps["refreshes"])), ("saved", new["id"], 1))
+        self.assertEqual((steps["refreshes"][0]["stale_id"], steps["refreshes"][0]["handoff_id"]), (first[0], new["id"]))
+        self.assertIsNone(self.latest())                                         # both consumed
+        self.assertFalse(self.paused()["paused"])
+        self.assertEqual(self.alerts, [])
+
+    def test_a_handoff_the_notification_turn_wrote_itself_needs_no_refresh(self):
+        self.after_save = [("notification", 2)]
+        self.turn_handoff = "Brought up to date in the notification turn."
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/compact ", AFTER[:9]])
+        self.assertIn("Summary: Brought up to date in the notification turn.", self.sent[-1][1])
+        self.assertEqual(rec["steps"]["save"]["handoff_id"], self.latest(unconsumed=False)["id"])
+
+    def test_a_message_delivered_into_the_save_turn_after_the_handoff_counts_too(self):
+        self.after_save = [("queued", 0)]
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual([m[:len(REFRESH)] for _, m in self.sent][1], REFRESH)
+        self.assertIn("a queued message", self.sent[1][1])
+
+    def test_the_turn_wait_timing_out_fails_as_before(self):
+        """D-234/D-235: the turn still running after COMPACT_TURN_WAIT: no /compact, recorded,
+        alerted, automation paused; the hand-off stays unconsumed."""
+        ka.COMPACT_TURN_WAIT = timedelta(0)
+        self.after_save = [("notification", 10 ** 6)]
+        d, rec = self.compact()
+        CompactionFailures.assert_failed(self, rec, "was still running 10 min later", [SAVE])
+        self.assertEqual(rec["steps"]["save"]["status"], "turn-busy")
+        self.assertIsNotNone(self.latest())
+
+    def test_a_handoff_out_of_date_again_after_every_refresh_fails(self):
+        self.after_save = [("notification", 1)] * (ka.HANDOFF_REFRESHES + 1)
+        d, rec = self.compact()
+        CompactionFailures.assert_failed(self, rec, f"new input kept reaching the session after its hand-off "
+                                                    f"({ka.HANDOFF_REFRESHES} hand-offs asked for again",
+                                         [SAVE] + [REFRESH] * ka.HANDOFF_REFRESHES)
+        self.assertEqual(len(rec["steps"]["save"]["refreshes"]), ka.HANDOFF_REFRESHES)
+
+    def test_a_refresh_answered_without_a_handoff_fails(self):
+        self.after_save = [("notification", 1)]
+        self.refreshes = "silent"
+        d, rec = self.compact()
+        CompactionFailures.assert_failed(self, rec, "the session answered the save prompt and its re-send without "
+                                                    "writing a hand-off (asking again for the hand-off that new "
+                                                    "input made out of date, D-307)", [SAVE, REFRESH])
+
+    def test_inputs_since(self):
+        t0 = datetime.now(UTC)
+        self.write([entry("user", t0 - timedelta(seconds=5), origin={"kind": "task-notification"},
+                          message={"role": "user", "content": "<task-notification>early"}),
+                    entry("user", t0 + timedelta(seconds=1),
+                          message={"role": "user", "content": [{"type": "tool_result", "content": "x"}]}),
+                    entry("user", t0 + timedelta(seconds=2), isMeta=True, message={"role": "user", "content": "meta"}),
+                    entry("user", t0 + timedelta(seconds=3), isSidechain=True, message={"role": "user", "content": "s"}),
+                    entry("queue-operation", t0 + timedelta(seconds=4), operation="dequeue"),
+                    entry("queue-operation", t0 + timedelta(seconds=5), operation="remove", content="<task-n"),
+                    entry("user", t0 + timedelta(seconds=6), origin={"kind": "task-notification"},
+                          message={"role": "user", "content": "<task-notification>late"}),
+                    owner(t0 + timedelta(seconds=7))])
+        self.assertEqual([w for _, w in ka.inputs_since(self.path, t0)],
+                         ["a queued message", "a task notification", "a typed message"])
+        self.assertEqual(ka.inputs_since(self.path, t0 + timedelta(seconds=7)), [])
 
 
 # ---------------------------------------------------------------- starts never compact (D-238)

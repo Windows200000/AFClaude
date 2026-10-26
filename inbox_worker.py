@@ -104,8 +104,11 @@ HOLD_LOCKED = "a compaction or a start is typing into the session"
 # D-262: the keep-alive's compaction flow (keepalive._compact_now: save prompt, hand-off, /compact,
 # compact_after, READY) is no task-manager activity, and a "now" message waits until it is over.
 # Every step has a timeout, so a flow still recorded "running" this long after its start is over
-COMPACT_FLOW_MAX = (2 * ka.COMPACT_IDLE_WAIT + ka.SAVE_TIMEOUT + ka.COMPACT_TIMEOUT + ka.VERIFY_TIMEOUT
-                    + timedelta(minutes=5))
+# (the save and its re-send; D-307: each hand-off asked for again, with the turn before it, and the
+# turns before and after the last one and before /compact)
+COMPACT_FLOW_MAX = (ka.COMPACT_IDLE_WAIT + 2 * ka.SAVE_TIMEOUT
+                    + ka.HANDOFF_REFRESHES * (ka.COMPACT_TURN_WAIT + ka.SAVE_TIMEOUT)
+                    + 2 * ka.COMPACT_TURN_WAIT + ka.COMPACT_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
 HOLD_COMPACTING = "the keep-alive's compaction flow is running (it goes in after the READY, D-262)"
 
 

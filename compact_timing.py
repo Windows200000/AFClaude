@@ -435,7 +435,9 @@ def decide(now: datetime, state: Mapping[str, Any], *, run_using: bool, run_ende
     """The triggers (D-238, D-307) on the context state (context_state). run_using: a keep-alive
     run still uses the session (keepalive.run_active); run_ended: the latest run is over and the
     session's last prompt was the run's, not the owner's (keepalive.run_ended); busy: why the
-    session can't take a message now (a turn running, a subagent working), else None;
+    session can't take a message now (a turn running, a subagent working; while a run uses the
+    session only a running turn: a mid-run compaction goes on while background subagents work,
+    D-307), else None;
     mid_run_hold: while a run uses the session, why it may not be compacted mid-run
     (mid_run_hold()), None = it may. Order: no requests, below the threshold, a run using it (a
     mid-run compaction if neither mid_run_hold, busy nor the cache stop it, else held), busy, the

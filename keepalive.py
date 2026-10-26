@@ -2507,9 +2507,11 @@ def plan_fillup_test(sid, remaining, args):
 # computed from the stored cost model, which the records and the quickview still show), and (c)
 # during a run (D-307: "mid-run"), at the first idle point once the context passed that threshold,
 # unless compact_timing.mid_run_hold says no (within an hour of the last compaction, the context not
-# grown past the threshold anew since then, the owner's message within 10 min). compaction_pass()
-# looks once a minute (run()) and holds while a run uses the session (run_active; except for (c)), a
-# turn or a subagent is running, the owner is typing (an attached terminal with recent keystrokes,
+# grown past the threshold anew since then, the owner's message within 10 min); (c) needs only the
+# session itself idle at its prompt: background subagents may still be working (the task-manager
+# almost always waits on them), they survive the compaction and the hand-off lists them as in
+# flight. compaction_pass() looks once a minute (run()) and holds while a run uses the session
+# (run_active; except for (c)), a turn (for (a)/(b) also a subagent) is running, the owner is typing (an attached terminal with recent keystrokes,
 # a draft in the input box, a dialog open), the owner holds the session elsewhere (preflight: Remote
 # Control, another process), the session isn't live in our tmux session, it stopped at a limit or
 # its session limit is nearly used up, or a start that types into it is due within COMPACT_GUARD
@@ -2521,15 +2523,21 @@ def plan_fillup_test(sid, remaining, args):
 #      directly before the compaction (D-233), so it also holds the owner's interactive chats; a
 #      reply without one (e.g. the session pointing at a hand-off it wrote before the prompt) gets
 #      the save prompt re-sent once, saying no new hand-off was found (session_end_save_retry.md);
-#   2. sends `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
+#      then (refresh_stale_handoff, D-307) waits for a turn that started after the hand-off (a
+#      subagent's task notification, the owner's message; up to COMPACT_TURN_WAIT) and, if
+#      anything reached the session after the hand-off was written (inputs_since), asks for it
+#      again (session_end_save_refresh.md: a hand-off newer than the out-of-date one), at most
+#      HANDOFF_REFRESHES times;
+#   2. once the session's turn has ended (up to COMPACT_TURN_WAIT), sends
+#      `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
 #      compact_boundary / isCompactSummary entry; up to COMPACT_TIMEOUT);
 #   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md): the session
 #      answers "READY" without starting work; the hand-off is consumed. After a mid-run compaction
 #      it gets prompts/compact_after_run.md instead (mid_run_text: the run's budget now, the end
 #      of its window, its pacing): the run goes on with the hand-off's next steps. A mid-run
 #      compaction is no run end (run_active).
-# Any failure or timeout on the way (a busy session, no new hand-off, a send failure, no compaction
-# marker, the saved hand-off not found, no reply, a DB error) is an error (D-234/D-235): the
+# Any failure or timeout on the way (a busy session, no new hand-off, a hand-off still out of date
+# after HANDOFF_REFRESHES asks, a send failure, no compaction marker, the saved hand-off not found, no reply, a DB error) is an error (D-234/D-235): the
 # compaction stops right there (no /compact after a failed save), the attempt is recorded (the
 # keepalive state's "compactions", one per activity: never retried), alerted, and automation is
 # paused until the owner has looked at it. An older hand-off is never injected in place of a fresh
@@ -2539,6 +2547,8 @@ def plan_fillup_test(sid, remaining, args):
 
 COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction marker, then: error
 COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn, then: error
+COMPACT_TURN_WAIT = timedelta(minutes=10)   # after the save: wait this long for a turn (a task notification) to end before /compact, then: error
+HANDOFF_REFRESHES = 3                       # a hand-off made stale by new input is asked for again at most this often, then: error
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
 COMPACT_POLL = 10                           # seconds
 SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt, then: error
@@ -2633,9 +2643,10 @@ def compact_command():
     return "/compact " + " ".join(load_prompt("compact").split())
 
 
-def wait_idle(path):
-    """Wait up to COMPACT_IDLE_WAIT for the session to finish its turn. -> True (idle) / False."""
-    deadline = time.time() + COMPACT_IDLE_WAIT.total_seconds()
+def wait_idle(path, wait=None):
+    """Wait up to `wait` (default COMPACT_IDLE_WAIT) for the session to finish its turn. -> True
+    (idle) / False."""
+    deadline = time.time() + (COMPACT_IDLE_WAIT if wait is None else wait).total_seconds()
     while not session_idle(path):
         if time.time() >= deadline:
             return False
@@ -2643,19 +2654,19 @@ def wait_idle(path):
     return True
 
 
-def compaction_busy(sid, what):
-    """The session was still mid-turn after COMPACT_IDLE_WAIT (`what`: before which step)."""
-    log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT} ({what})")
+def compaction_busy(sid, what, wait=None):
+    """The session was still mid-turn after `wait` (default COMPACT_IDLE_WAIT; `what`: before which step)."""
+    log(f"compaction: {sid[:8]} still busy after {COMPACT_IDLE_WAIT if wait is None else wait} ({what})")
     return {"status": "busy", "busy_before": what}
 
 
 def compact_session(sid, cwd, path):
     """Send /compact into our live tmux session and wait until the transcript shows it finished.
     -> dict status: compacted | timeout (no marker within COMPACT_TIMEOUT) | busy (still mid-turn
-    after COMPACT_IDLE_WAIT) | send-failed. Only "compacted" lets the start go on
-    (compact_with_handoff)."""
-    if not wait_idle(path):
-        return compaction_busy(sid, "before /compact")
+    after COMPACT_TURN_WAIT: a turn that started after the save, e.g. a task notification, D-307) |
+    send-failed. Only "compacted" lets the start go on (compact_with_handoff)."""
+    if not wait_idle(path, COMPACT_TURN_WAIT):
+        return compaction_busy(sid, "before /compact", COMPACT_TURN_WAIT)
     since = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, compact_command(), "send-keys")
     log(f"compaction: sent /compact to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
@@ -2702,20 +2713,60 @@ def replied_since(path, since):
                 and session_idle(path))
 
 
-def newest_handoff_id(sid):
-    """The id of the session's newest hand-off, consumed or not (0: none). A DB problem raises."""
+def newest_handoff(sid):
+    """The session's newest hand-off row, consumed or not (None: none). A DB problem raises."""
     import store
     conn = store.connect()
     try:
-        h = store.latest_handoff(conn, sid, unconsumed=False)
+        return store.latest_handoff(conn, sid, unconsumed=False)
     finally:
         conn.close()
+
+
+def newest_handoff_id(sid):
+    """The id of the session's newest hand-off, consumed or not (0: none). A DB problem raises."""
+    h = newest_handoff(sid)
     return h["id"] if h else 0
+
+
+def inputs_since(path, since):
+    """What reached the session after `since` (D-307: after its hand-off was written, so the
+    hand-off may miss it): a prompt (a task notification, the owner's message, a keep-alive
+    message; not a tool result or a meta entry) or a message queued for it or delivered into a
+    running turn (a queue-operation entry). -> [(time, what)], oldest first."""
+    out = []
+    if not path or not os.path.exists(path):
+        return out
+    for e in iter_entries(path):
+        ts = _entry_ts(e)
+        if e.get("isSidechain") or ts is None or ts <= since:
+            continue
+        if e.get("type") == "queue-operation" and e.get("operation") in ("enqueue", "remove"):
+            out.append((ts, "a queued message"))
+            continue
+        if e.get("type") != "user" or e.get("isMeta") or e.get("isCompactSummary"):
+            continue
+        content = (e.get("message") or {}).get("content")
+        if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            continue
+        text = message_text(e).lstrip()
+        if text and not text.startswith("[Request interrupted"):
+            kind = (e.get("origin") or {}).get("kind") if isinstance(e.get("origin"), dict) else None
+            out.append((ts, {"task-notification": "a task notification", "human": "a typed message"}.get(
+                kind, "a message")))
+    return sorted(out, key=lambda x: x[0])
 
 
 def save_text(sid, trigger="run-end"):
     return " ".join(load_prompt("session_end_save").format(session=sid, tasks=TASKS_PY,
                                                            why=TRIGGER_TEXT[trigger][0]).split())
+
+
+def save_refresh_text(sid, handoff_id, what):
+    """D-307: the hand-off asked for again because `what` (inputs_since) reached the session after
+    hand-off #handoff_id was written."""
+    return " ".join(load_prompt("session_end_save_refresh").format(
+        session=sid, tasks=TASKS_PY, handoff=f"#{handoff_id}", what=what).split())
 
 
 def save_retry_text(sid, newest):
@@ -2732,6 +2783,10 @@ SAVE_WHY = {   # why there is no new hand-off: the error says it (D-234)
     "no-handoff": "the session answered the save prompt and its re-send without writing a hand-off",
     "send-failed": "the save prompt could not be sent",
     "db-error": "the hand-offs could not be read",
+    "stale": f"new input kept reaching the session after its hand-off ({HANDOFF_REFRESHES} hand-offs asked for "
+             "again were each out of date before the /compact)",
+    "turn-busy": f"a turn that started after the hand-off (e.g. a task notification) was still running "
+                 f"{COMPACT_TURN_WAIT.total_seconds() / 60:g} min later",
 }
 COMPACT_WHY = {
     "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the save",
@@ -2783,18 +2838,54 @@ def _await_save(sid, cwd, path, text, before, out, at_key):
         # before the DB read: the row is written before the reply
         done = replied_since(path, since) and (prev is None or (last_activity(path) or prev) > prev)
         try:
-            newest = newest_handoff_id(sid)
+            h = newest_handoff(sid)
         except Exception as e:   # noqa: BLE001 - an error (D-234): store.retrying already retried (D-171)
             log(f"compaction: {sid[:8]}'s hand-offs unreadable while waiting for the save ({type(e).__name__}: {e})")
             return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
-        if newest > before:
-            log(f"compaction: {sid[:8]} saved hand-off #{newest} right before the compaction (D-233)")
-            return dict(out, status="saved", handoff_id=newest)
+        if h and h["id"] > before:
+            log(f"compaction: {sid[:8]} saved hand-off #{h['id']} right before the compaction (D-233)")
+            return dict(out, status="saved", handoff_id=h["id"], saved_at=parse_ts(h["created_at"]))
         if done:
             return dict(out, status="no-handoff")
         if time.time() >= deadline:
             return dict(out, status="timeout", still_busy=not session_idle(path))
         time.sleep(COMPACT_POLL)
+
+
+def refresh_stale_handoff(sid, cwd, path, save):
+    """D-307: the hand-off must still be current at the /compact. A turn can start after it was
+    written (a background subagent's task notification: a mid-run compaction goes on while they
+    work; the owner's message). Wait for the session's turn to end (up to COMPACT_TURN_WAIT; still
+    running: turn-busy); if anything reached the session after the hand-off (inputs_since) and the
+    session did not write a newer one after that on its own, ask for it again (save_refresh_text; _await_save waits for one newer than the stale one, as for the
+    save prompt) and check again, at most HANDOFF_REFRESHES times (then: stale). `save`:
+    save_before_compaction's "saved" result. -> the save dict: status saved with the current
+    hand-off (handoff_id, saved_at), or the failing status; "refreshes" lists each ask (jsonable)."""
+    save = dict(save, refreshes=list(save.get("refreshes") or []))
+    while True:
+        if not wait_idle(path, COMPACT_TURN_WAIT):
+            compaction_busy(sid, f"after hand-off #{save['handoff_id']}", COMPACT_TURN_WAIT)
+            return dict(save, status="turn-busy")
+        new = inputs_since(path, save["saved_at"])
+        if not new:
+            return save
+        h = newest_handoff(sid)   # the session may have brought it up to date on its own in that turn
+        if h and h["id"] > save["handoff_id"] and parse_ts(h["created_at"]) > new[-1][0]:
+            log(f"compaction: {sid[:8]} wrote hand-off #{h['id']} after what reached it; that one is current")
+            save.update(handoff_id=h["id"], saved_at=parse_ts(h["created_at"]))
+            continue
+        if len(save["refreshes"]) >= HANDOFF_REFRESHES:
+            log(f"compaction: {sid[:8]}'s hand-off #{save['handoff_id']} out of date again after "
+                f"{HANDOFF_REFRESHES} refreshes")
+            return dict(save, status="stale")
+        what = f"{' and '.join(sorted({w for _, w in new}))} (from {_hm(new[0][0])})"
+        log(f"compaction: {what} reached {sid[:8]} after its hand-off #{save['handoff_id']}; asking for it again")
+        res = _await_save(sid, cwd, path, save_refresh_text(sid, save["handoff_id"], what), save["handoff_id"],
+                          {"after": what, "stale_id": save["handoff_id"]}, "sent_at")
+        save["refreshes"].append(_jsonable(res))
+        if res["status"] != "saved":
+            return dict(save, status=res["status"], error=res.get("error"), still_busy=res.get("still_busy"))
+        save.update(handoff_id=res["handoff_id"], saved_at=res["saved_at"])
 
 
 def compact_resume_text(sid, save, trigger="run-end"):
@@ -2851,6 +2942,20 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end"):
         if st != "no-handoff" and save.get("resent_at"):
             why += " (after the save prompt was re-sent: the first reply had no hand-off)"
         raise failstop.Failed(f"no fresh hand-off before the compaction: {why}", save.get("error") or "", rec)
+    try:
+        save = refresh_stale_handoff(sid, cwd, path, save)
+    except Exception as e:   # noqa: BLE001
+        raise failstop.Failed("the hand-off check before /compact failed", f"{type(e).__name__}: {e}"[:300],
+                              rec) from None
+    rec["save"] = _jsonable(save)
+    if save["status"] != "saved":
+        st = save["status"]
+        why = SAVE_WHY.get(st, f"save status {st}")
+        if st not in ("stale", "turn-busy"):
+            why += " (asking again for the hand-off that new input made out of date, D-307)"
+        if st == "timeout" and save.get("still_busy"):
+            why += " (the session was still working on it)"
+        raise failstop.Failed(f"no current hand-off before the compaction: {why}", save.get("error") or "", rec)
     try:
         comp = compact_session(sid, cwd, path)
     except Exception as e:   # noqa: BLE001
@@ -3082,10 +3187,14 @@ def owner_typing(sid, now):
     return None
 
 
-def compaction_busy_reason(path, now):
-    """Why the session can't take the save prompt now (a turn running, a subagent working), or None."""
+def compaction_busy_reason(path, now, subagents=True):
+    """Why the session can't take the save prompt now (a turn running, a subagent working), or None.
+    subagents=False: only a running turn counts (D-307: a mid-run compaction goes on while background
+    subagents work; they survive the compaction, the hand-off lists them as in flight)."""
     if not session_idle(path, now):
         return "a turn is running"
+    if not subagents:
+        return None
     subs = glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
     newest = max((os.path.getmtime(f) for f in subs if os.path.exists(f)), default=None)
     if newest is not None and now - datetime.fromtimestamp(newest, UTC) < SUBAGENT_QUIET:
@@ -3215,7 +3324,7 @@ def compaction_pass(sid, now, args):
     using = run_active(sid, now, st) is not None
     mid = ct.mid_run_hold(sc, now, threshold) if using and state["above"] else ct.MID_RUN_UNCHECKED
     d = ct.decide(now, state, run_using=using, run_ended=not using and run_ended(sid, sc, st, now),
-                  busy=compaction_busy_reason(path, now), mid_run_hold=mid)
+                  busy=compaction_busy_reason(path, now, subagents=not using), mid_run_hold=mid)
     if d.key and (d.key in (st.get("compactions") or {}) or d.key in _COMPACT_TRIED):
         return d
     if d.due:
