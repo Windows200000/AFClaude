@@ -3,7 +3,7 @@
 Written 01.10.2026 by an AFClaude subagent, per the project rule: check for viable
 alternatives before building. Covers (1) tools that already do parts of AFClaude,
 (2) whether an existing self-hosted PM tool could replace the planned dashboard
-(`docs/dashboard_design.md`), (3) building blocks that would shrink the dashboard
+(`docs/dashboard_design/`, index: `docs/dashboard_design/README.md`), (3) building blocks that would shrink the dashboard
 build. Primary sources where possible; community project maturity read from the
 repo page itself (stars/forks/commits/dates), not secondary blog posts.
 
@@ -50,7 +50,7 @@ around the existing cache and sample files).
 This is the closest existing alternative to the planned dashboard itself, so it
 got the most scrutiny. All are read from their own GitHub pages directly.
 
-| project | covers | lacks (vs. `dashboard_design.md` §1-§2) | license | maturity |
+| project | covers | lacks (vs. `docs/dashboard_design/01_goals_and_non_goals.md` §1 / `docs/dashboard_design/02_users_roles_and_access.md` §2) | license | maturity |
 |---|---|---|---|---|
 | `akuks/Claude-Orchestrator` | web dashboard, task queue, cron schedules, Slack notify, approval inbox, MCP credential vault, cost caps, per-project budgets | no stalled-session/limit-reset concept, no RC-safety, no window/budget rule, no standing rules, no prompt-override system, headless `ANTHROPIC_API_KEY` auth only (no OIDC/local login, no per-user audit) | unstated on page | 116 commits, 1 star/0 forks, "phases 1-5 complete" but no license shown, light adoption |
 | `phahadek/claude-orchestrator` | web dashboard, task dispatch from Notion/GitHub/Jira/YAML, automated PR review, lifecycle states, live cost/token view, staged "intents" needing human approval | same gaps as above; no auth/OIDC evidence at all (assumes local/trusted use) | MIT | ~1,700+ commits claimed, 1 star/0 forks |
@@ -64,15 +64,15 @@ execution order, a blocked-task Q/A inbox, stalled-session continue/ignore with
 standing rules, per-weekday automation windows, a budget rule tied to Claude's
 own two usage windows, RC-thread-safety, a prompt-override editor, and generic
 OIDC + local login behind the owner's existing `/private` pattern. That
-combination is exactly the project-specific glue `dashboard_design.md` is
+combination is exactly the project-specific glue `docs/dashboard_design/` is
 built around; it is not a feature gap any of these would close with a plugin —
 it's most of the application. Adopting one would also mean a second,
 un-audited write path into task state (the exact risk Option C in
-`dashboard_design.md` §3 was rejected for), or running a Node/React or
+`docs/dashboard_design/03_main_flows.md` §3 was rejected for), or running a Node/React or
 Nuxt/Supabase stack alongside the existing pure-Python flat-module codebase.
 
 **Recommendation: BUILD (confirms Option A, already chosen in
-`dashboard_design.md`).** Two implementation ideas worth lifting, no adoption
+`docs/dashboard_design/`).** Two implementation ideas worth lifting, no adoption
 needed: `akuks`'s "staged intent requiring approval" pattern maps well onto
 `action_requests` (§4.6); `dnvriend`'s REST-trigger shape is a reasonable
 reference for `requests` POST (§5). No change to the phased plan.
@@ -115,7 +115,7 @@ local-execution assumption; nothing today replaces dispatcher/keepalive's job.
 
 ## 6. Self-hosted PM tools as a dashboard replacement
 
-Checked against the actual F1-F9 requirements in `dashboard_design.md` §2.
+Checked against the actual F1-F9 requirements in `docs/dashboard_design/02_users_roles_and_access.md` §2.
 
 | tool | fit | gap vs. requirements | license | maintenance |
 |---|---|---|---|---|
@@ -147,7 +147,7 @@ decision from this dashboard.
 | Session cookie signing | **itsdangerous** | ADOPT | small, already the de-facto Starlette-ecosystem signer; avoids hand-rolled crypto |
 | Password hashing (local login) | **argon2-cffi** or `passlib[argon2]` | ADOPT | standard, avoids a hand-rolled KDF for a security-critical path |
 | Login routes, CSRF, session glue | bespoke (`starlette-login`/`Imia` considered) | BUILD | the surface is small and security-critical (§6 of the design doc already scopes exactly this); a generic login framework adds indirection for ~100 lines of code the team should own directly |
-| htmx + component kit | plain vendored `htmx.min.js` + handwritten CSS | BUILD (no kit) | a kit like `htmui`/BasecoatUI needs a Tailwind build step, which the design doc explicitly avoids ("no JS build chain" is a stated Pro of Option A); the visual design is already specified (purple accent, quickview's tokens) and is a small, bespoke stylesheet | **Superseded 08.10.2026:** the frontend is TypeScript (Preact + esbuild), see dashboard_design.md §4.
+| htmx + component kit | plain vendored `htmx.min.js` + handwritten CSS | BUILD (no kit) | a kit like `htmui`/BasecoatUI needs a Tailwind build step, which the design doc explicitly avoids ("no JS build chain" is a stated Pro of Option A); the visual design is already specified (purple accent, quickview's tokens) and is a small, bespoke stylesheet | **Superseded 08.10.2026:** the frontend is TypeScript (Preact + esbuild), see docs/dashboard_design/04_architecture.md §4.
 | Charts (window timeline, usage ratios) | **uPlot**, vendored | ADOPT | MIT, ~50 KB, zero dependencies, canvas-based; fits "no CDN" rule as a single static file; the dashboard only needs simple line/bar views (F4/F5), not uPlot's streaming ceiling, but its small footprint still beats Chart.js (~60 KB) and avoids a framework |
 
 **Impact on phases:** phase 4 ("Dashboard skeleton... auth middleware") gets
@@ -167,5 +167,5 @@ vendor uPlot for the timeline and ratio charts. No other phase changes.
 | Anthropic native features (Routines etc.) | INTEGRATE-watch (monitor, no action now) |
 | Self-hosted PM tool as dashboard replacement | BUILD (every candidate leaves the same ~70% to build, plus a sync problem) |
 | OIDC / crypto libraries | ADOPT (Authlib, itsdangerous, argon2-cffi) |
-| htmx component kit | superseded: TypeScript frontend (Preact + esbuild, minimal npm deps), dashboard_design.md §4 |
+| htmx component kit | superseded: TypeScript frontend (Preact + esbuild, minimal npm deps), docs/dashboard_design/04_architecture.md §4 |
 | Charts | ADOPT (uPlot, vendored) |

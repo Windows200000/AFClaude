@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The DB error path (docs/dashboard_design.md §7.8, owner D-171): fault injection for each
+"""The DB error path (docs/dashboard_design/07_data_model.md §7.8, owner D-171): fault injection for each
 error class (a locked DB, a read-only file, a corrupted file, a newer schema), the hand-back
 to the CLI, the fallback alert file with its once-per-episode alert, and the runners pausing
 on a broken DB and resuming on their own. (The MCP hand-back: test_mcp_server.py, DBErrors.)

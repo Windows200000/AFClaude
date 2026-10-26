@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 project_docs.py: a project's docs in the DB (dashboard phase 2d part 2, D-161, D-152, D-181;
-docs/dashboard_design.md §7.2, §7.7). The tables are in store.py (DOCS_SCHEMA: docs, the
+docs/dashboard_design/07_data_model.md §7.2, §7.7). The tables are in store.py (DOCS_SCHEMA: docs, the
 append-only doc_entries), the write path in actions.py (doc.append, doc.set, doc.sync); this
 module maps the files onto them, imports them and writes the public build log back out:
 

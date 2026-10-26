@@ -28,7 +28,7 @@ Env: AFCLAUDE_DB (database), AFCLAUDE_PROJECTS_DIR (transcripts root for the
 stalled-session scan, default ~/.claude/projects). Results are compact JSON;
 times are Europe/Berlin. Expected failures (unknown id, wrong state, bad
 value) come back as tool errors with a one-line message; a database error
-(docs/dashboard_design.md §7.8) as a tool error holding a JSON object
+(docs/dashboard_design/07_data_model.md §7.8) as a tool error holding a JSON object
 {"error": {error_class, kind, message, not_saved, escalation, next_step}}.
 """
 import functools

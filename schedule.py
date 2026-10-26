@@ -1,4 +1,4 @@
-"""The schedule: the ONLY window code (docs/dashboard_design.md §6; D-148, D-030, D-033, D-034,
+"""The schedule: the ONLY window code (docs/dashboard_design/06_schedule.md §6; D-148, D-030, D-033, D-034,
 D-202, D-203, D-205).
 
 Settings (actions.SETTINGS, read through afclaude_config.settings(); tests pass a Config):

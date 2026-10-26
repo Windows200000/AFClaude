@@ -1,5 +1,6 @@
-// The typed route table over `history` (docs/phase6a_plan.md §3.8): the F-views (design §2,
-// docs/dashboard_design.md F1-F13; F14 is embedded in F1, not its own route) as a fixed list.
+// The typed route table over `history` (docs/phase6a_plan.md §3.8): the F-views (design
+// docs/dashboard_design/02_users_roles_and_access.md §2,
+// docs/dashboard_design/03_main_flows.md F1-F13; F14 is embedded in F1, not its own route) as a fixed list.
 // No router package.
 
 export type ViewName =

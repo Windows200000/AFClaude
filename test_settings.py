@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the settings in the DB (phase 2a, D-146; docs/dashboard_design.md §7.4):
+"""Offline tests for the settings in the DB (phase 2a, D-146; docs/dashboard_design/07_data_model.md §7.4):
 the one-time import of the file tunables (data/afclaude.json, data/dispatcher.json, the pacing
 keys of data/user_model.json) through actions.py, the accessor afclaude_config.setting()
 (DB value > code default; the DB unavailable -> the code defaults, logged), and that the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for schedule.py, the only window code (docs/dashboard_design.md §6; D-148,
+"""Offline tests for schedule.py, the only window code (docs/dashboard_design/06_schedule.md §6; D-148,
 D-030/D-033/D-034, D-202/D-203). Explicit Configs; the settings path through a temp DB."""
 import os
 import sys
