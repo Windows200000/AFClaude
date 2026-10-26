@@ -221,18 +221,20 @@ class Transcript(unittest.TestCase):
 
 
 class Decide(unittest.TestCase):
-    """D-238's triggers on a context state."""
+    """The triggers (D-238, D-307) on a context state."""
     def state(self, ctx=300_000, idle=timedelta(minutes=55)):
         last = T0
         return {"context": ctx, "last_request_at": last, "cache_expires_at": last + timedelta(hours=1),
-                "break_even": 177_000}, last + idle
+                "break_even": 177_000, "threshold": 150_000}, last + idle
 
     def test_matrix(self):
         st, now = self.state()
         d = ct.decide(now, st, run_using=False, run_ended=False, busy=None)
         self.assertEqual((d.due, d.trigger, d.key), (True, "idle", "compact-" + T0.isoformat()))
-        st, now = self.state(ctx=150_000)
-        self.assertIn("below the break-even 177k", ct.decide(now, st, run_using=False, run_ended=True, busy=None).reason)
+        st, now = self.state(ctx=149_000)
+        self.assertIn("below the threshold 150k", ct.decide(now, st, run_using=False, run_ended=True, busy=None).reason)
+        st, now = self.state(ctx=160_000)                       # D-307: under the break-even, still due
+        self.assertTrue(ct.decide(now, st, run_using=False, run_ended=True, busy=None).due)
         st, now = self.state()
         self.assertEqual(ct.decide(now, st, run_using=True, run_ended=False, busy=None).reason,
                          "a keep-alive run is using the session")
@@ -254,6 +256,80 @@ class Decide(unittest.TestCase):
             self.assertEqual((d.due, d.missed), (False, True))
         self.assertIn("no request", ct.decide(T0, {"context": None, "break_even": 1}, run_using=False,
                                               run_ended=False, busy=None).reason)
+
+    def test_mid_run(self):
+        """D-307: during a run, at an idle point above the threshold: a mid-run compaction, unless
+        mid_run_hold, a busy session or a cache about to expire holds it."""
+        st, now = self.state(idle=timedelta(minutes=2))
+        d = ct.decide(now, st, run_using=True, run_ended=False, busy=None, mid_run_hold=None)
+        self.assertEqual((d.due, d.trigger, d.key), (True, "mid-run", "compact-" + T0.isoformat()))
+        self.assertIn("passed the threshold 150k during the run", d.reason)
+        for kw, why in (({"mid_run_hold": "the owner wrote 3 min ago"}, "the owner wrote 3 min ago"),
+                        ({"mid_run_hold": None, "busy": "a subagent is working"}, "a subagent is working")):
+            d = ct.decide(now, st, run_using=True, run_ended=False, **dict({"busy": None}, **kw))
+            self.assertEqual((d.due, d.reason), (False, f"a keep-alive run is using the session (no mid-run "
+                                                        f"compaction: {why})"))
+        st, now = self.state(idle=timedelta(minutes=58))
+        d = ct.decide(now, st, run_using=True, run_ended=False, busy=None, mid_run_hold=None)
+        self.assertEqual((d.due, d.missed), (False, False))
+        self.assertIn("the prompt cache expires too soon", d.reason)
+        st, now = self.state(ctx=149_000, idle=timedelta(minutes=2))                # below: nothing to do
+        self.assertIn("below the threshold", ct.decide(now, st, run_using=True, run_ended=False, busy=None,
+                                                       mid_run_hold=None).reason)
+
+
+class MidRunHold(unittest.TestCase):
+    """D-307's loop and owner guards (compact_timing.mid_run_hold)."""
+    def scan(self, reqs, prompts=(), compactions=()):
+        return ct.Scan(requests=[ct.Request(ts=t, model="claude-opus-5-5", read=c) for t, c in reqs],
+                       prompts=[ct.Prompt(t, k) for t, k in prompts], compactions=list(compactions))
+
+    def test_no_compaction_yet(self):
+        s = self.scan([(T0, 100_000), (T0 + timedelta(minutes=30), 200_000)])
+        self.assertIsNone(ct.mid_run_hold(s, T0 + timedelta(minutes=31), 150_000))
+
+    def test_not_within_an_hour_of_the_last_compaction(self):
+        c = T0 + timedelta(minutes=10)
+        s = self.scan([(T0, 300_000), (c + timedelta(minutes=5), 60_000), (c + timedelta(minutes=50), 160_000)],
+                      compactions=[c])
+        self.assertIn("not again before", ct.mid_run_hold(s, c + timedelta(minutes=59), 150_000))
+        self.assertIsNone(ct.mid_run_hold(s, c + timedelta(minutes=60), 150_000))
+
+    def test_only_once_the_context_grew_past_the_threshold_anew(self):
+        """A compaction that left the context above the threshold would repeat: held until a request
+        after it was below the threshold."""
+        c = T0
+        s = self.scan([(c + timedelta(minutes=5), 155_000), (c + timedelta(minutes=90), 170_000)], compactions=[c])
+        self.assertIn("has not been below the threshold since the compaction",
+                      ct.mid_run_hold(s, c + timedelta(hours=2), 150_000))
+        s = self.scan([(c + timedelta(minutes=5), 90_000), (c + timedelta(minutes=90), 170_000)], compactions=[c])
+        self.assertIsNone(ct.mid_run_hold(s, c + timedelta(hours=2), 150_000))
+
+    def test_not_while_the_owner_chats(self):
+        """D-262/D-307: the owner's typed message or their dashboard message (inbox) within 10 min holds it;
+        the keep-alive's own messages and task notifications don't."""
+        now = T0 + timedelta(hours=1)
+        for kind in ("owner", "inbox"):
+            s = self.scan([(T0, 200_000)], prompts=[(now - timedelta(minutes=9), kind)])
+            self.assertEqual(ct.mid_run_hold(s, now, 150_000), "the owner wrote 9 min ago")
+            s = self.scan([(T0, 200_000)], prompts=[(now - timedelta(minutes=10), kind)])
+            self.assertIsNone(ct.mid_run_hold(s, now, 150_000))
+        s = self.scan([(T0, 200_000)], prompts=[(now - timedelta(minutes=1), k) for k in ("keepalive", "other")])
+        self.assertIsNone(ct.mid_run_hold(s, now, 150_000))
+
+    def test_an_inbox_message_is_its_own_prompt_kind(self):
+        e = {"origin": {"kind": "human"}}
+        self.assertEqual(ct.prompt_kind(e, "[AFClaude inbox #12] The owner wrote this"), "inbox")
+        self.assertEqual(ct.prompt_kind(e, "[AFClaude] something else"), "keepalive")
+        self.assertEqual(ct.prompt_kind(e, "a question"), "owner")
+
+    def test_context_state_threshold(self):
+        m = ct.builtin()
+        s = self.scan([(T0, 160_000)])
+        st = ct.context_state(s, m, T0, 150_000)
+        self.assertEqual((st["threshold"], st["above"], st["break_even"]), (150_000, True, ct.break_even(m)))
+        st = ct.context_state(s, m, T0)                                            # no threshold: the break-even
+        self.assertEqual((st["threshold"], st["above"]), (ct.break_even(m), False))
 
 
 class Fit(unittest.TestCase):

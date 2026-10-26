@@ -784,10 +784,14 @@ SETTINGS: dict[str, Setting] = {
                          "it, so the session windows line up with the schedule", "budget"),
     # --- automation
     # --- compaction of long-running sessions (D-144, D-191, D-214; design §5.5)
-    "compaction_enabled": _flag(True, "Compaction (D-144/D-233/D-238): the watcher compacts the task-manager "
-                                "(save a hand-off, /compact, inject the hand-off) when a run ends or after 50 min "
-                                "idle, before its prompt cache expires, if its context is at or above the "
-                                "computed break-even (compact_timing.py)", "automation"),
+    "compaction_enabled": _flag(True, "Compaction (D-144/D-233/D-238/D-307): the watcher compacts the "
+                                "task-manager (save a hand-off, /compact, inject the hand-off) when a run ends, "
+                                "after 50 min idle before its prompt cache expires, and during a run at an idle "
+                                "point, if its context is at or above compaction_threshold_tokens", "automation"),
+    "compaction_threshold_tokens": _int(150_000, 50_000, 1_000_000, "Compaction threshold (D-307): the watcher "
+                                        "compacts the task-manager only once its context is at or above this many "
+                                        "tokens, and during a run as soon as it passes it (replaced the computed "
+                                        "break-even of D-238, which the quickview still shows)", "automation"),
     "automation_paused": _flag(False, "Every runner holds new starts and continues (running sessions go "
                                "on). A runner sets it itself on any failure or timeout (D-234/D-235, "
                                "failstop.py); the owner clears it: `tasks.py automation resume`",

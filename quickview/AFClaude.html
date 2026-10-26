@@ -563,7 +563,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     }
     var l = c.live || {}, m = c.model || {};
     out.push(tile("Context now", (l.estimated ? "~" : "") + kTok(l.context),
-      '<div class="mut">break-even ' + kTok(l.break_even) + (l.above ? ' · <span class="warn">compacts when idle</span>' : " · no compaction needed") + "</div>"));
+      '<div class="mut">threshold ' + kTok(l.threshold) + (l.above ? ' · <span class="warn">compacts at the next idle point</span>' : " · no compaction needed") + "</div>"));
     out.push(tile("Prompt cache", l.warm ? '<span class="ok">warm</span>' : '<span class="warn">expired</span>',
       '<div class="mut">' + (l.warm ? "expires " + esc(l.cache_expires_at_berlin || "?") + " (in " + Math.round(l.minutes_left || 0) + " min)"
         : "expired " + esc(l.cache_expires_at_berlin || "?")) + "</div>"));
