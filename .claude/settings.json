@@ -1,4 +1,11 @@
 {
+  "enabledPlugins": {
+    "commercial-legal@synced": false,
+    "product-legal@synced": false,
+    "regulatory-legal@synced": false,
+    "legal-builder-hub@synced": false
+  },
+  "disableClaudeAiConnectors": true,
   "permissions": {
     "allow": [
       "Bash(bash tools/test_compact_live.sh:*)",
