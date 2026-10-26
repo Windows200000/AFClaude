@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Offline tests for the compaction of the task-manager (D-144, D-233, D-234, D-238; design §5.5):
 the watcher's compaction_pass compacts when a run ended (D-224) or after 50 min idle, while the
-prompt cache is warm, only at or above the break-even (compact_timing.py), never while a run uses
+prompt cache is warm, only at or above the threshold (compaction_threshold_tokens, D-307), and during
+a run once the context passed it (D-307: the run goes on after it); never while a run uses
 the session, a turn or subagent runs or the owner is typing; the save prompt right before the
 /compact (D-233), the fresh hand-off given back and consumed; every failure or timeout on the way
 (no new hand-off, a busy session, no compaction marker, DB and send failures) is recorded and
@@ -235,7 +236,7 @@ class NoWindowEndSave(Env):
 # ---------------------------------------------------------------- the watcher's compaction (D-238)
 
 class CompactWhenIdle(Env):
-    def test_idle_above_the_break_even_saves_compacts_and_gives_the_handoff_back(self):
+    def test_idle_above_the_threshold_saves_compacts_and_gives_the_handoff_back(self):
         old = self.handoff("Phase 1 state.", at=self.now - timedelta(days=3))
         self.save_summary = "Phase 2 merged."
         d, rec = self.compact()
@@ -258,26 +259,26 @@ class CompactWhenIdle(Env):
         self.assertEqual(rec["status"], "compacted")
         self.assertEqual((rec["trigger"], rec["context"], rec["handoff_id"], rec["handoff_consumed"], rec["replied"]),
                          ("idle", 300_400, new["id"], True, True))
-        self.assertEqual(rec["break_even"], ct.break_even(ct.builtin()))
+        self.assertEqual((rec["threshold"], rec["break_even"]), (150_000, ct.break_even(ct.builtin())))
         self.assertEqual(rec["steps"]["save"]["status"], "saved")
         self.assertIsNone(self.latest())                                       # consumed, the older one too
         self.assertEqual(new["consumed_by_start"], d.key)
         self.assertGreater(new["id"], old["id"])
-        self.assertIn(f"compacted {SID[:8]} (idle, D-238): context 300k", self.progress())
+        self.assertIn(f"compacted {SID[:8]} (idle, D-238/D-307): context 300k >= threshold 150k", self.progress())
         self.assertFalse(self.paused()["paused"])
         # the next pass: the context is small now (the compaction marker), nothing more
         self.sent.clear()
         d2, _ = self.compact()
         self.assertFalse(d2.due)
-        self.assertIn("below the break-even", d2.reason)
+        self.assertIn("below the threshold", d2.reason)
         self.assertEqual(self.sent, [])
 
-    def test_below_the_break_even_no_compaction(self):
-        """D-238: a context under the break-even (~177k with the built-in model) is left alone."""
-        self.idle_transcript(ctx=150_000)
+    def test_below_the_threshold_no_compaction(self):
+        """D-307: a context under the threshold (150k by default) is left alone."""
+        self.idle_transcript(ctx=149_000)
         d, rec = self.compact()
         self.assertFalse(d.due)
-        self.assertIn("below the break-even 177k", d.reason)
+        self.assertIn("below the threshold 150k", d.reason)
         self.assertEqual((self.sent, rec), ([], None))
 
     def test_not_before_50_min_idle(self):
@@ -288,7 +289,7 @@ class CompactWhenIdle(Env):
         self.assertEqual((self.sent, rec), ([], None))
 
     def test_the_cache_already_expired_is_recorded_missed(self):
-        """Above the break-even, but the cache expired (the owner typed until then, the watcher was
+        """Above the threshold, but the cache expired (the owner typed until then, the watcher was
         down): no compaction (it would re-read the whole context first), recorded "missed" once."""
         self.idle_transcript(idle=timedelta(minutes=58))
         d, rec = self.compact()
@@ -389,15 +390,21 @@ class CompactWhenIdle(Env):
         d, rec = self.compact()                                                # the lock is free: now
         self.assertEqual(rec["status"], "compacted")
 
-    def test_a_stored_cost_model_sets_the_break_even(self):
-        """The break-even comes from the stored model (cost_model.set): a cheaper cache write moves it up."""
+    def test_the_threshold_setting_decides_not_the_break_even(self):
+        """D-307: the setting compaction_threshold_tokens is the trigger; a stored cost model whose
+        break-even (cheaper cache writes: ~550k) lies above the context no longer holds it."""
+        testenv.set_setting("compaction_threshold_tokens", 400_000)
+        d, rec = self.compact()
+        self.assertFalse(d.due)
+        self.assertIn("below the threshold 400k", d.reason)
+        testenv.clear_settings()
         m = ct.builtin()
         m["weights"]["cache_write"] = 5.0
         ct.store_model(m)
         try:
+            self.assertGreater(ct.break_even(m), 300_400)
             d, rec = self.compact()
-            self.assertFalse(d.due)
-            self.assertIn(f"below the break-even {ct.break_even(m) / 1000:.0f}k", d.reason)
+            self.assertEqual((d.due, rec["status"], rec["break_even"]), (True, "compacted", ct.break_even(m)))
         finally:
             conn = store.connect()
             try:
@@ -431,9 +438,15 @@ class CompactAtRunEnd(Env):
         self.assertIsNone(ka.run_active(SID, datetime.now(UTC)))
 
     def test_a_run_still_going_holds_it(self):
+        """A run-end or idle compaction waits for the run's end; a mid-run one (D-307) waits for an idle
+        point (CompactMidRun)."""
         self.run_state(stop=False)                                             # written 10 min ago: active
+        self.write([assistant(self.now - timedelta(minutes=5), stop="tool_use", ctx=401_000,
+                              content=[{"type": "tool_use", "id": "t1", "name": "Agent", "input": {}}])], "a")
+        self.make_old()
         d, rec = self.compact()
-        self.assertEqual((d.due, d.reason), (False, "a keep-alive run is using the session"))
+        self.assertEqual((d.due, d.reason), (False, "a keep-alive run is using the session (no mid-run compaction: "
+                                                    "a turn is running)"))
         self.assertEqual(self.sent, [])
 
     def test_the_owner_chatting_after_the_run_gets_the_idle_trigger(self):
@@ -444,6 +457,108 @@ class CompactAtRunEnd(Env):
         self.assertFalse(d.due)
         self.assertIn("idle 3 min", d.reason)
         self.assertEqual(self.sent, [])
+
+
+class CompactMidRun(Env):
+    """D-307: during a run, once the context passed the threshold, the watcher compacts at the next
+    idle point; the run goes on after it (compact_after_run.md, not READY), the compaction is no run
+    end, and the loop and owner guards (compact_timing.mid_run_hold) hold the next one."""
+    BUDGET = "budget for this run: +4.0% weekly"
+
+    def setUp(self):
+        super().setUp()
+        ka.budget_eval = lambda usage, now, display=False: {"mode": "pacing", "go": True, "reason": "GO",
+                                                            "headroom": 4.0, "text": self.BUDGET}
+        self.fire = self.now - timedelta(hours=1)
+        self.run_end = self.now + timedelta(hours=3)
+
+    def run_state(self, ctx=200_000, prompt="continue", extra=()):
+        """A run fired an hour ago and still going (the transcript written 10 min ago); its last
+        turn ended 6 min ago with a context of ctx."""
+        ka.save_state({"handled": {"window-start-x": {
+            "at": self.fire.isoformat(), "result": "continued-in-place", "session": SID, "prompt": prompt,
+            "reason": "window start, GO", "run_end": self.run_end.isoformat()}}, "fires": {}})
+        self.write([keepalive_msg(self.fire)] + list(extra)
+                   + [assistant(self.now - timedelta(minutes=6), ctx=ctx, write=4000)])
+        self.make_old()
+
+    def test_the_run_goes_on_after_a_mid_run_compaction(self):
+        self.run_state()
+        d, rec = self.compact()
+        self.assertEqual((d.due, d.trigger), (True, "mid-run"))
+        save, compact, after = (m for _, m in self.sent)
+        self.assertTrue(save.startswith(SAVE))
+        self.assertIn("your context passed the compaction threshold during the run (D-307); the run goes on", save)
+        self.assertTrue(compact.startswith("/compact "))
+        self.assertTrue(after.startswith(AFTER + " during the run, when its context passed the threshold"), after[:90])
+        new = self.latest(unconsumed=False)
+        for part in (f"Hand-off #{new['id']}", "The run goes on (D-307)", "passed 150k tokens",
+                     f"The run started at {ka._hm(self.fire)} (window start, GO)", self.BUDGET,
+                     f"which ends at {ka._hm(self.run_end)}", "hand-off's next steps", "--run-stopped"):
+            self.assertIn(part, after)
+        self.assertNotIn("READY", after)
+        self.assertNotIn("fill-up", after)
+        self.assertEqual((rec["status"], rec["trigger"], rec["threshold"]), ("compacted", "mid-run", 150_000))
+        self.assertIn(f"compacted {SID[:8]} (mid-run, D-238/D-307): context 200k", self.progress())
+        self.assertIn("the run goes on", self.progress())
+        self.assertFalse(self.paused()["paused"])
+        # no run end: the run is still going (its fire), so a run-end compaction doesn't follow
+        self.assertEqual(ka.run_active(SID, datetime.now(UTC)), self.fire)
+        # the loop guard: the context grows past the threshold again within the hour: held
+        self.sent.clear()
+        self.write([keepalive_msg(datetime.now(UTC)),
+                    assistant(datetime.now(UTC) + timedelta(seconds=2), ctx=180_000)], "a")
+        self.make_old()
+        d2, rec2 = self.compact()
+        self.assertFalse(d2.due)
+        self.assertIn("no mid-run compaction: compacted at", d2.reason)
+        self.assertEqual((self.sent, rec2), ([], None))
+
+    def test_a_fill_up_run_keeps_its_rule(self):
+        self.run_state(prompt="fillup")
+        self.compact()
+        self.assertIn("It is a fill-up run (D-212): keep working until the session reset", self.sent[-1][1])
+
+    def test_the_owner_chatting_holds_it(self):
+        """D-262/D-307: the owner's message within 10 min (typed, or from the dashboard) holds it."""
+        for text in ("owner: how far is it?", "[AFClaude inbox #3] The owner wrote this on the dashboard"):
+            ct._CACHE.clear()
+            self.run_state(extra=[owner(self.now - timedelta(minutes=7), text)])
+            d, rec = self.compact()
+            self.assertFalse(d.due)
+            self.assertIn("no mid-run compaction: the owner wrote 7 min ago", d.reason)
+            self.assertEqual((self.sent, rec), ([], None))
+
+    def test_below_the_threshold_the_run_holds_it(self):
+        self.run_state(ctx=140_000)
+        d, rec = self.compact()
+        self.assertIn("below the threshold 150k", d.reason)
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_budget_evaluation_types_nothing(self):
+        """D-235: the run's part of the message is built first; its failure is an error and nothing
+        has been typed into the session."""
+        ka.budget_eval = lambda usage, now, display=False: ka.failed_eval("ValueError: x")
+        self.run_state()
+        d, rec = self.compact()
+        self.assertTrue(d.due)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(rec["status"], "failed")
+        self.assertIn("the run's budget could not be evaluated", rec["error"])
+        self.assertTrue(self.paused()["paused"])
+
+    def test_the_fire_record_keeps_the_run_end_and_its_prompt(self):
+        """_fire_start stores what a mid-run compaction's message needs: the run's window end and its kind."""
+        old = ka.verify_reply
+        ka.verify_reply = lambda path, since: {"message": {"model": "m"}}
+        try:
+            st = {"handled": {}, "fires": {}}
+            ka._fire_start(SID, {"uuid": "k", "timestamp": self.now, "prompt": "last_mile", "run_end": self.run_end,
+                                 "budget": "b"}, "r", st, Armed(), "k", "night", "send-keys")
+        finally:
+            ka.verify_reply = old
+        self.assertEqual((st["handled"]["k"]["prompt"], st["handled"]["k"]["run_end"]),
+                         ("last_mile", self.run_end.isoformat()))
 
 
 class SaveResend(Env):

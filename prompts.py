@@ -81,6 +81,8 @@ PROMPTS: dict[str, Prompt] = {
     "compact": Prompt(used_by="keepalive /compact instruction"),
     "compact_resume": Prompt(("handoff", "progress", "when"), used_by="keepalive, inside compact_after"),
     "compact_after": Prompt(("resume",), used_by="keepalive message after a compaction"),
+    "compact_after_run": Prompt(("budget", "pace", "reason", "resume", "started", "threshold"),
+                                used_by="keepalive message after a mid-run compaction (D-307): the run goes on"),
     "project_start": Prompt(("desc", "slug", "title"), used_by="keepalive --work-on (a new project session)"),
     "continue_foreign": Prompt(("context", "reason"), used_by="dispatcher: the user's own stalled session"),
     "task_start": Prompt(("description", "id", "project", "qa", "title"), used_by="unused since D-205"),

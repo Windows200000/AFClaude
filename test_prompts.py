@@ -233,6 +233,8 @@ class SameTextTest(unittest.TestCase):
         kinds = {"continue": {"reason": "r", "progress": "P.md"}, "last_mile": {"reason": "r", "progress": "P.md"},
                  "fillup": {"reason": "r", "progress": "P.md", "remaining": "5", "reset": "04:00"},
                  "compact_after": {"resume": "R"}, "project_start": {"title": "T", "desc": "D", "slug": "s"},
+                 "compact_after_run": {"resume": "R", "threshold": "150k", "started": "23:40 CET", "reason": "r",
+                                       "budget": "b", "pace": "p"},
                  "continue_foreign": {"reason": "r", "context": ""},
                  "inbox_now": {"id": 1, "at": "21.10. 10:00", "text": "t", "notes": ""}}
         for name, fields in kinds.items():

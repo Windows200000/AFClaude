@@ -1230,8 +1230,9 @@ def run_active(session_id, now, st=None):
     a limit notice, or the watcher noted one), or RUN_IDLE without a write to the session's
     transcript or one of its subagents'. After a stop the owner chatting with the session no
     longer keeps the run going; a later fire starts a new run. A compaction started after the fire
-    (D-238: only ever when the run was over) counts as an end too, so its own transcript writes
-    never revive the run. -> the fire time or None."""
+    (D-238: a run-end or idle one, only ever when the run was over) counts as an end too, so its
+    own transcript writes never revive the run; a mid-run one (D-307) does not: the run goes on
+    after it. -> the fire time or None."""
     st = st if st is not None else load_state()
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
              if isinstance(v, dict) and v.get("result") in RUN_RESULTS]
@@ -1242,7 +1243,8 @@ def run_active(session_id, now, st=None):
     stops = [usage_stale.ts(t) for t, sid in (st.get("run_stops") or {}).items() if sid in (None, session_id)]
     hits = [usage_stale.ts(t) for t in (st.get("limit_hits") or {}).values()]
     comps = [usage_stale.ts(v.get("at")) for v in (st.get("compactions") or {}).values()
-             if isinstance(v, dict) and v.get("session") in (None, session_id) and v.get("status") in COMPACT_STARTED]
+             if isinstance(v, dict) and v.get("session") in (None, session_id) and v.get("status") in COMPACT_STARTED
+             and v.get("trigger") != "mid-run"]
     if any(t and fire <= t <= now for t in stops + hits + comps):
         return None
     path = transcript_path(session_id)
@@ -2248,7 +2250,10 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
-              "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom")}
+              "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom"),
+              "prompt": stall.get("prompt", "continue")}   # + run_end: a mid-run compaction's message (D-307)
+    if stall.get("run_end"):
+        result["run_end"] = stall["run_end"].isoformat()
     if task_names:
         result["nightly_tasks"] = task_names   # nightly_tasks.track counts the runs that took them along
     if rc == 0 and held_ids:
@@ -2493,19 +2498,23 @@ def plan_fillup_test(sid, remaining, args):
     print(f"scheduled (DB: keepalive.fillup); the running watcher fires it at {berlin(p['start'])}")
 
 
-# ---------------------------------------------------------------- compaction (D-144, D-233, D-234, D-238)
+# ---------------------------------------------------------------- compaction (D-144, D-233, D-234, D-238, D-307)
 # When (D-238, replacing D-191/D-218's "at a start, by the conversation's age"): the watcher compacts
 # the task-manager while its prompt cache is still warm, (a) right when a keep-alive run has ended
 # (D-224) and (b) after compact_timing.IDLE_AFTER (50 min) without a request, shortly before the
 # 1-hour cache expires (this also covers the owner's daytime chats), each only if its context is at
-# or above the break-even computed from the stored cost model (compact_timing.py: below it a
-# compaction costs more than the later re-reads it saves). compaction_pass() looks once a minute
-# (run()) and holds while a run uses the session (run_active), a turn or a subagent is running, the
-# owner is typing (an attached terminal with recent keystrokes, a draft in the input box, a dialog
-# open), the owner holds the session elsewhere (preflight: Remote Control, another process), the
-# session isn't live in our tmux session, it stopped at a limit or its session limit is nearly used
-# up, or a start that types into it is due within COMPACT_GUARD (the start uses the warm cache; the
-# run's end compacts). How: compact_with_handoff(), then the hand-off goes back:
+# or above the setting compaction_threshold_tokens (D-307, default 150k; it replaced the break-even
+# computed from the stored cost model, which the records and the quickview still show), and (c)
+# during a run (D-307: "mid-run"), at the first idle point once the context passed that threshold,
+# unless compact_timing.mid_run_hold says no (within an hour of the last compaction, the context not
+# grown past the threshold anew since then, the owner's message within 10 min). compaction_pass()
+# looks once a minute (run()) and holds while a run uses the session (run_active; except for (c)), a
+# turn or a subagent is running, the owner is typing (an attached terminal with recent keystrokes,
+# a draft in the input box, a dialog open), the owner holds the session elsewhere (preflight: Remote
+# Control, another process), the session isn't live in our tmux session, it stopped at a limit or
+# its session limit is nearly used up, or a start that types into it is due within COMPACT_GUARD
+# (the start uses the warm cache; the run's end compacts). How: compact_with_handoff(), then the
+# hand-off goes back:
 #   1. once the session's turn has ended (up to COMPACT_IDLE_WAIT), types the save prompt
 #      (prompts/session_end_save.md) and waits for the session's NEW hand-off in the DB
 #      (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is written
@@ -2515,7 +2524,10 @@ def plan_fillup_test(sid, remaining, args):
 #   2. sends `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
 #      compact_boundary / isCompactSummary entry; up to COMPACT_TIMEOUT);
 #   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md): the session
-#      answers "READY" without starting work; the hand-off is consumed.
+#      answers "READY" without starting work; the hand-off is consumed. After a mid-run compaction
+#      it gets prompts/compact_after_run.md instead (mid_run_text: the run's budget now, the end
+#      of its window, its pacing): the run goes on with the hand-off's next steps. A mid-run
+#      compaction is no run end (run_active).
 # Any failure or timeout on the way (a busy session, no new hand-off, a send failure, no compaction
 # marker, the saved hand-off not found, no reply, a DB error) is an error (D-234/D-235): the
 # compaction stops right there (no /compact after a failed save), the attempt is recorded (the
@@ -2543,11 +2555,13 @@ SESSION_LOCK_DIR = os.environ.get("KEEPALIVE_LOCK_DIR", STATE_DIR)
 TRIGGER_TEXT = {   # trigger -> (the save prompt's why, the resume text's when)
     "run-end": ("the run is over", "right after the run ended"),
     "idle": ("you have been idle for 50 min and your prompt cache expires soon", "while it was idle"),
+    "mid-run": ("your context passed the compaction threshold during the run (D-307); the run goes on right "
+                "after the compaction", "during the run, when its context passed the threshold"),
 }
 
 
 def _compaction_settings():
-    return afclaude_config.settings("compaction_enabled")
+    return afclaude_config.settings("compaction_enabled", "compaction_threshold_tokens")
 
 
 def session_lock(sid, wait=timedelta(0)):
@@ -3173,18 +3187,21 @@ def _compact_log(line):
 
 
 def compaction_pass(sid, now, args):
-    """D-238: compact the task-manager when its run ended or after 50 min idle, while the cache is
-    warm, if its context is at or above the break-even (see the section comment). -> the
-    compact_timing.Decision, or None (compaction_enabled off, automation paused, no transcript).
-    A hold is logged once per reason; an attempt is recorded (record_compaction) and never retried
-    for the same activity; a context above the break-even whose cache expired without a compaction
-    is recorded "missed" (the quickview shows both). A failure of the compaction itself is recorded
-    and reported here (fail_stop); a failure before it (the transcript, the cost model, a host
-    call) raises (run() reports it: fail_stop)."""
+    """D-238/D-307: compact the task-manager when its run ended, after 50 min idle, or during a run
+    at an idle point, while the cache is warm, if its context is at or above the threshold
+    (compaction_threshold_tokens; see the section comment). -> the compact_timing.Decision, or
+    None (compaction_enabled off, automation paused, no transcript). A hold is logged once per
+    reason; an attempt is recorded (record_compaction) and never retried for the same activity; a
+    context above the threshold whose cache expired without a compaction is recorded "missed" (the
+    quickview shows both). A failure of the compaction itself is recorded and reported here
+    (fail_stop); a failure before it (the transcript, the cost model, a host call) raises (run()
+    reports it: fail_stop)."""
     import compact_timing as ct
-    if not _compaction_settings()["compaction_enabled"]:
+    cfg = _compaction_settings()
+    if not cfg["compaction_enabled"]:
         _compact_log("compaction: compaction_enabled is off")
         return None
+    threshold = int(cfg["compaction_threshold_tokens"])
     if automation_paused(f"the compaction of {sid[:8]}", sid):
         return None
     path = transcript_path(sid)
@@ -3193,11 +3210,12 @@ def compaction_pass(sid, now, args):
         return None
     model = ct.load()
     sc = ct.scan_cached(path)
-    state = ct.context_state(sc, model, now)
+    state = ct.context_state(sc, model, now, threshold)
     st = load_state()
     using = run_active(sid, now, st) is not None
+    mid = ct.mid_run_hold(sc, now, threshold) if using and state["above"] else ct.MID_RUN_UNCHECKED
     d = ct.decide(now, state, run_using=using, run_ended=not using and run_ended(sid, sc, st, now),
-                  busy=compaction_busy_reason(path, now))
+                  busy=compaction_busy_reason(path, now), mid_run_hold=mid)
     if d.key and (d.key in (st.get("compactions") or {}) or d.key in _COMPACT_TRIED):
         return d
     if d.due:
@@ -3205,9 +3223,10 @@ def compaction_pass(sid, now, args):
         if why:
             d = ct.Decision(False, None, why, d.key)
     ctx = state.get("context")
-    head = (f"compaction of {sid[:8]}: context {ctx / 1000:.0f}k, break-even {state['break_even'] / 1000:.0f}k: "
+    head = (f"compaction of {sid[:8]}: context {ctx / 1000:.0f}k, threshold {threshold / 1000:.0f}k: "
             if ctx is not None else f"compaction of {sid[:8]}: ")
-    rec = {"at": now, "trigger": d.trigger, "reason": d.reason, "context": ctx, "break_even": state["break_even"],
+    rec = {"at": now, "trigger": d.trigger, "reason": d.reason, "context": ctx, "threshold": threshold,
+           "break_even": state["break_even"],
            "est_cost_pct": round(state["compaction_cost"], 2) if ctx is not None else None,
            "saves_per_reread_pct": (round(ct.reread_cost(model, ctx - model["compaction"]["base_tokens"]), 2)
                                     if ctx is not None else None)}
@@ -3235,6 +3254,38 @@ def compaction_pass(sid, now, args):
     return d
 
 
+MID_RUN_KIND = {   # the run's start prompt -> what its continue said that the run still needs
+    "fillup": " It is a fill-up run (D-212): keep working until the session reset, not stopping at the usual "
+              "session stop.",
+}
+
+
+def mid_run_text(sid, threshold, now):
+    """D-307: the fields of compact_after_run.md, the message after a mid-run compaction: the run
+    goes on. From the run's fire record (latest_run_fire): when it started, why, its kind
+    (MID_RUN_KIND) and its window's end (its "run_end"; a fire recorded without one: the live
+    session window's end, as run_pace_text does for any start without it); the budget evaluated now
+    (budget_eval: what the run may still use, the same text a start's continue carries) and the
+    pacing (run_pace_text). -> dict(threshold, started, reason, budget, pace). No run or a failed
+    budget evaluation raises failstop.Failed (the compaction is not started: D-234/D-235)."""
+    import failstop
+    st = load_state()
+    fire = latest_run_fire(sid, st, now)
+    rec = next((v for v in (st.get("handled") or {}).values()
+                if isinstance(v, dict) and v.get("result") in RUN_RESULTS and parse_ts(v.get("at")) == fire), None)
+    if fire is None or rec is None:
+        raise failstop.Failed("no run to go on with after a mid-run compaction", f"no run fire of {sid[:8]} found")
+    u = usage_cache_checked()
+    b = budget_eval(u, now, display=True)   # a failure is reported once, as the compaction's (_compaction_failed)
+    if b.get("mode") == "failed":
+        raise failstop.Failed("the run's budget could not be evaluated for the mid-run compaction", b["reason"])
+    run_end = parse_ts(rec.get("run_end")) if rec.get("run_end") else None
+    pace = run_pace_text(sid, {"run_end": run_end} if run_end else {}, now, u)
+    return {"threshold": f"{threshold / 1000:.0f}k", "started": _hm(fire),
+            "reason": " ".join(str(rec.get("reason") or "").split())[:300] + MID_RUN_KIND.get(rec.get("prompt"), ""),
+            "budget": b["text"], "pace": pace}
+
+
 def _compaction_failed(sid, key, rec, why, detail="", steps=None):
     rec.update(status="failed", error=(f"{why}: {detail}" if detail else why)[:500], done_at=datetime.now(UTC))
     if steps:
@@ -3247,19 +3298,25 @@ def _compaction_failed(sid, key, rec, why, detail="", steps=None):
 
 def _compact_now(sid, path, d, rec, head):
     """The compaction (compact_with_handoff), then the hand-off back to the session
-    (compact_after.md) and its reply; recorded either way. A failure: _compaction_failed."""
+    (compact_after.md; after a mid-run one compact_after_run.md: the run goes on) and its reply;
+    recorded either way. A failure: _compaction_failed."""
     import failstop
     cwd = session_cwd(path)
     log(head + f"COMPACTING ({d.trigger}: {d.reason})")
     record_compaction(sid, d.key, dict(rec, status="running"))
     try:
         try:
+            # a mid-run one's run part is built before anything is typed: its failure leaves the session as it was
+            run = mid_run_text(sid, rec["threshold"], datetime.now(UTC)) if d.trigger == "mid-run" else None
             insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger)
         except failstop.Failed as e:
             return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record)
         rec["steps"] = _jsonable(steps)
         notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages, read after the hand-off
-        msg = session_message("compact_after", hooked=rules_hooked(cwd), resume=with_notes(insert, notes))
+        if run is None:
+            msg = session_message("compact_after", hooked=rules_hooked(cwd), resume=with_notes(insert, notes))
+        else:
+            msg = session_message("compact_after_run", hooked=rules_hooked(cwd), resume=insert, insert=notes, **run)
         sent_at = datetime.now(UTC)
         rc, out, err = fire(sid, cwd, msg, "send-keys")
         if rc != 0:
@@ -3277,9 +3334,10 @@ def _compact_now(sid, path, d, rec, head):
     rec.update(status="compacted", handoff_id=h["id"], handoff_consumed=consumed, replied=bool(reply),
                done_at=datetime.now(UTC))
     record_compaction(sid, d.key, rec)
-    progress_note(f"compacted {sid[:8]} ({d.trigger}, D-238): context {rec['context'] / 1000:.0f}k >= break-even "
-                  f"{rec['break_even'] / 1000:.0f}k, est. cost ~{rec['est_cost_pct']}% session, saves "
-                  f"~{rec['saves_per_reread_pct']}% per later re-read; hand-off #{h['id']} given back")
+    progress_note(f"compacted {sid[:8]} ({d.trigger}, D-238/D-307): context {rec['context'] / 1000:.0f}k >= threshold "
+                  f"{rec['threshold'] / 1000:.0f}k, est. cost ~{rec['est_cost_pct']}% session, saves "
+                  f"~{rec['saves_per_reread_pct']}% per later re-read; hand-off #{h['id']} given back"
+                  + ("; the run goes on" if run is not None else ""))
     if not consumed:
         fail_stop(f"hand-off #{h['id']} of {sid[:8]} not marked consumed after its compaction",
                   "it was sent; a later compaction would not find a fresh one")

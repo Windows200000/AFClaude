@@ -10,7 +10,11 @@ the time to compact it is while the cache is still warm (D-238):
   (a) when a keep-alive run ends (D-224), and
   (b) after IDLE_AFTER (50 min) without a request, shortly before the cache expires (this also
       covers the owner's daytime chats),
-each only if the context is at or above the break-even below (below it, no compaction: "maybe
+  (c) during a run (D-307), at an idle point once the context passed the threshold (mid_run_hold:
+      its loop and owner guards),
+each only if the context is at or above the threshold: the setting compaction_threshold_tokens
+(D-307, default 150k), which replaced D-238's computed break-even below as the trigger; the
+break-even stays as information (the quickview, the records). Below it, no compaction ("maybe
 compacting isn't necessary at all after just questions"). keepalive.compaction_pass() runs the
 triggers in the watcher; this module holds the pure parts: the cost model, the transcript
 reading, the break-even and the decision, and the quickview's context block (D-237).
@@ -74,6 +78,10 @@ REREAD_FRACTION = 0.8               # cache_creation >= this x the context = a r
 IDLE_AFTER = timedelta(minutes=50)  # D-238 (b): compact after this long without a request
 SEND_MARGIN = timedelta(minutes=3)  # the save prompt must go out at least this long before the cache expires
 RUN_END_SLACK = timedelta(seconds=5)
+MID_RUN_GAP = timedelta(minutes=60)          # D-307 (c): no mid-run compaction this soon after the last one
+MID_RUN_OWNER_QUIET = timedelta(minutes=10)  # ... nor this soon after the owner's last message
+MID_RUN_UNCHECKED = "no mid-run compaction checked"   # decide()'s default: a run holds it
+INBOX_PREFIX = "[AFClaude inbox #"           # the owner's dashboard message delivered into the session
 KEEPALIVE_PREFIXES = ("[keep-alive]", "This session was compacted", "You are the long-running", "[AFClaude",
                       "/compact", "<command-name>/compact")
 
@@ -281,7 +289,7 @@ class Request:
 @dataclass
 class Prompt:
     ts: datetime
-    kind: str               # owner | keepalive | summary (a compaction summary) | other
+    kind: str               # owner | inbox (the owner's dashboard message) | keepalive | summary | other
 
 
 @dataclass
@@ -330,6 +338,8 @@ def _text(e: Mapping[str, Any]) -> Optional[str]:
 def prompt_kind(e: Mapping[str, Any], text: str) -> str:
     if e.get("isCompactSummary"):
         return "summary"
+    if text.lstrip().startswith(INBOX_PREFIX):
+        return "inbox"
     if text.lstrip().startswith(KEEPALIVE_PREFIXES):
         return "keepalive"
     origin = e.get("origin")
@@ -387,14 +397,17 @@ def scan_cached(path: str) -> Scan:
 
 # ---------------------------------------------------------------- the context now
 
-def context_state(s: Scan, m: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+def context_state(s: Scan, m: Mapping[str, Any], now: datetime, threshold: Optional[int] = None) -> dict[str, Any]:
     """The context the next message re-sends and how long the cache holds it:
     context (tokens: the last request's context + its reply; after a compaction with no request
     since, the model's base_tokens, `estimated`), last_request_at, cache_expires_at, minutes_left,
-    warm, reread_cost / weekly (session-% / weekly-% a re-read of it costs), break_even, above."""
+    warm, reread_cost / weekly (session-% / weekly-% a re-read of it costs), break_even,
+    threshold (the compaction trigger: `threshold`, the setting compaction_threshold_tokens, D-307;
+    None: the break-even, D-238) and above (at or above the threshold)."""
     be = break_even(m)
+    thr = be if threshold is None else int(threshold)
     if not s.requests:
-        return {"context": None, "last_request_at": None, "break_even": be, "above": False}
+        return {"context": None, "last_request_at": None, "break_even": be, "threshold": thr, "above": False}
     last = s.requests[-1]
     ctx, estimated = last.context + last.output, False
     if s.compactions and s.compactions[-1] > last.ts:
@@ -403,40 +416,50 @@ def context_state(s: Scan, m: Mapping[str, Any], now: datetime) -> dict[str, Any
     cost = reread_cost(m, ctx)
     return {"context": ctx, "estimated": estimated, "last_request_at": last.ts, "cache_expires_at": expires,
             "minutes_left": max(0.0, (expires - now).total_seconds() / 60), "warm": now < expires,
-            "reread_cost": cost, "reread_weekly": weekly(m, cost), "break_even": be, "above": ctx >= be,
+            "reread_cost": cost, "reread_weekly": weekly(m, cost), "break_even": be, "threshold": thr,
+            "above": ctx >= thr,
             "compaction_cost": compaction_cost(m, ctx)}
 
 
 @dataclass
 class Decision:
     due: bool
-    trigger: Optional[str]      # run-end | idle (when due)
+    trigger: Optional[str]      # run-end | idle | mid-run (when due)
     reason: str
     key: Optional[str] = None   # the attempt's dedup key: the last request's time
-    missed: bool = False        # above the break-even, but the cache expired before a compaction
+    missed: bool = False        # above the threshold, but the cache expired before a compaction
 
 
 def decide(now: datetime, state: Mapping[str, Any], *, run_using: bool, run_ended: bool,
-           busy: Optional[str]) -> Decision:
-    """D-238's triggers on the context state (context_state). run_using: a keep-alive run still
-    uses the session (keepalive.run_active); run_ended: the latest run is over and the session's
-    last prompt was the run's, not the owner's (keepalive.run_ended); busy: why the session can't
-    take a message now (a turn running, a subagent working), else None. Order: no requests,
-    below the break-even, a run using it, busy, the cache (about to be) expired, then run-end
-    (at once) or idle (IDLE_AFTER since the last request)."""
+           busy: Optional[str], mid_run_hold: Optional[str] = MID_RUN_UNCHECKED) -> Decision:
+    """The triggers (D-238, D-307) on the context state (context_state). run_using: a keep-alive
+    run still uses the session (keepalive.run_active); run_ended: the latest run is over and the
+    session's last prompt was the run's, not the owner's (keepalive.run_ended); busy: why the
+    session can't take a message now (a turn running, a subagent working), else None;
+    mid_run_hold: while a run uses the session, why it may not be compacted mid-run
+    (mid_run_hold()), None = it may. Order: no requests, below the threshold, a run using it (a
+    mid-run compaction if neither mid_run_hold, busy nor the cache stop it, else held), busy, the
+    cache (about to be) expired, then run-end (at once) or idle (IDLE_AFTER since the last
+    request)."""
     last = state.get("last_request_at")
     if state.get("context") is None or not isinstance(last, datetime):
         return Decision(False, None, "no request in the transcript yet")
     key = f"compact-{last.astimezone(UTC).isoformat()}"
-    ctx, be = int(state["context"]), int(state["break_even"])
-    if ctx < be:
-        return Decision(False, None, f"context {ctx / 1000:.0f}k below the break-even {be / 1000:.0f}k: "
-                                     "no compaction (D-238)", key)
+    ctx, thr = int(state["context"]), int(state["threshold"])
+    if ctx < thr:
+        return Decision(False, None, f"context {ctx / 1000:.0f}k below the threshold {thr / 1000:.0f}k: "
+                                     "no compaction (D-307)", key)
+    expires = state["cache_expires_at"]
     if run_using:
-        return Decision(False, None, "a keep-alive run is using the session", key)
+        why = mid_run_hold or busy or (f"the prompt cache expires too soon ({expires.astimezone(BERLIN):%H:%M})"
+                                       if now >= expires - SEND_MARGIN else None)
+        if why is None:
+            return Decision(True, "mid-run", f"the context passed the threshold {thr / 1000:.0f}k during the run "
+                                             "(D-307)", key)
+        return Decision(False, None, "a keep-alive run is using the session"
+                        + ("" if why == MID_RUN_UNCHECKED else f" (no mid-run compaction: {why})"), key)
     if busy:
         return Decision(False, None, busy, key)
-    expires = state["cache_expires_at"]
     if now >= expires - SEND_MARGIN:
         return Decision(False, None, f"the prompt cache expired{'' if now >= expires else ' too soon'} "
                                      f"({expires.astimezone(BERLIN):%H:%M}): a compaction now would re-read the "
@@ -449,6 +472,26 @@ def decide(now: datetime, state: Mapping[str, Any], *, run_using: bool, run_ende
                                       f"{expires.astimezone(BERLIN):%H:%M}", key)
     return Decision(False, None, f"idle {idle.total_seconds() / 60:.0f} min: compacts at "
                                  f"{(last + IDLE_AFTER).astimezone(BERLIN):%H:%M} if still idle", key)
+
+
+def mid_run_hold(s: Scan, now: datetime, threshold: int) -> Optional[str]:
+    """D-307: why the session may not be compacted mid-run now, else None. The loop guards: not
+    within MID_RUN_GAP of its last compaction (the transcript's compact_boundary), and only once
+    the context has grown past the threshold anew (a request after that compaction was below it;
+    a compaction that left it above would otherwise repeat); and not while the owner chats (their
+    typed or dashboard message within MID_RUN_OWNER_QUIET: the owner holds the conversation)."""
+    if s.compactions:
+        last = s.compactions[-1]
+        if now - last < MID_RUN_GAP:
+            return (f"compacted at {last.astimezone(BERLIN):%H:%M}, not again before "
+                    f"{(last + MID_RUN_GAP).astimezone(BERLIN):%H:%M}")
+        if not any(r.ts > last and r.context < threshold for r in s.requests):
+            return (f"the context has not been below the threshold since the compaction at "
+                    f"{last.astimezone(BERLIN):%H:%M}")
+    chat = [p.ts for p in s.prompts if p.kind in ("owner", "inbox")]
+    if chat and now - chat[-1] < MID_RUN_OWNER_QUIET:
+        return f"the owner wrote {max(0.0, (now - chat[-1]).total_seconds()) / 60:.0f} min ago"
+    return None
 
 
 def last_prompt_kind(s: Scan, since: Optional[datetime] = None) -> Optional[str]:
@@ -530,14 +573,15 @@ def daily_split(s: Scan, m: Mapping[str, Any], since: datetime) -> list[dict[str
 
 
 def context_block(path: Optional[str], now: datetime, m: Optional[Mapping[str, Any]] = None, days: int = 7,
-                  messages: int = 20) -> dict[str, Any]:
-    """The quickview's task-manager context block (D-237). Raises on a read failure (the caller
-    shows the error; a display path never pauses, D-239)."""
+                  messages: int = 20, threshold: Optional[int] = None) -> dict[str, Any]:
+    """The quickview's task-manager context block (D-237); threshold: the compaction trigger
+    (context_state). Raises on a read failure (the caller shows the error; a display path never
+    pauses, D-239)."""
     m = m if m is not None else load()
     if not path:
         return {"error": "no transcript of the task-manager session"}
     s = scan_cached(path)
-    st = context_state(s, m, now)
+    st = context_state(s, m, now, threshold)
     since = now - timedelta(days=days)
 
     def iso(x: object) -> object:
@@ -736,7 +780,8 @@ def summary(m: Mapping[str, Any]) -> str:
     return (f"cost model ({m.get('source')}, fitted {m.get('fitted_at')}): per 1M {m['reference_model']} tokens "
             f"cache read {w['cache_read']} / cache write {w['cache_write']} / input {w['input']} / output "
             f"{w['output']} session-%, weekly = session x {m['weekly_per_session']}; break-even {be / 1000:.0f}k tokens "
-            f"(a compaction there ~{compaction_cost(m, be):.1f} session-%)")
+            f"(a compaction there ~{compaction_cost(m, be):.1f} session-%; information only: the trigger is the "
+            "setting compaction_threshold_tokens, D-307)")
 
 
 # ---------------------------------------------------------------- CLI
