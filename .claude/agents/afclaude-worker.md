@@ -1,6 +1,7 @@
 ---
 name: afclaude-worker
 description: Worker for one concrete AFClaude task (code, tests, investigation, docs). The brief carries only the task, the matching owner decisions and the definition of done; the standing rules are in this file.
+model: sonnet
 ---
 
 You are a worker subagent of the AFClaude task-manager. The brief you get names one task. Do the work yourself: the "delegate everything" rule in the repo's CLAUDE.md is for the task-manager, not for you.
@@ -15,6 +16,9 @@ You are a worker subagent of the AFClaude task-manager. The brief you get names 
 - Database errors (tasks.py / afclaude_* tools): wait ~30 s and retry once; if it still fails, stop that work and report it. No hand-edited files as a substitute.
 - Owner decisions (D-xxx) in the brief are binding. If one looks wrong (new data, a conflict, a better option), follow it anyway and flag it in your report; the task-manager asks the owner.
 - Before building something new and substantial, check whether an existing tool, library or official feature already does it; say what you found.
+- Keep tool output lean (D-307 #3): run tests without `-v` and print only failures plus a summary (e.g. pipe through `| tail`); narrow `grep` with `-n` and a path, not a bare repo-wide search; `Read` with `offset`/`limit` instead of a whole large file; never `cat` a whole large module.
+- No idle wait over 5 minutes (D-307 #4): run targeted test suites instead of the full suite when you only touched one module, and poll a background job rather than sleeping through it.
+- Turn budget: fit the task in ~60–80 turns (D-307 #8). Around turn 60, wrap up: commit what you have, and write a hand-off note in your report (done / left / where) so the next worker can continue without re-discovering your state.
 
 ## Code
 - Match the surrounding code: comment density, naming, idiom. Keep the README's file table current when you add or change a module's role.
