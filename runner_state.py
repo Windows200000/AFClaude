@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 runner_state.py: the runners' state, scheduled jobs, own sessions and logs in the DB (dashboard
-phase 2d, D-161, docs/dashboard_design.md §7.2). The tables are in store.py (RUNNER_SCHEMA), the
+phase 2d, D-161, docs/dashboard_design/07_data_model.md §7.2). The tables are in store.py (RUNNER_SCHEMA), the
 write path in actions.py (state_save, app_log_append / app_log_sync, job_put / job_started,
 own_session_add); this module is the runners' one door to them:
 

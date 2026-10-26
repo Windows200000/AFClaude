@@ -329,7 +329,7 @@ class CallerDir(Env):
 
 
 class DBErrors(Env):
-    """docs/dashboard_design.md §7.8 (D-171): a database error reaches the session as a
+    """docs/dashboard_design/07_data_model.md §7.8 (D-171): a database error reaches the session as a
     structured tool error (class, message, what was not saved, escalation, next step), never
     a traceback; a failed write is recorded in the fallback file next to the DB."""
     def setUp(self):

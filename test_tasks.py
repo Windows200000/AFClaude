@@ -660,7 +660,7 @@ class Migration(unittest.TestCase):
 
 
 class SchemaGuard(unittest.TestCase):
-    """docs/dashboard_design.md §7.1 (review A1): no writes to a database newer than the
+    """docs/dashboard_design/07_data_model.md §7.1 (review A1): no writes to a database newer than the
     code; non-additive migrations only through the explicit migrate step, after a backup."""
     NEWER = store.SCHEMA_VERSION + 1
 

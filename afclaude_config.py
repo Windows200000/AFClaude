@@ -1,4 +1,4 @@
-"""AFClaude settings accessor + local machine identity (D-146, docs/dashboard_design.md §7.4).
+"""AFClaude settings accessor + local machine identity (D-146, docs/dashboard_design/07_data_model.md §7.4).
 
 Settings: everything the dashboard can change (window, budget, pacing, dispatcher timings)
 lives in the DB `settings` table, typed in actions.SETTINGS with its code default (D-169).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The type-checking gate (D-209, docs/dashboard_design.md §12): `mypy --strict` over
+"""The type-checking gate (D-209, docs/dashboard_design/12_testing_strategy.md §12): `mypy --strict` over
 the strict module list (mypy.ini, `files`) reports no error, and every `# type: ignore`
 in those modules names its error code and gives a reason on the same line.
 

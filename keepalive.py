@@ -2090,7 +2090,7 @@ _DB_PAUSE = None   # the database problem the starts are paused for (logged once
 
 
 def db_paused(what):
-    """A broken AFClaude database pauses every autonomous start (docs/dashboard_design.md §7.8,
+    """A broken AFClaude database pauses every autonomous start (docs/dashboard_design/07_data_model.md §7.8,
     D-171): store.db_gate checks it (alerting the owner once per episode) and handle_fire does
     not mark the start handled. A stall or last-mile-slot continue is decided again every
     watcher tick, so that alone is enough for it to retry once the database is healthy again.

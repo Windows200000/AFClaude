@@ -909,7 +909,7 @@ def parser():
 
 
 def db_error(e, args):
-    """A database error -> the hand-back text on stderr (docs/dashboard_design.md §7.8): class,
+    """A database error -> the hand-back text on stderr (docs/dashboard_design/07_data_model.md §7.8): class,
     message, what was not saved, the escalation, the next step. -> exit code 1. A failed write
     was already recorded and escalated by actions.perform; any other (a read, opening the DB)
     is reported here."""

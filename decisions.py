@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-decisions.py: the owner's decision store in the DB (D-242; phase 4b of docs/dashboard_design.md
+decisions.py: the owner's decision store in the DB (D-242; phase 4b of docs/dashboard_design/07_data_model.md
 §7.6, D-107/D-151/D-158/D-176). The table is in store.py (DECISIONS_SCHEMA: `decisions`, plus the
 FTS5 index `decisions_fts` when the SQLite build has FTS5, else lookups use LIKE), the writes in
 actions.py (decision.import, decision.keywords, audited). This module parses the Markdown source,

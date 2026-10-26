@@ -7,7 +7,7 @@
   "_settings_comment": "This file holds only machine identity (D-146). Every tunable (window, budget, pacing, dispatcher timings) is a setting in the DB settings table (actions.SETTINGS: code defaults, set with actions.py / the dashboard; `python3 afclaude_config.py` lists them). Tunables still found here are imported into the DB once and removed from this file.",
 
   "dashboard": {
-    "_comment": "Read from dashboard phase 4 on (docs/dashboard_design.md §6, §7.3).",
+    "_comment": "Read from dashboard phase 4 on (docs/dashboard_design/06_schedule.md §6, docs/dashboard_design/07_data_model.md §7.3).",
     "owner_user": "<owner-login>",
     "base_path": "/private/afclaude/",
     "public_host": "<private-host>",

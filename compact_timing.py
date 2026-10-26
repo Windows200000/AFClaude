@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """compact_timing.py: when to compact the task-manager session, and what its context costs
-(D-237, D-238; docs/dashboard_design.md §5.5).
+(D-237, D-238; docs/dashboard_design/05_runners.md §5.5).
 
 Every request of a Claude Code session re-sends the whole conversation. Within the prompt cache's
 lifetime (1 hour for the main conversation on a subscription) that is a cheap cache read; the

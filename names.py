@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Readable tmux session names (D-147; docs/dashboard_design.md §5.3, docs/phase3b_plan.md §3.2).
+"""Readable tmux session names (D-147; docs/dashboard_design/05_runners.md §5.3, docs/phase3b_plan.md §3.2).
 
 Pure: no DB, no tmux. The launchers (keepalive.claim_tmux) pass the names already taken and
 store the chosen one in driven_sessions; nothing computes a session's name from its id any more.

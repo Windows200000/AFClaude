@@ -75,7 +75,7 @@ except afclaude_config.ConfigError as e:
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 # D-211: the step key (as build_stages() keys steps, e.g. "6a") from which a non-blocking owner
-# preview build of the dashboard UI first becomes possible (docs/dashboard_design.md §10.9). A
+# preview build of the dashboard UI first becomes possible (docs/dashboard_design/10_deployment.md §10.9). A
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.
 PREVIEW_FROM = os.environ.get("QUICKVIEW_PREVIEW_FROM", "6a")
 UTC = timezone.utc

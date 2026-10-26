@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-telemetry.py: the usage telemetry in the DB (dashboard phase 2c, D-161, docs/dashboard_design.md
+telemetry.py: the usage telemetry in the DB (dashboard phase 2c, D-161, docs/dashboard_design/07_data_model.md
 §7.2/§7.3). The tables are in store.py (TELEMETRY_SCHEMA), the write path in actions.py (the
 registered appenders: append / append_many for the append-only kinds, put_record(s) for the
 derived records); this module is the producers' and readers' one door to them:

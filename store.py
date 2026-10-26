@@ -22,7 +22,7 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                Later columns (COLUMNS, no version bump): projects.manager_model and
                projects.manager_effort (D-260: the task-manager session's launch; NULL = the
                default; manager_launch.py, set only by actions.project.manager_launch).
-  v4 (dashboard phase 1, docs/dashboard_design.md §4): settings, prompt_overrides,
+  v4 (dashboard phase 1, docs/dashboard_design/04_architecture.md §4): settings, prompt_overrides,
                audit_log (append-only), idempotency_keys, run_log, driven_sessions,
                action_requests; a `version` column on projects, tasks,
                standing_rules and session_decisions, bumped by a trigger on every
@@ -72,7 +72,7 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                notices (D-306, additive the same way): the owner's dashboard notices (title, text,
                dismissed_at; actions.py's notice.* writes, inbox.view shows them).
 
-Schema guard (docs/dashboard_design.md §7.1, review A1): this code writes only to a
+Schema guard (docs/dashboard_design/07_data_model.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
 untouched: connect() opens it read-only (reads go on; transaction() raises
 SchemaTooNew naming both versions; any other write fails in SQLite). Non-additive
