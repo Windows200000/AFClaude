@@ -267,7 +267,8 @@ class Importer(Base):
         self.assertEqual(r["scheduled_jobs"]["status"], "ok")
         self.assertEqual({s["component"]: s["status"] for s in r["logs"]},
                          {"keepalive": "ok", "dispatcher": "ok", "sampler": "ok", "watchdog": "ok",
-                          "host_exec": "ok", "at_shim": "no file", "runner": "no file"})
+                          "host_exec": "ok", "at_shim": "no file", "runner": "no file",
+                          "runner_shadow": "no file"})
         counts = r["counts"]
         self.assertEqual(counts["app_log"], {"keepalive": 3, "dispatcher": 1, "sampler": 4, "watchdog": 1,
                                              "host_exec": 3})

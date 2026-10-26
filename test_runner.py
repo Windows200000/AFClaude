@@ -199,6 +199,19 @@ class Tables(Base):
                 self.assertTrue(any(job.cron_tag in ln for ln in cron), f"{name}: no cron line tagged {job.cron_tag!r}")
         self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS))
 
+    def test_the_legacy_crontab_runs_every_job_and_no_runner(self):
+        def lines(name):
+            with open(os.path.join(HERE, "docker", name), encoding="utf-8") as fh:
+                return [ln for ln in fh.read().splitlines() if ln.strip() and not ln.startswith("#")]
+        legacy, cron = lines("crontab.legacy"), lines("crontab")
+        for name, job in runner.JOBS.items():
+            if job.cron_tag:
+                self.assertTrue(any(job.cron_tag in ln for ln in legacy), name)
+        self.assertFalse(any("runner.py" in ln for ln in legacy))
+        self.assertEqual(len([ln for ln in cron if "runner.py ensure" in ln]), 1)      # the S2-S7 watchdog
+        self.assertEqual(set(legacy) - set(cron), {ln for ln in legacy if any(
+            runner.JOBS[n].cron_tag in ln for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag)})
+
 
 # ---------------------------------------------------------------- boot: recovery and catch-up
 
@@ -435,11 +448,12 @@ class Loop(Base):
         await self.wait_for(lambda: "stall_scan" in r.tasks)
         await asyncio.sleep(0.05)
         scans = r.scans
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
-            for _ in range(100):
-                s.sendto(b"w", r.sock)
-        await self.wait_for(lambda: r.wakes == 100)
+        # the senders never block: a full queue (the container's net.unix.max_dgram_qlen is 10)
+        # counts as sent, the runner has wakes waiting already
+        self.assertTrue(all([runner.wake(r.sock) for _ in range(100)]))
+        await self.wait_for(lambda: r.wakes >= 1)
         await asyncio.sleep(0.1)
+        self.assertLessEqual(r.wakes, 100)
         self.assertEqual(r.scans, scans + 1)
         self.assertTrue(runner.wake(r.sock))                           # the sender's side
         await self.wait_for(lambda: r.scans == scans + 2)
@@ -594,12 +608,35 @@ class Process(unittest.TestCase):
             conn.close()
 
     def popen(self):
-        code = PRELUDE + "import runner; sys.exit(runner.main(['serve']))"
-        p = subprocess.Popen([sys.executable, "-c", code], cwd=HERE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True)
+        """A real `.../runner.py serve` (a shim of that name, so runner_pids() sees it as /proc
+        does a live one) that owns nothing: no stall scan of the real transcripts mid-test."""
+        d = tempfile.mkdtemp(prefix="afc-runner-shim-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, d, True)
+        shim = os.path.join(d, "runner.py")
+        with open(shim, "w", encoding="utf-8") as fh:
+            fh.write(f"import sys\nsys.path.insert(0, {HERE!r})\n" + PRELUDE
+                     + "import runner; runner.RUNNER_OWNS = frozenset(); sys.exit(runner.main(sys.argv[1:]))\n")
+        p = subprocess.Popen([sys.executable, "-u", shim, "serve"], cwd=HERE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=dict(os.environ, KEEPALIVE_PROJECTS_DIR=d))
         self.addCleanup(p.stdout.close)
         self.addCleanup(p.stderr.close)
         return p
+
+    def booted(self, p):
+        """Wait until the runner `p` has booted (its boot, heartbeat and socket)."""
+        t = time.monotonic()
+        while True:
+            conn = store.connect()
+            try:
+                st = actions.runner_state_get(conn)
+                beat = store.get_runner_job(conn, "runner")
+            finally:
+                conn.close()
+            if (st.get("boot") or {}).get("pid") == p.pid and beat and os.path.exists(runner.sock_path()):
+                return
+            self.assertIsNone(p.poll(), p.stderr.read() if p.poll() is not None else "")
+            self.assertLess(time.monotonic() - t, 30, "the runner did not boot")
+            time.sleep(0.1)
 
     def test_two_runners_one_exits(self):
         fd = runner.acquire_lock()
@@ -615,19 +652,7 @@ class Process(unittest.TestCase):
     def test_sigterm_exits_cleanly(self):
         p = self.popen()
         try:
-            t = time.monotonic()
-            while True:
-                conn = store.connect()
-                try:
-                    st = actions.runner_state_get(conn)
-                    beat = store.get_runner_job(conn, "runner")
-                finally:
-                    conn.close()
-                if (st.get("boot") or {}).get("pid") == p.pid and beat and os.path.exists(runner.sock_path()):
-                    break
-                self.assertIsNone(p.poll(), p.stderr.read() if p.poll() is not None else "")
-                self.assertLess(time.monotonic() - t, 30, "the runner did not boot")
-                time.sleep(0.1)
+            self.booted(p)
             self.assertIsNone(runner.acquire_lock())                    # it holds the lock
             p.send_signal(signal.SIGTERM)
             out, err = p.communicate(timeout=30)
@@ -642,6 +667,29 @@ class Process(unittest.TestCase):
             self.assertTrue(actions.runner_state_get(conn)["clean_exit"])
         finally:
             conn.close()
+
+    def test_stop_ends_the_runner_cleanly(self):
+        p = self.popen()
+        out = []
+        try:
+            self.booted(p)
+            mine = lambda: [x for x in runner.runner_pids() if x == p.pid]   # noqa: E731 - never another runner
+            self.assertEqual(mine(), [p.pid])
+            self.assertEqual(runner.stop(30, pids=mine, out=out.append), 0)
+            p.wait(10)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait(10)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("stopped", out[-1])
+        conn = store.connect()
+        try:
+            self.assertTrue(actions.runner_state_get(conn)["clean_exit"])
+        finally:
+            conn.close()
+        self.assertEqual(runner.stop(pids=lambda: [], out=out.append), 0)
+        self.assertIn("none running", out[-1])
 
 
 # ---------------------------------------------------------------- drain, status, watchdog, watcher check
@@ -723,6 +771,200 @@ class Misc(Base):
             runner.Job("x", 1, every=MIN, daily=(1, 1))
         with self.assertRaises(ValueError):
             runner.Runner(self.conn, owns=frozenset({"nope"}))
+
+
+
+# ---------------------------------------------------------------- S2: offset, ownership, shadow, ensure, stop
+
+SEC = timedelta(seconds=1)
+BERLIN_PREFIX = "[2026-10-19 23:00:00 CEST] "
+
+
+def cron_line(t, tag):
+    return (f'time="{t:%Y-%m-%dT%H:%M:%SZ}" level=info msg=starting iteration=1 job.command="x >> y 2>&1 # {tag}" '
+            'job.position=1 job.schedule="* * * * *"')
+
+
+class Shadow(Base):
+    def test_the_stall_scan_runs_90_s_off_the_minute(self):
+        j = runner.JOBS["stall_scan"]
+        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 19, 23, 59, tzinfo=UTC)),
+                         datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC))
+        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC)),
+                         datetime(2026, 10, 20, 0, 4, 30, tzinfo=UTC))
+        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 20, 0, 0, 10, tzinfo=UTC)),
+                         datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC))
+        with self.assertRaises(ValueError):
+            runner.Job("x", 1, every=MIN, offset=MIN)
+        with self.assertRaises(ValueError):
+            runner.Job("x", 1, daily=(1, 1), offset=SEC)
+
+    def test_s2_owns_the_new_jobs_only(self):
+        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs"}))
+        self.assertEqual([n for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag], [])   # none cron ran
+
+    def test_shadow_lines_for_the_jobs_cron_runs(self):
+        lines = []
+        self.now = START - 2 * MIN
+        r = self.runner(owns={"stall_scan"}, shadow=lines.append)
+        self.assertEqual([j.name for j in r.shadow_jobs],
+                         ["dispatcher", "docs_import", "prune_logs", "quickview", "sampler", "usage_review",
+                          "window_start"])            # cron's jobs; not the owned stall scan, not prune_runs
+        r.shadow_pass(self.now)
+        self.assertEqual(lines, [])
+        self.assertEqual(r.shadow_next["quickview"], START)
+        self.assertEqual(r.shadow_next["window_start"], START)
+        self.assertEqual(r.shadow_next["prune_logs"], datetime(2026, 10, 20, 3, 17, tzinfo=UTC))
+        self.assertEqual(r.sleep_for(START - 30 * SEC), 30.0)          # it wakes for a shadow time too
+        self.now = START + timedelta(milliseconds=12)
+        r.shadow_pass(self.now)
+        key = schedule.start_key(START, CFG)
+        self.assertEqual(lines, [f"{n} due 2026-10-19T21:00:00.000Z at 2026-10-19T21:00:00.012Z" for n in
+                                 ("dispatcher", "docs_import", "quickview", "sampler", "usage_review")]
+                         + [f"window_start {key} due 2026-10-19T21:00:00.000Z at 2026-10-19T21:00:00.012Z"])
+        r.shadow_pass(self.now)
+        self.assertEqual(len(lines), 6)                                 # once per time
+        self.assertEqual(r.shadow_next["quickview"], START + 3 * MIN)
+        self.assertEqual(r.shadow_next["window_start"], START + 5 * 60 * MIN)
+        self.assertEqual(self.runner(owns={"stall_scan"}).shadow_jobs, [])   # no writer: no shadow
+
+    def entries(self, quickview_until=30, window_start=True):
+        lines = [BERLIN_PREFIX + f"quickview due {runner._iso_ms(START + k * MIN)} at "
+                 f"{runner._iso_ms(START + k * MIN + timedelta(milliseconds=9))}" for k in range(0, quickview_until + 1, 3)]
+        if window_start:
+            lines.append(BERLIN_PREFIX + f"window_start {schedule.start_key(START, CFG)} due {runner._iso_ms(START)} "
+                         f"at {runner._iso_ms(START + timedelta(milliseconds=20))}")
+        return runner.parse_shadow(lines)
+
+    def report(self, shadow, cron_lines, decision_lines):
+        cron = runner.parse_cron(cron_lines, runner.JOBS)
+        return runner.shadow_report(shadow, cron, runner.parse_decisions(decision_lines),
+                                    since=START - 60 * MIN, until=START + 60 * MIN)
+
+    def test_shadow_report_matches(self):
+        qv, ws = runner.JOBS["quickview"].cron_tag, runner.JOBS["window_start"].cron_tag
+        cron = [cron_line(START + k * MIN, qv) for k in range(0, 31, 3)]
+        cron += [cron_line(START + k * MIN, ws) for k in (-30, 0, 30)]      # */30: acts only at a start
+        cron.append(cron_line(START, "AFClaude at-shim (the jobs in the DB)"))  # no runner job: ignored
+        cron.append(cron_line(START - 9 * MIN, qv))                          # the runner was not up yet
+        dec = ["[2026-10-19 23:00:05 CEST] window-start: HOLD: no run", "[2026-10-19 23:15:07 CEST] window-start "
+               "(postponed): HOLD: user active"]
+        lines, bad = self.report(self.entries(), cron, dec)
+        self.assertEqual(bad, 0, "\n".join(lines))
+        self.assertIn("OK", lines[-1])
+        self.assertTrue(any("window_start" in ln and "HOLD" in ln for ln in lines))
+        self.assertTrue(any("1 cron start(s) while the runner was not running" in ln for ln in lines))
+
+    def test_shadow_report_mismatches(self):
+        qv, ws = runner.JOBS["quickview"].cron_tag, runner.JOBS["window_start"].cron_tag
+        cron = [cron_line(START + k * MIN, qv) for k in range(0, 31, 3) if k != 9]   # cron missed 21:09
+        cron.append(cron_line(START + 13 * MIN, qv))                                  # an off-grid cron start
+        cron.append(cron_line(START + 2 * SEC + 1 * SEC, ws))                         # 3 s late: no match
+        dec = ["[2026-10-19 23:20:05 CEST] window-start: FIRE: run"]                  # no start then
+        lines, bad = self.report(self.entries(), cron, dec)
+        text = "\n".join(lines)
+        self.assertIn("21:09:00.000Z has no cron start", text)
+        self.assertIn("cron started at 2026-10-19T21:13:00Z; the runner had no time", text)
+        self.assertIn("MISMATCH window_start", text)
+        self.assertIn("decided FIRE at 2026-10-19T21:20:05Z", text)
+        self.assertEqual(bad, 4, text)
+
+    def test_the_parsers(self):
+        self.assertEqual(runner.parse_shadow(["no", BERLIN_PREFIX + "quickview due x at y"]), [])
+        self.assertEqual(runner.parse_cron(['time="2026-10-19T21:00:00Z" level=info msg="job succeeded" '
+                                            'job.command="x # AFClaude quickview export"'], runner.JOBS), [])
+        self.assertEqual(runner.parse_decisions(["[2026-10-19 23:00:05 CEST] window-start: FIRE: x"]),
+                         [(START + 5 * SEC, "FIRE")])
+
+
+class FakeProc:
+    def __init__(self, rc):
+        self.pid, self.rc = 4242, rc
+
+    def poll(self):
+        return self.rc
+
+
+class Ensure(Base):
+    def ensure(self, running=(), rc=None):
+        spawned = []
+
+        def spawn():
+            spawned.append(1)
+            return FakeProc(rc)
+        n = runner.ensure(connect=lambda: store.connect(os.path.join(self.tmp, "t.db")), pids=lambda: list(running),
+                          spawn=spawn, settle=0.05, clock=lambda: self.now, sleep=lambda s: None, fail=self.fail,
+                          log_fn=self.logs.append)
+        self.assertEqual(n, 0)
+        return spawned
+
+    def test_a_running_runner_with_a_fresh_heartbeat(self):
+        self.prev_boot(self.now - MIN, clean=False)
+        self.assertEqual(self.ensure(running=[7]), [])
+        self.assertEqual(self.fails, [])
+
+    def test_a_stale_heartbeat_alerts(self):
+        self.prev_boot(self.now - 20 * MIN, clean=False)
+        self.assertEqual(self.ensure(running=[7]), [])
+        self.assertEqual(self.subjects(), ["the runner's heartbeat is stale"])
+        self.assertTrue(self.fails[0][3])                                         # and pauses (D-235)
+
+    def test_a_cleanly_stopped_runner_is_started_and_alerted(self):
+        self.prev_boot(self.now - 20 * MIN, clean=True)
+        self.assertEqual(self.ensure(), [1])
+        self.assertEqual(self.subjects(), ["the runner was not running"])
+        self.assertIn("exited cleanly", self.fails[0][2])
+
+    def test_never_booted(self):
+        self.assertEqual(self.ensure(), [1])
+        self.assertEqual(self.subjects(), ["the runner was not running"])
+        self.assertIn("never booted", self.fails[0][2])
+
+    def test_an_unclean_exit_or_a_reported_crash_is_reported_by_others(self):
+        self.prev_boot(self.now - 20 * MIN, clean=False)
+        self.assertEqual(self.ensure(), [1])
+        self.assertIn("unclean exit", self.logs[-1])
+        actions.runner_state_put(self.conn, {"crashed": {"boot_id": OTHER_BOOT, "at": "x"}}, actor="runner",
+                                 via="runner")
+        self.ensure()
+        self.assertIn("its crash", self.logs[-1])
+        self.assertEqual(self.fails, [])
+
+    def test_a_start_that_fails(self):
+        self.prev_boot(self.now - 20 * MIN, clean=False)
+        self.ensure(rc=1)
+        self.assertEqual(self.subjects(), ["the runner did not start"])
+        self.ensure(rc=runner.EXIT_REPORTED)                                      # it said why itself
+        self.ensure(rc=runner.EXIT_LOCKED)                                        # another one runs
+        self.assertEqual(len(self.fails), 1)
+
+    def test_one_ensure_at_a_time(self):
+        fd = runner._ensure_lock()
+        try:
+            self.assertEqual(self.ensure(), [])
+        finally:
+            os.close(fd)
+
+    def test_runner_pids(self):
+        proc = os.path.join(self.tmp, "proc")
+        for pid, argv in ((11, [sys.executable, "-u", "/x/runner.py", "serve"]), (12, ["python3", "runner.py", "status"]),
+                          (13, []), (14, ["python3", "/x/runner_jobs.py", "serve"])):
+            os.makedirs(os.path.join(proc, str(pid)))
+            with open(os.path.join(proc, str(pid), "cmdline"), "wb") as fh:
+                fh.write(b"".join(a.encode() + b"\0" for a in argv))
+        self.assertEqual(runner.runner_pids(proc), [11])
+
+    def test_wake_with_a_full_queue_counts_as_sent(self):
+        path = os.path.join(self.tmp, "full.sock")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as rx:
+            rx.bind(path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as tx:
+                tx.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    for _ in range(100000):
+                        tx.sendto(b"w", path)
+            self.assertTrue(runner.wake(path))
+        self.assertFalse(runner.wake(os.path.join(self.tmp, "none.sock")))
 
 
 if __name__ == "__main__":
