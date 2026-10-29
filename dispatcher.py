@@ -311,8 +311,9 @@ def task_of(conn, sid):
 # ---------------------------------------------------------------- the pass
 
 class Pass:
-    def __init__(self, conn, cfg, st, now, arm, usage_getter=None):
+    def __init__(self, conn, cfg, st, now, arm, usage_getter=None, quiet=False):
         self.conn, self.cfg, self.st, self.now, self.arm = conn, cfg, st, now, arm
+        self.quiet = quiet                 # a run-now continue: its request alerts a failure once (D-282), not here
         self.usage_getter = usage_getter or ka.fresh_usage
         self.paused = None                 # the automation_paused reason while paused (run())
         self.report = {"continue": [], "skip": [], "cleanup": [], "verify": []}
@@ -321,6 +322,10 @@ class Pass:
     # -- bookkeeping
     def skip(self, what, why):
         self.report["skip"].append(f"{what}: {why}")
+
+    def alert_once(self, key, subject, body=""):
+        if not self.quiet:
+            alert_once(self.st, key, subject, body)
 
     def track(self, sid, tmux, **info):
         prev = self.st["sessions"].get(sid, {})
@@ -402,8 +407,8 @@ class Pass:
             if self.arm:
                 self.st["handled"][key] = {"at": store.iso(self.now), "result": "name-error",
                                            "error": f"{type(e).__name__}: {e}"[:300]}
-                alert_once(self.st, f"name:{key}", f"dispatcher did NOT continue {sid[:8]}: no tmux name",
-                           f"{type(e).__name__}: {e}"[:500])
+                self.alert_once(f"name:{key}", f"dispatcher did NOT continue {sid[:8]}: no tmux name",
+                                f"{type(e).__name__}: {e}"[:500])
             self.skip(label, f"no tmux name: {type(e).__name__}: {e}"[:300])
             return "failed", f"no tmux name: {type(e).__name__}: {e}"[:300]
         ok, problems, plan = ka.preflight(sid, tmux)
@@ -420,8 +425,8 @@ class Pass:
             if self.arm:
                 self.st["handled"][key] = {"at": store.iso(self.now), "result": "preflight-failed",
                                            "problems": problems}
-                alert_once(self.st, f"preflight:{key}", f"dispatcher did NOT continue {sid[:8]}: preflight failed",
-                           "; ".join(problems))
+                self.alert_once(f"preflight:{key}", f"dispatcher did NOT continue {sid[:8]}: preflight failed",
+                                "; ".join(problems))
             return "failed", "preflight refused: " + "; ".join(problems)
         reason_txt = "dispatcher, " + detail
         af = is_afclaude_cwd(cwd)
@@ -448,8 +453,8 @@ class Pass:
         except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "result": "launch-error",
                                        "error": f"{type(e).__name__}: {e}"[:300]}
-            alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed: {type(e).__name__}",
-                       f"plan={plan}: {e}"[:500])
+            self.alert_once(f"launch:{key}", f"dispatcher continue of {sid[:8]} failed: {type(e).__name__}",
+                            f"plan={plan}: {e}"[:500])
             return "failed", f"launch error: {type(e).__name__}: {e}"[:300]
         entry.update(rc=rc, stdout=out.strip(), stderr=err.strip()[-500:])
         self.report["continue"].append(entry)
@@ -458,8 +463,8 @@ class Pass:
                                    "result": "launched" if rc == 0 else "launcher-failed"}
         self.st["starts"][self.day] = self.st["starts"].get(self.day, 0) + 1   # a count, no cap (D-206)
         if rc != 0:
-            alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed (rc={rc})",
-                       f"plan={plan} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
+            self.alert_once(f"launch:{key}", f"dispatcher continue of {sid[:8]} failed (rc={rc})",
+                            f"plan={plan} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
             return "failed", f"the launcher failed (rc={rc}): {err.strip()[-300:]}"
         tracked = self.st["sessions"].get(sid, {})
         self.track(sid, tmux, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
@@ -618,7 +623,7 @@ def continue_now(conn, sid, now, request_id):
         row = next((r for r in store.stalled_decisions(conn) if r["session_id"] == sid), None)
         if row is None:
             return "refused", f"session {sid[:8]} is not stalled at a limit now"
-        p = Pass(conn, cfg, st, now, True)
+        p = Pass(conn, cfg, st, now, True, quiet=True)   # its request alerts and pauses once (D-282)
         managed = managed_projects(conn)
         run = p.afclaude_run(sid, managed)
         if run:

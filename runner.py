@@ -820,12 +820,20 @@ class Runner:
     def _plan_requests(self, job: Job, now: datetime) -> list[Due]:
         """Phase 3b S5 (run-now, D-153): every open request without a run yet, oldest first, due now
         (no due time: request.add's caller wakes the runner, the loop's MAX_SLEEP is the backstop).
-        An open request that has a run already (a run that ended without deciding it, which its end
-        or the boot then marks failed) is never run again."""
+        An open request that has a run already is never run again: a run still going is its slot's (or
+        the boot's, as interrupted), one that has finished without deciding it (finish() died on a DB
+        error between run_end and the request's write) is decided failed here, at the next plan after
+        the boot, so request.add does not find it open for ever. A DB error here ends the runner's
+        loop like any other (D-234/D-235)."""
         out: list[Due] = []
         for row in reversed(store.list_requests(self.conn, "open", limit=200)):
             key = str(row["id"])
-            if job.slot(key) in self.tasks or store.key_runs(self.conn, job.name, key):
+            if job.slot(key) in self.tasks:
+                continue
+            runs = store.key_runs(self.conn, job.name, key)
+            if runs:
+                if all(r["status"] != "running" for r in runs):
+                    self._request_failed(key, int(runs[-1]["id"]), "ended without deciding the request")
                 continue
             out.append(Due(job, key, now))
         if self._next_due(job.name) is not None:
