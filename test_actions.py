@@ -588,7 +588,8 @@ class SettingActions(Base):
                           "auth_idle_timeout_min": 30, "auth_absolute_lifetime_h": 12,
                           "auth_remember_device_days": 7, "auth_reauth_window_min": 10,
                           "auth_max_sessions_per_user": 10,
-                          "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15}})
+                          "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15},
+                          "claude_plan": "pro"})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -1096,6 +1097,8 @@ class EveryAction(Base):
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
                                              "bundle_sha256": "0" * 64, "kind": "backup"}}),
             ("install.stamp", {}),
+            ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
+            ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
             ("auth.session_login", {"user_id": 7, "id_sha256": "1" * 64, "csrf_sha256": "2" * 64,
                                     "factors": ["passkey_hw"]}),
             ("auth.session_rotate", {"id_sha256": "1" * 64, "new_id_sha256": "3" * 64, "new_csrf_sha256": "4" * 64,
