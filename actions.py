@@ -869,6 +869,8 @@ SETTINGS: dict[str, Setting] = {
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_prune_runs": _num(10, 0.5, 720, "Runner: minutes the daily prune of its run records may "
                                       "take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_status_snapshot": _num(2, 0.5, 720, "Runner: minutes a status-snapshot run may take before it "
+                                           "is killed and fails (D-234)", "automation"),
     "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
                                         "is killed and fails (D-234)", "automation"),
     # an at-job's payload `timeout` (minutes, `at --timeout`) overrides it for that job (phase 3a S4)
@@ -3105,7 +3107,8 @@ def own_session_add(conn: sqlite3.Connection, session_id: object, *, actor: str,
 #
 # runner.py's writes (docs/phase3a_plan.md §3.3): its job rows (runner_jobs), its run records
 # (runner_runs: run_begin -> run_pid -> run_end), its own state (runner_state 'runner': boot,
-# clean exit, drain; runner_state_put) and the retention prune (runner.prune). The run writes are
+# clean exit, drain; runner_state_put), the status snapshot (snapshot_put, S9(b)) and the retention
+# prune (runner.prune). The run writes are
 # plain functions like job_put (no perform(): one per run, not an owner's action), with the writer
 # check, store.retrying and the §7.8 DB-error path (report_db_error, runner=True); the runner then
 # fails (failstop) and exits. D-256: a run row carries its actor (runner:<job>) and via, and gets no
@@ -3187,6 +3190,49 @@ def runner_job_set(conn: sqlite3.Connection, name: str, *, actor: str, via: str,
         with store.transaction(conn):
             return store.put_runner_job(conn, job, fields)
     return _runner_write(conn, "runner_job.set", actor, dict(fields, name=job), run)
+
+
+SNAPSHOT_SECTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+SNAPSHOT_MAX = 64 * 1024        # bytes of one section's payload JSON (docs/phase6c_plan.md §3.3)
+
+
+def snapshot_put(conn: sqlite3.Connection, sections: Mapping[str, Mapping[str, Any]], *, builder: int,
+                 actor: str, via: str, account_id: str = store.DEFAULT_ACCOUNT,
+                 computed_at: str | None = None) -> None:
+    """Replace the status snapshot's rows (status_snapshot, S9(b)): `sections` = {name: {"payload":
+    JSON object} | {"error": text}}, all in one transaction. A section that cannot be built is an
+    error row (shown, never dropped); a payload over SNAPSHOT_MAX is refused (ValueError: the caller
+    makes it an error section). Runner rows like run_begin: actor and via, no audit_log row (D-154,
+    D-256: one write a minute would be 1,440 audit rows a day for a value that is replaced)."""
+    _check_writer(actor, via, account_id)
+    if not actor.startswith("runner"):
+        raise PermissionError("the status snapshot is written by runner actors only")
+    if not isinstance(builder, int) or isinstance(builder, bool) or builder < 1:
+        raise ValueError(f"bad snapshot builder version {builder!r}")
+    at = computed_at if computed_at is not None else store.now_iso()
+    rows: list[tuple[str, str, str | None, str | None]] = []
+    for name, sec in sections.items():
+        if not SNAPSHOT_SECTION_RE.match(name):
+            raise ValueError(f"bad snapshot section name {name!r}")
+        if "error" in sec:
+            if "payload" in sec:
+                raise ValueError(f"snapshot section {name}: a payload and an error")
+            rows.append((name, "error", None, _short(sec["error"], "snapshot error", RUN_ERROR_MAX)))
+            continue
+        payload = sec.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError(f"snapshot section {name}: the payload is a JSON object")
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        if len(text.encode("utf-8")) > SNAPSHOT_MAX:
+            raise ValueError(f"snapshot section {name}: {len(text)} characters over the {SNAPSHOT_MAX} byte cap")
+        rows.append((name, "ok", text, None))
+
+    def run() -> None:
+        with store.transaction(conn):
+            for name, state, text, err in rows:
+                store.put_snapshot(conn, name, account_id, state=state, payload=text, error=err, builder=builder,
+                                   computed_at=at)
+    _runner_write(conn, "snapshot.put", actor, {"sections": sorted(sections)}, run)
 
 
 def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional[str], timeout_s: Optional[float],

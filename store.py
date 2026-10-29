@@ -62,6 +62,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                stays the settings automation_paused / automation_paused_reason (failstop.py).
                runner_jobs, runner_runs (phase 3a, additive the same way, RUNNER_RUNS_SCHEMA): the
                resident runner's due times and its run records (runner.py; actions.py writes).
+               status_snapshot (phase 3a S9(b), additive the same way, STATUS_SNAPSHOT_SCHEMA): the
+               latest usage / next-run / pause / running-runs sections the runner writes each minute.
                Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
                row's project) and action_requests.run_id / updated_at (run-now, D-153); the
                driven_sessions backfill is `python3 store.py import-driven` (driven.py).
@@ -577,7 +579,30 @@ CREATE TRIGGER IF NOT EXISTS app_log_guarded_delete BEFORE DELETE ON app_log
 WHEN (SELECT allowed FROM app_log_prune_gate WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'app_log deletes only through store.prune_app_log (retention)'); END;
 """
-RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "runner_runs")
+RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "runner_runs", "status_snapshot")
+
+# ---- the status snapshot (phase 3a S9(b), design 04_architecture.md: the web container reads usage and
+# the next run from a row the runner writes, it imports no model code). Additive, no version bump. One
+# row per (section, account), always the latest value (no history, so no retention: a row is replaced);
+# the shape is the one docs/phase6c_plan.md §3.3 names, so 6c R1 adds sections, not a table.
+# state 'error' = the section could not be built (error says why, payload is then NULL); builder = the
+# payload format's version. Written only through actions.snapshot_put (runner actors).
+STATUS_SNAPSHOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS status_snapshot (
+    section     TEXT NOT NULL,
+    account_id  TEXT NOT NULL DEFAULT 'default' REFERENCES accounts(id),
+    computed_at TEXT NOT NULL,           -- UTC, when the builder read the values
+    state       TEXT NOT NULL CHECK (state IN ('ok', 'error')),
+    payload     TEXT,                    -- JSON object; NULL when state is 'error'
+    error       TEXT,
+    builder     INTEGER NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (section, account_id)
+);
+CREATE TRIGGER IF NOT EXISTS status_snapshot_version AFTER UPDATE ON status_snapshot FOR EACH ROW
+WHEN NEW.version IS OLD.version
+BEGIN UPDATE status_snapshot SET version = OLD.version + 1 WHERE section = NEW.section AND account_id = NEW.account_id; END;
+"""
 
 # ---- the resident runner (phase 3a, docs/phase3a_plan.md §3.3; runner.py, written only through
 # actions.py: runner_job_set, run_begin, run_pid, run_end, runner.prune). Additive, no version bump.
@@ -1074,6 +1099,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(TELEMETRY_SCHEMA)
     conn.executescript(RUNNER_SCHEMA)
     conn.executescript(RUNNER_RUNS_SCHEMA)
+    conn.executescript(STATUS_SNAPSHOT_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     conn.executescript(PROMPT_VARS_SCHEMA)
@@ -3004,6 +3030,24 @@ def put_runner_job(conn: sqlite3.Connection, name: str, fields: Mapping[str, obj
     row = get_runner_job(conn, name)
     assert row is not None     # inserted above
     return row
+
+
+# ---- the status snapshot (STATUS_SNAPSHOT_SCHEMA; written only through actions.snapshot_put)
+
+def put_snapshot(conn: sqlite3.Connection, section: str, account_id: str, *, state: str, payload: str | None,
+                 error: str | None, builder: int, computed_at: str) -> None:
+    """Insert or replace the section's row (its version counts the replacements)."""
+    conn.execute("INSERT INTO status_snapshot(section, account_id, computed_at, state, payload, error, builder) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(section, account_id) DO UPDATE SET "
+                 "computed_at=excluded.computed_at, state=excluded.state, payload=excluded.payload, "
+                 "error=excluded.error, builder=excluded.builder",
+                 (section, account_id, computed_at, state, payload, error, builder))
+
+
+def snapshot_rows(conn: sqlite3.Connection, account_id: str = DEFAULT_ACCOUNT) -> dict[str, Row]:
+    """{section: row} of the account's status snapshot (payload still the JSON text)."""
+    return {str(r["section"]): dict(r) for r in conn.execute(
+        "SELECT * FROM status_snapshot WHERE account_id=? ORDER BY section", (account_id,))}
 
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> Row | None:

@@ -15,6 +15,7 @@ import io
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -223,7 +224,7 @@ class Tables(Base):
             if job.cron_tag:
                 self.assertTrue(any(job.cron_tag in ln for ln in legacy), name)
         self.assertFalse(any("runner.py" in ln for ln in legacy))
-        self.assertEqual(len([ln for ln in cron if "runner.py ensure" in ln]), 1)      # the S2-S7 watchdog
+        self.assertEqual(cron, [])                      # S8: the runner is the only schedule, no watchdog line either
         # S7: the inbox API watchdog has no Job of its own (the runner supervises it directly,
         # runner.SUPERVISED), so it is not matched by a cron_tag; it is the one extra line removed
         # from `on` mode that no owned job's tag accounts for.
@@ -514,6 +515,33 @@ class Loop(Base):
         self.assertEqual(self.fails, [])
         self.assertEqual([d.job.name for d in r2.plan(self.now)], ["stall_scan"])
 
+    async def test_a_blocking_job_trips_the_watchdog_while_it_blocks(self):
+        """S8, in the loop itself: a synchronous sleep in a job's spawner blocks the event loop; the
+        watchdog thread (exit injected: no process is ended here) fires during the block, not after."""
+        marks = {}
+
+        class Blocking:
+            async def run(self, argv, timeout_s, on_pid):
+                time.sleep(0.8)                                    # blocks the loop
+                marks["unblocked"] = time.monotonic()
+                return ok()
+
+        r = self.runner(owns={"stall_scan"}, spawner=Blocking())
+        r.boot()
+        actions.runner_job_set(self.conn, "stall_scan", actor="runner", via="runner", next_due=runner._iso(self.now))
+        exits = []
+        wd = runner.Watchdog(lambda: r.beat_mono, stale=0.3, every=0.05,
+                             exit_fn=lambda code: exits.append((code, time.monotonic())), log_fn=self.logs.append)
+        wd.start()
+        serve = asyncio.ensure_future(r.serve(install_signals=False))
+        await self.wait_for(lambda: "unblocked" in marks)
+        wd.join(5)
+        self.assertEqual([c for c, _ in exits], [runner.WATCHDOG_EXIT])
+        self.assertLess(exits[0][1], marks["unblocked"])           # it did not wait for the loop to come back
+        self.assertTrue(any("has not passed" in m for m in self.logs), self.logs)
+        r.request_stop()
+        self.assertEqual(await serve, 0)
+
     async def test_a_runner_write_failure_crashes_the_loop(self):
         r = self.runner(owns={"stall_scan"})
         r.boot()
@@ -647,15 +675,17 @@ class Process(unittest.TestCase):
         finally:
             conn.close()
 
-    def popen(self):
+    def popen(self, extra=""):
         """A real `.../runner.py serve` (a shim of that name, so runner_pids() sees it as /proc
-        does a live one) that owns nothing: no stall scan of the real transcripts mid-test."""
+        does a live one) that owns nothing: no stall scan of the real transcripts mid-test
+        (`extra`: code that runs before main, e.g. to give it a job)."""
         d = tempfile.mkdtemp(prefix="afc-runner-shim-", dir="/tmp")
         self.addCleanup(shutil.rmtree, d, True)
         shim = os.path.join(d, "runner.py")
         with open(shim, "w", encoding="utf-8") as fh:
             fh.write(f"import sys\nsys.path.insert(0, {HERE!r})\n" + PRELUDE
-                     + "import runner; runner.RUNNER_OWNS = frozenset(); sys.exit(runner.main(sys.argv[1:]))\n")
+                     + "import runner; runner.RUNNER_OWNS = frozenset()\n" + extra
+                     + "sys.exit(runner.main(sys.argv[1:]))\n")
         p = subprocess.Popen([sys.executable, "-u", shim, "serve"], cwd=HERE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=dict(os.environ, KEEPALIVE_PROJECTS_DIR=d))
         self.addCleanup(p.stdout.close)
@@ -707,6 +737,47 @@ class Process(unittest.TestCase):
             self.assertTrue(actions.runner_state_get(conn)["clean_exit"])
         finally:
             conn.close()
+
+    def test_a_blocked_loop_makes_the_watchdog_exit_the_process(self):
+        """S8: the only watchdog. A job whose child call blocks the asyncio loop synchronously (here: a
+        time.sleep in the spawner's coroutine) stops the loop's heartbeat; the watchdog thread then ends
+        the whole process with WATCHDOG_EXIT (compose's `restart: unless-stopped` starts the container
+        again) without a clean exit, and a stuck run is left `running` for the next boot to record."""
+        extra = ("import time\n"
+                 "runner.STALE_LOOP, runner.WATCHDOG_EVERY = 1.0, 0.2\n"
+                 "runner.RUNNER_OWNS = frozenset({'stall_scan'})\n"
+                 "async def blocked(self, argv, timeout_s, on_pid):\n"
+                 "    time.sleep(3600)\n"
+                 "runner.SubprocessSpawner.run = blocked\n")
+        conn = store.connect()
+        try:
+            actions.runner_job_set(conn, "stall_scan", actor="runner", via="runner",
+                                   next_due=runner._iso(runner._utcnow() - timedelta(minutes=1)))
+        finally:
+            conn.close()
+        p = self.popen(extra)
+        try:
+            out, err = p.communicate(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait(10)
+        self.assertEqual(p.returncode, runner.WATCHDOG_EXIT, err)
+        self.assertIn("the loop has not passed for more than 1 s", out)
+        conn = store.connect()
+        try:
+            self.assertIsNot(actions.runner_state_get(conn).get("clean_exit"), True)
+            self.assertEqual([r["status"] for r in store.running_runs(conn) if r["job"] == "stall_scan"], ["running"])
+            fails = []                                        # the restarted container's boot: D-257, alert + pause
+            runner.Runner(conn, owns=frozenset(), log_fn=lambda m: None, shadow=lambda m: None,
+                          fail=lambda component, subject, detail="", **kw: fails.append(subject)).boot()
+            self.assertEqual(fails, ["the previous runner did not exit cleanly"])
+            self.assertEqual(store.running_runs(conn), [])    # and the cut-off run is recorded interrupted
+        finally:
+            conn.close()
+        fd = runner.acquire_lock()
+        self.assertIsNotNone(fd)                              # the lock went with the process
+        os.close(fd)
 
     def test_stop_ends_the_runner_cleanly(self):
         p = self.popen()
@@ -785,6 +856,69 @@ class Misc(Base):
         w.join(5)
         self.assertEqual(exits, [runner.WATCHDOG_EXIT])
         self.assertIn("has not passed", self.logs[-1])
+
+    def test_health(self):
+        r = self.runner(owns={"sampler"})
+        r.boot()
+        on, off = {"AFCLAUDE_SCHEDULER": "runner"}, {"AFCLAUDE_SCHEDULER": "legacy"}
+        live = lambda: [7]   # noqa: E731
+        self.assertIsNone(runner.health(self.conn, on, self.now, pids=live))
+        self.assertIsNone(runner.health(self.conn, {"AFCLAUDE_SCHEDULER": "on"}, self.now, pids=live))
+        self.assertIn("no runner process", runner.health(self.conn, on, self.now, pids=lambda: []))
+        late = self.now + runner.HEALTH_STALE + timedelta(seconds=1)
+        self.assertIn("heartbeat is", runner.health(self.conn, on, late, pids=live))
+        self.assertIsNone(runner.health(self.conn, on, late - timedelta(seconds=2), pids=live))
+        # the other modes have no runner to check
+        self.assertIsNone(runner.health(self.conn, off, late, pids=lambda: []))
+        self.assertIsNone(runner.health(self.conn, {}, late, pids=lambda: []))
+        conn2 = store.connect(os.path.join(self.tmp, "empty.db"), create=True)
+        self.addCleanup(conn2.close)
+        self.assertEqual(runner.health(conn2, on, self.now, pids=live), "the runner has no heartbeat")
+
+    def test_health_cli_reports_and_fails(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "legacy"}), contextlib.redirect_stdout(out):
+            self.assertEqual(runner.main(["health"]), 0)
+        self.assertEqual(out.getvalue().strip(), "healthy")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "runner"}), \
+                mock.patch.object(runner, "runner_pids", return_value=[]), contextlib.redirect_stdout(out):
+            self.assertEqual(runner.main(["health"]), 1)
+        self.assertTrue(out.getvalue().startswith("unhealthy:"), out.getvalue())
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "runner"}), contextlib.redirect_stdout(out), \
+                mock.patch.object(store, "connect", side_effect=store.DBUnavailable("database locked", "locked")):
+            self.assertEqual(runner.main(["health"]), 1)      # an unreadable DB is never "healthy" (D-235)
+        self.assertIn("health check failed", out.getvalue())
+
+    def test_watchdog_and_health_bounds(self):
+        """The watchdog must outlast the loop's longest idle sleep and the health check must fail first;
+        the stop grace must fit compose's stop_grace_period."""
+        self.assertGreater(runner.STALE_LOOP, 2 * runner.MAX_SLEEP)
+        self.assertGreater(runner.HEALTH_STALE.total_seconds(), runner.MAX_SLEEP + runner.HEARTBEAT_EVERY.total_seconds())
+        self.assertLess(runner.HEALTH_STALE.total_seconds(), runner.STALE_LOOP)
+        self.assertNotEqual(runner.WATCHDOG_EXIT, runner.EXIT_REPORTED)
+        self.assertNotIn(runner.WATCHDOG_EXIT, (0, runner.EXIT_LOCKED, runner.EXIT_CRASH))
+        with open(os.path.join(HERE, "docker", "compose.yml"), encoding="utf-8") as fh:
+            compose = fh.read()
+        self.assertIn("restart: unless-stopped", compose)
+        self.assertRegex(compose, r"(?m)^    stop_grace_period: 90s$")
+        self.assertLess(runner.STOP_GRACE + 5, 90)
+        self.assertRegex(compose, r'(?m)^      test: \["CMD", "python3", "runner.py", "health"\]$')
+        interval = int(re.search(r"(?m)^      interval: (\d+)s$", compose).group(1))
+        start = int(re.search(r"(?m)^      start_period: (\d+)s$", compose).group(1))
+        self.assertGreaterEqual(start, 2 * runner.MAX_SLEEP)
+        self.assertLessEqual(interval, runner.HEALTH_STALE.total_seconds())
+
+    def test_the_runner_modes_run_no_cron(self):
+        """S8: `runner` and `on` exec the runner alone; only `legacy` runs supercronic."""
+        with open(os.path.join(HERE, "docker", "entrypoint.sh"), encoding="utf-8") as fh:
+            sh = fh.read()
+        self.assertEqual(runner.RUNNER_MODES, ("on", "runner"))
+        self.assertIn("on|runner|legacy)", sh)
+        self.assertEqual(sh.count("exec python3 -u \"$D/runner.py\" serve"), 1)
+        self.assertNotIn("runner.py\" stop", sh)
+        self.assertNotIn("&\n    CRON=", sh)
 
     def test_watcher_conflict_only_once_it_owns_a_watcher_pass(self):
         def boom():
@@ -1047,8 +1181,8 @@ class SimpleTicks(Base):
 
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
-                                                         "inbox", "inbox_verify"}
-                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7
+                                                         "inbox", "inbox_verify", "status_snapshot"}
+                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7, S9b
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):
@@ -1057,9 +1191,11 @@ class SimpleTicks(Base):
             tag = runner.JOBS[name].cron_tag
             self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
             self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        # + the runner watchdog, - the at-shim (S4), - the window start (S5), - the watcher watchdog (S6),
-        # - the inbox API watchdog (S7: the runner supervises it directly instead, no cron line at all)
-        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 3)
+        # legacy = the ticks + the at-shim (S4), the window start (S5), the watcher watchdog (S6), the inbox API watchdog
+        # (the runner supervises it directly since S7); S8: the S2-S7 runner watchdog line is gone too,
+        # so `on`/`runner` has no cron line at all
+        self.assertEqual(cron, [])
+        self.assertEqual(len(legacy), len(S3_TICKS) + 4)
 
     def test_each_tick_runs_what_its_cron_line_ran(self):
         """Registration: the handler has the legacy line's script, arguments, log file and flock."""
@@ -2086,3 +2222,47 @@ class PassChild(unittest.TestCase):
         self.assertEqual(json.loads(p.stdout)["status"], "skipped")
         with open(runner_jobs.log_path("fillup")) as fh:
             self.assertIn("pass fillup fillup-x.20261020T010000", fh.read())
+
+
+class StatusSnapshotJob(Base):
+    """S9(b): the status snapshot's job (status_snapshot.py): a tick at most once a minute, written
+    while automation is paused too, and a failed write is the run's failure (alert + pause, D-234/D-235)."""
+
+    async def test_at_most_once_a_minute(self):
+        r = self.runner(owns={"status_snapshot"})
+        r.boot()
+        starts = []
+        for _ in range(60 * 10):                          # a scan every 7 s for 10 minutes (wakes make extra scans)
+            for due in r.plan(self.now):
+                self.assertIsNotNone(await self.run_due(r, due))
+                starts.append(self.now)
+            self.now += timedelta(seconds=7)
+        self.assertGreaterEqual(len(starts), 9)           # it did run, each minute
+        minutes = [t.replace(second=0) for t in starts]       # a grid tick each minute: never two in one minute
+        self.assertEqual(len(minutes), len(set(minutes)))
+        self.assertTrue(all(30 <= t.second < 37 for t in starts))              # on its offset (+ the scan step)
+
+    async def test_it_is_written_while_paused_too(self):
+        r = self.runner(owns={"status_snapshot"}, paused=lambda: {"paused": True, "reason": "an error"})
+        r.boot()
+        actions.runner_job_set(self.conn, "status_snapshot", actor="runner", via="runner",
+                               next_due=runner._iso(self.now))
+        due, = r.plan(self.now)
+        await self.run_due(r, due)
+        run, = self.runs("status_snapshot")
+        self.assertEqual(run["status"], "ok")             # not skipped for the pause
+        self.assertEqual([c[0] for c in self.spawner.calls], ["status_snapshot"])
+
+    async def test_a_failed_write_is_an_alert_and_a_pause_and_the_next_tick_still_runs(self):
+        self.spawner.outcomes["status_snapshot"] = runner.ChildOutcome(
+            1, "", "Traceback ...\nstore.DBUnavailable: database locked", False)
+        r = self.runner(owns={"status_snapshot"})
+        r.boot()
+        actions.runner_job_set(self.conn, "status_snapshot", actor="runner", via="runner",
+                               next_due=runner._iso(self.now))
+        due, = r.plan(self.now)
+        await self.run_due(r, due)
+        self.assertEqual(self.subjects(), ["status_snapshot failed"])
+        self.assertTrue(self.fails[0][3])                 # pause=True
+        self.now += MIN
+        self.assertEqual([d.job.name for d in r.plan(self.now)], ["status_snapshot"])

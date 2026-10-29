@@ -118,6 +118,19 @@ def prune_runs() -> str:
 
 FUNCTIONS["prune_runs"] = ("prune_logs.log", prune_runs)
 
+
+def status_snapshot_tick() -> str:
+    """The status snapshot (S9(b), status_snapshot.py): the usage, next-run, threshold and runner
+    sections replaced in the DB. Runs while paused (paused="runs"): the pause is part of what it shows."""
+    snapshot: Any = importlib.import_module("status_snapshot")      # display code over untyped model modules
+    line = str(snapshot.run())
+    if "error in" in line:
+        print(line)             # the log gets the minutes with an error section, not every quiet minute
+    return line
+
+
+FUNCTIONS["status_snapshot"] = ("status_snapshot.log", status_snapshot_tick)
+
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
 # thread AFCLAUDE_SCHEDULER=legacy still runs (inbox_api.py serve's worker, inbox_worker.run_forever).
 INBOX_LOG = "inbox_worker.log"
@@ -228,6 +241,8 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
                      ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
                      ("keepalive", "tmux_has", 30, 1)),
     "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_has", 30, 1)),
+    # S9(b): the usage cache read (host.usage_cache) once for the sections and once by the last-mile slot
+    "status_snapshot": (("host", "usage_cache", 30, 2),),
 }
 # S6, the keep-alive watcher's ticks. The watch: the usage cache read by the detection, the last-stretch
 # plan, its next slot start and the fill-up plan (+ one spare), and the fill-up's usage refresh ahead of

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Offline tests for docker/start_watcher.sh and the entrypoint's watcher start (the container
 watcher comes back right after a rebuild, not only at the next :07/:22/:37/:52 watchdog: the
-legacy mode), and the entrypoint's scheduler modes (phase 3a S2): `on` runs the resident runner
-beside supercronic and passes a `docker stop` on to both, and since S6 starts no watcher (the
-runner runs its passes); `legacy` runs supercronic with docker/crontab.legacy and the watcher.
+legacy mode), and the entrypoint's scheduler modes (phase 3a): `runner` (and its alias `on`, S8)
+`exec`s the resident runner as the container's only process (no supercronic; a `docker stop`'s
+SIGTERM reaches the runner itself) and starts no watcher (S6: the runner runs its passes);
+`legacy` runs supercronic with docker/crontab.legacy and the watcher.
 
 Hermetic: the scripts run from a temp AFCLAUDE_DIR with a fake host.py (the bridge's process
 list), a fake keepalive.py (records its argv), a fake runner.py and supercronic (record their
 argv and signals) and a stub pgrep (a marker file = "running")."""
+import contextlib
 import json
 import os
 import shutil
@@ -221,11 +223,12 @@ class StartWatcher(unittest.TestCase):
         self.assertIn("scheduler LEGACY", out)
         self.assertEqual(self.started(wait=5), [f"--session {SID} --arm"])
 
-    def test_entrypoint_on_starts_no_watcher(self):
+    def test_entrypoint_runner_starts_no_watcher(self):
         # phase 3a S6: the runner runs the watcher's passes
-        out, _ = self.entrypoint("on", wait=5)
-        self.assertIn("scheduler ON", out)
-        self.assertEqual(self.started(wait=1.5), [])
+        for mode in ("on", "runner"):
+            out, _ = self.entrypoint(mode, wait=5)
+            self.assertIn(f"scheduler {mode.upper()}", out)
+            self.assertEqual(self.started(wait=1.5), [])
 
     def test_entrypoint_off_starts_nothing(self):
         out, _ = self.entrypoint("off", wait=1.5)
@@ -258,29 +261,30 @@ class StartWatcher(unittest.TestCase):
         self.addCleanup(lambda: p.poll() is None and os.killpg(p.pid, signal.SIGKILL))
         return p
 
-    def test_entrypoint_on_runs_the_runner_beside_supercronic_and_stops_both(self):
-        p = self.start_entrypoint("on")
-        self.assertIn("serve", self.lines("runner_calls", "serve"))
-        self.assertEqual(self.lines("cron_calls", "crontab"), [f"-passthrough-logs {self.d}/docker/crontab"])
-        runs = self.lines(os.path.join("data", "cron_runs.log"), "msg=starting")
-        self.assertEqual(len(runs), 1)                    # the job starts only, kept for the shadow report
-        self.assertIn("AFClaude quickview export", runs[0])
-        p.send_signal(signal.SIGTERM)                     # what tini passes on at `docker stop`
-        out, err = p.communicate(timeout=20)
-        self.assertIn("scheduler ON", out)
-        self.assertIn("msg=starting", err)                # supercronic's lines still reach docker logs
-        self.assertIn('msg="job succeeded"', err)
-        self.assertEqual(self.lines("runner_calls", "serve: TERM"), ["serve", "stop", "serve: TERM"])
-        self.assertIn("TERM", self.lines("cron_calls", "TERM"))
+    def test_entrypoint_runner_execs_the_runner_alone_and_a_term_reaches_it(self):
+        """S8: no supercronic, no shell left behind: the runner is the entrypoint's own process (tini's
+        only child), so the SIGTERM of a `docker stop` is the runner's, and its exit is the container's."""
+        for mode in ("runner", "on"):
+            for name in ("runner_calls", "cron_calls", "runner_pid"):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(os.path.join(self.d, name))
+            p = self.start_entrypoint(mode)
+            self.assertIn("serve", self.lines("runner_calls", "serve"))
+            self.assertEqual(self.lines("runner_pid", str(p.pid)), [str(p.pid)])     # exec: the same process
+            p.send_signal(signal.SIGTERM)                 # what tini passes on at `docker stop`
+            out, _ = p.communicate(timeout=20)
+            self.assertEqual(p.returncode, 0)
+            self.assertIn(f"scheduler {mode.upper()}", out)
+            self.assertEqual(self.lines("runner_calls", "serve: TERM"), ["serve", "serve: TERM"])   # no `stop` call
+            self.assertFalse(os.path.exists(os.path.join(self.d, "cron_calls")))     # supercronic never started
+            self.assertFalse(os.path.exists(os.path.join(self.d, "data", "cron_runs.log")))
 
-    def test_entrypoint_on_stops_the_runner_when_supercronic_ends(self):
-        with open(os.path.join(self.d, "bin", "supercronic"), "w") as fh:
-            fh.write("#!/bin/sh\nsleep 0.5\nexit 0\n")
-        p = self.start_entrypoint("on")
-        out, err = p.communicate(timeout=20)
-        self.assertEqual(p.returncode, 1)                 # the container exits (restart: unless-stopped)
-        self.assertIn("supercronic ended", err)
-        self.assertIn("serve: TERM", self.lines("runner_calls", "serve: TERM"))
+    def test_entrypoint_runner_exit_code_is_the_containers(self):
+        with open(os.path.join(self.d, "runner.py"), "w") as fh:
+            fh.write("import sys\nsys.exit(70)\n")       # the loop watchdog's exit
+        p = self.start_entrypoint("runner")
+        p.communicate(timeout=20)
+        self.assertEqual(p.returncode, 70)                # restart: unless-stopped starts the container again
 
     def test_entrypoint_legacy_runs_the_legacy_crontab_and_no_runner(self):
         p = self.start_entrypoint("legacy")
@@ -295,7 +299,7 @@ class StartWatcher(unittest.TestCase):
         p = self.start_entrypoint("sometimes")
         _, err = p.communicate(timeout=20)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("on, legacy or off", err)
+        self.assertIn("runner, on, legacy or off", err)
 
 
 if __name__ == "__main__":
