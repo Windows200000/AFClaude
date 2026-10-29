@@ -87,8 +87,8 @@ S1 and S2 are independent of the D-305 review and can be built before 01.11. S3 
 - **TM verifies:** the first live run after the deploy against the review's list of what went missing.
 - **Risk:** (b) changes the live task-manager's memory across the boundary; merge outside a run, watch the first one.
 
-## 6. Open questions for the owner
+## 6. Questions (settled by the task-manager, 29.10.)
 
-1. **Non-task-manager sessions (S2).** D-144 asks for compaction of other agents only if they run longer than one session length. None has so far (the reviews are one-offs). Build S2 now, or only add a detector (an alert when a review/request session passes the D-218 test) and build S2 when it first fires? The detector is a few lines; S2 is a full step. Recommendation: the detector now, S2 on the first hit.
-2. **D-191/D-218's "compact at the start by age".** D-238's entry says it supersedes them "once confirmed", and design §5.5 already treats them as replaced for task-managers. Confirm, so the decision store can mark them superseded (D-218's algorithmic age test then lives on only as S2's eligibility test).
-3. **"Not after just questions" (D-238).** The owner wondered whether a compaction is needed after daytime questions. Today the 50-min idle trigger compacts after them if the context is ≥150k. The D-305 review could also count how often an idle compaction followed only owner questions; no change planned before that.
+1. **Non-task-manager sessions (S2):** the detector now (an alert when a review/request session passes the D-218 test), S2 itself on its first hit (task-manager call).
+2. **D-191/D-218's "compact at the start by age":** already superseded: D-238's owner clarification of 14.10. states it ("Supersedes D-191/D-218's 'at the run start by age'"); D-218's algorithmic age test lives on only as S2's eligibility test. No owner question.
+3. **"Not after just questions" (D-238):** the D-305 review (01.11.) also counts how often an idle compaction followed only owner questions (task-manager call: data for that review, no change before it).
