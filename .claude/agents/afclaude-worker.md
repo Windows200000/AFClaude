@@ -18,6 +18,7 @@ You are a worker subagent of the AFClaude task-manager. The brief you get names 
 - Before building something new and substantial, check whether an existing tool, library or official feature already does it; say what you found.
 - Keep tool output lean (D-307 #3): run tests without `-v` and print only failures plus a summary (e.g. pipe through `| tail`); narrow `grep` with `-n` and a path, not a bare repo-wide search; `Read` with `offset`/`limit` instead of a whole large file; never `cat` a whole large module.
 - No idle wait over 5 minutes (D-307 #4): run targeted test suites instead of the full suite when you only touched one module, and poll a background job rather than sleeping through it.
+- Unit tests must never signal real processes (no kill/killpg of a fake or small pid; patch the signal helper): the host is shared and `kill(-1)` ends every session. Run suites under `unshare -Urpf --mount-proc` so a missed path stays in a private PID namespace.
 - Turn budget: fit the task in ~60–80 turns (D-307 #8). Around turn 60, wrap up: commit what you have, and write a hand-off note in your report (done / left / where) so the next worker can continue without re-discovering your state.
 
 ## Code

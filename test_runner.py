@@ -67,7 +67,15 @@ class FakeSpawner:
 
 
 class Base(unittest.IsolatedAsyncioTestCase):
+    real_signals = False       # a test class that spawns its own children (and only those) sets True
+
     def setUp(self):
+        # no test may signal a real process group: the fakes' pid 1 would be kill(-1, ...), every process of the user
+        self.signalled = []
+        if not self.real_signals:
+            patcher = mock.patch.object(runner, "_signal_group", lambda pid, sig: self.signalled.append((pid, sig)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.mkdtemp(prefix="afc-runner-", dir="/tmp")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.conn = store.connect(os.path.join(self.tmp, "t.db"), create=True)
@@ -509,6 +517,8 @@ class Loop(Base):
 # ---------------------------------------------------------------- real children
 
 class Children(Base):
+    real_signals = True        # real children of this test (SubprocessSpawner), each in its own group
+
     def job(self, name, code, timeout_s=10.0):
         return runner.Job(name, timeout_s / 60, every=MIN, argv=(sys.executable, "-c", code))
 
@@ -550,6 +560,24 @@ class Children(Base):
         row = await self.run_real(self.job("t_ok", code))
         self.assertEqual((row["status"], json.loads(row["result"])["note"]), ("ok", "hi"))
         self.assertEqual(self.next_due("t_ok"), START + MIN)             # its own tick is earlier
+
+
+class SignalGuard(unittest.TestCase):
+    def test_pids_that_would_signal_everything_raise_without_signalling(self):
+        for pid in (1, 0, -1, True):
+            with self.subTest(pid=pid), mock.patch.object(os, "killpg") as killpg, mock.patch.object(os, "kill") as kill:
+                with self.assertRaises(ValueError):
+                    runner._signal_group(pid, signal.SIGTERM)
+                with self.assertRaises(ValueError):
+                    runner.stop(pids=lambda pid=pid: [pid], out=lambda m: None)
+                killpg.assert_not_called()
+                kill.assert_not_called()
+
+    def test_a_real_child_pid_is_signalled(self):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        self.addCleanup(p.wait)
+        runner._signal_group(p.pid, signal.SIGKILL)
+        self.assertEqual(p.wait(10), -signal.SIGKILL)
 
 
 class ChildSide(unittest.TestCase):
