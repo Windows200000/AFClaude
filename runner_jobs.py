@@ -142,16 +142,18 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
                 ("host", "usage_cache", 30, 1), ("usage_sampler", "agents_snapshot", 60, 1),
                 ("usage_sampler", "haiku_judgement", 180, 2)),
     # one approved stalled continue (usage refresh, preflight, resume) and one tmux clean-up
+    # (keepalive.tmux_has: both dispatcher's own check, dispatcher.py:548, and the generic one,
+    # tmux_alive delegates to it without a timeout of its own)
     "dispatcher": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
-                   ("keepalive", "agent_entries", 60, 1), ("keepalive", "tmux_alive", 30, 1),
+                   ("keepalive", "agent_entries", 60, 1), ("keepalive", "tmux_has", 30, 1),
                    ("keepalive", "tmux_pids", 30, 1), ("host", "proc_snapshot", 30, 1),
                    ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
-                   ("dispatcher", "tmux_alive", 30, 1), ("dispatcher", "kill_tmux", 30, 1)),
+                   ("keepalive", "tmux_has", 30, 1), ("dispatcher", "kill_tmux", 30, 1)),
     # the usage refresh and one review start (the resume), after its lock wait (TICK_CONSTANTS)
     "usage_review": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
                      ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
-                     ("keepalive", "tmux_alive", 30, 1)),
-    "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_alive", 30, 1)),
+                     ("keepalive", "tmux_has", 30, 1)),
+    "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_has", 30, 1)),
 }
 TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
