@@ -71,6 +71,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                browser sessions (dashboard/sessions.py; actions.py's auth.session_* writes).
                notices (D-306, additive the same way): the owner's dashboard notices (title, text,
                dismissed_at; actions.py's notice.* writes, inbox.view shows them).
+               setup_codes (phase 6a W7, additive the same way, SETUP_SCHEMA): the one-time setup
+               code (first owner) and admin reset-auth codes (dashboard/setup.py; actions.py's
+               setup.mint_code / setup.claim_code write it; only a code's hash is ever stored).
 
 Schema guard (docs/dashboard_design/07_data_model.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -759,6 +762,29 @@ CREATE INDEX IF NOT EXISTS auth_sessions_user ON auth_sessions(user_id, ended_at
 CREATE INDEX IF NOT EXISTS auth_sessions_ended ON auth_sessions(ended_at);
 """
 
+# ---- the setup code (phase 6a W7, docs/phase6a_plan.md §3.7; design §9.3, §10.4): a one-time code,
+# 'first_owner' (user_id NULL: minted while no person exists yet) or 'reset' (admin reset-auth,
+# user_id = whose login it resets). Only the sha256 of the normalised code is stored; dashboard/setup.py
+# does the constant-time compare. Single use (used_at), expiring; minting a new code of the same
+# (kind, user_id) first supersedes any other open one (supersede_open_setup_codes), so there is at most
+# one live code per kind/user. Written only through actions.py (setup.mint_code / setup.claim_code,
+# audited: the hash and timestamps, never the raw code). Superseded in part by D-293 / 6b P10 (a setup
+# URL with a token replaces the first_owner flow; this table's 'reset' codes are unaffected).
+# Additive, no schema_version bump.
+SETUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS setup_codes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL CHECK (kind IN ('first_owner', 'reset')),
+    user_id     INTEGER,                 -- 'reset': whose code (5a's users.id, no FK yet); else NULL
+    code_hash   TEXT NOT NULL UNIQUE,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    used_at     TEXT,
+    CHECK ((kind = 'first_owner') = (user_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS setup_codes_open ON setup_codes(kind, user_id, used_at);
+"""
+
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
 # owner / task-manager decision, mirrored from DECISIONS.md (the source the task-manager edits for
 # now; actions.decision_import, audited) with the full entry text and its fields. keywords is the
@@ -1053,6 +1079,7 @@ def init(conn: sqlite3.Connection) -> None:
     conn.executescript(PROMPT_VARS_SCHEMA)
     conn.executescript(DECISIONS_SCHEMA)
     conn.executescript(AUTH_SCHEMA)
+    conn.executescript(SETUP_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         _init_decisions_fts(conn)
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
@@ -2486,6 +2513,50 @@ def prune_ended_sessions(conn: sqlite3.Connection, ended_before: str, abandoned_
     return conn.execute(
         "DELETE FROM auth_sessions WHERE (ended_at IS NOT NULL AND ended_at < ?) "
         "OR (ended_at IS NULL AND created_at < ?)", (ended_before, abandoned_before)).rowcount
+
+
+SETUP_CODE_KINDS = ("first_owner", "reset")
+
+
+def supersede_open_setup_codes(conn: sqlite3.Connection, kind: str, user_id: int | None) -> int:
+    """Mark every open (unused) code of this (kind, user_id) used 'superseded': a fresh mint always
+    leaves at most one live code per kind/user. -> number superseded."""
+    if kind not in SETUP_CODE_KINDS:
+        raise ValueError(f"unknown setup code kind {kind!r}")
+    return conn.execute(
+        "UPDATE setup_codes SET used_at=? WHERE kind=? AND user_id IS ? AND used_at IS NULL",
+        (now_iso(), kind, user_id)).rowcount
+
+
+def add_setup_code(conn: sqlite3.Connection, kind: str, user_id: int | None, code_hash: str,
+                   expires_at: str) -> int:
+    if kind not in SETUP_CODE_KINDS:
+        raise ValueError(f"unknown setup code kind {kind!r}")
+    if (kind == "first_owner") != (user_id is None):
+        raise ValueError("first_owner codes have no user_id; reset codes need one")
+    cur = conn.execute("INSERT INTO setup_codes(kind, user_id, code_hash, created_at, expires_at) "
+                       "VALUES (?, ?, ?, ?, ?)", (kind, user_id, code_hash, now_iso(), expires_at))
+    return _rowid(cur)
+
+
+def open_setup_code(conn: sqlite3.Connection, kind: str, user_id: int | None) -> Row | None:
+    """The one live (unused, not necessarily unexpired) code of this (kind, user_id), if any.
+    dashboard.setup compares the submitted code against it in constant time."""
+    r = conn.execute("SELECT * FROM setup_codes WHERE kind=? AND user_id IS ? AND used_at IS NULL "
+                     "ORDER BY id DESC LIMIT 1", (kind, user_id)).fetchone()
+    return dict(r) if r else None
+
+
+def get_setup_code_by_id(conn: sqlite3.Connection, code_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM setup_codes WHERE id=?", (code_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def claim_setup_code(conn: sqlite3.Connection, code_id: int, now: str) -> bool:
+    """Spend a setup code (single-use, not expired): the atomic guard against two racing claims
+    (SQLite serialises writers; only one UPDATE matches used_at IS NULL). -> whether this call won."""
+    return conn.execute("UPDATE setup_codes SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at > ?",
+                        (now, code_id, now)).rowcount == 1
 
 
 def add_run_log(conn: sqlite3.Connection, component: object, decision: object, reason: str | None = None,

@@ -97,6 +97,11 @@ except Exception as e:   # noqa: BLE001 - a display path: shown, never raised (D
 # preview build of the dashboard UI first becomes possible (docs/dashboard_design/10_deployment.md §10.9). A
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.
 PREVIEW_FROM = os.environ.get("QUICKVIEW_PREVIEW_FROM", "6a")
+# D-211: the owner preview build's own /private sub-path, published by tools/build_preview.py
+# (host-only, D-292) into OUT/PREVIEW_SUBDIR/ -- next to status.json, so quickview/nginx.conf's
+# existing `location /afclaude/` already serves it once ovm3 has a matching /private proxy
+# (D-253's pattern; not set up by this code, see README "Quickview status page").
+PREVIEW_SUBDIR = os.environ.get("QUICKVIEW_PREVIEW_SUBDIR", "AFClaude-preview")
 UTC = timezone.utc
 RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # names run_metrics.py's rows: the DB (D-161)
 
@@ -212,6 +217,33 @@ def publish_page(page=None):
     if page is None:
         page = read_page()[0]
     write_atomic("AFClaude.html", page)
+
+
+def preview_block():
+    """D-211/D-306: a read-only check of the owner preview build published by
+    tools/build_preview.py (host-only: it needs the pinned Node, D-292, which the manager
+    container does not have and whose root filesystem is read-only besides data/ and /tmp, so
+    nothing here ever tries to build) -- safe to call from every export, in the container or on
+    the host. {"enabled": False} while preview_publish_enabled is off (the default: no file read,
+    no new behaviour); else {"enabled": True, "available", "version", "built_at_berlin",
+    "url_path"} from OUT/PREVIEW_SUBDIR/preview_meta.json, or available: False with a reason if
+    nothing has been published yet. Never raises (a display path, D-239)."""
+    try:
+        if not afclaude_config.setting("preview_publish_enabled"):
+            return {"enabled": False}
+    except Exception as e:  # noqa: BLE001 - shown on the page instead
+        return {"enabled": False, "error": f"{type(e).__name__}: {e}"[:300]}
+    meta_path = os.path.join(OUT, PREVIEW_SUBDIR, "preview_meta.json")
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except FileNotFoundError:
+        return {"enabled": True, "available": False,
+                "reason": "not built yet (tools/build_preview.py, run on the host)"}
+    except (OSError, ValueError) as e:   # noqa: BLE001 - shown on the page instead
+        return {"enabled": True, "available": False, "error": f"{type(e).__name__}: {e}"[:300]}
+    return {"enabled": True, "available": True, "version": meta.get("version"),
+            "built_at_berlin": meta.get("built_at_berlin"), "url_path": f"/private/{PREVIEW_SUBDIR}/"}
 
 
 # -------------------------------------------------------------------- GOALS.md
@@ -1125,6 +1157,7 @@ def main():
         "goals": parse_goals(doc_source("GOALS.md", os.path.join(HERE, "GOALS.md"))[0]),
         "stages": stages(ka.read_usage_cache(), now),
         "preview_from": PREVIEW_FROM,  # D-211: owner-preview marker for the phase strip (§10.9)
+        "preview": preview_block(),  # D-211/D-306: the owner preview build, if published (tools/build_preview.py)
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),
         "inbox": inbox_block(),

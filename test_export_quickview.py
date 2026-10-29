@@ -310,6 +310,51 @@ class PreviewMarker(unittest.TestCase):
         self.assertIn("#ec4899", page)   # the pink outline color, distinct from the purple "cur" ring
 
 
+class PreviewBlock(unittest.TestCase):
+    """D-211/D-306: the preview build's publish state (tools/build_preview.py), read-only and
+    never raising -- the function export_quickview.py's main() shows in status.json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.old_out = qv.OUT
+        self.addCleanup(lambda: setattr(qv, "OUT", self.old_out))
+        qv.OUT = self.tmp.name
+        self.addCleanup(testenv.set_setting, "preview_publish_enabled", None)
+
+    def test_disabled_by_default_no_file_access(self):
+        self.assertEqual(qv.preview_block(), {"enabled": False})
+
+    def test_enabled_but_nothing_published_yet(self):
+        testenv.set_setting("preview_publish_enabled", True)
+        out = qv.preview_block()
+        self.assertEqual(out["enabled"], True)
+        self.assertFalse(out["available"])
+        self.assertIn("reason", out)
+
+    def test_enabled_and_published(self):
+        testenv.set_setting("preview_publish_enabled", True)
+        meta_dir = os.path.join(self.tmp.name, qv.PREVIEW_SUBDIR)
+        os.makedirs(meta_dir)
+        with open(os.path.join(meta_dir, "preview_meta.json"), "w") as fh:
+            json.dump({"version": "abc123", "built_at_berlin": "Thu 29.10. 12:00 CET"}, fh)
+        out = qv.preview_block()
+        self.assertEqual(out, {"enabled": True, "available": True, "version": "abc123",
+                              "built_at_berlin": "Thu 29.10. 12:00 CET",
+                              "url_path": f"/private/{qv.PREVIEW_SUBDIR}/"})
+
+    def test_corrupt_meta_is_shown_not_raised(self):
+        testenv.set_setting("preview_publish_enabled", True)
+        meta_dir = os.path.join(self.tmp.name, qv.PREVIEW_SUBDIR)
+        os.makedirs(meta_dir)
+        with open(os.path.join(meta_dir, "preview_meta.json"), "w") as fh:
+            fh.write("not json")
+        out = qv.preview_block()
+        self.assertEqual(out["enabled"], True)
+        self.assertFalse(out["available"])
+        self.assertIn("error", out)
+
+
 class AutomationPaused(unittest.TestCase):
     """D-234/D-235: the page shows a paused automation with its reason up front, and how to clear it."""
     def test_block(self):
@@ -409,7 +454,8 @@ class ScheduleSection(unittest.TestCase):
         out = self.entries("on", "crontab")
         cron = [e for e in out if e["owner"] == "cron"]
         mine = {e.get("job"): e for e in out if e["owner"] == "runner"}
-        self.assertTrue(any("inbox API watchdog" in e["what"] for e in cron))
+        self.assertTrue(any("runner watchdog" in e["what"] for e in cron))
+        self.assertFalse(any("inbox API watchdog" in e["what"] for e in cron))   # S7: the runner supervises it
         self.assertFalse(any("watcher watchdog" in e["what"] for e in cron))  # S6: the runner's passes now
         self.assertFalse(any("usage sampler" in e["what"] for e in cron))   # S3: the runner's now
         self.assertFalse(any("window-start" in e["what"] for e in cron))    # S5: the runner's now

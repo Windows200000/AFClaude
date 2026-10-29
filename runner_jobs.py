@@ -118,6 +118,44 @@ def prune_runs() -> str:
 
 FUNCTIONS["prune_runs"] = ("prune_logs.log", prune_runs)
 
+# phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
+# thread AFCLAUDE_SCHEDULER=legacy still runs (inbox_api.py serve's worker, inbox_worker.run_forever).
+INBOX_LOG = "inbox_worker.log"
+
+
+def inbox_tick() -> str:
+    """The `inbox` job: triage the new messages, then deliver every "now" one (inbox_worker.process).
+    runner.POLL_PENDING["inbox"] (inbox_worker.pending) is its while-there-is-work check (§3.2)."""
+    import inbox_worker
+    import store
+    conn = store.connect()
+    try:
+        counts = inbox_worker.process(conn)
+    finally:
+        conn.close()
+    note = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "nothing pending"
+    print(f"inbox: {note}")
+    return note
+
+
+def inbox_verify_tick() -> str:
+    """The `inbox_verify` job: one check per pending post-send verification (inbox_worker.verify_tick);
+    a restart resumes each from its stored runner_state entry (§3.3/§3.4)."""
+    import inbox_worker
+    import store
+    conn = store.connect()
+    try:
+        counts = inbox_worker.verify_tick(conn)
+    finally:
+        conn.close()
+    note = ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "nothing pending"
+    print(f"inbox_verify: {note}")
+    return note
+
+
+FUNCTIONS["inbox"] = (INBOX_LOG, inbox_tick)
+FUNCTIONS["inbox_verify"] = (INBOX_LOG, inbox_verify_tick)
+
 # ---- the window start's inner timeouts (docs/phase3a_plan.md §3.2: outer = their sum + a margin)
 #
 # keepalive.py --window-start, worst case: the usage refresh (/usage, the token-refresh request,

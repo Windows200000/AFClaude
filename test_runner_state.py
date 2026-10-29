@@ -262,7 +262,7 @@ class Importer(Base):
         self.fill()
         before = snapshot(self.dir)
         r = rs.import_all()
-        self.assertEqual([s["status"] for s in r["state"]], ["ok"] * 3 + ["no file"] + ["ok"] * 4 + ["no file"])   # keepalive.watch, nightly_tasks: never a file
+        self.assertEqual([s["status"] for s in r["state"]], ["ok"] * 3 + ["no file"] + ["ok"] * 4 + ["no file"] * 2)   # keepalive.watch, nightly_tasks, inbox: never a file
         self.assertEqual(r["own_sessions"]["status"], "ok")
         self.assertEqual(r["scheduled_jobs"]["status"], "ok")
         self.assertEqual({s["component"]: s["status"] for s in r["logs"]},

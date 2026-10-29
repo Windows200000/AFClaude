@@ -8,6 +8,7 @@
     python3 runner.py undrain             lift a drain (a deploy that did not happen)
     python3 runner.py wake                re-read the DB now (what the senders do after a write)
     python3 runner.py window-report [--hours H]   S5: each session-window start vs its run and decision
+    python3 runner.py watcher-check       exit 1 when a keep-alive watcher must not start (runner_conflict)
 
 One asyncio loop: read the due times, wait for the earliest of them, a wake datagram
 (data/run/runner.sock) or a child's exit, start what is due, repeat; a 60-s longest sleep is the
@@ -47,8 +48,8 @@ docker/crontab into it step by step (test_runner checks they never overlap). S2:
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
 (stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
 docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts. S6: the
-keep-alive watcher's passes (no watcher runs beside it any more); cron still runs the inbox API
-watchdog.
+keep-alive watcher's passes (no watcher runs beside it any more). S7: the inbox (inbox,
+inbox_verify) and the inbox API as a supervised child (SUPERVISED); no cron watchdog for it.
 
 Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
 `run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
@@ -86,6 +87,18 @@ lines, which the entrypoint copies to data/cron_runs.log) and, for the window st
 keep-alive's decision lines. Since S5 no job with a runner counterpart is left in docker/crontab
 (the watcher and inbox API watchdogs have none), so the shadow is empty; window-report replaces it
 for the window starts.
+
+The inbox (S7, the jobs "inbox" and "inbox_verify"; §3.2/§3.3): a Job with `poll` only runs while
+POLL_PENDING[name](conn, now) says there is work, at most once every `poll` while that lasts (no
+due time, only a wake, once it is idle again; _plan_poll). `inbox` (inbox_worker.process, woken by
+inbox_api after a post or a retry, §3.7) triages and delivers "now" messages every 30 s while one is
+pending or held; `inbox_verify` (inbox_worker.verify_tick) checks every 5 s the post-send
+verifications a delivery stored (runner_state "inbox" entries {msg, path, offset, deadline}), so a
+restart resumes one from the same offset and deadline and ends it seen or as an error at its
+deadline. The runner also keeps `inbox_api.py serve --no-worker` running (SUPERVISED, started at
+boot and again, with an alert, whenever it exits before a stop was requested): it only serves HTTP,
+stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
+messages are not automation (D-186/D-244), so both run while paused.
 
 Until S8 supercronic is the container's main schedule and this runner runs beside it:
     python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
@@ -149,6 +162,7 @@ EXIT_LOCKED = 2
 EXIT_REPORTED = runner_jobs.EXIT_REPORTED
 EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail): `ensure` does not alert again
 TINY = timedelta(microseconds=1)
+SUPERVISE_DELAY = 5.0                     # S7: a supervised child that exited is started again after this long
 # The keep-alive watcher's passes (S6). The runner refuses to start next to a running watcher only
 # once it owns one of them: until then (S2-S5) the watcher ran beside it by design (§4).
 WATCHER_PASSES = frozenset({"watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
@@ -176,7 +190,9 @@ class Job:
     the quickview's schedule list (default: the cron tag); at_jobs: the scheduled_jobs rows, one keyed
     run per row at its run_at (S4; on_interrupt and timeout_min are the defaults of the row's payload
     fields on_interrupt and timeout); planned: a keyed act at the time its pass's plan step stored
-    (S6, planned_act: the run's key is the plan's `run`)."""
+    (S6, planned_act: the run's key is the plan's `run`); poll: it only runs while POLL_PENDING[name]
+    says there is work (S7: `inbox`, `inbox_verify`), at most once every `poll`; no due time (only a
+    wake starts it) while there is none (_plan_poll)."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
@@ -184,6 +200,7 @@ class Job:
     window_start: bool = False
     at_jobs: bool = False
     planned: bool = False
+    poll: Optional[timedelta] = None
     paused: str = "runs"
     on_interrupt: str = "rerun"
     session: bool = False
@@ -196,8 +213,9 @@ class Job:
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
             raise ValueError(f"bad job name {self.name!r}")
-        if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs, self.planned)) != 1:
-            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs / planned")
+        if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs, self.planned,
+               self.poll is not None)) != 1:
+            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs / planned / poll")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
         if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
@@ -254,7 +272,31 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         what="fill-up start (D-212)"),
     Job("compaction", 60, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="compaction: save, /compact, the hand-off back (D-238)"),
+    # S7: the inbox (docs/phase3a_plan.md §5 S7). Both run while paused (D-186/D-244: the owner's own
+    # message is no automation); a rerun after an interrupted one is safe (the message's own status
+    # settles it: inbox.deliver can't apply twice, a stuck verify entry just resumes, §3.3/§3.4).
+    Job("inbox", 5, poll=30 * SEC, what="inbox: triage, then deliver \"now\" messages (inbox_worker.process)"),
+    Job("inbox_verify", 0.5, poll=5 * SEC,
+        what="inbox: resume pending post-send verifications (inbox_worker.verify_tick)"),
 )}
+def _inbox_pending(conn: Any, now: datetime) -> bool:
+    import inbox_worker
+    return bool(inbox_worker.pending(conn, now))
+
+
+def _inbox_verify_pending(conn: Any, now: datetime) -> bool:
+    import inbox_worker
+    return bool(inbox_worker.verify_pending(conn, now))
+
+
+# S7: a job that only ticks while POLL_PENDING[name](conn, now) says there is work (Job.poll); no
+# due time while there is none (_plan_poll), only a wake.
+POLL_PENDING: dict[str, Callable[[Any, datetime], bool]] = {"inbox": _inbox_pending, "inbox_verify": _inbox_verify_pending}
+# S7: a long-lived child the runner keeps alive (not a tick: no run row, no outer timeout) -> its
+# argv. inbox_api.py serve --no-worker only serves HTTP, stores the message and wakes this runner
+# (§3.7); the runner's own `inbox` / `inbox_verify` jobs above do the triage, delivery and
+# verification that AFCLAUDE_SCHEDULER=legacy still runs from its worker thread.
+SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve", "--no-worker")}
 # What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
 # here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
 # stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
@@ -262,8 +304,11 @@ JOBS: dict[str, Job] = {j.name: j for j in (
 # at-jobs (the */1 `at --run-due` line is gone; legacy keeps it). S5: the session-window starts (the
 # */30 `--window-start` line is gone; legacy keeps it). S6: the keep-alive watcher's passes (the
 # entrypoint no longer starts the watcher, its :07/:22/:37/:52 watchdog line is gone; legacy keeps both).
+# S7: the inbox jobs (the entrypoint no longer starts inbox_api.py, SUPERVISED does; its */5 ensure
+# cron line is gone; legacy keeps both).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
-                                         "docs_import", "prune_logs", "usage_review", "at", "window_start"}
+                                         "docs_import", "prune_logs", "usage_review", "at", "window_start",
+                                         "inbox", "inbox_verify"}
                                         | WATCHER_PASSES)
 
 
@@ -356,7 +401,15 @@ def at_policy(row: Optional[store.Row], job: Job) -> tuple[str, Optional[float]]
             float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else None)
 
 
+def _check_pid(pid: int) -> None:
+    """A pid to signal must be a real process: killpg(1, ...) is kill(-1, ...) (glibc), which signals every
+    process of the user, and 0 is the caller's own group. A fake's pid reaching here is a bug: fail fast (D-235)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise ValueError(f"refusing to signal pid {pid!r}: not a real child process (kill(-1) would signal everything)")
+
+
 def _signal_group(pid: int, sig: int) -> None:
+    _check_pid(pid)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, sig)
 
@@ -448,7 +501,8 @@ class Runner:
                  boot_id: Optional[str] = None, log_fn: Optional[Callable[[str], None]] = None,
                  fail: Optional[FailFn] = None, paused: Optional[Callable[[], dict[str, Any]]] = None,
                  schedule_cfg: Optional[schedule.Config] = None, sock: Optional[str] = None,
-                 stop_grace: float = STOP_GRACE, shadow: Optional[Callable[[str], None]] = None) -> None:
+                 stop_grace: float = STOP_GRACE, shadow: Optional[Callable[[str], None]] = None,
+                 supervise: Optional[dict[str, tuple[str, ...]]] = None) -> None:
         self.conn = conn
         self.jobs = dict(JOBS if jobs is None else jobs)
         self.owns = frozenset(RUNNER_OWNS if owns is None else owns)
@@ -465,6 +519,11 @@ class Runner:
         self.stop_grace = stop_grace
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.pids: dict[str, int] = {}
+        # S7: a long-lived supervised child (SUPERVISED), not a tick: started once at boot and
+        # again (alert + restart) whenever it exits before a stop was requested.
+        self.supervise = dict(SUPERVISED if supervise is None else supervise)
+        self.sup_tasks: dict[str, asyncio.Task[None]] = {}
+        self.sup_pids: dict[str, int] = {}
         self.wake_event = asyncio.Event()
         self.scans = 0
         self.wakes = 0
@@ -566,7 +625,7 @@ class Runner:
         n = 0
         for name in sorted(self.owns):
             job = self.jobs[name]
-            if job.keyed:
+            if job.keyed or job.poll is not None:    # a poll job's first plan() finds its own due time
                 continue
             nd = self._next_due(name)
             if nd is None:
@@ -638,6 +697,11 @@ class Runner:
                 continue
             if job.planned:
                 d = self._plan_planned(job, now)
+                if d is not None:
+                    out.append(d)
+                continue
+            if job.poll is not None:
+                d = self._plan_poll(job, now)
                 if d is not None:
                     out.append(d)
                 continue
@@ -718,6 +782,21 @@ class Runner:
             return None
         at, run = min(ready, key=lambda r: r[0])
         return Due(job, run, at)
+
+    def _plan_poll(self, job: Job, now: datetime) -> Optional[Due]:
+        """S7 (`inbox`, `inbox_verify`): due now if POLL_PENDING[job.name] says there is work and
+        either nothing is due yet (the first pending work, or a wake after it was dormant) or its
+        `poll` cooldown since the last run has passed; no due time (dormant, only a wake starts it
+        again) while there is none. start() sets the next due time (now + job.poll) when it runs."""
+        pending = POLL_PENDING[job.name](self.conn, now)
+        nd = self._next_due(job.name)
+        if not pending:
+            if nd is not None:
+                self.job_set(job.name, next_due=None)
+            return None
+        if (nd is None or nd <= now) and job.name not in self.tasks:
+            return Due(job)
+        return None
 
     def _settled(self, job: Job, key: str) -> bool:
         """The keyed run (job, key) was decided already: a run row (for a job that never reruns an
@@ -800,6 +879,12 @@ class Runner:
 
     # ---- runs
 
+    def _advance(self, job: Job, now: datetime) -> datetime:
+        """The next due time stored right when a non-keyed job starts: the grid tick (`every` /
+        `daily`), or, for a poll job (S7), a `poll`-long cooldown from now (_plan_poll re-admits it
+        once that passes and POLL_PENDING still says there is work; none: it falls dormant again)."""
+        return now + job.poll if job.poll is not None else next_tick(job, now)
+
     def start(self, due: Due, now: datetime) -> Optional[int]:
         """Record and spawn one run (or record it skipped). -> the run id, or None."""
         job, key = due.job, due.key
@@ -815,7 +900,7 @@ class Runner:
                                   actor=actor, via=VIA, rerun=job.on_interrupt == "rerun", skipped=why)
                 self.once(f"skip:{job.name}:{p.get('reason')}", f"{label} skipped: {why}")
                 if not job.keyed:
-                    self.job_set(job.name, next_due=_iso(next_tick(job, now)))
+                    self.job_set(job.name, next_due=_iso(self._advance(job, now)))
                 return None
         timeout = self.timeout_s(job)
         run_id, why_not = actions.run_begin(self.conn, boot_id=self.boot_id, job=job.name, key=key, timeout_s=timeout,
@@ -824,10 +909,10 @@ class Runner:
         if run_id is None:
             self.once(f"refused:{label}:{why_not}", f"{label} not started: {why_not}")
             if not job.keyed:
-                self.job_set(job.name, next_due=_iso(next_tick(job, now)))
+                self.job_set(job.name, next_due=_iso(self._advance(job, now)))
             return None
         if not job.keyed:
-            self.job_set(job.name, next_due=_iso(next_tick(job, now)))
+            self.job_set(job.name, next_due=_iso(self._advance(job, now)))
         self.log(f"start {label} (run {run_id}, timeout {timeout:g} s)")
         self.tasks[job.slot(key)] = asyncio.get_running_loop().create_task(self._run(job, key, run_id, timeout))
         return run_id
@@ -939,6 +1024,42 @@ class Runner:
         except OSError as e:
             self.log(f"{job.name}: its stderr could not be added to {path} ({type(e).__name__}: {e})")
 
+    # ---- a long-lived supervised child (S7: inbox_api)
+
+    def start_supervised(self, name: str) -> None:
+        """Start one supervised child; never while stopping, never twice."""
+        if self.stopping or name in self.sup_tasks:
+            return
+        argv = [sys.executable, "-u", os.path.join(HERE, self.supervise[name][0])] + list(self.supervise[name][1:])
+        self.log(f"start {name} (supervised: {' '.join(self.supervise[name])})")
+        self.sup_tasks[name] = asyncio.get_running_loop().create_task(self._supervise(name, argv))
+
+    async def _supervise(self, name: str, argv: list[str]) -> None:
+        """Run one supervised child until it exits (no timeout); then alert + pause (every time) and
+        restart it after SUPERVISE_DELAY (no tight loop for a child that dies at once, e.g. a missing
+        key), unless a stop was requested meanwhile (then its exit is expected: request_stop already
+        signalled it)."""
+        def on_pid(pid: int) -> None:
+            self.sup_pids[name] = pid
+        try:
+            out = await self.spawner.run(argv, math.inf, on_pid)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:   # noqa: BLE001 - the runner's own failure: it crashes (as a job run does)
+            self.crash = e
+            return
+        finally:
+            self.sup_tasks.pop(name, None)
+            self.sup_pids.pop(name, None)
+        if not self.stopping:
+            tail = out.stderr[-actions.RUN_ERROR_MAX:]
+            self.log(f"{name} (supervised) exited ({out.returncode}){': ' + tail.splitlines()[0] if tail else ''}")
+            self.fail(f"{name} was not running", f"it exited ({out.returncode}); the runner starts it again in "
+                      f"{SUPERVISE_DELAY:g} s\n{tail}"[:1200])
+            await asyncio.sleep(SUPERVISE_DELAY)
+            self.start_supervised(name)
+        self.wake_event.set()
+
     # ---- the loop
 
     def sleep_for(self, now: datetime) -> float:
@@ -957,6 +1078,9 @@ class Runner:
             self.stopping = True
             self.stop_deadline = time.monotonic() + self.stop_grace
             self.log(f"stop requested: no new runs; {len(self.tasks)} running get up to {self.stop_grace:g} s")
+            for name, pid in list(self.sup_pids.items()):   # never finish on their own: end them now
+                self.log(f"stop: ending {name} (supervised, pid {pid})")
+                _signal_group(pid, signal.SIGTERM)
         self.wake_event.set()
 
     def on_datagram(self, sock: socket.socket) -> None:
@@ -989,6 +1113,8 @@ class Runner:
                 loop.add_signal_handler(sig, self.request_stop)
         sock = self.bind()
         loop.add_reader(sock.fileno(), self.on_datagram, sock)
+        for name in self.supervise:          # S7: inbox_api, started fresh each boot (no alert)
+            self.start_supervised(name)
         try:
             while True:
                 self.wake_event.clear()
@@ -997,7 +1123,7 @@ class Runner:
                 now = self.clock()
                 self.heartbeat(now)
                 if self.stopping:
-                    if not self.tasks or time.monotonic() >= self.stop_deadline:
+                    if (not self.tasks and not self.sup_tasks) or time.monotonic() >= self.stop_deadline:
                         break
                     delay = max(0.0, min(MAX_SLEEP, self.stop_deadline - time.monotonic()))
                 else:
@@ -1021,12 +1147,17 @@ class Runner:
 
     async def _stop_children(self) -> None:
         """Runs still going at the end of the stop grace: their groups get SIGTERM, their rows stay
-        `running` (the next boot records them interrupted and applies the job's policy)."""
-        if not self.tasks:
+        `running` (the next boot records them interrupted and applies the job's policy). A
+        supervised child (request_stop already sent it SIGTERM) is cancelled the same way, with no
+        row to leave behind."""
+        if self.tasks:
+            self.log(f"stop: {', '.join(sorted(self.tasks))} still running after {self.stop_grace:g} s; ended, "
+                     "left for the next boot (interrupted)")
+        if self.sup_tasks:
+            self.log(f"stop: {', '.join(sorted(self.sup_tasks))} (supervised) still running; ended")
+        tasks = list(self.tasks.values()) + list(self.sup_tasks.values())
+        if not tasks:
             return
-        self.log(f"stop: {', '.join(sorted(self.tasks))} still running after {self.stop_grace:g} s; ended, "
-                 "left for the next boot (interrupted)")
-        tasks = list(self.tasks.values())
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1124,6 +1255,30 @@ def watcher_conflict(owns: frozenset[str], local: Callable[[], list[int]] = loca
     except Exception as e:   # noqa: BLE001 - can't tell: don't start (as start_watcher.sh)
         return f"the host's process list is unavailable ({type(e).__name__}: {e})"
     return f"a keep-alive watcher runs on the HOST (pid {', '.join(map(str, hp))})" if hp else None
+
+
+RUNNER_MODES = ("on", "runner")           # AFCLAUDE_SCHEDULER values with the resident runner (as export_quickview)
+
+
+def runner_conflict(conn: Any, env: Optional[dict[str, str]] = None,
+                    now: Optional[datetime] = None) -> Optional[str]:
+    """Why a keep-alive watcher (keepalive.run, docker/start_watcher.sh, start_keepalive.sh) must
+    not start, or None: the reverse of watcher_conflict, since S6 the runner runs the watcher's
+    passes and both would fire. AFCLAUDE_SCHEDULER=on, or a runner that did not exit cleanly whose
+    heartbeat is less than STALE_BEAT old (`ensure`'s bound: a runner on the other side of the
+    bridge, or one that crashed a moment ago). AFCLAUDE_SCHEDULER=legacy after a clean stop: None."""
+    mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
+    if mode in RUNNER_MODES:
+        return f"AFCLAUDE_SCHEDULER={mode}: the resident runner runs the watcher's passes (phase 3a S6)"
+    row = store.get_runner_job(conn, actions.RUNNER_ROW)
+    beat = _parse(row["heartbeat_at"]) if row else None
+    if beat is None or actions.runner_state_get(conn).get("clean_exit") is True:
+        return None
+    age = (now or _utcnow()) - beat
+    if age > STALE_BEAT:
+        return None
+    return (f"the resident runner's heartbeat is {int(age.total_seconds())} s old (fresh: under {STALE_BEAT}) and it "
+            "did not exit cleanly: it runs the watcher's passes; stop it first (`runner.py stop`)")
 
 
 def planned_act(conn: Any, name: str) -> Optional[tuple[str, datetime]]:
@@ -1357,6 +1512,7 @@ def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runn
         out("runner: none running")
         return 0
     for pid in targets:
+        _check_pid(pid)
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + wait_s
@@ -1624,6 +1780,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("wake", help="make the runner re-read the DB now")
     sub.add_parser("ensure", help="cron watchdog (S2-S7): start the runner unless one runs, check its heartbeat")
     sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the entrypoint's TERM trap)")
+    sub.add_parser("watcher-check", help="exit 1 (the reason on stderr) when a keep-alive watcher must not start "
+                                         "(runner_conflict); start_watcher.sh / start_keepalive.sh ask it")
     r = sub.add_parser("shadow-report", help="the shadow times against cron's actual starts (exit 1 on a mismatch)")
     r.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
     r.add_argument("--cron-log", default=None, help=f"supercronic's lines (default data/{CRON_RUNS}; - = stdin, "
@@ -1674,6 +1832,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(json.dumps(st, indent=2, default=str))
             else:
                 print_status(st)
+            return 0
+        if args.cmd == "watcher-check":
+            why = runner_conflict(conn)
+            if why:
+                print(f"not starting a keep-alive watcher: {why}", file=sys.stderr)
+                return 1
             return 0
         if args.cmd == "drain":
             return drain(conn, timedelta(minutes=args.max_wait) if args.max_wait is not None else None)

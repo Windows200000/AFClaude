@@ -1421,7 +1421,22 @@ def last_mile_next_start(now, usage=None):
     return min(future) if future else None
 
 
+def runner_refusal():
+    """Why this watcher must not start (runner.runner_conflict: AFCLAUDE_SCHEDULER=on or a live
+    resident runner, which runs the watcher's passes since phase 3a S6), or None."""
+    import runner
+    import store
+    conn = store.connect()
+    try:
+        return runner.runner_conflict(conn)
+    finally:
+        conn.close()
+
+
 def run(args):
+    why = runner_refusal()
+    if why:
+        sys.exit(f"keepalive.py: not starting the watcher: {why}")
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3671,13 +3686,31 @@ def _act_entry(key, at, sid, run=None):
     return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at, sid), "session": sid}
 
 
+def _act_cut_off(job, run, sid):
+    """The stored act's run `run` was cut off (a timeout, or a runner restart: run_act never
+    rewrote its entry) and the pause that cut-off raised (D-239/D-257) is cleared: its entry is
+    stale. While paused (sid's project too) it stays (no retry while paused); a running run stays."""
+    import failstop
+    import store
+    conn = store.connect()
+    try:
+        rows = store.key_runs(conn, job, run)
+    finally:
+        conn.close()
+    if not rows or any(r["status"] == "running" for r in rows):
+        return False
+    return not failstop.paused(session=sid)["paused"]
+
+
 def store_act(job, sid, key, at, now, hold=False):
     """A plan step's result for the act job `job` of the task-manager `sid`: the dedup key and the time it is due (None: no
     act; the stored one is dropped). An act due now that is pending already (the same key, its time
     come, not run yet: an act always rewrites or drops its entry when it ends) keeps its time and so
     its run key: a plan each minute never plans it twice. An act due now with none pending is due at
     `now` (a new run key: a retry after an act that did not start it). hold: a stored act of the same
-    key keeps its time whatever it is (a HOLD's recheck the act returned). -> the stored time or None."""
+    key keeps its time whatever it is (a HOLD's recheck the act returned). A stored act whose run was
+    cut off is replaced once the owner cleared the pause (_act_cut_off; `sid`: whose project's pause
+    counts too), so the plan decides anew. -> the stored time or None."""
     doc = load_watch()
     acts = doc.setdefault("acts", {})
     name = act_name(job, sid)
@@ -3687,12 +3720,18 @@ def store_act(job, sid, key, at, now, hold=False):
             acts.pop(name)
             save_watch(doc)
         return None
-    cur_at = parse_ts(cur.get("at")) if cur is not None and cur.get("key") == key else None
+    stale = cur is not None and _act_cut_off(job, cur.get("run"), sid)
+    cur_at = parse_ts(cur.get("at")) if cur is not None and cur.get("key") == key and not stale else None
     if cur_at is not None and (hold or cur_at == at or (at <= now and cur_at <= now)):
         return cur_at
     if at <= now:
         at = now
-    acts[name] = _act_entry(key, at, sid)
+    ent = _act_entry(key, at, sid)
+    if stale and ent["run"] == cur.get("run"):
+        ent = _act_entry(key, at, sid, act_run_key(f"{key}.", at, sid))
+    if stale:
+        log(f"{job}: the act {cur.get('run')} was cut off and the pause is cleared; planned anew as {ent['run']}")
+    acts[name] = ent
     save_watch(doc)
     return at
 
@@ -3915,7 +3954,8 @@ def run_act(job, run, sid, now, args):
         nxt, note = ACTS[job](sid, now, args, cur["key"])
     except Exception:
         # it failed (the runner reports it: alert + pause): dropped, so once the owner cleared the pause
-        # the next plan decides again, as the watcher's next pass would (a cut-off act stays: D-257)
+        # the next plan decides again, as the watcher's next pass would (a cut-off act stays until the
+        # pause it raised is cleared, D-257: store_act then replaces it)
         _act_done(job, sid, cur["key"], run, None, now)
         raise
     _act_done(job, sid, cur["key"], run, nxt, now)

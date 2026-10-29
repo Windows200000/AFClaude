@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import keepalive as ka  # noqa: E402
 import schedule  # noqa: E402
+import actions  # noqa: E402
+import store  # noqa: E402
 
 UTC = timezone.utc
 
@@ -1249,6 +1251,52 @@ class WatcherNoContinue(unittest.TestCase):
             self.assertEqual(st["handled"], {})
 
 
+class NoWatcherBesideTheRunner(unittest.TestCase):
+    """Phase 3a S6 follow-up: the watcher (run) refuses to start under AFCLAUDE_SCHEDULER=on or
+    next to a live resident runner (it runs the watcher's passes: both would fire); legacy after
+    the runner's clean stop starts it as before."""
+    def setUp(self):
+        self.conn = store.connect()
+        self.addCleanup(self.conn.close)
+        self.old = ka.LOCK_FILE, ka.STOP_FILE, ka.log
+        self.tmp = tempfile.TemporaryDirectory()
+        ka.LOCK_FILE = os.path.join(self.tmp.name, "ka.lock")
+        ka.STOP_FILE = os.path.join(self.tmp.name, "STOP")       # a watcher that starts exits at its first pass
+        open(ka.STOP_FILE, "w").close()
+        ka.log = lambda line: None
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        ka.LOCK_FILE, ka.STOP_FILE, ka.log = self.old
+        actions.runner_state_put(self.conn, {"clean_exit": True}, actor="runner", via="runner")
+        self.tmp.cleanup()
+
+    def beat(self, age, clean):
+        t = datetime.now(UTC) - age
+        actions.runner_job_set(self.conn, "runner", actor="runner", via="runner", heartbeat_at=t.isoformat())
+        actions.runner_state_put(self.conn, {"clean_exit": clean}, actor="runner", via="runner")
+
+    def refused(self, env):
+        class A:
+            session, arm, once, now = SID, False, True, False
+        from unittest import mock
+        with mock.patch.dict(os.environ, env):
+            try:
+                ka.run(A())
+            except SystemExit as e:
+                return str(e)
+        return None
+
+    def test_on_mode_or_a_live_runner_refuses_legacy_after_a_clean_stop_starts(self):
+        self.beat(timedelta(hours=1), clean=False)
+        self.assertIn("AFCLAUDE_SCHEDULER=on", self.refused({"AFCLAUDE_SCHEDULER": "on"}))
+        self.assertIsNone(self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))          # stale beat: the watcher runs
+        self.beat(timedelta(seconds=40), clean=False)
+        self.assertIn("heartbeat is", self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))
+        self.beat(timedelta(seconds=40), clean=True)                               # `docker stop`, then legacy
+        self.assertIsNone(self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))
+
+
 class PassesThroughTheRunner(unittest.TestCase):
     """Phase 3a S6: the watcher's passes with the resident runner as the caller (the `watch` tick
     stores the acts, the runner starts each under its run key; testenv.runner_pass = one child, a
@@ -1477,6 +1525,34 @@ class PassesThroughTheRunner(unittest.TestCase):
         self.assertIsNone(testenv.act_of(ka, "last_stretch"))
         self.tick(t + timedelta(minutes=1))
         self.assertNotEqual(testenv.act_of(ka, "last_stretch")["run"], a["run"])
+
+    def test_a_timed_out_act_stays_while_paused_and_is_planned_anew_once_cleared(self):
+        """The runner cut the act off (a timeout: alert + pause, D-239/D-257), so run_act never
+        rewrote its entry: no retry while paused; once the owner cleared the pause, a new run key."""
+        self.last_stretch()
+        t = self.R - timedelta(hours=3, minutes=53)
+        self.go = {"go": False, "postpone": False, "reason": "HOLD: x", "text": "t"}
+        self.tick(t)
+        a = testenv.act_of(ka, "last_stretch")
+        conn = store.connect()
+        self.addCleanup(conn.close)
+        rid, _ = actions.run_begin(conn, boot_id="b" * 32, job="last_stretch", key=a["run"], timeout_s=60,
+                                   actor="runner:last_stretch", via="runner")     # (its own t: a run key no other test has)
+        self.tick(t + timedelta(minutes=1))
+        self.assertEqual(testenv.act_of(ka, "last_stretch"), a)           # still running: kept
+        actions.run_end(conn, rid, "timeout", actor="runner:last_stretch", via="runner", error="timed out")
+        actions.perform(conn, "automation.set", {"paused": True, "reason": "last_stretch timed out"},
+                        actor="cli", via="cli")
+        self.addCleanup(testenv.unpause)
+        self.tick(t + timedelta(minutes=2))
+        self.assertEqual(testenv.act_of(ka, "last_stretch"), a)           # paused: no retry
+        testenv.unpause()
+        self.tick(t + timedelta(minutes=3))
+        b = testenv.act_of(ka, "last_stretch")
+        self.assertNotEqual(b["run"], a["run"])
+        self.assertEqual(ka.parse_ts(b["at"]), t + timedelta(minutes=3))
+        self.assertTrue(any("was cut off" in ln for ln in self.logs), self.logs)
+        self.assertEqual(self.act("last_stretch", t + timedelta(minutes=3))["status"], "ok")
 
 
 class RunEnd(unittest.TestCase):
