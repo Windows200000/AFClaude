@@ -3637,7 +3637,12 @@ RUN_KEY_RE = re.compile(r"[^A-Za-z0-9_.:+-]")
 RUN_KEY_MAX = 128
 SESSION_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _STOP_LINE = None        # runner_pass: why the passes are held (STOP / PAUSED), logged when it changes
-MEMO = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
+# The log-once lines of the three passes are per task-manager (phase 3b S3): _LINES = {session: {name:
+# line}}, swapped into the module's _WATCH_LINE / _FILLUP_LINE / _COMPACT_LINE around each session's step
+# (lines_of), so two sessions' alternating lines don't log themselves every minute.
+LINE_NAMES = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE")
+_LINES = {}
+MEMO = ("_LINES", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
 
 
 def load_watch():
@@ -3717,7 +3722,8 @@ def _memo_get():
     g = globals()
     return {"_PAUSE_LOGGED": {("*" if k is None else k): v for k, v in g["_PAUSE_LOGGED"].items()},
             "_FILLUP_BUSY": {k: v.astimezone(UTC).isoformat() for k, v in g["_FILLUP_BUSY"].items()},
-            **{n: g[n] for n in MEMO if n not in ("_PAUSE_LOGGED", "_FILLUP_BUSY")}}
+            "_LINES": json.loads(json.dumps(g["_LINES"])),       # a copy: lines_of changes it in place
+            **{n: g[n] for n in MEMO if n not in ("_PAUSE_LOGGED", "_FILLUP_BUSY", "_LINES")}}
 
 
 def memo_load(doc):
@@ -3947,6 +3953,17 @@ def _pass_args(sid):
     return argparse.Namespace(session=sid, arm=True, now=False, once=True, take_over_idle=False, start_key=None)
 
 
+def lines_of(sid, fn, *a):
+    """fn(*a) with the log-once lines of the task-manager `sid` swapped in (LINE_NAMES), kept after."""
+    g = globals()
+    for n in LINE_NAMES:
+        g[n] = (_LINES.get(sid) or {}).get(n)
+    try:
+        return fn(*a)
+    finally:
+        _LINES[sid] = {n: g[n] for n in LINE_NAMES}
+
+
 def run_tick(job, tms, now):
     """The tick `job` over every task-manager of the registry `tms` (phase 3b S3): each session's plan
     steps in rank order; the result's next_due is the earliest of theirs, the note names the sessions
@@ -3954,7 +3971,7 @@ def run_tick(job, tms, now):
     notes, dues = [], []
     for t in tms:
         sid = t["session"]
-        res = TICKS[job](sid, now, _pass_args(sid))
+        res = lines_of(sid, TICKS[job], sid, now, _pass_args(sid))
         if res.get("note"):
             notes.append(f"{t['name']} {sid[:8]}: {res['note']}" if len(tms) > 1 else str(res["note"]))
         due = parse_ts(res.get("next_due"))
@@ -4000,7 +4017,7 @@ def runner_pass(job, key=None):
             note = f"{job} {key}: not run, its plan changed since (no task-manager has it planned)"
             log(note)
             return {"status": "ok", "note": note}
-        return run_act(job, key, owner, now, _pass_args(owner))
+        return lines_of(owner, run_act, job, key, owner, now, _pass_args(owner))
     finally:
         memo_save(doc, before)
 

@@ -203,7 +203,7 @@ def runner_pass(ka, job, key=None, now=None, session=SID):
     def fresh():
         for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE", "_DB_PAUSE"):
             setattr(ka, n, None)
-        ka._PAUSE_LOGGED, ka._FILLUP_BUSY = {}, {}
+        ka._PAUSE_LOGGED, ka._FILLUP_BUSY, ka._LINES = {}, {}, {}
         ka._COMPACT_TRIED.clear()
     fresh()
     t = now or datetime.now(timezone.utc)

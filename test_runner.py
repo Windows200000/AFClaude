@@ -1792,6 +1792,73 @@ class WatcherPasses(Base):
         self.assertEqual(r.plan(self.now + MIN), [])
         self.assertEqual(self.subjects(), ["a planned act is not valid"])
 
+    SID2 = "22222222-0000-4000-8000-000000000002"
+
+    def two_managers(self):
+        store.add_project(self.conn, "beta")
+        store.update_project(self.conn, "beta", manager_session=self.SID2)
+        store.add_project(self.conn, "gamma")            # no task-manager session yet (D-281): skipped
+        self.conn.commit()
+
+    async def test_each_task_manager_has_its_own_act_and_one_runs_at_a_time(self):
+        """3b S3: acts.<job>:<sid8> per registry session; the earliest due runs, a tie goes to the better rank,
+        the next one when it ends; a run key that ran never runs again."""
+        self.two_managers()
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        run_a = self.store_act("fillup", self.AT + 10 * SEC)
+        run_b = self.store_act("fillup", self.AT, session=self.SID2)
+        self.assertNotEqual(run_a, run_b)                                  # one dedup key, two run keys
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.next_due("fillup"), self.AT.replace(microsecond=0))   # the earliest of the two
+        self.now = self.AT
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_b)                                    # beta's is earlier
+        await self.run_due(r, due)
+        self.now = self.AT + 10 * SEC
+        self.assertEqual(self.next_due("fillup"), (self.AT + 10 * SEC).replace(microsecond=0))   # beta's: ahead
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_a)
+        await self.run_due(r, due)
+        self.assertEqual(r.plan(self.now + MIN), [])
+        self.assertEqual([c[1] for c in self.spawner.calls], [run_b, run_a])
+
+    async def test_a_tie_goes_to_the_better_ranked_project(self):
+        self.two_managers()
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        run_b = self.store_act("fillup", self.AT, session=self.SID2)
+        run_a = self.store_act("fillup", self.AT)
+        self.now = self.AT + MIN
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_a)
+        r.tasks["fillup"] = asyncio.get_running_loop().create_future()      # one is running: the other waits
+        self.assertEqual(r.plan(self.now), [])
+        del r.tasks["fillup"]
+        await self.run_due(r, due)
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_b)
+
+    def test_an_act_of_a_session_outside_the_registry_is_not_planned(self):
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        self.store_act("fillup", self.AT, session=self.SID2)               # beta is no project here
+        self.now = self.AT + MIN
+        self.assertEqual(r.plan(self.now), [])
+        self.assertIsNone(self.next_due("fillup"))
+
+    def test_status_lists_the_task_managers_and_their_plans(self):
+        self.two_managers()
+        run = self.store_act("fillup", self.AT)
+        st = runner.status(self.conn, self.now)
+        self.assertEqual([(t["project"], t["session"]) for t in st["task_managers"]],
+                         [("alpha", self.SID[:8]), ("beta", self.SID2[:8])])
+        self.assertEqual([(p["act"], p["run"]) for p in st["plans"]], [(f"fillup:{self.SID[:8]}", run)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_status(st)
+        self.assertIn(f"plan fillup:{self.SID[:8]}", buf.getvalue())
+
     def test_the_ticks_result_next_due_moves_the_tick_earlier(self):
         r = self.runner(owns={"watch"})
         r.boot()

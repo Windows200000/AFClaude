@@ -277,7 +277,9 @@ def _text(key: str, legacy: str) -> str:
 
 
 def manager_session() -> str:
-    """Session id of the AFClaude manager (keep-alive target; the dispatcher never touches it).
+    """Session id of the AFClaude manager (legacy: phase 3b S3 moved every reader to the task-manager
+    registry, projects.manager_session; only a boot check compares this setting with the registry
+    until 3b S6 removes it).
     Raises ConfigError if the local file (CONFIG_FILE, or $AFCLAUDE_CONFIG) has no manager_session
     (D-235: no baked-in fallback for host-specific data)."""
     v = identity("manager_session")

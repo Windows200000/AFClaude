@@ -53,8 +53,10 @@ watchdog.
 Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
 `run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
 `fillup` and `compaction` are `planned` jobs: a keyed run at the time the pass's plan step stored in
-the keep-alive's runner state (PLANS_COMPONENT, acts.<job> = {key, at, run}; planned_act), under its
-run key once (a run row settles it); a session run (a drain holds it), a cut-off one is an alert +
+the keep-alive's runner state (PLANS_COMPONENT, acts.<job>:<sid8> = {key, at, run, session}; planned_act),
+one plan per task-manager of the registry (phase 3b S3: store.manager_sessions, rank order; the ticks run
+over all of them, the earliest due act of a job runs, one at a time), under its run key once (a run row
+settles it); a session run (a drain holds it), a cut-off one is an alert +
 pause and never reruns (D-257). The job row's next_due is that time while it is ahead.
 
 Window starts (S5, the job "window_start"): a keyed run at each session-window start, to the second
@@ -151,8 +153,9 @@ TINY = timedelta(microseconds=1)
 # once it owns one of them: until then (S2-S5) the watcher ran beside it by design (§4).
 WATCHER_PASSES = frozenset({"watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
                             "compaction"})
-# Where a planned job's next act is (S6): the keep-alive's runner state, acts.<job> = {key, at, run}
-# (its plan step writes it, keepalive.store_act; the runner only reads it).
+# Where a planned job's next act is (S6): the keep-alive's runner state, acts.<job>:<sid8> = {key, at, run,
+# session} per task-manager of the registry (3b S3; its plan step writes it, keepalive.store_act; the runner
+# only reads it).
 PLANS_COMPONENT = "keepalive.watch"
 WATCHER_ONE_SHOT = frozenset({"--window-start", "--plan-fillup-test", "--decide", "--last-mile", "--once",
                               "--work-on", "--run-stopped", "--session-rules"})
@@ -1125,7 +1128,8 @@ def watcher_conflict(owns: frozenset[str], local: Callable[[], list[int]] = loca
 
 def planned_act(conn: Any, name: str) -> Optional[tuple[str, datetime]]:
     """The next act of the planned job `name` (S6): (its run key, when) from the keep-alive's runner
-    state (PLANS_COMPONENT, acts.<name>: {key, at, run}, written by the pass's plan step), or None.
+    state (PLANS_COMPONENT, acts.<name>: {key, at, run}, written by the pass's plan step), or None. `name`
+    is runner_state.act_name(job, session): <job>:<sid8>.
     A stored entry that is not valid raises ValueError."""
     raw = store.state_rows(conn, PLANS_COMPONENT).get(actions._state_json(["acts", name]))
     if raw is None:
