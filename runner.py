@@ -8,6 +8,7 @@
     python3 runner.py undrain             lift a drain (a deploy that did not happen)
     python3 runner.py wake                re-read the DB now (what the senders do after a write)
     python3 runner.py window-report [--hours H]   S5: each session-window start vs its run and decision
+    python3 runner.py watcher-check       exit 1 when a keep-alive watcher must not start (runner_conflict)
 
 One asyncio loop: read the due times, wait for the earliest of them, a wake datagram
 (data/run/runner.sock) or a child's exit, start what is due, repeat; a 60-s longest sleep is the
@@ -1225,6 +1226,30 @@ def watcher_conflict(owns: frozenset[str], local: Callable[[], list[int]] = loca
     return f"a keep-alive watcher runs on the HOST (pid {', '.join(map(str, hp))})" if hp else None
 
 
+RUNNER_MODES = ("on", "runner")           # AFCLAUDE_SCHEDULER values with the resident runner (as export_quickview)
+
+
+def runner_conflict(conn: Any, env: Optional[dict[str, str]] = None,
+                    now: Optional[datetime] = None) -> Optional[str]:
+    """Why a keep-alive watcher (keepalive.run, docker/start_watcher.sh, start_keepalive.sh) must
+    not start, or None: the reverse of watcher_conflict, since S6 the runner runs the watcher's
+    passes and both would fire. AFCLAUDE_SCHEDULER=on, or a runner that did not exit cleanly whose
+    heartbeat is less than STALE_BEAT old (`ensure`'s bound: a runner on the other side of the
+    bridge, or one that crashed a moment ago). AFCLAUDE_SCHEDULER=legacy after a clean stop: None."""
+    mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
+    if mode in RUNNER_MODES:
+        return f"AFCLAUDE_SCHEDULER={mode}: the resident runner runs the watcher's passes (phase 3a S6)"
+    row = store.get_runner_job(conn, actions.RUNNER_ROW)
+    beat = _parse(row["heartbeat_at"]) if row else None
+    if beat is None or actions.runner_state_get(conn).get("clean_exit") is True:
+        return None
+    age = (now or _utcnow()) - beat
+    if age > STALE_BEAT:
+        return None
+    return (f"the resident runner's heartbeat is {int(age.total_seconds())} s old (fresh: under {STALE_BEAT}) and it "
+            "did not exit cleanly: it runs the watcher's passes; stop it first (`runner.py stop`)")
+
+
 def planned_act(conn: Any, name: str) -> Optional[tuple[str, datetime]]:
     """The next act of the planned job `name` (S6): (its run key, when) from the keep-alive's runner
     state (PLANS_COMPONENT, acts.<name>: {key, at, run}, written by the pass's plan step), or None.
@@ -1703,6 +1728,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("wake", help="make the runner re-read the DB now")
     sub.add_parser("ensure", help="cron watchdog (S2-S7): start the runner unless one runs, check its heartbeat")
     sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the entrypoint's TERM trap)")
+    sub.add_parser("watcher-check", help="exit 1 (the reason on stderr) when a keep-alive watcher must not start "
+                                         "(runner_conflict); start_watcher.sh / start_keepalive.sh ask it")
     r = sub.add_parser("shadow-report", help="the shadow times against cron's actual starts (exit 1 on a mismatch)")
     r.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
     r.add_argument("--cron-log", default=None, help=f"supercronic's lines (default data/{CRON_RUNS}; - = stdin, "
@@ -1753,6 +1780,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(json.dumps(st, indent=2, default=str))
             else:
                 print_status(st)
+            return 0
+        if args.cmd == "watcher-check":
+            why = runner_conflict(conn)
+            if why:
+                print(f"not starting a keep-alive watcher: {why}", file=sys.stderr)
+                return 1
             return 0
         if args.cmd == "drain":
             return drain(conn, timedelta(minutes=args.max_wait) if args.max_wait is not None else None)

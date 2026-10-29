@@ -12,6 +12,8 @@ if pgrep -f "^python3 -u [^ ]*keepalive.py --session" >/dev/null; then
   echo "a watcher is already running:"; pgrep -af "^python3 -u [^ ]*keepalive.py --session"
   echo "stop it first: touch $DIR/STOP; sleep 35; rm $DIR/STOP"; exit 1
 fi
+# never beside the resident runner (phase 3a S6: it runs the watcher's passes; the reason on stderr)
+python3 "$DIR/runner.py" watcher-check || exit 1
 rm -f "$DIR/STOP"
 # clean env: no CLAUDECODE / CLAUDE_CODE_* / messaging socket from whoever runs this
 env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL=/bin/bash LANG=C.UTF-8 \

@@ -1421,7 +1421,22 @@ def last_mile_next_start(now, usage=None):
     return min(future) if future else None
 
 
+def runner_refusal():
+    """Why this watcher must not start (runner.runner_conflict: AFCLAUDE_SCHEDULER=on or a live
+    resident runner, which runs the watcher's passes since phase 3a S6), or None."""
+    import runner
+    import store
+    conn = store.connect()
+    try:
+        return runner.runner_conflict(conn)
+    finally:
+        conn.close()
+
+
 def run(args):
+    why = runner_refusal()
+    if why:
+        sys.exit(f"keepalive.py: not starting the watcher: {why}")
     lock = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -3657,13 +3672,31 @@ def _act_entry(key, at, run=None):
     return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at)}
 
 
-def store_act(job, key, at, now, hold=False):
+def _act_cut_off(job, run, sid):
+    """The stored act's run `run` was cut off (a timeout, or a runner restart: run_act never
+    rewrote its entry) and the pause that cut-off raised (D-239/D-257) is cleared: its entry is
+    stale. While paused (sid's project too) it stays (no retry while paused); a running run stays."""
+    import failstop
+    import store
+    conn = store.connect()
+    try:
+        rows = store.key_runs(conn, job, run)
+    finally:
+        conn.close()
+    if not rows or any(r["status"] == "running" for r in rows):
+        return False
+    return not failstop.paused(session=sid)["paused"]
+
+
+def store_act(job, key, at, now, hold=False, sid=None):
     """A plan step's result for the act job `job`: the dedup key and the time it is due (None: no
     act; the stored one is dropped). An act due now that is pending already (the same key, its time
     come, not run yet: an act always rewrites or drops its entry when it ends) keeps its time and so
     its run key: a plan each minute never plans it twice. An act due now with none pending is due at
     `now` (a new run key: a retry after an act that did not start it). hold: a stored act of the same
-    key keeps its time whatever it is (a HOLD's recheck the act returned). -> the stored time or None."""
+    key keeps its time whatever it is (a HOLD's recheck the act returned). A stored act whose run was
+    cut off is replaced once the owner cleared the pause (_act_cut_off; `sid`: whose project's pause
+    counts too), so the plan decides anew. -> the stored time or None."""
     doc = load_watch()
     acts = doc.setdefault("acts", {})
     cur = acts.get(job) if isinstance(acts.get(job), dict) else None
@@ -3672,12 +3705,18 @@ def store_act(job, key, at, now, hold=False):
             acts.pop(job)
             save_watch(doc)
         return None
-    cur_at = parse_ts(cur.get("at")) if cur is not None and cur.get("key") == key else None
+    stale = cur is not None and _act_cut_off(job, cur.get("run"), sid)
+    cur_at = parse_ts(cur.get("at")) if cur is not None and cur.get("key") == key and not stale else None
     if cur_at is not None and (hold or cur_at == at or (at <= now and cur_at <= now)):
         return cur_at
     if at <= now:
         at = now
-    acts[job] = _act_entry(key, at)
+    ent = _act_entry(key, at)
+    if stale and ent["run"] == cur.get("run"):
+        ent = _act_entry(key, at, act_run_key(f"{key}.", at))
+    if stale:
+        log(f"{job}: the act {cur.get('run')} was cut off and the pause is cleared; planned anew as {ent['run']}")
+    acts[job] = ent
     save_watch(doc)
     return at
 
@@ -3747,9 +3786,9 @@ def plan_deferred_act(sid, now, st=None):
     recheck time (+ WAKE_SLACK, as the watcher woke for it)."""
     p = deferred_plan(sid, now, st if st is not None else load_state())
     if p is None:
-        return store_act("deferred_start", None, None, now)
+        return store_act("deferred_start", None, None, now, sid=sid)
     due = parse_ts(p[1].get("recheck_at")) or now
-    return store_act("deferred_start", p[0], due + WAKE_SLACK, now)
+    return store_act("deferred_start", p[0], due + WAKE_SLACK, now, sid=sid)
 
 
 def _fillup_act_at(d, due, fire_now):
@@ -3789,7 +3828,7 @@ def watch_tick(sid, now, args):
     try:
         watch_pass(sid, now, st)
         p = last_stretch_plan(sid, now, st)
-        store_act("last_stretch", p and p["key"], p and now, now, hold=True)
+        store_act("last_stretch", p and p["key"], p and now, now, hold=True, sid=sid)
     except Exception as e:   # noqa: BLE001
         fail_stop(f"watcher pass failed: {type(e).__name__}", str(e)[:500])
     try:
@@ -3799,7 +3838,7 @@ def watch_tick(sid, now, args):
     try:
         d, due, fire_now = _fillup_plan_any(sid, now)
         at = _fillup_act_at(d, due, fire_now)
-        store_act("fillup", d.get("key") if at else None, at, now)
+        store_act("fillup", d.get("key") if at else None, at, now, sid=sid)
         start = d.get("start")
         if at is not None and not fire_now and isinstance(start, datetime) and start - FILLUP_PREFETCH > now:
             nxt.append(start - FILLUP_PREFETCH)          # refresh the usage ahead of the start
@@ -3819,7 +3858,7 @@ def compaction_check_tick(sid, now, args):
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235), reported as the watcher did
         fail_stop(f"compaction pass failed: {type(e).__name__}", str(e)[:500])
         return {"status": "ok", "note": "the check failed"}
-    store_act("compaction", d.key if ready else None, now if ready else None, now, hold=True)
+    store_act("compaction", d.key if ready else None, now if ready else None, now, hold=True, sid=sid)
     return {"status": "ok", "note": d.reason if d is not None else ""}
 
 
@@ -3898,7 +3937,8 @@ def run_act(job, run, sid, now, args):
         nxt, note = ACTS[job](sid, now, args, cur["key"])
     except Exception:
         # it failed (the runner reports it: alert + pause): dropped, so once the owner cleared the pause
-        # the next plan decides again, as the watcher's next pass would (a cut-off act stays: D-257)
+        # the next plan decides again, as the watcher's next pass would (a cut-off act stays until the
+        # pause it raised is cleared, D-257: store_act then replaces it)
         _act_done(job, cur["key"], run, None, now)
         raise
     _act_done(job, cur["key"], run, nxt, now)
