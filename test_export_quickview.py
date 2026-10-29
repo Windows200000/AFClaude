@@ -972,6 +972,22 @@ class TmuxTile(unittest.TestCase):
         testenv.fresh_db(self)
         self.old = qv.ka.tmux_has
         self.addCleanup(setattr, qv.ka, "tmux_has", self.old)
+        self.addCleanup(setattr, qv, "SELF_SESSION", qv.SELF_SESSION)
+        qv.SELF_SESSION = testenv.SID
+
+    def test_self_session_comes_from_the_registry(self):
+        """3b S3: the quickview's own session is the task-manager of the stages project (the registry)."""
+        conn = store.connect()
+        try:
+            store.add_project(conn, qv.STAGES_PROJECT)
+            with self.assertRaisesRegex(ValueError, "no task-manager session yet"):
+                qv.registry_self_session(qv.STAGES_PROJECT)
+            store.update_project(conn, qv.STAGES_PROJECT, manager_session=testenv.SID)
+        finally:
+            conn.close()
+        self.assertEqual(qv.registry_self_session(qv.STAGES_PROJECT), testenv.SID)
+        with self.assertRaisesRegex(ValueError, "no project"):
+            qv.registry_self_session("Nope")
 
     def test_tile(self):
         self.assertEqual(qv.tmux_block(), {"tmux_name": None, "tmux_ka_exists": None,

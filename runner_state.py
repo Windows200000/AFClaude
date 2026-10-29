@@ -357,6 +357,12 @@ def _side_ids(path: str) -> set[str]:
         return set()
 
 
+def act_name(job: str, session: str) -> str:
+    """The plan key of the planned act `job` of the task-manager `session` in the keep-alive's
+    runner state (acts.<job>:<sid8>, phase 3b S3): the keep-alive writes it, the runner reads it."""
+    return f"{job}:{session[:8]}"
+
+
 def own_sessions(path: Optional[str] = None) -> set[str]:
     """The session ids listed as AFClaude's own (driven_sessions kind 'own'; the CLI `own add`
     adds one). `path`: a side list file (tests) is read as a file; the live one (None or

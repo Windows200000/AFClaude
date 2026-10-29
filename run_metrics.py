@@ -546,10 +546,17 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
     now = now or datetime.now(UTC)
     out_path = out_path or RUNS_FILE
     if session is None:
+        # only for fire records older than their `session` field: the task-manager that existed then is
+        # the registry's first (phase 3b S3; the records carry the session from now on)
         try:
-            import afclaude_config
-            session = afclaude_config.manager_session()
-        except Exception:   # noqa: BLE001 - the fire records carry the session from now on
+            import store
+            conn = store.connect()
+            try:
+                tms = store.manager_sessions(conn)
+            finally:
+                conn.close()
+            session = str(tms[0]["session"]) if tms else None
+        except Exception:   # noqa: BLE001 - advisory: those old fires then have no session
             session = None
     runs = group_fires(fires_from_states(load_states(state_paths), session))
     rows = {r.get("run_id"): r for r in read_rows(out_path) if isinstance(r, dict)}

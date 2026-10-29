@@ -1098,11 +1098,11 @@ class ThroughTheRunner:
         res = testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
         self.assertEqual(res["status"], "ok")
         d = self.checks[0]
-        act = testenv.act_of(ka, "compaction")
+        act = testenv.act_of(ka, "compaction", SID)
         if act is not None:
             self.assertEqual(act["key"], d.key)
             testenv.runner_act(ka, "compaction", now=t, session=SID)
-            self.assertIsNone(testenv.act_of(ka, "compaction"))          # the act ended: its entry is dropped
+            self.assertIsNone(testenv.act_of(ka, "compaction", SID))          # the act ended: its entry is dropped
         recs = ka.load_state().get("compactions") or {}
         return d, (recs.get(d.key) if d is not None and d.key else None)
 
@@ -1124,7 +1124,7 @@ class CompactWhenIdleRunner(ThroughTheRunner, CompactWhenIdle):
         res = testenv.runner_pass(ka, "compaction_check", now=datetime.now(UTC), session=SID)
         self.assertEqual(res["note"], "the check failed")
         self.assertIn("compaction pass failed: RuntimeError", self.paused()["reason"])
-        self.assertIsNone(testenv.act_of(ka, "compaction"))
+        self.assertIsNone(testenv.act_of(ka, "compaction", SID))
         self.assertEqual(self.sent, [])
 
 
@@ -1154,11 +1154,11 @@ class RunnerActs(ThroughTheRunner, Env):
     def test_a_check_due_stores_the_act_and_a_changed_plan_is_not_run(self):
         t = datetime.now(UTC)
         testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
-        act = testenv.act_of(ka, "compaction")
+        act = testenv.act_of(ka, "compaction", SID)
         self.assertEqual(act["key"], self.checks[0].key)
         self.assertEqual(ka.parse_ts(act["at"]), t)
         testenv.runner_pass(ka, "compaction_check", now=t + timedelta(minutes=1), session=SID)   # a minute on: still pending
-        self.assertEqual(testenv.act_of(ka, "compaction"), act)                     # same run key: never twice
+        self.assertEqual(testenv.act_of(ka, "compaction", SID), act)                     # same run key: never twice
         res = testenv.runner_pass(ka, "compaction", "compact-other.20261005T000000", now=t, session=SID)
         self.assertIn("its plan changed", res["note"])
         self.assertEqual(self.sent, [])
@@ -1168,15 +1168,15 @@ class RunnerActs(ThroughTheRunner, Env):
     def test_the_lock_held_by_a_start_drops_the_act_and_the_next_check_plans_again(self):
         t = datetime.now(UTC)
         testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
-        first = testenv.act_of(ka, "compaction")
+        first = testenv.act_of(ka, "compaction", SID)
         lock = ka.session_lock(SID)
         try:
             testenv.runner_act(ka, "compaction", now=t, session=SID)
         finally:
             ka.release_lock(lock)
-        self.assertIsNone(testenv.act_of(ka, "compaction"))
+        self.assertIsNone(testenv.act_of(ka, "compaction", SID))
         testenv.runner_pass(ka, "compaction_check", now=t + timedelta(minutes=1), session=SID)
-        again = testenv.act_of(ka, "compaction")
+        again = testenv.act_of(ka, "compaction", SID)
         self.assertNotEqual(again["run"], first["run"])                              # a new run key
         testenv.runner_act(ka, "compaction", now=t + timedelta(minutes=1), session=SID)
         self.assertEqual(ka.load_state()["compactions"][again["key"]]["status"], "compacted")

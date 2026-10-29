@@ -776,6 +776,21 @@ def run_fit(days: int, projects_dir: str, main_session: Optional[str], now: date
     return fit(read_samples(since), reqs, prev, now, scans)
 
 
+def registry_session(session: Optional[str]) -> str:
+    """The task-manager session the CLI looks at: `session`, else the first project's of the registry
+    (store.manager_sessions, rank order; phase 3b S3). None at all is a ValueError (D-235)."""
+    if session:
+        return session
+    conn = store.connect()
+    try:
+        tms = store.manager_sessions(conn)
+    finally:
+        conn.close()
+    if not tms:
+        raise ValueError("no project has a task-manager session (projects.manager_session); pass --session")
+    return str(tms[0]["session"])
+
+
 def summary(m: Mapping[str, Any]) -> str:
     be = break_even(m)
     w = m["weights"]
@@ -798,8 +813,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     f.add_argument("--projects-dir", default=os.environ.get("KEEPALIVE_PROJECTS_DIR",
                                                             os.path.expanduser("~/.claude/projects")))
     f.add_argument("--store", action="store_true", help="store it (the audited action cost_model.set)")
+    f.add_argument("--session", default=None, help="session id (default: the first project's task-manager)")
     c = sub.add_parser("context", help="the task-manager's context, cache and per-message costs (JSON)")
-    c.add_argument("--session", default=None, help="session id (default: the manager session)")
+    c.add_argument("--session", default=None, help="session id (default: the first project's task-manager)")
     c.add_argument("--days", type=int, default=7)
     args = ap.parse_args(argv)
     now = datetime.now(UTC)
@@ -809,8 +825,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(m, indent=1))
             print(summary(m))
         elif args.cmd == "fit":
-            import afclaude_config
-            m = run_fit(args.days, args.projects_dir, afclaude_config.manager_session(), now)
+            m = run_fit(args.days, args.projects_dir, registry_session(args.session), now)
             print(json.dumps(m, indent=1))
             print(summary(m))
             if args.store:
@@ -819,9 +834,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 print("not stored (pass --store)")
         else:
-            import afclaude_config
             import keepalive
-            sid = args.session or afclaude_config.manager_session()
+            sid = registry_session(args.session)
             path = getattr(keepalive, "transcript_path")(sid)
             print(json.dumps(context_block(path, now, days=args.days), indent=1, default=str))
     except FitError as e:

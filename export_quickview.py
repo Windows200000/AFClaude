@@ -64,18 +64,35 @@ USAGE_REVIEW_STATE_FILE = os.path.join(HERE, "data", "usage_review_state.json")
 AT_SPOOL_DIR = os.path.join(HERE, "data", "at_spool")   # legacy (frozen): jobs the at-shim adopts
 DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
     "~/.claude/projects/-mnt-BlockVolume-Claude/memory/task_manager_mcp_plan.md"))
-# This manager's own session/tmux (data/afclaude.json manager_session, as usage_report.py).
-# A display path (D-239): a missing manager_session must not crash the export (no page update,
-# no alert, every 3 min); it is shown on the page instead (status.json self_session_error), and
-# every SELF_SESSION-dependent field below degrades to unknown rather than raising.
-try:
-    SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or afclaude_config.manager_session()
-    SELF_SESSION_ERROR = None
-except afclaude_config.ConfigError as e:
-    SELF_SESSION = None
-    SELF_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
+# This manager's own session/tmux: the task-manager of the project STAGES_PROJECT in the registry
+# (projects.manager_session, phase 3b S3; the machine setting is not read). A display path (D-239): a
+# project without a task-manager session, or an unreadable registry, must not crash the export (no
+# page update, no alert, every 3 min); it is shown on the page instead (status.json self_session_error),
+# and every SELF_SESSION-dependent field below degrades to unknown rather than raising.
+
+
+def registry_self_session(project):
+    """The task-manager session of `project` (name or id) from the registry. Raises ValueError."""
+    conn = store.connect()
+    try:
+        p = store.get_project(conn, project)
+    finally:
+        conn.close()
+    if p is None:
+        raise ValueError(f"no project {project!r} in the registry")
+    if not p.get("manager_session"):
+        raise ValueError(f"project {p['name']!r} has no task-manager session yet")
+    return p["manager_session"]
+
+
+try:
+    SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or registry_self_session(STAGES_PROJECT)
+    SELF_SESSION_ERROR = None
+except Exception as e:   # noqa: BLE001 - a display path: shown, never raised (D-239)
+    SELF_SESSION = None
+    SELF_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
 # D-211: the step key (as build_stages() keys steps, e.g. "6a") from which a non-blocking owner
 # preview build of the dashboard UI first becomes possible (docs/dashboard_design/10_deployment.md §10.9). A
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.

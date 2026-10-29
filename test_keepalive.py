@@ -1554,10 +1554,6 @@ class PassesThroughTheRunner(unittest.TestCase):
         self.assertTrue(any("was cut off" in ln for ln in self.logs), self.logs)
         self.assertEqual(self.act("last_stretch", t + timedelta(minutes=3))["status"], "ok")
 
-    def test_the_session_must_be_given(self):
-        with self.assertRaisesRegex(RuntimeError, "FULL session UUID"):
-            testenv.runner_pass(ka, "watch", now=self.NIGHT, session="00000000")
-
 
 class RunEnd(unittest.TestCase):
     """D-224: a run ends at the earliest of the task-manager's clean stop (--run-stopped), RUN_IDLE,

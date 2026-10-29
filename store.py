@@ -1732,6 +1732,53 @@ def task_managers(conn: sqlite3.Connection) -> list[Row]:
     return out
 
 
+def manager_sessions(conn: sqlite3.Connection) -> list[Row]:
+    """The registry rows that have a task-manager session, in rank order: what every per-session
+    runner job acts on (phase 3b S3). A project whose session is not created yet (D-281: at its
+    first start) is skipped here, not an error."""
+    return [t for t in task_managers(conn) if t["session"]]
+
+
+# Until phase 3b S4's project selection exists, at most ONE project may have a task-manager session:
+# nothing yet decides which project a start, a last-stretch slot or a fill-up continues, so a second
+# session (e.g. the owner's own interactive chat registered by mistake) would get /compact and continue
+# prompts typed into it. project.edit refuses a second one (actions.project_edit, check_one_manager)
+# and the runner path fails (registry_sessions / start_manager: alert + pause, D-235). S4 drops it.
+ONE_MANAGER_UNTIL_S4 = True
+
+
+def check_one_manager(tms: list[Row]) -> None:
+    """The registry rows `tms` (manager_sessions) hold at most one task-manager session until 3b
+    S4 (ONE_MANAGER_UNTIL_S4), else ValueError naming them (the runner path fail-stops, D-235)."""
+    if ONE_MANAGER_UNTIL_S4 and len(tms) > 1:
+        have = ", ".join(f"{t['name']} {str(t['session'])[:8]}" for t in tms)
+        raise ValueError(f"{len(tms)} projects have a task-manager session ({have}); until phase 3b S4's project "
+                         "selection only one may (clear the others: tasks.py project edit NAME --manager '')")
+
+
+def start_manager(conn: sqlite3.Connection) -> Row:
+    """The task-manager a session-window start continues until 3b S4's project selection exists:
+    the first of the registry (rank order, D-064) that is not paused (D-244), else the first (its own
+    pause then holds the start, as it does today). No task-manager at all, or more than one
+    (check_one_manager), is an error (D-235)."""
+    tms = manager_sessions(conn)
+    if not tms:
+        raise ValueError("no project has a task-manager session (projects.manager_session): nothing to start")
+    check_one_manager(tms)
+    return next((t for t in tms if not t["paused"]), tms[0])
+
+
+def check_manager_setting(conn: sqlite3.Connection, setting: str) -> None:
+    """The boot check of phase 3b S3 (docs/phase3b_plan.md §3.3), while the machine setting
+    manager_session (or a legacy --session) still exists: it must be a registered task-manager
+    session, else ValueError (the caller fail-stops, D-235)."""
+    tms = manager_sessions(conn)
+    if setting not in {str(t["session"]) for t in tms}:
+        have = ", ".join(f"{t['name']} {str(t['session'])[:8]}" for t in tms) or "none"
+        raise ValueError(f"the session {setting[:8]} (setting manager_session / --session) is no project's "
+                         f"task-manager in the registry (projects.manager_session: {have})")
+
+
 def update_project(conn: sqlite3.Connection, ref: object, **fields: object) -> Row:
     """Rename a project or change its description/path/manager_session. A
     manager_session (full session id; empty = none) makes the project managed:

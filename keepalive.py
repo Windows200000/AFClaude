@@ -3632,8 +3632,10 @@ def _compact_now(sid, path, d, rec, head):
 # the plan steps of the last stretch, the postponed / planned starts and the fill-up), `compaction_check`
 # (60 s) and `run_readings` (5 min). What types into the session is an act run of its own (last_stretch,
 # deferred_start, fillup, compaction) at the time its plan step stored: the plan step writes
-# acts.<job> = {key: the pass's dedup key, at, run: the run's key} into the runner state 'keepalive.watch'
-# (store_act); the runner wakes at `at` and starts the act under `run` (runner.planned_act); the act
+# acts.<job>:<sid8> = {key: the pass's dedup key, at, run: the run's key, session} into the runner state
+# 'keepalive.watch' (store_act; phase 3b S3: one plan per task-manager of the registry, store.task_managers,
+# so the key and the run key carry the session's first 8 characters); the runner wakes at `at` and starts
+# the act under `run` (runner.planned_act); the act
 # re-plans first (still the same dedup key, still due) and then acts as the watcher does, with the
 # watcher's dedup (handled, compactions: a rollback to legacy starts nothing twice). An act cut off by a
 # restart is never rerun (D-257: its run key is settled). The watcher's in-memory timing is stored
@@ -3650,7 +3652,12 @@ RUN_KEY_RE = re.compile(r"[^A-Za-z0-9_.:+-]")
 RUN_KEY_MAX = 128
 SESSION_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _STOP_LINE = None        # runner_pass: why the passes are held (STOP / PAUSED), logged when it changes
-MEMO = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
+# The log-once lines of the three passes are per task-manager (phase 3b S3): _LINES = {session: {name:
+# line}}, swapped into the module's _WATCH_LINE / _FILLUP_LINE / _COMPACT_LINE around each session's step
+# (lines_of), so two sessions' alternating lines don't log themselves every minute.
+LINE_NAMES = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE")
+_LINES = {}
+MEMO = ("_LINES", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
 
 
 def load_watch():
@@ -3662,14 +3669,36 @@ def save_watch(d):
         log("the passes' runner state (keepalive.watch) was not saved (recorded in data/ALERTS.fallback.md)")
 
 
-def act_run_key(key, at):
-    """The run key of the act for the dedup key `key` at `at` (runner_runs: one run per key)."""
+def act_name(job, sid):
+    """The plan key of the act `job` of the task-manager `sid` (phase 3b S3): <job>:<sid8>."""
+    return runner_state.act_name(job, sid)
+
+
+def act_run_key(key, at, sid=None):
+    """The run key of the act for the dedup key `key` at `at` (runner_runs: one run per key; the
+    dedup key is the same for every task-manager, so the run key carries the session's 8 characters)."""
     tail = "." + at.astimezone(UTC).strftime("%Y%m%dT%H%M%S")
-    return RUN_KEY_RE.sub("_", str(key))[:RUN_KEY_MAX - len(tail)] + tail
+    head = f"{sid[:8]}." if sid else ""
+    return RUN_KEY_RE.sub("_", head + str(key))[:RUN_KEY_MAX - len(tail)] + tail
 
 
-def _act_entry(key, at, run=None):
-    return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at)}
+def drop_legacy_acts():
+    """Drop the plans stored under the pre-S3 keys acts.<job> (no session suffix): nothing reads them
+    any more (the runner and run_act look up acts.<job>:<sid8>), so they would only linger. Writes
+    only when there is one, i.e. once. -> the dropped names."""
+    doc = load_watch()
+    acts = doc.get("acts") or {}
+    old = [j for j in ACT_JOBS if j in acts]
+    if old:
+        for j in old:
+            acts.pop(j)
+        save_watch(doc)
+        log(f"dropped the pre-S3 act plans {', '.join(f'acts.{j}' for j in old)} (now one per task-manager)")
+    return old
+
+
+def _act_entry(key, at, sid, run=None):
+    return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at, sid), "session": sid}
 
 
 def _act_cut_off(job, run, sid):
@@ -3688,8 +3717,8 @@ def _act_cut_off(job, run, sid):
     return not failstop.paused(session=sid)["paused"]
 
 
-def store_act(job, key, at, now, hold=False, sid=None):
-    """A plan step's result for the act job `job`: the dedup key and the time it is due (None: no
+def store_act(job, sid, key, at, now, hold=False):
+    """A plan step's result for the act job `job` of the task-manager `sid`: the dedup key and the time it is due (None: no
     act; the stored one is dropped). An act due now that is pending already (the same key, its time
     come, not run yet: an act always rewrites or drops its entry when it ends) keeps its time and so
     its run key: a plan each minute never plans it twice. An act due now with none pending is due at
@@ -3699,10 +3728,11 @@ def store_act(job, key, at, now, hold=False, sid=None):
     counts too), so the plan decides anew. -> the stored time or None."""
     doc = load_watch()
     acts = doc.setdefault("acts", {})
-    cur = acts.get(job) if isinstance(acts.get(job), dict) else None
+    name = act_name(job, sid)
+    cur = acts.get(name) if isinstance(acts.get(name), dict) else None
     if key is None or at is None:
-        if job in acts:
-            acts.pop(job)
+        if name in acts:
+            acts.pop(name)
             save_watch(doc)
         return None
     stale = cur is not None and _act_cut_off(job, cur.get("run"), sid)
@@ -3711,33 +3741,34 @@ def store_act(job, key, at, now, hold=False, sid=None):
         return cur_at
     if at <= now:
         at = now
-    ent = _act_entry(key, at)
+    ent = _act_entry(key, at, sid)
     if stale and ent["run"] == cur.get("run"):
-        ent = _act_entry(key, at, act_run_key(f"{key}.", at))
+        ent = _act_entry(key, at, sid, act_run_key(f"{key}.", at, sid))
     if stale:
         log(f"{job}: the act {cur.get('run')} was cut off and the pause is cleared; planned anew as {ent['run']}")
-    acts[job] = ent
+    acts[name] = ent
     save_watch(doc)
     return at
 
 
-def _act_done(job, key, run, nxt, now):
+def _act_done(job, sid, key, run, nxt, now):
     """An act ended: its entry is dropped (nxt None) or due again at `nxt` (never under the run key
     that just ran), unless a plan step replaced it meanwhile."""
     doc = load_watch()
     acts = doc.setdefault("acts", {})
-    cur = acts.get(job)
+    name = act_name(job, sid)
+    cur = acts.get(name)
     if isinstance(cur, dict) and cur.get("run") != run:
         return
     if nxt is None:
-        if job in acts:
-            acts.pop(job)
+        if name in acts:
+            acts.pop(name)
             save_watch(doc)
         return
-    run2 = act_run_key(key, nxt)
+    run2 = act_run_key(key, nxt, sid)
     if run2 == run:
-        run2 = act_run_key(f"{key}.", max(nxt, now))
-    acts[job] = _act_entry(key, nxt, run2)
+        run2 = act_run_key(f"{key}.", max(nxt, now), sid)
+    acts[name] = _act_entry(key, nxt, sid, run2)
     save_watch(doc)
 
 
@@ -3745,7 +3776,8 @@ def _memo_get():
     g = globals()
     return {"_PAUSE_LOGGED": {("*" if k is None else k): v for k, v in g["_PAUSE_LOGGED"].items()},
             "_FILLUP_BUSY": {k: v.astimezone(UTC).isoformat() for k, v in g["_FILLUP_BUSY"].items()},
-            **{n: g[n] for n in MEMO if n not in ("_PAUSE_LOGGED", "_FILLUP_BUSY")}}
+            "_LINES": json.loads(json.dumps(g["_LINES"])),       # a copy: lines_of changes it in place
+            **{n: g[n] for n in MEMO if n not in ("_PAUSE_LOGGED", "_FILLUP_BUSY", "_LINES")}}
 
 
 def memo_load(doc):
@@ -3786,9 +3818,9 @@ def plan_deferred_act(sid, now, st=None):
     recheck time (+ WAKE_SLACK, as the watcher woke for it)."""
     p = deferred_plan(sid, now, st if st is not None else load_state())
     if p is None:
-        return store_act("deferred_start", None, None, now, sid=sid)
+        return store_act("deferred_start", sid, None, None, now)
     due = parse_ts(p[1].get("recheck_at")) or now
-    return store_act("deferred_start", p[0], due + WAKE_SLACK, now, sid=sid)
+    return store_act("deferred_start", sid, p[0], due + WAKE_SLACK, now)
 
 
 def _fillup_act_at(d, due, fire_now):
@@ -3828,7 +3860,7 @@ def watch_tick(sid, now, args):
     try:
         watch_pass(sid, now, st)
         p = last_stretch_plan(sid, now, st)
-        store_act("last_stretch", p and p["key"], p and now, now, hold=True, sid=sid)
+        store_act("last_stretch", sid, p and p["key"], p and now, now, hold=True)
     except Exception as e:   # noqa: BLE001
         fail_stop(f"watcher pass failed: {type(e).__name__}", str(e)[:500])
     try:
@@ -3838,7 +3870,7 @@ def watch_tick(sid, now, args):
     try:
         d, due, fire_now = _fillup_plan_any(sid, now)
         at = _fillup_act_at(d, due, fire_now)
-        store_act("fillup", d.get("key") if at else None, at, now, sid=sid)
+        store_act("fillup", sid, d.get("key") if at else None, at, now)
         start = d.get("start")
         if at is not None and not fire_now and isinstance(start, datetime) and start - FILLUP_PREFETCH > now:
             nxt.append(start - FILLUP_PREFETCH)          # refresh the usage ahead of the start
@@ -3858,7 +3890,7 @@ def compaction_check_tick(sid, now, args):
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235), reported as the watcher did
         fail_stop(f"compaction pass failed: {type(e).__name__}", str(e)[:500])
         return {"status": "ok", "note": "the check failed"}
-    store_act("compaction", d.key if ready else None, now if ready else None, now, hold=True, sid=sid)
+    store_act("compaction", sid, d.key if ready else None, now if ready else None, now, hold=True)
     return {"status": "ok", "note": d.reason if d is not None else ""}
 
 
@@ -3925,10 +3957,10 @@ ACTS = {"last_stretch": _act_last_stretch, "deferred_start": _act_deferred_start
 
 
 def run_act(job, run, sid, now, args):
-    """The runner's act job `job` under its run key `run`: only while it is still the stored act
-    (a plan step may have replaced it), re-planned and acted on by ACTS[job]; its entry is then
-    rewritten or dropped (_act_done)."""
-    cur = (load_watch().get("acts") or {}).get(job)
+    """The runner's act job `job` of the task-manager `sid` under its run key `run`: only while it is
+    still the stored act (a plan step may have replaced it), re-planned and acted on by ACTS[job]; its
+    entry is then rewritten or dropped (_act_done)."""
+    cur = (load_watch().get("acts") or {}).get(act_name(job, sid))
     if not isinstance(cur, dict) or cur.get("run") != run:
         note = f"{job} {run}: not run, its plan changed since (now {cur.get('run') if isinstance(cur, dict) else 'none'})"
         log(note)
@@ -3939,44 +3971,118 @@ def run_act(job, run, sid, now, args):
         # it failed (the runner reports it: alert + pause): dropped, so once the owner cleared the pause
         # the next plan decides again, as the watcher's next pass would (a cut-off act stays until the
         # pause it raised is cleared, D-257: store_act then replaces it)
-        _act_done(job, cur["key"], run, None, now)
+        _act_done(job, sid, cur["key"], run, None, now)
         raise
-    _act_done(job, cur["key"], run, nxt, now)
+    _act_done(job, sid, cur["key"], run, nxt, now)
     return {"status": "ok", "note": note}
 
 
+def registry_sessions():
+    """The task-managers the per-session runner jobs act on (store.manager_sessions, rank order; a
+    project with no session yet is skipped, D-281): [{session, name, paused, ...}]. None at all, or
+    more than one until 3b S4 (store.check_one_manager), raises: the tick or act fails (the runner
+    alerts + pauses, D-235) instead of doing nothing, or acting on a session nothing selected."""
+    import store
+    conn = store.connect()
+    try:
+        tms = store.retrying(lambda: store.manager_sessions(conn), conn)
+    finally:
+        conn.close()
+    if not tms:
+        raise RuntimeError("no project has a task-manager session (projects.manager_session): the keep-alive "
+                           "passes have no session to act on")
+    try:
+        store.check_one_manager(tms)
+    except ValueError as e:
+        raise RuntimeError(str(e)) from None
+    for t in tms:
+        if not re.fullmatch(SESSION_RE, str(t["session"])):
+            raise RuntimeError(f"project {t['name']!r}: its task-manager session must be the FULL session UUID, "
+                               f"got {t['session']!r}")
+    return tms
+
+
+def start_session():
+    """The session a session-window start continues (store.start_manager: the registry's first
+    unpaused task-manager until 3b S4's project selection). A registry without one raises."""
+    import store
+    conn = store.connect()
+    try:
+        return str(store.retrying(lambda: store.start_manager(conn), conn)["session"])
+    finally:
+        conn.close()
+
+
+def _pass_args(sid):
+    return argparse.Namespace(session=sid, arm=True, now=False, once=True, take_over_idle=False, start_key=None)
+
+
+def lines_of(sid, fn, *a):
+    """fn(*a) with the log-once lines of the task-manager `sid` swapped in (LINE_NAMES), kept after."""
+    g = globals()
+    for n in LINE_NAMES:
+        g[n] = (_LINES.get(sid) or {}).get(n)
+    try:
+        return fn(*a)
+    finally:
+        _LINES[sid] = {n: g[n] for n in LINE_NAMES}
+
+
+def run_tick(job, tms, now):
+    """The tick `job` over every task-manager of the registry `tms` (phase 3b S3): each session's plan
+    steps in rank order; the result's next_due is the earliest of theirs, the note names the sessions
+    that had one."""
+    notes, dues = [], []
+    for t in tms:
+        sid = t["session"]
+        res = lines_of(sid, TICKS[job], sid, now, _pass_args(sid))
+        if res.get("note"):
+            notes.append(f"{t['name']} {sid[:8]}: {res['note']}" if len(tms) > 1 else str(res["note"]))
+        due = parse_ts(res.get("next_due"))
+        if due is not None:
+            dues.append(due)
+    return {"status": "ok", "note": "; ".join(notes),
+            "next_due": min(dues).astimezone(UTC).isoformat() if dues else None}
+
+
 def runner_pass(job, key=None):
-    """runner_jobs.py's entry for the watcher's passes (the section comment): the tick `job`, or the
-    act `job` under its run key `key`, on the task-manager session $AFCLAUDE_MANAGER_SESSION, armed
-    (as the watcher ran). -> {status ok|skipped, note, next_due}. A missing session or key raises."""
+    """runner_jobs.py's entry for the watcher's passes (the section comment): the tick `job` over every
+    task-manager of the registry, or the act `job` under its run key `key` on the task-manager whose
+    plan it is, armed (as the watcher ran). -> {status ok|skipped, note, next_due}. A missing key raises."""
     global _STOP_LINE
-    sid = os.environ.get("AFCLAUDE_MANAGER_SESSION") or ""
-    if not re.fullmatch(SESSION_RE, sid):
-        raise RuntimeError(f"AFCLAUDE_MANAGER_SESSION must be the FULL session UUID, got {sid!r}")
     if job not in TICKS and job not in ACTS:
         raise RuntimeError(f"unknown keep-alive pass {job!r}")
     if job in ACTS and not key:
         raise RuntimeError(f"the act {job} needs its run key")
     afclaude_config.LOG = log
+    tms = registry_sessions()
+    drop_legacy_acts()
     doc = load_watch()
     before = memo_load(doc)
     try:
+        owner = None
+        if job in ACTS:
+            owner = next((t["session"] for t in tms
+                          if ((doc.get("acts") or {}).get(act_name(job, t["session"])) or {}).get("run") == key), None)
         why = watcher_stopped()
         if why:
             if why != _STOP_LINE:
                 log(f"keep-alive passes held: {why}")
                 _STOP_LINE = why
-            if job in ACTS:     # not started: dropped, so a plan once the file is gone plans it anew (a new run key)
-                _act_done(job, None, key, None, _now())
+            if owner:     # not started: dropped, so a plan once the file is gone plans it anew (a new run key)
+                _act_done(job, owner, None, key, None, _now())
             return {"status": "skipped", "note": why}
         if _STOP_LINE is not None:
             log("keep-alive passes run again: the watcher's STOP / PAUSED file is gone")
             _STOP_LINE = None
-        args = argparse.Namespace(session=sid, arm=True, now=False, once=True, take_over_idle=False, start_key=None)
         now = _now()
         if job in TICKS:
-            return TICKS[job](sid, now, args)
-        return run_act(job, key, sid, now, args)
+            return run_tick(job, tms, now)
+        if owner is None:
+            note = f"{job} {key}: not run, its plan changed since (no task-manager has it planned)"
+            log(note)
+            return {"status": "ok", "note": note}
+        return lines_of(owner, run_act, job, key, owner, now, _pass_args(owner))
     finally:
         memo_save(doc, before)
 
@@ -4070,7 +4176,7 @@ def main():
     ap.add_argument("--remaining", type=float, default=3.0, help="with --plan-fillup-test: session %% left to fill")
     ap.add_argument("--run-stopped", action="store_true",
                     help="the task-manager stopped cleanly: its run is over now (D-224; the session: --session, "
-                         "else this Claude Code session, else the manager session)")
+                         "else this Claude Code session)")
     ap.add_argument("--session-rules", choices=list(RULES_PARTS), metavar="PART",
                     help="the repo's SessionStart hook (D-225): print one part of the standing rules "
                          f"({' / '.join(RULES_PARTS)}) as hook JSON for a session started in this repo; "
@@ -4097,7 +4203,10 @@ def main():
     if args.run_stopped:
         # the task-manager runs this on the host, where STATE_DIR is the pre-container repo dir:
         # the stop always goes into the live state, i.e. the DB (D-161), never a file there
-        sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or afclaude_config.manager_session()
+        sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if not sid:       # its own session, never a guessed one (phase 3b S3, D-235)
+            sys.exit("--run-stopped needs the session whose run is over: --session, or run it inside that Claude Code "
+                     "session ($CLAUDE_CODE_SESSION_ID)")
         t = mark_run_stopped(sid, datetime.now(UTC), runner_state.live_path("keepalive"))
         if t is None:
             sys.exit(f"run of {sid[:8]}: the stop could not be stored in the DB (kept in data/ALERTS.fallback.md)")
@@ -4105,6 +4214,8 @@ def main():
         return
     if args.work_on:
         return work_on_project(args.work_on, args)
+    if args.session and not args.decide:
+        check_registry(args.session)
     if args.plan_fillup_test:
         if not args.session:
             sys.exit("--plan-fillup-test needs --session")
@@ -4159,6 +4270,23 @@ def main():
     if not args.session or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", args.session):
         sys.exit("--session must be the FULL session UUID (a short id or a prefix makes resume fork)")
     run(args)
+
+
+def check_registry(session):
+    """A `--session` (cron's window start, the watcher, and the runner's window_start child, whose
+    {session} comes from the registry: store.start_manager) must be a task-manager of the registry
+    (phase 3b S3, docs/phase3b_plan.md §3.3): else a fail-stop (alert + pause) and exit
+    runner_jobs.EXIT_REPORTED (3: the failure is reported, the runner does not alert again)."""
+    import store
+    conn = store.connect()
+    try:
+        store.retrying(lambda: store.check_manager_setting(conn, session), conn)
+    except ValueError as e:
+        fail_stop("the keep-alive's --session disagrees with the task-manager registry", str(e))
+        import runner_jobs
+        sys.exit(runner_jobs.EXIT_REPORTED)
+    finally:
+        conn.close()
 
 
 def alert(subject, body=""):

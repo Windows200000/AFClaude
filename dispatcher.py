@@ -13,10 +13,10 @@ one pass per invocation does:
      usage no longer shows the limit at 100%); keepalive.preflight() still applies (send-keys
      / resume / take-over of archived or idle holders; never an RC-server thread, an sdk-url
      child or a busy session). Never continued (D-204: a limit hit ends an AFClaude run): the
-     sessions keepalive.py targets (config keepalive_sessions = the AFClaude task-manager, any
-     running watcher's --session), the task-manager sessions of managed projects
-     (projects.manager_session) and AFClaude task sessions (assigned to a task or tracked as
-     one). Forks (sessions sharing entry uuids, detected by the uuid of their first message)
+     task-manager of every project (the registry, projects.manager_session; phase 3b S3: no
+     machine setting, no scan of running watchers), every other driven session
+     (driven_sessions) and AFClaude task sessions (assigned to a task or tracked as one). Forks
+     (sessions sharing entry uuids, detected by the uuid of their first message)
      are grouped into families, and at most one per family is continued: the explicitly
      decided one (one-off decision or session rule), else the one with the most recent
      activity of its own (entries the other copies don't have).
@@ -39,7 +39,7 @@ state, no ka_resume, no tmux kill). It reads the DB as the last scan left it
 --arm acts. State: the DB (runner_state "dispatcher"), log: data/dispatcher.log. Tunables are DB
 settings (D-146; afclaude_config.setting): stall_take_over_idle, stall_verify_minutes,
 cleanup_finished_grace_minutes, cleanup_idle_hours. data/dispatcher.json (optional) keeps only
-session ids (keepalive_sessions, exclude_sessions); its old tunables were imported into the DB
+session ids (exclude_sessions; the retired keepalive_sessions is ignored); its old tunables were imported into the DB
 once. Failures (D-234/D-235): any failure or timeout is an error the owner sees (an ERROR line in
 dispatcher.log = app_log, an alert through keepalive.alert) and pauses automation
 (automation_paused, failstop.py) until the owner clears it (`tasks.py automation resume`); the
@@ -51,10 +51,8 @@ verifies earlier continues and logs.
 """
 import argparse
 import fcntl
-import glob
 import json
 import os
-import subprocess
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -75,24 +73,13 @@ STATE_FILE = os.path.join(DATA_DIR, "dispatcher_state.json")
 LOG_FILE = os.path.join(DATA_DIR, "dispatcher.log")
 LOCK_FILE = os.path.join(DATA_DIR, ".dispatcher.lock")
 CONFIG_FILE = os.path.join(DATA_DIR, "dispatcher.json")
-# The AFClaude task-manager session (continued by keepalive.py at each session-window start);
-# same source as export_quickview.py's SELF_SESSION (data/afclaude.json manager_session). A
-# missing manager_session must not crash the import (every pass, every 10 min, with no alert):
-# MANAGER_SESSION is None and load_config() below raises failstop.Failed, which main() turns
-# into the usual alert + pause (D-235) and aborts the pass before anything (e.g. cleanup(),
-# which must never mistake the task-manager's own tmux session for an orphan) runs on it.
-MANAGER_SESSION_ERROR = None
-try:
-    MANAGER_SESSION = os.environ.get("DISPATCHER_MANAGER_SESSION") or afclaude_config.manager_session()
-except afclaude_config.ConfigError as e:
-    MANAGER_SESSION = None
-    MANAGER_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
-
 # data/dispatcher.json: session ids only (machine identity, D-146)
 DEFAULTS = {
-    "keepalive_sessions": [MANAGER_SESSION],   # the task-manager: started by keepalive.py, never by the dispatcher
     "exclude_sessions": [],         # never continued, never cleaned up
 }
+# keys an older data/dispatcher.json may still have: the task-managers come from the registry now
+# (phase 3b S3, excluded_sessions), so they are accepted and not read
+RETIRED_KEYS = ("keepalive_sessions",)
 # cfg key -> DB setting (actions.SETTINGS), read on every pass
 SETTING_KEYS = {
     "idle_cleanup_hours": "cleanup_idle_hours",               # idle after an end_turn this long -> kill its tmux
@@ -136,15 +123,13 @@ def log(msg):
 def load_config(path=None, overrides=None):
     """The pass's config: the session ids of data/dispatcher.json (or `path`), the tunables from
     the DB settings (afclaude_config.settings: DB value, else the code default), then `overrides`."""
-    if MANAGER_SESSION is None:   # D-235: no fallback; the pass must not run without knowing it
-        raise failstop.Failed("manager_session not configured", MANAGER_SESSION_ERROR or "")
     s = afclaude_config.settings(*SETTING_KEYS.values())   # first: it imports the file's old tunables once
     cfg = json.loads(json.dumps(DEFAULTS))
     try:
         with open(path or CONFIG_FILE) as fh:
             f = json.load(fh)
         cfg.update({k: v for k, v in f.items() if k in DEFAULTS})
-        left = sorted(k for k in f if k not in DEFAULTS and not k.startswith("_"))
+        left = sorted(k for k in f if k not in DEFAULTS and k not in RETIRED_KEYS and not k.startswith("_"))
         if left:
             log(f"config {path or CONFIG_FILE}: {left} ignored (tunables are DB settings now, D-146)")
     except FileNotFoundError:
@@ -184,40 +169,17 @@ def alert_once(st, key, subject, body=""):
 
 # ---------------------------------------------------------------- who not to touch
 
-def keepalive_targets():
-    """Session ids that a running keepalive.py watcher targets (its --session): local
-    ones, plus, inside the container, the host's (a watcher left running there)."""
-    out = set()
-    argvs = []
-    for cmdline in glob.glob("/proc/[0-9]*/cmdline"):
-        try:
-            with open(cmdline, "rb") as fh:
-                argvs.append([a.decode(errors="replace") for a in fh.read().split(b"\0") if a])
-        except OSError:
-            continue
-    if host.in_container():
-        try:
-            argvs += [p["argv"] for p in host.proc_snapshot().values() if p.get("argv")]
-        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-            # without it a host watcher's session could be continued: an error, the pass stops
-            raise failstop.Failed("host process list unavailable",
-                                  f"{type(e).__name__}: {e}"[:300]) from None
-    for argv in argvs:
-        if not any(os.path.basename(a) == "keepalive.py" for a in argv):
-            continue
-        for i, a in enumerate(argv):
-            if a == "--session" and i + 1 < len(argv):
-                out.add(argv[i + 1])
-            elif a.startswith("--session="):
-                out.add(a.split("=", 1)[1])
-    return out
-
-
-def excluded_sessions(cfg):
-    """{session id: why} for sessions the dispatcher never continues or cleans up."""
-    ex = {s: "continued by keepalive.py (config keepalive_sessions)" for s in cfg["keepalive_sessions"]}
-    for s in keepalive_targets():
-        ex.setdefault(s, "target of a running keepalive.py watcher")
+def excluded_sessions(cfg, conn):
+    """{session id: why} for sessions the dispatcher never continues or cleans up: every task-manager
+    of the registry (projects.manager_session: continued by keepalive.py at the starts) and every driven
+    session but the stalled ones it continues itself (driven_sessions kinds task-manager, own, review,
+    request; phase 3b S3), plus the config's exclude_sessions."""
+    ex = {str(p["manager_session"]): f"task-manager of the project {p['name']!r}: no continue after a session limit (D-204), the next "
+                                       "session-window start decides" for p in store.list_projects(conn)
+          if p.get("manager_session")}
+    for r in store.driven_sessions(conn):
+        if r["kind"] != "stall":
+            ex.setdefault(r["session_id"], f"a driven session ({r['kind']})")
     for s in cfg["exclude_sessions"]:
         ex.setdefault(s, "config exclude_sessions")
     return ex
@@ -527,8 +489,7 @@ class Pass:
         task-manager's tmux session or one of the excluded sessions (their stored names)."""
         rows = store.driven_sessions(self.conn)
         never = {r["tmux"] for r in rows if r["tmux"] and (r["kind"] == "task-manager"
-                                                           or r["session_id"] in excluded
-                                                           or r["session_id"] == MANAGER_SESSION)}
+                                                           or r["session_id"] in excluded)}
         stored = {r["session_id"]: r for r in rows}
         for sid, s in self.st["sessions"].items():
             if s.get("status") != "running":
@@ -615,7 +576,7 @@ class Pass:
         # (a task-manager's or a task's are never continued, afclaude_run), so no project pause applies
         p = failstop.paused()
         self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
-        excluded = excluded_sessions(self.cfg)
+        excluded = excluded_sessions(self.cfg, self.conn)
         self.verify()
         self.cleanup(excluded)
         for r, key in self.stalled_candidates(excluded):

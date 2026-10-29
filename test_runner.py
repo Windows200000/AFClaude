@@ -1524,9 +1524,9 @@ class WindowStarts(Base):
 
     def test_the_child_gets_the_runs_key(self):
         h = runner_jobs.HANDLERS["window_start"]
-        with mock.patch.dict(os.environ, {"AFCLAUDE_MANAGER_SESSION": "sid"}):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_MANAGER_SESSION": "not-read"}):    # 3b S3: the registry's
             argv = runner_jobs._argv(h, "window-start-2026-10-20-s2")
-            self.assertEqual(argv[1:], ["--session", "sid", "--window-start", "--start-key",
+            self.assertEqual(argv[1:], ["--session", testenv.SID, "--window-start", "--start-key",
                                         "window-start-2026-10-20-s2", "--arm", "--take-over-idle"])
             with self.assertRaises(RuntimeError):
                 runner_jobs._argv(h, None)
@@ -1729,11 +1729,19 @@ class WatcherPasses(Base):
     step stored (runner state 'keepalive.watch', acts.<job>), each under its run key once; a cut-off
     act fails (D-257) and is never rerun; a drain holds it; the legacy mode keeps the watcher."""
     AT = START + 3 * 60 * MIN + 17 * SEC
+    SID = "00000000-0000-4000-8000-000000000001"
 
-    def store_act(self, job, at, key="fillup-2026-10-20T02:00:00+00:00", run=None):
-        ent = {"key": key, "at": runner._iso(at), "run": run or f"{key}.{at:%Y%m%dT%H%M%S}"}
-        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {job: ent}}, mode="file",
-                           actor="runner:keepalive", via="runner")
+    def setUp(self):
+        super().setUp()
+        store.add_project(self.conn, "alpha")           # the registry (3b S3): one task-manager
+        store.update_project(self.conn, "alpha", manager_session=self.SID)
+        self.conn.commit()
+
+    def store_act(self, job, at, key="fillup-2026-10-20T02:00:00+00:00", run=None, session=SID):
+        ent = {"key": key, "at": runner._iso(at), "run": run or f"{session[:8]}.{key}.{at:%Y%m%dT%H%M%S}",
+               "session": session}
+        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {runner_state.act_name(job, session): ent}},
+                           mode="file", actor="runner:keepalive", via="runner")
         return ent["run"]
 
     def test_s6_owns_the_passes_the_crontabs_and_the_watcher_check(self):
@@ -1828,13 +1836,80 @@ class WatcherPasses(Base):
         self.assertEqual([c[0] for c in self.spawner.calls], ["deferred_start"])
 
     def test_a_stored_act_that_is_not_valid_alerts_once(self):
-        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {"fillup": {"key": "k", "at": "soon"}}},
+        actions.state_save(self.conn, runner.PLANS_COMPONENT, {"acts": {runner_state.act_name("fillup", self.SID): {"key": "k", "at": "soon"}}},
                            mode="file", actor="runner:keepalive", via="runner")
         r = self.runner(owns={"fillup"})
         r.boot()
         self.assertEqual(r.plan(self.now), [])
         self.assertEqual(r.plan(self.now + MIN), [])
         self.assertEqual(self.subjects(), ["a planned act is not valid"])
+
+    SID2 = "22222222-0000-4000-8000-000000000002"
+
+    def two_managers(self):
+        store.add_project(self.conn, "beta")
+        store.update_project(self.conn, "beta", manager_session=self.SID2)
+        store.add_project(self.conn, "gamma")            # no task-manager session yet (D-281): skipped
+        self.conn.commit()
+
+    async def test_each_task_manager_has_its_own_act_and_one_runs_at_a_time(self):
+        """3b S3: acts.<job>:<sid8> per registry session; the earliest due runs, a tie goes to the better rank,
+        the next one when it ends; a run key that ran never runs again."""
+        self.two_managers()
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        run_a = self.store_act("fillup", self.AT + 10 * SEC)
+        run_b = self.store_act("fillup", self.AT, session=self.SID2)
+        self.assertNotEqual(run_a, run_b)                                  # one dedup key, two run keys
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.next_due("fillup"), self.AT.replace(microsecond=0))   # the earliest of the two
+        self.now = self.AT
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_b)                                    # beta's is earlier
+        await self.run_due(r, due)
+        self.now = self.AT + 10 * SEC
+        self.assertEqual(self.next_due("fillup"), (self.AT + 10 * SEC).replace(microsecond=0))   # beta's: ahead
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_a)
+        await self.run_due(r, due)
+        self.assertEqual(r.plan(self.now + MIN), [])
+        self.assertEqual([c[1] for c in self.spawner.calls], [run_b, run_a])
+
+    async def test_a_tie_goes_to_the_better_ranked_project(self):
+        self.two_managers()
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        run_b = self.store_act("fillup", self.AT, session=self.SID2)
+        run_a = self.store_act("fillup", self.AT)
+        self.now = self.AT + MIN
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_a)
+        r.tasks["fillup"] = asyncio.get_running_loop().create_future()      # one is running: the other waits
+        self.assertEqual(r.plan(self.now), [])
+        del r.tasks["fillup"]
+        await self.run_due(r, due)
+        due, = r.plan(self.now)
+        self.assertEqual(due.key, run_b)
+
+    def test_an_act_of_a_session_outside_the_registry_is_not_planned(self):
+        r = self.runner(owns={"fillup"})
+        r.boot()
+        self.store_act("fillup", self.AT, session=self.SID2)               # beta is no project here
+        self.now = self.AT + MIN
+        self.assertEqual(r.plan(self.now), [])
+        self.assertIsNone(self.next_due("fillup"))
+
+    def test_status_lists_the_task_managers_and_their_plans(self):
+        self.two_managers()
+        run = self.store_act("fillup", self.AT)
+        st = runner.status(self.conn, self.now)
+        self.assertEqual([(t["project"], t["session"]) for t in st["task_managers"]],
+                         [("alpha", self.SID[:8]), ("beta", self.SID2[:8])])
+        self.assertEqual([(p["act"], p["run"]) for p in st["plans"]], [(f"fillup:{self.SID[:8]}", run)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_status(st)
+        self.assertIn(f"plan fillup:{self.SID[:8]}", buf.getvalue())
 
     def test_the_ticks_result_next_due_moves_the_tick_earlier(self):
         r = self.runner(owns={"watch"})
