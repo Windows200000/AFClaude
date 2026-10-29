@@ -100,10 +100,12 @@ def get(name: str, st: Optional[dict[str, Any]] = None) -> Optional[dict[str, An
     return task if isinstance(task, dict) else None
 
 
-def fill(task: dict[str, Any], template: str) -> str:
-    """`template` filled in with the task's fields and its name, title and report."""
-    fields = dict(task.get("fields") or {}, **{k: task[k] for k in ALWAYS_FIELDS})
-    return template.format(**fields)
+def task_fields(task: dict[str, Any]) -> dict[str, Any]:
+    """The task's own --field values, plus its name, title and report (ALWAYS_FIELDS): what fills
+    its prompts. A prompt only uses the names it declares (prompts.variables); the rest are
+    ignored, so one task can carry fields several of its prompts each need only some of (date,
+    since for usage_review; date, report for the ETA ones; ...)."""
+    return dict(task.get("fields") or {}, **{k: task[k] for k in ALWAYS_FIELDS})
 
 
 def add(name: str, due_from: datetime, title: str, prompts: list[str], report: str,
@@ -127,13 +129,16 @@ def add(name: str, due_from: datetime, title: str, prompts: list[str], report: s
         "prompts": list(prompts), "fields": dict(fields or {}), "report": report, "max_runs": max_runs,
         "status": "pending", "added_at": now.astimezone(UTC).isoformat(), "by": by, "count_from": None,
         "misses": [], "done_at": None, "why": None}
-    for p in ["nightly_task", *prompts]:         # fills in now: a missing prompt or field fails here
+    task_fields_all = task_fields(task)
+    for p in ["nightly_task", *prompts]:         # renders now: a missing prompt or field fails here
         try:
-            fill(task, _prompt(p))
+            needed = prompt_registry.variables(p)
         except OSError as e:
             raise ValueError(f"no prompt prompts/{p}.md ({type(e).__name__})") from None
-        except (KeyError, IndexError) as e:
-            raise ValueError(f"prompts/{p}.md needs the field {e} (--field KEY=VALUE)") from None
+        try:
+            prompt_registry.render(p, **{k: task_fields_all[k] for k in needed if k in task_fields_all})
+        except ValueError as e:
+            raise ValueError(f"prompts/{p}.md needs the field ({e}) (--field KEY=VALUE)") from None
     st = load()
     if name in st["tasks"]:
         raise ValueError(f"a task named {name!r} exists already ({st['tasks'][name].get('status')})")
@@ -162,11 +167,16 @@ def due(now: datetime, st: Optional[dict[str, Any]] = None) -> list[dict[str, An
 
 
 def brief(name: str) -> str:
-    """The worker's brief for the task `name`: nightly_task.md, then its prompts, filled in."""
+    """The worker's brief for the task `name`: its head (the "nightly_task" bundle, P2 of the
+    phase 4a plan), then its own --prompt list, filled in, in order."""
     task = get(name)
     if task is None:
         raise ValueError(f"no task named {name!r}")
-    return "\n\n".join(fill(task, _prompt(p)).strip() for p in ["nightly_task", *task["prompts"]])
+    fields = task_fields(task)
+    head = prompt_registry.bundle("nightly_task", **fields)
+    subs = (prompt_registry.render(p, **{k: fields[k] for k in prompt_registry.variables(p) if k in fields}).strip()
+           for p in task["prompts"])
+    return "\n\n".join([head, *subs])
 
 
 def start_insert(now: datetime) -> tuple[Optional[str], list[str]]:

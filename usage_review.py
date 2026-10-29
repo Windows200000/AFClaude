@@ -110,6 +110,7 @@ import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
 import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
 import nightly_tasks  # noqa: E402  (D-254: the monthly review is a task of the next nightly run)
+import prompts  # noqa: E402  (phase 4a P2: the one-off review bundles, usage_review_oneoff / stage_eta_review_oneoff)
 
 UTC = timezone.utc
 STATE = os.path.join(HERE, "data", "usage_review_state.json")
@@ -122,6 +123,8 @@ MODEL, EFFORT = "claude-opus-5-5", "medium"
 # own prompt so the one-off brief (the owner's specific ask) can differ from the periodic one.
 # "usage" reuses the regular monthly brief (it IS the same full review, just logged as a one-off).
 ONLY_PROMPTS = {"stage-eta": "stage_eta_review_once", "usage": "usage_review"}
+# ... and its bundle (prompts.BUNDLES, P2): the brief + the chained pointer, if any + guard_respect + manager.
+ONLY_BUNDLES = {"stage-eta": "stage_eta_review_oneoff", "usage": "usage_review_oneoff"}
 # Chaining order (D-228): when --only names more than one of the above, they always run in this
 # order, whatever order the owner typed them in -- the ETA review needs the usage review's result.
 ONLY_ORDER = ("usage", "stage-eta")
@@ -388,9 +391,7 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     local = now.astimezone(ka.BERLIN)
     d = local.date().isoformat()
     since = st["runs"][-1]["at"][:10] if st.get("runs") else "2026-09-26"
-    brief = ka.load_prompt(ONLY_PROMPTS[which]).format(date=d, since=since, report=report_doc(now))
-    parts = [brief] + ([extra] if extra else []) + [ka.load_prompt("guard_respect"), ka.load_prompt("manager")]
-    msg = " ".join(" ".join(parts).split())
+    msg = prompts.bundle(ONLY_BUNDLES[which], insert=extra, date=d, since=since, report=report_doc(now))
     sid = sid or str(uuid.uuid4())
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
     tmux = ka.claim_tmux(sid, "review", actor="runner:usage_review")   # its readable name, stored first (3b S2)
