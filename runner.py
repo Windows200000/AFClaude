@@ -257,6 +257,10 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("docs_import", 5, every=10 * MIN, cron_tag="AFClaude docs import"),
     Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),
     Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
+    # S9(b): the status snapshot rows (usage, next run, pause, running runs), once a minute and also while
+    # paused (the pause is part of it); 30 s off the minute, between the other ticks' offsets
+    Job("status_snapshot", 2, every=MIN, offset=30 * SEC, what="status snapshot (status_snapshot.py): the DB rows "
+                                                               "the dashboard reads"),
     Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
     Job("window_start", 80, window_start=True, paused="handler", on_interrupt="fail", session=True,
         cron_tag="AFClaude window-start"),
@@ -316,8 +320,8 @@ SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve",
 # entrypoint no longer starts the watcher, its :07/:22/:37/:52 watchdog line is gone; legacy keeps both).
 # S7: the inbox jobs (the entrypoint no longer starts inbox_api.py, SUPERVISED does; its */5 ensure
 # cron line is gone; legacy keeps both).
-RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
-                                         "docs_import", "prune_logs", "usage_review", "at", "window_start",
+RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
+                                         "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
                                          "inbox", "inbox_verify"}
                                         | WATCHER_PASSES)
 
