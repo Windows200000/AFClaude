@@ -185,6 +185,7 @@ class Tables(Base):
         inner = runner_jobs.window_start_min_timeout()
         self.assertGreaterEqual(timedelta(minutes=lo), inner)          # an inner timeout always fires first
         self.assertGreater(inner, timedelta(minutes=60))               # COMPACT_LOCK_WAIT + VERIFY_TIMEOUT, ...
+        self.assertIn("NEW_TRANSCRIPT_WAIT", runner_jobs.window_start_inner())     # 3b S4: a first start
 
     def test_the_declared_host_call_timeouts_are_keepalives(self):
         with open(os.path.join(HERE, "keepalive.py"), encoding="utf-8") as fh:
@@ -196,7 +197,7 @@ class Tables(Base):
                     if isinstance(n, ast.keyword) and n.arg == "timeout" and isinstance(n.value, ast.Constant):
                         found.setdefault(f.name, set()).add(n.value.value)
         declared = {}
-        for fn, secs, _ in runner_jobs.WINDOW_START_HOST_CALLS:
+        for fn, secs, _ in runner_jobs.WINDOW_START_HOST_CALLS + runner_jobs.PICK_PREFLIGHT_CALLS:
             declared.setdefault(fn, set()).add(secs)
         for fn, secs in declared.items():
             self.assertEqual(found.get(fn), secs, fn)
@@ -437,7 +438,7 @@ class Runs(Base):
         r.boot()
         due, = r.plan(self.now)
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 4800.0)])
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5400.0)])
         self.now += 5 * MIN
         self.assertEqual(r.plan(self.now), [])
         self.assertEqual(self.next_due("window_start"), START + 5 * 60 * MIN)
@@ -1545,7 +1546,7 @@ class WindowStarts(Base):
         due, = r.plan(self.now)
         self.assertEqual((due.key, due.at), ("window-start-2026-10-20", START))
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 4800.0)])
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5400.0)])
         self.assertEqual(self.fails, [])
 
     async def test_dst_nights_give_the_next_start(self):
@@ -1802,7 +1803,7 @@ class WatcherPasses(Base):
         due, = r.plan(self.now)
         self.assertEqual((due.job.name, due.key), ("fillup", run))
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("fillup", run, 4800.0)])
+        self.assertEqual(self.spawner.calls, [("fillup", run, 5400.0)])
         self.assertEqual(r.plan(self.now + MIN), [])                    # its run key ran: never twice
         self.assertIsNone(self.next_due("fillup"))
         self.assertEqual(self.runs("fillup")[0]["key"], run)

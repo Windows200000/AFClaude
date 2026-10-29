@@ -128,6 +128,7 @@ USAGE_STATE_FILE = os.path.join(STATE_DIR, "usage_refresh_state.json")
 HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this often
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
 VERIFY_TIMEOUT = timedelta(minutes=10)
+NEW_TRANSCRIPT_WAIT = timedelta(minutes=2)   # create_task_manager: the new session's transcript appears
 TAKE_OVER_WAIT = 30                       # seconds for a SIGTERMed holder to exit before a take-over resume
 
 IGNORE_WINDOW = False  # --now: skip the window-start-hour gate (budget rule still applies)
@@ -2263,7 +2264,6 @@ def handle_fire(sid, stall, reason, st, args):
     db_paused's docstring), "paused" (automation_paused: dropped, not handled) or "failed" (the
     start was aborted on an error, D-234/D-235: recorded as start-failed, alerted, automation
     paused; abort_start)."""
-    import failstop
     key = stall["uuid"] or str(stall["timestamp"])
     if key in st["handled"]:
         return None
@@ -2289,8 +2289,19 @@ def handle_fire(sid, stall, reason, st, args):
             return None          # HOLD: no project to run (recorded)
         stall["project"] = {k: pick[k] for k in ("project_id", "name", "why")}
         if pick["session"] is None:
-            return _first_start(pick, stall, reason, st, args, key, night)
-        sid, pre = pick["session"], pick.get("preflight")
+            r = _first_start(pick, stall, reason, st, args, key, night)
+        else:
+            r = _start_session(pick["session"], pick.get("preflight"), stall, reason, st, args, key, night)
+        if r != OWNER_BUSY and args.arm:   # decided (fired, skipped, failed): one run_log row per start
+            _pick_logged(key, pick)
+        return r
+    return _start_session(sid, None, stall, reason, st, args, key, night)
+
+
+def _start_session(sid, pre, stall, reason, st, args, key, night):
+    """handle_fire's start of the session `sid` after the pick (`pre`: its preflight when the pick
+    ran it): the preflight, the compaction lock, the owner check, the fire. -> as handle_fire."""
+    import failstop
     ok, problems, plan = pre or preflight(sid)
     log(f"preflight: {'ok, plan=' + plan if ok else 'PROBLEMS: ' + '; '.join(problems)}")
     if not ok:
@@ -2334,6 +2345,7 @@ def handle_fire(sid, stall, reason, st, args):
 OWNER_HOLDS = (RC_HELD, OTHER_HELD, "session is busy in another process", "held by an idle interactive process")
 OWNER_BUSY = "owner_busy"                    # handle_fire: an owner_check start waits for the owner (D-259)
 OWNER_BUSY_RECHECK = timedelta(minutes=5)    # ... and is retried this much later
+PICK_MAX_PASS_OVER = 3   # pick_start passes over at most this many owner-held projects (runner_jobs' budget)
 
 
 def owner_holds(problems):
@@ -2394,13 +2406,17 @@ def _run_log(decision, reason, sid=None):
 
 def pick_start(stall, key, now, st, arm):
     """The project the start `key` continues (store.pick_project): the first candidate, but one the
-    owner holds (preflight, D-239.1) or that is at a limit (stall_status WAIT_RESET, D-204) is passed
-    over while a later candidate exists; the last one goes to handle_fire's own checks as before
-    (the preflight's skip, the last stretch's wait for the owner). Chained (D-274: a run of the
-    registry is still going, stall["chained"] or running_session): that run's project first (D-281).
-    -> the candidate (+ "preflight" when it was run here), or None: HOLD, no project to run, recorded
-    as handled (a decision, not an error; the next start decides again). The pick or the HOLD goes
-    into run_log (armed) and the log. A failure raises (the caller aborts the start)."""
+    owner holds (preflight, D-239.1) is passed over while a later candidate exists (at most
+    PICK_MAX_PASS_OVER: their preflights are in the start's timeout budget); the last one goes to
+    handle_fire's own checks as before (the preflight's skip, the last stretch's wait for the owner).
+    A project at a limit is not passed over: limits are account-wide, so another project would hit
+    the same one, and the gate has decided on the usage already (D-204: a start right at a reset
+    continues). Chained (D-274: a run of the registry is still going, stall["chained"] or
+    running_session): that run's project first (D-281).
+    -> the candidate (+ "preflight" when it was run here, "line" for the log), or None: HOLD, no
+    project to run, recorded as handled (a decision, not an error; the next start decides again; its
+    run_log row (armed) is written here). The pick's run_log row is handle_fire's, once the start is
+    decided (_pick_logged). A failure raises (the caller aborts the start)."""
     import store
     chained_sid = stall.get("chained") or running_session(now, st)
     conn = store.connect()
@@ -2413,13 +2429,9 @@ def pick_start(stall, key, now, st, arm):
     cands, passed = sel["candidates"], []
     pick = None
     for i, c in enumerate(cands):
-        if c["session"] is None or i == len(cands) - 1:
+        if c["session"] is None or i == len(cands) - 1 or len(passed) >= PICK_MAX_PASS_OVER:
             pick = c
             break
-        action, detail, _ = stall_status(c["session"], now)
-        if action == "WAIT_RESET":
-            passed.append(f"{c['name']}: at its limit, {detail} (D-204)")
-            continue
         pre = preflight(c["session"])
         if not pre[0] and owner_holds(pre[1]):
             passed.append(f"{c['name']}: the owner holds its session ({pre[1][0]})")
@@ -2438,13 +2450,23 @@ def pick_start(stall, key, now, st, arm):
         return None
     if passed:
         pick["why"] += "; passed over: " + "; ".join(passed)
-    line = (f"start {key}: project {pick['name']} "
-            + (f"(task-manager {pick['session'][:8]})" if pick["session"] else "(no task-manager yet: created now, D-281)")
-            + f": {pick['why']}")
-    log(line)
-    if arm:
-        _run_log("PICK", line, pick["session"])
+    pick["line"] = (f"start {key}: project {pick['name']} "
+                    + (f"(task-manager {pick['session'][:8]})" if pick["session"]
+                       else "(no task-manager yet: created now, D-281)")
+                    + f": {pick['why']}")
+    log(pick["line"])
     return pick
+
+
+def _pick_logged(key, pick):
+    """The pick's run_log row (PICK), once handle_fire has decided the start (fired, skipped,
+    failed; not an OWNER_BUSY wait, retried later: one row per start). The start is handled
+    already, so a failed write is not raised (the caller would not re-decide it) but alerted and
+    paused (fail_stop, D-235)."""
+    try:
+        _run_log("PICK", pick["line"], pick["session"])
+    except Exception as e:   # noqa: BLE001 - reported below
+        fail_stop(f"start {key}: its PICK row could not be written to run_log", f"{type(e).__name__}: {e}")
 
 
 def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
@@ -2454,8 +2476,11 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
     names.tmux_name) stored first, then ka_resume.sh --new in the project's path with
     manager_first_start.md (the description: the one-off kickstart, D-301; `insert`, e.g. the
     pacing, after it) and the standing rules (the hook pointer in this checkout, else inline without
-    manager_afclaude.md), then the reply awaited. A launcher failure takes the session back off the
-    project and ends its row, then raises; so does anything before the launch (D-235). arm False: the
+    manager_afclaude.md), then the reply awaited. Anything failing before the launch raises with
+    nothing written; anything failing from the writes through the launch (an exception, rc != 0)
+    takes the session back off the project and ends its row (_take_back), then raises (D-235). A
+    launch that timed out is taken back only if its tmux session does not exist; one that does is
+    kept (it may be starting) and raised as an error too, as is a failed tmux check. arm False: the
     name only, nothing written or started. -> {session, tmux, message, rc, out, err, sent_at, reply}
     (reply None: no reply within VERIFY_TIMEOUT, the caller's error)."""
     import actions
@@ -2478,27 +2503,34 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
         out = {"session": sid, "tmux": tmux, "message": msg}
         if not arm:
             return out
-        actions.perform(conn, "project.edit", {"project": project["project_id"], "manager_session": sid},
-                        actor=actor, via="runner")
-        actions.perform(conn, "driven.set", {"session_id": sid, "kind": "task-manager", "tmux": tmux,
-                                             "project": project["project_id"]}, actor=actor, via="runner")
+        try:
+            actions.perform(conn, "project.edit", {"project": project["project_id"], "manager_session": sid},
+                            actor=actor, via="runner")
+            actions.perform(conn, "driven.set", {"session_id": sid, "kind": "task-manager", "tmux": tmux,
+                                                 "project": project["project_id"]}, actor=actor, via="runner")
+        except Exception as e:
+            _take_back(project, sid, actor, f"storing it failed ({type(e).__name__}: {e})")
+            raise
     finally:
         conn.close()
     sent_at = datetime.now(UTC)
-    rc, so, se = fire(sid, path, msg, "resume", new=True)
+    try:
+        rc, so, se = fire(sid, path, msg, "resume", new=True)
+    except subprocess.TimeoutExpired as e:
+        if tmux_has(tmux):   # a raise here (the check failed) keeps it too: unknown is not taken back
+            raise RuntimeError(f"the launch of the new task-manager of {project['name']!r} timed out ({e}), "
+                               f"but its tmux session {tmux} exists: kept on the project, check it") from e
+        _take_back(project, sid, actor, f"its launch timed out ({e}) and no tmux session {tmux} exists")
+        raise
+    except Exception as e:
+        _take_back(project, sid, actor, f"its launch failed ({type(e).__name__}: {e})")
+        raise
     out.update(rc=rc, out=so, err=se, sent_at=sent_at, reply=None)
     if rc != 0:
-        conn = store.connect()
-        try:
-            actions.perform(conn, "project.edit", {"project": project["project_id"], "manager_session": ""},
-                            actor=actor, via="runner")
-            actions.perform(conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
-                            actor=actor, via="runner")
-        finally:
-            conn.close()
+        _take_back(project, sid, actor, f"rc={rc}")
         raise RuntimeError(f"the new task-manager of {project['name']!r} did not start (rc={rc}): "
                            f"{(se or so or '').strip()[:300]}; taken back off the project")
-    deadline = time.time() + 120
+    deadline = time.time() + NEW_TRANSCRIPT_WAIT.total_seconds()
     while not transcript_path(sid) and time.time() < deadline:
         time.sleep(5)
     tp = transcript_path(sid)
@@ -2506,11 +2538,37 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
     return out
 
 
+def _take_back(project, sid, actor, why):
+    """create_task_manager's undo of what it stored, read back from the DB (a write may have landed
+    before its call failed): the project's manager_session cleared while it is `sid`, the session's
+    live driven_sessions row ended; logged with `why`. A failure of the undo raises (the caller's
+    error then says the session was not taken back)."""
+    import actions
+    import store
+    log(f"task-manager {sid[:8]} of {project['name']!r} taken back: {why}")
+    conn = store.connect()
+    try:
+        row = store.get_project(conn, project["project_id"])
+        if row is not None and row.get("manager_session") == sid:
+            actions.perform(conn, "project.edit", {"project": project["project_id"], "manager_session": ""},
+                            actor=actor, via="runner")
+        d = store.get_driven_session(conn, sid)
+        if d is not None and not d.get("ended_at"):
+            actions.perform(conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
+                            actor=actor, via="runner")
+    except Exception as e:
+        raise RuntimeError(f"the task-manager {sid[:8]} of {project['name']!r} could not be taken back after "
+                           f"{why}: {type(e).__name__}: {e}") from e
+    finally:
+        conn.close()
+
+
 def _first_start(pick, stall, reason, st, args, key, night):
     """handle_fire for a picked project without a task-manager session yet (D-281): it is created
     now (create_task_manager) and this start is its first run, recorded like _fire_start's (a run:
     run_active, the fill-up and run_metrics see it). A failure before the launch aborts the start
-    (abort_start); no reply after it is an error (fail_stop), as for a continue."""
+    (abort_start), as does a failed or timed-out launch (taken back unless its tmux session exists,
+    create_task_manager); no reply after it is an error (fail_stop), as for a continue."""
     now = datetime.now(UTC)
     try:
         pace = run_pace_text("", stall, now, usage_cache_checked())     # D-274/D-275
@@ -2525,7 +2583,7 @@ def _first_start(pick, stall, reason, st, args, key, night):
             return None
         at_fire = _fire_usage()
         c = create_task_manager(pick, insert=pace)
-    except Exception as e:   # noqa: BLE001 - nothing reached a session, or the launch was taken back
+    except Exception as e:   # noqa: BLE001 - not launched, taken back, or kept after a timed-out launch
         abort_start(pick.get("session") or "-", key, st, reason, "new", "task-manager creation failed",
                     f"{type(e).__name__}: {e}", stall=stall)
         return "failed"

@@ -2,11 +2,14 @@
 """Offline tests for phase 3b S4, project selection at the start (docs/phase3b_plan.md §2, §5 S4):
 store.pick_project's order (chained first, D-281; ready stages by priority then rank, D-064; the
 task-managers without a ready stage after them; paused and session-less idle projects skipped),
-keepalive.pick_start inside handle_fire (an owner-held or limited project passed over while a later
-one exists, D-204 / D-239.1; none: HOLD), a chained start and a last-stretch slot keeping the
-running project, a project's first start creating its task-manager (D-281), the dedup of one start
-key, the per-project prompt (inline rules without manager_afclaude.md, its length), and the
-single-task-manager case behaving as before S4 (no extra preflight or limit check)."""
+keepalive.pick_start inside handle_fire (an owner-held project passed over while a later one
+exists, at most PICK_MAX_PASS_OVER, D-239.1; one at a limit is not, D-204; none: HOLD), one run_log
+row per start (not per owner-busy retry), a chained start and a last-stretch slot keeping the
+running project, a project's first start creating its task-manager (D-281) and taking it back on
+any failure up to the launch, the dedup of one start key, the per-project prompt (inline rules
+without manager_afclaude.md, its length), and the single-task-manager case behaving as before S4
+(no extra preflight or limit check)."""
+import subprocess
 import json
 import os
 import sys
@@ -65,7 +68,7 @@ class Base(unittest.TestCase):
             p = mock.patch.object(ka, n, v)
             p.start()
             self.addCleanup(p.stop)
-        self.preflights, self.limited, self.held = [], set(), set()
+        self.preflights, self.limited, self.held, self.stall_calls = [], set(), set(), []
         p = mock.patch.object(ka, "preflight", self.fake_preflight)
         p.start()
         self.addCleanup(p.stop)
@@ -82,6 +85,7 @@ class Base(unittest.TestCase):
         return (False, [HELD], None) if sid in self.held else (True, [], "send-keys")
 
     def fake_stall_status(self, sid, now):
+        self.stall_calls.append(sid)
         return ("WAIT_RESET", "session limit resets 23:00", {}) if sid in self.limited else ("NO_STALL", "", None)
 
     def task(self, project, priority="high", status="pending"):
@@ -165,16 +169,46 @@ class PickStart(Base):
         self.assertEqual((dec, sid), ("PICK", SID_B))
         self.assertIn("project beta (task-manager bbbbbbbb): 1 ready stage(s), best priority high", why)
 
-    def test_an_owner_held_or_limited_project_is_passed_over(self):
+    def test_an_owner_held_project_is_passed_over(self):
         self.task("alpha")
         self.held = {SID_A}
         self.start("k1")
         self.assertEqual(self.fired[-1][0], SID_B)
         self.assertIn("passed over: alpha: the owner holds its session", self.fired[-1][1]["project"]["why"])
-        self.held, self.limited = set(), {SID_A}
-        self.start("k2")
-        self.assertEqual(self.fired[-1][0], SID_B)
-        self.assertIn("alpha: at its limit", self.fired[-1][1]["project"]["why"])
+
+    def test_a_project_at_its_limit_is_not_passed_over(self):
+        """A 04:00 start fired to the second, its session limit resetting at 04:00 (still inside
+        RESET_GRACE): it continues, as before S4 (limits are account-wide; the gate decided)."""
+        self.task("alpha")
+        self.limited = {SID_A}
+        self.start("window-start-2026-10-29-s2")
+        self.assertEqual(self.fired[-1][0], SID_A)
+        self.assertNotIn("passed over", self.fired[-1][1]["project"]["why"])
+        self.assertEqual(self.stall_calls, [])
+
+    def test_at_most_pick_max_pass_over_projects_are_passed_over(self):
+        self.task("alpha")
+        self.task("beta")
+        self.task("gamma")
+        self.held = {SID_A, SID_B}
+        with mock.patch.object(ka, "PICK_MAX_PASS_OVER", 1):
+            r, st = self.start()
+        self.assertEqual(self.preflights, [SID_A, SID_B])          # alpha's in the pick, beta's in handle_fire
+        rec = st["handled"]["2026-10-29T22:00"]
+        self.assertEqual((rec["result"], rec["project"]), ("preflight-failed", "beta"))
+
+    def test_one_run_log_row_per_start_not_per_owner_busy_retry(self):
+        self.held = {SID_A, SID_B}
+        st = {"handled": {}, "fires": {}}
+        for _ in range(2):
+            r, _ = self.start(stall={"owner_check": True}, st=st)
+            self.assertEqual(r, ka.OWNER_BUSY)
+        self.assertEqual(self.run_log(), [])
+        self.held = set()
+        with mock.patch.object(ka, "owner_typing", lambda sid, now: None):
+            self.start(stall={"owner_check": True}, st=st)
+        self.assertEqual([d for d, _, _ in self.run_log()], ["PICK"])
+        self.assertEqual(self.fired[0][0], SID_A)
 
     def test_the_last_candidate_goes_through_the_starts_own_checks(self):
         """Owner-held with no other candidate: handle_fire's preflight skip as before S4."""
@@ -244,10 +278,6 @@ class OneTaskManager(Base):
         store.update_project(self.conn, "beta", manager_session="")
         self.conn.commit()
         self.task("alpha")
-        self.stall_calls = []
-        p = mock.patch.object(ka, "stall_status", lambda sid, now: self.stall_calls.append(sid))
-        p.start()
-        self.addCleanup(p.stop)
 
     def test_the_start_continues_it_as_before(self):
         self.start()
@@ -322,6 +352,54 @@ class FirstStart(Base):
         sid = self.launches[0][0]
         self.assertIsNotNone(store.get_driven_session(self.conn, sid)["ended_at"])
         self.assertIn("task-manager creation failed", ka.fail_stop.call_args[0][0])
+
+    def assert_taken_back(self, r):
+        self.assertEqual(r, "failed")
+        self.assertIsNone(self.gamma()["manager_session"])
+        rows = [x for x in store.driven_sessions(self.conn, include_ended=True) if x["kind"] == "task-manager"
+                and x["project_id"] == self.gamma()["id"]]
+        self.assertTrue(rows and all(x["ended_at"] for x in rows))
+        self.assertIn("task-manager creation failed", ka.fail_stop.call_args[0][0])
+
+    def test_a_failure_storing_it_takes_it_back(self):
+        real = actions.perform
+
+        def perform(conn, action, *a, **kw):
+            if action == "driven.set" and "kind" in a[0]:
+                real(conn, action, *a, **kw)
+                raise RuntimeError("db hiccup")
+            return real(conn, action, *a, **kw)
+        with mock.patch.object(actions, "perform", perform):
+            r, st = self.start()
+        self.assertEqual(self.launches, [])
+        self.assert_taken_back(r)
+        self.assertIn("db hiccup", st["handled"]["2026-10-29T22:00"]["error"])
+
+    def test_a_launch_exception_takes_it_back(self):
+        with mock.patch.object(ka, "fire", side_effect=RuntimeError("no launcher")):
+            r, st = self.start()
+        self.assert_taken_back(r)
+
+    def test_a_timed_out_launch_without_its_tmux_session_is_taken_back(self):
+        with mock.patch.object(ka, "fire", side_effect=subprocess.TimeoutExpired("ka_resume.sh", 120)):
+            r, st = self.start()
+        self.assert_taken_back(r)
+
+    def test_a_timed_out_launch_with_its_tmux_session_is_kept_and_fails(self):
+        launched = []
+
+        def fire(*a, **kw):
+            launched.append(1)
+            raise subprocess.TimeoutExpired("ka_resume.sh", 120)
+        with mock.patch.object(ka, "fire", fire), \
+                mock.patch.object(ka, "tmux_has", lambda name: bool(launched)):
+            r, st = self.start()
+        self.assertEqual(r, "failed")
+        sid = self.gamma()["manager_session"]
+        self.assertTrue(sid)
+        self.assertIsNone(store.get_driven_session(self.conn, sid)["ended_at"])
+        self.assertIn("kept on the project", st["handled"]["2026-10-29T22:00"]["error"])
+        ka.fail_stop.assert_called_once()
 
     def test_no_reply_is_an_error_but_the_session_stays(self):
         with mock.patch.object(ka, "verify_reply", lambda path, since: None):

@@ -248,7 +248,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),
     Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
     Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
-    Job("window_start", 80, window_start=True, paused="handler", on_interrupt="fail", session=True,
+    Job("window_start", 90, window_start=True, paused="handler", on_interrupt="fail", session=True,
         cron_tag="AFClaude window-start"),
     # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
     Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail", cron_tag="AFClaude at-shim",
@@ -264,11 +264,11 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         what="compaction check (D-238): is one due"),
     # the acts: each types into the task-manager session, at the time its plan step stored; a cut-off
     # one is never rerun (D-257), a drain holds it
-    Job("last_stretch", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("last_stretch", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="last-stretch slot start (D-020/D-204)"),
-    Job("deferred_start", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("deferred_start", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="postponed or planned session-window start (D-202/D-274)"),
-    Job("fillup", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("fillup", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="fill-up start (D-212)"),
     Job("compaction", 60, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="compaction: save, /compact, the hand-off back (D-238)"),

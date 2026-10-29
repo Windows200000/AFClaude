@@ -877,7 +877,7 @@ SETTINGS: dict[str, Setting] = {
                               "it is killed and fails (D-234), unless the job sets its own", "automation"),
     # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
     # test_runner checks it), so an inner timeout, with its own clear error, always fires first
-    "runner_timeout_window_start": _num(80, 80, 720, "Runner: minutes a session-window start may take (its "
+    "runner_timeout_window_start": _num(90, 90, 720, "Runner: minutes a session-window start may take (its "
                                         "waits for a compaction, the resume and its verification, or the "
                                         "window-start ping and its check) before it is killed and fails (D-234)",
                                         "automation"),
@@ -891,11 +891,11 @@ SETTINGS: dict[str, Setting] = {
                                         "D-207) may take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_compaction_check": _num(6, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
                                             "before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_last_stretch": _num(80, 80, 720, "Runner: minutes a last-stretch slot start may take before "
+    "runner_timeout_last_stretch": _num(90, 90, 720, "Runner: minutes a last-stretch slot start may take before "
                                         "it is killed and fails (D-234)", "automation"),
-    "runner_timeout_deferred_start": _num(80, 80, 720, "Runner: minutes a postponed or planned session-window "
+    "runner_timeout_deferred_start": _num(90, 90, 720, "Runner: minutes a postponed or planned session-window "
                                           "start may take before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_fillup": _num(80, 80, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
+    "runner_timeout_fillup": _num(90, 90, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
                                   "killed and fails (D-234)", "automation"),
     "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
                                       "back, D-238) may take before it is killed and fails (D-234)", "automation"),
