@@ -97,9 +97,24 @@ class Actions(DB):
         self.assertNotIn(text, json.dumps(audit))                           # D-241: the row is the only copy
         self.assertEqual(audit["after"]["text"]["chars"], len(text))
 
-    def test_post_defaults_to_the_manager_session(self):
+    def test_post_defaults_to_the_first_projects_task_manager(self):
         m = actions.perform(self.conn, "inbox.post", {"text": "hi"}, actor="owner", via="dashboard")
-        self.assertEqual(m["session_id"], ka.afclaude_config.manager_session())
+        self.assertEqual(m["session_id"], store.manager_sessions(self.conn)[0]["session"])
+
+    def test_post_targets_a_project_s_task_manager(self):
+        """3b S3: the target is a project (its task-manager), not a machine setting."""
+        sid2 = "00000000-0000-4000-8000-0000000000b2"
+        store.add_project(self.conn, "inbox-two")
+        store.add_project(self.conn, "inbox-none")
+        store.update_project(self.conn, "inbox-two", manager_session=sid2)
+        self.conn.commit()
+        m = actions.perform(self.conn, "inbox.post", {"text": "to two", "project": "inbox-two"}, actor="owner",
+                            via="dashboard")
+        self.assertEqual(m["session_id"], sid2)
+        for params in ({"project": "inbox-none"}, {"project": "nope"}, {"project": "inbox-two", "session_id": sid2}):
+            with self.assertRaises(ValueError, msg=str(params)):      # no guess: no session yet, unknown, both
+                actions.perform(self.conn, "inbox.post", {"text": "x", **params}, actor="owner", via="dashboard")
+        self.assertEqual([r["text"] for r in store.list_inbox(self.conn)], ["to two"])
 
     def test_post_validation(self):
         for bad in ("", "   \n", None, 7, "x" * (store.INBOX_TEXT_MAX + 1), "a\0b"):

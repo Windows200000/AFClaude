@@ -1651,10 +1651,27 @@ def _short(value: Any, what: str, limit: int, required: bool = True) -> str | No
 
 
 @action("inbox.post", "inbox", owner_only=True)
-def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None) -> Result:
-    """A message from the owner to the task-manager (default: the AFClaude manager session),
-    pending until the triage sorts it."""
-    sid = session_id if session_id is not None else afclaude_config.manager_session()
+def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None, project: Any = None) -> Result:
+    """A message from the owner to a task-manager, pending until the triage sorts it. The target is a
+    project (its task-manager from the registry, phase 3b S3) or a session id; with neither, the first
+    project's task-manager (rank order, D-064: AFClaude today). A project without a task-manager session
+    yet, or no task-manager at all, is an error (D-235), not a guess."""
+    if session_id is not None and project is not None:
+        raise ValueError("name a project or a session, not both")
+    if session_id is not None:
+        sid = session_id
+    elif project is not None:
+        p = store.get_project(conn, project)
+        if p is None:
+            raise ValueError(f"unknown project {project!r}")
+        if not p.get("manager_session"):
+            raise ValueError(f"project {p['name']!r} has no task-manager session yet (created at its first start)")
+        sid = p["manager_session"]
+    else:
+        tms = store.manager_sessions(conn)
+        if not tms:
+            raise ValueError("no project has a task-manager session: nowhere to post to")
+        sid = tms[0]["session"]
     m = store.add_inbox(conn, text, sid, ctx.actor)
     return Result(m, m["id"], None, _inbox_audit(m))
 
