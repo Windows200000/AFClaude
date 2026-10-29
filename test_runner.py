@@ -213,7 +213,7 @@ class Tables(Base):
             if job.cron_tag and name not in runner.RUNNER_OWNS:
                 self.assertTrue(any(job.cron_tag in ln for ln in cron), f"{name}: no cron line tagged {job.cron_tag!r}")
         self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS)
-                         | set(runner_jobs.PASSES) | {runner_jobs.AT_JOB})
+                         | set(runner_jobs.PASSES) | {runner_jobs.AT_JOB, runner_jobs.REQUEST_JOB})
 
     def test_the_legacy_crontab_runs_every_job_and_no_runner(self):
         def lines(name):
@@ -1181,8 +1181,8 @@ class SimpleTicks(Base):
 
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
-                                                         "inbox", "inbox_verify", "status_snapshot"}
-                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7, S9b
+                                                         "inbox", "inbox_verify", "status_snapshot", "request"}
+                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4-S7, S9b, 3b S5
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):

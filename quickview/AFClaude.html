@@ -220,6 +220,11 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   </section>
 
   <section>
+    <h2>Run-now requests</h2>
+    <div id="requests"></div>
+  </section>
+
+  <section>
     <h2>Scheduled (runner and cron, tagged AFClaude)</h2>
     <div id="cron"></div>
   </section>
@@ -788,6 +793,18 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); $("msg-form").requestSubmit(); }
   });
 
+  function renderRequests(s) {   // phase 3b S5: open, started, refused and failed run-now requests
+    var r = s.requests || {};
+    if (r.error) { $("requests").innerHTML = '<p class="bad">' + esc(r.error) + "</p>"; return; }
+    $("requests").innerHTML = (r.requests || []).map(function (q) {
+      var st = q.status === "failed" ? "bad" : (q.status === "open" ? "" : "mut");
+      return '<div class="sess">#' + esc(q.id) + ' <span class="' + st + '">' + esc(q.status) + "</span> " +
+        esc(q.kind) + (q.target ? " " + esc(q.target) : "") + ' <span class="mut">' + esc(q.at_berlin || "") +
+        " by " + esc(q.by) + "</span>" + (q.tmux ? " <code>" + esc(q.tmux) + "</code>" : "") +
+        (q.reason ? ' <span class="mut">' + esc(q.reason) + "</span>" : "") + "</div>";
+    }).join("") || '<p class="mut">No run-now requests (tasks.py run-now work PROJECT | continue SESSION | review).</p>';
+  }
+
   function renderCron(s) {
     $("cron").innerHTML = (s.cron || []).map(function (c) {
       var who = '<span class="mut">' + esc(c.owner || "cron") + "</span> ";
@@ -828,7 +845,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
       $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
       $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
-      renderPageVersion(s); renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderProgressLog(s); renderGoals(s); renderDecision(s); renderInput(s); renderCron(s);
+      renderPageVersion(s); renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderProgressLog(s); renderGoals(s); renderDecision(s); renderInput(s); renderRequests(s); renderCron(s);
       docList($("docs"), s.docs, "title");
       docList($("prompts"), s.prompts, "name");
     }).catch(function (e) {

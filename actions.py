@@ -901,6 +901,11 @@ SETTINGS: dict[str, Setting] = {
                                   "killed and fails (D-234)", "automation"),
     "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
                                       "back, D-238) may take before it is killed and fails (D-234)", "automation"),
+    # phase 3b S5: a run-now request; the lower bound is its slowest kind's inner timeouts + 5 min (a
+    # work_on_now continues a task-manager as a start does: runner_jobs.request_min_timeout; test_run_now)
+    "runner_timeout_request": _num(90, 90, 720, "Runner: minutes a run-now request (continue a task-manager, a "
+                                   "stalled session or start a review now) may take before it is killed and "
+                                   "fails (D-234)", "automation"),
     "runner_timeout_inbox": _num(5, 0.5, 720, "Runner: minutes the inbox job (triage, then deliver \"now\" "
                                 "messages) may take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_inbox_verify": _num(0.5, 0.1, 720, "Runner: minutes the inbox_verify job (one check per "
@@ -1458,11 +1463,19 @@ def prompt_var_migrate(conn: sqlite3.Connection, ctx: Ctx) -> Result:
 # Phase 3b (docs/phase3b_plan.md §2, §3.1): work_on_now (target = a project; run-now, D-153) joins
 # continue_now and review_now. A request goes open -> started | refused | failed; the runner
 # (S5) records that through request.start / request.finish, audited: that is what the requester
-# sees, unlike the run row itself (D-256). Nothing consumes requests before S5.
+# sees, unlike the run row itself (D-256). The runner's job "request" consumes them (S5, run_now.py).
 
 REQUEST_KINDS = ("continue_now", "review_now", "work_on_now")
 REQUEST_STATUSES = ("open", "started", "refused", "failed", "done", "cancelled")   # done, cancelled: legacy
 REQUEST_FINISH = {"refused": ("open",), "failed": ("open", "started")}   # outcome -> from
+
+
+def may_request(conn: sqlite3.Connection, ctx: Ctx, kind: str, target: str | None) -> None:
+    """Who may request a run-now (D-184/D-190): today the owner only (request.add is owner_only: the
+    CLI and an MCP call of the owner's own session act as the owner; an autonomous session is refused
+    before this). The hook for phase 5a's roles (a manager for their project: a forced run past the
+    usage; an editor never); raises Forbidden."""
+    return None
 
 
 @action("request.add", "request", owner_only=True)
@@ -1470,7 +1483,8 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
     """Queue continue_now (target = a stalled session id), review_now (no target) or work_on_now
     (target = a project, name or id; stored as its id). One open request per (kind, target):
     asking again returns the open one. A project whose task-manager session doesn't exist yet
-    is a valid target: its first start creates it (D-281)."""
+    is a valid target: its first start creates it (D-281). The caller wakes the runner after the
+    commit (runner.wake; phase 3b S5: it runs the request at once, run_now.py)."""
     store._enum(kind, REQUEST_KINDS, "kind")
     if kind == "continue_now":
         target = store._text(target, "target", required=True)
@@ -1482,6 +1496,7 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
         target = str(store._project_row(conn, target)["id"])
     elif target is not None:
         raise ValueError("review_now takes no target")
+    may_request(conn, ctx, kind, target)
     open_ = store.open_request(conn, kind, target)
     if open_:
         return Result(open_, open_["id"], open_, open_, changed=False)

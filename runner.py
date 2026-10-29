@@ -108,6 +108,13 @@ boot and again, with an alert, whenever it exits before a stop was requested): i
 stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
 messages are not automation (D-186/D-244), so both run while paused.
 
+Run-now (phase 3b S5, the job "request"; docs/phase3b_plan.md §2): every open action_requests row
+(request.add, whose callers wake the runner; the loop's 60-s sleep is the backstop) is a keyed run
+`request <id>`, due at once, one slot per request; its child decides it (run_now.run: started /
+refused / failed, through request.start / request.finish). It runs while paused (D-282), a drain
+holds it, and a restart during one fails it (on_interrupt "fail": the request is recorded failed,
+alert + pause, D-257); a run that ends without deciding its request records it failed (alert + pause).
+
 S2-S7 supercronic was the container's main schedule and this runner ran beside it (nothing runs
 `ensure` and `stop` since S8; S9 removes them with the legacy mode):
     python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
@@ -202,7 +209,9 @@ class Job:
     fields on_interrupt and timeout); planned: a keyed act at the time its pass's plan step stored
     (S6, planned_act: the run's key is the plan's `run`); poll: it only runs while POLL_PENDING[name]
     says there is work (S7: `inbox`, `inbox_verify`), at most once every `poll`; no due time (only a
-    wake starts it) while there is none (_plan_poll)."""
+    wake starts it) while there is none (_plan_poll); requests: the open action_requests rows, one
+    keyed run per row (phase 3b S5, run-now: _plan_requests; due at once, a wake or the 60-s sleep finds
+    a new one), a run's end or interruption decides the request if its handler did not."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
@@ -211,6 +220,7 @@ class Job:
     at_jobs: bool = False
     planned: bool = False
     poll: Optional[timedelta] = None
+    requests: bool = False
     paused: str = "runs"
     on_interrupt: str = "rerun"
     session: bool = False
@@ -224,8 +234,9 @@ class Job:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
             raise ValueError(f"bad job name {self.name!r}")
         if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs, self.planned,
-               self.poll is not None)) != 1:
-            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs / planned / poll")
+               self.poll is not None, self.requests)) != 1:
+            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs / planned / poll "
+                             "/ requests")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
         if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
@@ -233,11 +244,11 @@ class Job:
 
     @property
     def keyed(self) -> bool:
-        return self.window_start or self.at_jobs or self.planned
+        return self.window_start or self.at_jobs or self.planned or self.requests
 
     def slot(self, key: Optional[str]) -> str:
-        """Its runs' slot (Runner.tasks): one run per job at a time, an at-job one per key."""
-        return f"{self.name} {key}" if self.at_jobs and key else self.name
+        """Its runs' slot (Runner.tasks): one run per job at a time, an at-job / a request one per key."""
+        return f"{self.name} {key}" if (self.at_jobs or self.requests) and key else self.name
 
 
 SEC, MIN = timedelta(seconds=1), timedelta(minutes=1)
@@ -292,6 +303,10 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("inbox", 5, poll=30 * SEC, what="inbox: triage, then deliver \"now\" messages (inbox_worker.process)"),
     Job("inbox_verify", 0.5, poll=5 * SEC,
         what="inbox: resume pending post-send verifications (inbox_worker.verify_tick)"),
+    # phase 3b S5: run-now (D-153). Runs while paused (D-282); it types into or starts a session, so a
+    # drain holds it and a restart during one fails it (D-257); one run per open request, at once
+    Job("request", 90, requests=True, on_interrupt="fail", session=True,
+        what="run-now requests (action_requests: work_on_now, continue_now, review_now; run_now.py)"),
 )}
 def _inbox_pending(conn: Any, now: datetime) -> bool:
     import inbox_worker
@@ -322,7 +337,7 @@ SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve",
 # cron line is gone; legacy keeps both).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
                                          "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
-                                         "inbox", "inbox_verify"}
+                                         "inbox", "inbox_verify", "request"}
                                         | WATCHER_PASSES)
 
 
@@ -663,6 +678,8 @@ class Runner:
         policy = job.on_interrupt if job is not None else "fail"
         if job is not None and job.at_jobs:
             policy = at_policy(store.get_job(self.conn, str(r["key"])) if r["key"] else None, job)[0]
+        if job is not None and job.requests and r["key"]:     # D-257: a restart during a request fails it
+            self._request_failed(str(r["key"]), int(r["id"]), "a runner restart cut its run off (D-257)")
         if job is None or policy == "fail":
             self.fail(f"{r['job']} interrupted by a runner restart",
                       f"run {r['id']} ({what}, started {r['started_at']}) was cut off by a runner restart; it is not "
@@ -713,6 +730,9 @@ class Runner:
                 d = self._plan_planned(job, now)
                 if d is not None:
                     out.append(d)
+                continue
+            if job.requests:
+                out.extend(self._plan_requests(job, now))
                 continue
             if job.poll is not None:
                 d = self._plan_poll(job, now)
@@ -796,6 +816,32 @@ class Runner:
             return None
         at, run = min(ready, key=lambda r: r[0])
         return Due(job, run, at)
+
+    def _plan_requests(self, job: Job, now: datetime) -> list[Due]:
+        """Phase 3b S5 (run-now, D-153): every open request without a run yet, oldest first, due now
+        (no due time: request.add's caller wakes the runner, the loop's MAX_SLEEP is the backstop).
+        An open request that has a run already (a run that ended without deciding it, which its end
+        or the boot then marks failed) is never run again."""
+        out: list[Due] = []
+        for row in reversed(store.list_requests(self.conn, "open", limit=200)):
+            key = str(row["id"])
+            if job.slot(key) in self.tasks or store.key_runs(self.conn, job.name, key):
+                continue
+            out.append(Due(job, key, now))
+        if self._next_due(job.name) is not None:
+            self.job_set(job.name, next_due=None)
+        return out
+
+    def _request_failed(self, key: str, run_id: int, why: str) -> None:
+        """A request whose run ended without deciding it (failed, timed out, cut off by a restart):
+        recorded failed (request.finish, audited, D-154) while it is still open. The run's own
+        failure is reported by the caller (alert + pause, D-282/D-257)."""
+        r = store.get_request(self.conn, int(key))
+        if r is None or r["status"] != "open":     # decided by its handler (a started one stays started)
+            return
+        actions.perform(self.conn, "request.finish", {"request_id": int(key), "status": "failed",
+                                                      "reason": f"its run {run_id} {why}", "run_id": run_id},
+                        actor="runner:request", via=VIA)
 
     def _plan_poll(self, job: Job, now: datetime) -> Optional[Due]:
         """S7 (`inbox`, `inbox_verify`): due now if POLL_PENDING[job.name] says there is work and
@@ -1009,7 +1055,17 @@ class Runner:
             status, error = "failed", f"ended by signal {-out.returncode}\n{tail}"
         else:
             status, error = "failed", f"exit {out.returncode}\n{tail}"
+        undecided = False
+        if job.requests and key is not None:
+            req = store.get_request(self.conn, int(key))
+            undecided = req is not None and req["status"] == "open"
+            if undecided and status == "ok":       # a handler that returned without deciding it: an error
+                status, report, result = "failed", True, None
+                error = "exit 0, but its request is still open (the handler did not decide it)"
         actions.run_end(self.conn, run_id, status, actor=f"runner:{job.name}", via=VIA, result=result, error=error)
+        if undecided:
+            assert key is not None
+            self._request_failed(key, run_id, f"ended {status} without deciding it")
         row = store.get_runner_job(self.conn, job.name) or {}
         fails = 0 if status == "ok" else int(row.get("consecutive_failures") or 0) + 1
         fields: dict[str, Any] = {"last_run_id": run_id, "last_status": status, "consecutive_failures": fails}

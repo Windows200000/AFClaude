@@ -620,5 +620,30 @@ async def afclaude_notice(action: Literal["post", "list"], title: Optional[str] 
         conn.close()
 
 
+
+@tool("Run now, no window/budget gate: work (target: project), continue (target: stalled session) or review "
+      "(usage review).")
+async def afclaude_request(kind: Literal["work", "continue", "review"], target: Optional[str] = None,
+                           ctx: Optional[Context] = None) -> str:
+    import runner
+    conn = db()
+    try:
+        if kind == "continue":
+            target = cli.resolve_session(conn, (target or "").strip())
+        elif kind == "work" and target is not None:
+            target = await resolve_dir_arg(ctx, target)
+        usage = cli.run_now_usage()       # phase 3b S5 risk: it spends budget outside the plan
+        r = act(conn, "request.add", kind=cli.RUN_NOW_KINDS[kind], target=target)
+    finally:
+        conn.close()
+    runner.wake()
+    return out(dict(request_brief(r), usage=usage))
+
+
+def request_brief(r: Mapping[str, Any]) -> dict[str, Any]:
+    res = json.loads(r["result"]) if r.get("result") else {}
+    return compact({"id": r["id"], "kind": r["kind"], "target": r["target"], "status": r["status"],
+                    "at": bt(r["ts"]), "by": r["actor"], "tmux": res.get("tmux"), "reason": res.get("reason")})
+
 if __name__ == "__main__":
     server.run("stdio")

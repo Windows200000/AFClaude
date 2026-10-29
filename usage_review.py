@@ -410,6 +410,22 @@ def start_one_off(st, now, which, attempt=1):
     return ok
 
 
+def review_now(now, request_id):
+    """A run-now review_now request (phase 3b S5, docs/phase3b_plan.md §2; D-153): a one-off full
+    usage review (run_once "usage") started now, WITHOUT the quota gate (start_one_off's) and while
+    automation is paused (D-282), under the review lock (one pass at a time). A failed launch is
+    run_once's fail_stop (alert + pause). -> (ok, session id, tmux name)."""
+    fh = lock()
+    try:
+        st = load()      # under the lock: what the last pass saved
+        ok = run_once(st, now, "usage", record={"attempt": 1, "request": request_id})
+        save_checked(st, f"the one-off usage review of run-now request #{request_id}")
+    finally:
+        ka.release_lock(fh)
+    sid = st["one_off_runs"][-1]["session"]
+    return ok, sid, ka.tmux_name(sid)
+
+
 def parse_only(value):
     """argparse type for --only: one ONLY_PROMPTS key, or a comma-separated combination of them
     (D-228: "usage,stage-eta"). -> the canonical, chain-order string ("usage", "stage-eta" or

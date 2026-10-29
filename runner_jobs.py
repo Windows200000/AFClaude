@@ -3,6 +3,7 @@
 
     python3 runner_jobs.py <job> [--key K]
     python3 runner_jobs.py at --key <scheduled job id>     an at-job (phase 3a S4, at_job)
+    python3 runner_jobs.py request --key <request id>      a run-now request (phase 3b S5, run_now.run)
 
 runner.py starts one of these per run, in its own process group, with a timeout. It runs the
 job's existing code the way its cron line does: the same script with the same arguments (runpy,
@@ -93,12 +94,15 @@ PASSES: tuple[str, ...] = ("watch", "run_readings", "compaction_check", "last_st
                            "compaction")
 AT_JOB = "at"               # the at-jobs (runner.JOBS "at", keyed by the scheduled job's id): at_job()
 AT_LOG = "at_shim.log"      # the --run-due cron line's log
+# phase 3b S5: the run-now requests (runner.JOBS "request", keyed by the action_requests id): run_now.run(key),
+# its lines in the keep-alive's log (it starts and continues sessions as the starts do)
+REQUEST_JOB = "request"
 
 
 def log_path(job: str) -> str:
     """The job's log file (what its stdout is appended to, and the runner appends its stderr to)."""
-    rel = (AT_LOG if job == AT_JOB else HANDLERS[job].log if job in HANDLERS else PASS_LOG if job in PASSES
-           else FUNCTIONS[job][0])
+    rel = (AT_LOG if job == AT_JOB else HANDLERS[job].log if job in HANDLERS
+           else PASS_LOG if job in PASSES or job == REQUEST_JOB else FUNCTIONS[job][0])
     return os.path.join(runner_state.data_dir(), rel)
 
 
@@ -314,6 +318,31 @@ def act_min_timeout(job: str) -> timedelta:
     return sum(act_inner(job).values(), timedelta(0)) + OUTER_MARGIN
 
 
+# ---- a run-now request (phase 3b S5): outer timeout = the worst of its kinds' inner timeouts + OUTER_MARGIN
+#
+# work_on_now continues a task-manager as a start does (keepalive._start_session / _first_start: the
+# window start's inner timeouts, window_start_inner, the safe side); continue_now is one dispatcher
+# continue (the dispatcher tick's calls) after the wait for the pass's lock (dispatcher.CONTINUE_LOCK_WAIT);
+# review_now is one review start (the usage_review tick's calls and its lock wait).
+def request_inner(kind: str) -> dict[str, timedelta]:
+    """{what: worst-case time} of one run-now request of `kind`."""
+    if kind == "work_on_now":
+        return window_start_inner()
+    if kind == "continue_now":
+        out = dict(tick_inner("dispatcher"))
+        out["dispatcher.CONTINUE_LOCK_WAIT"] = importlib.import_module("dispatcher").CONTINUE_LOCK_WAIT
+        return out
+    if kind == "review_now":
+        return tick_inner("usage_review")
+    raise KeyError(f"{kind} is not a request kind")
+
+
+def request_min_timeout() -> timedelta:
+    """The least outer timeout of a request run: its slowest kind's inner timeouts + OUTER_MARGIN."""
+    return max(sum(request_inner(k).values(), timedelta(0))
+               for k in ("work_on_now", "continue_now", "review_now")) + OUTER_MARGIN
+
+
 # ---- an at-job (phase 3a S4)
 
 def at_job(key: str) -> int:
@@ -419,11 +448,11 @@ def _argv(h: Handler, key: Optional[str] = None) -> list[str]:
 
 def run(job: str, key: Optional[str] = None) -> int:
     """Run `job` (see the module doc). -> the exit code."""
-    if job not in HANDLERS and job not in FUNCTIONS and job not in PASSES and job != AT_JOB:
+    if job not in HANDLERS and job not in FUNCTIONS and job not in PASSES and job not in (AT_JOB, REQUEST_JOB):
         print(f"runner_jobs: unknown job {job!r}", file=sys.stderr)
         return EXIT_USAGE
-    if job == AT_JOB and not key:
-        print("runner_jobs: an at-job needs --key <scheduled job id>", file=sys.stderr)
+    if job in (AT_JOB, REQUEST_JOB) and not key:
+        print(f"runner_jobs: {job} needs --key <its id>", file=sys.stderr)
         return EXIT_USAGE
     os.chdir(HERE)          # the cron lines' `cd $AFCLAUDE_DIR`
     out = _redirect_stdout(log_path(job))
@@ -445,7 +474,10 @@ def run(job: str, key: Optional[str] = None) -> int:
     reports.install()
     note, status, next_due = "", "ok", None
     try:
-        if job in PASSES:
+        if job == REQUEST_JOB:
+            note = str(importlib.import_module("run_now").run(str(key)))
+            code = 0
+        elif job in PASSES:
             res = importlib.import_module("keepalive").runner_pass(job, key)
             note, status, next_due = str(res.get("note") or ""), str(res.get("status") or "ok"), res.get("next_due")
             code = 0
@@ -486,7 +518,7 @@ def _result(out: TextIO, status: str, note: str = "", next_due: Optional[str] = 
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Run one resident-runner job (runner.py starts these).")
-    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS) | set(PASSES) | {AT_JOB}))}")
+    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS) | set(PASSES) | {AT_JOB, REQUEST_JOB}))}")
     ap.add_argument("--key", default=None, help="the run's key (a keyed run: a window start, ...)")
     args = ap.parse_args(argv)
     return run(args.job, args.key)
