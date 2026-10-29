@@ -79,6 +79,85 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(readers, {"export_quickview.py"})
 
 
+class BundleTest(unittest.TestCase):
+    """prompts.BUNDLES / prompts.bundle (phase 4a P2, §3.2)."""
+
+    def test_every_part_names_a_real_prompt(self):
+        for kind, b in prompts.BUNDLES.items():
+            with self.subTest(kind=kind):
+                self.assertTrue(b.used_by)
+                self.assertTrue(b.parts)
+                for part in b.parts:
+                    self.assertEqual(sum(bool(x) for x in (part.prompt, part.insert, part.rules)), 1,
+                                     "a part is exactly one of prompt / insert / rules")
+                    if part.prompt:
+                        self.assertIn(part.prompt, prompts.PROMPTS)
+
+    def test_unknown_bundle(self):
+        for bad in ("nope", None, "", 3):
+            with self.assertRaises(prompts.UnknownBundle):
+                prompts.bundle(bad)
+        self.assertTrue(issubclass(prompts.UnknownBundle, LookupError))
+
+    def test_flat_joins_one_line_non_flat_keeps_paragraphs(self):
+        msg = prompts.bundle("continue", reason="r", progress="P.md", insert="x\ny", hooked=True)
+        self.assertNotIn("\n", msg)
+        rules = prompts.bundle("manager_rules", part=1, what="the task-manager rules")
+        self.assertIn("\n\n", rules)
+
+    def test_rules_tail_variants(self):
+        # hooked + manager: the pointer alone; manager=False: guard_respect alone (neutral message,
+        # e.g. the user's own session); the exact byte-for-byte proof against the old code is
+        # SameTextTest below.
+        base = dict(reason="r", progress="P.md")
+        hooked_manager = prompts.bundle("continue", hooked=True, manager=True, **base)
+        self.assertIn(prompts.default("rules_pointer").strip(), hooked_manager)
+        self.assertNotIn(prompts.default("manager").strip(), hooked_manager)
+        neutral = prompts.bundle("continue_foreign", manager=False, reason="r", context="")
+        self.assertIn(prompts.default("guard_respect").strip(), neutral)
+        self.assertNotIn(prompts.default("manager").strip(), neutral)
+
+    def test_system_vars_routed_per_part_not_shared_blindly(self):
+        """A bundle with several prompt parts: one **system dict serves all of them, each part
+        using only the names it declares (manager_rules: session_rules needs part/what,
+        manager needs nothing)."""
+        text = prompts.bundle("manager_rules", part=2, what="the AFClaude-repo rules", unrelated="ignored by both")
+        self.assertIn("the AFClaude-repo rules", text)
+
+    def test_name_keyed_system_variable_does_not_collide(self):
+        """nightly_task.md declares a system variable literally called "name"; render()/bundle()
+        take `name`/`kind` positional-only so a **fields dict with a "name" key still works
+        (nightly_tasks.brief passes the task's own fields straight through)."""
+        text = prompts.bundle("nightly_task", name="t1", title="T", report="review:t1")
+        self.assertEqual(text, prompts.default("nightly_task").format(name="t1", title="T", report="review:t1")
+                         .strip())
+        self.assertEqual(prompts.render("nightly_task", name="t1", title="T", report="review:t1"),
+                         prompts.default("nightly_task").format(name="t1", title="T", report="review:t1"))
+
+    def test_bundle_kinds_match_the_known_sender_paths(self):
+        """Every BUNDLES kind (§3.2) is reachable from one of the senders the plan names: a
+        session_message kind, a compaction prompt sent as is, a standing_rules part
+        (ka.STANDING_RULES_BUNDLES), a usage_review one-off (ur.ONLY_BUNDLES), the nightly task
+        head, or a Haiku judge (documented for F8/D-111, not sent through a bundle of its own)."""
+        session_message_kinds = {"continue", "fillup", "last_mile", "continue_foreign", "project_start",
+                                 "task_start", "compact_after", "compact_after_run", "inbox_now"}
+        compaction_kinds = {"session_end_save", "session_end_save_retry", "session_end_save_refresh", "compact"}
+        other = (set(ka.STANDING_RULES_BUNDLES.values()) | set(ur.ONLY_BUNDLES.values())
+                | {"nightly_task", "usage_haiku", "inbox_triage"})
+        self.assertEqual(set(prompts.BUNDLES), session_message_kinds | compaction_kinds | other)
+
+    def test_cli_bundles_and_bundle(self):
+        with mock.patch("sys.stdout") as out:
+            self.assertEqual(prompts.main(["bundles"]), 0)
+            self.assertEqual(prompts.main(["bundle", "continue", "--set", "reason=r", "--set", "progress=p",
+                                           "--set", "session_stop_pct=95"]), 0)
+        text = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertIn("continue", text)
+        self.assertIn(" ".join(prompts.default("manager").split()), text)   # the bundle is flat: squashed
+        with mock.patch("sys.stderr"):
+            self.assertEqual(prompts.main(["bundle", "nope"]), 1)
+
+
 class RenderTest(unittest.TestCase):
     def test_strict_system_variables(self):
         self.assertEqual(prompts.render("continue", reason="r", progress="P.md"),

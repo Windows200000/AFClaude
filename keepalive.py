@@ -154,26 +154,18 @@ def load_prompt(name):
 
 
 def session_message(name, afclaude=True, manager=True, insert=None, hooked=False, **fields):
-    """One-line message for a session: <name>.md + the standing rules. insert: text that goes
-    right after <name>.md (the hand-off after a compaction).
+    """One-line message for a session: name's own bundle (prompts.BUNDLES[name], P2 of the phase 4a
+    plan) -- <name>.md, then insert (text that goes right after it, e.g. the hand-off after a
+    compaction), then the standing-rule tail.
     hooked=True (a session started in this repo, rules_hooked(cwd)): the standing rules already
     come from the repo's SessionStart hook (D-225), so only the one-line pointer
     (rules_pointer.md) follows. Otherwise they are inline: guard_respect.md + manager.md +
     manager_afclaude.md (the AFClaude-repo rules) + afk_rules.md; afclaude=False leaves out
     manager_afclaude.md, manager=False leaves out all but guard_respect.md (the user's own
     sessions get a neutral message). One line because tmux send-keys would submit at the first
-    newline."""
-    parts = [load_prompt(name).format(**fields)] + ([insert] if insert else [])
-    if hooked and manager:
-        parts.append(load_prompt("rules_pointer"))
-    elif manager:
-        parts += [load_prompt("guard_respect"), load_prompt("manager")]
-        if afclaude:
-            parts.append(load_prompt("manager_afclaude").format(session_stop_pct=session_stop_pct()))
-        parts.append(load_prompt("afk_rules"))
-    else:
-        parts.append(load_prompt("guard_respect"))
-    return " ".join(" ".join(parts).split())
+    newline (every bundle `name` names here is `flat`)."""
+    return prompts.bundle(name, insert=insert, hooked=hooked, manager=manager, afclaude=afclaude,
+                          session_stop_pct=session_stop_pct(), **fields)
 
 
 # The standing rules the repo's SessionStart hook injects (.claude/settings.json, D-225), in two
@@ -194,18 +186,18 @@ def rules_hooked(cwd):
         return False
 
 
+STANDING_RULES_BUNDLES = {"manager": "manager_rules", "afclaude": "afclaude_rules"}
+
+
 def standing_rules(part):
-    """One part of the standing rules (RULES_PARTS), with a header line; variables filled as
-    in session_message ({session_stop_pct}). Newlines kept: this is hook context, not tmux."""
-    if part == "manager":
-        body = [load_prompt("manager")]
-    elif part == "afclaude":
-        body = [load_prompt("manager_afclaude").format(session_stop_pct=session_stop_pct()),
-                load_prompt("guard_respect"), load_prompt("afk_rules")]
-    else:
+    """One part of the standing rules (RULES_PARTS; its bundle, STANDING_RULES_BUNDLES), with a
+    header line; variables filled as in session_message ({session_stop_pct}). Newlines kept: this
+    is hook context, not tmux (the bundle is not `flat`)."""
+    kind = STANDING_RULES_BUNDLES.get(part)
+    if kind is None:
         raise ValueError(f"unknown standing-rules part {part!r} (one of {', '.join(RULES_PARTS)})")
-    head = load_prompt("session_rules").format(part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part])
-    return "\n\n".join(p.strip() for p in [head] + body)
+    return prompts.bundle(kind, part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part],
+                          session_stop_pct=session_stop_pct())
 
 
 def session_rules_hook(part, hook_input, project_dir=None):
