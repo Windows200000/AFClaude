@@ -140,7 +140,7 @@ class BundleTest(unittest.TestCase):
         (ka.STANDING_RULES_BUNDLES), a usage_review one-off (ur.ONLY_BUNDLES), the nightly task
         head, or a Haiku judge (documented for F8/D-111, not sent through a bundle of its own)."""
         session_message_kinds = {"continue", "fillup", "last_mile", "continue_foreign", "project_start",
-                                 "task_start", "compact_after", "compact_after_run", "inbox_now"}
+                                 "manager_first_start", "task_start", "compact_after", "compact_after_run", "inbox_now"}
         compaction_kinds = {"session_end_save", "session_end_save_retry", "session_end_save_refresh", "compact"}
         other = (set(ka.STANDING_RULES_BUNDLES.values()) | set(ur.ONLY_BUNDLES.values())
                 | {"nightly_task", "usage_haiku", "inbox_triage"})
@@ -313,7 +313,6 @@ class SameTextTest(unittest.TestCase):
                  "fillup": {"reason": "r", "progress": "P.md", "remaining": "5", "reset": "04:00"},
                  "compact_after": {"resume": "R"}, "project_start": {"title": "T", "desc": "D", "slug": "s"},
                  "manager_first_start": {"project": "N", "path": "/p", "desc": "D", "progress": "P.md"},
-                 "run_project": {"project": "N"},
                  "compact_after_run": {"resume": "R", "threshold": "150k", "started": "23:40 CET", "reason": "r",
                                        "budget": "b", "pace": "p"},
                  "continue_foreign": {"reason": "r", "context": ""},
@@ -325,6 +324,7 @@ class SameTextTest(unittest.TestCase):
                         for ins in (None, insert):
                             out[f"session_message {name} {afclaude} {manager} {hooked} {ins}"] = ka.session_message(
                                 name, afclaude=afclaude, manager=manager, insert=ins, hooked=hooked, **fields)
+        out["run_project"] = ka.load_prompt("run_project").format(project="N")   # a fragment, as keepalive uses it
         for part in ka.RULES_PARTS:
             out[f"standing_rules {part}"] = ka.standing_rules(part)
         out["compact_command"] = ka.compact_command()
