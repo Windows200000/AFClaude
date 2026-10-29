@@ -106,16 +106,28 @@ export interface Client {
   setCsrfToken(token: string | null): void;
 }
 
-const browserFetch: Transport = { fetch: (input, init) => fetch(input, init) };
-
-export function createClient(transport: Transport = browserFetch): Client {
-  const core = new RequestCore(transport);
+/**
+ * Builds the typed `ApiClient` (one function per endpoint) over an already-constructed
+ * `RequestCore`. Split out from `createClient` so a caller that never wants the real browser
+ * `fetch` in its dependency graph -- the preview build (preview/main.ts, D-211, §3.9) -- can
+ * import this and `RequestCore` without pulling in `browserFetch` below: esbuild then has no
+ * reachable reference to the real `fetch` to include in that bundle (checked by
+ * test_dashboard_web.py's preview build test).
+ */
+export function clientFromCore(core: RequestCore): ApiClient {
   const entries = (Object.keys(ENDPOINTS) as EndpointName[]).map((name) => {
     const endpoint = ENDPOINTS[name];
     const call = (request: EndpointTypes[typeof name]["request"]): Promise<ApiResult<EndpointTypes[typeof name]["response"]>> =>
       core.send(endpoint.method, endpoint.path, request as JsonValue | null, { idempotent: endpoint.idempotent });
     return [name, call] as const;
   });
-  const api = Object.fromEntries(entries) as ApiClient;
+  return Object.fromEntries(entries) as ApiClient;
+}
+
+const browserFetch: Transport = { fetch: (input, init) => fetch(input, init) };
+
+export function createClient(transport: Transport = browserFetch): Client {
+  const core = new RequestCore(transport);
+  const api = clientFromCore(core);
   return { api, setCsrfToken: (token) => core.setCsrfToken(token) };
 }

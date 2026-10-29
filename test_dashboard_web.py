@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""The TS frontend scaffold's Python wrapper (D-208/D-209, docs/phase6a_plan.md §3.8, W3).
+"""The TS frontend scaffold's Python wrapper (D-208/D-209, docs/phase6a_plan.md §3.8, W3; the
+preview build of §3.9/W4, D-211).
 
 Runs the pinned Node (tools/node.py, D-292) over dashboard/web: `npm ci --ignore-scripts`,
 `tsc --noEmit` (strict), the `node:test` suite (the client, the router, the shell and the
-tooltip via preact-render-to-string, the source checks), `npm audit` (high/critical) and the
-esbuild production build.
+tooltip via preact-render-to-string, the source checks), `npm audit` (high/critical), the
+esbuild production build, and the owner preview build (`npm run build:preview`): its index.html
+carries a `connect-src 'none'` CSP and its bundle has no reachable call to the real global
+`fetch` (only `this.transport.fetch(...)` to the mock, dispatched through the `Transport`
+interface -- D-211's "disconnected from the backend", checked on the built file itself, not just
+on the source, so a future change that re-introduces `browserFetch` into the preview's import
+graph is caught here even if it looks fine in review).
 
 Without a usable pinned Node this is a skip, like test_mds/test_oidc's optional dependencies --
 except when AFCLAUDE_REQUIRE_NODE=1 (the image's build stage; once Node is on this host, the
@@ -16,6 +22,7 @@ the owner has said Node must be there).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -87,6 +94,31 @@ class FrontendScaffold(unittest.TestCase):
         assets = os.path.join(WEB, "dist", "assets")
         self.assertTrue(any(f.endswith(".js") for f in os.listdir(assets)))
         self.assertTrue(any(f.endswith(".css") for f in os.listdir(assets)))
+
+    def test_preview_build(self) -> None:
+        """docs/phase6a_plan.md W4 (§3.9, D-211): dummy-data-only, disconnected from any
+        backend. A bare `fetch(` call (not `obj.fetch(`) would be a real network call; the mock
+        transport is only ever reached through `this.transport.fetch(...)` (the Transport
+        interface), which this regex deliberately does not flag."""
+        assert _NODE is not None
+        result = _run([_NODE.npm, "run", "-s", "build:preview"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        index_path = os.path.join(WEB, "dist-preview", "index.html")
+        self.assertTrue(os.path.isfile(index_path))
+        with open(index_path, encoding="utf-8") as fh:
+            index_html = fh.read()
+        self.assertIn("connect-src 'none'", index_html)
+        assets = os.path.join(WEB, "dist-preview", "assets")
+        js_files = [f for f in os.listdir(assets) if f.endswith(".js")]
+        self.assertTrue(js_files)
+        self.assertTrue(any(f.endswith(".css") for f in os.listdir(assets)))
+        bare_fetch = re.compile(r"(^|[^.\w])fetch\s*\(")
+        for name in js_files:
+            with open(os.path.join(assets, name), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIsNone(bare_fetch.search(text),
+                               f"{name} calls the real global fetch -- the preview must only "
+                               "reach the mock through the Transport interface")
 
 
 if __name__ == "__main__":
