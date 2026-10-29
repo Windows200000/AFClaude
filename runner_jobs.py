@@ -190,7 +190,7 @@ TICK_HOST_CALLS.update({
               ("keepalive", "poke_auth", 180, 1)),
     "run_readings": (("host", "usage_cache", 30, 3), ("keepalive", "refresh_usage", 120, 2),
                      ("keepalive", "poke_auth", 180, 1)),
-    "compaction_check": (("host", "usage_cache", 30, 2), ("keepalive", "tmux_alive", 30, 1),
+    "compaction_check": (("host", "usage_cache", 30, 2), ("keepalive", "tmux_has", 30, 1),
                          ("keepalive", "tmux_pids", 30, 1), ("keepalive", "agent_entries", 60, 1),
                          ("host", "proc_snapshot", 30, 1), ("keepalive", "owner_typing", 30, 2)),
 })
