@@ -1180,8 +1180,8 @@ class SimpleTicks(Base):
 
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
-                                                         "inbox", "inbox_verify"}
-                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7
+                                                         "inbox", "inbox_verify", "status_snapshot"}
+                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7, S9b
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):
@@ -2221,3 +2221,47 @@ class PassChild(unittest.TestCase):
         self.assertEqual(json.loads(p.stdout)["status"], "skipped")
         with open(runner_jobs.log_path("fillup")) as fh:
             self.assertIn("pass fillup fillup-x.20261020T010000", fh.read())
+
+
+class StatusSnapshotJob(Base):
+    """S9(b): the status snapshot's job (status_snapshot.py): a tick at most once a minute, written
+    while automation is paused too, and a failed write is the run's failure (alert + pause, D-234/D-235)."""
+
+    async def test_at_most_once_a_minute(self):
+        r = self.runner(owns={"status_snapshot"})
+        r.boot()
+        starts = []
+        for _ in range(60 * 10):                          # a scan every 7 s for 10 minutes (wakes make extra scans)
+            for due in r.plan(self.now):
+                self.assertIsNotNone(await self.run_due(r, due))
+                starts.append(self.now)
+            self.now += timedelta(seconds=7)
+        self.assertGreaterEqual(len(starts), 9)           # it did run, each minute
+        minutes = [t.replace(second=0) for t in starts]       # a grid tick each minute: never two in one minute
+        self.assertEqual(len(minutes), len(set(minutes)))
+        self.assertTrue(all(30 <= t.second < 37 for t in starts))              # on its offset (+ the scan step)
+
+    async def test_it_is_written_while_paused_too(self):
+        r = self.runner(owns={"status_snapshot"}, paused=lambda: {"paused": True, "reason": "an error"})
+        r.boot()
+        actions.runner_job_set(self.conn, "status_snapshot", actor="runner", via="runner",
+                               next_due=runner._iso(self.now))
+        due, = r.plan(self.now)
+        await self.run_due(r, due)
+        run, = self.runs("status_snapshot")
+        self.assertEqual(run["status"], "ok")             # not skipped for the pause
+        self.assertEqual([c[0] for c in self.spawner.calls], ["status_snapshot"])
+
+    async def test_a_failed_write_is_an_alert_and_a_pause_and_the_next_tick_still_runs(self):
+        self.spawner.outcomes["status_snapshot"] = runner.ChildOutcome(
+            1, "", "Traceback ...\nstore.DBUnavailable: database locked", False)
+        r = self.runner(owns={"status_snapshot"})
+        r.boot()
+        actions.runner_job_set(self.conn, "status_snapshot", actor="runner", via="runner",
+                               next_due=runner._iso(self.now))
+        due, = r.plan(self.now)
+        await self.run_due(r, due)
+        self.assertEqual(self.subjects(), ["status_snapshot failed"])
+        self.assertTrue(self.fails[0][3])                 # pause=True
+        self.now += MIN
+        self.assertEqual([d.job.name for d in r.plan(self.now)], ["status_snapshot"])
