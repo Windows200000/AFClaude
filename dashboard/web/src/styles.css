@@ -149,3 +149,13 @@ body {
     transform: translate(-50%, 0) scale(1);
   }
 }
+
+/* Preview build only (D-211, §3.9): a plain fact, not marketing copy, so it stays out of
+   D-230's "no filler text" -- it names what the owner is looking at, nothing else. Unused by the
+   production shell/build. */
+.preview-banner {
+  padding: 0.4rem 1rem;
+  background: var(--status-info);
+  color: #0b0b12;
+  font-size: 0.8rem;
+}

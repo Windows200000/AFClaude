@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- D-211/§3.9: this build never calls any backend, so connect-src is 'none' -- stricter than
+     the real app's CSP (dashboard/security.py, connect-src 'self'). Served as a static file with
+     no server to set a CSP header, so it is a <meta> tag here; note that a <meta> CSP cannot
+     carry frame-ancestors (the spec ignores it there), so that directive is left to whatever
+     serves this file from /private, not restated here where it would silently do nothing. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'self'; base-uri 'none'; form-action 'none'" />
+<title>AFClaude (preview)</title>
+<link rel="stylesheet" href="__APP_CSS__" />
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="__APP_JS__"></script>
+</body>
+</html>
