@@ -1739,33 +1739,67 @@ def manager_sessions(conn: sqlite3.Connection) -> list[Row]:
     return [t for t in task_managers(conn) if t["session"]]
 
 
-# Until phase 3b S4's project selection exists, at most ONE project may have a task-manager session:
-# nothing yet decides which project a start, a last-stretch slot or a fill-up continues, so a second
-# session (e.g. the owner's own interactive chat registered by mistake) would get /compact and continue
-# prompts typed into it. project.edit refuses a second one (actions.project_edit, check_one_manager)
-# and the runner path fails (registry_sessions / start_manager: alert + pause, D-235). S4 drops it.
-ONE_MANAGER_UNTIL_S4 = True
-
-
-def check_one_manager(tms: list[Row]) -> None:
-    """The registry rows `tms` (manager_sessions) hold at most one task-manager session until 3b
-    S4 (ONE_MANAGER_UNTIL_S4), else ValueError naming them (the runner path fail-stops, D-235)."""
-    if ONE_MANAGER_UNTIL_S4 and len(tms) > 1:
-        have = ", ".join(f"{t['name']} {str(t['session'])[:8]}" for t in tms)
-        raise ValueError(f"{len(tms)} projects have a task-manager session ({have}); until phase 3b S4's project "
-                         "selection only one may (clear the others: tasks.py project edit NAME --manager '')")
-
-
 def start_manager(conn: sqlite3.Connection) -> Row:
-    """The task-manager a session-window start continues until 3b S4's project selection exists:
-    the first of the registry (rank order, D-064) that is not paused (D-244), else the first (its own
-    pause then holds the start, as it does today). No task-manager at all, or more than one
-    (check_one_manager), is an error (D-235)."""
+    """The task-manager a session-window start is anchored on (its `--session`, the deferred
+    entry's and the start's pause check): the first of the registry (rank order, D-064) that is not
+    paused (D-244), else the first (its own pause then holds the start, as every other one is paused
+    too). The project the start continues is chosen later, after the gate and the timing
+    (pick_project, phase 3b S4). No task-manager at all is an error (D-235)."""
     tms = manager_sessions(conn)
     if not tms:
         raise ValueError("no project has a task-manager session (projects.manager_session): nothing to start")
-    check_one_manager(tms)
     return next((t for t in tms if not t["paused"]), tms[0])
+
+
+# Phase 3b S4: the open work a start picks a project by. A pending stage is ready; an in_progress one
+# is the task-manager's unfinished work (a run that ended mid-stage). blocked waits for the owner.
+READY_STATUSES = ("pending", "in_progress")
+
+
+def pick_project(conn: sqlite3.Connection, chained: object = None) -> Row:
+    """The projects a start (a session-window start, a postponed one, a last-stretch slot) may
+    continue, best first (phase 3b S4, docs/phase3b_plan.md §2), read-only:
+    {"candidates": [registry row + ready, best, why], "skipped": [(name, why)]}.
+      - a paused project (D-244) is skipped; so is one with no task-manager session yet AND no ready
+        stage (D-281 creates its session at its first start, which needs work to start for);
+      - `chained` (a project id: the run before is still going, D-274) comes first (D-281);
+      - then the projects with ready stages (READY_STATUSES): all whose best stage is high, by
+        project rank, then medium, then low (D-064; inside the project its task-manager decides);
+      - then the task-managers without a ready stage, by rank (each still has its own work, as
+        the only task-manager always had before S4).
+    The caller passes over a candidate the owner holds or that is at a limit (D-204, D-239.1)
+    while a later one exists. No candidate: the start holds ("no project to run"), not an error."""
+    work: dict[int, tuple[int, int]] = {}
+    marks = ",".join("?" * len(READY_STATUSES))
+    for pid, n, best in conn.execute(
+            f"SELECT project_id, COUNT(*), MIN(CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END) "
+            f"FROM tasks WHERE status IN ({marks}) AND project_id IS NOT NULL GROUP BY project_id",
+            READY_STATUSES):
+        work[int(pid)] = (int(n), int(best))
+    first: list[Row] = []
+    ready: list[Row] = []
+    rest: list[Row] = []
+    skipped: list[tuple[str, str]] = []
+    for t in task_managers(conn):
+        n, best = work.get(int(t["project_id"]), (0, len(PRIORITIES)))
+        if t["paused"]:
+            skipped.append((str(t["name"]), f"paused ({t['pause_reason']})"))
+            continue
+        if not t["session"] and not n:
+            skipped.append((str(t["name"]), "no task-manager session yet and no ready stage"))
+            continue
+        c = dict(t, ready=n, best=PRIORITIES[best] if n else None)
+        if chained is not None and int(t["project_id"]) == chained:
+            c["why"] = "chained: the run before is still going, so the start keeps its project (D-274, D-281)"
+            first.append(c)
+        elif n:
+            c["why"] = f"{n} ready stage(s), best priority {c['best']}, project rank {t['rank']} (D-064)"
+            ready.append(c)
+        else:
+            c["why"] = f"no ready stage, project rank {t['rank']}: its task-manager continues its own work"
+            rest.append(c)
+    ready.sort(key=lambda c: (PRIORITIES.index(str(c["best"])), int(c["rank"]), int(c["project_id"])))
+    return {"candidates": first + ready + rest, "skipped": skipped}
 
 
 def check_manager_setting(conn: sqlite3.Connection, setting: str) -> None:

@@ -429,7 +429,6 @@ class NoStarts(Base):
         rep = self.run_pass(now=NOW + timedelta(hours=1))
         self.assertEqual(self.resume_calls(), [])
         self.assertEqual(rep["continue"], [])
-        self.assertEqual([p["name"] for p in dp.start_project_seam(self.conn)], ["managed"])   # phase 3b seam
 
     def test_managed_manager_ignored_or_kept_by_keepalive(self):
         mgr = sid(7)

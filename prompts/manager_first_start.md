@@ -1,0 +1,1 @@
+[keep-alive] A new run starts, the first one of this session: you are the task-manager of the project {project} (its directory: {path}), created at the project's first start. {desc} Keep the project's progress in {progress} (create it if missing) and work the project's tasks from the AFClaude task store in their order.

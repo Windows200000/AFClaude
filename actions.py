@@ -423,16 +423,11 @@ def project_add(conn: sqlite3.Connection, ctx: Ctx, name: Any, description: Any 
 
 @action("project.edit", "project", extra=store.PROJECT_EDITABLE)
 def project_edit(conn: sqlite3.Connection, ctx: Ctx, project: Any, version: Any = None, **fields: Any) -> Result:
-    """name / description / path / manager_session (None = unmanaged). Until phase 3b S4 a
-    manager_session is refused while another project has one (store.ONE_MANAGER_UNTIL_S4)."""
+    """name / description / path / manager_session (its task-manager session; a session-window start
+    creates it at the project's first start, D-281, so setting it here means forcing a different one).
+    Several projects may have one since phase 3b S4: the start picks the project (store.pick_project)."""
     before = _project(conn, project)
     _check_version(before, version, f"project {before['name']!r}")
-    if str(fields.get("manager_session") or "").strip() and store.ONE_MANAGER_UNTIL_S4:
-        others = [t for t in store.manager_sessions(conn) if t["project_id"] != before["id"]]
-        if others:
-            raise ValueError(f"project {others[0]['name']!r} already has a task-manager session "
-                             f"({str(others[0]['session'])[:8]}); until phase 3b S4's project selection only "
-                             "one project may have one (clear it first: manager_session '')")
     after = store.update_project(conn, before["id"], **fields)
     return Result(after, after["id"], before, after)
 
@@ -2949,6 +2944,25 @@ def app_log_append(conn: sqlite3.Connection, component: str, entries: Iterable[t
                 store.insert_app_log(conn, ts, component, level, line, actor, via)
         return len(rows)
     return store.retrying(run, conn) if rows else 0
+
+
+def run_log_add(conn: sqlite3.Connection, component: str, decision: str, reason: str, *,
+                session_id: str | None = None, actor: str, via: str) -> int:
+    """One keep-alive / dispatcher decision row (run_log; phase 3b S4: a start's project pick or its
+    HOLD). A log row like app_log's, so no audit row (D-256). -> its id."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if decision not in RUN_LOG_DECISIONS:
+        raise ValueError(f"unknown run_log decision {decision!r} ({'|'.join(RUN_LOG_DECISIONS)})")
+    if not isinstance(reason, str) or "\n" in reason or len(reason) > TELEMETRY_LINE_MAX:
+        raise ValueError("a run_log reason is one line of text")
+
+    def run() -> int:
+        with store.transaction(conn):
+            return store.add_run_log(conn, component, decision, reason, session_id=session_id)
+    return store.retrying(run, conn)
+
+
+RUN_LOG_DECISIONS = ("PICK", "HOLD")
 
 
 def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,
