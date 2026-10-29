@@ -805,6 +805,12 @@ SETTINGS: dict[str, Setting] = {
                                         section="automation", kind="text"),
     "ui_chat_reset_hours": _num(5, 1, 168, "Dashboard message box to the task-manager (D-178): it starts "
                               "empty again after this many hours without a new message or answer", "automation"),
+    "preview_publish_enabled": _flag(False, "Owner preview build of the dashboard UI (D-211): "
+                                     "tools/build_preview.py (host-only, needs the pinned Node, D-292) builds and "
+                                     "publishes dashboard/web's dist-preview/ next to the quickview export, and "
+                                     "export_quickview.py's preview_block reports it in status.json; off = no "
+                                     "build, no publish, no new status.json field (default, until ovm3 has the "
+                                     "matching /private proxy, D-253's pattern)", "automation"),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
                                   "that holds an approved stalled session is stopped so it can be continued",
                                   "automation"),
