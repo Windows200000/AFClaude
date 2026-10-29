@@ -85,14 +85,14 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.now = START
         self.spawner = FakeSpawner()
 
-    def fail(self, component, subject, detail="", **kw):
+    def record_fail(self, component, subject, detail="", **kw):
         self.fails.append((component, subject, detail, kw.get("pause", True)))
 
     def runner(self, owns=(), jobs=None, **kw):
         kw.setdefault("spawner", self.spawner)
         kw.setdefault("supervise", {})     # S7: no supervised children unless a test asks for one
         return runner.Runner(self.conn, jobs=jobs, owns=frozenset(owns), clock=lambda: self.now,
-                             log_fn=self.logs.append, fail=self.fail, schedule_cfg=CFG,
+                             log_fn=self.logs.append, fail=self.record_fail, schedule_cfg=CFG,
                              sock=os.path.join(self.tmp, "r.sock"), **kw)
 
     def subjects(self):
@@ -929,7 +929,7 @@ class Ensure(Base):
             spawned.append(1)
             return FakeProc(rc)
         n = runner.ensure(connect=lambda: store.connect(os.path.join(self.tmp, "t.db")), pids=lambda: list(running),
-                          spawn=spawn, settle=0.05, clock=lambda: self.now, sleep=lambda s: None, fail=self.fail,
+                          spawn=spawn, settle=0.05, clock=lambda: self.now, sleep=lambda s: None, fail=self.record_fail,
                           log_fn=self.logs.append)
         self.assertEqual(n, 0)
         return spawned
@@ -1752,6 +1752,20 @@ class WatcherPasses(Base):
             else:
                 self.assertEqual(job.on_interrupt, "rerun", name)
         self.assertEqual(runner.JOBS["watch"].paused, "runs")           # detection runs while paused
+
+    def test_runner_conflict_keeps_a_watcher_from_starting_beside_the_runner(self):
+        """The reverse of watcher_conflict: keepalive.run, start_watcher.sh and start_keepalive.sh
+        (runner.py watcher-check) refuse under AFCLAUDE_SCHEDULER=on or a fresh heartbeat of a
+        runner that did not exit cleanly; legacy after the runner's clean stop does not."""
+        legacy = {"AFCLAUDE_SCHEDULER": "legacy"}
+        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now))           # never ran
+        self.assertIn("AFCLAUDE_SCHEDULER=on", runner.runner_conflict(self.conn, {"AFCLAUDE_SCHEDULER": "on"}, self.now))
+        self.prev_boot(self.now - 30 * SEC, clean=False)
+        self.assertIn("heartbeat is 30 s old", runner.runner_conflict(self.conn, legacy, self.now))
+        self.assertIn("heartbeat", runner.runner_conflict(self.conn, {}, self.now + runner.STALE_BEAT - 31 * SEC))
+        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now + runner.STALE_BEAT - 29 * SEC))
+        self.prev_boot(self.now - 30 * SEC, clean=True)
+        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now))
 
     def test_the_act_timeouts_exceed_their_inner_timeouts(self):
         for name in runner_jobs.START_ACTS + ("compaction",):

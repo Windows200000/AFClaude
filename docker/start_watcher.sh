@@ -11,6 +11,8 @@
 # Never two: a running watcher (pgrep) or one on the HOST makes this a no-op, concurrent starts
 # (the entrypoint's and the watchdog's) are serialized by a lock file, and keepalive.py's own
 # lock makes any second instance exit.
+# Never beside the resident runner (phase 3a S6: it runs the watcher's passes): AFCLAUDE_SCHEDULER=on
+# or a runner heartbeat that is fresh (`runner.py watcher-check`) is a refusal, exit 1.
 set -eu
 D="${AFCLAUDE_DIR:?}"; S="${KEEPALIVE_STATE_DIR:?}"
 WATCHER='^python3 -u [^ ]*keepalive.py --session'
@@ -39,6 +41,7 @@ if pgrep -f "$WATCHER" >/dev/null; then exit 0; fi
 # A watcher is `keepalive.py --session <uuid>` without a one-shot flag: the */30 --window-start
 # run, --plan-fillup-test or --decide (also this container's own, visible on the host) are none.
 cd "$D"
+python3 "$D/runner.py" watcher-check || exit 1
 if ! python3 - <<'PY'
 import sys
 import host

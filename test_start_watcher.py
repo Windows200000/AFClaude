@@ -52,6 +52,8 @@ def note(text):
     with open(os.path.join(D, "runner_calls"), "a") as fh:
         fh.write(text + "\\n")
 note(" ".join(sys.argv[1:]))
+if sys.argv[1:] == ["watcher-check"] and os.path.exists(os.path.join(D, "runner_live")):
+    sys.exit("not starting a keep-alive watcher: the resident runner's heartbeat is 5 s old")
 if sys.argv[1:] == ["serve"]:
     with open(os.path.join(D, "runner_pid"), "w") as fh:
         fh.write(str(os.getpid()))
@@ -191,6 +193,17 @@ class StartWatcher(unittest.TestCase):
             p.wait(timeout=30)
         self.assertEqual(self.started(), [f"--session {SID} --arm"])
 
+    def test_a_live_runner_refuses_the_start(self):
+        # phase 3a S6: the runner runs the watcher's passes (runner.py watcher-check says so)
+        open(os.path.join(self.d, "runner_live"), "w").close()
+        r = self.sh()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("resident runner", r.stderr)
+        self.assertEqual(self.started(wait=1), [])
+        os.unlink(os.path.join(self.d, "runner_live"))
+        self.assertEqual(self.sh().returncode, 0)
+        self.assertEqual(self.started(), [f"--session {SID} --arm"])
+
     def entrypoint(self, scheduler, wait):
         p = subprocess.Popen([os.path.join(self.d, "docker", "entrypoint.sh")],
                              env=dict(self.env, AFCLAUDE_SCHEDULER=scheduler, AFCLAUDE_CRONTAB="/nonexistent"),
@@ -275,7 +288,7 @@ class StartWatcher(unittest.TestCase):
         p.send_signal(signal.SIGTERM)                     # supercronic is the exec'd process: it gets it
         out, _ = p.communicate(timeout=20)
         self.assertIn("scheduler LEGACY", out)
-        self.assertEqual(self.lines("runner_calls"), [])
+        self.assertEqual(self.lines("runner_calls", "watcher-check"), ["watcher-check"])  # only start_watcher's check
         self.assertEqual(self.started(), [f"--session {SID} --arm"])   # the watcher as before
 
     def test_entrypoint_rejects_an_unknown_mode(self):
