@@ -83,13 +83,21 @@ HANDLERS: dict[str, Handler] = {
 }
 # Jobs whose code is a function here, not a script: name -> (log file, function -> note).
 FUNCTIONS: dict[str, tuple[str, Callable[[], str]]] = {}
+# S6: the keep-alive watcher's passes, run in this process as keepalive.runner_pass(job, key) (the
+# session: $AFCLAUDE_MANAGER_SESSION, as the watcher's --session; armed, as the watcher ran), their
+# output appended to the keep-alive's log as the watcher's was. The ticks plan; the acts (a key: the
+# run key their plan stored) type into the session. -> the result line's status, note and next_due.
+PASS_LOG = "keepalive/keepalive.log"
+PASSES: tuple[str, ...] = ("watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
+                           "compaction")
 AT_JOB = "at"               # the at-jobs (runner.JOBS "at", keyed by the scheduled job's id): at_job()
 AT_LOG = "at_shim.log"      # the --run-due cron line's log
 
 
 def log_path(job: str) -> str:
     """The job's log file (what its stdout is appended to, and the runner appends its stderr to)."""
-    rel = AT_LOG if job == AT_JOB else HANDLERS[job].log if job in HANDLERS else FUNCTIONS[job][0]
+    rel = (AT_LOG if job == AT_JOB else HANDLERS[job].log if job in HANDLERS else PASS_LOG if job in PASSES
+           else FUNCTIONS[job][0])
     return os.path.join(runner_state.data_dir(), rel)
 
 
@@ -172,6 +180,20 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
                      ("keepalive", "tmux_has", 30, 1)),
     "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_has", 30, 1)),
 }
+# S6, the keep-alive watcher's ticks. The watch: the usage cache read by the detection, the last-stretch
+# plan, its next slot start and the fill-up plan (+ one spare), and the fill-up's usage refresh ahead of
+# its start (with its one token-refresh retry). The run readings: one usage refresh with its retry and the
+# cache reads around it. The compaction check: the holds (the usage cache twice, the preflight's tmux /
+# `claude agents` / process calls, the owner-typing check's two tmux reads).
+TICK_HOST_CALLS.update({
+    "watch": (("host", "usage_cache", 30, 5), ("keepalive", "refresh_usage", 120, 2),
+              ("keepalive", "poke_auth", 180, 1)),
+    "run_readings": (("host", "usage_cache", 30, 3), ("keepalive", "refresh_usage", 120, 2),
+                     ("keepalive", "poke_auth", 180, 1)),
+    "compaction_check": (("host", "usage_cache", 30, 2), ("keepalive", "tmux_has", 30, 1),
+                         ("keepalive", "tmux_pids", 30, 1), ("keepalive", "agent_entries", 60, 1),
+                         ("host", "proc_snapshot", 30, 1), ("keepalive", "owner_typing", 30, 2)),
+})
 TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
 }
@@ -193,6 +215,39 @@ def tick_inner(job: str) -> dict[str, timedelta]:
 def tick_min_timeout(job: str) -> timedelta:
     """The least outer timeout of the tick `job`: its inner timeouts + TICK_MARGIN."""
     return sum(tick_inner(job).values(), timedelta(0)) + TICK_MARGIN
+
+
+# ---- the watcher passes' acts (S6): outer timeout = their inner timeouts + OUTER_MARGIN
+#
+# A start (last_stretch, deferred_start, fillup) re-plans and then fires as a session-window start does
+# (handle_fire): its inner timeouts are the window start's (window_start_inner, the ping included: the
+# safe side). The compaction re-runs its check (the compaction_check tick's calls), then waits for the
+# turn to end twice (before the save prompt and before /compact), for the hand-off, the compaction marker
+# and the reply to the hand-off, and types three times (the save prompt, /compact, the hand-off).
+START_ACTS = ("last_stretch", "deferred_start", "fillup")
+COMPACTION_CONSTANTS: tuple[tuple[str, int], ...] = (("COMPACT_IDLE_WAIT", 2), ("SAVE_TIMEOUT", 1),
+                                                     ("COMPACT_TIMEOUT", 1), ("VERIFY_TIMEOUT", 1))
+COMPACTION_HOST_CALLS: tuple[tuple[str, int, int], ...] = (("fire", 120, 3),)
+
+
+def act_inner(job: str) -> dict[str, timedelta]:
+    """{what: worst-case time} of one run of the act `job` (a start or the compaction)."""
+    if job in START_ACTS:
+        return window_start_inner()
+    if job != "compaction":
+        raise KeyError(f"{job} is not an act")
+    ka = importlib.import_module("keepalive")
+    out = dict(tick_inner("compaction_check"))
+    for name, n in COMPACTION_CONSTANTS:
+        out[name] = out.get(name, timedelta(0)) + getattr(ka, name) * n
+    for fn, secs, calls in COMPACTION_HOST_CALLS:
+        out[f"host:{fn}"] = out.get(f"host:{fn}", timedelta(0)) + timedelta(seconds=secs * calls)
+    return out
+
+
+def act_min_timeout(job: str) -> timedelta:
+    """The least outer timeout of the act `job`: its inner timeouts + OUTER_MARGIN."""
+    return sum(act_inner(job).values(), timedelta(0)) + OUTER_MARGIN
 
 
 # ---- an at-job (phase 3a S4)
@@ -300,7 +355,7 @@ def _argv(h: Handler, key: Optional[str] = None) -> list[str]:
 
 def run(job: str, key: Optional[str] = None) -> int:
     """Run `job` (see the module doc). -> the exit code."""
-    if job not in HANDLERS and job not in FUNCTIONS and job != AT_JOB:
+    if job not in HANDLERS and job not in FUNCTIONS and job not in PASSES and job != AT_JOB:
         print(f"runner_jobs: unknown job {job!r}", file=sys.stderr)
         return EXIT_USAGE
     if job == AT_JOB and not key:
@@ -324,9 +379,13 @@ def run(job: str, key: Optional[str] = None) -> int:
         return EXIT_OK
     reports = _Reports()
     reports.install()
-    note = ""
+    note, status, next_due = "", "ok", None
     try:
-        if h is not None:
+        if job in PASSES:
+            res = importlib.import_module("keepalive").runner_pass(job, key)
+            note, status, next_due = str(res.get("note") or ""), str(res.get("status") or "ok"), res.get("next_due")
+            code = 0
+        elif h is not None:
             argv = _argv(h, key)
             saved = sys.argv
             sys.argv = argv
@@ -352,7 +411,7 @@ def run(job: str, key: Optional[str] = None) -> int:
     if code != 0:
         print(f"runner_jobs: {job} exited {code}", file=sys.stderr)
         return code if 0 < code < 256 and code != EXIT_REPORTED else 1
-    _result(out, "ok", note)
+    _result(out, status, note, next_due)
     return EXIT_OK
 
 
@@ -363,7 +422,7 @@ def _result(out: TextIO, status: str, note: str = "", next_due: Optional[str] = 
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Run one resident-runner job (runner.py starts these).")
-    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS) | {AT_JOB}))}")
+    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS) | set(PASSES) | {AT_JOB}))}")
     ap.add_argument("--key", default=None, help="the run's key (a keyed run: a window start, ...)")
     args = ap.parse_args(argv)
     return run(args.job, args.key)

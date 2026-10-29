@@ -47,7 +47,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -599,7 +599,29 @@ def latest_decision():
     return full[:120]
 
 
-def watcher_running():
+WATCH_STALE = timedelta(minutes=5)   # the runner's watch pass (S6) last ran ok this long ago: not running
+
+
+def watcher_running(conn=None, now=None):
+    """The keep-alive watcher: its process (pgrep), or while the resident runner runs its passes
+    (AFCLAUDE_SCHEDULER on/runner, phase 3a S6) the runner's `watch` job: running = its last ok run
+    is younger than WATCH_STALE ({"running", "pids": [], "by": "runner", "last_ok_berlin"}). A
+    read that fails is running None (unknown), never raised."""
+    if os.environ.get("AFCLAUDE_SCHEDULER", "off") in RUNNER_MODES:
+        now = now or datetime.now(UTC)
+        try:
+            own = conn is None
+            conn = conn or store.connect()
+            try:
+                row = store.get_runner_job(conn, "watch") or {}
+            finally:
+                if own:
+                    conn.close()
+        except Exception:   # noqa: BLE001 - a display path: unknown
+            return {"running": None, "pids": [], "by": "runner"}
+        ok = store.parse_iso(row.get("last_ok_at")) if row.get("last_ok_at") else None
+        return {"running": bool(ok and now - ok <= WATCH_STALE), "pids": [], "by": "runner",
+                "last_ok_berlin": bstr(ok) if ok else None}
     try:
         r = subprocess.run(["pgrep", "-f", "keepalive.py --session"], capture_output=True, text=True, timeout=10)
         pids = [p for p in r.stdout.split() if p.strip()]
@@ -1014,6 +1036,8 @@ def runner_schedule(job):
         return f"daily {t:%H:%M} UTC", f"daily {t.astimezone(ka.BERLIN):%H:%M %Z}"
     if job.at_jobs:
         return "each at-job's minute", "each at-job's minute"
+    if job.planned:
+        return "when its pass plans it", "when its pass plans it"
     return "each session-window start", "each session-window start"
 
 

@@ -46,8 +46,16 @@ Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) move
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
 (stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
-docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts; cron still
-runs the watcher watchdog and the inbox API watchdog.
+docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts. S6: the
+keep-alive watcher's passes (no watcher runs beside it any more); cron still runs the inbox API
+watchdog.
+
+Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
+`run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
+`fillup` and `compaction` are `planned` jobs: a keyed run at the time the pass's plan step stored in
+the keep-alive's runner state (PLANS_COMPONENT, acts.<job> = {key, at, run}; planned_act), under its
+run key once (a run row settles it); a session run (a drain holds it), a cut-off one is an alert +
+pause and never reruns (D-257). The job row's next_due is that time while it is ahead.
 
 Window starts (S5, the job "window_start"): a keyed run at each session-window start, to the second
 (schedule.next_session_start is the job row's next_due; key schedule.start_key), as
@@ -140,8 +148,12 @@ EXIT_REPORTED = runner_jobs.EXIT_REPORTED
 EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail): `ensure` does not alert again
 TINY = timedelta(microseconds=1)
 # The keep-alive watcher's passes (S6). The runner refuses to start next to a running watcher only
-# once it owns one of them: until then (S2-S5) the watcher runs beside it by design (§4).
-WATCHER_PASSES = frozenset({"watch", "compaction", "last_stretch", "deferred_start", "fillup"})
+# once it owns one of them: until then (S2-S5) the watcher ran beside it by design (§4).
+WATCHER_PASSES = frozenset({"watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
+                            "compaction"})
+# Where a planned job's next act is (S6): the keep-alive's runner state, acts.<job> = {key, at, run}
+# (its plan step writes it, keepalive.store_act; the runner only reads it).
+PLANS_COMPONENT = "keepalive.watch"
 WATCHER_ONE_SHOT = frozenset({"--window-start", "--plan-fillup-test", "--decide", "--last-mile", "--once",
                               "--work-on", "--run-stopped", "--session-rules"})
 
@@ -160,13 +172,15 @@ class Job:
     child's command instead of runner_jobs.py (tests); offset: see every; what: what it does, for
     the quickview's schedule list (default: the cron tag); at_jobs: the scheduled_jobs rows, one keyed
     run per row at its run_at (S4; on_interrupt and timeout_min are the defaults of the row's payload
-    fields on_interrupt and timeout)."""
+    fields on_interrupt and timeout); planned: a keyed act at the time its pass's plan step stored
+    (S6, planned_act: the run's key is the plan's `run`)."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
     daily: Optional[tuple[int, int]] = None
     window_start: bool = False
     at_jobs: bool = False
+    planned: bool = False
     paused: str = "runs"
     on_interrupt: str = "rerun"
     session: bool = False
@@ -179,8 +193,8 @@ class Job:
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
             raise ValueError(f"bad job name {self.name!r}")
-        if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs)) != 1:
-            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs")
+        if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs, self.planned)) != 1:
+            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs / planned")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
         if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
@@ -188,7 +202,7 @@ class Job:
 
     @property
     def keyed(self) -> bool:
-        return self.window_start or self.at_jobs
+        return self.window_start or self.at_jobs or self.planned
 
     def slot(self, key: Optional[str]) -> str:
         """Its runs' slot (Runner.tasks): one run per job at a time, an at-job one per key."""
@@ -218,15 +232,36 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
     Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail", cron_tag="AFClaude at-shim",
         what="at-jobs (scheduled_jobs: the weekly-reset samples, one-off reviews, the review chain's steps)"),
+    # S6: the keep-alive watcher's passes (keepalive.runner_pass). The ticks only read and plan (a rerun
+    # is safe); off the minute, never at the second of the other ticks (cron's grid, stall_scan's +90 s).
+    # The watch runs while paused (detection only); the compaction check and the acts check the pause.
+    Job("watch", 12, every=MIN, offset=15 * SEC, cron_tag="AFClaude watcher watchdog",
+        what="keep-alive watch: limit detection; the plans of the last stretch, the postponed / planned starts "
+             "and the fill-up"),
+    Job("run_readings", 10, every=5 * MIN, offset=50 * SEC, what="usage readings during a run (D-207)"),
+    Job("compaction_check", 6, every=MIN, offset=45 * SEC, paused="handler",
+        what="compaction check (D-238): is one due"),
+    # the acts: each types into the task-manager session, at the time its plan step stored; a cut-off
+    # one is never rerun (D-257), a drain holds it
+    Job("last_stretch", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+        what="last-stretch slot start (D-020/D-204)"),
+    Job("deferred_start", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+        what="postponed or planned session-window start (D-202/D-274)"),
+    Job("fillup", 80, planned=True, paused="handler", on_interrupt="fail", session=True,
+        what="fill-up start (D-212)"),
+    Job("compaction", 60, planned=True, paused="handler", on_interrupt="fail", session=True,
+        what="compaction: save, /compact, the hand-off back (D-238)"),
 )}
 # What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
 # here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
 # stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
 # cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them). S4: the
 # at-jobs (the */1 `at --run-due` line is gone; legacy keeps it). S5: the session-window starts (the
-# */30 `--window-start` line is gone; legacy keeps it).
+# */30 `--window-start` line is gone; legacy keeps it). S6: the keep-alive watcher's passes (the
+# entrypoint no longer starts the watcher, its :07/:22/:37/:52 watchdog line is gone; legacy keeps both).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
-                                         "docs_import", "prune_logs", "usage_review", "at", "window_start"})
+                                         "docs_import", "prune_logs", "usage_review", "at", "window_start"}
+                                        | WATCHER_PASSES)
 
 
 # ---------------------------------------------------------------- paths, log, small helpers
@@ -589,6 +624,11 @@ class Runner:
             if job.at_jobs:
                 out.extend(self._plan_at(job, now))
                 continue
+            if job.planned:
+                d = self._plan_planned(job, now)
+                if d is not None:
+                    out.append(d)
+                continue
             nd = self._next_due(name)
             if nd is None:
                 self.job_set(name, next_due=_iso(next_tick(job, now)))
@@ -632,6 +672,29 @@ class Runner:
         if self._next_due(job.name) != want:
             self.job_set(job.name, next_due=_iso(ahead) if ahead else None)
         return out
+
+    def _plan_planned(self, job: Job, now: datetime) -> Optional[Due]:
+        """The act its pass's plan step stored (planned_act), due once its time has come and it is not
+        running or settled (a run row under its key: it ran, or it was cut off and never reruns); the
+        job row's next_due is that time while it is ahead (the loop wakes for it). A stored act that
+        is not valid is an error (alert + pause), reported once per boot."""
+        try:
+            act = planned_act(self.conn, job.name)
+        except ValueError as e:
+            if f"plan-bad:{job.name}:{e}" not in self.logged:
+                self.once(f"plan-bad:{job.name}:{e}", f"{job.name}: its stored plan is not valid ({e}); not run")
+                self.fail("a planned act is not valid", f"{job.name}: {e}")
+            act = None
+        ahead = act[1] if act is not None and act[1] > now else None
+        want = ahead.replace(microsecond=0) if ahead else None
+        if self._next_due(job.name) != want:
+            self.job_set(job.name, next_due=_iso(ahead) if ahead else None)
+        if act is None or ahead is not None or job.name in self.tasks:
+            return None
+        run, at = act
+        if store.key_runs(self.conn, job.name, run):
+            return None
+        return Due(job, run, at)
 
     def _settled(self, job: Job, key: str) -> bool:
         """The keyed run (job, key) was decided already: a run row (for a job that never reruns an
@@ -1038,6 +1101,24 @@ def watcher_conflict(owns: frozenset[str], local: Callable[[], list[int]] = loca
     except Exception as e:   # noqa: BLE001 - can't tell: don't start (as start_watcher.sh)
         return f"the host's process list is unavailable ({type(e).__name__}: {e})"
     return f"a keep-alive watcher runs on the HOST (pid {', '.join(map(str, hp))})" if hp else None
+
+
+def planned_act(conn: Any, name: str) -> Optional[tuple[str, datetime]]:
+    """The next act of the planned job `name` (S6): (its run key, when) from the keep-alive's runner
+    state (PLANS_COMPONENT, acts.<name>: {key, at, run}, written by the pass's plan step), or None.
+    A stored entry that is not valid raises ValueError."""
+    raw = store.state_rows(conn, PLANS_COMPONENT).get(actions._state_json(["acts", name]))
+    if raw is None:
+        return None
+    ent = json.loads(raw)
+    if ent is None:
+        return None
+    if not isinstance(ent, dict):
+        raise ValueError(f"acts.{name} is not an object: {raw[:120]}")
+    run, at = ent.get("run"), _parse_text(ent.get("at"))
+    if not isinstance(run, str) or not actions.RUN_KEY_RE.match(run) or at is None:
+        raise ValueError(f"acts.{name} has no valid run key and time: {raw[:200]}")
+    return run, at
 
 
 # ---------------------------------------------------------------- status, drain

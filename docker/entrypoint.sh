@@ -1,8 +1,9 @@
 #!/bin/sh
 # Entrypoint of the AFClaude manager container (PID 1 is tini).
 #   AFCLAUDE_SCHEDULER=on      the resident runner (runner.py serve, phase 3a) for the jobs it owns
-#                              (runner.RUNNER_OWNS) beside supercronic with docker/crontab for the
-#                              rest, plus the keep-alive watcher and the inbox API
+#                              (runner.RUNNER_OWNS; since S6 also the keep-alive watcher's passes, so
+#                              no watcher is started) beside supercronic with docker/crontab for the
+#                              rest, plus the inbox API
 #   AFCLAUDE_SCHEDULER=legacy  the phase 3a rollback (docs/phase3a_plan.md §4): supercronic with
 #                              docker/crontab.legacy (the crontab before the runner), the watcher and
 #                              the inbox API; no runner
@@ -28,10 +29,13 @@ MODE="${AFCLAUDE_SCHEDULER:-off}"
 case "$MODE" in
   on|legacy)
     echo "afclaude: scheduler $(echo "$MODE" | tr '[:lower:]' '[:upper:]') ($(date -u +%FT%TZ))"
-    # The watcher starts right away (the host crontab's "@reboot ... start_keepalive.sh" line), not
-    # only at the next :07/:22/:37/:52 watchdog: retried until it runs (the bridge may need a
-    # moment after a rebuild), never while PAUSED exists, never a second one (start_watcher.sh).
-    "$D/docker/start_watcher.sh" --boot &
+    # legacy: the watcher starts right away (the host crontab's "@reboot ... start_keepalive.sh"
+    # line), not only at the next :07/:22/:37/:52 watchdog: retried until it runs (the bridge may
+    # need a moment after a rebuild), never while PAUSED exists, never a second one
+    # (start_watcher.sh). on: the runner runs the watcher's passes (phase 3a S6), no watcher.
+    if [ "$MODE" = legacy ]; then
+      "$D/docker/start_watcher.sh" --boot &
+    fi
     # The message box's API (D-241): a unix socket in data/api/ for the quickview's nginx; the cron
     # watchdog restarts it (and alerts) if it dies.
     python3 "$D/inbox_api.py" ensure --boot >>"$D/data/inbox_api.log" 2>&1 \

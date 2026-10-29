@@ -1249,6 +1249,240 @@ class WatcherNoContinue(unittest.TestCase):
             self.assertEqual(st["handled"], {})
 
 
+class PassesThroughTheRunner(unittest.TestCase):
+    """Phase 3a S6: the watcher's passes with the resident runner as the caller (the `watch` tick
+    stores the acts, the runner starts each under its run key; testenv.runner_pass = one child, a
+    fresh process each), next to the watcher (run() / the *_pass functions) on the same scenarios:
+    the same starts under the same dedup keys, a HOLD's recheck and a postponed start stored as the
+    act's time, never a second run of an act, the limit hit noted and logged once across the runs,
+    the watcher's STOP / PAUSED files holding the passes."""
+    NIGHT = Z("2026-10-04T21:00:00Z")                   # Sun 23:00 Berlin, a session-window start
+    R = Z("2026-10-01T16:59:59Z")                       # a weekly reset (the last stretch)
+    NAMES = ("PROJECTS_DIR", "STATE_FILE", "DEFER_FILE", "FILLUP_FILE", "PROGRESS_FILE", "STOP_FILE", "PAUSED_FILE",
+             "LOCK_FILE", "read_usage_cache", "fresh_usage", "handle_fire", "budget_eval", "stall_status",
+             "last_mile_next_start", "fillup_decision", "log")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.tmp.name
+        self.old = {n: getattr(ka, n) for n in self.NAMES}
+        self.addCleanup(self.restore)
+        testenv.clear_watch()
+        self.addCleanup(testenv.clear_watch)
+        setcfg(usage_model="linear", run_start_factor=0)
+        ka.PROJECTS_DIR = d
+        for n, f in (("STATE_FILE", "st.json"), ("DEFER_FILE", "deferred.json"), ("FILLUP_FILE", "fillup.json"),
+                     ("PROGRESS_FILE", "P.md"), ("STOP_FILE", "STOP"), ("PAUSED_FILE", "PAUSED"),
+                     ("LOCK_FILE", "ka.lock")):
+            setattr(ka, n, os.path.join(d, f))
+        testenv.notes_project(d)
+        self.cache = {"fetched_at": self.NIGHT, "weekly": {"percent": 30.0, "resets_at": self.NIGHT + timedelta(days=3)},
+                      "session": {"percent": 0.0, "resets_at": None}}
+        ka.read_usage_cache = lambda: self.cache
+        ka.fresh_usage = lambda n, force=False: self.cache
+        self.go = {"go": True, "postpone": False, "recheck_at": None, "reason": "CONTINUE: test", "text": "budget t"}
+        ka.budget_eval = lambda u, now, display=False: dict(self.go)
+        ka.stall_status = lambda sid, now: ("NO_STALL", "last message is not a limit notice", None)
+        ka.last_mile_next_start = lambda now, usage=None: None
+        ka.fillup_decision = lambda sid, now, usage=None: {"status": "off", "reason": "fillup_enabled is off"}
+        self.logs = []
+        ka.log = self.logs.append
+        self.fired, self.busy = [], 0
+
+        def hf(sid, stall, reason, st, args):
+            if self.busy:
+                self.busy -= 1
+                return ka.OWNER_BUSY
+            self.fired.append((stall["uuid"], reason))
+            st["handled"][stall["uuid"]] = {"result": "test", "at": stall["timestamp"].isoformat()}
+            ka.save_state(st)
+        ka.handle_fire = hf
+        ka.save_state({"handled": {}, "fires": {}})
+
+    def restore(self):
+        for n, v in self.old.items():
+            setattr(ka, n, v)
+        self.tmp.cleanup()
+
+    def tick(self, now):
+        return testenv.runner_pass(ka, "watch", now=now)
+
+    def act(self, job, now):
+        return testenv.runner_act(ka, job, now=now)
+
+    # ---- the postponed / planned session-window start
+
+    def test_a_postponed_start_fires_at_its_recheck_under_its_key(self):
+        start = self.NIGHT + timedelta(seconds=5)
+        key = schedule.start_key(start)
+        recheck = self.NIGHT + timedelta(minutes=50)
+        ka.defer_window_start(key, SID, recheck, "POSTPONE: the user was active")
+        self.tick(start + timedelta(seconds=10))
+        a = testenv.act_of(ka, "deferred_start")
+        self.assertEqual((a["key"], ka.parse_ts(a["at"])), (key, recheck + ka.WAKE_SLACK))
+        self.tick(start + timedelta(minutes=1))
+        self.assertEqual(testenv.act_of(ka, "deferred_start"), a)          # planned once
+        self.assertEqual(self.fired, [])
+        self.act("deferred_start", recheck + ka.WAKE_SLACK)
+        self.assertEqual([k for k, _ in self.fired], [key])
+        self.assertIn("postponed", self.fired[0][1])
+        self.assertIsNone(testenv.act_of(ka, "deferred_start"))
+        self.assertEqual(ka.load_deferred(), {})
+        self.tick(recheck + timedelta(minutes=1))                          # handled: nothing more
+        self.assertIsNone(testenv.act_of(ka, "deferred_start"))
+        # the watcher, on the same scenario: the same start under the same key
+        self.fired.clear()
+        ka.save_state({"handled": {}, "fires": {}})
+        ka.defer_window_start(key, SID, recheck, "POSTPONE: the user was active")
+        st = ka.load_state()
+        self.assertEqual(ka.deferred_window_start_pass(SID, start + timedelta(minutes=1), st, Args()), recheck)
+        self.assertIsNone(ka.deferred_window_start_pass(SID, recheck + ka.WAKE_SLACK, st, Args()))
+        self.assertEqual([k for k, _ in self.fired], [key])
+
+    def test_the_owner_busy_retry_is_the_acts_next_time_under_a_new_run_key(self):
+        start = self.NIGHT + timedelta(seconds=5)
+        key = schedule.start_key(start)
+        ka.defer_window_start(key, SID, start + timedelta(minutes=1), "planned", self.NIGHT + timedelta(hours=5),
+                              planned=True)
+        self.tick(start)
+        first = testenv.act_of(ka, "deferred_start")
+        self.busy = 1
+        t = start + timedelta(minutes=1, seconds=1)
+        self.act("deferred_start", t)
+        again = testenv.act_of(ka, "deferred_start")
+        self.assertEqual(ka.parse_ts(again["at"]), t + ka.OWNER_BUSY_RECHECK + ka.WAKE_SLACK)
+        self.assertNotEqual(again["run"], first["run"])
+        self.tick(t + timedelta(minutes=1))
+        self.assertEqual(testenv.act_of(ka, "deferred_start"), again)     # the tick keeps the retry
+        self.act("deferred_start", ka.parse_ts(again["at"]))
+        self.assertEqual([k for k, _ in self.fired], [key])
+
+    def test_a_runner_window_start_stores_its_planned_start_at_once(self):
+        """The window_start child (--start-key) stores a start it planned late as the act right away,
+        not only at the next watch tick (D-274)."""
+        start = self.NIGHT + timedelta(seconds=3)
+        key = schedule.start_key(start)
+        old = ka.run_timing
+        ka.run_timing = lambda sid, now, u, d: {"start": self.NIGHT + timedelta(hours=3), "end": self.NIGHT + timedelta(hours=5),
+                                               "reason": "test", "chained": False}
+        oldp, oldc = ka.window_ping_after, ka.claim_window_start
+        ka.window_ping_after = lambda *a, **k: None
+        ka.claim_window_start = lambda k, now, by: None
+        try:
+            class A:
+                now, arm, start_key = False, True, key
+            ka.window_start_cli(SID, start, A())
+        finally:
+            ka.run_timing, ka.window_ping_after, ka.claim_window_start = old, oldp, oldc
+        a = testenv.act_of(ka, "deferred_start")
+        self.assertEqual((a["key"], ka.parse_ts(a["at"])), (key, self.NIGHT + timedelta(hours=3) + ka.WAKE_SLACK))
+
+    # ---- the last stretch
+
+    def last_stretch(self):
+        self.cache = {"fetched_at": self.R, "weekly": {"percent": 95.0, "resets_at": self.R},
+                      "session": {"percent": 0.0, "resets_at": None}}
+
+    def test_a_last_stretch_slot_holds_then_fires_once(self):
+        self.last_stretch()
+        t = self.R - timedelta(hours=4)
+        self.go = {"go": False, "postpone": False, "reason": "HOLD: x", "text": "t"}
+        self.tick(t)
+        a = testenv.act_of(ka, "last_stretch")
+        self.assertEqual(ka.parse_ts(a["at"]), t)                        # due at once
+        self.act("last_stretch", t + timedelta(seconds=2))
+        hold = testenv.act_of(ka, "last_stretch")
+        self.assertEqual(ka.parse_ts(hold["at"]), t + timedelta(seconds=2) + ka.LAST_MILE_RECHECK)
+        self.tick(t + timedelta(minutes=1))
+        self.assertEqual(testenv.act_of(ka, "last_stretch"), hold)        # the HOLD's recheck is kept
+        self.go = {"go": True, "postpone": False, "reason": "CONTINUE: last mile", "text": "t"}
+        self.act("last_stretch", ka.parse_ts(hold["at"]))
+        self.assertEqual(len(self.fired), 1)
+        self.assertTrue(self.fired[0][0].startswith("last-mile-"))
+        self.tick(t + timedelta(minutes=30))                              # the same slot: handled
+        self.assertIsNone(testenv.act_of(ka, "last_stretch"))
+        # the watcher: the same key, once
+        fired = list(self.fired)
+        self.fired.clear()
+        ka.save_state({"handled": {}, "fires": {}})
+        st = ka.load_state()
+        ka.last_mile_pass(SID, t, st, Args())
+        ka.last_mile_pass(SID, t + timedelta(minutes=30), st, Args())
+        self.assertEqual([k for k, _ in self.fired], [k for k, _ in fired])
+
+    def test_an_act_is_never_run_twice_and_a_replaced_plan_is_not_run(self):
+        self.last_stretch()
+        t = self.R - timedelta(hours=4)
+        self.go = {"go": False, "postpone": False, "reason": "HOLD: x", "text": "t"}
+        self.tick(t)
+        a = testenv.act_of(ka, "last_stretch")
+        self.act("last_stretch", t)
+        res = testenv.runner_pass(ka, "last_stretch", a["run"], now=t)   # its run key again (a stale start)
+        self.assertIn("its plan changed", res["note"])
+
+    # ---- the watch itself
+
+    def test_a_limit_hit_is_noted_and_logged_once_across_the_runs_and_never_continued(self):
+        stall = {"uuid": "stall-1", "kind": "session", "timestamp": self.NIGHT, "reset": self.NIGHT + timedelta(hours=1)}
+        ka.stall_status = lambda sid, now: ("RESET_PASSED", "session limit reset has passed", dict(stall))
+        for k in range(3):
+            self.tick(self.NIGHT + timedelta(hours=2, minutes=k))
+        self.assertEqual(len([ln for ln in self.logs if ln.startswith("LIMIT_HIT:") and "D-204" in ln]), 1, self.logs)
+        self.assertEqual(testenv.notes(self.tmp.name).count("hit its session limit"), 1)
+        self.assertEqual(self.fired, [])
+
+    def test_the_stop_or_paused_file_holds_every_pass(self):
+        ka.defer_window_start(schedule.start_key(self.NIGHT), SID, self.NIGHT + timedelta(minutes=5), "r")
+        for f in (ka.STOP_FILE, ka.PAUSED_FILE):
+            open(f, "w").close()
+            res = self.tick(self.NIGHT + timedelta(minutes=1))
+            self.assertEqual(res["status"], "skipped")
+            self.assertIsNone(testenv.act_of(ka, "deferred_start"))
+            os.unlink(f)
+        self.assertEqual(len([ln for ln in self.logs if "keep-alive passes held" in ln]), 2)
+        self.assertEqual(self.tick(self.NIGHT + timedelta(minutes=2))["status"], "ok")
+        a = testenv.act_of(ka, "deferred_start")
+        open(ka.STOP_FILE, "w").close()                    # an act due while held: not run, dropped
+        self.assertEqual(self.act("deferred_start", ka.parse_ts(a["at"]))["status"], "skipped")
+        self.assertIsNone(testenv.act_of(ka, "deferred_start"))
+        os.unlink(ka.STOP_FILE)
+        t = ka.parse_ts(a["at"]) + timedelta(minutes=1)
+        self.tick(t)                                       # planned anew (a new run key), then fired
+        b = testenv.act_of(ka, "deferred_start")
+        self.assertNotEqual(b["run"], a["run"])
+        self.act("deferred_start", t)
+        self.assertEqual([k for k, _ in self.fired], [schedule.start_key(self.NIGHT)])
+
+    def test_a_failing_part_is_reported_and_the_others_still_plan(self):
+        def boom(sid, now):
+            raise ValueError("transcript unreadable")
+        ka.stall_status = boom
+        ka.defer_window_start(schedule.start_key(self.NIGHT), SID, self.NIGHT + timedelta(minutes=5), "r")
+        self.addCleanup(testenv.unpause)
+        self.tick(self.NIGHT + timedelta(minutes=1))
+        self.assertIn("watcher pass failed: ValueError", afclaude_config.automation_pause()["reason"])
+        self.assertIsNotNone(testenv.act_of(ka, "deferred_start"))
+
+    def test_a_failing_act_is_dropped_and_planned_anew(self):
+        self.last_stretch()
+        t = self.R - timedelta(hours=4)
+        self.tick(t)
+        a = testenv.act_of(ka, "last_stretch")
+
+        def boom(u, now, display=False):
+            raise ValueError("budget model broken")
+        ka.budget_eval = boom
+        with self.assertRaises(ValueError):                 # the runner reports it (alert + pause)
+            self.act("last_stretch", t)
+        self.assertIsNone(testenv.act_of(ka, "last_stretch"))
+        self.tick(t + timedelta(minutes=1))
+        self.assertNotEqual(testenv.act_of(ka, "last_stretch")["run"], a["run"])
+
+    def test_the_session_must_be_given(self):
+        with self.assertRaisesRegex(RuntimeError, "FULL session UUID"):
+            testenv.runner_pass(ka, "watch", now=self.NIGHT, session="00000000")
+
+
 class RunEnd(unittest.TestCase):
     """D-224: a run ends at the earliest of the task-manager's clean stop (--run-stopped), RUN_IDLE,
     a limit hit and the session window's end; the owner chatting on never keeps it going."""

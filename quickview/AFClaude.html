@@ -405,7 +405,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     }
     var w = k.watcher || {};
     out.push(tile("Watcher", w.running ? '<span class="ok">running</span>' : (w.running === false ? '<span class="bad">not running</span>' : "?"),
-      w.pids && w.pids.length ? '<div class="mut">pid ' + esc(w.pids.join(", ")) + "</div>" : ""));
+      w.by === "runner" ? '<div class="mut">the runner\'s passes' + (w.last_ok_berlin ? ", last " + esc(w.last_ok_berlin) : "") + "</div>"
+        : (w.pids && w.pids.length ? '<div class="mut">pid ' + esc(w.pids.join(", ")) + "</div>" : "")));
     out.push(tile("tmux " + esc(k.tmux_name || "?"), k.tmux_ka_exists ? '<span class="ok">up</span>' : (k.tmux_ka_exists === false ? '<span class="bad">down</span>' : "?"),
       k.tmux_error ? '<div class="bad">' + esc(k.tmux_error) + "</div>" : ""));
     out.push(tile(k.in_window ? "Window (now)" : "Next window",

@@ -168,3 +168,53 @@ def notes(directory, name="progress", db=None):
         return store.doc_render(conn, d["id"]) if d is not None else ""
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- the watcher passes through the runner (phase 3a S6)
+
+def clear_watch(db=None):
+    """No acts and no log-once memory of the runner's keep-alive passes (runner state 'keepalive.watch')."""
+    conn = store.connect(db or store.DB_PATH)
+    try:
+        with store.transaction(conn):
+            conn.execute("DELETE FROM runner_state WHERE component='keepalive.watch'")
+    finally:
+        conn.close()
+
+
+def act_of(ka, job):
+    """The stored act of the runner's job `job` ({key, at, run}) or None."""
+    return (ka.load_watch().get("acts") or {}).get(job)
+
+
+def runner_pass(ka, job, key=None, now=None, session=SID):
+    """What the runner's child `runner_jobs.py <job> [--key K]` does (keepalive.runner_pass), in a
+    fresh process: the module's process-local memory reset first (a child starts without it; the
+    log-once memory comes from the DB), its clock at `now`, the task-manager session `session`."""
+    from datetime import datetime, timezone
+    from unittest import mock
+
+    def fresh():
+        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE", "_DB_PAUSE"):
+            setattr(ka, n, None)
+        ka._PAUSE_LOGGED, ka._FILLUP_BUSY = {}, {}
+        ka._COMPACT_TRIED.clear()
+    fresh()
+    t = now or datetime.now(timezone.utc)
+    old = ka._now
+    ka._now = lambda: t
+    try:
+        with mock.patch.dict(os.environ, {"AFCLAUDE_MANAGER_SESSION": session}):
+            return ka.runner_pass(job, key)
+    finally:
+        ka._now = old
+        fresh()                    # the child ends: nothing of it stays in this process
+
+
+def runner_act(ka, job, now=None, session=SID):
+    """The runner starting the stored act of `job` (its run key) at `now` -> its result, or None
+    (no act stored)."""
+    a = act_of(ka, job)
+    if a is None:
+        return None
+    return runner_pass(ka, job, a["run"], now, session)
