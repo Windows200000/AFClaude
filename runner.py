@@ -397,7 +397,15 @@ def at_policy(row: Optional[store.Row], job: Job) -> tuple[str, Optional[float]]
             float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else None)
 
 
+def _check_pid(pid: int) -> None:
+    """A pid to signal must be a real process: killpg(1, ...) is kill(-1, ...) (glibc), which signals every
+    process of the user, and 0 is the caller's own group. A fake's pid reaching here is a bug: fail fast (D-235)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise ValueError(f"refusing to signal pid {pid!r}: not a real child process (kill(-1) would signal everything)")
+
+
 def _signal_group(pid: int, sig: int) -> None:
+    _check_pid(pid)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, sig)
 
@@ -1428,6 +1436,7 @@ def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runn
         out("runner: none running")
         return 0
     for pid in targets:
+        _check_pid(pid)
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + wait_s
