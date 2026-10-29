@@ -1274,7 +1274,7 @@ class AtJobs(Base):
         self.assertEqual(at, timedelta(minutes=runner.JOBS["at"].timeout_min))
         for tick in ("sampler", "usage_review"):
             self.assertGreaterEqual(at, runner_jobs.tick_min_timeout(tick), tick)
-        callers = subprocess.run(["grep", "-rlE", r'\["at",', "--include=*.py", "."], cwd=HERE,
+        callers = subprocess.run(["grep", "-rlE", "--exclude-dir=.claude", r'\["at",', "--include=*.py", "."], cwd=HERE,
                                  capture_output=True, text=True).stdout.split()
         self.assertEqual(sorted(c for c in callers if not os.path.basename(c).startswith("test_")),
                          ["./usage_review.py", "./usage_sampler.py"])     # a new caller: check its worst case
@@ -1895,6 +1895,9 @@ class Supervised(Base):
     def setUp(self):
         super().setUp()
         self.sup = FakeSupervisor()
+        patch = mock.patch.object(runner, "SUPERVISE_DELAY", 0.05)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def start(self):
         r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve", "--no-worker")}, spawner=self.sup)
@@ -1935,7 +1938,10 @@ class Supervised(Base):
     async def test_stop_ends_it_without_restarting(self):
         r = self.start()
         await asyncio.sleep(0)
-        r.request_stop()                 # SIGTERMs its (fake) pid right away: it does not wait for a tick
+        signalled = []
+        with mock.patch.object(runner, "_signal_group", lambda pid, sig: signalled.append((pid, sig))):
+            r.request_stop()             # SIGTERMs its pid right away: it does not wait for a tick
+        self.assertEqual(signalled, [(1, signal.SIGTERM)])     # (patched: the fake pid 1 is never signalled)
         self.sup.gate.set()
         await asyncio.sleep(0.05)
         self.assertEqual(len(self.sup.calls), 1)

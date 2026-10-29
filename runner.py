@@ -159,6 +159,7 @@ EXIT_LOCKED = 2
 EXIT_REPORTED = runner_jobs.EXIT_REPORTED
 EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail): `ensure` does not alert again
 TINY = timedelta(microseconds=1)
+SUPERVISE_DELAY = 5.0                     # S7: a supervised child that exited is started again after this long
 # The keep-alive watcher's passes (S6). The runner refuses to start next to a running watcher only
 # once it owns one of them: until then (S2-S5) the watcher ran beside it by design (§4).
 WATCHER_PASSES = frozenset({"watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
@@ -985,20 +986,19 @@ class Runner:
 
     # ---- a long-lived supervised child (S7: inbox_api)
 
-    def start_supervised(self, name: str, *, alert: bool = False) -> None:
-        """Start (or, `alert`: restart + alert, D-257's phrasing for this one) one supervised
-        child; never while stopping, never twice."""
+    def start_supervised(self, name: str) -> None:
+        """Start one supervised child; never while stopping, never twice."""
         if self.stopping or name in self.sup_tasks:
             return
         argv = [sys.executable, "-u", os.path.join(HERE, self.supervise[name][0])] + list(self.supervise[name][1:])
-        if alert:
-            self.fail(f"{name} was not running", "the runner starts it again; see its own log")
         self.log(f"start {name} (supervised: {' '.join(self.supervise[name])})")
         self.sup_tasks[name] = asyncio.get_running_loop().create_task(self._supervise(name, argv))
 
     async def _supervise(self, name: str, argv: list[str]) -> None:
-        """Run one supervised child until it exits (no timeout); restart it (alert) unless a stop
-        was requested meanwhile (then its exit is expected: request_stop already signalled it)."""
+        """Run one supervised child until it exits (no timeout); then alert + pause (every time) and
+        restart it after SUPERVISE_DELAY (no tight loop for a child that dies at once, e.g. a missing
+        key), unless a stop was requested meanwhile (then its exit is expected: request_stop already
+        signalled it)."""
         def on_pid(pid: int) -> None:
             self.sup_pids[name] = pid
         try:
@@ -1014,7 +1014,10 @@ class Runner:
         if not self.stopping:
             tail = out.stderr[-actions.RUN_ERROR_MAX:]
             self.log(f"{name} (supervised) exited ({out.returncode}){': ' + tail.splitlines()[0] if tail else ''}")
-            self.start_supervised(name, alert=True)
+            self.fail(f"{name} was not running", f"it exited ({out.returncode}); the runner starts it again in "
+                      f"{SUPERVISE_DELAY:g} s\n{tail}"[:1200])
+            await asyncio.sleep(SUPERVISE_DELAY)
+            self.start_supervised(name)
         self.wake_event.set()
 
     # ---- the loop
