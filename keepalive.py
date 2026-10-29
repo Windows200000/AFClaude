@@ -1275,13 +1275,37 @@ def mark_run_stopped(session_id, now, path=None):
     return now if save_state(disk, path) else None
 
 
-def progress_note(line):
-    """A note in the progress doc of the project whose directory holds PROGRESS_FILE, in the DB
-    (doc.append, actor runner:keepalive; design §7.7): the file gets it at the next export. Never
+def progress_note(line, repo=None):
+    """A note in the progress doc of the project whose directory is `repo` (default: the one that
+    holds PROGRESS_FILE; 3c S1: a compaction's notes go to the compacted session's project), in the
+    DB (doc.append, actor runner:keepalive; design §7.7): the file gets it at the next export. Never
     raises (a DB failure: data/ALERTS.fallback.md, §7.8)."""
     import project_docs
     project_docs.append_note("progress", f"- {datetime.now(BERLIN).strftime('%H:%M')} [keepalive.py] {line}\n",
-                             "runner:keepalive", repo=os.path.dirname(os.path.abspath(PROGRESS_FILE)))
+                             "runner:keepalive", repo=repo or os.path.dirname(os.path.abspath(PROGRESS_FILE)))
+
+
+def session_progress(sid):
+    """The project the task-manager `sid` belongs to (store.session_project, 3c S1), for the
+    compaction's texts and notes: -> {"name", "repo" (its directory), "progress" (its PROGRESS.md;
+    this checkout's project keeps PROGRESS_FILE, as a start's continue does)}. No project, or the DB
+    could not be read: raises failstop.Failed (D-235: never AFClaude's doc instead)."""
+    import failstop
+    import store
+    try:
+        conn = store.connect()
+        try:
+            p = store.retrying(lambda: store.session_project(conn, sid), conn)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - an error (D-235): no texts without the project
+        raise failstop.Failed("the session's project could not be read", f"{type(e).__name__}: {e}"[:300]) from None
+    if p is None or not p.get("path"):
+        raise failstop.Failed("the session belongs to no project",
+                              f"{sid[:8]} is no project's task-manager" + (f" ({p['name']} has no path)" if p else ""))
+    repo = os.path.abspath(p["path"])
+    return {"name": p["name"], "repo": repo,
+            "progress": PROGRESS_FILE if rules_hooked(repo) else os.path.join(repo, "PROGRESS.md")}
 
 
 # ---------------------------------------------------------------- main loop
@@ -2485,27 +2509,8 @@ def pick_start(stall, key, now, st, arm):
     project to run, recorded as handled (a decision, not an error; the next start decides again; its
     run_log row (armed) is written here). The pick's run_log row is handle_fire's, once the start is
     decided (_pick_logged). A failure raises (the caller aborts the start)."""
-    import store
-    chained_sid = stall.get("chained") or running_session(now, st)
-    conn = store.connect()
-    try:
-        tms = store.retrying(lambda: store.task_managers(conn), conn)
-        chained = next((t["project_id"] for t in tms if chained_sid and t["session"] == chained_sid), None)
-        sel = store.retrying(lambda: store.pick_project(conn, chained), conn)
-    finally:
-        conn.close()
-    cands, passed = sel["candidates"], []
-    pick = None
-    for i, c in enumerate(cands):
-        if c["session"] is None or i == len(cands) - 1 or len(passed) >= PICK_MAX_PASS_OVER:
-            pick = c
-            break
-        pre = preflight(c["session"])
-        if not pre[0] and owner_holds(pre[1]):
-            passed.append(f"{c['name']}: the owner holds its session ({pre[1][0]})")
-            continue
-        pick = dict(c, preflight=pre)
-        break
+    sel = _pick_candidates(stall.get("chained") or running_session(now, st))
+    pick, passed = _pass_over(sel["candidates"])
     others = [f"{n}: {w}" for n, w in sel["skipped"]] + passed
     if pick is None:
         why = "no project to run" + (f" ({'; '.join(others)})" if others else " (no project)")
@@ -2524,6 +2529,45 @@ def pick_start(stall, key, now, st, arm):
                     + f": {pick['why']}")
     log(pick["line"])
     return pick
+
+
+def _pick_candidates(chained_sid):
+    """store.pick_project with the project of the run `chained_sid` (D-274/D-281) first, read-only.
+    A failure raises."""
+    import store
+    conn = store.connect()
+    try:
+        tms = store.retrying(lambda: store.task_managers(conn), conn)
+        chained = next((t["project_id"] for t in tms if chained_sid and t["session"] == chained_sid), None)
+        return store.retrying(lambda: store.pick_project(conn, chained), conn)
+    finally:
+        conn.close()
+
+
+def _pass_over(cands):
+    """pick_start's choice among the candidates: the first, but one the owner holds (preflight) is
+    passed over while a later one exists (at most PICK_MAX_PASS_OVER). -> (the candidate, + its
+    "preflight" when it was run, or None; the passed-over lines)."""
+    passed = []
+    for i, c in enumerate(cands):
+        if c["session"] is None or i == len(cands) - 1 or len(passed) >= PICK_MAX_PASS_OVER:
+            return c, passed
+        pre = preflight(c["session"])
+        if not pre[0] and owner_holds(pre[1]):
+            passed.append(f"{c['name']}: the owner holds its session ({pre[1][0]})")
+            continue
+        return dict(c, preflight=pre), passed
+    return None, passed
+
+
+def start_continues(now, st=None):
+    """The task-manager session the next start (a session-window start, a last-stretch slot) would
+    continue: pick_start's choice evaluated now, read-only (3c S1; a running run keeps its session,
+    D-281). -> the session, or None (no project to run, or the pick's project has no session yet).
+    The pick at the start itself may differ (tasks change in between): the start then waits for the
+    compaction's session lock. A failure raises."""
+    pick, _ = _pass_over(_pick_candidates(running_session(now, st))["candidates"])
+    return pick["session"] if pick else None
 
 
 def _pick_logged(key, pick):
@@ -2965,6 +3009,7 @@ def fillup_plan(sid, now):
             d = fillup_decision(sid, now, u)
     f = load_fillup()
     plan = {k: (v.astimezone(UTC).isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
+    plan["session"] = sid   # whose start it is: start_soon holds only this session's compaction (3c S1)
     if f.get("plan") != plan:
         f["plan"] = plan
         save_fillup(f)
@@ -3402,14 +3447,16 @@ def refresh_stale_handoff(sid, cwd, path, save):
         save.update(handoff_id=res["handoff_id"], saved_at=res["saved_at"])
 
 
-def compact_resume_text(sid, save, trigger="run-end"):
+def compact_resume_text(sid, save, trigger="run-end", progress=None):
     """The text that gives the session its hand-off back after a compaction -> (text, hand-off row):
     the session's latest unconsumed hand-off, which must be the one the save right before this
-    compaction wrote (`save`: save_before_compaction's result, status "saved"; compact_resume.md).
+    compaction wrote (`save`: save_before_compaction's result, status "saved"; compact_resume.md),
+    pointing at `progress` (default: the session's project's PROGRESS.md, session_progress).
     Anything else raises failstop.Failed (D-234): no save, the saved hand-off not found (e.g.
-    consumed or gone meanwhile), or the DB could not be read."""
+    consumed or gone meanwhile), no project, or the DB could not be read."""
     import failstop
     import store
+    progress = progress or session_progress(sid)["progress"]
     want = int((save or {}).get("handoff_id") or 0)
     if (save or {}).get("status") != "saved" or not want:
         raise failstop.Failed("no fresh hand-off to inject", f"save status {(save or {}).get('status')!r}")
@@ -3425,7 +3472,7 @@ def compact_resume_text(sid, save, trigger="run-end"):
         raise failstop.Failed("the saved hand-off was not found",
                               f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
                               + (f"#{h['id']}" if h else "none"))
-    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=PROGRESS_FILE,
+    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress,
                                                 when=TRIGGER_TEXT[trigger][1]), h
 
 
@@ -3433,16 +3480,19 @@ def _jsonable(d):
     return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
 
 
-def compact_with_handoff(sid, cwd, path, trigger="run-end"):
+def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
     """The compaction (D-233/D-234/D-238): save_before_compaction -> compact_session ->
     compact_resume_text. trigger: run-end | idle (TRIGGER_TEXT: the prompts' wording). -> (the
     hand-off text to send after the compaction, the hand-off row to consume once it went out, the
     record: save (its result), status "compacted", sent_at, done_at, handoff_id). Every failure or
     timeout raises failstop.Failed(why, detail, record) and stops right there: no /compact after a
     failed save, no hand-off after a failed compaction (the caller records and reports it,
-    compaction_pass). Also the live test (tools/test_compact_live.sh) runs exactly this."""
+    compaction_pass). progress: the PROGRESS.md the hand-off text names (default: the session's
+    project's, session_progress, looked up before anything is typed: no project, no save prompt).
+    Also the live test (tools/test_compact_live.sh) runs exactly this."""
     import failstop
     rec = {}
+    progress = progress or session_progress(sid)["progress"]
     try:
         save = save_before_compaction(sid, cwd, path, trigger)
     except Exception as e:   # noqa: BLE001
@@ -3479,7 +3529,7 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end"):
         raise failstop.Failed(f"compaction not done: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
     try:
-        insert, h = compact_resume_text(sid, save, trigger)
+        insert, h = compact_resume_text(sid, save, trigger, progress)
     except failstop.Failed as e:
         raise failstop.Failed(e.why, e.detail, rec) from None
     rec["handoff_id"] = h["id"]
@@ -3717,9 +3767,11 @@ def compaction_busy_reason(path, now, subagents=True):
 
 
 def latest_run_fire(sid, st, now):
-    """The latest fire that started a run of this session (as run_active counts them), or None."""
+    """The latest fire that started a run of this session (as run_active counts them), or None. A
+    record without "session" (before 3b) is no session's (3c S1): it must not give a second
+    task-manager a run it never had."""
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
-             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") in (None, sid)]
+             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") == sid]
     fired = [t for t in fired if t and t <= now]
     return max(fired) if fired else None
 
@@ -3738,14 +3790,22 @@ def run_ended(sid, sc, st, now):
 
 
 def start_soon(sid, now):
-    """A start that types into the session within COMPACT_GUARD (the cron's next session-window
+    """A start that types into this session within COMPACT_GUARD (the cron's next session-window
     start, a postponed start's recheck, a planned fill-up, a last-stretch slot): -> why, else None.
     That start uses the warm cache (and the watcher's own starts must not wait behind a ~25-min
-    compaction); its run's end compacts. A failed read raises (compaction_pass: an error)."""
+    compaction); its run's end compacts. Only the start's own session is held (3c S1): the fill-up
+    plan's session, and for a session-window start or a last-stretch slot the session the pick
+    would continue (start_continues). A failed read raises (compaction_pass: an error)."""
     def soon(t):
         return t is not None and now <= t < now + COMPACT_GUARD
+    picked = []   # start_continues, evaluated once and only when a pick-made start is soon
+
+    def continues():
+        if not picked:
+            picked.append(start_continues(now))
+        return picked[0] == sid
     nxt = schedule.next_session_start(now)
-    if soon(nxt):
+    if soon(nxt) and continues():
         return f"the session-window start {berlin(nxt)} is due within {COMPACT_GUARD.total_seconds() / 60:g} min"
     for v in load_deferred().values():
         r = parse_ts(v.get("recheck_at")) if isinstance(v, dict) and v.get("session") in (None, sid) else None
@@ -3753,10 +3813,10 @@ def start_soon(sid, now):
             return f"a postponed session-window start rechecks at {berlin(r)}"
     plan = load_fillup().get("plan") or {}
     start = parse_ts(plan.get("start")) if plan.get("status") in ("wait", "fire") and plan.get("start") else None
-    if soon(start) or plan.get("status") == "fire":
+    if (soon(start) or plan.get("status") == "fire") and plan.get("session") == sid:
         return f"the fill-up run is planned for {berlin(start) if start else 'now'}"
     lm = last_mile_next_start(now)
-    if soon(lm):
+    if soon(lm) and continues():
         return f"the last-stretch slot starts {berlin(lm)}"
     return None
 
@@ -3869,6 +3929,9 @@ def compaction_plan(sid, now, args):
         if d.missed and d.key and expires and now - expires < timedelta(hours=1):
             _COMPACT_TRIED.add(d.key)
             record_compaction(sid, d.key, dict(rec, status="missed", last_hold=_COMPACT_LINE))
+            if getattr(args, "arm", False):
+                _compaction_logged(sid, d.key, "MISSED", d.reason
+                                   + (f" (last hold: {_COMPACT_LINE})" if _COMPACT_LINE else ""))
         _compact_log(head + d.reason)
         return d, None
     _COMPACT_TRIED.add(d.key)
@@ -3925,13 +3988,34 @@ def mid_run_text(sid, threshold, now):
             "budget": b["text"], "pace": pace}
 
 
+def _compaction_logged(sid, key, decision, line):
+    """The attempt's run_log row (3c S1, docs/phase3c_plan.md §3.1: component compaction, COMPACT /
+    FAILED / MISSED, the recorded reason), written by the armed paths only (a dry run and a hold
+    write none), once per attempt key (the `once` prefix, as the start rows of 3a S9b). The attempt
+    is recorded already, so a failed write is not raised but alerted and paused (fail_stop, D-235),
+    as _pick_logged does."""
+    once = f"compaction {key} of {sid[:8]}:"
+    try:
+        _run_log(decision, f"{once} {' '.join(str(line).split())}"[:900], sid, once, component="compaction")
+    except Exception as e:   # noqa: BLE001 - reported below
+        fail_stop(f"the {decision} row of the compaction {key} of {sid[:8]} could not be written to run_log",
+                  f"{type(e).__name__}: {e}")
+
+
 def _compaction_failed(sid, key, rec, why, detail="", steps=None):
+    import failstop
     rec.update(status="failed", error=(f"{why}: {detail}" if detail else why)[:500], done_at=datetime.now(UTC))
     if steps:
         rec["steps"] = _jsonable(steps)
     record_compaction(sid, key, rec)
-    progress_note(f"compaction of {sid[:8]} FAILED ({rec.get('trigger')}): {why}; automation paused until the "
-                  "owner clears it (D-234/D-235)")
+    try:
+        repo = session_progress(sid)["repo"]
+    except failstop.Failed as e:   # no project to note it in: the alert below carries it
+        repo, detail = None, f"{detail}; no progress note ({e.why})".lstrip("; ")
+    if repo:
+        progress_note(f"compaction of {sid[:8]} FAILED ({rec.get('trigger')}): {why}; automation paused until "
+                      "the owner clears it (D-234/D-235)", repo=repo)
+    _compaction_logged(sid, key, "FAILED", f"{rec.get('trigger')}: {why}")
     fail_stop(f"compaction of {sid[:8]} failed: {why}", detail)
 
 
@@ -3945,9 +4029,11 @@ def _compact_now(sid, path, d, rec, head):
     record_compaction(sid, d.key, dict(rec, status="running"))
     try:
         try:
-            # a mid-run one's run part is built before anything is typed: its failure leaves the session as it was
+            # the project and a mid-run one's run part come before anything is typed: their failure
+            # leaves the session as it was (3c S1: no project = no save prompt, no /compact)
+            proj = session_progress(sid)
             run = mid_run_text(sid, rec["threshold"], datetime.now(UTC)) if d.trigger == "mid-run" else None
-            insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger)
+            insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger, proj["progress"])
         except failstop.Failed as e:
             return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record)
         rec["steps"] = _jsonable(steps)
@@ -3976,7 +4062,9 @@ def _compact_now(sid, path, d, rec, head):
     progress_note(f"compacted {sid[:8]} ({d.trigger}, D-238/D-307): context {rec['context'] / 1000:.0f}k >= threshold "
                   f"{rec['threshold'] / 1000:.0f}k, est. cost ~{rec['est_cost_pct']}% session, saves "
                   f"~{rec['saves_per_reread_pct']}% per later re-read; hand-off #{h['id']} given back"
-                  + ("; the run goes on" if run is not None else ""))
+                  + ("; the run goes on" if run is not None else ""), repo=proj["repo"])
+    _compaction_logged(sid, d.key, "COMPACT", f"{d.trigger}: {d.reason}; context {rec['context'] / 1000:.0f}k, "
+                       f"threshold {rec['threshold'] / 1000:.0f}k; hand-off #{h['id']} given back")
     if not consumed:
         fail_stop(f"hand-off #{h['id']} of {sid[:8]} not marked consumed after its compaction",
                   "it was sent; a later compaction would not find a fresh one")

@@ -252,7 +252,7 @@ class SameTextTest(unittest.TestCase):
         for trigger in ka.TRIGGER_TEXT:
             out[f"save_text {trigger}"] = ka.save_text(SID, trigger)
             out[f"compact_resume {trigger}"] = ka.compact_resume_text(
-                SID, {"status": "saved", "handoff_id": self.handoff}, trigger)[0]
+                SID, {"status": "saved", "handoff_id": self.handoff}, trigger, ka.PROGRESS_FILE)[0]   # 3c S1: as before
         out["save_retry_text"] = ka.save_retry_text(SID, 8)
         out["save_refresh_text"] = ka.save_refresh_text(SID, 9, "a task notification (from 01:10 CET)")
         for chained in (end, end + timedelta(hours=5)):

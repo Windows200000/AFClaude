@@ -83,6 +83,7 @@ class Env(unittest.TestCase):
         ka.PROJECTS_DIR = d
         ka.STATE_FILE, ka.PROGRESS_FILE = os.path.join(d, "state.json"), os.path.join(d, "PROGRESS.md")
         testenv.notes_project(d)                     # the progress notes go to its doc in the DB (§7.7)
+        self.addCleanup(self.manage(d))              # ... SID is its task-manager (3c S1: the texts' project)
         ka.FILLUP_FILE = os.path.join(d, "fillup.json")
         ka.DEFER_FILE, ka.USAGE_STATE_FILE = os.path.join(d, "deferred.json"), os.path.join(d, "usage.json")
         ka.alert = lambda subject, body="": self.alerts.append(subject)
@@ -119,6 +120,10 @@ class Env(unittest.TestCase):
         ct._CACHE.clear()
         self.idle_transcript()
         self.addCleanup(testenv.unpause)
+
+    def manage(self, d):
+        """Make SID the task-manager of the project in `d` (its notes project). -> the cleanup."""
+        return testenv.managed_project("notes-" + os.path.basename(os.path.normpath(d)), SID)
 
     def tearDown(self):
         for n, v in self.old.items():
@@ -1280,17 +1285,131 @@ class StartSoon(Env):
         super().tearDown()
 
     def test_start_soon(self):
+        old_rs = ka.running_session
+        ka.running_session = lambda now, st=None: SID                          # SID's run goes on: the start keeps it
+        self.addCleanup(setattr, ka, "running_session", old_rs)
         before = NIGHT - timedelta(minutes=30)                                 # 22:30 Berlin
         self.assertIn("the session-window start", ka.start_soon(SID, before))
         self.assertIsNone(ka.start_soon(SID, NIGHT - timedelta(hours=3)))
         ka.defer_window_start("window-start-x", SID, NIGHT - timedelta(hours=3) + timedelta(minutes=10), "user active")
         self.assertIn("a postponed session-window start", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
         ka.save_deferred({})
-        ka.save_fillup({"plan": {"status": "wait", "start": (NIGHT - timedelta(hours=2, minutes=40)).isoformat()}})
+        ka.save_fillup({"plan": {"status": "wait", "start": (NIGHT - timedelta(hours=2, minutes=40)).isoformat(),
+                                 "session": SID}})
         self.assertIn("the fill-up run is planned", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
         ka.save_fillup({"plan": {"status": "hold"}})
         ka.last_mile_next_start = lambda now, usage=None: now + timedelta(minutes=20)
         self.assertIn("the last-stretch slot starts", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
+
+    # 3c S1: with two task-managers (testenv's A, rank 1, and SID, rank 2) only the session the start
+    # continues is held
+    A = testenv.SID
+
+    def test_a_window_start_holds_only_the_picked_task_manager(self):
+        before = NIGHT - timedelta(minutes=30)
+        self.assertEqual(ka.start_continues(before), self.A)                  # the pick: rank 1
+        self.assertIn("the session-window start", ka.start_soon(self.A, before))
+        self.assertIsNone(ka.start_soon(SID, before))
+        ka.last_mile_next_start = lambda now, usage=None: now + timedelta(minutes=20)
+        t = NIGHT - timedelta(hours=3)
+        self.assertIn("the last-stretch slot starts", ka.start_soon(self.A, t))
+        self.assertIsNone(ka.start_soon(SID, t))
+
+    def test_the_fill_up_plan_holds_only_its_session(self):
+        t = NIGHT - timedelta(hours=3)
+        ka.save_fillup({"plan": {"status": "wait", "start": (t + timedelta(minutes=20)).isoformat(), "session": self.A}})
+        self.assertIn("the fill-up run is planned", ka.start_soon(self.A, t))
+        self.assertIsNone(ka.start_soon(SID, t))
+        ka.save_fillup({"plan": {"status": "fire"}})                           # stored before 3c S1: nobody's
+        self.assertIsNone(ka.start_soon(self.A, t))
+
+    def test_a_failed_pick_raises(self):
+        old = ka._pick_candidates
+        ka._pick_candidates = lambda chained: (_ for _ in ()).throw(RuntimeError("db gone"))
+        self.addCleanup(setattr, ka, "_pick_candidates", old)
+        with self.assertRaisesRegex(RuntimeError, "db gone"):
+            ka.start_soon(SID, NIGHT - timedelta(minutes=30))
+
+    def test_a_run_fire_without_its_session_is_nobodys(self):
+        st = {"handled": {"old": {"at": (self.now - timedelta(hours=1)).isoformat(), "result": "fired"}}}
+        self.assertIsNone(ka.latest_run_fire(SID, st, self.now))
+
+
+class SeveralTaskManagers(Env):
+    """3c S1: the compaction's texts, notes and run_log rows are the compacted session's own
+    project's (StartSoon: a start holds only the session it continues)."""
+
+    def setUp(self):
+        super().setUp()
+        conn = store.connect()
+        try:
+            with store.transaction(conn):
+                conn.execute("DELETE FROM run_log WHERE component='compaction'")
+        finally:
+            conn.close()
+
+    def rows(self):
+        conn = store.connect()
+        try:
+            return [r for r in store.run_log(conn, "compaction", 100) if r["session_id"] == SID]
+        finally:
+            conn.close()
+
+    def test_its_texts_and_notes_point_at_its_own_project(self):
+        d = self.tmp.name
+        afc = d + "-afc"                                                       # another project's (AFClaude's) doc
+        ka.PROGRESS_FILE = os.path.join(afc, "PROGRESS.md")
+        testenv.notes_project(afc)
+        _, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted")
+        after = self.sent[-1][1]
+        self.assertIn(f"latest Status line in {os.path.join(d, 'PROGRESS.md')}", after)
+        self.assertNotIn(ka.PROGRESS_FILE, after)
+        self.assertIn(f"compacted {SID[:8]} (idle", self.progress())
+        self.assertNotIn("compacted", testenv.notes(afc))
+        rows = self.rows()
+        self.assertEqual([r["decision"] for r in rows], ["COMPACT"])
+        key = next(k for k, v in ka.load_state()["compactions"].items() if v.get("session") == SID)
+        self.assertTrue(rows[0]["reason"].startswith(f"compaction {key} of {SID[:8]}: idle:"), rows[0]["reason"])
+
+    def test_one_row_per_attempt_key_none_in_dry_run_or_for_a_hold(self):
+        self.soon = "a start soon"
+        d, rec = self.compact()
+        self.assertIsNone(rec)                                                 # held: nothing recorded
+        self.assertEqual(self.rows(), [])
+        self.soon = None
+        d, rec = self.compact(args=DryRun())
+        self.assertEqual((rec["status"], self.rows()), ("dry-run", []))
+        ka._compaction_logged(SID, "k1", "MISSED", "idle: one")
+        ka._compaction_logged(SID, "k1", "MISSED", "idle: again")             # a retry of the same key
+        self.assertEqual([r["reason"] for r in self.rows()], [f"compaction k1 of {SID[:8]}: idle: one"])
+
+    def test_missed_armed_writes_its_row(self):
+        self.idle_transcript(idle=timedelta(minutes=58))
+        _, rec = self.compact()
+        self.assertEqual(rec["status"], "missed")
+        self.assertEqual([r["decision"] for r in self.rows()], ["MISSED"])
+        self.compact()                                                        # the next pass: no second row
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_a_session_without_a_project_fails_before_anything_is_typed(self):
+        testenv.managed_project("notes-" + os.path.basename(self.tmp.name), "")()
+        _, rec = self.compact()
+        self.assertEqual((rec["status"], self.sent), ("failed", []))
+        self.assertIn("the session belongs to no project", rec["error"])
+        self.assertTrue(self.paused()["paused"])
+        self.assertTrue(any("compaction of abcdef01 failed" in a for a in self.alerts))
+        self.assertEqual([r["decision"] for r in self.rows()], ["FAILED"])
+        self.assertNotIn("FAILED", self.progress())                           # no project: no note anywhere
+
+    def test_a_failed_row_write_is_a_fail_stop(self):
+        old = ka._run_log
+        ka._run_log = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("disk full"))
+        self.addCleanup(setattr, ka, "_run_log", old)
+        _, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted")
+        self.assertTrue(self.paused()["paused"])
+        self.assertTrue(any("COMPACT row of the compaction" in a for a in self.alerts))
 
 
 class FailStopAtStart(Env):

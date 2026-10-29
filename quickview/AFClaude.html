@@ -588,7 +588,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     $("ctx-comps").innerHTML = (c.compactions_error ? '<p class="mut">' + esc(c.compactions_error) + "</p>" : "") +
       (comps.length ? comps.map(function (x) {
         var cls = x.status === "compacted" ? "ok" : (x.status === "failed" ? "bad" : "warn");
-        return '<div class="sess"><span class="' + cls + '">' + esc(x.status) + "</span> " + esc(x.at_berlin || "?") +
+        return '<div class="sess"><span class="' + cls + '">' + esc(x.status) + "</span> " +
+          (x.project ? "<strong>" + esc(x.project) + "</strong> · " : "") + esc(x.at_berlin || "?") +
           (x.trigger ? " · " + esc(x.trigger) : "") + " · context " + kTok(x.context) +
           (x.est_cost_pct != null ? " · ~" + x.est_cost_pct + "% cost, saves ~" + x.saves_per_reread_pct + "% per re-read" : "") +
           '<div class="mut">' + esc(x.error || x.last_hold || x.reason || "") + "</div></div>";

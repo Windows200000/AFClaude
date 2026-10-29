@@ -134,14 +134,15 @@ def unpause(db=None):
         conn.close()
 
 
-def managed_project(name, session, db=None):
-    """A project `name` whose task-manager is `session` (created once; projects.manager_session).
+def managed_project(name, session, db=None, path=None):
+    """A project `name` whose task-manager is `session` (created once; projects.manager_session),
+    in the directory `path` when given (the compaction's texts and notes use it, 3c S1).
     -> a cleanup that makes it unmanaged again (so a later test's session has no project)."""
     conn = store.connect(db or store.DB_PATH)
     try:
         if store.get_project(conn, name) is None:
             store.add_project(conn, name)
-        store.update_project(conn, name, manager_session=session)
+        store.update_project(conn, name, manager_session=session, **({"path": path} if path else {}))
     finally:
         conn.close()
 

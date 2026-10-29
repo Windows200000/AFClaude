@@ -614,7 +614,8 @@ def context_block(now):
     """D-237: the task-manager's context (compact_timing.context_block): its size, when its prompt
     cache expires and what the next message would re-read, a daily split (re-reads / warm reads /
     writes / output), the compaction threshold (D-307) and the cost model's break-even, and the
-    latest compaction attempts (D-238, the keepalive state's "compactions"). The per-message list
+    latest compaction attempts of every task-manager with its project (D-238, 3c S1; the keepalive
+    state's "compactions"). The per-message list
     is dropped: the owner keeps only the daily split (owner, 25.10.). A display path: an error is
     shown, never paused (D-239)."""
     try:
@@ -625,10 +626,16 @@ def context_block(now):
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"error": f"{type(e).__name__}: {e}"[:300]}
     try:
-        comps = [dict(v, key=k) for k, v in (ka.load_state().get("compactions") or {}).items()
-                 if isinstance(v, dict) and v.get("session") in (None, SELF_SESSION)]
+        # every task-manager's attempts (3c S1), each named by its project (a record without a session: this one's)
+        conn = store.connect()
+        try:
+            names = {t["session"]: t["name"] for t in store.task_managers(conn) if t["session"]}
+        finally:
+            conn.close()
+        comps = [dict(v, key=k) for k, v in (ka.load_state().get("compactions") or {}).items() if isinstance(v, dict)]
         comps.sort(key=lambda c: str(c.get("at")), reverse=True)
         out["compactions"] = [{"at_berlin": bstr(ka.parse_ts(c["at"])) if c.get("at") else None,
+                               "project": names.get(c.get("session") or SELF_SESSION),
                                **{k: c.get(k) for k in ("status", "trigger", "reason", "context", "threshold",
                                                         "break_even", "est_cost_pct", "saves_per_reread_pct", "error",
                                                         "last_hold")}}

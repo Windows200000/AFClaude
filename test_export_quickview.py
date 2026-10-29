@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -964,6 +965,35 @@ class UsageTiles(unittest.TestCase):
             out = qv.keepalive_and_usage(datetime.now(qv.UTC))
         self.assertNotIn("session", out)
         self.assertIn("usage_error", out)
+
+
+class CompactionRows(unittest.TestCase):
+    """3c S1: the context block lists every task-manager's compaction attempts, each with its project
+    (a record without a session is the quickview's own task-manager's)."""
+    def setUp(self):
+        testenv.fresh_db(self)
+        self.addCleanup(setattr, qv, "SELF_SESSION", qv.SELF_SESSION)
+        qv.SELF_SESSION = testenv.SID
+
+    def test_each_row_names_its_project(self):
+        other = "b" * 36
+        conn = store.connect()
+        try:
+            for name, sid in (("Alpha", testenv.SID), ("Beta", other)):
+                store.add_project(conn, name)
+                store.update_project(conn, name, manager_session=sid)
+        finally:
+            conn.close()
+        comps = {"k1": {"at": "2026-10-29T10:00:00+00:00", "status": "compacted", "session": testenv.SID},
+                 "k2": {"at": "2026-10-29T11:00:00+00:00", "status": "missed", "session": other},
+                 "k0": {"at": "2026-10-01T10:00:00+00:00", "status": "failed"}}
+        import compact_timing
+        with mock.patch.object(compact_timing, "context_block", lambda *a, **kw: {}), \
+                mock.patch.object(qv.ka, "transcript_path", lambda sid: None), \
+                mock.patch.object(qv.ka, "load_state", lambda: {"compactions": comps}):
+            out = qv.context_block(datetime.now(timezone.utc))
+        self.assertEqual([(c["status"], c["project"]) for c in out["compactions"]],
+                         [("missed", "Beta"), ("compacted", "Alpha"), ("failed", "Alpha")])
 
 
 class TmuxTile(unittest.TestCase):

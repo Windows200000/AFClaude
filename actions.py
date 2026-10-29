@@ -2989,8 +2989,11 @@ def run_log_add(conn: sqlite3.Connection, component: str, decision: str, reason:
 # PICK / HOLD: a start's project (3b S4); GO / HOLD / POSTPONE: the budget gate at a session-window
 # start, a postponed one's re-decision and a last-stretch slot (also HOLD for a start with no
 # project); DEFER / FIRE: the D-274 timing (planned late / now); FILLUP: a fill-up start;
-# START / POSTPONE: a usage review's launch / its quota postponement (component usage_review).
-RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START")
+# START / POSTPONE: a usage review's launch / its quota postponement (component usage_review);
+# COMPACT / FAILED / MISSED: a compaction attempt's outcome (component compaction, 3c S1; armed only,
+# so a dry run's attempt has no row).
+RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START", "COMPACT", "FAILED",
+                     "MISSED")
 
 
 def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,
