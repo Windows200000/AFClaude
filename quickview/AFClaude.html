@@ -371,7 +371,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       if (th.predicted_end_sd != null) lines.push('<div class="mut">predicted week end ± ' + th.predicted_end_sd + " weekly %</div>");
       var fw = th.forecast || {};
       if (fw.other_week != null) lines.push('<div class="mut">forecast per week: other use ' + fw.other_week +
-        "% + design chats " + fw.design_week + "% (AFClaude's, tracked apart)</div>");
+        "% (design chats count as AFClaude's usage, not forecast)</div>");
       if (nw && nw.predicted_end != null) lines.push('<div class="mut">now: predicted end ' + nw.predicted_end + "% vs " +
         nw.threshold + "% (slack " + sgn(nw.slack) + "%)</div>");
       out.push(tile("Reserve threshold", t.active + "%", lines.join("")));
