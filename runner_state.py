@@ -15,6 +15,7 @@ own_session_add); this module is the runners' one door to them:
   runner_state 'sampler' (offsets, sessions per entry)             sampler_state.json
   runner_state 'usage_review'                                      usage_review_state.json
   runner_state 'nightly_tasks' (tasks per entry; nightly_tasks.py)  none (new in the DB era)
+  runner_state 'inbox' (entries per entry; phase 3a S7, inbox_worker.py)  none (new in the DB era)
   driven_sessions (kind 'own')                                     own_sessions.txt
   scheduled_jobs (a started job is marked, not deleted)            at_spool/*.json
   app_log (component = the file's stem; append-only)   keepalive/keepalive.log, dispatcher.log,
@@ -77,6 +78,7 @@ STATE_FILES: dict[str, str] = {   # component -> its legacy file, relative to th
     "sampler": "sampler_state.json",
     "usage_review": "usage_review_state.json",
     "nightly_tasks": "nightly_tasks_state.json",   # D-254/D-261: born in the DB, never a file (the name only)
+    "inbox": "inbox_verify_state.json",   # phase 3a S7: born in the DB, never a file (the name only)
 }
 LOG_FILES: dict[str, str] = {
     "keepalive": "keepalive/keepalive.log",

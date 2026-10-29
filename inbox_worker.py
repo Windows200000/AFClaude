@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """The inbox's worker (D-241; inbox.py has the overview): triage each new message with Haiku and
-type the "now" ones into the task-manager's session. Runs as a thread of inbox_api.py, woken by
-each post and every POLL seconds (a held message is tried again).
+type the "now" ones into the task-manager's session. Phase 3a S7 (docs/phase3a_plan.md §5 S7, §3.2):
+the resident runner calls process() as its `inbox` job (woken by inbox_api's wake, plus a 30-s tick
+while a message is pending or held) and verify_tick() as its `inbox_verify` job (5 s while a
+verification is pending). AFCLAUDE_SCHEDULER=legacy still runs both from inbox_api.py serve's
+worker thread (run_forever), woken by each post and every POLL seconds.
+
+A delivered message's post-send check is a stored runner_state "inbox" entry ({msg, path, offset,
+deadline}, store_verify/verify_tick), not a thread: a restart resumes it from the same offset and
+deadline and ends it seen or as an error at its deadline (§3.4).
 
 Triage: one `claude -p --model haiku` call (keepalive.POKE_ARGV: no tools, no session file; the
 shape docker/host_exec.py whitelists, so inside the container it runs on the host through the
@@ -41,8 +48,9 @@ is asking, that is no automation) goes through the keep-alive's own send path an
   - plan send-keys: keepalive.owner_typing (keystrokes in an attached terminal, a draft in the input
     box, a dialog) holds it; an unreadable pane is an error (D-235);
   - keepalive.fire (ka_resume.sh: send-keys into the live tmux session, else a resume into one).
-A hold is shown on the message and tried again every POLL while it lasts, at most until the next
-session-window start after it began (D-244, inbox.hold_deadline; the dashboard shows "held until"):
+A hold is shown on the message and tried again by the next pass while it lasts (the `inbox` job's
+wake-or-30-s-tick, or the legacy thread's POLL), at most until the next session-window start after
+it began (D-244, inbox.hold_deadline; the dashboard shows "held until"):
 that start's message takes the message along (keepalive._fire_start, inbox.held_insert: with its
 marker and how to answer) and marks it delivered. Still pending START_GRACE after that start (the
 start was skipped, held, failed or postponed; the session still held or at its limit) is an error;
@@ -68,7 +76,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -99,7 +106,7 @@ ACTIVE_WINDOW = timedelta(minutes=10)     # D-252: a request this recent: the ta
 # waits up to COMPACT_LOCK_WAIT for a compaction, then sends and marks it delivered
 START_GRACE = schedule.CRON_STEP + ka.COMPACT_LOCK_WAIT + timedelta(minutes=5)
 VERIFY_TIMEOUT = timedelta(minutes=10)    # the sent message must be in the transcript by then
-VERIFY_POLL = 5                           # seconds
+VERIFY_COMPONENT = "inbox"                # runner_state: "entries" {msg, path, offset, deadline} (§3.3)
 HOLD_LOCKED = "a compaction or a start is typing into the session"
 # D-262: the keep-alive's compaction flow (keepalive._compact_now: save prompt, hand-off, /compact,
 # compact_after, READY) is no task-manager activity, and a "now" message waits until it is over.
@@ -451,41 +458,81 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
                           f"{ids} went out with #{m['id']}: {type(e).__name__}: {e}", session=sid)
     finally:
         ka.release_lock(lock)
-    (verify or start_verify)(m["id"], path, offset)
+    (verify or store_verify)(m["id"], path, offset, now)
     return "delivered"
 
 
-def verify(msg_id: int, path: str, offset: int, timeout: timedelta | None = None) -> bool:
-    """The delivered message must reach the session's transcript within VERIFY_TIMEOUT (its marker
-    in what was written after the send); otherwise it is an error. -> seen."""
-    mark = inbox.marker(msg_id)
-    timeout = VERIFY_TIMEOUT if timeout is None else timeout
-    deadline = time.time() + timeout.total_seconds()
-    while True:
-        if inbox.seen(path, offset, mark):
-            return True
-        if time.time() >= deadline:
-            break
-        time.sleep(VERIFY_POLL)
-    try:
-        conn = store.connect()
+# ---------------------------------------------------------------- post-send verification (S7, §3.3)
+#
+# A delivered message's check used to be a thread (one per message, blocking in time.sleep until it
+# saw the marker or its timeout). Phase 3a S7 stores it instead (runner_state VERIFY_COMPONENT
+# "inbox", "entries" {msg, path, offset, deadline}), so a restart resumes the same entry from the
+# same offset and deadline rather than losing it: the `inbox_verify` runner job (or, in legacy mode,
+# the worker thread's own pass) checks every pending entry each time it runs.
+
+def store_verify(msg_id: int, path: str, offset: int, now: datetime, timeout: timedelta | None = None) -> None:
+    """Record message `msg_id`'s post-send check: it must reach the session's transcript (its
+    marker, inbox.seen, after `offset`) within `timeout` (default VERIFY_TIMEOUT), else it is an
+    error (D-235), as a live verify always was. Wakes the runner: its `inbox_verify` tick is
+    otherwise dormant while nothing is pending (§3.7)."""
+    deadline = now + (VERIFY_TIMEOUT if timeout is None else timeout)
+    doc = runner_state.load(VERIFY_COMPONENT, default={"entries": {}})
+    doc.setdefault("entries", {})[str(msg_id)] = {"msg": msg_id, "path": path, "offset": offset,
+                                                  "deadline": store.iso(deadline)}
+    runner_state.save(VERIFY_COMPONENT, doc)
+    import runner      # runner.py never imports inbox_worker; a plain import would still be safe, but this
+    runner.wake()      # matches how runner_jobs.py's own functions import their modules late
+
+
+def check_verify(conn: Any, entry: dict[str, Any], now: datetime) -> str:
+    """One stored entry's outcome: "seen" (its marker is in the transcript after its offset:
+    settled), "pending" (keep waiting), or "failed" (past its deadline without being seen: an
+    error on the message, as a live verify always was) -> "seen" | "pending" | "failed"."""
+    if inbox.seen(entry["path"], entry["offset"], inbox.marker(entry["msg"])):
+        return "seen"
+    deadline = store.parse_iso(entry.get("deadline"))
+    if deadline is not None and now < deadline:
+        return "pending"
+    m = store.get_inbox(conn, entry["msg"])
+    if m is not None and m["status"] == "delivered":
+        failed(conn, m, "inbox message not delivered",
+              f"typed into the session, but not in its transcript after {VERIFY_TIMEOUT}")
+    return "failed"
+
+
+def verify_pending(conn: Any = None, now: datetime | None = None) -> bool:
+    """Whether the `inbox_verify` job has anything to do (runner.POLL_PENDING)."""
+    return bool(runner_state.load(VERIFY_COMPONENT, default={"entries": {}}).get("entries"))
+
+
+def verify_tick(conn: Any, now: datetime | None = None) -> dict[str, int]:
+    """The `inbox_verify` job (docs/phase3a_plan.md §3.2/§3.3): one check per pending entry; a
+    restart resumes each from its stored offset and deadline (§3.4) and ends it seen or as an
+    error at its deadline. -> counts per outcome."""
+    now = now or datetime.now(UTC)
+    doc = runner_state.load(VERIFY_COMPONENT, default={"entries": {}})
+    entries = doc.setdefault("entries", {})
+    out: dict[str, int] = {}
+    for key in list(entries):
         try:
-            m = store.get_inbox(conn, msg_id)
-            if m is not None and m["status"] == "delivered":
-                failed(conn, m, "inbox message not delivered",
-                       f"typed into the session, but not in its transcript after {timeout}")
-        finally:
-            conn.close()
-    except Exception as e:   # noqa: BLE001 - the verify thread's own error (D-235): reported, not lost
-        fail_stop("inbox delivery check failed", f"message #{msg_id}: {type(e).__name__}: {e}")
-    return False
-
-
-def start_verify(msg_id: int, path: str, offset: int) -> None:
-    threading.Thread(target=verify, args=(msg_id, path, offset), name=f"inbox-verify-{msg_id}", daemon=True).start()
+            outcome = check_verify(conn, entries[key], now)
+        except Exception as e:   # noqa: BLE001 - the tick's own error (D-235): reported, not lost
+            fail_stop("inbox delivery check failed", f"message #{entries[key].get('msg')}: {type(e).__name__}: {e}")
+            outcome = "failed"
+        out[outcome] = out.get(outcome, 0) + 1
+        if outcome != "pending":
+            entries.pop(key, None)
+    runner_state.save(VERIFY_COMPONENT, doc)
+    return out
 
 
 # ---------------------------------------------------------------- the passes
+
+def pending(conn: Any, now: datetime | None = None) -> bool:
+    """Whether the `inbox` job has anything to do (runner.POLL_PENDING): a message waiting to be
+    triaged or delivered, or held (D-244: tried again by every pass while a hold lasts)."""
+    return bool(store.list_inbox(conn, "pending", limit=1))
+
 
 def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] | None = None) -> dict[str, int]:
     """One pass: triage the new messages, then try to deliver every "now" one (oldest first).
@@ -503,9 +550,11 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
 
 
 def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> None:
-    """The worker thread: a pass on every wake-up (a new message, a retry) and every POLL seconds.
-    A failed pass (a DB failure, ...) is an error (fail_stop: alert + automation paused, install-wide:
-    it is about no one message); the next pass still runs (the owner's messages are no automation)."""
+    """AFCLAUDE_SCHEDULER=legacy only (S7: the runner's `inbox` / `inbox_verify` jobs replace this
+    thread otherwise): a pass on every wake-up (a new message, a retry) and every POLL seconds,
+    triage/delivery then the verify checks. A failed pass (a DB failure, ...) is an error
+    (fail_stop: alert + automation paused, install-wide: it is about no one message); the next pass
+    still runs (the owner's messages are no automation)."""
     stop = stop or threading.Event()
     log("inbox worker started")
     while not stop.is_set():
@@ -514,6 +563,7 @@ def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> N
             conn = store.connect()
             try:
                 process(conn)
+                verify_tick(conn)
             finally:
                 conn.close()
         except Exception as e:   # noqa: BLE001 - an error (D-235/D-244), reported; the next pass runs

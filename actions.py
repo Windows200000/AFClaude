@@ -898,6 +898,11 @@ SETTINGS: dict[str, Setting] = {
                                   "killed and fails (D-234)", "automation"),
     "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
                                       "back, D-238) may take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_inbox": _num(5, 0.5, 720, "Runner: minutes the inbox job (triage, then deliver \"now\" "
+                                "messages) may take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_inbox_verify": _num(0.5, 0.1, 720, "Runner: minutes the inbox_verify job (one check per "
+                                        "pending post-send verification) may take before it is killed and fails "
+                                        "(D-234)", "automation"),
     # at most 30: a start missed by more than 30 min is an error, never started late (D-257)
     "runner_start_catchup": _num(30, 0, 30, "Runner: a session-window start the runner missed (down at that "
                                  "time) still runs when it is back within this many minutes; a later one is "
@@ -2769,6 +2774,10 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("usage_review", "runner:usage_review", deletes=False),
     StateComponent("nightly_tasks", "runner:nightly_tasks", ("tasks",), deletes=False),   # D-254/D-261: one row per task
     StateComponent("runner", "runner"),       # the resident runner: boot, exit, drain (runner.py)
+    # phase 3a S7: a delivered "now" message's post-send check (inbox_worker.store_verify), one
+    # entry per pending message ({msg, path, offset, deadline}), so a restart resumes it from the
+    # same offset and deadline instead of losing it with a thread.
+    StateComponent("inbox", "runner:inbox", ("entries",)),
 )}
 # "db": store.TimedConnection's warnings about write transactions held too long, from any process
 LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim", "runner", "db",
