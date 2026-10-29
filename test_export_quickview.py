@@ -452,9 +452,10 @@ class ScheduleSection(unittest.TestCase):
         finally:
             conn.close()
         out = self.entries("on", "crontab")
+        self.assertEqual(self.entries("runner", "crontab"), out)                 # S8: `on` is `runner`
         cron = [e for e in out if e["owner"] == "cron"]
         mine = {e.get("job"): e for e in out if e["owner"] == "runner"}
-        self.assertTrue(any("runner watchdog" in e["what"] for e in cron))
+        self.assertEqual(cron, [])                                              # S8: no cron line left at all
         self.assertFalse(any("inbox API watchdog" in e["what"] for e in cron))   # S7: the runner supervises it
         self.assertFalse(any("watcher watchdog" in e["what"] for e in cron))  # S6: the runner's passes now
         self.assertFalse(any("usage sampler" in e["what"] for e in cron))   # S3: the runner's now

@@ -184,8 +184,8 @@ At boot, after taking the lock:
   | mode | what runs |
   |---|---|
   | `off` | nothing (unchanged) |
-  | `on` (S2–S7) | supercronic with `docker/crontab` + the runner for `RUNNER_OWNS` |
-  | `runner` (S8) | the runner only |
+  | `on` (S2–S7) | supercronic with `docker/crontab` + the runner for `RUNNER_OWNS`; since S8 an alias of `runner` |
+  | `runner` (S8) | the runner only (`exec`ed by the entrypoint, no supercronic) |
   | `legacy` | supercronic with `docker/crontab.legacy` (today's crontab, frozen at S2) + the watcher + the inbox `ensure`; no runner |
 - **Rollback:**
   - Set `legacy` in `docker/.env` and run `docker compose up -d` (recreates the container, no rebuild).
@@ -347,6 +347,14 @@ At boot, after taking the lock:
   - 7 days with every job's cadence met and no unexplained pause;
   - a test that blocks the loop (a synchronous sleep injected into a test job) makes the watchdog thread exit the process, and Docker restarts the container.
 - **Risk:** there is no outside watchdog anymore. The watchdog thread is the only one, so it is tested on its own.
+- **As built:**
+  - **Modes:** `runner` and `on` both mean "the runner only" (`runner.RUNNER_MODES`, the quickview, `runner_conflict` and the entrypoint treat them alike). I read "`on` becomes `runner`" as an alias, not a removal: the S2-S7 deploys set `on` in `docker/.env`, so the S8 deploy needs no env change to take effect, and `docker/crontab` has no job line left that an `on` with supercronic could still run, so keeping the old meaning would only start an idle supercronic. `runner` is the name to use from now on (`env.example`, compose docs); S9 removes `on` with `legacy`. `legacy` and `off` are unchanged.
+  - **Entrypoint:** `on|runner` `exec`s `python3 -u runner.py serve` after the common start (known hosts, prompt import); no shell stays, so tini's only child is the runner and `docker stop`'s SIGTERM is the runner's own (clean exit within `STOP_GRACE` 80 s < compose's 90 s). The FIFO, `tee`, `data/cron_runs.log` and the TERM trap with `runner.py stop` are gone. Exit codes pass through: the loop watchdog's 70, a reported crash (`EXIT_CRASH`), a second runner (`EXIT_LOCKED` 2).
+  - **Cron:** the `*/5 runner.py ensure` line is removed; `docker/crontab` is comments only (kept for the quickview's listing and the `AFCLAUDE_CRONTAB` default; S9 removes it). `ensure`, `stop` and `shadow-report` stay as CLI commands for S9 to remove; nothing runs them.
+  - **Loop watchdog:** the thread already existed since S1 (`runner.Watchdog`, `STALE_LOOP` 300 s, checked every 15 s, `os._exit(70)`); S8 makes `serve()` read the constants at call time (a test patches them) and documents it as the only watchdog. It alerts nothing itself: a wedged process may not reach the DB or the bridge, and the exit must not wait for them; the restarted container's boot finds no clean exit and alerts + pauses (D-257, tested), and the cut-off run is recorded `interrupted` and handled by its job policy. A crash loop (a persistent boot failure) is slowed by Docker's restart back-off and alerts at every crash (failstop).
+  - **Compose:** `restart: unless-stopped` and `stop_grace_period: 90s` were already there (S2). New: `healthcheck: runner.py health` (interval 60 s, timeout 30 s, 3 retries, start period 120 s). `health` = a live `runner.py serve` process and a `runner_jobs 'runner'` heartbeat younger than `HEALTH_STALE` (3 min; the loop writes it at least every 60 s, the watchdog fires at 5 min, so health shows first); an unreadable DB is unhealthy too; `legacy` and `off` are always healthy. Docker only marks the container `unhealthy` (visible in `docker ps`); it restarts nothing itself, the watchdog thread does.
+  - **Tests:** a synchronous `time.sleep` in a job's spawner (a) in the loop with the exit injected (the watchdog fires during the block), (b) in a real `runner.py serve` process (exit code 70, no clean exit, lock released, the next boot alerts and records the run interrupted); `health` (modes, no process, no/stale heartbeat, unreadable DB, CLI); the bounds between `STALE_LOOP`, `HEALTH_STALE`, `STOP_GRACE` and compose; the entrypoint with fakes (same pid as the runner, no supercronic, exit code passes through); no cron line left in `docker/crontab` (`test_runner`, `test_export_quickview`).
+  - **Deploy:** `AFCLAUDE_SCHEDULER` stays `on` (works as `runner`) or becomes `runner` in `docker/.env`; no other host step. It is an image rebuild (entrypoint, compose healthcheck): `tools/deploy.py` as usual (drain first, not within 30 min of a window start). The "7 days with every job's cadence met" check and the live "Docker restarts the container" check (a blocked loop on a temp container) are for after the deploy.
 
 **S9: cleanup and observation.**
 - **(a) Cleanup**, after 7 calm days in `runner` mode:

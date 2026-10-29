@@ -2,8 +2,8 @@
 # The only AFClaude schedule (the host crontab has no AFClaude lines since 01.10.); every
 # Claude-side action goes through the SSH bridge (host.py). Keep the "# AFClaude ..." tags:
 # export_quickview.py lists them, and runner.py matches its jobs to them (JOBS cron_tag).
-# Phase 3a (docs/phase3a_plan.md): with AFCLAUDE_SCHEDULER=on the resident runner (runner.py)
-# runs beside this crontab and owns the jobs in runner.RUNNER_OWNS; each cut-over step moves lines
+# Phase 3a (docs/phase3a_plan.md): while this crontab was in use (S2-S7) the resident runner (runner.py)
+# ran beside it and owned the jobs in runner.RUNNER_OWNS; each cut-over step moves lines
 # from here into it. S2: stall_scan, prune_runs (new, never cron lines). S3: the usage sampler, the
 # dispatcher, the quickview export, the docs import, the log retention and the hourly usage review
 # (their lines are gone from here; runner.JOBS has their cadences, runner_jobs.HANDLERS their
@@ -18,7 +18,8 @@
 # docker/crontab.legacy is this file as it was before S2 (the rollback mode AFCLAUDE_SCHEDULER=legacy,
 # which keeps every line, `at --run-due`, the */30 window-start, the watcher watchdog and the inbox
 # API watchdog among them).
-# RUNNER WATCHDOG (phase 3a S2-S7, removed in S8 when the runner is the container's main process):
-# starts runner.py serve again if it is not running (an alert + pause unless its crash or unclean
-# exit is reported already), and alerts a stale loop heartbeat. The entrypoint starts the runner.
-*/5 * * * * cd $AFCLAUDE_DIR && python3 runner.py ensure >> $AFCLAUDE_DIR/data/runner.log 2>&1 # AFClaude runner watchdog (no-op if running)
+# S8: the runner is the container's only schedule (AFCLAUDE_SCHEDULER=runner, `on` is the same): the
+# entrypoint no longer starts supercronic for it, so this file has no job line left and is not read
+# by anything but the quickview's schedule listing. The temporary `runner.py ensure` watchdog line is
+# gone: a stuck loop is the runner's own watchdog thread (runner.Watchdog, exit 70), and Docker's
+# `restart: unless-stopped` starts the container again. S9 removes this file with the legacy mode.

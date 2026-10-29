@@ -9,6 +9,7 @@
     python3 runner.py wake                re-read the DB now (what the senders do after a write)
     python3 runner.py window-report [--hours H]   S5: each session-window start vs its run and decision
     python3 runner.py watcher-check       exit 1 when a keep-alive watcher must not start (runner_conflict)
+    python3 runner.py health              S8: the container's health check (a live runner, a fresh heartbeat)
 
 One asyncio loop: read the due times, wait for the earliest of them, a wake datagram
 (data/run/runner.sock) or a child's exit, start what is due, repeat; a 60-s longest sleep is the
@@ -42,6 +43,13 @@ SIGTERM: no new runs; running ones get up to STOP_GRACE (under compose's 90-s st
 their groups get SIGTERM and their rows stay `running` (the next boot: interrupted); the runner
 records the clean exit. A watchdog thread exits the process (70) when the loop's heartbeat is
 older than 5 min (a wedged loop; Docker's restart policy then restarts the container).
+
+S8, the runner only (AFCLAUDE_SCHEDULER=runner, `on` is the same): docker/entrypoint.sh `exec`s
+`runner.py serve` as tini's only child; no supercronic, no cron. A `docker stop` reaches the runner
+as SIGTERM (clean exit within compose's 90-s grace); a crash or the watchdog's exit ends the
+container and `restart: unless-stopped` starts it again, whose boot alerts + pauses for the unclean
+exit (D-257). The docker HEALTHCHECK is `runner.py health` (a live runner process and a loop
+heartbeat under HEALTH_STALE); it only reports, the watchdog thread is the one that acts.
 
 Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) moves jobs from
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
@@ -98,7 +106,8 @@ boot and again, with an alert, whenever it exits before a stop was requested): i
 stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
 messages are not automation (D-186/D-244), so both run while paused.
 
-Until S8 supercronic is the container's main schedule and this runner runs beside it:
+S2-S7 supercronic was the container's main schedule and this runner ran beside it (nothing runs
+`ensure` and `stop` since S8; S9 removes them with the legacy mode):
     python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
                                  unless one runs (an alert + pause when it had stopped without a
                                  crash or unclean exit its own boot reports, D-235/D-257); a
@@ -151,6 +160,7 @@ HEARTBEAT_EVERY = timedelta(seconds=30)   # runner_jobs 'runner'.heartbeat_at, a
 STALE_LOOP = 300.0                        # the watchdog exits the process after this long without a loop pass
 WATCHDOG_EVERY = 15.0
 WATCHDOG_EXIT = 70
+HEALTH_STALE = timedelta(minutes=3)       # S8: `health` fails when the loop heartbeat is older (the watchdog exits at STALE_LOOP)
 TERM_GRACE = 10.0                         # SIGTERM -> SIGKILL of a timed-out child's group
 STOP_GRACE = 80.0                         # SIGTERM of the runner: running runs get this long (compose: 90 s)
 STAGGER = timedelta(seconds=5)            # boot catch-up: the missed interval jobs start this far apart
@@ -1136,7 +1146,11 @@ class Runner:
 
 class Watchdog(threading.Thread):
     """Exits the process (WATCHDOG_EXIT) when the loop has not passed for `stale` seconds: a
-    wedged loop (Docker's health check alone restarts nothing; restart: unless-stopped does)."""
+    wedged loop (a synchronous call that blocks the asyncio loop, a hung DB write). Since S8 the
+    runner is the container's main process (docker/entrypoint.sh execs it) and this thread the only
+    watchdog: the exit ends the container and `restart: unless-stopped` starts it again; the new
+    boot finds no clean exit and alerts + pauses (D-257). The thread alerts nothing itself: a
+    wedged process may not reach the DB or the bridge, and the exit must not wait for them."""
     def __init__(self, beat: Callable[[], float], stale: float = STALE_LOOP, every: float = WATCHDOG_EVERY,
                  exit_fn: Callable[[int], object] = os._exit, log_fn: Callable[[str], None] = log) -> None:
         super().__init__(name="runner-watchdog", daemon=True)
@@ -1391,7 +1405,9 @@ def ensure(*, connect: Callable[[], Any] = store.connect, pids: Callable[[], lis
            settle: float = ENSURE_SETTLE, clock: Callable[[], datetime] = _utcnow,
            sleep: Callable[[float], object] = time.sleep, fail: FailFn = failstop.fail,
            log_fn: Callable[[str], None] = log) -> int:
-    """The temporary cron watchdog (docker/crontab */5, S2 until S8). A runner runs: its heartbeat
+    """The temporary cron watchdog (docker/crontab */5, S2-S7; since S8 nothing runs it: the runner
+    is the container's main process and its own Watchdog thread plus the restart policy replace it;
+    S9 removes it). A runner runs: its heartbeat
     must be fresh (else an alert + pause: its watchdog thread should have ended it). None runs: it
     starts one detached and reports what nobody else reports (D-235): a runner that stopped
     without a crash it reported or an unclean exit its new boot reports (D-257), or one that does
@@ -1453,8 +1469,9 @@ def ensure(*, connect: Callable[[], Any] = store.connect, pids: Callable[[], lis
 def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runner_pids,
          sleep: Callable[[float], object] = time.sleep, out: Callable[[str], object] = print) -> int:
     """SIGTERM to every running `runner.py serve`, then wait until they are gone (a stopping runner
-    gives its running runs up to STOP_GRACE). The entrypoint's TERM trap: tini signals only its
-    child, the entrypoint shell, which keeps supercronic AND the runner (whoever started it).
+    gives its running runs up to STOP_GRACE). The entrypoint's TERM trap in the S2-S7 `on` mode (tini
+    signals only its child, the entrypoint shell, which kept supercronic AND the runner); since S8
+    the runner is tini's child itself and gets the SIGTERM directly; S9 removes this.
     -> 0 stopped (or none ran), 1 still running after wait_s."""
     targets = pids()
     if not targets:
@@ -1474,6 +1491,29 @@ def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runn
             out(f"runner: still running after {wait_s:g} s (pid {', '.join(map(str, left))})")
             return 1
         sleep(0.2)
+
+
+def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[datetime] = None,
+           pids: Callable[[], list[int]] = runner_pids) -> Optional[str]:
+    """The container's health check (S8): None when healthy, else why not. Only a runner mode
+    (AFCLAUDE_SCHEDULER on/runner) has a runner to check (legacy and off: healthy). The runner
+    must be a live process and its loop heartbeat (runner_jobs 'runner', written at most every
+    HEARTBEAT_EVERY and at every loop pass, so at most MAX_SLEEP + HEARTBEAT_EVERY old) younger
+    than HEALTH_STALE. It only reports: the restart is the loop watchdog's (Watchdog) and compose's."""
+    mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
+    if mode not in RUNNER_MODES:
+        return None
+    if not pids():
+        return "no runner process (runner.py serve) is running"
+    row = store.get_runner_job(conn, actions.RUNNER_ROW)
+    beat = _parse(row["heartbeat_at"]) if row else None
+    if beat is None:
+        return "the runner has no heartbeat"
+    age = (now or _utcnow()) - beat
+    if age > HEALTH_STALE:
+        return (f"the runner's heartbeat is {int(age.total_seconds())} s old "
+                f"(healthy: under {int(HEALTH_STALE.total_seconds())} s)")
+    return None
 
 
 def shadow_log(line: str) -> None:
@@ -1682,7 +1722,7 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
         conn = store.connect()
         runner = Runner(conn, owns=o, shadow=shadow_log)
         r = runner
-        Watchdog(lambda: r.beat_mono).start()
+        Watchdog(lambda: r.beat_mono, stale=STALE_LOOP, every=WATCHDOG_EVERY).start()   # (read now: tests patch them)
         runner.boot()
         return asyncio.run(runner.serve())
     except Exception as e:   # noqa: BLE001 - the runner's own failure: report, exit non-zero (no clean exit)
@@ -1715,6 +1755,21 @@ def _window_report_cli(conn: Any, args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+def _health_cli() -> int:
+    """`health`: 0 healthy, 1 unhealthy (the reason on stdout, which `docker inspect` keeps); a DB that
+    cannot be read is unhealthy too (never reported as healthy, D-235)."""
+    try:
+        conn = store.connect()
+        try:
+            why = health(conn, pids=runner_pids)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - the check itself failed: unhealthy with the error
+        why = f"the health check failed: {type(e).__name__}: {e}"
+    print(f"unhealthy: {why}" if why else "healthy")
+    return 1 if why else 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="The AFClaude resident runner (phase 3a).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1726,8 +1781,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                                                                  "session-run timeout + 5)")
     sub.add_parser("undrain", help="lift a drain")
     sub.add_parser("wake", help="make the runner re-read the DB now")
-    sub.add_parser("ensure", help="cron watchdog (S2-S7): start the runner unless one runs, check its heartbeat")
-    sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the entrypoint's TERM trap)")
+    sub.add_parser("ensure", help="the S2-S7 cron watchdog (nothing runs it since S8): start the runner unless one "
+                                  "runs, check its heartbeat")
+    sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the S2-S7 entrypoint's TERM trap)")
+    sub.add_parser("health", help="the container's health check (S8): exit 1 (the reason on stdout) when no runner "
+                                  "runs or its loop heartbeat is stale; healthy in the legacy and off modes")
     sub.add_parser("watcher-check", help="exit 1 (the reason on stderr) when a keep-alive watcher must not start "
                                          "(runner_conflict); start_watcher.sh / start_keepalive.sh ask it")
     r = sub.add_parser("shadow-report", help="the shadow times against cron's actual starts (exit 1 on a mismatch)")
@@ -1749,6 +1807,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0 if wake() else 1
     if args.cmd == "stop":
         return stop()
+    if args.cmd == "health":
+        return _health_cli()
     if args.cmd == "ensure":
         try:
             return ensure()

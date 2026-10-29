@@ -18,6 +18,15 @@ services:
     # a `docker stop` reaches the runner through the entrypoint (runner.py stop): its running runs get
     # up to 80 s (runner.STOP_GRACE) to end before it records its clean exit (phase 3a S2)
     stop_grace_period: 90s
+    # phase 3a S8 (AFCLAUDE_SCHEDULER on/runner): a live runner with a loop heartbeat under 3 min; the
+    # legacy and off modes are always healthy. It only reports (docker ps); a stuck loop is ended by the
+    # runner's own watchdog thread (exit 70) and `restart: unless-stopped` starts the container again.
+    healthcheck:
+      test: ["CMD", "python3", "runner.py", "health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
     environment:
       AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
       AFCLAUDE_MANAGER_SESSION: ${AFCLAUDE_MANAGER_SESSION:?set in docker/.env}
