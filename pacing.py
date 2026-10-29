@@ -12,7 +12,8 @@ window to the end):
     run_cost      = the weekly % of the session window AFClaude would use: ratio x (100 - session %)
                     of the live session window, else ratio x 100 = full_session_cost (a fresh one)
     predicted_end = w + run_cost + forecast(now, weekly reset)
-                    forecast = the user's other use + the owner's design chats (D-266, below)
+                    forecast = the user's other use only (D-308: the owner's design chats are
+                    AFClaude's own work, not forecast; below)
     RUN iff predicted_end <= threshold: budget for this run (headroom) = run_cost (one number:
     reason, --decide, the continue message, the quickview; ~ 1 session window). Otherwise no run
     (no partial runs); the next session window / night re-checks.
@@ -40,12 +41,13 @@ AFClaude usage, tracked as their own category. Usage outside runs is split per s
 by the weighted tokens of AFClaude's own sessions vs the other sessions (usage_sampler's
 own_w_tokens / other_w_tokens, as stage_eta.py --split): the own part is design chats, the rest
 (and a rise without local tokens: another device) is the user's other use. forecast_user() is
-the other use only (the rates and the weekly budget above are fitted on it); forecast_design()
-is a steady weekly amount, the trailing mean of the measured design chats per covered hour of
-the fitted closed weeks (D-264: flat until >= 4 measured weeks exist; a bursty model is for a
-later review), spread evenly and, inside the open cycle, blended like the weekly budget with
-the week's amount left (budget_weight x max(weekly amount - design chats so far, 0)). The night gate still adds both (forecast_gate(): the owner stays protected,
-D-141/D-258); the decision shows them apart (forecast_other, forecast_design).
+the other use only (the rates and the weekly budget above are fitted on it). D-308: the night
+gate and the last stretch forecast the other use only; design chats already used count as
+AFClaude's usage in the week's %, like a run, and no future design-chat amount is added.
+forecast_design() (a steady weekly amount, the trailing mean of the measured design chats per
+covered hour of the fitted closed weeks, D-264, blended inside the open cycle with the week's
+amount left) and forecast_gate() remain for stage_eta.py only (the ETA still counts design chats
+as AFClaude capacity, D-264/D-266).
 
 Accuracy, computed in code: forecast_backtest() back-calculates the predictor's error from the
 usage data (at every past night session-window start, the forecast fitted on the samples up to
@@ -105,7 +107,6 @@ LAST_MILE_SESSION_CAP = 100.0
 DEFAULT_RATIO = 0.2
 RATIO_RANGE = (0.01, 1.0)
 MIN_FORECAST_HOURS = 72.0        # covered hours of user data before the forecast is trusted
-DESIGN_FLAT_WEEKS = 4            # D-264: design chats are a flat weekly amount until this many measured weeks
 FIT_CYCLES = 4
 RETRY = timedelta(minutes=15)
 SAMPLE_MAX_AGE = timedelta(minutes=30)
@@ -571,8 +572,14 @@ def cycle_split(rows, spans, cycle):
 def user_intervals(rows, fires, runs=None):
     """-> [(t0, t1, weekly-% rise outside AFClaude's runs)] of consecutive samples in one weekly
     cycle (<= 1 h apart), 0 inside an autonomous AFClaude run (run_spans). Outside the runs = the
-    user's other use + the owner's design chats: what the night gate forecasts (forecast_gate)."""
+    user's other use + the owner's design chats (other_intervals: without the design chats)."""
     return [(t0, t1, 0.0 if auto else dw) for t0, t1, dw, auto, _, _ in _intervals(rows, fires, runs)]
+
+
+def other_intervals(rows, fires, runs=None):
+    """-> [(t0, t1, the user's other weekly-% use)]: outside AFClaude's runs and without the
+    owner's design chats; what the night gate forecasts (forecast_user, D-308)."""
+    return [(t0, t1, 0.0 if auto else dw - d) for t0, t1, dw, auto, _, d in _intervals(rows, fires, runs)]
 
 
 def design_intervals(rows, fires, runs=None):
@@ -671,14 +678,15 @@ def fit_profile(rows, fires, now, runs=None, params=None):
     totals = [max(ctot[c][0] - auto.get(c, 0.0), 0.0) for c in closed
               if c in last and c - _ts(last[c]["at"]) <= FINAL_MAX_GAP and cov.get(c, 0.0) >= BUDGET_MIN_COVERAGE]
     info = (f"forecast from {len(closed)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% other user usage; "
-            f"design chats {rates.design_week:.1f}%/week (flat mean of {len(closed)} week(s), D-264)")
+            f"design chats {rates.design_week:.1f}%/week (flat mean of {len(closed)} week(s), D-264; for the "
+            f"ETA only, the gate doesn't forecast them, D-308)")
     open_c = [c for c in last if c > now]
     if open_c and P["budget_weight"] > 0:     # the design chats' weekly amount left in the open cycle
         c = min(open_c)
         rates.design_end, rates.design_as_of = c, _ts(last[c]["at"])
         rates.design_used = sum(des for _, _, _, _, cyc, des in iv if cyc == c)
         rates.design_weight = P["budget_weight"]
-        info += f", {rates.design_used:.0f}% used this week"
+        info += f", {rates.design_used:.0f}% used this week (AFClaude's)"
     if totals and open_c and P["budget_weight"] > 0:
         c = min(open_c)
         r = last[c]
@@ -723,7 +731,8 @@ def forecast_user(rates, a, b):
 
 
 def forecast_design(rates, a, b):
-    """Forecast of the owner's design chats' weekly % in [a, b) (D-264): the steady weekly amount
+    """Forecast of the owner's design chats' weekly % in [a, b) for stage_eta.py (D-264; the night
+    gate doesn't forecast them, D-308): the steady weekly amount
     design_week, spread evenly over the time; inside the open cycle blended like the user's
     weekly budget: (1 - design_weight) x that + design_weight x the week's amount left
     (max(design_week - design_used, 0), spread evenly over [design_as_of, design_end))."""
@@ -743,8 +752,9 @@ def forecast_design(rates, a, b):
 
 
 def forecast_gate(rates, a, b):
-    """What the night gate adds for [a, b): the user's other use + the design chats (D-266: the
-    design chats are AFClaude's, but still forecast into the gate so the owner stays protected)."""
+    """The user's other use + the design chats in [a, b): stage_eta.py's view (the ETA counts
+    design chats, D-264/D-266). Not the night gate any more: it forecasts forecast_user() only
+    (D-308)."""
     return forecast_user(rates, a, b) + forecast_design(rates, a, b)
 
 
@@ -777,21 +787,20 @@ def profile(rows=None, now=None, fires=None, runs=None):
 
 def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, session_resets_at=None,
                 activity_known=True, ratio=DEFAULT_RATIO, lm_setting="auto", sched=None, threshold="auto",
-                forecast=None, design=None):
-    """Pure decision. forecast = a function (a, b) -> the user's forecast weekly % in [a, b), or
-    None (no forecast: the straight line). design = the same for the owner's design chats (D-266),
-    added to the forecast (None: forecast is the whole use outside runs). threshold =
+                forecast=None):
+    """Pure decision. forecast = a function (a, b) -> the user's forecast other weekly % in [a, b)
+    (D-308: no design chats; they are AFClaude's own, already in the weekly %), or None (no
+    forecast: the straight line). threshold =
     "auto"/None (dynamic_threshold(ratio)) or a %. sched = the schedule.Config (None: the
     settings). -> dict(go, headroom, target, mode, postpone, recheck_at, session_cap, reason,
-    threshold, predicted_end, run_cost, forecast (other + design), forecast_other,
-    forecast_design, ...)."""
+    threshold, predicted_end, run_cost, forecast (= forecast_other: the user's other use), ...)."""
     P = {**DEFAULTS, **(P or {})}
     sched = sched or schedule.load()
     thr, thr_src = threshold_for(ratio, threshold)
     d = {"go": False, "headroom": None, "target": None, "mode": None, "postpone": False, "recheck_at": None,
          "session_cap": P["session_cap"], "user_active": None, "ratio": ratio, "last_mile_h": None,
          "last_mile_start": None, "t0": None, "w0": None, "forecast": None, "forecast_other": None,
-         "forecast_design": None, "run_cost": None,
+         "run_cost": None,
          "full_session_cost": full_session_cost(ratio), "predicted_end": None, "threshold": thr,
          "threshold_source": thr_src}
     if weekly_pct is None or resets_at is None:
@@ -831,15 +840,12 @@ def decide_core(weekly_pct, resets_at, now, msu, P=None, session_pct=None, sessi
         thr_txt = f"threshold {thr:.1f}% ({thr_src})"
         if forecast is not None:
             fo = forecast(now, resets_at)
-            fd = design(now, resets_at) if design is not None else None
-            fc = fo + (fd or 0.0)
-            pred = w + cost + fc
+            pred = w + cost + fo
             ok = pred <= thr
-            use = (f"{fo:.1f}% forecast user use" if fd is None else
-                   f"{fo:.1f}% forecast other user use + {fd:.1f}% design chats")
-            how = (f"predicted end {w:.0f}% now + {cost:.1f}% for {what} + {use} until "
-                   f"the reset {_b(resets_at)} = {pred:.1f}% {'<=' if ok else '>'} {thr_txt}")
-            d.update(forecast=fc, forecast_other=fo, forecast_design=fd, predicted_end=pred)
+            how = (f"predicted end {w:.0f}% now + {cost:.1f}% for {what} + {fo:.1f}% forecast other user use "
+                   f"(design chats not forecast, D-308) until the reset {_b(resets_at)} = {pred:.1f}% "
+                   f"{'<=' if ok else '>'} {thr_txt}")
+            d.update(forecast=fo, forecast_other=fo, predicted_end=pred)
         else:
             cw = schedule.current_window(now, sched)
             end = min(max(cw.end if cw else now, now), resets_at)
@@ -898,12 +904,11 @@ def decide(usage, now, params=None, rows=None, long_rows=None, msu=None, activit
     ratio, rsrc = ratio_info(long_rows)
     rates, fsrc = profile(long_rows, now, fires)
     resets_at = w.get("resets_at")
-    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))
-    fd = None if rates is None else (lambda a, b: forecast_design(rates, a, b))
+    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))     # D-308: no design chats
     setting, tsrc = afclaude_config.reserve_threshold_setting()
     d = decide_core(w.get("percent"), resets_at, now, msu, P, s.get("percent"), s.get("resets_at"),
                     activity_known, ratio, afclaude_config.last_mile_setting(), schedule.load(),
-                    setting, fc, fd)
+                    setting, fc)
     if setting != "auto":
         d["threshold_source"] = tsrc
         d["reason"] = d["reason"].replace("(override)", f"({tsrc})")
@@ -1104,7 +1109,7 @@ def next_run(usage, now, decision=None, rows=None, fires=None, active=None, defe
         decision = decide(usage, now, rows=rows, fires=fires)
     ratio, _ = ratio_info(rows)
     rates, fsrc = profile(rows, now, fires)
-    fc = None if rates is None else (lambda a, b: forecast_gate(rates, a, b))
+    fc = None if rates is None else (lambda a, b: forecast_user(rates, a, b))     # D-308: no design chats
     setting, _ = afclaude_config.reserve_threshold_setting()
     P, _ = load_params()
     d = next_run_core(w.get("percent"), w.get("resets_at"), now, ratio, fc, setting,
@@ -1134,14 +1139,14 @@ def _r2(x):
 
 def record_forecast(d, resets_at, path=None):
     """Log one window-start decision (the forecast from d["t0"], the decision time, to the
-    reset) so forecast_errors() can score it later. forecast_user = the whole forecast outside
-    AFClaude's runs (other use + design chats, as user_intervals measures it); forecast_other /
-    forecast_design its parts (D-266)."""
+    reset) so forecast_errors() can score it later. forecast_user = forecast_other = the gate's
+    forecast of the user's other use (D-308: no design chats; records before it also carry
+    forecast_design)."""
     if d.get("forecast") is None or d.get("t0") is None:
         return False
     rec = {"at": d["t0"].astimezone(UTC).isoformat(), "reset": _round_reset(resets_at).isoformat(),
            "w0": d["w0"], "forecast_user": round(d["forecast"], 2), "forecast_other": _r2(d.get("forecast_other")),
-           "forecast_design": _r2(d.get("forecast_design")), "run_cost": _r2(d.get("run_cost")),
+           "run_cost": _r2(d.get("run_cost")),
            "predicted_end": _r2(d.get("predicted_end")), "threshold": _r2(d.get("threshold")),
            "go": d.get("go"), "target": _r2(d.get("target")), "logged_at": datetime.now(UTC).isoformat()}
     # the DB for the live path (a DB failure: the fallback file, §7.8), else a side file
@@ -1151,22 +1156,26 @@ def record_forecast(d, resets_at, path=None):
 def forecast_errors(rows, fires, now, path=None, runs=None):
     """Score the logged forecasts of closed weeks against the user's real use from the logged
     time to the reset (runs: run_metrics rows for the AFClaude/user split, as the fit; default
-    run_rows()).
+    run_rows()): forecast_other vs the other use (other_intervals, D-308); an older record
+    without it: forecast_user vs all use outside the runs (user_intervals).
     -> list of {at, forecast, actual, error} (error = forecast - actual)."""
     try:
         recs = [json.loads(x) for x in telemetry.lines(path or FORECAST_LOG) if x.strip()]
     except (OSError, ValueError):
         return []
-    iv = user_intervals(sorted(rows, key=lambda r: _ts(r["at"])), fires, run_rows() if runs is None else runs)
+    rows = sorted(rows, key=lambda r: _ts(r["at"]))
+    runs = run_rows() if runs is None else runs
+    iv_all, iv_other = user_intervals(rows, fires, runs), other_intervals(rows, fires, runs)
     out, seen = [], set()
     for r in recs:
         a, reset = _ts(r.get("at")), _ts(r.get("reset"))
         if not a or not reset or reset > now or (r["at"], r["reset"]) in seen:
             continue
         seen.add((r["at"], r["reset"]))
+        fc, iv = ((r["forecast_other"], iv_other) if r.get("forecast_other") is not None
+                  else (r["forecast_user"], iv_all))
         actual = sum(dw for t0, t1, dw in iv if t0 >= a and t1 <= reset + timedelta(minutes=5))
-        out.append({"at": r["at"], "forecast": r["forecast_user"], "actual": actual,
-                    "error": r["forecast_user"] - actual})
+        out.append({"at": r["at"], "forecast": fc, "actual": actual, "error": fc - actual})
     return out
 
 
@@ -1180,10 +1189,10 @@ def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8, runs=None,
     session-window start t (the window start, + 5 h, ... inside the window) the profile fitted on
     the samples up to t (what the gate would have used: the closed cycles' rates and weekly
     budget, the use so far in this cycle; runs = run_metrics rows, default run_rows(); params as
-    fit_profile) forecasts the use outside AFClaude's runs (forecast_gate: the user's other use +
-    the design chats, what the gate adds) until
+    fit_profile) forecasts the user's other use (forecast_user, what the gate adds, D-308) until
     the weekly reset (for the open cycle: until now, a partial horizon); actual = the user's real
-    use over the same span (user_intervals, the definition the fit uses). Spans the samples cover
+    other use over the same span (other_intervals: outside the runs, without the design chats,
+    the definition the fit uses). Spans the samples cover
     less than min_coverage are skipped. -> [{at, reset, end, closed, horizon_h, predicted, actual,
     error}], error = actual - predicted (> 0: the model under-predicted, the week ended higher)."""
     sched = sched or schedule.load()
@@ -1191,7 +1200,7 @@ def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8, runs=None,
     cycles = sorted({c for c in (_round_reset(_weekly(r).get("resets_at")) for r in rows) if c is not None})
     params = predictor_params()[0] if params is None else params
     runs = run_rows() if runs is None else runs
-    iv = user_intervals(rows, fires, runs)
+    iv = other_intervals(rows, fires, runs)
     step = timedelta(hours=SESSION_H)
     out = []
     for c in cycles:
@@ -1206,7 +1215,7 @@ def forecast_backtest(rows, fires, now, sched=None, min_coverage=0.8, runs=None,
                 hz = (end - k).total_seconds() / 3600
                 if sum((x[1] - x[0]).total_seconds() for x in span) / 3600 >= min_coverage * hz:
                     rates = fit_profile([r for r in rows if _ts(r["at"]) <= k], fires, k, runs, params)[0]
-                    pred, act = forecast_gate(rates, k, end), sum(x[2] for x in span)
+                    pred, act = forecast_user(rates, k, end), sum(x[2] for x in span)
                     out.append({"at": k.astimezone(UTC).isoformat(), "reset": c.isoformat(),
                                 "end": end.isoformat(), "closed": end == c, "horizon_h": round(hz, 1),
                                 "predicted": pred, "actual": act, "error": act - pred})
@@ -1281,16 +1290,13 @@ def threshold_info(rows=None, fires=None, now=None, decision=None, runs=None):
                               "note": "weekly % of one full session window = 100 x ratio; sd = per-session "
                                       "variation without integer-rounding noise (intrinsic) and the estimate's se"},
         "model_error": {**{k: _rnd(v) if isinstance(v, float) else v for k, v in me.items()},
-                        "sign": "actual - predicted use outside AFClaude's runs (other user use + design "
-                                "chats) until the reset (> 0: under-predicted)",
+                        "sign": "actual - predicted other user use (outside AFClaude's runs and design "
+                                "chats, D-308) until the reset (> 0: under-predicted)",
                         "logged": {"n": len(logged), "bias": _rnd(sum(logged) / len(logged)) if logged else None}},
         "predicted_end_sd": _rnd(end_sd),
-        # the forecast's two categories per week (D-266): the user's other use (the rate profile)
-        # and the design chats (a flat weekly amount, D-264); the gate adds both
-        "forecast": {"source": fsrc, "other_week": _rnd(sum(rates)) if rates is not None else None,
-                     "design_week": _rnd(rates.design_week) if rates is not None else None,
-                     "design_weeks": rates.design_weeks if rates is not None else 0,
-                     "design_flat_until_weeks": DESIGN_FLAT_WEEKS},
+        # the gate's forecast per week: the user's other use (the rate profile); design chats are
+        # AFClaude's own and not forecast (D-308)
+        "forecast": {"source": fsrc, "other_week": _rnd(sum(rates)) if rates is not None else None},
         "threshold": {"active": _rnd(active), "source": "dynamic" if setting == "auto" else tsrc,
                       "dynamic_default": _rnd(dyn), "dynamic_default_sd": _rnd(cost_sd),
                       "override": None if setting == "auto" else float(setting),
@@ -1302,7 +1308,6 @@ def threshold_info(rows=None, fires=None, now=None, decision=None, runs=None):
                       "predicted_end": _rnd(pe), "threshold": _rnd(thr), "run_cost": _rnd(decision.get("run_cost")),
                       "forecast_user": _rnd(decision.get("forecast")),
                       "forecast_other": _rnd(decision.get("forecast_other")),
-                      "forecast_design": _rnd(decision.get("forecast_design")),
                       "slack": _rnd(thr - pe) if _num(pe) and _num(thr) else None,
                       "slack_in_sd": _rnd((thr - pe) / end_sd, 2) if _num(pe) and _num(thr) and end_sd else None}
     return out
@@ -1320,8 +1325,8 @@ def threshold_lines(ti):
             f"actual - predicted use outside runs" if m["n"] else f"model error: {m['note']}"),
            f"predicted week end ± {ti['predicted_end_sd']:g} weekly %" if ti["predicted_end_sd"] is not None
            else "predicted week end ± ? (too little data)",
-           (f"forecast per week (D-266): other user use {f['other_week']:g}% + design chats {f['design_week']:g}% "
-            f"(AFClaude's, tracked apart; flat mean of {f['design_weeks']} week(s), D-264); the gate adds both"
+           (f"forecast per week: other user use {f['other_week']:g}% (design chats count as AFClaude's "
+            f"usage and are not forecast, D-308)"
             if f.get("other_week") is not None else f"forecast: {f.get('source')}"),
            f"threshold {t['active']:g}% ({t['source']}; dynamic default {t['dynamic_default']:g}%"
            f"{pm(t['dynamic_default_sd'])} = one session window left)"]
@@ -1330,8 +1335,8 @@ def threshold_lines(ti):
         out.append(f"now: predicted end {n['predicted_end']:g}% vs threshold {n['threshold']:g}% "
                    f"(slack {n['slack']:+g}%" + (f", {n['slack_in_sd']:+g} sd" if n.get("slack_in_sd") is not None
                                                  else "") + ")"
-                   + (f"; until the reset: other user use {n['forecast_other']:g}% + design chats "
-                      f"{n['forecast_design']:g}%" if n.get("forecast_design") is not None else ""))
+                   + (f"; until the reset: other user use {n['forecast_other']:g}%"
+                      if n.get("forecast_other") is not None else ""))
     return out
 
 
