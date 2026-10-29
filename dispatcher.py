@@ -54,6 +54,7 @@ import fcntl
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -379,15 +380,21 @@ class Pass:
 
     def continue_stalled(self, r, key):
         """D-206: right at the reset (+ grace), any time of day, no window / budget / pacing gate;
-        the preflight still refuses RC-server threads, sdk-url children and busy sessions."""
+        the preflight still refuses RC-server threads, sdk-url children and busy sessions.
+        -> (outcome, detail) for a run-now request (continue_now, phase 3b S5; the pass ignores it):
+        "started" (detail: the tmux name), "refused" (it can't run now: not at its reset, held by the
+        owner, not resumable), "failed" (alerted and paused here already) or "dry-run"."""
         sid = r["session_id"]
         label = f"stalled {sid[:8]}"
         action, detail, _ = ka.evaluate(sid, self.now, self.usage_getter)
         if action != "FIRE":
-            return self.skip(label, f"{action}: {detail}")
+            self.skip(label, f"{action}: {detail}")
+            # the usage reading failed: fresh_usage alerted and paused already
+            return ("failed" if action == "USAGE_FAILED" else "refused"), f"{action}: {detail}"
         cwd = session_cwd(self.conn, sid)
         if not cwd:
-            return self.skip(label, "no existing working directory recorded; not resumable")
+            self.skip(label, "no existing working directory recorded; not resumable")
+            return "refused", "no existing working directory recorded; not resumable"
         try:   # its readable tmux name (3b S2), stored before the launch (armed)
             tmux = ka.claim_tmux(sid, "stall", title=r.get("title"), arm=self.arm, actor="dispatcher",
                                  conn=self.conn)
@@ -397,7 +404,8 @@ class Pass:
                                            "error": f"{type(e).__name__}: {e}"[:300]}
                 alert_once(self.st, f"name:{key}", f"dispatcher did NOT continue {sid[:8]}: no tmux name",
                            f"{type(e).__name__}: {e}"[:500])
-            return self.skip(label, f"no tmux name: {type(e).__name__}: {e}"[:300])
+            self.skip(label, f"no tmux name: {type(e).__name__}: {e}"[:300])
+            return "failed", f"no tmux name: {type(e).__name__}: {e}"[:300]
         ok, problems, plan = ka.preflight(sid, tmux)
         if not ok and problems and problems[0].startswith(ka.RC_HELD):
             # the user has it open in the Remote Control app: skip, retry next pass, log once per stall
@@ -406,7 +414,7 @@ class Pass:
                 log(f"not continuing {sid[:8]}: {problems[0]}")
                 if self.arm:
                     self.st["rc_held"][key] = store.iso(self.now)
-            return
+            return "refused", f"the owner holds the session ({problems[0]})"
         if not ok:
             self.skip(label, "preflight refused: " + "; ".join(problems))
             if self.arm:
@@ -414,7 +422,7 @@ class Pass:
                                            "problems": problems}
                 alert_once(self.st, f"preflight:{key}", f"dispatcher did NOT continue {sid[:8]}: preflight failed",
                            "; ".join(problems))
-            return
+            return "failed", "preflight refused: " + "; ".join(problems)
         reason_txt = "dispatcher, " + detail
         af = is_afclaude_cwd(cwd)
         model = None                                  # AFClaude-repo sessions: LAUNCH or their project's (D-260, ka.fire)
@@ -433,7 +441,7 @@ class Pass:
             log(f"WOULD CONTINUE (dry-run) {sid[:8]} plan={plan} cwd={cwd} tmux={tmux} name={name!r} "
                 f"model={entry['model']}: "
                 f"{msg[:160]!r}...")
-            return
+            return "dry-run", tmux
         try:
             rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model,
                                    category=ka.remote_control.CONTINUE)   # D-269
@@ -442,7 +450,7 @@ class Pass:
                                        "error": f"{type(e).__name__}: {e}"[:300]}
             alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed: {type(e).__name__}",
                        f"plan={plan}: {e}"[:500])
-            return
+            return "failed", f"launch error: {type(e).__name__}: {e}"[:300]
         entry.update(rc=rc, stdout=out.strip(), stderr=err.strip()[-500:])
         self.report["continue"].append(entry)
         log(f"CONTINUED {sid[:8]} plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()[-300:]!r}")
@@ -452,10 +460,11 @@ class Pass:
         if rc != 0:
             alert_once(self.st, f"launch:{key}", f"dispatcher continue of {sid[:8]} failed (rc={rc})",
                        f"plan={plan} stdout={out.strip()[:300]} stderr={err.strip()[:500]}")
-            return
+            return "failed", f"the launcher failed (rc={rc}): {err.strip()[-300:]}"
         tracked = self.st["sessions"].get(sid, {})
         self.track(sid, tmux, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
                    own_tmux=plan != "send-keys" or tracked.get("own_tmux", False))
+        return "started", tmux
 
     # -- 2. verification of earlier continues, 3. cleanup
     def verify(self):
@@ -577,6 +586,60 @@ class Pass:
         # no task-session starts and no in-window starts of task-managers here (D-205): runs
         # begin only at the session-window / last-stretch slot starts (keepalive.py)
         return self.report
+
+
+CONTINUE_LOCK_WAIT = timedelta(minutes=5)   # continue_now waits this long for a running pass, then: error
+
+
+def continue_now(conn, sid, now, request_id):
+    """A run-now continue_now request (phase 3b S5, docs/phase3b_plan.md §2): the stalled session
+    `sid` continued through the pass's own continue path (Pass.continue_stalled: the D-206 preflight,
+    the session's limit), now, with no decision row needed and while automation is paused (D-282).
+    Refused: not stalled now, an AFClaude run (a task-manager or a task session: D-204, `run-now work`
+    is the way for a task-manager), excluded, or this stall continued already. Under the pass's lock
+    (one writer of its state); held longer than CONTINUE_LOCK_WAIT: an error (D-234).
+    -> (outcome, detail) as continue_stalled's ("started": detail = the tmux name)."""
+    cfg = load_config()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        deadline = time.monotonic() + CONTINUE_LOCK_WAIT.total_seconds()
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise failstop.Failed("the dispatcher's lock is held too long",
+                                          f"continue_now request #{request_id}: still held after {CONTINUE_LOCK_WAIT}")
+                time.sleep(2)
+        stalled.scan(conn)            # the stall as it is now (the pass scans first, too)
+        st = load_state()
+        row = next((r for r in store.stalled_decisions(conn) if r["session_id"] == sid), None)
+        if row is None:
+            return "refused", f"session {sid[:8]} is not stalled at a limit now"
+        p = Pass(conn, cfg, st, now, True)
+        managed = managed_projects(conn)
+        run = p.afclaude_run(sid, managed)
+        if run:
+            return "refused", run + ("; continue a task-manager with `tasks.py run-now work PROJECT`"
+                                     if sid in managed else "")
+        excluded = excluded_sessions(cfg, conn)
+        if sid in excluded:
+            return "refused", f"excluded: {excluded[sid]}"
+        key = row.get("stall_uuid") or row.get("stalled_since")
+        h = st["handled"].get(key)
+        if h:
+            return "refused", f"this stall was already continued at {h.get('at')} ({h.get('result')})"
+        ka.TAKE_OVER_IDLE = bool(cfg["take_over_idle"])
+        outcome = p.continue_stalled(row, key)
+        if outcome[0] == "started" and isinstance(st["handled"].get(key), dict):
+            st["handled"][key]["request"] = request_id
+        log(f"run-now request #{request_id}: continue_now {sid[:8]}: {outcome[0]} ({outcome[1]})")
+        save_state(st)
+        return outcome
+    finally:
+        lock.close()
 
 
 def prune_state(st, now, days=7):

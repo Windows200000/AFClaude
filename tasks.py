@@ -48,6 +48,12 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py driven list [--all]           the sessions AFClaude drives (phase 3b): kind, tmux name, project
     tasks.py driven check                  rows vs. the task-managers and the live tmux sessions (exit 1
                                            on a mismatch; the backfill is `store.py import-driven`)
+    tasks.py run-now work PROJECT          run now (phase 3b S5, D-153): continue the project's task-manager
+                                           at once, no window or budget gate (refused while it runs, at its
+                                           limit or held by the owner; a project without one gets it created)
+    tasks.py run-now continue SESSION      continue one stalled session now (no decision needed)
+    tasks.py run-now review                a one-off usage review now, without its quota wait
+    tasks.py run-now list [--all]          the open requests (--all: the recent ones, with their outcome)
     tasks.py doc list [--project P]        the project's docs in the DB (phase 2d, project_docs.py)
     tasks.py doc show NAME [--project P] [--entries N]   a doc's text (--entries: its newest entries)
     tasks.py doc append NAME TEXT|- [--project P]   add an entry to progress|exceptions|alerts
@@ -560,6 +566,8 @@ def run(conn, args):
         run_automation(conn, args)
     elif c == "driven":
         return run_driven(conn, args) or 0
+    elif c == "run-now":
+        return run_now(conn, args) or 0
     elif c == "notice":
         run_notice(conn, args)
     elif c == "inbox" and args.inbox_cmd:
@@ -666,6 +674,65 @@ def run_automation(conn, args):
                           + [failstop.resume_cmd(pp["name"]) for pp in st["projects"]])
               + (f" (or all at once: {failstop.RESUME_CMD} --all)" if len(st["projects"]) + st["paused"] > 1 else ""))
     return None
+
+
+RUN_NOW_KINDS = {"work": "work_on_now", "continue": "continue_now", "review": "review_now"}
+
+
+def run_now_usage() -> str:
+    """The run-now's cost context (docs/phase3b_plan.md §5 S5 risk: it spends budget outside the
+    plan): the current session % and the weekly % with the budget headroom, from the usage cache.
+    A reading that fails is said so (the request is still the owner's call, D-153). -> one line."""
+    import keepalive as ka
+    from datetime import datetime, timezone
+    try:
+        u = ka.usage_cache_checked()
+        now = datetime.now(timezone.utc)
+        parts = []
+        for k, label in (("session", "session"), ("weekly", "weekly")):
+            m = (u or {}).get(k) or {}
+            when = f", resets {ka.berlin(m['resets_at'])}" if m.get("resets_at") else ""
+            parts.append(f"{label} {m['percent']:.0f} %{when}" if m.get("percent") is not None else f"{label} unknown")
+        parts.append(ka.budget_headroom(u, now)[1])
+        return "usage now: " + "; ".join(parts)
+    except Exception as e:  # noqa: BLE001 - shown as what it is, the request is not blocked by it
+        return f"usage now: NOT READ ({type(e).__name__}: {str(e)[:200]})"
+
+
+def request_line(r):
+    res = json.loads(r["result"]) if r.get("result") else {}
+    what = res.get("tmux") or res.get("reason") or ""
+    tgt = f" {r['target']}" if r["target"] else ""
+    return f"#{r['id']}  {r['status']}  {r['kind']}{tgt}  {berlin(r['ts'])}  by {r['actor']}" + (f"  {what}" if what else "")
+
+
+def run_now(conn, args):
+    """Phase 3b S5 (run_now.py): queue a run-now request (request.add, as the owner) after printing
+    the current usage, then wake the runner; or list the requests."""
+    if args.run_now_cmd == "list":
+        rows = store.list_requests(conn, None if args.all else "open")
+        if args.json:
+            return dump(rows)
+        for r in rows:
+            print(request_line(r))
+        if not rows:
+            print("(no open run-now requests)" if not args.all else "(no run-now requests)")
+        return 0
+    kind = RUN_NOW_KINDS[args.run_now_cmd]
+    target = None
+    if kind == "work_on_now":
+        target = project_ref(args.project)
+    elif kind == "continue_now":
+        target = resolve_session(conn, args.session.strip())
+    print(run_now_usage() + "; run-now skips the window and the budget (D-153)",
+          file=sys.stderr if args.json else sys.stdout)
+    r = act(conn, "request.add", kind=kind, target=target)
+    import runner
+    runner.wake()
+    if args.json:
+        return dump(r)
+    print(request_line(r) + ("  (queued; the runner starts it now)" if r["status"] == "open" else ""))
+    return 0
 
 
 def run_driven(conn, args):
@@ -850,6 +917,17 @@ def parser():
     q.add_argument("--all", action="store_true", help="the ended ones too")
     dvs.add_parser("check", parents=[js], help="rows vs. the projects' task-managers and the live tmux sessions "
                                                "(exit 1 on a mismatch)")
+    p = sub.add_parser("run-now", help="run now, outside the window and the budget (phase 3b S5, D-153): "
+                                      "work PROJECT | continue SESSION | review | list")
+    rns = p.add_subparsers(dest="run_now_cmd", required=True)
+    q = rns.add_parser("work", parents=[js], help="continue the project's task-manager now (created at its first "
+                                                  "start)")
+    q.add_argument("project", help="name, directory or id")
+    q = rns.add_parser("continue", parents=[js], help="continue one stalled session now (no decision needed)")
+    q.add_argument("session", help="session id or unique prefix")
+    rns.add_parser("review", parents=[js], help="a one-off usage review now, without its quota wait")
+    q = rns.add_parser("list", parents=[js], help="the open requests")
+    q.add_argument("--all", action="store_true", help="the recent ones too, with their outcome")
     p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
     ds = p.add_subparsers(dest="doc_cmd", required=True)
     q = ds.add_parser("list", parents=[js], help="the project's docs")

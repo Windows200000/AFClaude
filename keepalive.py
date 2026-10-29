@@ -64,7 +64,7 @@ or by hand) nothing starts or continues; the owner clears it: `python3 tasks.py 
 The task-manager's checks also hold while its own project is paused (D-244: an inbox error pauses
 only the project the message was for; `automation resume --project NAME` clears it): every check
 here asks failstop.paused(session=sid), the install-wide pause OR the pause of the project sid is
-the task-manager of. --work-on (a backlog project, no session) checks the install-wide one only.
+the task-manager of. (--work-on and --window-start --now are retired, 3b S5: `tasks.py run-now`.)
 
 Default is DRY-RUN (decides and logs "WOULD FIRE", never resumes anything).
 Pass --arm to actually fire. Create a file named STOP next to this script to
@@ -132,7 +132,6 @@ NEW_TRANSCRIPT_WAIT = timedelta(minutes=2)   # create_task_manager: the new sess
 TAKE_OVER_WAIT = 30                       # seconds for a SIGTERMed holder to exit before a take-over resume
 
 IGNORE_WINDOW = False  # --now: skip the window-start-hour gate (budget rule still applies)
-BACKLOG_FILE = os.path.join(HERE, "BACKLOG.md")
 TAKE_OVER_IDLE = False  # opt-in: SIGTERM an idle interactive holder (e.g. an open terminal)
 # Core AFClaude sessions run on Opus 5.5 with high effort (user rule, 2026-09-26); subagents they
 # spawn may use other models. A project can give its task-manager another model / effort (D-260,
@@ -2587,7 +2586,8 @@ def _first_start(pick, stall, reason, st, args, key, night):
         abort_start(pick.get("session") or "-", key, st, reason, "new", "task-manager creation failed",
                     f"{type(e).__name__}: {e}", stall=stall)
         return "failed"
-    st["fires"][night] = st["fires"].get(night, 0) + 1
+    if not stall.get("run_now"):     # a run-now (3b S5, D-153) is not one of the night's capped starts
+        st["fires"][night] = st["fires"].get(night, 0) + 1
     result = {"at": c["sent_at"].isoformat(), "plan": "new", "rc": c["rc"], "stdout": c["out"], "stderr": c["err"],
               "reason": reason, "session": c["session"], "usage": at_fire, "budget_pct": stall.get("headroom"),
               "prompt": "manager_first_start", "created": True, **_picked(stall),
@@ -2628,7 +2628,9 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     held, held_ids = inbox_held(sid)     # D-244: held "now" inbox messages go along, to be answered
     notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages go along
     # D-254/D-261: a night start (not a last-stretch slot or a fill-up) names the due nightly tasks
-    tasks, task_names = nightly_tasks_due(cwd) if stall.get("prompt", "continue") == "continue" else (None, [])
+    # (not a run-now, 3b S5: it is no night start)
+    tasks, task_names = (nightly_tasks_due(cwd) if stall.get("prompt", "continue") == "continue"
+                         and not stall.get("run_now") else (None, []))
     msg = build(with_notes(with_notes(with_notes(with_notes(stall.get("insert"), pace), held), notes), tasks))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
@@ -2645,7 +2647,8 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     rc, out, err = fire(sid, cwd, msg, plan)
     errors = []                      # failures after the continue went out: recorded, then raised;
                                      # (subject, detail[, session]): an inbox one pauses only sid's project (D-244)
-    st["fires"][night] = st["fires"].get(night, 0) + 1
+    if not stall.get("run_now"):     # a run-now (3b S5, D-153) is not one of the night's capped starts
+        st["fires"][night] = st["fires"].get(night, 0) + 1
     log(f"FIRED plan={plan} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     result = {"at": sent_at.isoformat(), "plan": plan, "rc": rc, "stdout": out, "stderr": err, "reason": reason,
               "session": sid, "usage": at_fire, "budget_pct": stall.get("headroom"),
@@ -4362,65 +4365,8 @@ def runner_pass(job, key=None):
         memo_save(doc, before)
 
 
-def load_backlog():
-    """BACKLOG.md numbered items: '1. **Title** - description' (+ indented continuation lines)."""
-    items, cur = [], None
-    with open(BACKLOG_FILE) as fh:
-        for line in fh:
-            m = re.match(r"^(\d+)\.\s+\*\*(.+?)\*\*\s*(?:[—-]+\s*)?(.*)$", line.rstrip("\n"))
-            if m:
-                cur = {"n": int(m.group(1)), "title": m.group(2), "desc": m.group(3).strip()}
-                items.append(cur)
-            elif cur and line.startswith("   ") and line.strip():
-                cur["desc"] += " " + line.strip()
-            else:
-                cur = None
-    return items
-
-
-def work_on_project(sel, args):
-    """Start a backlog project immediately in a NEW tmux session, ignoring the nightly
-    window. The budget rule still applies. `sel` = list number or title substring."""
-    items = load_backlog()
-    hits = [i for i in items if (sel.isdigit() and i["n"] == int(sel)) or (not sel.isdigit() and sel.lower() in i["title"].lower())]
-    if len(hits) != 1:
-        sys.exit(f"--work-on {sel!r}: {'no match' if not hits else 'ambiguous'}; backlog: "
-                 + "; ".join(f"{i['n']}={i['title']}" for i in items))
-    p = hits[0]
-    now = datetime.now(UTC)
-    if automation_paused(f"the backlog project {p['title']!r}"):
-        sys.exit(f"automation is paused ({paused_reason()}); clear it first: {resume_hint()}")
-    go, reason = budget_decision(fresh_usage(now, force=True), now)
-    log(f"work-on {p['title']!r} (window ignored): {reason}")
-    if not go:
-        progress_note(f"work-on {p['title']!r} not started: {reason}")
-        return
-    sid = str(uuid.uuid4())
-    slug = re.sub(r"[^a-z0-9]+", "-", p["title"].lower()).strip("-")
-    msg = session_message("project_start", title=p["title"], desc=p["desc"], slug=slug, hooked=rules_hooked(HERE))
-    if not args.arm:
-        log(f"WOULD START (dry-run): new session {sid} for {p['title']!r} cwd={HERE}")
-        return
-    claim_tmux(sid, "request", title=p["title"])      # its readable tmux name, stored first (3b S2)
-    sent_at = datetime.now(UTC)
-    rc, out, err = fire(sid, HERE, msg, "resume", new=True, name=p["title"])
-    log(f"STARTED project {p['title']!r} session={sid} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
-    st = load_state()
-    st.setdefault("projects", {})[sid] = {"title": p["title"], "at": sent_at.isoformat(), "rc": rc, "reason": reason}
-    save_state(st)
-    reply = None
-    if rc == 0:
-        deadline = time.time() + 120
-        while not transcript_path(sid) and time.time() < deadline:
-            time.sleep(5)
-        path = transcript_path(sid)
-        reply = verify_reply(path, sent_at) if path else None
-    log(f"work-on {p['title']!r}: {'VERIFIED new assistant message' if reply else 'VERIFY FAILED'}")
-    progress_note(f"started backlog project {p['title']!r} as session {sid[:8]} "
-                  f"({'verified' if reply else 'NOT verified'}; {reason})")
-    if not reply:
-        fail_stop(f"backlog project start failed: {'no reply' if rc == 0 else 'launcher failed'}",
-                  f"{p['title']!r} session {sid} rc={rc} stdout={out.strip()[:300]} stderr={err.strip()[:300]}")
+RETIRED_NOW = ("retired (phase 3b S5): run things now with `python3 tasks.py run-now work PROJECT` (continue a "
+               "project's task-manager now, D-153), `run-now continue SESSION` or `run-now review`")
 
 
 def main():
@@ -4441,10 +4387,9 @@ def main():
                     help="with --window-start: the session-window start the resident runner starts this for "
                          "(schedule.start_key); it must be the current one, else an error (phase 3a S5)")
     ap.add_argument("--now", action="store_true",
-                    help="with --window-start: ignore the start-hour gate (a manual start now); budget rule still applies")
+                    help="retired (3b S5): prints a pointer to `tasks.py run-now` and exits non-zero")
     ap.add_argument("--work-on", metavar="PROJECT",
-                    help="start a BACKLOG.md project right now in a new tmux session (list number or title substring); "
-                         "needs --arm to actually start")
+                    help="retired (3b S5): prints a pointer to `tasks.py run-now` and exits non-zero")
     ap.add_argument("--plan-fillup-test", action="store_true",
                     help="schedule ONE test fill-up run (D-212) for --session at session reset - remaining / rate "
                          "x fillup_factor; the running watcher fires it (needs --arm to schedule)")
@@ -4464,6 +4409,8 @@ def main():
     ap.add_argument("--rename-tmux", nargs=2, metavar=("OLD", "NEW"),
                     help="rename a live tmux session and its driven_sessions row (D-281: once, at a quiet moment)")
     args = ap.parse_args()
+    if args.work_on or args.now:      # D-036's flags, superseded by D-153's run-now (3b S5)
+        sys.exit(f"keepalive.py {'--work-on' if args.work_on else '--now'}: {RETIRED_NOW}")
     if args.session_rules:
         return print_session_rules(args.session_rules)
     if args.rename_tmux:
@@ -4487,8 +4434,6 @@ def main():
             sys.exit(f"run of {sid[:8]}: the stop could not be stored in the DB (kept in data/ALERTS.fallback.md)")
         print(f"run of {sid[:8]} marked stopped at {berlin(t)}")
         return
-    if args.work_on:
-        return work_on_project(args.work_on, args)
     if args.session and not args.decide:
         check_registry(args.session)
     if args.plan_fillup_test:

@@ -86,7 +86,7 @@ PROMPTS: dict[str, Prompt] = {
     "compact_after": Prompt(("resume",), used_by="keepalive message after a compaction"),
     "compact_after_run": Prompt(("budget", "pace", "reason", "resume", "started", "threshold"),
                                 used_by="keepalive message after a mid-run compaction (D-307): the run goes on"),
-    "project_start": Prompt(("desc", "slug", "title"), used_by="keepalive --work-on (a new project session)"),
+    "project_start": Prompt(("desc", "slug", "title"), used_by="unused since keepalive --work-on was retired (3b S5); S6 removes it"),
     "manager_first_start": Prompt(("desc", "path", "progress", "project"),
                                   used_by="keepalive.create_task_manager: a project's first start (3b S4, D-281)"),
     "run_project": Prompt(("project",), used_by="keepalive start / slot / fill-up: the project's name (D-301)"),

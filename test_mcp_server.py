@@ -38,7 +38,7 @@ CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
                   "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions",
-                  "afclaude_notice"}
+                  "afclaude_notice", "afclaude_request"}
 
 
 def run(coro):

@@ -522,6 +522,40 @@ def inbox_block():
         return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
 
 
+REQUESTS_SHOWN = 20          # requests_block: the recent requests listed (open ones always)
+REQUESTS_RECENT = timedelta(days=2)
+
+
+def requests_block():
+    """Phase 3b S5: the run-now requests (action_requests; run_now.py): every open one, and the
+    started / refused / failed ones of the last two days (newest first), each with its kind,
+    target (a project's name), who asked, when, and the outcome (tmux name or reason). A display
+    path: an error is shown, never raised."""
+    try:
+        conn = store.connect()
+        try:
+            rows = store.list_requests(conn, None, limit=REQUESTS_SHOWN)
+            names = {str(p["id"]): p["name"] for p in store.list_projects(conn)}
+        finally:
+            conn.close()
+        cut = datetime.now(UTC) - REQUESTS_RECENT
+        out = []
+        for r in rows:
+            at = store.parse_iso(r["ts"])
+            if r["status"] != "open" and (at is None or at < cut):
+                continue
+            res = json.loads(r["result"]) if r.get("result") else {}
+            target = r["target"]
+            if r["kind"] == "work_on_now" and target is not None:
+                target = names.get(str(target), f"project #{target}")
+            out.append({"id": r["id"], "kind": r["kind"], "target": target, "status": r["status"], "by": r["actor"],
+                        "at_berlin": bstr(at), "handled_berlin": bstr(store.parse_iso(r["handled_at"]))
+                        if r.get("handled_at") else None, "tmux": res.get("tmux"), "reason": res.get("reason")})
+        return {"requests": out}
+    except Exception as e:  # noqa: BLE001 - shown on the page, never breaks the export
+        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+
+
 def automation_block():
     """The automation pause (D-234/D-235) for the page's banner: a runner sets it on any failure;
     no run starts until the owner clears it. Strict read (a DB that can't be read = paused).
@@ -1055,6 +1089,8 @@ def runner_schedule(job):
         return "each at-job's minute", "each at-job's minute"
     if job.planned:
         return "when its pass plans it", "when its pass plans it"
+    if job.requests:
+        return "each run-now request, at once", "each run-now request, at once"
     return "each session-window start", "each session-window start"
 
 
@@ -1161,6 +1197,7 @@ def main():
         "latest_decision": latest_decision(),
         "needs_input": needs_input(),
         "inbox": inbox_block(),
+        "requests": requests_block(),
         "cron": cron_entries(),
         "docs": docs,
         "prompts": prompts,
