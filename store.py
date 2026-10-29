@@ -2648,6 +2648,12 @@ def add_run_log(conn: sqlite3.Connection, component: object, decision: object, r
     return _rowid(cur)
 
 
+def has_run_log(conn: sqlite3.Connection, component: str, decision: str, prefix: str) -> bool:
+    """A run_log row of `component` and `decision` whose reason starts with `prefix`."""
+    return conn.execute("SELECT 1 FROM run_log WHERE component=? AND decision=? AND substr(reason, 1, ?)=? LIMIT 1",
+                        (component, decision, len(prefix), prefix)).fetchone() is not None
+
+
 def run_log(conn: sqlite3.Connection, component: str | None = None, limit: int = 50) -> list[Row]:
     if component is None:
         rows = conn.execute(f"SELECT * FROM run_log ORDER BY id DESC LIMIT {int(limit)}")

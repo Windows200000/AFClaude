@@ -243,6 +243,17 @@ def finish_review(sid, status, now, **extra):
     return rec
 
 
+def log_decision(decision, line, sid=None):
+    """The run_log row of a review decision (S9b; component usage_review; there is no dry run here, so
+    always written). The decision is acted on already (the session launched, the job spooled), so a
+    failed write is not raised but alerted and paused (D-235), like keepalive's _pick_logged."""
+    try:
+        ka._run_log(decision, " ".join(line.split()), sid, component="usage_review", actor=ACTOR)
+    except Exception as e:  # noqa: BLE001 - reported below
+        fail_stop(f"a {decision} row of a usage review could not be written to run_log",
+                  f"{line[:200]}: {type(e).__name__}: {e}")
+
+
 def review_label(rec):
     """'monthly usage+stage-eta', 'one-off usage', 'one-off usage (D-228 chain)', ..."""
     label = f"{'one-off' if rec.get('one_off') else 'monthly'} {'+'.join(rec.get('reviews') or [])}"
@@ -293,6 +304,7 @@ def note_postponed(st, now, what, until, why, attempt):
                                            "why": why, "attempt": attempt})
     st["postponed"] = st["postponed"][-POSTPONED_KEPT:]
     ka.log(f"usage review: {what} review postponed to {ka.berlin(until)}: {why}")
+    log_decision("POSTPONE", f"{what} review postponed to {ka.berlin(until)} (attempt {attempt}): {why}")
     ka.progress_note(f"{what} review postponed to {ka.berlin(until)}, not enough quota now: {why}")
 
 
@@ -387,7 +399,9 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     ok = rc == 0 and out.strip().startswith("started")
     st.setdefault("one_off_runs", []).append(
         {"at": now.isoformat(), "only": which, "session": sid, "rc": rc, "out": out.strip(), "err": err.strip()[-300:]})
-    record_review(sid, (which,), now, ok, rc, True, **(record or {}))
+    rec = record_review(sid, (which,), now, ok, rc, True, **(record or {}))
+    log_decision("START", f"{review_label(rec)} review "
+                 + (f"started: session {sid[:8]}, tmux {tmux}" if ok else f"launch failed: session {sid[:8]}, rc={rc}"), sid)
     if ok:
         ka.log(f"one-off {which} review started: {sid}")
         ka.progress_note(f"one-off {which} review started: session {sid} (Opus medium, tmux {tmux})")

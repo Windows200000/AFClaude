@@ -1596,12 +1596,19 @@ def last_stretch_act(sid, now, st, args, p):
     key, slot, w = p["key"], p["slot"], {"resets_at": p["resets_at"]}
     if automation_paused(f"the last-stretch slot {key}", sid):
         return now + LAST_MILE_RECHECK
+    arm = getattr(args, "arm", False)
+    head = f"last-stretch slot {key}: "
     action, detail, stall = stall_status(sid, now)
     if action == "WAIT_RESET":
         log(f"last-mile: slot start waits for the limit reset, {detail}")
+        decided(arm, "HOLD", f"{head}waits for the limit reset, {detail}", sid, head + "waits for the limit reset")
         return stall["reset"] + RESET_GRACE
     d = budget_eval(fresh_usage(now, force=True), now)
     log(f"last-mile: {d['reason']}")
+    # one row per slot and decision: the slot is re-decided at each recheck until it has started
+    dec = "GO" if d["go"] else "POSTPONE" if d.get("postpone") else "HOLD"
+    if not decided(arm, dec, head + d["reason"], sid, head):
+        return now + LAST_MILE_RECHECK     # fail_stop paused automation: the next pass is held
     if not d["go"]:
         return max(d.get("recheck_at") or now + LAST_MILE_RECHECK, now + timedelta(seconds=POLL_SECONDS)) \
             if d.get("postpone") else now + LAST_MILE_RECHECK
@@ -1632,8 +1639,11 @@ def window_start_pass(sid, now, args):
     is an error (fresh_usage: alert + pause). A start whose run begins later (planned late,
     postponed) or not at all (held) then pings Claude once so its session window opens on the
     schedule (D-277, window_ping_after). -> the decision dict."""
+    arm = getattr(args, "arm", False)
+    key = f"manual-now-{now.isoformat()}" if args.now else schedule.start_key(now)
     if automation_paused(f"the session-window start {berlin(now)}", sid):
         d = {"go": False, "reason": f"PAUSED: automation is paused ({paused_reason(sid)})", "postpone": False}
+        decided(arm, "HOLD", f"window start {key}: {d['reason']}", sid)
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}; clear it with "
                       f"`{resume_hint(sid)}` once the error is fixed (D-234/D-235)")
         return d
@@ -1641,14 +1651,14 @@ def window_start_pass(sid, now, args):
     if u is None:      # fresh_usage raised the error (alert + pause): no decision on unknown numbers
         d = {"go": False, "reason": "HOLD: usage reading failed (automation paused, D-234/D-235)",
              "postpone": False}
+        decided(arm, "HOLD", f"window start {key}: {d['reason']}", sid)
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
         return d
     d = budget_eval(u, now)
     log(f"window-start: {d['reason']}")
-    key = f"manual-now-{now.isoformat()}" if args.now else schedule.start_key(now)
     deadline = schedule.postpone_deadline(now)
     defer = bool(d.get("postpone") and d.get("recheck_at") and not args.now and d["recheck_at"] < deadline)
-    if not args.now and getattr(args, "arm", False):
+    if not args.now and arm:
         try:                                  # score the forecast later (pacing.forecast_errors)
             import pacing
             pacing.record_forecast(d, ((u or {}).get("weekly") or {}).get("resets_at"))
@@ -1656,6 +1666,8 @@ def window_start_pass(sid, now, args):
             fail_stop("forecast log failed at a session-window start", f"{type(e).__name__}: {e}")
             progress_note(f"window-start {berlin(now)}: not resumed, the forecast log failed (automation paused)")
             return dict(d, go=False, reason=f"HOLD: forecast log failed ({type(e).__name__})")
+    if not decided(arm, *_gate_row(d, defer, args.now, "window start", key, sid)):
+        return dict(d, go=False, reason="HOLD: the run_log write failed (automation paused)")
     if d["go"]:
         try:     # D-274: the gate decided WHETHER; the timing decides WHEN (late in the window)
             timing = None if args.now else run_timing(sid, now, u, d)
@@ -1663,6 +1675,8 @@ def window_start_pass(sid, now, args):
             fail_stop("run timing failed at a session-window start", f"{type(e).__name__}: {e}")
             progress_note(f"window-start {berlin(now)}: not resumed, the run timing failed (automation paused)")
             return dict(d, go=False, reason=f"HOLD: run timing failed ({type(e).__name__})")
+        if not decided(arm, *_timing_row(timing, now, key, sid)):
+            return dict(d, go=False, reason="HOLD: the run_log write failed (automation paused)")
         if timing and timing["start"] > now + TIMING_SLACK:
             defer_window_start(key, sid, timing["start"], d["reason"], timing["end"], planned=True)
             progress_note(f"window-start {berlin(now)}: the gate passed, the run starts at {berlin(timing['start'])} "
@@ -1806,6 +1820,30 @@ def running_session(now, st=None):
     None. A start then is chained onto that run and keeps its project (D-274, D-281)."""
     st = st if st is not None else load_state()
     return next((t["session"] for t in registry_sessions() if run_active(t["session"], now, st) is not None), None)
+
+
+def _gate_row(d, defer, now_flag, what, key, sid):
+    """The run_log row of the budget gate's decision `d` (budget_eval) at the start `key` (S9b):
+    (decision, line, session, once). GO / HOLD, or POSTPONE: the start is re-decided later
+    (`defer`) or skipped to the next start. Only GO repeats on a retry (a db / owner wait), so only
+    it is written once."""
+    head = f"{what} {key}: "
+    if d["go"]:
+        return "GO", head + d["reason"], sid, head
+    if defer:
+        return "POSTPONE", f"{head}postponed to {berlin(d['recheck_at'])}, {d['reason']}", sid, None
+    if d.get("postpone") and d.get("recheck_at") and not now_flag:
+        return "POSTPONE", f"{head}postponed past the night's next start, skipped to it, {d['reason']}", sid, None
+    return "HOLD", head + d["reason"], sid, None
+
+
+def _timing_row(timing, now, key, sid):
+    """The run_log row of the D-274 timing of a start whose gate passed (S9b): DEFER (the run starts
+    later; each re-plan is a new decision) or FIRE (now; once per start, a retry repeats it)."""
+    head = f"window start {key}: "
+    if timing and timing["start"] > now + TIMING_SLACK:
+        return "DEFER", f"{head}the run starts at {berlin(timing['start'])} (D-274: {timing['reason']})", sid, None
+    return "FIRE", head + (_timing_why(timing) or "no timing plan, ") + "starts now", sid, head
 
 
 def _timing_why(timing):
@@ -2085,9 +2123,12 @@ def deferred_plan(sid, now, st):
 def deferred_act(sid, now, st, args, key, ent, defs):
     """The act step of the postponed / planned start `key` (its entry `ent` of `defs`, due): decide
     again, then fire, postpone again or drop it. -> the next recheck time or None."""
+    arm = getattr(args, "arm", False)
     paused = automation_paused(f"the postponed session-window start {key}", sid)
     u = None if paused else fresh_usage(now, force=True)
     if u is None:   # paused, or the usage reading failed (fresh_usage: alert + pause): dropped
+        decided(arm, "HOLD", f"window start {key}: the postponed start is dropped, "
+                + ("automation is paused" if paused else "the usage reading failed"), sid)
         defs.pop(key, None)
         save_deferred(defs)
         progress_note(f"window-start (postponed) {berlin(now)}: not resumed, "
@@ -2100,6 +2141,10 @@ def deferred_act(sid, now, st, args, key, ent, defs):
     # planned late in its session window (D-274) that window's end
     deadline = parse_ts(ent.get("deadline")) or schedule.postpone_deadline(now)
     again = bool(d.get("postpone") and d.get("recheck_at") and d["recheck_at"] < deadline)
+    if not decided(arm, *_gate_row(d, again, False, "window start", key, sid)):
+        defs.pop(key, None)
+        save_deferred(defs)
+        return None
     if d["go"]:
         try:     # D-274: still WHEN, on the numbers of now (the owner may have used the session)
             timing = run_timing(sid, now, u, d)
@@ -2109,6 +2154,10 @@ def deferred_act(sid, now, st, args, key, ent, defs):
             fail_stop("run timing failed at a postponed session-window start", f"{type(e).__name__}: {e}")
             progress_note(f"window-start (postponed) {berlin(now)}: not resumed, the run timing failed "
                           "(automation paused)")
+            return None
+        if not decided(arm, *_timing_row(timing, now, key, sid)):
+            defs.pop(key, None)
+            save_deferred(defs)
             return None
         if timing and timing["start"] > now + TIMING_SLACK:
             ent.update(recheck_at=timing["start"].astimezone(UTC).isoformat(), reason=d["reason"], planned=True,
@@ -2294,7 +2343,10 @@ def handle_fire(sid, stall, reason, st, args):
         if r != OWNER_BUSY and args.arm:   # decided (fired, skipped, failed): one run_log row per start
             _pick_logged(key, pick)
         return r
-    return _start_session(sid, None, stall, reason, st, args, key, night)
+    r = _start_session(sid, None, stall, reason, st, args, key, night)
+    if r != OWNER_BUSY and args.arm and stall.get("prompt") == "fillup":   # no pick: the fill-up's own row
+        _fillup_logged(key, sid, reason, st)
+    return r
 
 
 def _start_session(sid, pre, stall, reason, st, args, key, night):
@@ -2393,14 +2445,31 @@ def _picked(stall):
     return {"project": p["name"], "why": p["why"]} if p else {}
 
 
-def _run_log(decision, reason, sid=None):
+def _run_log(decision, reason, sid=None, once=None, component="keepalive", actor="keepalive"):
     import actions
     import store
     conn = store.connect()
     try:
-        actions.run_log_add(conn, "keepalive", decision, reason, session_id=sid, actor="keepalive", via="runner")
+        actions.run_log_add(conn, component, decision, reason, session_id=sid, actor=actor, via="runner",
+                            once=once)
     finally:
         conn.close()
+
+
+def decided(arm, decision, reason, sid=None, once=None):
+    """The run_log row of a decision (S9b; armed only: a dry run writes none), written before the
+    decision is acted on. `once`: the identity prefix of a decision a retry repeats (GO, FIRE,
+    last-stretch rows). -> True, or False after fail_stop (D-234/D-235: a row that cannot be written
+    is an error, never skipped): the caller aborts what it was about to do."""
+    if not arm:
+        return True
+    try:
+        _run_log(decision, " ".join(reason.split()), sid, once)
+    except Exception as e:   # noqa: BLE001 - reported below
+        fail_stop(f"the {decision} row of a start decision could not be written to run_log",
+                  f"{reason[:200]}: {type(e).__name__}: {e}")
+        return False
+    return True
 
 
 def pick_start(stall, key, now, st, arm):
@@ -2466,6 +2535,17 @@ def _pick_logged(key, pick):
         _run_log("PICK", pick["line"], pick["session"])
     except Exception as e:   # noqa: BLE001 - reported below
         fail_stop(f"start {key}: its PICK row could not be written to run_log", f"{type(e).__name__}: {e}")
+
+
+def _fillup_logged(key, sid, reason, st):
+    """The fill-up start's run_log row (FILLUP), once handle_fire has decided it (fired, skipped,
+    failed: the outcome is the handled record's result). Not raised, like _pick_logged: alerted and
+    paused (D-235)."""
+    line = " ".join(f"start {key}: {reason}: {(st['handled'].get(key) or {}).get('result', 'not handled')}".split())
+    try:
+        _run_log("FILLUP", line, sid)
+    except Exception as e:   # noqa: BLE001 - reported below
+        fail_stop(f"start {key}: its FILLUP row could not be written to run_log", f"{type(e).__name__}: {e}")
 
 
 def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
