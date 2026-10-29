@@ -589,7 +589,7 @@ class SettingActions(Base):
                           "auth_remember_device_days": 7, "auth_reauth_window_min": 10,
                           "auth_max_sessions_per_user": 10,
                           "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15},
-                          "claude_plan": "pro"})
+                          "claude_plan": "unset"})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that

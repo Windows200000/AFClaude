@@ -157,10 +157,17 @@ class MintAndClaim(DbCase):
 
 
 class ClaudePlanSetting(DbCase):
-    def test_default_and_choices(self):
+    def test_default_is_unset_not_a_guessed_plan(self):
+        """D-229: AFClaude asks for the plan at first startup, so the code default must not look
+        like an answered choice -- "unset" is in CLAUDE_PLANS only so the default passes its own
+        check (test_actions.SettingActions.test_registry_metadata), never a real plan."""
         s = actions.settings(self.conn)
-        self.assertEqual(s["claude_plan"]["value"], "pro")
+        self.assertEqual(s["claude_plan"]["value"], "unset")
+        self.assertEqual(actions.CLAUDE_PLAN_UNSET, "unset")
         self.assertEqual(s["claude_plan"]["section"], "host")
+        self.assertIn("team", s["claude_plan"]["choices"])
+
+    def test_choices(self):
         with self.assertRaises(ValueError):
             self.act("setting.set", {"key": "claude_plan", "value": "bogus"})
         self.act("setting.set", {"key": "claude_plan", "value": "team"})

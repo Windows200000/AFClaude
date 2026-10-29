@@ -732,7 +732,12 @@ def _remote_control(category: str) -> Setting:
 USAGE_MODELS = ("pacing", "linear")
 # D-229's plan names: interpretation, since Anthropic's own naming (and the owner's exact seat type,
 # standard vs premium) is not settled by the decision; 5d's X3 is free to widen this list.
-CLAUDE_PLANS = ("free", "pro", "max_5x", "max_20x", "team", "enterprise")
+# CLAUDE_PLAN_UNSET is not a plan: it is claude_plan's code default (D-146/D-169), so the wizard has
+# something to ask about instead of a guessed real one (D-229: AFClaude asks at first startup). A
+# step that sets the owner's plan must require one of the other choices; nothing reads this setting
+# today, but anything that does must treat CLAUDE_PLAN_UNSET as "not answered yet", never as a plan.
+CLAUDE_PLAN_UNSET = "unset"
+CLAUDE_PLANS = (CLAUDE_PLAN_UNSET, "free", "pro", "max_5x", "max_20x", "team", "enterprise")
 
 # Everything the dashboard can change (D-146): the runners read these (afclaude_config.setting()),
 # DB value > code default; data/afclaude.json keeps only machine identity. Names are flat (§7.4).
@@ -894,11 +899,12 @@ SETTINGS: dict[str, Setting] = {
                                section="auth", kind="login_rate"),
     # --- host (phase 6a W7 / 5d; design §10.4, D-229). 5d's X3 (not built) adds working_root and the
     # rest of this section's settings; it reuses this key rather than redefining it.
-    "claude_plan": Setting("pro", _choice(CLAUDE_PLANS),
-                           "The owner's Claude subscription plan, asked once at first startup (D-229) so "
-                           "AFClaude can adjust plan-dependent numbers (weekly limit, session length, "
-                           "available models); changing it later does not retune those on its own, a "
-                           "measured value always wins where one exists",
+    "claude_plan": Setting(CLAUDE_PLAN_UNSET, _choice(CLAUDE_PLANS),
+                           "The owner's Claude subscription plan, asked once at first startup (D-229); "
+                           "\"unset\" until the wizard's step is done (it must get a real choice, never "
+                           "leave this as \"unset\") so AFClaude can adjust plan-dependent numbers (weekly "
+                           "limit, session length, available models); changing it later does not retune "
+                           "those on its own, a measured value always wins where one exists",
                            section="host", kind="enum", choices=CLAUDE_PLANS),
 }
 RUNNER_TIMEOUT = "runner_timeout_"
