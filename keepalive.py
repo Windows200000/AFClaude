@@ -2,8 +2,10 @@
 """
 Keep-alive for the AFClaude task-manager session (no dashboard).
 
-Runs begin only at STARTS (D-205): each session-window start of the night window (cron
---window-start every 30 min, acting only when a start is due: 23:00 and 04:00 for the default
+Runs begin only at STARTS (D-205): each session-window start of the night window (--window-start:
+the resident runner's window_start job at the start itself with --start-key, phase 3a S5; cron
+every 30 min in the legacy mode, acting only when a start is due; each start is decided once, the
+keepalive state's "window_starts": 23:00 and 04:00 for the default
 23:00 x 2, generally start + k x session_hours per weekday, schedule.py, D-202/D-203; a start postponed for
 an active user is re-decided by the watcher before the next start, D-018) and each last-stretch
 slot start (D-020). A session-window start that passes the budget rule fires late in its session
@@ -1652,6 +1654,61 @@ def window_start_pass(sid, now, args):
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
         window_ping_after(sid, now, key, u, "the gate held", args)
     return d
+
+
+# ---------------------------------------------------------------- --window-start: who starts it, once per start
+# Phase 3a S5 (docs/phase3a_plan.md): the resident runner's window_start job starts --window-start
+# at the session-window start itself (`--start-key`: the start it planned, which must still be the
+# current one; the runner keeps the timing and the 30-min catch-up, runner_start_catchup). In the
+# legacy mode (AFCLAUDE_SCHEDULER=legacy) cron starts it every 30 min and it acts only when a start
+# is due (schedule.due_session_start). Either way a start is decided once: the first caller claims
+# its key in the keepalive state's "window_starts" before window_start_pass, and a later caller
+# for the same start (cron after the runner across a switch to legacy) only logs it. The runner
+# reads the same claims (runner._settled), so a start cron decided is no "missed start" for it.
+
+WINDOW_STARTS_KEPT = 60                  # st["window_starts"]: about a month of nights
+
+
+def claim_window_start(key, now, by):
+    """Claim the session-window start `key` for this caller (`by`: "runner" or "cron"). -> None
+    (claimed: decide it now) or the earlier claim's record (decided already)."""
+    disk = load_state()
+    starts = disk.setdefault("window_starts", {})
+    prev = starts.get(key)
+    if prev is not None:
+        return prev if isinstance(prev, dict) else {"at": str(prev)}
+    starts[key] = {"at": now.astimezone(UTC).isoformat(), "by": by}
+    for k in sorted(starts, key=lambda k: str((starts[k] or {}).get("at")))[:-WINDOW_STARTS_KEPT]:
+        starts.pop(k, None)
+    if not save_state(disk):
+        log(f"window-start {key}: its claim was not stored in the DB (kept in data/ALERTS.fallback.md)")
+    return None
+
+
+def window_start_cli(sid, now, args):
+    """`keepalive.py --window-start` (module doc; "--window-start" section above). With --start-key
+    (the runner): the latest session-window start must be that start, else SystemExit (an error the
+    runner reports: alert + pause, D-234/D-257). Without it (cron, legacy mode): nothing unless a
+    start is due in this cron slot. --now: a manual start, no claim. -> window_start_pass's
+    decision, or None (nothing due, or decided already)."""
+    if args.now:
+        return window_start_pass(sid, now, args)
+    want = getattr(args, "start_key", None)
+    if want:
+        s = schedule.latest_session_start(now)
+        key = schedule.start_key(s) if s is not None else None
+        if key != want:
+            raise SystemExit(f"--window-start --start-key {want}: at {berlin(now)} the current session-window start "
+                             f"is {key or 'none (outside a window)'}; not started (D-257)")
+    else:
+        if schedule.due_session_start(now) is None:
+            return None                  # no session-window start due in this cron slot
+        key = schedule.start_key(now)
+    prev = claim_window_start(key, now, "runner" if want else "cron")
+    if prev is not None:
+        log(f"window-start {key}: decided already at {prev.get('at')} (by the {prev.get('by', '?')}); not again")
+        return None
+    return window_start_pass(sid, now, args)
 
 
 # ---------------------------------------------------------------- run timing (D-274, D-275)
@@ -3529,8 +3586,12 @@ def main():
     ap.add_argument("--last-mile", action="store_true",
                     help="one-shot: continue the session if the last-mile period before the weekly reset is open")
     ap.add_argument("--window-start", action="store_true",
-                    help="one-shot (cron, every 30 min): at a due session-window start (23:00, 04:00 by default; D-202), "
+                    help="one-shot (the runner at each session-window start with --start-key; cron every 30 min in "
+                         "the legacy mode): at a due session-window start (23:00, 04:00 by default; D-202), "
                          "continue the session if the budget rule allows")
+    ap.add_argument("--start-key", metavar="KEY",
+                    help="with --window-start: the session-window start the resident runner starts this for "
+                         "(schedule.start_key); it must be the current one, else an error (phase 3a S5)")
     ap.add_argument("--now", action="store_true",
                     help="with --window-start: ignore the start-hour gate (a manual start now); budget rule still applies")
     ap.add_argument("--work-on", metavar="PROJECT",
@@ -3593,10 +3654,7 @@ def main():
         sys.exit("--window-start needs --session")
     if args.window_start:
         # Session-window-start continue (no stall needed, D-202): budget rule + window, then fire.
-        now = datetime.now(UTC)
-        if not args.now and schedule.due_session_start(now) is None:
-            return                       # no session-window start due in this cron slot
-        window_start_pass(args.session, now, args)
+        window_start_cli(args.session, datetime.now(UTC), args)
         return
     if args.decide:
         now = datetime.now(UTC)

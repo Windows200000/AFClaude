@@ -421,7 +421,7 @@ class Runs(Base):
         r.boot()
         due, = r.plan(self.now)
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 4200.0)])
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 4800.0)])
         self.now += 5 * MIN
         self.assertEqual(r.plan(self.now), [])
         self.assertEqual(self.next_due("window_start"), START + 5 * 60 * MIN)
@@ -1009,8 +1009,9 @@ class SimpleTicks(Base):
     the runner; the legacy crontab keeps them; a timed-out tick is its run's failure, not D-257."""
 
     def test_s3_owns_the_simple_ticks(self):
-        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at"} | set(S3_TICKS)))   # + S4
-        self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, {"window_start"})   # S5
+        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start"}
+                                                       | set(S3_TICKS)))          # + S4, S5
+        self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):
         cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
@@ -1018,8 +1019,8 @@ class SimpleTicks(Base):
             tag = runner.JOBS[name].cron_tag
             self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
             self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS))        # + the runner watchdog, - the at-shim (S4)
-        self.assertTrue(any(runner.JOBS["window_start"].cron_tag in ln for ln in cron))
+        # + the runner watchdog, - the at-shim (S4), - the window start (S5)
+        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 1)
 
     def test_each_tick_runs_what_its_cron_line_ran(self):
         """Registration: the handler has the legacy line's script, arguments, log file and flock."""
@@ -1443,6 +1444,237 @@ class AtChild(unittest.TestCase):
     async def _start_due(self, r, due):
         self.assertIsNotNone(r.start(due, datetime.now(UTC)))
         return r.tasks[runner.JOBS["at"].slot(due.key)]
+
+
+# ---------------------------------------------------------------- S5: the session-window starts
+
+def _ws_run(conn, key, started, status="ok", error=None):
+    """A finished window_start run row started at `started` (the report reads started_at)."""
+    run_id = store.insert_run(conn, OTHER_BOOT, "window_start", key, "running", 4800, "runner:window_start", "runner")
+    conn.execute("UPDATE runner_runs SET started_at=? WHERE id=?", (store.iso(started), run_id))
+    conn.commit()
+    if status == "skipped":
+        conn.execute("UPDATE runner_runs SET status='skipped', finished_at=started_at, error=? WHERE id=?",
+                     (error, run_id))
+        conn.commit()
+    else:
+        actions.run_end(conn, run_id, status, actor="runner:window_start", via="runner", error=error)
+    return store.get_run(conn, run_id)
+
+
+class WindowStarts(Base):
+    """S5: the runner starts each session-window start at its second, keyed by schedule.start_key,
+    with the 30-min catch-up; cron's */30 line is gone (legacy keeps it); one claim per start shared
+    with that legacy line (keepalive "window_starts"); the DST nights; window-report."""
+
+    def test_s5_crontab_per_mode_and_the_handler_is_the_legacy_line_plus_its_key(self):
+        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
+        tag = runner.JOBS["window_start"].cron_tag
+        self.assertEqual([ln for ln in cron if tag in ln], [])
+        line, = [ln for ln in legacy if tag in ln]
+        self.assertTrue(line.startswith("*/30 * * * * "), line)
+        h = runner_jobs.HANDLERS["window_start"]
+        cmd = line.split(" && ", 1)[1].split(" >> ")[0].split()
+        self.assertEqual(cmd[1], h.script)
+        legacy_args = [a.replace("$AFCLAUDE_MANAGER_SESSION", "{session}") for a in cmd[2:]]
+        self.assertEqual([a for a in h.args if a not in ("--start-key", "{key}")], legacy_args)
+        self.assertEqual(h.args[h.args.index("--start-key") + 1], "{key}")
+        self.assertIn("$KEEPALIVE_STATE_DIR/keepalive.log", line)
+        self.assertEqual(h.log, "keepalive/keepalive.log")
+
+    def test_the_child_gets_the_runs_key(self):
+        h = runner_jobs.HANDLERS["window_start"]
+        with mock.patch.dict(os.environ, {"AFCLAUDE_MANAGER_SESSION": "sid"}):
+            argv = runner_jobs._argv(h, "window-start-2026-10-20-s2")
+            self.assertEqual(argv[1:], ["--session", "sid", "--window-start", "--start-key",
+                                        "window-start-2026-10-20-s2", "--arm", "--take-over-idle"])
+            with self.assertRaises(RuntimeError):
+                runner_jobs._argv(h, None)
+
+    async def test_it_wakes_at_the_start_and_starts_it_at_its_second(self):
+        self.prev_boot(START - 10 * MIN)
+        self.now = START - 90 * SEC
+        r = self.runner(owns={"window_start"})
+        r.boot()
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.next_due("window_start"), START)
+        self.assertEqual(r.sleep_for(self.now), 60.0)                      # MAX_SLEEP first ...
+        self.now = START - 7 * SEC
+        self.assertEqual(r.sleep_for(self.now), 7.0)                       # ... then to the start
+        self.now = START
+        due, = r.plan(self.now)
+        self.assertEqual((due.key, due.at), ("window-start-2026-10-20", START))
+        await self.run_due(r, due)
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 4800.0)])
+        self.assertEqual(self.fails, [])
+
+    async def test_dst_nights_give_the_next_start(self):
+        """Fall back (25.10.2026) and spring forward (29.03.2026): a window is n whole sessions
+        (D-148), so the second start is 03:00 CET / 05:00 CEST on the wall clock."""
+        for first, second, nxt in (
+                (datetime(2026, 10, 24, 21, 0, tzinfo=UTC), datetime(2026, 10, 25, 2, 0, tzinfo=UTC),    # 23:00 CEST, 03:00 CET
+                 datetime(2026, 10, 25, 22, 0, tzinfo=UTC)),                                             # 23:00 CET
+                (datetime(2026, 3, 28, 22, 0, tzinfo=UTC), datetime(2026, 3, 29, 3, 0, tzinfo=UTC),      # 23:00 CET, 05:00 CEST
+                 datetime(2026, 3, 29, 21, 0, tzinfo=UTC))):                                             # 23:00 CEST
+            with self.subTest(first=first):
+                self.setUp()
+                self.prev_boot(first - 10 * MIN)
+                self.now = first - MIN
+                r = self.runner(owns={"window_start"})
+                r.boot()
+                r.plan(self.now)
+                self.assertEqual(self.next_due("window_start"), first)
+                got = []
+                for t in (first, first + 10 * MIN, second - SEC, second, second + 31 * MIN, nxt - MIN, nxt):
+                    self.now = t
+                    for due in r.plan(self.now):
+                        got.append((t, due.key))
+                        await self.run_due(r, due)
+                    if t == first:
+                        self.assertEqual(self.next_due("window_start"), second)
+                key1, key2 = schedule.start_key(first, CFG), schedule.start_key(second, CFG)
+                self.assertEqual(got, [(first, key1), (second, key2), (nxt, schedule.start_key(nxt, CFG))])
+                self.assertTrue(key2.endswith("-s2") and key2.startswith(key1))
+                self.assertEqual(self.fails, [])
+
+    def test_a_start_cron_decided_in_legacy_mode_is_neither_run_nor_missed(self):
+        """A rollback to legacy and back: the starts cron's */30 line decided meanwhile (its claim in
+        the keep-alive's "window_starts", whatever the outcome) are settled, not missed starts; a
+        start nobody decided is a missed start (alert + pause, D-257)."""
+        claims = {"window-start-2026-10-20": {"at": "2026-10-19T21:00:03+00:00", "by": "cron"}}
+        actions.state_save(self.conn, "keepalive", {"window_starts": claims}, mode="file",
+                           actor="runner:keepalive", via="runner")
+        self.prev_boot(START - 60 * MIN)                                  # the runner stopped before the night
+        self.now = START + 5 * 60 * MIN + 10 * MIN                        # back at 02:10Z: s2 is 10 min old
+        r = self.runner(owns={"window_start"})
+        r.boot()
+        self.assertEqual([d.key for d in r.plan(self.now)], ["window-start-2026-10-20-s2"])
+        self.assertEqual(self.fails, [])
+        self.setUp()
+        actions.state_save(self.conn, "keepalive", {"window_starts": {}}, mode="file", actor="runner:keepalive",
+                           via="runner")
+        self.prev_boot(START - 60 * MIN)
+        self.now = START + 5 * 60 * MIN + 10 * MIN
+        r = self.runner(owns={"window_start"})
+        r.boot()
+        self.assertEqual([d.key for d in r.plan(self.now)], ["window-start-2026-10-20-s2"])
+        self.assertEqual(self.subjects(), ["missed session-window start"])
+
+    def test_the_catch_up_is_at_most_30_min(self):
+        self.assertEqual(actions.SETTINGS["runner_start_catchup"].bounds[1], 30)
+        self.assertEqual(actions.SETTINGS["runner_start_catchup"].default(), 30)
+
+    def report(self, runs, decisions, until=START + 6 * 60 * MIN):
+        starts = [(t, schedule.start_key(t, CFG)) for t, _ in schedule.session_slots(START - TINY, until, CFG)]
+        return runner.window_report(starts, runs, runner.parse_decisions(decisions), since=START - 60 * MIN,
+                                    until=until)
+
+    def test_window_report_ok(self):
+        runs = [_ws_run(self.conn, "window-start-2026-10-20", START + timedelta(milliseconds=40)),
+                _ws_run(self.conn, "window-start-2026-10-20-s2", START + 5 * 60 * MIN + timedelta(milliseconds=900))]
+        dec = ["[2026-10-19 23:00:04 CEST] window-start: HOLD: no run",
+               "[2026-10-20 04:00:06 CEST] window-start: POSTPONE: user active",
+               "[2026-10-20 05:10:00 CEST] window-start (postponed): FIRE: x"]          # the watcher's: not a start
+        lines, bad = self.report(runs, dec)
+        self.assertEqual(bad, 0, "\n".join(lines))
+        self.assertIn("decision HOLD", "\n".join(lines))
+        self.assertIn("decision POSTPONE", "\n".join(lines))
+
+    def test_window_report_mismatches(self):
+        runs = [_ws_run(self.conn, "window-start-2026-10-20", START + 3 * SEC),                 # 3 s late
+                _ws_run(self.conn, "window-start-2026-10-20-s2", START + 5 * 60 * MIN, status="skipped",
+                        error="missed start")]
+        dec = ["[2026-10-20 01:00:00 CEST] window-start: FIRE: x"]                              # at no start
+        lines, bad = self.report(runs, dec)
+        text = "\n".join(lines)
+        self.assertIn("started +3.000 s", text)
+        self.assertIn("logged no window-start decision", text)
+        self.assertIn("not started (missed start)", text)
+        self.assertIn("decided FIRE at 2026-10-19T23:00:00Z, at no session-window start", text)
+        self.assertEqual(bad, 4, text)
+        lines, bad = self.report([], [])
+        self.assertEqual(bad, 2)                                                               # no run for either
+
+
+class WindowStartClaim(unittest.TestCase):
+    """keepalive.py --window-start (window_start_cli): the runner's --start-key must be the current
+    start; each start is decided once, by whichever of the runner and cron's legacy line comes
+    first (the keepalive state's "window_starts"); window_start_pass itself is unchanged."""
+
+    def setUp(self):
+        import keepalive as ka
+        import runner_state
+        self.ka = ka
+        old = {n: getattr(ka, n) for n in ("STATE_FILE", "window_start_pass")}
+        self.addCleanup(lambda: [setattr(ka, n, v) for n, v in old.items()])
+        ka.STATE_FILE = runner_state.live_path("keepalive")
+        st = ka.load_state()
+        st["window_starts"] = {}
+        ka.save_state(st)
+        self.passes = []
+        ka.window_start_pass = lambda sid, now, args: self.passes.append((now, args.now)) or {"go": False}
+        self.cfg = mock.patch.object(schedule, "load", lambda: CFG)
+        self.cfg.start()
+        self.addCleanup(self.cfg.stop)
+
+    def call(self, now, start_key=None, manual=False):
+        args = mock.Mock(now=manual, start_key=start_key, arm=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            res = self.ka.window_start_cli("sid", now, args)
+        return res, out.getvalue()
+
+    def claims(self):
+        return self.ka.load_state().get("window_starts") or {}
+
+    def test_the_runner_first_then_cron_in_the_same_slot(self):
+        res, _ = self.call(START + SEC, start_key="window-start-2026-10-20")
+        self.assertEqual(res, {"go": False})
+        self.assertEqual(self.claims()["window-start-2026-10-20"]["by"], "runner")
+        res, out = self.call(START + 2 * SEC)                                   # cron's */30 at 23:00 (legacy)
+        self.assertIsNone(res)
+        self.assertIn("decided already", out)
+        self.assertEqual(len(self.passes), 1)
+
+    def test_cron_first_then_the_runner(self):
+        self.call(START + SEC)
+        self.assertEqual(self.claims()["window-start-2026-10-20"]["by"], "cron")
+        res, out = self.call(START + 5 * SEC, start_key="window-start-2026-10-20")
+        self.assertIsNone(res)
+        self.assertIn("by the cron", out)
+        self.assertEqual(len(self.passes), 1)
+
+    def test_a_key_that_is_not_the_current_start_is_an_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.call(START + 5 * 60 * MIN + SEC, start_key="window-start-2026-10-20")   # it is s2 now
+        self.assertIn("window-start-2026-10-20-s2", str(cm.exception.code))
+        with self.assertRaises(SystemExit) as cm:
+            self.call(START - 60 * MIN, start_key="window-start-2026-10-20")              # outside a window
+        self.assertIn("outside a window", str(cm.exception.code))
+        self.assertEqual((self.passes, self.claims()), ([], {}))
+
+    def test_the_runners_catch_up_is_not_cut_by_the_cron_step(self):
+        res, _ = self.call(START + 29 * MIN + 59 * SEC, start_key="window-start-2026-10-20")
+        self.assertIsNotNone(res)                                       # the runner decided it was due
+        self.assertEqual(len(self.passes), 1)
+
+    def test_cron_acts_only_in_its_slot_and_now_never_claims(self):
+        self.assertEqual(self.call(START + 30 * MIN)[0], None)          # cron's 23:30: no start due
+        self.assertEqual((self.passes, self.claims()), ([], {}))
+        self.call(START + 30 * MIN, manual=True)
+        self.call(START + 31 * MIN, manual=True)
+        self.assertEqual(len(self.passes), 2)
+        self.assertEqual(self.claims(), {})
+
+    def test_the_claims_are_kept_a_month(self):
+        st = self.ka.load_state()
+        st["window_starts"] = {f"k{i:03d}": {"at": f"2026-09-{1 + i // 3:02d}T21:00:{i % 60:02d}+00:00"}
+                               for i in range(self.ka.WINDOW_STARTS_KEPT)}
+        self.ka.save_state(st)
+        self.call(START + SEC, start_key="window-start-2026-10-20")
+        c = self.claims()
+        self.assertEqual(len(c), self.ka.WINDOW_STARTS_KEPT)
+        self.assertIn("window-start-2026-10-20", c)
+        self.assertNotIn("k000", c)
 
 
 if __name__ == "__main__":
