@@ -572,7 +572,7 @@ class SettingActions(Base):
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "run_start_factor": 1.5, "window_ping": True,
                           "compaction_enabled": True, "compaction_threshold_tokens": 150_000,
-                          "ui_chat_reset_hours": 5.0,
+                          "ui_chat_reset_hours": 5.0, "preview_publish_enabled": False,
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
