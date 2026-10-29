@@ -534,7 +534,7 @@ class Autonomous(Base):
         store.upsert_driven_session(self.conn, drv, kind="task")
         self.conn.commit()
         cases = [dict(actor="mcp:" + AUTO), dict(actor="mcp:" + mgr), dict(actor="mcp:" + drv),
-                 dict(actor="mcp:" + afclaude_config.manager_session()), dict(actor="mcp", autonomous=True),
+                 dict(actor="mcp", autonomous=True),
                  dict(actor="mcp:" + SID2, autonomous=True)]
         for who in cases:
             for name, params in (("session.decide", {"session_id": SID, "decision": "continue"}),

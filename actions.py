@@ -275,14 +275,13 @@ def _own_list() -> set[str]:
 
 
 def autonomous_sessions(conn: sqlite3.Connection) -> set[str]:
-    """Session ids AFClaude drives: driven_sessions (incl. the own sessions), the
-    manager session (data/afclaude.json) and every managed project's manager_session. A 'stall'
+    """Session ids AFClaude drives: driven_sessions (incl. the own sessions) and every
+    project's task-manager (the registry, projects.manager_session; phase 3b S3: no machine setting). A 'stall'
     row is the owner's own session AFClaude only continued (phase 3b): its id stays the owner's
     (a continue AFClaude launches runs with CLAUDE_GUARD_DISABLE=1, so that one is autonomous anyway)."""
     ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions WHERE kind<>'stall'")}
     ids |= {r[0] for r in conn.execute("SELECT manager_session FROM projects WHERE manager_session IS NOT NULL")}
     ids |= _own_list()
-    ids.add(afclaude_config.manager_session())
     return ids
 
 
@@ -424,9 +423,16 @@ def project_add(conn: sqlite3.Connection, ctx: Ctx, name: Any, description: Any 
 
 @action("project.edit", "project", extra=store.PROJECT_EDITABLE)
 def project_edit(conn: sqlite3.Connection, ctx: Ctx, project: Any, version: Any = None, **fields: Any) -> Result:
-    """name / description / path / manager_session (None = unmanaged)."""
+    """name / description / path / manager_session (None = unmanaged). Until phase 3b S4 a
+    manager_session is refused while another project has one (store.ONE_MANAGER_UNTIL_S4)."""
     before = _project(conn, project)
     _check_version(before, version, f"project {before['name']!r}")
+    if str(fields.get("manager_session") or "").strip() and store.ONE_MANAGER_UNTIL_S4:
+        others = [t for t in store.manager_sessions(conn) if t["project_id"] != before["id"]]
+        if others:
+            raise ValueError(f"project {others[0]['name']!r} already has a task-manager session "
+                             f"({str(others[0]['session'])[:8]}); until phase 3b S4's project selection only "
+                             "one project may have one (clear it first: manager_session '')")
     after = store.update_project(conn, before["id"], **fields)
     return Result(after, after["id"], before, after)
 
@@ -1682,10 +1688,27 @@ def _short(value: Any, what: str, limit: int, required: bool = True) -> str | No
 
 
 @action("inbox.post", "inbox", owner_only=True)
-def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None) -> Result:
-    """A message from the owner to the task-manager (default: the AFClaude manager session),
-    pending until the triage sorts it."""
-    sid = session_id if session_id is not None else afclaude_config.manager_session()
+def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None, project: Any = None) -> Result:
+    """A message from the owner to a task-manager, pending until the triage sorts it. The target is a
+    project (its task-manager from the registry, phase 3b S3) or a session id; with neither, the first
+    project's task-manager (rank order, D-064: AFClaude today). A project without a task-manager session
+    yet, or no task-manager at all, is an error (D-235), not a guess."""
+    if session_id is not None and project is not None:
+        raise ValueError("name a project or a session, not both")
+    if session_id is not None:
+        sid = session_id
+    elif project is not None:
+        p = store.get_project(conn, project)
+        if p is None:
+            raise ValueError(f"unknown project {project!r}")
+        if not p.get("manager_session"):
+            raise ValueError(f"project {p['name']!r} has no task-manager session yet (created at its first start)")
+        sid = p["manager_session"]
+    else:
+        tms = store.manager_sessions(conn)
+        if not tms:
+            raise ValueError("no project has a task-manager session: nowhere to post to")
+        sid = tms[0]["session"]
     m = store.add_inbox(conn, text, sid, ctx.actor)
     return Result(m, m["id"], None, _inbox_audit(m))
 

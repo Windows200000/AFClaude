@@ -60,8 +60,9 @@ EXIT_USAGE = 2
 class Handler:
     """A job's existing code: `script` (in the repo) run with `args` as its cron line runs it.
     log: its log file under the data dir (the cron line's redirect); lock: its flock file under
-    the data dir, or None. "{session}" in args is $AFCLAUDE_MANAGER_SESSION (as in the crontab),
-    "{key}" the run's key (a keyed run: the window start's schedule.start_key, S5)."""
+    the data dir, or None. "{session}" in args is the task-manager session the start continues, from
+    the registry (keepalive.start_session, phase 3b S3; the crontab's $AFCLAUDE_MANAGER_SESSION is
+    not read), "{key}" the run's key (a keyed run: the window start's schedule.start_key, S5)."""
     script: str
     args: tuple[str, ...]
     log: str
@@ -84,7 +85,7 @@ HANDLERS: dict[str, Handler] = {
 # Jobs whose code is a function here, not a script: name -> (log file, function -> note).
 FUNCTIONS: dict[str, tuple[str, Callable[[], str]]] = {}
 # S6: the keep-alive watcher's passes, run in this process as keepalive.runner_pass(job, key) (the
-# session: $AFCLAUDE_MANAGER_SESSION, as the watcher's --session; armed, as the watcher ran), their
+# sessions: every task-manager of the registry, phase 3b S3; armed, as the watcher ran), their
 # output appended to the keep-alive's log as the watcher's was. The ticks plan; the acts (a key: the
 # run key their plan stored) type into the session. -> the result line's status, note and next_due.
 PASS_LOG = "keepalive/keepalive.log"
@@ -382,9 +383,9 @@ def _lock(name: str) -> Optional[int]:
 
 
 def _argv(h: Handler, key: Optional[str] = None) -> list[str]:
-    session = os.environ.get("AFCLAUDE_MANAGER_SESSION", "")
-    if "{session}" in h.args and not session:
-        raise RuntimeError("AFCLAUDE_MANAGER_SESSION is not set (the task-manager session the job acts on)")
+    session = ""
+    if "{session}" in h.args:     # the registry's task-manager for this start (a registry without one raises)
+        session = importlib.import_module("keepalive").start_session()
     if "{key}" in h.args and not key:
         raise RuntimeError(f"{h.script}: this job needs --key (its run's key)")
     subst = {"{session}": session, "{key}": key or ""}
