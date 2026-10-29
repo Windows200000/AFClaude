@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1154,6 +1155,36 @@ class Endpoint(DB):
         finally:
             inbox_api.KEY_FILE, inbox_api.LOCK = old
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x.sock")))
+
+    def test_no_worker_serve_writes_its_log_lines_to_the_log_file(self):
+        """S7 follow-up: under the runner the child's stdout is a pipe nobody reads while it runs;
+        `serve --no-worker` must put its lines (posted, http) in data/inbox_api.log itself."""
+        data = os.path.join(self.tmp.name, "data")
+        sock = os.path.join(self.tmp.name, "child", "inbox.sock")
+        env = dict(os.environ, AFCLAUDE_DATA_DIR=data, AFCLAUDE_INBOX_KEY_FILE=self.keyfile,
+                   AFCLAUDE_INBOX_SOCKET=sock)
+        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve", "--no-worker",
+                                 "--socket", sock], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for _ in range(100):
+                if os.path.exists(sock):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(os.path.exists(sock), "the server did not start")
+            c = UnixHTTP(sock)
+            c.request("POST", "/afclaude/api/inbox", body=json.dumps({"text": "hello"}).encode(),
+                      headers={"X-AFClaude-Key": self.KEY, "Content-Type": "application/json"})
+            r = c.getresponse()
+            self.assertEqual(r.status, 201)
+            r.read()
+            c.close()
+        finally:
+            proc.terminate()
+            out = proc.communicate(timeout=10)[0].decode()
+        with open(os.path.join(data, "inbox_api.log")) as fh:
+            logged = fh.read()
+        self.assertRegex(logged, r"inbox #\d+: posted \(5 characters\)")
+        self.assertNotIn("posted", out)      # not duplicated into the runner's pipe
 
 
 # ---------------------------------------------------------------- the CLI and the quickview
