@@ -11,6 +11,7 @@ the retired keepalive flags; the CLI's usage line."""
 import io
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -247,6 +248,44 @@ class ContinueAndReview(Base):
         self.assertEqual(row["status"], "started")
         self.assertEqual(self.result(row)["tmux"], "afc-stall-x-dddd")
 
+    def _refused_preflight_stall(self, quiet):
+        """Pass.continue_stalled on a stall whose preflight refuses (a "failed" outcome that alerts)."""
+        st = {"handled": {}, "sessions": {}, "alerted": {}, "rc_held": {}, "starts": {}}
+        p = dispatcher.Pass(self.conn, {}, st, NOW, True, quiet=quiet)
+        stall = {"session_id": STALLED, "stall_uuid": "u1", "title": "x"}
+        with mock.patch.object(ka, "evaluate", lambda sid, now, getter: ("FIRE", "d", None)), \
+                mock.patch.object(dispatcher, "session_cwd", lambda conn, sid: self.dir), \
+                mock.patch.object(ka, "claim_tmux", lambda *a, **kw: "afc-stall-x"), \
+                mock.patch.object(ka, "preflight", lambda sid, tmux: (False, ["busy"], None)):
+            return p.continue_stalled(stall, "u1"), st
+
+    def test_a_failed_continue_now_alerts_once(self):
+        # the pass itself alerts (alert_once) ...
+        (outcome, _), st = self._refused_preflight_stall(quiet=False)
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("preflight:u1", st["alerted"])
+        # ... a run-now continue leaves the alert to its request (failstop.fail, alert + pause, D-282)
+        self.alerts.clear()
+        with mock.patch.object(dispatcher, "LOCK_FILE", os.path.join(self.dir, "d.lock")), \
+                mock.patch.object(dispatcher.stalled, "scan", lambda conn: None), \
+                mock.patch.object(dispatcher, "save_state", lambda st: True), \
+                mock.patch.object(dispatcher, "load_state", lambda: {"handled": {}, "sessions": {}, "alerted": {},
+                                                                     "rc_held": {}, "starts": {}}), \
+                mock.patch.object(store, "stalled_decisions",
+                                  lambda conn: [{"session_id": STALLED, "stall_uuid": "u1", "title": "x"}]), \
+                mock.patch.object(ka, "evaluate", lambda sid, now, getter: ("FIRE", "d", None)), \
+                mock.patch.object(dispatcher, "session_cwd", lambda conn, sid: self.dir), \
+                mock.patch.object(ka, "claim_tmux", lambda *a, **kw: "afc-stall-x"), \
+                mock.patch.object(ka, "preflight", lambda sid, tmux: (False, ["busy"], None)):
+            r = store.add_request(self.conn, "cli", "continue_now", STALLED)
+            self.conn.commit()
+            row, _ = self.decide(r)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("preflight refused", self.result(row)["reason"])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertTrue(failstop.paused()["paused"])
+
     def test_continue_now_refuses_a_task_manager(self):
         with mock.patch.object(dispatcher, "LOCK_FILE", os.path.join(self.dir, "d.lock")), \
                 mock.patch.object(dispatcher.stalled, "scan", lambda conn: None), \
@@ -340,6 +379,39 @@ class RunnerJob(unittest.IsolatedAsyncioTestCase):
         self.assertIn("runner restart", req["result"])
         self.assertIn("request interrupted by a runner restart", self.fails)
         self.assertEqual(r.plan(self.now), [])
+
+    async def test_a_finished_run_that_left_its_request_open_is_decided_failed(self):
+        # finish() died between run_end and the request's write (a DB error): nothing else decides it
+        a = self.add()
+        rid, _ = actions.run_begin(self.conn, boot_id="a" * 32, job="request", key=str(a["id"]), timeout_s=60,
+                                actor="runner:request", via="runner", session=True, rerun=False)
+        actions.run_end(self.conn, rid, "failed", actor="runner:request", via="runner", error="x")
+        r = self.runner()
+        self.assertEqual(r.plan(self.now), [])
+        req = store.get_request(self.conn, a["id"])
+        self.assertEqual(req["status"], "failed")
+        self.assertIn("ended without deciding the request", req["result"])
+        self.assertEqual(store.list_requests(self.conn, "open"), [])  # request.add can take a new one
+        self.assertEqual(r.plan(self.now), [])
+
+    async def test_a_running_run_is_not_decided_by_the_plan(self):
+        a = self.add()
+        actions.run_begin(self.conn, boot_id="a" * 32, job="request", key=str(a["id"]), timeout_s=60,
+                          actor="runner:request", via="runner", session=True, rerun=False)
+        r = self.runner()
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(store.get_request(self.conn, a["id"])["status"], "open")
+
+    async def test_a_db_error_while_deciding_it_is_not_swallowed(self):
+        a = self.add()
+        rid, _ = actions.run_begin(self.conn, boot_id="a" * 32, job="request", key=str(a["id"]), timeout_s=60,
+                                actor="runner:request", via="runner", session=True, rerun=False)
+        actions.run_end(self.conn, rid, "failed", actor="runner:request", via="runner", error="x")
+        r = self.runner()
+        with mock.patch.object(actions, "perform", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                r.plan(self.now)
+        self.assertEqual(store.get_request(self.conn, a["id"])["status"], "open")
 
     def test_the_timeout_covers_the_inner_waits(self):
         least = runner_jobs.request_min_timeout()
