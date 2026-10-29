@@ -3682,6 +3682,21 @@ def act_run_key(key, at, sid=None):
     return RUN_KEY_RE.sub("_", head + str(key))[:RUN_KEY_MAX - len(tail)] + tail
 
 
+def drop_legacy_acts():
+    """Drop the plans stored under the pre-S3 keys acts.<job> (no session suffix): nothing reads them
+    any more (the runner and run_act look up acts.<job>:<sid8>), so they would only linger. Writes
+    only when there is one, i.e. once. -> the dropped names."""
+    doc = load_watch()
+    acts = doc.get("acts") or {}
+    old = [j for j in ACT_JOBS if j in acts]
+    if old:
+        for j in old:
+            acts.pop(j)
+        save_watch(doc)
+        log(f"dropped the pre-S3 act plans {', '.join(f'acts.{j}' for j in old)} (now one per task-manager)")
+    return old
+
+
 def _act_entry(key, at, sid, run=None):
     return {"key": key, "at": at.astimezone(UTC).isoformat(), "run": run or act_run_key(key, at, sid), "session": sid}
 
@@ -3964,13 +3979,22 @@ def run_act(job, run, sid, now, args):
 
 def registry_sessions():
     """The task-managers the per-session runner jobs act on (store.manager_sessions, rank order; a
-    project with no session yet is skipped, D-281): [{session, name, paused, ...}]."""
+    project with no session yet is skipped, D-281): [{session, name, paused, ...}]. None at all, or
+    more than one until 3b S4 (store.check_one_manager), raises: the tick or act fails (the runner
+    alerts + pauses, D-235) instead of doing nothing, or acting on a session nothing selected."""
     import store
     conn = store.connect()
     try:
         tms = store.retrying(lambda: store.manager_sessions(conn), conn)
     finally:
         conn.close()
+    if not tms:
+        raise RuntimeError("no project has a task-manager session (projects.manager_session): the keep-alive "
+                           "passes have no session to act on")
+    try:
+        store.check_one_manager(tms)
+    except ValueError as e:
+        raise RuntimeError(str(e)) from None
     for t in tms:
         if not re.fullmatch(SESSION_RE, str(t["session"])):
             raise RuntimeError(f"project {t['name']!r}: its task-manager session must be the FULL session UUID, "
@@ -4032,6 +4056,7 @@ def runner_pass(job, key=None):
         raise RuntimeError(f"the act {job} needs its run key")
     afclaude_config.LOG = log
     tms = registry_sessions()
+    drop_legacy_acts()
     doc = load_watch()
     before = memo_load(doc)
     try:
@@ -4248,16 +4273,18 @@ def main():
 
 
 def check_registry(session):
-    """The legacy `--session` (cron's window start, the watcher) must be a task-manager of the registry
-    (phase 3b S3, docs/phase3b_plan.md §3.3): else a fail-stop (alert + pause) and exit 1. The runner's own
-    jobs take their sessions from the registry and never pass this."""
+    """A `--session` (cron's window start, the watcher, and the runner's window_start child, whose
+    {session} comes from the registry: store.start_manager) must be a task-manager of the registry
+    (phase 3b S3, docs/phase3b_plan.md §3.3): else a fail-stop (alert + pause) and exit
+    runner_jobs.EXIT_REPORTED (3: the failure is reported, the runner does not alert again)."""
     import store
     conn = store.connect()
     try:
         store.retrying(lambda: store.check_manager_setting(conn, session), conn)
     except ValueError as e:
         fail_stop("the keep-alive's --session disagrees with the task-manager registry", str(e))
-        sys.exit(1)
+        import runner_jobs
+        sys.exit(runner_jobs.EXIT_REPORTED)
     finally:
         conn.close()
 

@@ -423,9 +423,16 @@ def project_add(conn: sqlite3.Connection, ctx: Ctx, name: Any, description: Any 
 
 @action("project.edit", "project", extra=store.PROJECT_EDITABLE)
 def project_edit(conn: sqlite3.Connection, ctx: Ctx, project: Any, version: Any = None, **fields: Any) -> Result:
-    """name / description / path / manager_session (None = unmanaged)."""
+    """name / description / path / manager_session (None = unmanaged). Until phase 3b S4 a
+    manager_session is refused while another project has one (store.ONE_MANAGER_UNTIL_S4)."""
     before = _project(conn, project)
     _check_version(before, version, f"project {before['name']!r}")
+    if str(fields.get("manager_session") or "").strip() and store.ONE_MANAGER_UNTIL_S4:
+        others = [t for t in store.manager_sessions(conn) if t["project_id"] != before["id"]]
+        if others:
+            raise ValueError(f"project {others[0]['name']!r} already has a task-manager session "
+                             f"({str(others[0]['session'])[:8]}); until phase 3b S4's project selection only "
+                             "one project may have one (clear it first: manager_session '')")
     after = store.update_project(conn, before["id"], **fields)
     return Result(after, after["id"], before, after)
 

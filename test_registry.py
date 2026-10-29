@@ -27,9 +27,15 @@ NOW = datetime(2026, 10, 29, 22, 0, tzinfo=UTC)
 
 
 class Base(unittest.TestCase):
-    """A temp DB with two task-managers (alpha, beta; rank order) and a project without one (gamma)."""
+    """A temp DB with two task-managers (alpha, beta; rank order) and a project without one (gamma).
+    Two are refused until S4 (store.ONE_MANAGER_UNTIL_S4, class OneManager); these tests switch that
+    off to keep the per-session paths S4 builds on tested."""
+    ONE = False
+
     def setUp(self):
         testenv.fresh_db(self)
+        self.addCleanup(setattr, store, "ONE_MANAGER_UNTIL_S4", store.ONE_MANAGER_UNTIL_S4)
+        store.ONE_MANAGER_UNTIL_S4 = self.ONE
         self.addCleanup(testenv.unpause)
         self.conn = store.connect()
         self.addCleanup(self.conn.close)
@@ -80,7 +86,8 @@ class Registry(Base):
             store.start_manager(self.conn)
         with self.assertRaisesRegex(ValueError, "no project has a task-manager session"):
             ka.start_session()
-        self.assertEqual(ka.runner_pass("watch"), {"status": "ok", "note": "", "next_due": None})   # nothing to watch
+        with self.assertRaisesRegex(RuntimeError, "no project has a task-manager session"):
+            ka.runner_pass("watch")                   # an error (the runner alerts + pauses), not a quiet no-op
 
     def test_a_registry_session_must_be_a_full_uuid(self):
         store.update_project(self.conn, "gamma", manager_session="00000000")
@@ -238,7 +245,7 @@ class Legacy(Base):
 
     def test_a_session_that_disagrees_fails_and_starts_nothing(self):
         code, fs, ws = self.run_main("--session", "cccccccc-0000-4000-8000-000000000003", "--window-start")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, runner_jobs.EXIT_REPORTED)     # reported: the runner does not alert again
         ws.assert_not_called()
         self.assertEqual(fs.call_args[0][0], "the keep-alive's --session disagrees with the task-manager registry")
         self.assertIn("cccccccc", fs.call_args[0][1])
@@ -258,6 +265,56 @@ class Legacy(Base):
         self.assertEqual(fails, [])
         self.assertFalse(r.check_registry("cccccccc-0000-4000-8000-000000000003"))
         self.assertEqual(fails[0][0][1], "the manager_session setting disagrees with the task-manager registry")
+
+
+class OneManager(Base):
+    """Until S4's project selection: at most one project has a task-manager session."""
+    ONE = True
+
+    def edit(self, name, sid):
+        return actions.perform(self.conn, "project.edit", {"project": name, "manager_session": sid},
+                               actor="cli", via="cli")
+
+    def test_the_project_edit_refuses_a_second_session(self):
+        with self.assertRaisesRegex(ValueError, "already has a task-manager session .*phase 3b S4"):
+            self.edit("gamma", "cccccccc-0000-4000-8000-000000000003")
+        self.edit("beta", "")
+        self.edit("alpha", SID_A)                     # its own session again: fine
+        with self.assertRaisesRegex(ValueError, "'alpha' already has"):
+            self.edit("beta", SID_B)
+        self.edit("alpha", "")
+        self.assertEqual(self.edit("beta", SID_B)["manager_session"], SID_B)   # the other one cleared first
+
+    def test_the_runner_path_fails_on_two(self):
+        with self.assertRaisesRegex(RuntimeError, "2 projects have a task-manager session .*alpha aaaaaaaa"):
+            ka.registry_sessions()
+        with self.assertRaisesRegex(RuntimeError, "2 projects have"):
+            ka.runner_pass("watch")
+        with self.assertRaisesRegex(ValueError, "2 projects have"):
+            store.start_manager(self.conn)
+        with self.assertRaisesRegex(ValueError, "2 projects have"):
+            runner_jobs._argv(runner_jobs.HANDLERS["window_start"], "k")
+        store.update_project(self.conn, "beta", manager_session="")
+        self.conn.commit()
+        self.assertEqual([t["session"] for t in ka.registry_sessions()], [SID_A])
+        self.assertEqual(store.start_manager(self.conn)["session"], SID_A)
+
+    def test_pre_s3_act_plans_are_dropped_once(self):
+        store.update_project(self.conn, "beta", manager_session="")
+        self.conn.commit()
+        doc = ka.load_watch()
+        doc.setdefault("acts", {}).update({"fillup": {"key": "k", "at": NOW.isoformat(), "run": "k.1"},
+                                           "compaction": {"key": "c", "at": NOW.isoformat(), "run": "c.1"}})
+        ka.save_watch(doc)
+        ka.store_act("last_stretch", SID_A, "ls", NOW + timedelta(hours=1), NOW)
+        with mock.patch.dict(ka.TICKS, {"watch": lambda *a: None}), \
+                mock.patch.object(ka, "run_tick", lambda job, tms, now: {"status": "ok", "note": "", "next_due": None}):
+            ka.runner_pass("watch")
+            self.assertEqual(sorted(ka.load_watch()["acts"]), [f"last_stretch:{SID_A[:8]}"])
+            self.assertEqual(sum("pre-S3 act plans" in ln for ln in self.logs), 1)
+            ka.runner_pass("watch")
+        self.assertEqual(sum("pre-S3 act plans" in ln for ln in self.logs), 1)   # once
+        self.assertEqual(ka.drop_legacy_acts(), [])
 
 
 if __name__ == "__main__":
