@@ -273,14 +273,13 @@ def _own_list() -> set[str]:
 
 
 def autonomous_sessions(conn: sqlite3.Connection) -> set[str]:
-    """Session ids AFClaude drives: driven_sessions (incl. the own sessions), the
-    manager session (data/afclaude.json) and every managed project's manager_session. A 'stall'
+    """Session ids AFClaude drives: driven_sessions (incl. the own sessions) and every
+    project's task-manager (the registry, projects.manager_session; phase 3b S3: no machine setting). A 'stall'
     row is the owner's own session AFClaude only continued (phase 3b): its id stays the owner's
     (a continue AFClaude launches runs with CLAUDE_GUARD_DISABLE=1, so that one is autonomous anyway)."""
     ids = {r[0] for r in conn.execute("SELECT session_id FROM driven_sessions WHERE kind<>'stall'")}
     ids |= {r[0] for r in conn.execute("SELECT manager_session FROM projects WHERE manager_session IS NOT NULL")}
     ids |= _own_list()
-    ids.add(afclaude_config.manager_session())
     return ids
 
 

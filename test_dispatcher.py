@@ -142,8 +142,7 @@ class Base(unittest.TestCase):
             os.chmod(p, 0o755)
         self.saved = {"PATH": os.environ["PATH"], "ka": (ka.PROJECTS_DIR, ka.KA_RESUME, dict(ka.SCRUBBED_ENV),
                                                          ka.TAKE_OVER_IDLE, ka.IGNORE_WINDOW),
-                      "dp": (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE,
-                             dp.keepalive_targets),
+                      "dp": (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE),
                       "own": stalled.OWN_LIST, "alert": ka.alert}
         self.alerts, self.logs = [], []
         self.saved["log"] = dp.log
@@ -156,11 +155,10 @@ class Base(unittest.TestCase):
         data = os.path.join(d, "data")
         dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE = data, os.path.join(data, "st.json"), os.path.join(data, "d.log")
         dp.LOCK_FILE, dp.CONFIG_FILE = os.path.join(data, ".lock"), os.path.join(data, "cfg.json")
-        dp.keepalive_targets = lambda: set()
         self.own = stalled.OWN_LIST = os.path.join(d, "own_sessions.txt")
         self.db = testenv.fresh_db(self)       # the keep-alive's own reads (tmux_name) see the same DB
         self.conn = store.connect(self.db)
-        self.cfg = dp.load_config(os.path.join(d, "none.json"), {"keepalive_sessions": [], "take_over_idle": False})
+        self.cfg = dp.load_config(os.path.join(d, "none.json"), {"take_over_idle": False})
         self.st = dp.load_state()
 
     def tearDown(self):
@@ -169,8 +167,7 @@ class Base(unittest.TestCase):
         (ka.PROJECTS_DIR, ka.KA_RESUME, env, ka.TAKE_OVER_IDLE, ka.IGNORE_WINDOW) = self.saved["ka"]
         ka.SCRUBBED_ENV.clear()
         ka.SCRUBBED_ENV.update(env)
-        (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE,
-         dp.keepalive_targets) = self.saved["dp"]
+        (dp.DATA_DIR, dp.STATE_FILE, dp.LOG_FILE, dp.LOCK_FILE, dp.CONFIG_FILE) = self.saved["dp"]
         stalled.OWN_LIST = self.saved["own"]
         ka.alert = self.saved["alert"]
         dp.log = self.saved["log"]
@@ -341,20 +338,34 @@ class Stalled(Base):
         self.assertEqual(self.resume_calls(), [])
         self.assertTrue(any("live usage still shows session limit 100%" in s for s in rep["skip"]))
 
-    def test_keepalive_target_is_never_continued(self):
-        self.stalled_session(sid(1))
+    def test_task_managers_and_driven_sessions_are_never_continued(self):
+        """3b S3: the exclusions come from the registry and driven_sessions, not from a setting or a scan
+        of running watchers; a stall row (what the dispatcher itself continues) is not one."""
+        self.project("p1", manager=sid(1))                          # a registered task-manager
+        store.upsert_driven_session(self.conn, sid(2), kind="review")
+        store.upsert_driven_session(self.conn, sid(3), kind="stall")
+        self.conn.commit()
+        for n in (1, 2, 3):
+            self.stalled_session(sid(n), prefix=f"x{n}")            # no forks of each other
         self.scan()
-        store.decide_session(self.conn, sid(1), "continue")
-        rep = self.run_pass(keepalive_sessions=[sid(1)])
-        self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any("keepalive.py" in s for s in rep["skip"]))
-        dp.keepalive_targets = lambda: {sid(1)}                    # a running watcher's --session
-        rep = self.run_pass(keepalive_sessions=[])
-        self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any("running keepalive.py watcher" in s for s in rep["skip"]))
+        for n in (1, 2, 3):
+            store.decide_session(self.conn, sid(n), "continue")
+        ex = dp.excluded_sessions(self.cfg, self.conn)
+        self.assertIn("task-manager of the project 'p1'", ex[sid(1)])
+        self.assertIn("review", ex[sid(2)])
+        self.assertNotIn(sid(3), ex)
+        rep = self.run_pass()
+        self.assertEqual(self.resumed_sessions(), [sid(3)], rep["skip"])
+        self.assertTrue(any("p1" in s for s in rep["skip"]) and any("driven session (review)" in s for s in rep["skip"]))
 
-    def test_keepalive_targets_reads_proc(self):
-        self.assertIsInstance(self.saved["dp"][5](), set)
+    def test_a_retired_keepalive_sessions_key_is_accepted_quietly(self):
+        path = os.path.join(self.d, "old.json")
+        with open(path, "w") as fh:
+            json.dump({"keepalive_sessions": [sid(1)], "exclude_sessions": [sid(2)]}, fh)
+        cfg = dp.load_config(path)
+        self.assertEqual(cfg["exclude_sessions"], [sid(2)])
+        self.assertNotIn("keepalive_sessions", cfg)
+        self.assertFalse(any("ignored" in x for x in self.logs), self.logs)
 
 
 class Forks(Base):
@@ -412,7 +423,7 @@ class NoStarts(Base):
         store.add_task(self.conn, "managed stage", project="managed")
         rep = self.run_pass()                                       # undecided
         self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any(f"{mgr[:8]}: task-manager of the project 'managed'" in s and "D-204" in s
+        self.assertTrue(any(f"{mgr[:8]}: skipped: task-manager of the project 'managed'" in s and "D-204" in s
                             for s in rep["skip"]), rep["skip"])
         store.decide_session(self.conn, mgr, "continue")            # even an explicit continue
         rep = self.run_pass(now=NOW + timedelta(hours=1))
@@ -425,11 +436,11 @@ class NoStarts(Base):
         self.stalled_session(mgr)
         self.scan()
         self.project("managed", manager=mgr)
-        rep = self.run_pass(keepalive_sessions=[mgr])              # the AFClaude task-manager
+        rep = self.run_pass()                                      # a task-manager of the registry
         self.assertEqual(self.resume_calls(), [])
-        self.assertTrue(any("keepalive.py" in s for s in rep["skip"]))
+        self.assertTrue(any("task-manager of the project" in s for s in rep["skip"]))
         store.decide_session(self.conn, mgr, "ignore")
-        rep = self.run_pass(keepalive_sessions=[])
+        rep = self.run_pass()
         self.assertEqual(self.resume_calls(), [])
         self.assertFalse(any(mgr[:8] in s for s in rep["skip"]))   # ignored: quietly left alone
 
@@ -487,8 +498,7 @@ class Settings(Base):
         self.scan()
         store.decide_session(self.conn, sid(1), "continue")
         testenv.setcfg(usage_model="linear", stall_verify_minutes=5)
-        self.cfg = dp.load_config(os.path.join(self.d, "none.json"), {"keepalive_sessions": [],
-                                                                       "take_over_idle": False})
+        self.cfg = dp.load_config(os.path.join(self.d, "none.json"), {"take_over_idle": False})
         self.run_pass()
         self.assertEqual(self.resumed_sessions(), [sid(1)])
         self.alerts.clear()
@@ -554,8 +564,8 @@ class Cleanup(Base):
                                                      reply("s5a", NOW - timedelta(hours=4), self.work, "tool_use")])
         self.track(sid(6), own_tmux=False); self.idle(sid(6), 300)  # only typed into: release, never kill
         with open(self.alive, "a") as fh:                           # untracked + the manager
-            fh.write("ka-99999999\n" + tname(dp.MANAGER_SESSION) + "\n")
-        mgr = dp.MANAGER_SESSION
+            fh.write("ka-99999999\n" + tname(sid(9)) + "\n")
+        mgr = sid(9)
         self.st["sessions"][mgr] = {"tmux": tname(mgr), "status": "running", "own_tmux": True}
         testenv.tmux_row(mgr, tname(mgr))                           # its task-manager row: never killed
         self.idle(mgr, 600)
@@ -568,7 +578,7 @@ class Cleanup(Base):
             self.assertEqual(self.st["sessions"][s]["status"], "running")
         alive = open(self.alive).read().split()
         self.assertIn("ka-99999999", alive)
-        self.assertIn(tname(dp.MANAGER_SESSION), alive)
+        self.assertIn(tname(mgr), alive)
         self.assertIn(tname(sid(6)), alive)
         rows = {r["session_id"]: r for r in store.driven_sessions(self.conn)}   # 3b S2: a killed one's name is free
         self.assertEqual({s for s, r in rows.items() if r["ended_at"]}, {sid(1), sid(2)})
@@ -692,15 +702,6 @@ class FailStop(Base):
         self.assertEqual(self.alerts, [])
         self.assertFalse(self.paused()["paused"])
         self.assertTrue(any("no current client" in x and "verified gone" in x for x in self.logs), self.logs)
-
-    def test_host_process_list_unavailable_stops_the_pass(self):
-        import failstop
-        dp.keepalive_targets = self.saved["dp"][5]                  # the real one
-        with mock.patch.object(dp.host, "in_container", return_value=True), \
-                mock.patch.object(dp.host, "proc_snapshot", side_effect=OSError("bridge down")):
-            with self.assertRaises(failstop.Failed) as cm:
-                dp.keepalive_targets()
-        self.assertEqual(cm.exception.why, "host process list unavailable")
 
     def test_unreadable_config_is_an_error(self):
         import failstop

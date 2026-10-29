@@ -408,24 +408,24 @@ class FillupThroughTheRunner(ExactTiming):
 
     def test_planned_then_fired_at_its_start_on_usage_refreshed_ahead(self):
         res = self.tick(self.start - timedelta(minutes=30))
-        a = testenv.act_of(ka, "fillup")
+        a = testenv.act_of(ka, "fillup", self.SID)
         self.assertEqual((a["key"], ka.parse_ts(a["at"])), (fillup.key(RESET), self.start + ka.WAKE_SLACK))
         self.assertEqual(ka.parse_ts(res["next_due"]), self.start - ka.FILLUP_PREFETCH)
         self.assertEqual(self.refreshes, [])                           # far from the start: the cache
         self.tick(self.start - ka.FILLUP_PREFETCH + timedelta(seconds=15))
         self.assertEqual(self.refreshes, [self.start - ka.FILLUP_PREFETCH + timedelta(seconds=15)])
-        self.assertEqual(testenv.act_of(ka, "fillup"), a)              # the same act
+        self.assertEqual(testenv.act_of(ka, "fillup", self.SID), a)              # the same act
         ka.fresh_usage = lambda now, force=False: self.fail("no /usage call at the start: numbers are fresh")
         self.act(ka.parse_ts(a["at"]))
         self.assertEqual([k for _, k in self.fired], [fillup.key(RESET)])
         late = (self.fired[0][0] - self.start).total_seconds()
         self.assertTrue(0 <= late <= 2, late)
-        self.assertIsNone(testenv.act_of(ka, "fillup"))
+        self.assertIsNone(testenv.act_of(ka, "fillup", self.SID))
 
     def test_the_owner_busy_retry_is_stored(self):
         t = self.start + timedelta(seconds=10)
         self.tick(t)
-        a = testenv.act_of(ka, "fillup")
+        a = testenv.act_of(ka, "fillup", self.SID)
         self.assertLessEqual(ka.parse_ts(a["at"]), t)                  # due: at once
         fire, recheck = ka.handle_fire, ka.OWNER_BUSY_RECHECK
         ka.handle_fire = lambda *x: ka.OWNER_BUSY
@@ -435,10 +435,10 @@ class FillupThroughTheRunner(ExactTiming):
             self.act(t)
         finally:
             ka.handle_fire = fire
-        retry = testenv.act_of(ka, "fillup")
+        retry = testenv.act_of(ka, "fillup", self.SID)
         self.assertEqual(ka.parse_ts(retry["at"]), t + ka.OWNER_BUSY_RECHECK)
         self.tick(t + timedelta(seconds=30))                           # the memory of the busy owner: kept
-        self.assertEqual(testenv.act_of(ka, "fillup"), retry)
+        self.assertEqual(testenv.act_of(ka, "fillup", self.SID), retry)
         self.act(ka.parse_ts(retry["at"]))
         self.assertEqual(len(self.fired), 1)
 
@@ -447,7 +447,7 @@ class FillupThroughTheRunner(ExactTiming):
         ka.save_fillup({"test": {"session": self.SID, "key": fillup.test_key(RESET), "start": start.isoformat(),
                                  "reset": RESET.isoformat(), "remaining": 3.0}})
         self.tick(start - timedelta(minutes=35))
-        a = testenv.act_of(ka, "fillup")
+        a = testenv.act_of(ka, "fillup", self.SID)
         self.assertEqual(ka.parse_ts(a["at"]), start + ka.WAKE_SLACK)
         self.act(start + ka.WAKE_SLACK)
         self.assertEqual([k for _, k in self.fired], [fillup.test_key(RESET)])

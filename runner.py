@@ -516,6 +516,23 @@ class Runner:
         row = store.get_runner_job(self.conn, name)
         return _parse(row["next_due"]) if row else None
 
+    # ---- the registry (phase 3b S3)
+
+    def check_registry(self, setting: Optional[str] = None) -> bool:
+        """The boot check of docs/phase3b_plan.md §3.3: while the machine setting manager_session still
+        exists (legacy mode and the SessionStart-era scripts read it until 3a S9), it must be a task-manager
+        of the registry, else an alert + pause (D-235). The runner's jobs never read it. -> ok."""
+        import afclaude_config
+        want = setting if setting is not None else afclaude_config.identity("manager_session")
+        if not isinstance(want, str) or not want.strip():
+            return True
+        try:
+            store.check_manager_setting(self.conn, want.strip())
+        except ValueError as e:
+            self.fail("the manager_session setting disagrees with the task-manager registry", str(e))
+            return False
+        return True
+
     # ---- boot (§3.4)
 
     def boot(self) -> None:
@@ -666,26 +683,37 @@ class Runner:
         return out
 
     def _plan_planned(self, job: Job, now: datetime) -> Optional[Due]:
-        """The act its pass's plan step stored (planned_act), due once its time has come and it is not
-        running or settled (a run row under its key: it ran, or it was cut off and never reruns); the
-        job row's next_due is that time while it is ahead (the loop wakes for it). A stored act that
-        is not valid is an error (alert + pause), reported once per boot."""
-        try:
-            act = planned_act(self.conn, job.name)
-        except ValueError as e:
-            if f"plan-bad:{job.name}:{e}" not in self.logged:
-                self.once(f"plan-bad:{job.name}:{e}", f"{job.name}: its stored plan is not valid ({e}); not run")
-                self.fail("a planned act is not valid", f"{job.name}: {e}")
-            act = None
-        ahead = act[1] if act is not None and act[1] > now else None
+        """The act its pass's plan step stored (planned_act) for one of the registry's task-managers
+        (store.manager_sessions, rank order; phase 3b S3: one plan per session, acts.<job>:<sid8>),
+        due once its time has come and it is not running or settled (a run row under its key: it ran,
+        or it was cut off and never reruns). One act of a job runs at a time: the earliest due (a tie:
+        the better-ranked project), the next one when it ends. The job row's next_due is the earliest
+        time still ahead (the loop wakes for it). A stored act that is not valid is an error (alert +
+        pause), reported once per boot."""
+        ready: list[tuple[datetime, str]] = []
+        ahead: Optional[datetime] = None
+        for t in store.manager_sessions(self.conn):
+            name = runner_state.act_name(job.name, str(t["session"]))
+            try:
+                act = planned_act(self.conn, name)
+            except ValueError as e:
+                if f"plan-bad:{name}:{e}" not in self.logged:
+                    self.once(f"plan-bad:{name}:{e}", f"{name}: its stored plan is not valid ({e}); not run")
+                    self.fail("a planned act is not valid", f"{name}: {e}")
+                continue
+            if act is None:
+                continue
+            run, at = act
+            if at > now:
+                ahead = at if ahead is None else min(ahead, at)
+            elif not store.key_runs(self.conn, job.name, run):
+                ready.append((at, run))
         want = ahead.replace(microsecond=0) if ahead else None
         if self._next_due(job.name) != want:
             self.job_set(job.name, next_due=_iso(ahead) if ahead else None)
-        if act is None or ahead is not None or job.name in self.tasks:
+        if not ready or job.name in self.tasks:
             return None
-        run, at = act
-        if store.key_runs(self.conn, job.name, run):
-            return None
+        at, run = min(ready, key=lambda r: r[0])
         return Due(job, run, at)
 
     def _settled(self, job: Job, key: str) -> bool:
@@ -1128,7 +1156,22 @@ def status(conn: Any, now: Optional[datetime] = None) -> dict[str, Any]:
                      "last_status": r.get("last_status"), "last_ok_at": r.get("last_ok_at"),
                      "consecutive_failures": r.get("consecutive_failures", 0)})
     st = actions.runner_state_get(conn)
-    return {"heartbeat_at": _iso(beat) if beat else None,
+    tms: list[dict[str, Any]] = []
+    plans: list[dict[str, Any]] = []
+    for t in store.manager_sessions(conn):      # phase 3b S3: the registry's per-session plans (acts.<job>:<sid8>)
+        tms.append({"project": t["name"], "session": str(t["session"])[:8], "paused": t["paused"]})
+        for jname, job in JOBS.items():
+            if not job.planned:
+                continue
+            key = runner_state.act_name(jname, str(t["session"]))
+            try:
+                act = planned_act(conn, key)
+            except ValueError as e:
+                plans.append({"act": key, "project": t["name"], "error": str(e)[:200]})
+                continue
+            if act is not None:
+                plans.append({"act": key, "project": t["name"], "run": act[0], "at": _iso(act[1])})
+    return {"heartbeat_at": _iso(beat) if beat else None, "task_managers": tms, "plans": plans,
             "heartbeat_age_s": round((now - beat).total_seconds()) if beat else None,
             "boot": st.get("boot"), "clean_exit": st.get("clean_exit"), "drain": actions.runner_drain(conn),
             "jobs": jobs, "running": store.running_runs(conn),
@@ -1145,6 +1188,10 @@ def print_status(s: dict[str, Any]) -> None:
     for j in s["jobs"]:
         print(f"  {j['job']:<13} {j['owner'] or '-':<6} next {j['next_due'] or '-':<24} "
               f"last {j['last_status'] or '-':<9} ok {j['last_ok_at'] or '-':<21} fails {j['consecutive_failures']}")
+    for t in s["task_managers"]:
+        print(f"task-manager: {t['project']} {t['session']}" + (" (paused)" if t["paused"] else ""))
+    for p in s["plans"]:
+        print(f"  plan {p['act']:<26} " + (f"ERROR {p['error']}" if "error" in p else f"at {p['at']} run {p['run']}"))
     for r in s["running"]:
         print(f"running: run {r['id']} {r['job']} {r['key'] or ''} since {r['started_at']} pid {r['pid']}")
     for r in s["recent_failures"]:
@@ -1527,6 +1574,7 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
         runner = Runner(conn, owns=o, shadow=shadow_log)
         r = runner
         Watchdog(lambda: r.beat_mono).start()
+        runner.check_registry()
         runner.boot()
         return asyncio.run(runner.serve())
     except Exception as e:   # noqa: BLE001 - the runner's own failure: report, exit non-zero (no clean exit)

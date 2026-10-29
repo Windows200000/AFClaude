@@ -35,8 +35,13 @@ store.DB_PATH = DB
 store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes the alerts doc
 import notify  # noqa: E402
 notify.push = lambda text: "test: push not sent"   # an alert (failstop.fail, keepalive.alert) never runs claude
-store.connect(DB, create=True).close()   # explicit, like a real install's setup: an empty DB, no
-                                          # "no database" log line from the settings reads
+_conn = store.connect(DB, create=True)   # explicit, like a real install's setup: an empty DB, no
+                                         # "no database" log line from the settings reads
+# the task-manager registry (phase 3b S3, projects.manager_session) holds the synthetic identity SID, as
+# a live install's AFClaude project holds its session: code that read the setting reads the registry
+store.add_project(_conn, "testenv-task-manager")
+store.update_project(_conn, "testenv-task-manager", manager_session=SID)
+_conn.close()
 
 
 def fresh_db(test):
@@ -182,9 +187,10 @@ def clear_watch(db=None):
         conn.close()
 
 
-def act_of(ka, job):
-    """The stored act of the runner's job `job` ({key, at, run}) or None."""
-    return (ka.load_watch().get("acts") or {}).get(job)
+def act_of(ka, job, session=SID):
+    """The stored act of the runner's job `job` for the task-manager `session` ({key, at, run, session})
+    or None (phase 3b S3: acts.<job>:<sid8>)."""
+    return (ka.load_watch().get("acts") or {}).get(ka.act_name(job, session))
 
 
 def runner_pass(ka, job, key=None, now=None, session=SID):
@@ -204,7 +210,9 @@ def runner_pass(ka, job, key=None, now=None, session=SID):
     old = ka._now
     ka._now = lambda: t
     try:
-        with mock.patch.dict(os.environ, {"AFCLAUDE_MANAGER_SESSION": session}):
+        # the registry is `session` alone (phase 3b S3: the runner's passes take their sessions from it;
+        # a test of the registry itself uses its own DB, test_registry.py)
+        with mock.patch.object(ka, "registry_sessions", lambda: [{"session": session, "name": "test"}]):
             return ka.runner_pass(job, key)
     finally:
         ka._now = old
@@ -214,7 +222,7 @@ def runner_pass(ka, job, key=None, now=None, session=SID):
 def runner_act(ka, job, now=None, session=SID):
     """The runner starting the stored act of `job` (its run key) at `now` -> its result, or None
     (no act stored)."""
-    a = act_of(ka, job)
+    a = act_of(ka, job, session)
     if a is None:
         return None
     return runner_pass(ka, job, a["run"], now, session)
