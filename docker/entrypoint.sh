@@ -3,10 +3,12 @@
 #   AFCLAUDE_SCHEDULER=on      the resident runner (runner.py serve, phase 3a) for the jobs it owns
 #                              (runner.RUNNER_OWNS; since S6 also the keep-alive watcher's passes, so
 #                              no watcher is started) beside supercronic with docker/crontab for the
-#                              rest, plus the inbox API
+#                              rest; since S7 the runner also keeps the inbox API running
+#                              (runner.SUPERVISED: `inbox_api.py serve --no-worker`), so this
+#                              entrypoint does not start it
 #   AFCLAUDE_SCHEDULER=legacy  the phase 3a rollback (docs/phase3a_plan.md §4): supercronic with
 #                              docker/crontab.legacy (the crontab before the runner), the watcher and
-#                              the inbox API; no runner
+#                              the inbox API (with its worker thread); no runner
 #   AFCLAUDE_SCHEDULER=off     (default) nothing is scheduled; the container only idles, so
 #                              `docker exec` works (tests, the MCP server, manual runs)
 set -eu
@@ -35,12 +37,11 @@ case "$MODE" in
     # (start_watcher.sh). on: the runner runs the watcher's passes (phase 3a S6), no watcher.
     if [ "$MODE" = legacy ]; then
       "$D/docker/start_watcher.sh" --boot &
-    fi
-    # The message box's API (D-241): a unix socket in data/api/ for the quickview's nginx; the cron
-    # watchdog restarts it (and alerts) if it dies.
-    python3 "$D/inbox_api.py" ensure --boot >>"$D/data/inbox_api.log" 2>&1 \
-      || echo "afclaude: the inbox API did not start (see data/inbox_api.log)" >&2
-    if [ "$MODE" = legacy ]; then
+      # The message box's API (D-241): a unix socket in data/api/ for the quickview's nginx; the
+      # cron watchdog restarts it (and alerts) if it dies. S7: `on` mode no longer starts it here;
+      # the runner keeps it running itself (runner.SUPERVISED).
+      python3 "$D/inbox_api.py" ensure --boot >>"$D/data/inbox_api.log" 2>&1 \
+        || echo "afclaude: the inbox API did not start (see data/inbox_api.log)" >&2
       AFCLAUDE_CRONTAB="$D/docker/crontab.legacy"
       export AFCLAUDE_CRONTAB             # export_quickview.py lists the lines that run
       exec "$CRON_BIN" -passthrough-logs "$AFCLAUDE_CRONTAB"

@@ -17,13 +17,21 @@ X-AFClaude-Key here too (compared with the key file, read on every request, so a
 needs no restart; no key file: every request is refused, 503), a POST must be JSON
 (application/json, so a cross-site form can't send one), at most BODY_MAX bytes, and at most
 inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / retry / dismiss and
-notice.dismiss, actor owner, via dashboard: audited). The worker (inbox_worker.run_forever) runs in the same process.
+notice.dismiss, actor owner, via dashboard: audited).
 
-  inbox_api.py serve [--socket PATH]    the server (one per data/: a lock file); the entrypoint
-                                         starts it with `ensure --boot`
-  inbox_api.py ensure [--boot]          start the server detached unless one runs (cron watchdog;
-                                         without --boot a server that was not running is an
-                                         error: alert + automation paused, D-244)
+Phase 3a S7 (docs/phase3a_plan.md §5 S7): with AFCLAUDE_SCHEDULER=on this process only serves HTTP;
+a post or a retry wakes the resident runner (runner.wake, --no-worker) instead of a worker thread,
+and the runner's own `inbox` / `inbox_verify` jobs do the triage, delivery and verification
+(inbox_worker.py). AFCLAUDE_SCHEDULER=legacy keeps the worker thread (inbox_worker.run_forever) in
+this same process, woken by the same events, as before S7; the runner supervises `serve --no-worker`
+as a child (restart + alert) instead of the entrypoint/cron starting and watching `ensure`.
+
+  inbox_api.py serve [--socket PATH] [--no-worker]   the server (one per data/: a lock file); the
+                                         legacy entrypoint starts it with `ensure --boot`; the
+                                         runner starts `serve --no-worker` directly (S7)
+  inbox_api.py ensure [--boot]          legacy only (S7): start the server detached unless one
+                                         runs (cron watchdog; without --boot a server that was not
+                                         running is an error: alert + automation paused, D-244)
 """
 from __future__ import annotations
 
@@ -39,7 +47,7 @@ import sys
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler
-from typing import IO, Any
+from typing import IO, Any, Protocol
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -82,10 +90,16 @@ class HTTPError(Exception):
         self.status, self.message = status, message
 
 
+class Waker(Protocol):
+    """threading.Event (the worker thread, legacy) or _WakeRunner (the resident runner, S7): the
+    HTTP handler only ever calls `.set()` on it."""
+    def set(self) -> None: ...
+
+
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, path: str, key_file: str, wake: threading.Event) -> None:
+    def __init__(self, path: str, key_file: str, wake: Waker) -> None:
         self.key_file, self.wake = key_file, wake
         super().__init__(path, Handler)
 
@@ -205,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = _not_allowed
 
 
-def bind(path: str, key_file: str, wake: threading.Event) -> Server:
+def bind(path: str, key_file: str, wake: Waker) -> Server:
     """The server on a fresh socket at `path` (its directory 0755, the socket 0666: nginx's worker
     in the quickview container runs as another user; the key check guards every request)."""
     d = os.path.dirname(path)
@@ -229,18 +243,31 @@ def take_lock() -> IO[str] | None:
     return fh
 
 
-def serve(path: str) -> int:
+class _WakeRunner:
+    """The resident runner's wake (S7, --no-worker): a `.set()` that sends it a datagram instead of
+    setting a local event, so the HTTP handler's one `self.server.wake.set()` call (route()) works
+    unchanged in both modes. Never blocks or raises (runner.wake's own contract)."""
+    def set(self) -> None:
+        import runner
+        runner.wake()
+
+
+def serve(path: str, no_worker: bool = False) -> int:
     lock = take_lock()
     if lock is None:
         log("another inbox_api.py serve holds the lock; exiting")
         return 0
     if read_key(KEY_FILE) is None:      # fail fast: without the key every request would be refused
-        log(f"ERROR: no key in {KEY_FILE}; not serving (the watchdog alerts it)")
+        log(f"ERROR: no key in {KEY_FILE}; not serving (the watchdog/runner alerts it)")
         lock.close()
         return 1
-    import inbox_worker
-    wake = threading.Event()
-    threading.Thread(target=inbox_worker.run_forever, args=(wake,), name="inbox-worker", daemon=True).start()
+    wake: threading.Event | _WakeRunner
+    if no_worker:
+        wake = _WakeRunner()           # S7: the runner's own `inbox` / `inbox_verify` jobs do the work
+    else:
+        wake = threading.Event()
+        import inbox_worker
+        threading.Thread(target=inbox_worker.run_forever, args=(wake,), name="inbox-worker", daemon=True).start()
     srv = bind(path, KEY_FILE, wake)
     log(f"inbox API listening on {path} (pid {os.getpid()})")
     if os.path.exists(DOWN):
@@ -280,11 +307,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("serve", help="run the server on the unix socket")
     p.add_argument("--socket", default=SOCKET)
-    p = sub.add_parser("ensure", help="start the server detached unless one runs")
+    p.add_argument("--no-worker", action="store_true",
+                   help="S7: no worker thread; the resident runner's `inbox` / `inbox_verify` jobs do the work")
+    p = sub.add_parser("ensure", help="legacy only (S7): start the server detached unless one runs")
     p.add_argument("--boot", action="store_true", help="the container start: no alert")
     args = ap.parse_args(argv)
     if args.cmd == "serve":
-        return serve(args.socket)
+        return serve(args.socket, args.no_worker)
     return ensure(args.boot)
 
 

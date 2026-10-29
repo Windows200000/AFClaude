@@ -33,6 +33,7 @@ import inbox  # noqa: E402
 import inbox_api  # noqa: E402
 import inbox_worker as iw  # noqa: E402
 import keepalive as ka  # noqa: E402
+import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
 import tasks  # noqa: E402
@@ -500,7 +501,8 @@ class Delivery(tc.Env):
         self.assertEqual((r["status"], r["delivered_via"]), ("delivered", "send-keys"))
         self.assertEqual((self.row(n)["status"], self.row(n)["included_by"]), ("included", f"inbox #{m['id']}"))
         self.assertEqual(self.verified[0][0], m["id"])
-        self.assertTrue(iw.verify(m["id"], self.path, 0, timedelta(0)))      # the fake session wrote it
+        entry = {"msg": m["id"], "path": self.path, "offset": 0, "deadline": store.iso(datetime.now(UTC))}
+        self.assertEqual(iw.check_verify(self.conn, entry, datetime.now(UTC)), "seen")   # the fake session wrote it
 
     def test_held_by_a_compaction_or_start_lock(self):
         m = self.now_msg()
@@ -624,17 +626,43 @@ class Delivery(tc.Env):
     def test_not_in_the_transcript_is_an_error(self):
         m = self.now_msg()
         ka.fire = lambda *a, **kw: (0, "sent-keys ka-abcdef01", "")          # typed, but nothing arrives
-        old, iw.VERIFY_POLL = iw.VERIFY_POLL, 0
-        try:
-            self.assertEqual(iw.deliver(self.conn, self.row(m), datetime.now(UTC),
-                                        verify=lambda mid, path, off: iw.verify(mid, path, off, timedelta(0))),
-                             "delivered")
-        finally:
-            iw.VERIFY_POLL = old
+        now = datetime.now(UTC)
+        self.assertEqual(iw.deliver(self.conn, self.row(m), now,
+                                    verify=lambda mid, path, off, t: iw.store_verify(mid, path, off, t, timedelta(0))),
+                         "delivered")
+        self.assertEqual(iw.verify_tick(self.conn, now + timedelta(seconds=1)), {"failed": 1})   # past its deadline
         r = self.row(m)
         self.assertEqual(r["status"], "error")
         self.assertIn("not in its transcript", r["error"])
         self.assertTrue(failstop.paused()["paused"])
+
+    def test_verify_resumes_after_a_restart_and_ends_seen_or_failed_at_its_deadline(self):
+        """§3.3/§3.4 (S7): the verification is a runner_state 'inbox' entry, not a thread: a
+        restart (a fresh read of the same DB state, not an in-process thread) resumes it from the
+        same path/offset/deadline and ends it seen or as an error at its deadline."""
+        m = self.now_msg()
+        now = datetime.now(UTC)
+        offset = os.path.getsize(self.path)
+        iw.store_verify(m["id"], self.path, offset, now, timeout=timedelta(seconds=30))
+        self.assertTrue(iw.verify_pending(self.conn))
+        entry = runner_state.load(iw.VERIFY_COMPONENT)["entries"][str(m["id"])]
+        self.assertEqual((entry["msg"], entry["path"], entry["offset"]), (m["id"], self.path, offset))
+        # "a restart": a fresh read of the same DB state finds the same entry and still waits
+        self.assertEqual(iw.verify_tick(self.conn, now), {"pending": 1})           # before its deadline: not seen yet
+        self.write([tc.assistant(now, text=inbox.marker(m["id"]))], "a")           # the session answers
+        self.assertEqual(iw.verify_tick(self.conn, now), {"seen": 1})
+        self.assertFalse(iw.verify_pending(self.conn))
+        # the other path: still unseen at its deadline, after a restart (a fresh read of the entries)
+        m2 = self.now_msg()
+        actions.perform(self.conn, "inbox.deliver", {"message_id": m2["id"], "plan": "send-keys"},
+                        actor=iw.ACTOR, via="runner")
+        iw.store_verify(m2["id"], self.path, os.path.getsize(self.path), now, timeout=timedelta(seconds=1))
+        self.assertTrue(iw.verify_pending(self.conn))
+        self.assertEqual(iw.verify_tick(self.conn, now + timedelta(seconds=2)), {"failed": 1})
+        r2 = self.row(m2)
+        self.assertEqual(r2["status"], "error")
+        self.assertIn("not in its transcript", r2["error"])
+        self.assertFalse(iw.verify_pending(self.conn))
 
     def test_a_resumed_session_gets_the_rules_pointer(self):
         ka.preflight = lambda sid: (True, [], "resume")

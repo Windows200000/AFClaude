@@ -82,6 +82,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
 
     def runner(self, owns=(), jobs=None, **kw):
         kw.setdefault("spawner", self.spawner)
+        kw.setdefault("supervise", {})     # S7: no supervised children unless a test asks for one
         return runner.Runner(self.conn, jobs=jobs, owns=frozenset(owns), clock=lambda: self.now,
                              log_fn=self.logs.append, fail=self.fail, schedule_cfg=CFG,
                              sock=os.path.join(self.tmp, "r.sock"), **kw)
@@ -214,8 +215,13 @@ class Tables(Base):
                 self.assertTrue(any(job.cron_tag in ln for ln in legacy), name)
         self.assertFalse(any("runner.py" in ln for ln in legacy))
         self.assertEqual(len([ln for ln in cron if "runner.py ensure" in ln]), 1)      # the S2-S7 watchdog
-        self.assertEqual(set(legacy) - set(cron), {ln for ln in legacy if any(
-            runner.JOBS[n].cron_tag in ln for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag)})
+        # S7: the inbox API watchdog has no Job of its own (the runner supervises it directly,
+        # runner.SUPERVISED), so it is not matched by a cron_tag; it is the one extra line removed
+        # from `on` mode that no owned job's tag accounts for.
+        tagged = {ln for ln in legacy if any(
+            runner.JOBS[n].cron_tag in ln for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag)}
+        untagged = {ln for ln in legacy if "AFClaude inbox API watchdog" in ln}
+        self.assertEqual(set(legacy) - set(cron), tagged | untagged)
 
 
 # ---------------------------------------------------------------- boot: recovery and catch-up
@@ -1011,8 +1017,9 @@ class SimpleTicks(Base):
     the runner; the legacy crontab keeps them; a timed-out tick is its run's failure, not D-257."""
 
     def test_s3_owns_the_simple_ticks(self):
-        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start"}
-                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6
+        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
+                                                         "inbox", "inbox_verify"}
+                                                       | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4, S5, S6, S7
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
     def test_crontab_per_mode(self):
@@ -1021,8 +1028,9 @@ class SimpleTicks(Base):
             tag = runner.JOBS[name].cron_tag
             self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
             self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        # + the runner watchdog, - the at-shim (S4), - the window start (S5), - the watcher watchdog (S6)
-        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 2)
+        # + the runner watchdog, - the at-shim (S4), - the window start (S5), - the watcher watchdog (S6),
+        # - the inbox API watchdog (S7: the runner supervises it directly instead, no cron line at all)
+        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) + 3)
 
     def test_each_tick_runs_what_its_cron_line_ran(self):
         """Registration: the handler has the legacy line's script, arguments, log file and flock."""
@@ -1056,6 +1064,8 @@ class SimpleTicks(Base):
 
     def test_tick_timeouts_exceed_their_inner_timeouts_and_the_measured_p99(self):
         for name in runner.RUNNER_OWNS:
+            if runner.JOBS[name].poll is not None:
+                continue   # S7: not a fixed-grid tick (no TICK_HOST_CALLS/TICK_MARGIN comparison fits it)
             with self.subTest(name):
                 self.assertGreaterEqual(timedelta(minutes=runner.JOBS[name].timeout_min),
                                         runner_jobs.tick_min_timeout(name))
@@ -1797,6 +1807,140 @@ class WatcherPasses(Base):
                                next_due=runner._iso(self.now + MIN))
         r.finish(due.job, None, run_id, runner.ChildOutcome(0, line + "\n", "", False), 720, 1.0)
         self.assertEqual(self.next_due("watch"), soon)
+
+
+class Inbox(Base):
+    """S7: the inbox jobs (docs/phase3a_plan.md §5 S7, §3.2). A `poll` job only runs while
+    POLL_PENDING[name] says there is work, at most once every `poll`; dormant (no due time, only a
+    wake restarts the plan loop's attention to it) once it reports none."""
+
+    def set_pending(self, name, value):
+        old = runner.POLL_PENDING[name]
+        runner.POLL_PENDING[name] = lambda conn, now: value
+        self.addCleanup(runner.POLL_PENDING.__setitem__, name, old)
+
+    def test_s7_owns_the_inbox_jobs(self):
+        self.assertLessEqual({"inbox", "inbox_verify"}, runner.RUNNER_OWNS)
+        self.assertIsNone(runner.JOBS["inbox"].cron_tag)            # no cron line ever ran it (S7 is new)
+        self.assertIsNone(runner.JOBS["inbox_verify"].cron_tag)
+        self.assertLessEqual({"inbox", "inbox_verify"}, set(runner_jobs.FUNCTIONS))
+        self.assertEqual(runner.JOBS["inbox"].poll, timedelta(seconds=30))
+        self.assertEqual(runner.JOBS["inbox_verify"].poll, timedelta(seconds=5))
+        for name in ("inbox", "inbox_verify"):
+            job = runner.JOBS[name]
+            self.assertEqual((job.paused, job.on_interrupt, job.session), ("runs", "rerun", False), name)
+
+    async def test_dormant_until_pending_then_polls_at_its_cooldown(self):
+        self.set_pending("inbox", False)
+        r = self.runner(owns={"inbox"})
+        r.boot()
+        self.assertIsNone(self.next_due("inbox"))        # no catch-up tick: a poll job starts dormant
+        self.assertEqual(r.plan(self.now), [])
+        self.set_pending("inbox", True)
+        due, = r.plan(self.now)
+        self.assertEqual(due.job.name, "inbox")
+        await self.run_due(r, due)
+        self.assertEqual(self.next_due("inbox"), self.now + timedelta(seconds=30))   # the cooldown
+        self.assertEqual(r.plan(self.now + timedelta(seconds=10)), [])               # still cooling down
+        due, = r.plan(self.now + timedelta(seconds=30))
+        self.assertEqual(due.job.name, "inbox")
+        await self.run_due(r, due)
+        self.set_pending("inbox", False)
+        self.assertEqual(r.plan(self.now + timedelta(seconds=60)), [])
+        self.assertIsNone(self.next_due("inbox"))                                    # dormant again
+
+    async def test_a_running_job_is_not_started_twice_while_pending(self):
+        self.set_pending("inbox", True)
+        r = self.runner(owns={"inbox"})
+        r.boot()
+        self.spawner.gates["inbox"] = asyncio.Event()
+        due, = r.plan(self.now)
+        r.start(due, self.now)
+        self.assertEqual(r.plan(self.now), [])                 # already running: not started again
+        self.spawner.gates["inbox"].set()
+        await r.tasks["inbox"]
+
+    def test_an_interrupted_poll_job_is_rerun(self):
+        """on_interrupt=rerun (not keyed): it is simply due now, no alert (D-257 is for "fail" jobs)."""
+        self.prev_boot(self.now - MIN)
+        actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="inbox_verify", key=None, timeout_s=30,
+                          actor="runner:inbox_verify", via="runner")
+        r = self.runner(owns={"inbox_verify"})
+        r.boot()
+        self.assertEqual(self.runs("inbox_verify")[0]["status"], "interrupted")
+        self.assertEqual(self.fails, [])
+        self.assertEqual(self.next_due("inbox_verify"), self.now)
+
+
+class FakeSupervisor:
+    """Records each start (full argv); the run blocks on a fresh gate until it is told to exit."""
+    def __init__(self):
+        self.calls = []
+        self.outcome = runner.ChildOutcome(0, "", "", False)
+        self.gate = asyncio.Event()
+
+    async def run(self, argv, timeout_s, on_pid):
+        self.calls.append(argv)
+        self.gate = asyncio.Event()
+        on_pid(1)                      # pid 1: never really signalled (as FakeSpawner's on_pid(1))
+        await self.gate.wait()
+        return self.outcome
+
+
+class Supervised(Base):
+    """S7: the runner keeps `inbox_api.py serve --no-worker` running as a long-lived child
+    (SUPERVISED): started at boot without an alert, restarted with one on an unexpected exit, ended
+    (not restarted) once a stop was requested."""
+
+    def setUp(self):
+        super().setUp()
+        self.sup = FakeSupervisor()
+
+    def start(self):
+        r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve", "--no-worker")}, spawner=self.sup)
+        r.boot()
+        r.start_supervised("inbox_api")
+        return r
+
+    async def test_starts_at_boot_without_an_alert(self):
+        r = self.start()
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.sup.calls), 1)
+        self.assertEqual(self.sup.calls[0][-2:], ["serve", "--no-worker"])
+        self.assertEqual(self.sup.calls[0][0], sys.executable)
+        self.assertEqual(self.fails, [])
+        self.assertIn("inbox_api", r.sup_tasks)
+        self.assertEqual(r.sup_pids["inbox_api"], 1)
+
+    async def test_never_started_twice(self):
+        r = self.start()
+        await asyncio.sleep(0)
+        r.start_supervised("inbox_api")
+        self.assertEqual(len(self.sup.calls), 1)
+
+    async def test_an_unexpected_exit_is_restarted_and_alerted(self):
+        r = self.start()
+        await asyncio.sleep(0)
+        self.sup.outcome = runner.ChildOutcome(1, "", "boom", False)
+        self.sup.gate.set()
+        for _ in range(100):
+            if len(self.sup.calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(self.sup.calls), 2)
+        self.assertEqual(self.subjects(), ["inbox_api was not running"])
+        self.assertTrue(self.fails[0][3])                      # alert + pause, like any other runner failure
+        self.assertIn("inbox_api", r.sup_tasks)                 # the restart is running again
+
+    async def test_stop_ends_it_without_restarting(self):
+        r = self.start()
+        await asyncio.sleep(0)
+        r.request_stop()                 # SIGTERMs its (fake) pid right away: it does not wait for a tick
+        self.sup.gate.set()
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.sup.calls), 1)
+        self.assertEqual(self.fails, [])
+        self.assertEqual(r.sup_tasks, {})
 
 
 class PassChild(unittest.TestCase):
