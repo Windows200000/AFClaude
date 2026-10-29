@@ -76,9 +76,11 @@ import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
-# user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it)
-ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|runner(:[a-z0-9_-]{1,32})?|mcp(:[A-Za-z0-9._-]{1,64})?"
-                      r"|user:[1-9][0-9]{0,17})$")
+# user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
+# setup: an anonymous browser spending a one-time setup/reset code (phase 6a W7) -- the one write a
+# pre-session makes, before there is a user_id to act as.
+ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|setup|runner(:[a-z0-9_-]{1,32})?"
+                      r"|mcp(:[A-Za-z0-9._-]{1,64})?|user:[1-9][0-9]{0,17})$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 IDEMPOTENCY_TTL = timedelta(days=7)
 OWN_LIST = os.environ.get("AFCLAUDE_OWN_LIST", os.path.join(HERE, "data", "own_sessions.txt"))
@@ -524,7 +526,7 @@ DAYS = schedule.DAYS
 GROUP_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 WINDOW_MODES = ("linked", "individual", "week", "link")
 SESSION_HOURS = afclaude_config.SESSION_LENGTH.total_seconds() / 3600   # 5: one session-limit window
-SECTIONS = ("schedule", "budget", "automation", "storage", "auth")
+SECTIONS = ("schedule", "budget", "automation", "storage", "auth", "host")
 
 
 SettingCheck = Callable[[Any, Optional[sqlite3.Connection]], Any]   # (value, conn) -> normalized value
@@ -728,6 +730,14 @@ def _remote_control(category: str) -> Setting:
 
 
 USAGE_MODELS = ("pacing", "linear")
+# D-229's plan names: interpretation, since Anthropic's own naming (and the owner's exact seat type,
+# standard vs premium) is not settled by the decision; 5d's X3 is free to widen this list.
+# CLAUDE_PLAN_UNSET is not a plan: it is claude_plan's code default (D-146/D-169), so the wizard has
+# something to ask about instead of a guessed real one (D-229: AFClaude asks at first startup). A
+# step that sets the owner's plan must require one of the other choices; nothing reads this setting
+# today, but anything that does must treat CLAUDE_PLAN_UNSET as "not answered yet", never as a plan.
+CLAUDE_PLAN_UNSET = "unset"
+CLAUDE_PLANS = (CLAUDE_PLAN_UNSET, "free", "pro", "max_5x", "max_20x", "team", "enterprise")
 
 # Everything the dashboard can change (D-146): the runners read these (afclaude_config.setting()),
 # DB value > code default; data/afclaude.json keeps only machine identity. Names are flat (§7.4).
@@ -805,6 +815,12 @@ SETTINGS: dict[str, Setting] = {
                                         section="automation", kind="text"),
     "ui_chat_reset_hours": _num(5, 1, 168, "Dashboard message box to the task-manager (D-178): it starts "
                               "empty again after this many hours without a new message or answer", "automation"),
+    "preview_publish_enabled": _flag(False, "Owner preview build of the dashboard UI (D-211): "
+                                     "tools/build_preview.py (host-only, needs the pinned Node, D-292) builds and "
+                                     "publishes dashboard/web's dist-preview/ next to the quickview export, and "
+                                     "export_quickview.py's preview_block reports it in status.json; off = no "
+                                     "build, no publish, no new status.json field (default, until ovm3 has the "
+                                     "matching /private proxy, D-253's pattern)", "automation"),
     "stall_take_over_idle": _flag(True, "Dispatcher: an idle interactive process (e.g. an open terminal) "
                                   "that holds an approved stalled session is stopped so it can be continued",
                                   "automation"),
@@ -916,6 +932,15 @@ SETTINGS: dict[str, Setting] = {
                                "Dashboard: failed sign-ins allowed per account and per client address within "
                                "window_min minutes before exponential backoff (repeated failures alert)",
                                section="auth", kind="login_rate"),
+    # --- host (phase 6a W7 / 5d; design §10.4, D-229). 5d's X3 (not built) adds working_root and the
+    # rest of this section's settings; it reuses this key rather than redefining it.
+    "claude_plan": Setting(CLAUDE_PLAN_UNSET, _choice(CLAUDE_PLANS),
+                           "The owner's Claude subscription plan, asked once at first startup (D-229); "
+                           "\"unset\" until the wizard's step is done (it must get a real choice, never "
+                           "leave this as \"unset\") so AFClaude can adjust plan-dependent numbers (weekly "
+                           "limit, session length, available models); changing it later does not retune "
+                           "those on its own, a measured value always wins where one exists",
+                           section="host", kind="enum", choices=CLAUDE_PLANS),
 }
 RUNNER_TIMEOUT = "runner_timeout_"
 
@@ -2389,6 +2414,70 @@ def auth_session_touch(conn: sqlite3.Connection, session_id: int) -> bool:
         with store.transaction(conn):
             return store.touch_auth_session(conn, session_id, store.iso_ms(store._utcnow() - TOUCH_EVERY))
     return store.retrying(run, conn)
+
+
+# ---------------------------------------------------------------- setup codes (phase 6a W7)
+#
+# docs/phase6a_plan.md §3.7, design §9.3 / §10.4. dashboard/setup.py generates the raw code, hashes it
+# and (for 'first_owner') races to claim it and create the first owner in one transaction; this module
+# never sees a raw code, only its sha256 (mint_code's caller hashes it) and a row id (claim_code's
+# caller already matched the submission against the open row in constant time, store.open_setup_code).
+# The actual 'first_owner' -> a user row is 5a's (store.setup_codes has no users FK yet, §7.1): until
+# then dashboard.setup's OwnerRegistry hook raises, same as sessions.py's no_roles.
+
+SETUP_CODE_TTL_MAX_H = 24 * 30
+
+
+def _setup_kind(v: Any) -> str:
+    return store._enum(v, store.SETUP_CODE_KINDS, "kind")
+
+
+def _setup_code_id(v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"id must be a positive integer, got {v!r}")
+    return v
+
+
+@action("setup.mint_code", "setup_code")
+def setup_mint_code(conn: sqlite3.Connection, ctx: Ctx, kind: Any, code_hash: Any, ttl_hours: Any,
+                    user_id: Any = None) -> Result:
+    """A fresh one-time code, already hashed by the caller: dashboard/setup.py generates the raw
+    code and keeps it only long enough to print or show it once, never passing it to this module or
+    into the audit log. 'first_owner' (user_id None, minted while the install has no owner yet --
+    this module can't check that itself without 5a's users table, so the caller decides when) or
+    'reset' (user_id set, afclaude admin reset-auth). Supersedes any other open code of the same
+    (kind, user_id) first, so at most one is ever live. -> {id, kind, user_id, expires_at}."""
+    k, h = _setup_kind(kind), _sha256_hex(code_hash, "code_hash")
+    uid = None if user_id is None else _user_id(user_id)
+    if isinstance(ttl_hours, bool) or not isinstance(ttl_hours, (int, float)) or not 0 < ttl_hours <= SETUP_CODE_TTL_MAX_H:
+        raise ValueError(f"ttl_hours must be a number in (0, {SETUP_CODE_TTL_MAX_H}]")
+    expires_at = store.iso_ms(store._utcnow() + timedelta(hours=ttl_hours))
+    store.supersede_open_setup_codes(conn, k, uid)
+    cid = store.add_setup_code(conn, k, uid, h, expires_at)
+    return Result({"id": cid, "kind": k, "user_id": uid, "expires_at": expires_at}, cid, None,
+                  {"kind": k, "user_id": uid, "expires_at": expires_at})
+
+
+@action("setup.claim_code", "setup_code")
+def setup_claim_code(conn: sqlite3.Connection, ctx: Ctx, id: Any, kind: Any, user_id: Any = None) -> Result:
+    """Spend one setup code by row id: the caller already matched the submitted code against this
+    row in constant time (dashboard.setup.SetupFlow, store.open_setup_code) and names the (kind,
+    user_id) it expects, so a claim can't be replayed against a different code than the one it was
+    checked against. Single use and not expired; store.claim_setup_code's UPDATE ... WHERE used_at IS
+    NULL is the race guard (two browsers claiming the same code: one winner). -> {id, kind, user_id}."""
+    cid, k = _setup_code_id(id), _setup_kind(kind)
+    uid = None if user_id is None else _user_id(user_id)
+    row = store.get_setup_code_by_id(conn, cid)
+    if row is None or row["kind"] != k or row["user_id"] != uid:
+        raise store.NotFound("no such setup code")
+    if row["used_at"] is not None:
+        raise store.InvalidTransition("this code has already been used")
+    now = store.now_iso()
+    if store._utcnow() >= _when(row["expires_at"]):
+        raise store.InvalidTransition("this code has expired")
+    if not store.claim_setup_code(conn, cid, now):
+        raise store.InvalidTransition("this code has already been used")   # lost the race
+    return Result({"id": cid, "kind": k, "user_id": uid}, cid, {"used_at": None}, {"used_at": now})
 
 
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)

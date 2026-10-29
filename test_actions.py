@@ -572,7 +572,7 @@ class SettingActions(Base):
                           "session_stop_pct": 95.0, "fillup_enabled": True, "fillup_factor": 1.1,
                           "run_start_factor": 1.5, "window_ping": True,
                           "compaction_enabled": True, "compaction_threshold_tokens": 150_000,
-                          "ui_chat_reset_hours": 5.0,
+                          "ui_chat_reset_hours": 5.0, "preview_publish_enabled": False,
                           "automation_paused": False, "automation_paused_reason": "",
                           "stall_take_over_idle": True, "stall_verify_minutes": 15.0,
                           "cleanup_finished_grace_minutes": 10.0, "cleanup_idle_hours": 2.0,
@@ -587,12 +587,14 @@ class SettingActions(Base):
                           "runner_timeout_watch": 12.0, "runner_timeout_run_readings": 10.0,
                           "runner_timeout_compaction_check": 6.0, "runner_timeout_last_stretch": 80.0,
                           "runner_timeout_deferred_start": 80.0, "runner_timeout_fillup": 80.0,
-                          "runner_timeout_compaction": 60.0, "runner_start_catchup": 30.0,
+                          "runner_timeout_compaction": 60.0, "runner_timeout_inbox": 5.0,
+                          "runner_timeout_inbox_verify": 0.5, "runner_start_catchup": 30.0,
                           "runner_runs_retention_days": 30.0, "restore_starts_paused": True,
                           "auth_idle_timeout_min": 30, "auth_absolute_lifetime_h": 12,
                           "auth_remember_device_days": 7, "auth_reauth_window_min": 10,
                           "auth_max_sessions_per_user": 10,
-                          "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15}})
+                          "auth_login_rate": {"account_failures": 5, "ip_failures": 20, "window_min": 15},
+                          "claude_plan": "unset"})
 
     def test_registry_metadata(self):
         """Every setting has a section, a type, a one-line explanation (D-075) and a default that
@@ -1100,6 +1102,8 @@ class EveryAction(Base):
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
                                              "bundle_sha256": "0" * 64, "kind": "backup"}}),
             ("install.stamp", {}),
+            ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
+            ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
             ("auth.session_login", {"user_id": 7, "id_sha256": "1" * 64, "csrf_sha256": "2" * 64,
                                     "factors": ["passkey_hw"]}),
             ("auth.session_rotate", {"id_sha256": "1" * 64, "new_id_sha256": "3" * 64, "new_csrf_sha256": "4" * 64,

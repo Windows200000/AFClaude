@@ -1302,7 +1302,7 @@ class AtJobs(Base):
         self.assertEqual(at, timedelta(minutes=runner.JOBS["at"].timeout_min))
         for tick in ("sampler", "usage_review"):
             self.assertGreaterEqual(at, runner_jobs.tick_min_timeout(tick), tick)
-        callers = subprocess.run(["grep", "-rlE", "--exclude-dir=.claude", r'\["at",', "--include=*.py", "."], cwd=HERE,
+        callers = subprocess.run(["grep", "-rlE", r'\["at",', "--include=*.py", "--exclude-dir=.claude", "."], cwd=HERE,
                                  capture_output=True, text=True).stdout.split()
         self.assertEqual(sorted(c for c in callers if not os.path.basename(c).startswith("test_")),
                          ["./usage_review.py", "./usage_sampler.py"])     # a new caller: check its worst case
