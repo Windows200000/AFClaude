@@ -19,6 +19,8 @@ group gets SIGTERM, SIGKILL 10 s later, the run is recorded `timeout` and fails.
 3 = failed and already reported by the handler, anything else = failed and reported here
 (failstop.fail: an alert and the pause, D-235; a job with pause_on_failure=False only alerts,
 D-239.3). At most one run per job at a time; a tick still running at its next tick skips that tick.
+A tick that timed out or failed is that run's failure (D-234), not runner downtime (D-257): its
+row is ended, its next tick is on time, and a later boot neither reruns nor reports it again.
 
 Records: runner_jobs (one row per job + the row 'runner' with the loop's heartbeat) and
 runner_runs (one row per run; a keyed run, e.g. a session-window start, can't run twice: UNIQUE
@@ -42,7 +44,9 @@ older than 5 min (a wedged loop; Docker's restart policy then restarts the conta
 Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) moves jobs from
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
-(stall_scan, prune_runs); cron still runs the rest.
+(stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
+docs_import, prune_logs, usage_review); cron still runs the window start, the at-jobs, the watcher
+watchdog and the inbox API watchdog.
 
 Shadow (S2-S7, §5 S2): for every job cron still runs, the runner logs when it WOULD start it
 (data/runner_shadow.log, component runner_shadow), waking at that time as it would for its own
@@ -130,7 +134,8 @@ class Job:
     off by a restart is rerun or "fail"s (alert + pause, D-257); session: it types into the
     task-manager session (a drain holds it); pause_on_failure: False = a failure alerts only
     (D-239.3); cron_tag: its docker/crontab line's tag (the cut-over check, the shadow); argv: the
-    child's command instead of runner_jobs.py (tests); offset: see every."""
+    child's command instead of runner_jobs.py (tests); offset: see every; what: what it does, for
+    the quickview's schedule list (default: the cron tag)."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
@@ -143,6 +148,7 @@ class Job:
     cron_tag: Optional[str] = None
     argv: Optional[tuple[str, ...]] = None
     offset: timedelta = timedelta(0)
+    what: str = ""
 
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
@@ -160,24 +166,32 @@ class Job:
 
 
 SEC, MIN = timedelta(seconds=1), timedelta(minutes=1)
+# The ticks' timeouts (S3) are above the sum of each handler's own worst-case inner timeouts + 1 min
+# (runner_jobs.tick_inner; test_runner checks it), so a slow run that is still within its own limits
+# is never killed, and a hung host call fails with its own clear error first. Measured on cron's
+# runs before S3: sampler p99 10.4 s, max 13.8 s (1129 runs, 09.-21.10., app_log; its hourly Haiku
+# call is ~5 s of that); dispatcher pass p99 2 s, max 2 s (3440 armed passes, 29.09.-21.10.,
+# dispatcher.log; no pass continued a session in that time). Every timeout is far above them.
 JOBS: dict[str, Job] = {j.name: j for j in (
     # 90 s off the minute: never at the same second as the quickview's and the dispatcher's scans
     # (cron starts every line on a whole minute), so the three don't contend for the DB at once
-    Job("stall_scan", 2, every=3 * MIN, offset=90 * SEC),
-    Job("sampler", 10, every=15 * MIN, cron_tag="AFClaude usage sampler"),
-    Job("dispatcher", 8, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
+    Job("stall_scan", 2, every=3 * MIN, offset=90 * SEC, what="stall scan (stalled.scan)"),
+    Job("sampler", 20, every=15 * MIN, cron_tag="AFClaude usage sampler"),
+    Job("dispatcher", 20, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
     Job("quickview", 2, every=3 * MIN, pause_on_failure=False, cron_tag="AFClaude quickview export"),
     Job("docs_import", 5, every=10 * MIN, cron_tag="AFClaude docs import"),
     Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),
-    Job("prune_runs", 10, daily=(3, 27)),
-    Job("usage_review", 15, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
+    Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
+    Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
     Job("window_start", 70, window_start=True, paused="handler", on_interrupt="fail", session=True,
         cron_tag="AFClaude window-start"),
 )}
 # What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
-# here and removes their cron lines in the same commit). S2: the new jobs only, which have no cron
-# line: the stall_scan tick and the daily prune of the runner's own run records.
-RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs"})
+# here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
+# stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
+# cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them).
+RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
+                                         "docs_import", "prune_logs", "usage_review"})
 
 
 # ---------------------------------------------------------------- paths, log, small helpers

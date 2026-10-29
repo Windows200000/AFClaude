@@ -20,7 +20,8 @@ serves at /afclaude/:
                 one markdown string, + task-store inbox), page_version (the published
                 page's stamp: a page that doesn't match is an old copy and says so),
                 the owner's message box to the task-manager (counts only:
-                the page reads the messages from the inbox API, D-241), AFClaude cron entries, the task-manager's context (D-237:
+                the page reads the messages from the inbox API, D-241), what is scheduled (the AFClaude cron lines, plus the resident
+                runner's jobs from runner_jobs while it runs), the task-manager's context (D-237:
                 size, cache expiry, the next re-read's cost, a daily split; the compaction
                 attempts of D-238; compact_timing.context_block), each project's
                 task-manager model / effort (D-260, manager_launch.py; data only, the page
@@ -35,7 +36,8 @@ Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
 ~/.claude.json cache that the sampler keeps fresh. All times Europe/Berlin.
 Also publishes the page itself (quickview/AFClaude.html -> AFClaude.html, D-253).
-Run from cron every few minutes (via flock); each file is replaced atomically.
+Run every 3 min (the runner's quickview job, or cron in the legacy mode; via flock); each
+file is replaced atomically.
 """
 import glob
 import hashlib
@@ -953,7 +955,68 @@ def next_review_block():
     return {"at_berlin": win["at_berlin"], "which": win["kind"], "label": win["label"], "secondary": secondary}
 
 
+RUNNER_MODES = ("on", "runner")     # AFCLAUDE_SCHEDULER values with the resident runner (phase 3a §4)
+
+
 def cron_entries():
+    """What is scheduled: the crontab lines tagged AFClaude (owner "cron") and, while the resident
+    runner runs (AFCLAUDE_SCHEDULER on/runner; not in legacy, where cron runs everything), its own
+    jobs from runner_jobs (owner "runner", phase 3a S3). A display path: a runner read that fails
+    is shown as an entry with its error, never raised (D-239.3)."""
+    out = crontab_entries()
+    if os.environ.get("AFCLAUDE_SCHEDULER", "off") in RUNNER_MODES:
+        out += runner_entries()
+    return out
+
+
+def runner_schedule(job):
+    """A runner job's cadence as (UTC, Berlin) text."""
+    if job.every is not None:
+        mins = job.every.total_seconds() / 60
+        txt = f"every {mins:g} min" if mins < 60 else f"every {mins / 60:g} h"
+        if job.offset:
+            txt += f" (+{job.offset.total_seconds():g} s)"
+        return txt, txt
+    if job.daily is not None:
+        t = datetime.now(UTC).replace(hour=job.daily[0], minute=job.daily[1], second=0, microsecond=0)
+        return f"daily {t:%H:%M} UTC", f"daily {t.astimezone(ka.BERLIN):%H:%M %Z}"
+    return "each session-window start", "each session-window start"
+
+
+def runner_entries(conn=None, now=None):
+    """The runner's jobs (runner.RUNNER_OWNS) with their next due time and last run, from
+    runner_jobs; the first entry is the runner itself (its loop heartbeat)."""
+    now = now or datetime.now(UTC)
+    try:
+        import actions
+        import runner
+        own = conn is None
+        conn = conn or store.connect()
+        try:
+            rows = store.runner_job_rows(conn)
+        finally:
+            if own:
+                conn.close()
+    except Exception as e:  # noqa: BLE001 - shown on the page, never breaks the export
+        return [{"owner": "runner", "schedule_utc": "", "schedule_berlin": "", "what": "resident runner",
+                 "error": f"{type(e).__name__}: {str(e)[:300]}"}]
+
+    def when(v):
+        return bstr(store.parse_iso(v)) if v else None
+    beat = store.parse_iso((rows.get(actions.RUNNER_ROW) or {}).get("heartbeat_at"))
+    out = [{"owner": "runner", "schedule_utc": "", "schedule_berlin": "", "what": "resident runner (runner.py serve)",
+            "heartbeat_berlin": bstr(beat), "heartbeat_age_s": round((now - beat).total_seconds()) if beat else None}]
+    for name in sorted(runner.RUNNER_OWNS):
+        job, r = runner.JOBS[name], rows.get(name) or {}
+        utc, berlin = runner_schedule(job)
+        out.append({"owner": "runner", "job": name, "schedule_utc": utc, "schedule_berlin": berlin,
+                    "what": job.what or job.cron_tag or name, "next_due_berlin": when(r.get("next_due")),
+                    "last_status": r.get("last_status"), "last_ok_berlin": when(r.get("last_ok_at")),
+                    "consecutive_failures": r.get("consecutive_failures") or 0})
+    return out
+
+
+def crontab_entries():
     # In the manager container supercronic runs a crontab FILE (AFCLAUDE_CRONTAB);
     # there is no `crontab -l` there.
     if os.environ.get("AFCLAUDE_CRONTAB"):
@@ -972,7 +1035,7 @@ def cron_entries():
             sched = line.split()[0]
         else:
             sched = " ".join(line.split()[:5])
-        out.append({"schedule_utc": sched, "schedule_berlin": cron_berlin(sched),
+        out.append({"owner": "cron", "schedule_utc": sched, "schedule_berlin": cron_berlin(sched),
                     "what": comment or line[len(sched):].strip()[:120]})
     return out
 

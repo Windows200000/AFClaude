@@ -836,12 +836,13 @@ SETTINGS: dict[str, Setting] = {
                                kind="component_days"),
     # --- the resident runner (phase 3a, runner.py; docs/phase3a_plan.md §3.2-3.5). Each job's outer
     # timeout is the setting RUNNER_TIMEOUT + <job> (minutes; D-234: a run past it is killed, recorded
-    # as a timeout and fails), defaulting to its runner.JOBS entry (a test keeps both equal).
+    # as a timeout and fails), defaulting to its runner.JOBS entry (a test keeps both equal). A tick's
+    # default is above its handler's own worst-case inner timeouts + 5 min (runner_jobs.TICK_INNER).
     "runner_timeout_stall_scan": _num(2, 0.5, 720, "Runner: minutes a stall scan may run before it is killed "
                                       "and fails (D-234)", "automation"),
-    "runner_timeout_sampler": _num(10, 0.5, 720, "Runner: minutes a usage-sampler run may take before it is "
+    "runner_timeout_sampler": _num(20, 0.5, 720, "Runner: minutes a usage-sampler run may take before it is "
                                    "killed and fails (D-234)", "automation"),
-    "runner_timeout_dispatcher": _num(8, 0.5, 720, "Runner: minutes a dispatcher pass may take before it is "
+    "runner_timeout_dispatcher": _num(20, 0.5, 720, "Runner: minutes a dispatcher pass may take before it is "
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_quickview": _num(2, 0.5, 720, "Runner: minutes a quickview export may take before it is "
                                      "killed (an alert, no pause: D-239)", "automation"),
@@ -851,7 +852,7 @@ SETTINGS: dict[str, Setting] = {
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_prune_runs": _num(10, 0.5, 720, "Runner: minutes the daily prune of its run records may "
                                       "take before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_usage_review": _num(15, 0.5, 720, "Runner: minutes a usage-review run may take before it "
+    "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
                                         "is killed and fails (D-234)", "automation"),
     # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
     # test_runner checks it), so an inner timeout, with its own clear error, always fires first

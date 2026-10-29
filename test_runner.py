@@ -353,7 +353,7 @@ class Runs(Base):
                 self.spawner.outcomes["sampler"] = outcome
                 run_id = await self.run_due(r, runner.Due(job))
                 row = store.get_run(self.conn, run_id)
-                self.assertEqual((row["status"], row["pid"], row["timeout_s"]), (status, 1, 600.0))
+                self.assertEqual((row["status"], row["pid"], row["timeout_s"]), (status, 1, 1200.0))
                 self.assertEqual(self.subjects(), subjects)
         jr = store.get_runner_job(self.conn, "sampler")
         self.assertEqual((jr["last_status"], jr["consecutive_failures"]), ("failed", 4))
@@ -799,9 +799,6 @@ class Shadow(Base):
         with self.assertRaises(ValueError):
             runner.Job("x", 1, daily=(1, 1), offset=SEC)
 
-    def test_s2_owns_the_new_jobs_only(self):
-        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs"}))
-        self.assertEqual([n for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag], [])   # none cron ran
 
     def test_shadow_lines_for_the_jobs_cron_runs(self):
         lines = []
@@ -965,6 +962,155 @@ class Ensure(Base):
                         tx.sendto(b"w", path)
             self.assertTrue(runner.wake(path))
         self.assertFalse(runner.wake(os.path.join(self.tmp, "none.sock")))
+
+
+# ---------------------------------------------------------------- S3: the simple ticks
+
+S3_TICKS = ("sampler", "dispatcher", "quickview", "docs_import", "prune_logs", "usage_review")
+TINY = timedelta(microseconds=1)
+
+
+def crontab_lines(name):
+    with open(os.path.join(HERE, "docker", name), encoding="utf-8") as fh:
+        return [ln for ln in fh.read().splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+def cron_field(field, lo, hi):
+    """The values a crontab field matches (*, */N, N, a,b)."""
+    out = set()
+    for part in field.split(","):
+        if part == "*":
+            out |= set(range(lo, hi + 1))
+        elif part.startswith("*/"):
+            out |= set(range(lo, hi + 1, int(part[2:])))
+        else:
+            out.add(int(part))
+    return out
+
+
+def cron_times(line, a, b):
+    """The minutes in [a, b) at which a crontab line runs (UTC: the container's clock)."""
+    f = line.split()[:5]
+    assert f[2:] == ["*", "*", "*"], line
+    mins, hours = cron_field(f[0], 0, 59), cron_field(f[1], 0, 23)
+    out, t = [], a
+    while t < b:
+        if t.minute in mins and t.hour in hours:
+            out.append(t)
+        t += MIN
+    return out
+
+
+class SimpleTicks(Base):
+    """S3: sampler, dispatcher, quickview, docs_import, prune_logs, usage_review move from cron to
+    the runner; the legacy crontab keeps them; a timed-out tick is its run's failure, not D-257."""
+
+    def test_s3_owns_the_simple_ticks(self):
+        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs"} | set(S3_TICKS)))
+        self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, {"window_start"})   # S5
+
+    def test_crontab_per_mode(self):
+        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
+        for name in S3_TICKS:
+            tag = runner.JOBS[name].cron_tag
+            self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
+            self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
+        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) - 1)    # + the runner watchdog in `on`
+        self.assertTrue(any(runner.JOBS["window_start"].cron_tag in ln for ln in cron))
+
+    def test_each_tick_runs_what_its_cron_line_ran(self):
+        """Registration: the handler has the legacy line's script, arguments, log file and flock."""
+        legacy = crontab_lines("crontab.legacy")
+        for name in S3_TICKS:
+            with self.subTest(name):
+                h = runner_jobs.HANDLERS[name]
+                line, = [ln for ln in legacy if runner.JOBS[name].cron_tag in ln]
+                cmd = line.split(" # ")[0]
+                self.assertIn(f"{h.script} {' '.join(h.args)}".strip(), cmd)
+                log = ("$KEEPALIVE_STATE_DIR/" + h.log[len("keepalive/"):] if h.log.startswith("keepalive/")
+                       else f"$AFCLAUDE_DIR/data/{h.log}")
+                self.assertIn(f">> {log} 2>&1", cmd)
+                self.assertEqual(f"flock -n $AFCLAUDE_DIR/data/{h.lock} " in cmd, h.lock is not None)
+
+    def test_each_cadence_is_its_cron_lines(self):
+        legacy = crontab_lines("crontab.legacy")
+        a = datetime(2026, 10, 24, 22, 0, tzinfo=UTC)                    # over the DST night (UTC: no change)
+        b = a + timedelta(days=2)
+        for name in S3_TICKS:
+            with self.subTest(name):
+                job = runner.JOBS[name]
+                line, = [ln for ln in legacy if job.cron_tag in ln]
+                ticks, t = [], a - TINY
+                while True:
+                    t = runner.next_tick(job, t)
+                    if t >= b:
+                        break
+                    ticks.append(t)
+                self.assertEqual(ticks, cron_times(line, a, b))
+
+    def test_tick_timeouts_exceed_their_inner_timeouts_and_the_measured_p99(self):
+        for name in runner.RUNNER_OWNS:
+            with self.subTest(name):
+                self.assertGreaterEqual(timedelta(minutes=runner.JOBS[name].timeout_min),
+                                        runner_jobs.tick_min_timeout(name))
+        # the measured p99 before S3 (runner.JOBS): sampler 10.4 s, dispatcher 2 s
+        self.assertGreater(runner.JOBS["sampler"].timeout_min * 60, 100 * 10.4)
+        self.assertGreater(runner.JOBS["dispatcher"].timeout_min * 60, 100 * 2)
+        self.assertGreater(runner_jobs.tick_min_timeout("usage_review"), timedelta(minutes=10))   # its LOCK_WAIT
+
+    def test_the_declared_tick_call_timeouts_are_in_the_sources(self):
+        found = {}
+        for mod in {c[0] for calls in runner_jobs.TICK_HOST_CALLS.values() for c in calls}:
+            with open(os.path.join(HERE, mod + ".py"), encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for f in ast.walk(tree):
+                if isinstance(f, ast.FunctionDef):
+                    for n in ast.walk(f):
+                        if isinstance(n, ast.keyword) and n.arg == "timeout" and isinstance(n.value, ast.Constant):
+                            found.setdefault((mod, f.name), set()).add(n.value.value)
+        for job, calls in runner_jobs.TICK_HOST_CALLS.items():
+            for mod, fn, secs, _ in calls:
+                with self.subTest(job=job, call=f"{mod}.{fn}"):
+                    self.assertIn(secs, found.get((mod, fn), set()))
+
+    async def test_a_timed_out_tick_is_its_runs_failure_not_runner_downtime(self):
+        """D-234: an alert (+ the pause unless pause_on_failure=False, D-239.3); not D-257: the next
+        tick is on time, and the next boot neither reruns it nor alerts for it again."""
+        r = self.runner(owns={"sampler", "quickview"})
+        r.boot()
+        for name in ("sampler", "quickview"):
+            self.spawner.outcomes[name] = runner.ChildOutcome(-15, "", "", True)
+            await self.run_due(r, runner.Due(runner.JOBS[name]))
+        self.assertEqual([(f[1], f[3]) for f in self.fails],
+                         [("sampler timed out", True), ("quickview timed out", False)])
+        self.assertEqual((self.next_due("sampler"), self.next_due("quickview")), (START + 15 * MIN, START + 3 * MIN))
+        self.assertEqual([x["status"] for x in self.runs()], ["timeout", "timeout"])
+        actions.runner_state_put(self.conn, {"clean_exit": True}, actor="runner", via="runner")
+        self.fails.clear()
+        self.now = START + MIN
+        r2 = self.runner(owns={"sampler", "quickview"})
+        r2.boot()
+        self.assertEqual((self.fails, r2.reruns), ([], []))             # no unclean exit, nothing interrupted
+        self.assertEqual(r2.plan(self.now), [])                           # due at their next tick, not now
+        self.now = START + 15 * MIN
+        self.assertEqual([d.job.name for d in r2.plan(self.now)], ["quickview", "sampler"])
+
+    async def test_a_sampler_slower_than_the_old_timeout_is_not_killed(self):
+        r = self.runner(owns={"sampler"})
+        await self.run_due(r, runner.Due(runner.JOBS["sampler"]))
+        self.assertGreater(self.spawner.calls[-1][2], 15 * 60)            # was 10 min (S1)
+
+    def test_a_job_runs_in_the_repo_directory(self):
+        path = os.path.join(testenv.DIR, "t_cwd.py")
+        with open(path, "w") as fh:
+            fh.write("import os; print('cwd=' + os.getcwd())\n")
+        code = PRELUDE + ("import runner_jobs as r; r.HANDLERS['t'] = r.Handler(sys.argv[1], (), 't_cwd.log'); "
+                          "sys.exit(r.main(['t']))")
+        p = subprocess.run([sys.executable, "-c", code, path], cwd="/", capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, PYTHONPATH=HERE))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(testenv.DIR, "t_cwd.log")) as fh:
+            self.assertIn(f"cwd={HERE}", fh.read())
 
 
 if __name__ == "__main__":

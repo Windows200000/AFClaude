@@ -386,6 +386,56 @@ class AutomationPaused(unittest.TestCase):
         self.assertLess(page.index('id="paused"'), page.index('id="s-input"'))
 
 
+class ScheduleSection(unittest.TestCase):
+    """The page's schedule ("cron") section, phase 3a S3: the crontab's AFClaude lines, plus the
+    resident runner's jobs from runner_jobs while it runs (AFCLAUDE_SCHEDULER on/runner)."""
+    REPO = os.path.dirname(os.path.abspath(__file__))
+
+    def entries(self, mode, crontab):
+        from unittest import mock
+        env = {"AFCLAUDE_SCHEDULER": mode, "AFCLAUDE_CRONTAB": os.path.join(self.REPO, "docker", crontab)}
+        with mock.patch.dict(os.environ, env):
+            return qv.cron_entries()
+
+    def test_on_mode_lists_the_runners_jobs_with_their_rows(self):
+        import runner
+        conn = store.connect()
+        try:
+            actions.runner_job_set(conn, "runner", actor="runner", via="runner", heartbeat_at="2026-10-21T10:00:00Z")
+            actions.runner_job_set(conn, "sampler", actor="runner", via="runner", next_due="2026-10-21T10:15:00Z",
+                                   last_status="timeout", consecutive_failures=2)
+        finally:
+            conn.close()
+        out = self.entries("on", "crontab")
+        cron = [e for e in out if e["owner"] == "cron"]
+        mine = {e.get("job"): e for e in out if e["owner"] == "runner"}
+        self.assertTrue(any("window-start" in e["what"] for e in cron))
+        self.assertFalse(any("usage sampler" in e["what"] for e in cron))   # S3: the runner's now
+        self.assertEqual(set(mine) - {None}, set(runner.RUNNER_OWNS))
+        self.assertIsNotNone(mine[None]["heartbeat_berlin"])
+        s = mine["sampler"]
+        self.assertEqual((s["schedule_utc"], s["what"], s["last_status"], s["consecutive_failures"]),
+                         ("every 15 min", "AFClaude usage sampler", "timeout", 2))
+        self.assertIn("21.10. 12:15", s["next_due_berlin"])
+        self.assertEqual(mine["prune_logs"]["schedule_utc"], "daily 03:17 UTC")
+        self.assertEqual(mine["stall_scan"]["schedule_utc"], "every 3 min (+90 s)")
+
+    def test_legacy_mode_lists_the_legacy_crontab_only(self):
+        out = self.entries("legacy", "crontab.legacy")
+        self.assertEqual({e["owner"] for e in out}, {"cron"})
+        whats = " ".join(e["what"] for e in out)
+        for tag in ("usage sampler", "dispatcher", "quickview export", "docs import", "log retention",
+                    "usage-model review", "window-start"):
+            self.assertIn(tag, whats)
+
+    def test_a_runner_read_that_fails_is_shown(self):
+        from unittest import mock
+        with mock.patch.object(qv.store, "runner_job_rows", side_effect=RuntimeError("db gone")):
+            out = qv.runner_entries()
+        self.assertEqual(len(out), 1)
+        self.assertIn("RuntimeError: db gone", out[0]["error"])
+
+
 class WindowInfo(unittest.TestCase):
     """The 23:00-09:00 window spans midnight: inside it, the next window is the following
     evening's; outside, this evening's."""

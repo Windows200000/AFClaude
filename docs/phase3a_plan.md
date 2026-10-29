@@ -75,12 +75,12 @@ The rows in bold are the same kind of failure as on 15.10. 3a fixes all of them.
 | job | trigger | timeout (setting `runner_timeout_<job>`) | while paused | on interrupt | calls |
 |---|---|---|---|---|---|
 | `stall_scan` | 3 min (new: its own tick, §5.1) | 2 min | runs | rerun | `stalled.scan` |
-| `sampler` | 15 min | 10 min | runs (D-239.4) | rerun | `usage_sampler.main` |
-| `dispatcher` | 10 min | 8 min | the handler checks | rerun | `dispatcher.main(--arm --once)` |
+| `sampler` | 15 min | 20 min (S3) | runs (D-239.4) | rerun | `usage_sampler.main` |
+| `dispatcher` | 10 min | 20 min (S3) | the handler checks | rerun | `dispatcher.main(--arm --once)` |
 | `quickview` | 3 min | 2 min | runs; a failure alerts but never pauses (D-239.3) | rerun | `export_quickview` |
 | `docs_import` | 10 min | 5 min | runs | rerun | `project_docs import --cron` |
 | `prune_logs` | daily 03:17 UTC | 10 min | runs | rerun | `store.py prune-logs` |
-| `usage_review` | hourly | 15 min | the handler checks | rerun | `usage_review.main` (the backstop for the chain) |
+| `usage_review` | hourly | 30 min (S3) | the handler checks | rerun | `usage_review.main` (the backstop for the chain) |
 | `at:<id>` | `scheduled_jobs.run_at` | 30 min or payload `timeout` | the job checks | payload `on_interrupt` (default `fail`; chain steps and samples `rerun`) | the job's command |
 | `window_start:<start_key>` | each `schedule.next_session_start`, exact | sum of its inner waits + 5 min | the handler checks | **fail** | `keepalive.window_start_pass` |
 | `deferred_start:<key>`, `last_stretch:<key>`, `fillup:<key>` | `next_due` from the plan step | as for `window_start` | the handler checks | **fail** | the keep-alive passes' act step (S6) |
@@ -251,6 +251,13 @@ At boot, after taking the lock:
   - `export_quickview`'s cron section reads `runner_jobs`.
 - **Done when:** one day in which each cadence matches cron's, with no failed runs. The scripts' own flocks stay for now; they do no harm.
 - **Risk:** the dispatcher pass and the sampler's Haiku call sometimes run long. Measure their p99 duration first and set the timeouts above it.
+- **As built:**
+  - `RUNNER_OWNS` + `sampler`, `dispatcher`, `quickview`, `docs_import`, `prune_logs`, `usage_review`; their 6 lines are gone from `docker/crontab` (`on` mode). `docker/crontab.legacy` is unchanged, so `AFCLAUDE_SCHEDULER=legacy` still runs them all from cron (the rollback stays one setting). `test_runner` checks per mode which file has which line, that each handler is its legacy line (script, arguments, log file, flock) and that each cadence is its line's (every tick over two days). A job's child now runs in the repo directory (the cron lines' `cd $AFCLAUDE_DIR`).
+  - **Measured** (read-only, cron's runs before S3): the sampler took p50 5.4 s, p99 10.4 s, max 13.8 s (1129 runs 09.-21.10., the time from its sample to its final log line's `app_log` row; the hourly Haiku call is ~5 s of it). The dispatcher pass took p99 2 s, max 2 s (3440 armed passes 29.09.-21.10., `dispatcher.log`; 1-s resolution; no pass continued a session then).
+  - **Timeouts:** the measured p99s are far below the old defaults, but the handlers' own worst-case inner timeouts were not (the sampler: the usage refresh with its retry, `claude agents`, two Haiku calls = 14.5 min; the dispatcher with one continue: 13.5 min; the usage review: its 10-min lock wait + a refresh + a review start = 20.5 min). The outer timeout must not kill a slow run that is still within its own limits (that would turn a slow sampler into a pause), so `runner_jobs.TICK_HOST_CALLS` declares each tick's inner timeouts (checked against the literal `timeout=` in each function by `test_runner`) and the defaults are above their sum + 1 min: sampler 20 min, dispatcher 20 min, usage review 30 min; quickview 2, docs import 5, log prune 10 unchanged.
+  - **A timeout of a tick** is that run's failure (D-234, §3.5): an alert and the pause (the quickview only alerts, D-239.3; the sampler keeps sampling while paused, D-239.4). It is not runner downtime (D-257): the run row ends as `timeout`, the next tick is on time, and a later boot neither reruns it nor alerts for it again; only `running` rows (a restart) and an unclean exit are D-257 events.
+  - **The quickview's schedule section** lists the crontab's AFClaude lines (owner `cron`) and, while the runner runs (`AFCLAUDE_SCHEDULER` `on`/`runner`, not `legacy`), the runner's heartbeat and each owned job's cadence, next due time, last status and failures in a row from `runner_jobs` (owner `runner`); a failed read is shown, never raised.
+  - The shadow now covers only `window_start` (the one cron job with a runner counterpart left).
 
 **S4: at-jobs.**
 - **Build:**
