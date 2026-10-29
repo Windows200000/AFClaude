@@ -2964,22 +2964,33 @@ def app_log_append(conn: sqlite3.Connection, component: str, entries: Iterable[t
 
 
 def run_log_add(conn: sqlite3.Connection, component: str, decision: str, reason: str, *,
-                session_id: str | None = None, actor: str, via: str) -> int:
-    """One keep-alive / dispatcher decision row (run_log; phase 3b S4: a start's project pick or its
-    HOLD). A log row like app_log's, so no audit row (D-256). -> its id."""
+                session_id: str | None = None, actor: str, via: str, once: str | None = None) -> int:
+    """One keep-alive / usage-review decision row (run_log; RUN_LOG_DECISIONS). A log row like
+    app_log's, so no audit row (D-256). `once`: the row's identity prefix (a start key and the
+    point of the decision): when a row of the same component and decision already starts with it
+    nothing is written (a retried decision is one row, not one per retry; the check and the insert
+    share one transaction). -> its id, 0 when `once` found its row."""
     _check_writer(actor, via, store.DEFAULT_ACCOUNT)
     if decision not in RUN_LOG_DECISIONS:
         raise ValueError(f"unknown run_log decision {decision!r} ({'|'.join(RUN_LOG_DECISIONS)})")
     if not isinstance(reason, str) or "\n" in reason or len(reason) > TELEMETRY_LINE_MAX:
         raise ValueError("a run_log reason is one line of text")
+    if once is not None and not reason.startswith(once):
+        raise ValueError("a run_log row's `once` prefix must start its reason")
 
     def run() -> int:
         with store.transaction(conn):
+            if once is not None and store.has_run_log(conn, component, decision, once):
+                return 0
             return store.add_run_log(conn, component, decision, reason, session_id=session_id)
     return store.retrying(run, conn)
 
 
-RUN_LOG_DECISIONS = ("PICK", "HOLD")
+# PICK / HOLD: a start's project (3b S4); GO / HOLD / POSTPONE: the budget gate at a session-window
+# start, a postponed one's re-decision and a last-stretch slot (also HOLD for a start with no
+# project); DEFER / FIRE: the D-274 timing (planned late / now); FILLUP: a fill-up start;
+# START / POSTPONE: a usage review's launch / its quota postponement (component usage_review).
+RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START")
 
 
 def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,

@@ -266,7 +266,7 @@ class PickStart(Base):
         ka.handle_fire(SID_A, {"uuid": "fillup-k", "timestamp": NOW, "prompt": "fillup"}, "fill-up", st, Args())
         self.assertEqual(self.fired[0][0], SID_A)
         self.assertNotIn("project", self.fired[0][1])
-        self.assertEqual(self.run_log(), [])
+        self.assertEqual([d for d, _, _ in self.run_log()], ["FILLUP"])    # its own row (S9b), not a PICK
 
 
 class OneTaskManager(Base):
@@ -526,7 +526,7 @@ class Plumbing(Base):
 
     def test_run_log_add_checks_its_decision(self):
         with self.assertRaisesRegex(ValueError, "unknown run_log decision"):
-            actions.run_log_add(self.conn, "keepalive", "FIRE", "x", actor="keepalive", via="runner")
+            actions.run_log_add(self.conn, "keepalive", "NOPE", "x", actor="keepalive", via="runner")
         actions.run_log_add(self.conn, "keepalive", "HOLD", "x", actor="keepalive", via="runner")
         self.assertEqual(self.run_log(), [("HOLD", None, "x")])
 
