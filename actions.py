@@ -870,6 +870,10 @@ SETTINGS: dict[str, Setting] = {
                                       "take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
                                         "is killed and fails (D-234)", "automation"),
+    # an at-job's payload `timeout` (minutes, `at --timeout`) overrides it for that job (phase 3a S4)
+    "runner_timeout_at": _num(30, 0.5, 720, "Runner: minutes an at-job (scheduled_jobs: the sampler's "
+                              "weekly-reset samples, one-off reviews, the review chain's steps) may run before "
+                              "it is killed and fails (D-234), unless the job sets its own", "automation"),
     # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
     # test_runner checks it), so an inner timeout, with its own clear error, always fires first
     "runner_timeout_window_start": _num(70, 70, 720, "Runner: minutes a session-window start may take (its "
@@ -2959,9 +2963,14 @@ def log_prune(conn: sqlite3.Connection, ctx: Ctx, batch_size: Any = 1000) -> Res
     return Result(after, "app_log", None, after, changed=True)
 
 
+JOB_ON_INTERRUPT = ("rerun", "fail")   # an at-job's payload on_interrupt (phase 3a S4; absent: the runner's default)
+JOB_TIMEOUT_MAX = 720.0                # minutes: an at-job's payload timeout (as the runner_timeout_* settings)
+
+
 def job_put(conn: sqlite3.Connection, job: object, *, actor: str, via: str) -> str:
-    """Store an at-shim job (its spool file's object: id, at, cmd, cwd). Audited.
-    -> 'inserted' | 'updated' | 'same'."""
+    """Store an at-shim job (its spool file's object: id, at, cmd, cwd; optional on_interrupt
+    (JOB_ON_INTERRUPT: what the runner does with a run of it a restart cut off) and timeout (minutes
+    the run may take), phase 3a S4). Audited. -> 'inserted' | 'updated' | 'same'."""
     _check_writer(actor, via, store.DEFAULT_ACCOUNT)
     if not isinstance(job, Mapping):
         raise ValueError("a job is a JSON object")
@@ -2970,6 +2979,11 @@ def job_put(conn: sqlite3.Connection, job: object, *, actor: str, via: str) -> s
         raise ValueError(f"bad job id {jid!r}")
     if not isinstance(cmd, str) or not cmd or not isinstance(at, str):
         raise ValueError(f"job {jid}: needs at and cmd")
+    if job.get("on_interrupt") is not None and job.get("on_interrupt") not in JOB_ON_INTERRUPT:
+        raise ValueError(f"job {jid}: on_interrupt is one of {'|'.join(JOB_ON_INTERRUPT)}, got {job.get('on_interrupt')!r}")
+    t = job.get("timeout")
+    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= JOB_TIMEOUT_MAX):
+        raise ValueError(f"job {jid}: timeout is minutes in (0, {JOB_TIMEOUT_MAX:g}], got {t!r}")
     job_id, run_at, command = jid, store.telemetry_ts(at), cmd
     workdir = cwd if isinstance(cwd, str) else None
     payload = _state_json(dict(job))
@@ -3109,17 +3123,23 @@ def runner_job_set(conn: sqlite3.Connection, name: str, *, actor: str, via: str,
 
 def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional[str], timeout_s: Optional[float],
               actor: str, via: str, session: bool = False, rerun: bool = True,
-              skipped: Optional[str] = None) -> tuple[Optional[int], Optional[str]]:
+              skipped: Optional[str] = None, claim: Optional[str] = None) -> tuple[Optional[int], Optional[str]]:
     """Record a run start ('running'), or with `skipped` (the reason) a run that was not started
     ('skipped', finished). In one transaction with the checks: a keyed run that ran before is
     refused (UNIQUE (job, key): any row that was not interrupted; with rerun=False, for a job whose
     interrupted run must never run again, any row at all), and so is a run that acts on a session
-    (`session`) while a drain is in force. -> (run id, None) or (None, why not)."""
+    (`session`) while a drain is in force. claim: the id of the pending scheduled job (an at-job,
+    phase 3a S4) this run claims in the same transaction (marked started, audited as job.started,
+    as the at-shim's claim); one claimed elsewhere already (`at --run-due`) is refused, so a job
+    never runs twice and a refused run never leaves its job claimed but not run.
+    -> (run id, None) or (None, why not)."""
     _check_writer(actor, via, store.DEFAULT_ACCOUNT)
     name, k = _job_name(job), _run_key(key)
     if not isinstance(boot_id, str) or not BOOT_ID_RE.match(boot_id):
         raise ValueError(f"bad boot id {boot_id!r}")
     why = None if skipped is None else _short(skipped, "skip reason", RUN_ERROR_MAX)
+    if claim is not None and (why is not None or not isinstance(claim, str)):
+        raise ValueError("a run claims a scheduled job (its id) only when it starts")
 
     def run() -> tuple[Optional[int], Optional[str]]:
         with store.transaction(conn):
@@ -3131,9 +3151,16 @@ def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional
                 d = runner_drain(conn)
                 if d is not None:
                     return None, f"drained until {d['until']}"
+            if claim is not None:
+                if not store.mark_job_started(conn, claim, actor, via):
+                    j = store.get_job(conn, claim)
+                    return None, (f"scheduled job {claim} is unknown" if j is None else
+                                  f"scheduled job {claim} was claimed already ({j['status']} {j['started_at']})")
+                store.add_audit(conn, actor, via, "job.started", "scheduled_job", claim,
+                                {"status": "pending"}, {"status": "started"})
             status = "running" if why is None else "skipped"
             return store.insert_run(conn, boot_id, name, k, status, timeout_s, actor, via, why), None
-    return _runner_write(conn, "run.begin", actor, {"job": name, "key": k, "boot_id": boot_id}, run)
+    return _runner_write(conn, "run.begin", actor, {"job": name, "key": k, "boot_id": boot_id, "claim": claim}, run)
 
 
 def run_pid(conn: sqlite3.Connection, run_id: int, pid: int, *, actor: str, via: str) -> bool:

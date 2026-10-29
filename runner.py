@@ -45,8 +45,18 @@ Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) move
 docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
 live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
 (stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
-docs_import, prune_logs, usage_review); cron still runs the window start, the at-jobs, the watcher
-watchdog and the inbox API watchdog.
+docs_import, prune_logs, usage_review). S4: the at-jobs; cron still runs the window start, the
+watcher watchdog and the inbox API watchdog.
+
+At-jobs (S4, the job "at"): every pending scheduled_jobs row (stored by `at -t`, which then wakes
+the runner) is a keyed run `at <id>` at its run_at: its run claims the job in its own begin
+(actions.run_begin(claim=): never twice, also against a legacy `at --run-due`) and runs its command
+as a tracked child (runner_jobs.at_job) with the job's payload `timeout` (minutes; default the
+setting runner_timeout_at). Several at-jobs may run at once (one slot per key). A run a restart cut
+off follows the job's payload `on_interrupt`: "rerun" (the sampler's samples, the review chain's
+steps) runs it again at the boot, "fail" (the default: a one-off review start) is an alert + pause
+(D-257); a "fail" job is held by a drain, a "rerun" one is not. The runner_jobs row "at" has the
+earliest future run_at as its next_due.
 
 Shadow (S2-S7, §5 S2): for every job cron still runs, the runner logs when it WOULD start it
 (data/runner_shadow.log, component runner_shadow), waking at that time as it would for its own
@@ -135,12 +145,15 @@ class Job:
     task-manager session (a drain holds it); pause_on_failure: False = a failure alerts only
     (D-239.3); cron_tag: its docker/crontab line's tag (the cut-over check, the shadow); argv: the
     child's command instead of runner_jobs.py (tests); offset: see every; what: what it does, for
-    the quickview's schedule list (default: the cron tag)."""
+    the quickview's schedule list (default: the cron tag); at_jobs: the scheduled_jobs rows, one keyed
+    run per row at its run_at (S4; on_interrupt and timeout_min are the defaults of the row's payload
+    fields on_interrupt and timeout)."""
     name: str
     timeout_min: float
     every: Optional[timedelta] = None
     daily: Optional[tuple[int, int]] = None
     window_start: bool = False
+    at_jobs: bool = False
     paused: str = "runs"
     on_interrupt: str = "rerun"
     session: bool = False
@@ -153,8 +166,8 @@ class Job:
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
             raise ValueError(f"bad job name {self.name!r}")
-        if sum((self.every is not None, self.daily is not None, self.window_start)) != 1:
-            raise ValueError(f"{self.name}: exactly one of every / daily / window_start")
+        if sum((self.every is not None, self.daily is not None, self.window_start, self.at_jobs)) != 1:
+            raise ValueError(f"{self.name}: exactly one of every / daily / window_start / at_jobs")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
         if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
@@ -162,7 +175,11 @@ class Job:
 
     @property
     def keyed(self) -> bool:
-        return self.window_start
+        return self.window_start or self.at_jobs
+
+    def slot(self, key: Optional[str]) -> str:
+        """Its runs' slot (Runner.tasks): one run per job at a time, an at-job one per key."""
+        return f"{self.name} {key}" if self.at_jobs and key else self.name
 
 
 SEC, MIN = timedelta(seconds=1), timedelta(minutes=1)
@@ -185,13 +202,17 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
     Job("window_start", 70, window_start=True, paused="handler", on_interrupt="fail", session=True,
         cron_tag="AFClaude window-start"),
+    # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
+    Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail", cron_tag="AFClaude at-shim",
+        what="at-jobs (scheduled_jobs: the weekly-reset samples, one-off reviews, the review chain's steps)"),
 )}
 # What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
 # here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
 # stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
-# cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them).
+# cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them). S4: the
+# at-jobs (the */1 `at --run-due` line is gone; legacy keeps it).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "sampler", "dispatcher", "quickview",
-                                         "docs_import", "prune_logs", "usage_review"})
+                                         "docs_import", "prune_logs", "usage_review", "at"})
 
 
 # ---------------------------------------------------------------- paths, log, small helpers
@@ -267,6 +288,20 @@ def next_tick(job: Job, now: datetime) -> datetime:
         t = now.astimezone(UTC).replace(hour=job.daily[0], minute=job.daily[1], second=0, microsecond=0)
         return t if t > now else t + timedelta(days=1)
     raise ValueError(f"{job.name} has no tick")
+
+
+def at_policy(row: Optional[store.Row], job: Job) -> tuple[str, Optional[float]]:
+    """A scheduled job's (on_interrupt, timeout minutes or None) from its payload; a field that is
+    absent (a job stored before S4) is the "at" job's default (on_interrupt "fail": the safe side)."""
+    try:
+        p = json.loads(row["payload"]) if row else {}
+    except ValueError:
+        p = {}
+    p = p if isinstance(p, dict) else {}
+    oi = p.get("on_interrupt")
+    t = p.get("timeout")
+    return (oi if oi in actions.JOB_ON_INTERRUPT else job.on_interrupt,
+            float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else None)
 
 
 def _signal_group(pid: int, sig: int) -> None:
@@ -346,6 +381,7 @@ class Due:
     job: Job
     key: Optional[str] = None
     at: Optional[datetime] = None
+    rerun: bool = False            # an interrupted run of it runs again (an at-job's is claimed already)
 
 
 FailFn = Callable[..., Any]
@@ -391,8 +427,9 @@ class Runner:
         # the shadow (S2-S7): the jobs cron still runs that have a cron line, and when this runner
         # would start each next (in memory: a restart only starts the comparison afresh)
         self.shadow = shadow
-        self.shadow_jobs = [j for n, j in sorted(self.jobs.items()) if j.cron_tag and n not in self.owns] \
-            if shadow is not None else []
+        # (not the at-jobs: they have no cadence of their own to compare, S4)
+        self.shadow_jobs = [j for n, j in sorted(self.jobs.items()) if j.cron_tag and n not in self.owns
+                            and not j.at_jobs] if shadow is not None else []
         self.shadow_next: dict[str, datetime] = {}
 
     # ---- small parts
@@ -481,7 +518,10 @@ class Runner:
                         error=f"interrupted by a runner restart (boot {str(r['boot_id'])[:8]} -> {self.boot_id[:8]})")
         job = self.jobs.get(str(r["job"]))
         what = str(r["job"]) + (f" {r['key']}" if r["key"] else "")
-        if job is None or job.on_interrupt == "fail":
+        policy = job.on_interrupt if job is not None else "fail"
+        if job is not None and job.at_jobs:
+            policy = at_policy(store.get_job(self.conn, str(r["key"])) if r["key"] else None, job)[0]
+        if job is None or policy == "fail":
             self.fail(f"{r['job']} interrupted by a runner restart",
                       f"run {r['id']} ({what}, started {r['started_at']}) was cut off by a runner restart; it is not "
                       "rerun: a start or compaction cut off mid-way leaves the session in an unknown state (D-257)")
@@ -524,6 +564,9 @@ class Runner:
                 if d is not None:
                     out.append(d)
                 continue
+            if job.at_jobs:
+                out.extend(self._plan_at(job, now))
+                continue
             nd = self._next_due(name)
             if nd is None:
                 self.job_set(name, next_due=_iso(next_tick(job, now)))
@@ -537,11 +580,35 @@ class Runner:
             out.append(Due(job))
         keep: list[tuple[str, str]] = []
         for name, key in self.reruns:
-            if name in self.tasks or any(d.job.name == name for d in out):
+            job = self.jobs[name]
+            if job.slot(key) in self.tasks or any(job.slot(key) == d.job.slot(d.key) for d in out):
                 keep.append((name, key))
             else:
-                out.append(Due(self.jobs[name], key))
+                out.append(Due(job, key, rerun=True))
         self.reruns = keep
+        return out
+
+    def _plan_at(self, job: Job, now: datetime) -> list[Due]:
+        """The pending scheduled jobs whose run_at has come (not running already), earliest first;
+        the job row's next_due becomes the earliest run_at still ahead (the loop wakes for it; `at -t`
+        wakes it for a new one)."""
+        out: list[Due] = []
+        ahead: Optional[datetime] = None
+        for row in store.list_jobs(self.conn, "pending"):
+            key = str(row["id"])
+            at = _parse_text(row["run_at"])
+            if at is None:
+                if f"at-bad:{key}" not in self.logged:      # reported once per boot
+                    self.once(f"at-bad:{key}", f"at {key}: its run_at {row['run_at']!r} is not a time; not run")
+                    self.fail("a scheduled job has no valid run time", f"scheduled job {key}: run_at {row['run_at']!r}")
+                continue
+            if at > now:
+                ahead = at if ahead is None else min(ahead, at)
+            elif job.slot(key) not in self.tasks:
+                out.append(Due(job, key, at))
+        want = ahead.replace(microsecond=0) if ahead else None
+        if self._next_due(job.name) != want:
+            self.job_set(job.name, next_due=_iso(ahead) if ahead else None)
         return out
 
     def _settled(self, job: Job, key: str) -> bool:
@@ -628,6 +695,8 @@ class Runner:
         job, key = due.job, due.key
         actor = f"runner:{job.name}"
         label = job.name + (f" {key}" if key else "")
+        if job.at_jobs:
+            return self._start_at(due, now)
         if job.paused == "skip":
             p = self._paused()
             if p.get("paused"):
@@ -650,7 +719,28 @@ class Runner:
         if not job.keyed:
             self.job_set(job.name, next_due=_iso(next_tick(job, now)))
         self.log(f"start {label} (run {run_id}, timeout {timeout:g} s)")
-        self.tasks[job.name] = asyncio.get_running_loop().create_task(self._run(job, key, run_id, timeout))
+        self.tasks[job.slot(key)] = asyncio.get_running_loop().create_task(self._run(job, key, run_id, timeout))
+        return run_id
+
+    def _start_at(self, due: Due, now: datetime) -> Optional[int]:
+        """An at-job's run: its payload's timeout and interrupt policy; its begin claims the
+        scheduled job (a rerun's is claimed already); a "fail" job is held by a drain (it stays
+        pending and runs once the drain is over)."""
+        job, key = due.job, due.key
+        assert key is not None
+        label = f"{job.name} {key}"
+        on_interrupt, minutes = at_policy(store.get_job(self.conn, key), job)
+        timeout = minutes * 60 if minutes is not None else self.timeout_s(job)
+        run_id, why_not = actions.run_begin(self.conn, boot_id=self.boot_id, job=job.name, key=key, timeout_s=timeout,
+                                            actor=f"runner:{job.name}", via=VIA, session=on_interrupt == "fail",
+                                            rerun=on_interrupt == "rerun", claim=None if due.rerun else key)
+        if run_id is None:
+            self.once(f"refused:{label}:{why_not}", f"{label} not started: {why_not}")
+            return None
+        late = f", {(now - due.at).total_seconds():.0f} s after its time" if due.at and now - due.at > MIN else ""
+        self.log(f"start {label} (run {run_id}, timeout {timeout:g} s, on interrupt {on_interrupt}"
+                 f"{', a rerun' if due.rerun else ''}{late})")
+        self.tasks[job.slot(key)] = asyncio.get_running_loop().create_task(self._run(job, key, run_id, timeout))
         return run_id
 
     def _argv(self, job: Job, key: Optional[str]) -> list[str]:
@@ -661,8 +751,10 @@ class Runner:
     async def _run(self, job: Job, key: Optional[str], run_id: int, timeout: float) -> None:
         t0 = time.monotonic()
 
+        slot = job.slot(key)
+
         def on_pid(pid: int) -> None:
-            self.pids[job.name] = pid
+            self.pids[slot] = pid
             actions.run_pid(self.conn, run_id, pid, actor=f"runner:{job.name}", via=VIA)
         try:
             try:
@@ -675,8 +767,8 @@ class Runner:
         except BaseException as e:   # noqa: BLE001 - the runner's own failure (a record not written): it crashes
             self.crash = e
         finally:
-            self.tasks.pop(job.name, None)
-            self.pids.pop(job.name, None)
+            self.tasks.pop(slot, None)
+            self.pids.pop(slot, None)
             self.wake_event.set()
 
     def finish(self, job: Job, key: Optional[str], run_id: int, out: ChildOutcome, timeout: float,
@@ -967,23 +1059,33 @@ def session_jobs() -> list[Job]:
     return [j for j in JOBS.values() if j.session]
 
 
+def _held_by_drain(conn: Any, r: store.Row) -> bool:
+    """A running run a drain waits for: a session job's, or an at-job's whose interruption fails."""
+    job = JOBS.get(str(r["job"]))
+    if job is None:
+        return False
+    if job.at_jobs:
+        return at_policy(store.get_job(conn, str(r["key"])) if r["key"] else None, job)[0] == "fail"
+    return job.session
+
+
 def drain(conn: Any, max_wait: Optional[timedelta] = None, *, poll: float = DRAIN_POLL,
           clock: Callable[[], datetime] = _utcnow, sleep: Callable[[float], object] = time.sleep,
           out: Callable[[str], object] = print) -> int:
     """Before a deploy (§3.4.5): no new run that acts on a session (until the longest such timeout
-    + DRAIN_MARGIN, or the next runner boot lifts it), then wait until none is running.
+    + DRAIN_MARGIN, or the next runner boot lifts it), then wait until none is running. An at-job
+    whose interruption fails (on_interrupt "fail": a one-off review start) counts as one (S4).
     -> 0 drained, 1 still running after max_wait (do not deploy)."""
     now = clock()
-    longest = max((float(actions.get_setting(conn, actions.RUNNER_TIMEOUT + j.name)) for j in session_jobs()),
-                  default=0.0)
+    held = session_jobs() + [j for j in JOBS.values() if j.at_jobs]
+    longest = max((float(actions.get_setting(conn, actions.RUNNER_TIMEOUT + j.name)) for j in held), default=0.0)
     span = timedelta(minutes=longest) + DRAIN_MARGIN
     until = now + span
     actions.runner_state_put(conn, {"drain": {"until": _iso(until), "at": _iso(now)}}, actor="cli", via="cli")
     wake()
     deadline = now + (max_wait if max_wait is not None else span)
-    names = {j.name for j in session_jobs()}
     while True:
-        running = [r for r in store.running_runs(conn) if r["job"] in names]
+        running = [r for r in store.running_runs(conn) if _held_by_drain(conn, r)]
         if not running:
             out(f"drained until {_iso(until)}: no run that acts on a session is running")
             return 0
@@ -1158,8 +1260,9 @@ def parse_shadow(lines: Iterable[str]) -> list[ShadowEntry]:
 
 
 def parse_cron(lines: Iterable[str], jobs: dict[str, Job]) -> list[tuple[str, datetime]]:
-    """(job, start) of supercronic's `msg=starting` lines whose command carries a job's cron tag."""
-    tags = [(j.cron_tag, n) for n, j in jobs.items() if j.cron_tag]
+    """(job, start) of supercronic's `msg=starting` lines whose command carries a job's cron tag
+    (not the at-shim's per-minute `--run-due` line: the at-jobs are not shadowed)."""
+    tags = [(j.cron_tag, n) for n, j in jobs.items() if j.cron_tag and not j.at_jobs]
     out: list[tuple[str, datetime]] = []
     for ln in lines:
         m = _CRON_RE.search(ln)

@@ -103,6 +103,25 @@ class Fail(unittest.TestCase):
         r = failstop.fail("sampler", "s", log=boom, alert=boom)
         self.assertEqual((r["paused"], r["alerted"]), (True, False))
 
+    def test_a_runner_child_notes_its_reports(self):
+        """Phase 3a S4: with REPORTS_ENV set (an at-job's command under the runner) each fail()
+        appends its subject, so the runner does not alert a second time; a note that can't be
+        written does not stop the report."""
+        path = os.path.join(testenv.DIR, "reports.txt")
+        with mock.patch.dict(os.environ, {failstop.REPORTS_ENV: path}):
+            self.fail("sample\nbroke", pause=False)
+            self.fail("another", pause=False)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "keepalive: sample broke\nkeepalive: another\n")
+        os.remove(path)
+        with mock.patch.dict(os.environ, {failstop.REPORTS_ENV: os.path.join(testenv.DIR, "no", "dir")}), \
+                mock.patch.object(failstop, "_stderr_log") as err:
+            r = self.fail("still reported", pause=False)
+        self.assertTrue(r["alerted"])
+        self.assertIn("report note for the runner could not be written", err.call_args[0][0])
+        self.fail("no runner", pause=False)                          # without the variable: no file
+        self.assertFalse(os.path.exists(path))
+
 
 class StrictRead(unittest.TestCase):
     def test_unreadable_counts_as_paused(self):

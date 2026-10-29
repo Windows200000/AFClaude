@@ -2,12 +2,20 @@
 """Minimal `at` for the manager container (installed as /usr/local/bin/at).
 
 usage_sampler.py schedules its pre-/post-weekly-reset samples (and usage_review.py its one-off
-reviews) with `at -t [[CC]YY]MMDDhhmm` and the command on stdin (TZ from the environment). The
-container has no atd, so jobs are stored in the AFClaude DB's scheduled_jobs (D-161: the DB is
-their only copy, runner_state.py) and the crontab runs `at --run-due` every minute, which
-claims every due pending job (marks it started, so it never runs twice) and starts it with
-/bin/sh. A job that can't be stored (a broken DB) is recorded in data/ALERTS.fallback.md
-(§7.8) and `at` exits 1.
+reviews and the review chain's steps) with `at -t [[CC]YY]MMDDhhmm` and the command on stdin (TZ
+from the environment). The container has no atd, so jobs are stored in the AFClaude DB's
+scheduled_jobs (D-161: the DB is their only copy, runner_state.py). A job that can't be stored (a
+broken DB) is recorded in data/ALERTS.fallback.md (§7.8) and `at` exits 1.
+
+Who runs them (phase 3a S4, docs/phase3a_plan.md): the resident runner (runner.py, job "at"), at
+their minute, each as a tracked child with a timeout; `at -t` wakes it after storing the job (only
+when a runner listens: its socket exists). Two fields of the job are for the runner:
+  --on-interrupt rerun|fail   a run cut off by a runner restart is run again ("rerun": the samples,
+                              the chain steps) or is an alert + pause ("fail", the default: D-257)
+  --timeout MIN               minutes the run may take (default: the setting runner_timeout_at)
+In the rollback mode AFCLAUDE_SCHEDULER=legacy the crontab still runs `at --run-due` every minute
+instead (it is kept for that mode only), which claims every due pending job (marks it started, so
+it never runs twice) and starts it detached with /bin/sh; its result is not recorded.
 
 Failures of `--run-due` (D-234/D-235, failstop.py): the jobs can't be read or claimed, or a job
 can't be started: an ERROR line in at_shim.log (= app_log), an alert, and automation paused until
@@ -22,8 +30,9 @@ The old spool dir ($AFCLAUDE_AT_SPOOL, default <data>/at_spool) is a read-only l
 files are never written or deleted any more; `--run-due` adds a spooled job the DB doesn't
 know yet (one an older shim copy spooled without its DB write) to the DB and runs it from there.
 
-  at -t 202610011656 < cmd      schedule a job (prints "job <id> at <UTC time>" on stderr)
-  at --run-due                  run the due jobs
+  at [--on-interrupt rerun|fail] [--timeout MIN] -t 202610011656 < cmd
+                                schedule a job (prints "job <id> at <UTC time>" on stderr)
+  at --run-due                  run the due jobs (legacy mode only)
   at -l                         list the pending jobs
 """
 import os
@@ -61,11 +70,57 @@ def parse_t(value, tz):
     return datetime.strptime(digits, fmt).replace(tzinfo=tz)
 
 
-def spool(when, cmd):
-    """Store the job in the DB. -> its id, or None (not stored: recorded in the fallback file)."""
+def spool(when, cmd, on_interrupt=None, timeout=None):
+    """Store the job in the DB (with the runner's fields when given). -> its id, or None (not
+    stored: recorded in the fallback file)."""
     jid = uuid.uuid4().hex[:12]
     job = {"id": jid, "at": when.astimezone(timezone.utc).isoformat(), "cmd": cmd, "cwd": os.getcwd()}
+    if on_interrupt is not None:
+        job["on_interrupt"] = on_interrupt
+    if timeout is not None:
+        job["timeout"] = timeout
     return jid if runner_state.job_add(job) else None
+
+
+def wake_runner():
+    """Make the resident runner re-read the jobs now (S4), if one listens (its socket exists: none
+    in legacy mode, where `--run-due` runs them). Never fails the scheduling: a wake that is not
+    sent is a warning on stderr (the runner re-reads the DB within a minute anyway)."""
+    try:
+        import runner
+        if os.path.exists(runner.sock_path()):
+            runner.wake()
+    except Exception as e:   # noqa: BLE001 - the job is stored; the runner's next pass finds it
+        print(f"at: the runner was not woken ({type(e).__name__}: {e}); it finds the job within a minute",
+              file=sys.stderr)
+
+
+def parse_schedule_args(argv):
+    """[--on-interrupt rerun|fail] [--timeout MIN] -t TIME, in any order. -> (time, on_interrupt,
+    timeout) or raises ValueError."""
+    t, oi, timeout = None, None, None
+    rest = list(argv)
+    while rest:
+        flag = rest.pop(0)
+        if not rest:
+            raise ValueError(f"{flag} needs a value")
+        val = rest.pop(0)
+        if flag == "-t" and t is None:
+            t = val
+        elif flag == "--on-interrupt" and oi is None and val in ("rerun", "fail"):
+            oi = val
+        elif flag == "--timeout" and timeout is None:
+            try:
+                timeout = float(val)
+            except ValueError:
+                raise ValueError(f"bad --timeout {val!r} (minutes)") from None
+            if not 0 < timeout <= 720:
+                raise ValueError(f"bad --timeout {val!r} (minutes, at most 720)")
+        else:
+            raise ValueError(f"bad argument {flag} {val}")
+    if t is None:
+        raise ValueError("-t TIME is required")
+    return t, oi, timeout
 
 
 def _adopt_legacy(known):
@@ -157,21 +212,24 @@ def main(argv):
             print(f"at: database problem ({e.kind}): {e}", file=sys.stderr)
             return 1
         return 0
-    if len(argv) == 2 and argv[0] == "-t":
+    if "-t" in argv:
         tzname = os.environ.get("TZ") or "UTC"
         try:
-            when = parse_t(argv[1], ZoneInfo(tzname))
+            t, on_interrupt, timeout = parse_schedule_args(argv)
+            when = parse_t(t, ZoneInfo(tzname))
         except (ValueError, KeyError) as e:
             print(f"at: {e}", file=sys.stderr)
             return 1
-        jid = spool(when, sys.stdin.read())
+        jid = spool(when, sys.stdin.read(), on_interrupt, timeout)
         if jid is None:
             print("at: the job could not be stored (database problem; recorded in data/ALERTS.fallback.md)",
                   file=sys.stderr)
             return 1
+        wake_runner()           # before the job line: the callers keep the tail of stderr
         print(f"job {jid} at {when.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC", file=sys.stderr)
         return 0
-    print("usage: at -t [[CC]YY]MMDDhhmm < cmd | at --run-due | at -l", file=sys.stderr)
+    print("usage: at [--on-interrupt rerun|fail] [--timeout MIN] -t [[CC]YY]MMDDhhmm < cmd | at --run-due | at -l",
+          file=sys.stderr)
     return 2
 
 

@@ -2,6 +2,7 @@
 """runner_jobs.py: the resident runner's child side (phase 3a, docs/phase3a_plan.md §3.1, §3.2).
 
     python3 runner_jobs.py <job> [--key K]
+    python3 runner_jobs.py at --key <scheduled job id>     an at-job (phase 3a S4, at_job)
 
 runner.py starts one of these per run, in its own process group, with a timeout. It runs the
 job's existing code the way its cron line does: the same script with the same arguments (runpy,
@@ -20,6 +21,12 @@ Exit codes (runner.py records the run by them):
   other  failed without a report (a crash, a non-zero exit, an unknown job, a missing setting):
          the runner reports it (failstop.fail, D-234/D-235)
 
+An at-job (`at --key ID`): the scheduled job's command (scheduled_jobs, stored by `at -t`; the runner
+claimed it in the run's own begin, actions.run_begin(claim=)) runs with /bin/sh in its working
+directory as the at-shim's `--run-due` started it, but as this child (same process group: the
+runner's timeout ends it), not detached; its stdout goes to data/at_shim.log (the --run-due cron
+line's redirect). A fail() inside the command is seen through failstop.REPORTS_ENV (exit 3).
+
 The window start's inner timeouts (window_start_inner) and the ticks' (tick_inner, S3) are here
 too: the runner's outer timeout for each must exceed their sum (actions.SETTINGS runner_timeout_*;
 test_runner), so a slow run within its own limits is never killed by the runner.
@@ -32,7 +39,9 @@ import importlib
 import json
 import os
 import runpy
+import subprocess
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from datetime import timedelta
@@ -71,11 +80,13 @@ HANDLERS: dict[str, Handler] = {
 }
 # Jobs whose code is a function here, not a script: name -> (log file, function -> note).
 FUNCTIONS: dict[str, tuple[str, Callable[[], str]]] = {}
+AT_JOB = "at"               # the at-jobs (runner.JOBS "at", keyed by the scheduled job's id): at_job()
+AT_LOG = "at_shim.log"      # the --run-due cron line's log
 
 
 def log_path(job: str) -> str:
     """The job's log file (what its stdout is appended to, and the runner appends its stderr to)."""
-    rel = HANDLERS[job].log if job in HANDLERS else FUNCTIONS[job][0]
+    rel = AT_LOG if job == AT_JOB else HANDLERS[job].log if job in HANDLERS else FUNCTIONS[job][0]
     return os.path.join(runner_state.data_dir(), rel)
 
 
@@ -178,6 +189,48 @@ def tick_min_timeout(job: str) -> timedelta:
     return sum(tick_inner(job).values(), timedelta(0)) + TICK_MARGIN
 
 
+# ---- an at-job (phase 3a S4)
+
+def at_job(key: str) -> int:
+    """Run the claimed scheduled job `key` (module doc). -> the exit code: 0 its command exited 0,
+    EXIT_REPORTED a fail() inside it reported its failure, else 1 (or the command's own code)."""
+    import failstop
+    import store
+    conn = store.connect()
+    try:
+        row = store.retrying(lambda: store.get_job(conn, key), conn)
+    finally:
+        conn.close()
+    if row is None or row["status"] != "started":
+        print(f"runner_jobs: scheduled job {key} is " + ("unknown" if row is None else
+              f"{row['status']}, not claimed by this run"), file=sys.stderr)
+        return 1
+    cwd = row["cwd"] if os.path.isdir(row["cwd"] or "") else "/"
+    run_dir = os.path.join(runner_state.data_dir(), "run")
+    os.makedirs(run_dir, exist_ok=True)
+    fd, marks = tempfile.mkstemp(prefix=f".at-{key}-", suffix=".reports", dir=run_dir)
+    os.close(fd)
+    try:
+        sys.stdout.flush()
+        code = subprocess.call(["/bin/sh", "-c", str(row["cmd"])], cwd=cwd, stdin=subprocess.DEVNULL,
+                               env=dict(os.environ, **{failstop.REPORTS_ENV: marks}))
+        with open(marks, encoding="utf-8") as fh:
+            reported = [ln for ln in fh.read().splitlines() if ln.strip()]
+    finally:
+        os.unlink(marks)
+    what = f"at-job {key} ({' '.join(str(row['cmd']).split())[:200]})"
+    if reported:
+        print(f"runner_jobs: {what} exited {code} and reported its failure itself: {'; '.join(reported)[:500]}",
+              file=sys.stderr)
+        return EXIT_REPORTED
+    if code != 0:
+        print(f"runner_jobs: {what} " + (f"ended by signal {-code}" if code < 0 else f"exited {code}"),
+              file=sys.stderr)
+        return code if 0 < code < 256 and code != EXIT_REPORTED else 1
+    print(f"runner_jobs: {what} exited 0")
+    return EXIT_OK
+
+
 # ---- running one job
 
 class _Reports:
@@ -238,11 +291,24 @@ def _argv(h: Handler) -> list[str]:
 
 def run(job: str, key: Optional[str] = None) -> int:
     """Run `job` (see the module doc). -> the exit code."""
-    if job not in HANDLERS and job not in FUNCTIONS:
+    if job not in HANDLERS and job not in FUNCTIONS and job != AT_JOB:
         print(f"runner_jobs: unknown job {job!r}", file=sys.stderr)
+        return EXIT_USAGE
+    if job == AT_JOB and not key:
+        print("runner_jobs: an at-job needs --key <scheduled job id>", file=sys.stderr)
         return EXIT_USAGE
     os.chdir(HERE)          # the cron lines' `cd $AFCLAUDE_DIR`
     out = _redirect_stdout(log_path(job))
+    if job == AT_JOB:
+        try:
+            code = at_job(str(key))
+        except BaseException:   # noqa: BLE001 - a crash (the job unreadable, ...): its traceback is the error
+            traceback.print_exc()
+            code = 1
+        sys.stdout.flush()
+        if code == EXIT_OK:
+            _result(out, "ok", f"scheduled job {key}")
+        return code
     h = HANDLERS.get(job)
     if h is not None and h.lock is not None and _lock(h.lock) is None:
         _result(out, "skipped", f"another copy holds {h.lock} (cron's flock -n)")
@@ -288,7 +354,7 @@ def _result(out: TextIO, status: str, note: str = "", next_due: Optional[str] = 
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Run one resident-runner job (runner.py starts these).")
-    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS)))}")
+    ap.add_argument("job", help=f"one of {', '.join(sorted(set(HANDLERS) | set(FUNCTIONS) | {AT_JOB}))}")
     ap.add_argument("--key", default=None, help="the run's key (a keyed run: a window start, ...)")
     args = ap.parse_args(argv)
     return run(args.job, args.key)

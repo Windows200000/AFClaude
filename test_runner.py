@@ -9,6 +9,9 @@ SIGTERM; the wake socket's coalescing; the outer > inner timeout check of the wi
 cut-over check (RUNNER_OWNS vs docker/crontab)."""
 import ast
 import asyncio
+import contextlib
+import importlib.util
+import io
 import fcntl
 import json
 import os
@@ -197,7 +200,7 @@ class Tables(Base):
         for name, job in runner.JOBS.items():
             if job.cron_tag and name not in runner.RUNNER_OWNS:
                 self.assertTrue(any(job.cron_tag in ln for ln in cron), f"{name}: no cron line tagged {job.cron_tag!r}")
-        self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS))
+        self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS) | {runner_jobs.AT_JOB})
 
     def test_the_legacy_crontab_runs_every_job_and_no_runner(self):
         def lines(name):
@@ -1006,7 +1009,7 @@ class SimpleTicks(Base):
     the runner; the legacy crontab keeps them; a timed-out tick is its run's failure, not D-257."""
 
     def test_s3_owns_the_simple_ticks(self):
-        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs"} | set(S3_TICKS)))
+        self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at"} | set(S3_TICKS)))   # + S4
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, {"window_start"})   # S5
 
     def test_crontab_per_mode(self):
@@ -1015,7 +1018,7 @@ class SimpleTicks(Base):
             tag = runner.JOBS[name].cron_tag
             self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
             self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS) - 1)    # + the runner watchdog in `on`
+        self.assertEqual(len(legacy) - len(cron), len(S3_TICKS))        # + the runner watchdog, - the at-shim (S4)
         self.assertTrue(any(runner.JOBS["window_start"].cron_tag in ln for ln in cron))
 
     def test_each_tick_runs_what_its_cron_line_ran(self):
@@ -1111,6 +1114,335 @@ class SimpleTicks(Base):
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(os.path.join(testenv.DIR, "t_cwd.log")) as fh:
             self.assertIn(f"cwd={HERE}", fh.read())
+
+
+# ---------------------------------------------------------------- S4: the at-jobs
+
+AT_SHIM_LINE = ("* * * * * python3 $AFCLAUDE_DIR/docker/at_shim.py --run-due >> $AFCLAUDE_DIR/data/at_shim.log 2>&1 "
+                "# AFClaude at-shim (the jobs in the DB: the sampler's pre/post weekly-reset samples, one-off reviews)")
+
+
+def load_shim():
+    spec = importlib.util.spec_from_file_location("at_shim_s4", os.path.join(HERE, "docker", "at_shim.py"))
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    return shim
+
+
+class AtJobs(Base):
+    """S4: the runner runs scheduled_jobs (claimed in the run's begin, a tracked child with a
+    timeout); on_interrupt per job; `at -t` wakes it; the legacy crontab keeps `at --run-due`."""
+    AT = runner.JOBS["at"]
+
+    def add(self, jid, at, cmd="true\n", **fields):
+        actions.job_put(self.conn, dict({"id": jid, "at": runner._iso(at), "cmd": cmd, "cwd": "/"}, **fields),
+                        actor="runner:at_shim", via="runner")
+        return jid
+
+    async def run_at(self, r, due):
+        run_id = r.start(due, self.now)
+        task = r.tasks.get(self.AT.slot(due.key))
+        if task is not None:
+            await task
+        return run_id
+
+    def test_s4_owns_the_at_jobs_and_the_legacy_crontab_keeps_run_due(self):
+        self.assertIn("at", runner.RUNNER_OWNS)
+        self.assertEqual([ln for ln in crontab_lines("crontab") if "at_shim" in ln or "AFClaude at-shim" in ln], [])
+        self.assertEqual([ln for ln in crontab_lines("crontab.legacy") if "at_shim" in ln], [AT_SHIM_LINE])
+        self.assertEqual(runner.JOBS["at"].cron_tag, "AFClaude at-shim")
+        self.assertEqual(runner_jobs.log_path("at"), os.path.join(testenv.DIR, "at_shim.log"))   # the line's log
+
+    async def test_an_at_job_runs_at_its_minute_and_is_claimed_once(self):
+        jid = self.add("job1", START + MIN)
+        r = self.runner(owns={"at"})
+        r.boot()
+        self.assertEqual(r.plan(self.now), [])
+        self.assertEqual(self.next_due("at"), START + MIN)               # the loop wakes for it
+        self.assertEqual(r.sleep_for(self.now), 60.0)
+        self.now = START + MIN
+        due, = r.plan(self.now)
+        self.assertEqual((due.job.name, due.key), ("at", jid))
+        run_id = await self.run_at(r, due)
+        self.assertEqual(store.get_run(self.conn, run_id)["status"], "ok")
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
+        self.assertEqual(self.spawner.calls, [("at", jid, 1800.0)])      # the default: runner_timeout_at
+        self.assertEqual([a["action"] for a in store.audit_log(self.conn, target_type="scheduled_job")],
+                         ["job.started", "job.put"])
+        self.assertEqual(r.plan(self.now + MIN), [])                      # never twice
+        self.assertIsNone(self.next_due("at"))
+        self.assertEqual(self.fails, [])
+
+    async def test_claim_exclusivity_against_at_run_due(self):
+        jid = self.add("job2", START)
+        r = self.runner(owns={"at"})
+        r.boot()
+        due, = r.plan(self.now)
+        self.assertTrue(actions.job_started(self.conn, jid, actor="runner:at_shim", via="runner"))   # --run-due won
+        self.assertIsNone(r.start(due, self.now))
+        self.assertEqual((self.runs("at"), self.spawner.calls), ([], []))
+        self.assertTrue(any("was claimed already" in ln for ln in self.logs))
+        a, _ = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="at", key="job3", timeout_s=60,
+                                 actor="runner:at", via="runner", claim=self.add("job3", START))
+        b, why = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="at", key="job3", timeout_s=60,
+                                   actor="runner:at", via="runner", claim="job3")
+        self.assertIsNotNone(a)
+        self.assertEqual((b, why), (None, f"at job3 ran before (run {a}, running)"))
+
+    async def test_the_payload_timeout_and_several_at_once(self):
+        self.add("j_a", START, timeout=5)
+        self.add("j_b", START)
+        r = self.runner(owns={"at"})
+        r.boot()
+        self.spawner.gates["at"] = asyncio.Event()
+        dues = r.plan(self.now)
+        for d in dues:
+            r.start(d, self.now)
+        self.assertEqual(sorted(r.tasks), ["at j_a", "at j_b"])           # one slot per job
+        self.assertEqual(r.plan(self.now), [])                            # running: not again
+        self.spawner.gates["at"].set()
+        await asyncio.gather(*r.tasks.values())
+        self.assertEqual(sorted((k, t) for _, k, t in self.spawner.calls), [("j_a", 300.0), ("j_b", 1800.0)])
+
+    async def test_an_interrupted_at_job_is_rerun_or_fails_per_its_flag(self):
+        self.prev_boot(START - MIN)
+        ids = {}
+        for jid, flag in (("j_rerun", "rerun"), ("j_fail", "fail"), ("j_old", None)):
+            self.add(jid, START - MIN, **({"on_interrupt": flag} if flag else {}))
+            ids[jid], _ = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="at", key=jid, timeout_s=60,
+                                            actor="runner:at", via="runner", claim=jid)
+        r = self.runner(owns={"at"})
+        r.boot()
+        self.assertEqual({x["id"]: x["status"] for x in self.runs("at")}, {i: "interrupted" for i in ids.values()})
+        self.assertEqual(self.subjects(), ["at interrupted by a runner restart"] * 2)   # j_fail and j_old (default)
+        self.assertTrue(all(f[3] for f in self.fails))                    # alert + pause (D-257)
+        self.assertTrue(any("j_fail" in f[2] for f in self.fails) and any("j_old" in f[2] for f in self.fails))
+        due, = r.plan(self.now)
+        self.assertEqual((due.key, due.rerun), ("j_rerun", True))
+        run_id = await self.run_at(r, due)
+        self.assertEqual(store.get_run(self.conn, run_id)["status"], "ok")
+        self.assertEqual([x["status"] for x in self.runs("at") if x["key"] == "j_rerun"], ["interrupted", "ok"])
+        self.assertEqual(r.plan(self.now), [])                            # the failed ones never run again
+
+    async def test_a_drain_holds_a_fail_job_not_a_rerun_job(self):
+        self.add("j_review", START, on_interrupt="fail")
+        self.add("j_sample", START, on_interrupt="rerun")
+        r = self.runner(owns={"at"})
+        r.boot()
+        actions.runner_state_put(self.conn, {"drain": {"until": runner._iso(datetime.now(UTC) + timedelta(days=1))}},
+                                 actor="cli", via="cli")
+        started = {d.key: await self.run_at(r, d) for d in r.plan(self.now)}
+        self.assertIsNone(started["j_review"])
+        self.assertIsNotNone(started["j_sample"])
+        self.assertEqual(store.get_job(self.conn, "j_review")["status"], "pending")   # not claimed: runs later
+        actions.runner_state_put(self.conn, {"drain": None}, actor="cli", via="cli")
+        due, = r.plan(self.now + MIN)
+        self.assertEqual(due.key, "j_review")
+        self.assertIsNotNone(await self.run_at(r, due))
+
+    def test_the_drain_waits_for_a_running_fail_at_job_only(self):
+        for jid, flag in (("j_f", "fail"), ("j_r", "rerun")):
+            self.add(jid, START, on_interrupt=flag)
+        rr, _ = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="at", key="j_r", timeout_s=60, actor="runner:at",
+                                  via="runner", claim="j_r")
+        out = []
+        with mock.patch.object(runner, "wake"):
+            self.assertEqual(runner.drain(self.conn, timedelta(0), out=out.append), 0)    # a rerun job: not waited for
+            rf, _ = actions.run_begin(self.conn, boot_id=OTHER_BOOT, job="at", key="j_f", timeout_s=60,
+                                      actor="runner:at", via="runner", claim="j_f")
+            self.assertEqual(runner.drain(self.conn, timedelta(0), sleep=lambda s: None, out=out.append), 1)
+        self.assertIn(f"run {rf} at j_f", out[-1])
+
+    def test_the_at_timeout_covers_every_at_t_caller(self):
+        """The at -t callers (usage_sampler's samples, usage_review's one-off reviews and chain
+        steps) run the same code paths as the sampler and usage-review ticks (S3's inner timeouts):
+        the default at-job timeout is above each one's worst case + margin."""
+        at = timedelta(minutes=actions.SETTINGS["runner_timeout_at"].default())
+        self.assertEqual(at, timedelta(minutes=runner.JOBS["at"].timeout_min))
+        for tick in ("sampler", "usage_review"):
+            self.assertGreaterEqual(at, runner_jobs.tick_min_timeout(tick), tick)
+        callers = subprocess.run(["grep", "-rlE", r'\["at",', "--include=*.py", "."], cwd=HERE,
+                                 capture_output=True, text=True).stdout.split()
+        self.assertEqual(sorted(c for c in callers if not os.path.basename(c).startswith("test_")),
+                         ["./usage_review.py", "./usage_sampler.py"])     # a new caller: check its worst case
+
+    def test_job_put_checks_the_runner_fields(self):
+        for bad in ({"on_interrupt": "maybe"}, {"timeout": 0}, {"timeout": "5"}, {"timeout": 721}, {"timeout": True}):
+            with self.subTest(bad), self.assertRaises(ValueError):
+                self.add("jbad", START, **bad)
+        self.add("jok", START, on_interrupt="rerun", timeout=2.5)
+        self.assertEqual(runner.at_policy(store.get_job(self.conn, "jok"), self.AT), ("rerun", 2.5))
+        self.assertEqual(runner.at_policy(None, self.AT), ("fail", None))
+
+
+class AtShim(unittest.TestCase):
+    """`at -t` with the runner's fields, and its wake (only when a runner listens)."""
+    def setUp(self):
+        self.shim = load_shim()
+        self.conn = store.connect()
+        self.addCleanup(self.conn.close)
+
+    def at(self, *argv, cmd="true\n"):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(cmd)), contextlib.redirect_stderr(err):
+            rc = self.shim.main(list(argv))
+        return rc, err.getvalue()
+
+    def test_the_runner_fields_are_stored(self):
+        rc, err = self.at("--on-interrupt", "rerun", "--timeout", "5", "-t", "209901010000")
+        self.assertEqual(rc, 0, err)
+        jid = err.split()[1]
+        p = json.loads(store.get_job(self.conn, jid)["payload"])
+        self.assertEqual((p["on_interrupt"], p["timeout"]), ("rerun", 5.0))
+        rc, err = self.at("-t", "209901010001")                          # as before: no fields (default fail)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("on_interrupt", json.loads(store.get_job(self.conn, err.split()[1])["payload"]))
+        for bad in (("--on-interrupt", "x", "-t", "209901010000"), ("--timeout", "0", "-t", "209901010000"),
+                    ("-t",)):
+            with self.subTest(bad):
+                self.assertEqual(self.at(*bad)[0], 1)
+        self.assertEqual(self.at("--on-interrupt", "rerun")[0], 2)      # no -t: the usage
+
+    def test_at_t_wakes_a_listening_runner_and_is_quiet_without_one(self):
+        path = runner.sock_path()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        rc, err = self.at("-t", "209901010000")
+        self.assertEqual(rc, 0)
+        self.assertTrue(err.startswith("job "), err)                      # no runner (legacy): no warning
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.bind(path)
+        self.addCleanup(os.unlink, path)
+        self.addCleanup(s.close)
+        s.setblocking(False)
+        rc, err = self.at("-t", "209901010000")
+        self.assertEqual(rc, 0)
+        self.assertEqual(s.recv(64), b"w")                                # the wake
+        self.assertTrue(err.strip().splitlines()[-1].startswith("job "))  # the callers keep the tail
+
+
+class AtChild(unittest.TestCase):
+    """runner_jobs.py at --key: the claimed job's command as a tracked child; real runners and
+    children against the test DB (the children read it through the environment)."""
+    def setUp(self):
+        testenv.unpause()
+        self.addCleanup(testenv.unpause)
+        self.conn = store.connect()
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.mkdtemp(prefix="afc-at-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.fails, self.logs = [], []
+        self.n = 0
+
+    def add(self, cmd, claim=True, **fields):
+        self.n += 1
+        jid = f"t{os.getpid()}x{self.n}x{int(time.time() * 1000) % 10**8}"
+        actions.job_put(self.conn, dict({"id": jid, "at": runner._iso(datetime.now(UTC)), "cmd": cmd,
+                                         "cwd": self.tmp}, **fields), actor="runner:at_shim", via="runner")
+        if claim:
+            actions.job_started(self.conn, jid, actor="runner:at_shim", via="runner")
+        return jid
+
+    def child(self, jid):
+        code = PRELUDE + "import runner_jobs as r; sys.exit(r.main(['at', '--key', sys.argv[1]]))"
+        return subprocess.run([sys.executable, "-c", code, jid], cwd=HERE, capture_output=True, text=True, timeout=60)
+
+    def log_text(self):
+        try:
+            with open(runner_jobs.log_path("at"), encoding="utf-8") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return ""
+
+    def test_ok_runs_in_its_cwd_and_logs_to_at_shim_log(self):
+        p = self.child(self.add("echo hello-$(basename $(pwd))\n"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["status"], "ok")
+        self.assertIn(f"hello-{os.path.basename(self.tmp)}", self.log_text())
+
+    def test_a_failure_the_command_reported_exits_3(self):
+        cmd = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{HERE}'); import failstop; "
+               "failstop.fail('t', 'sample broke', pause=False, alert=lambda s, b='': None); sys.exit(1)\"\n")
+        p = self.child(self.add(cmd))
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn("reported its failure itself: t: sample broke", p.stderr)
+        self.assertEqual([f for f in os.listdir(os.path.join(testenv.DIR, "run")) if f.endswith(".reports")], [])
+
+    def test_a_nonzero_exit_and_an_unclaimed_job(self):
+        p = self.child(self.add("exit 5\n"))
+        self.assertEqual(p.returncode, 5)
+        self.assertIn("exited 5", p.stderr)
+        p = self.child(self.add("true\n", claim=False))
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("pending, not claimed by this run", p.stderr)
+        self.assertEqual(runner_jobs.main(["at"]), runner_jobs.EXIT_USAGE)
+
+    def runner(self, clock=None, boot_id=None):
+        return runner.Runner(self.conn, owns=frozenset({"at"}), spawner=runner.SubprocessSpawner(term_grace=1.0),
+                             log_fn=self.logs.append, boot_id=boot_id,
+                             fail=lambda c, s, d="", **kw: self.fails.append((s, d)),
+                             sock=os.path.join(self.tmp, "r.sock"), clock=clock)
+
+    async def _start(self, r, jid):
+        due = runner.Due(runner.JOBS["at"], jid, datetime.now(UTC))
+        run_id = r.start(due, datetime.now(UTC))
+        self.assertIsNotNone(run_id)
+        return run_id, r.tasks[runner.JOBS["at"].slot(jid)]
+
+    def test_a_real_at_job_past_its_timeout_is_ended(self):
+        async def go():
+            r = self.runner()
+            jid = self.add(f"sleep 60 & echo $! > {self.tmp}/pid; wait\n", claim=False, timeout=0.02)
+            run_id, task = await self._start(r, jid)
+            await task
+            return run_id
+        run_id = asyncio.run(go())
+        row = store.get_run(self.conn, run_id)
+        self.assertEqual(row["status"], "timeout")
+        self.assertEqual([f[0] for f in self.fails], ["at timed out"])
+        with open(os.path.join(self.tmp, "pid")) as fh:
+            pid = int(fh.read())
+        time.sleep(0.2)
+        self.assertFalse(os.path.exists(f"/proc/{pid}") and "sleep" in open(f"/proc/{pid}/cmdline").read())
+
+    def test_a_restart_reruns_or_fails_a_real_at_job_per_its_flag(self):
+        """The done-when of S4: a test job interrupted by a restart is rerun or fails by its flag."""
+        marker = os.path.join(self.tmp, "ran-once")
+        cmd = f"if [ -e {marker}.$FLAG ]; then echo second; exit 0; fi; touch {marker}.$FLAG; sleep 60\n"
+        jobs = {flag: self.add(cmd.replace("$FLAG", flag), claim=False, on_interrupt=flag) for flag in ("rerun", "fail")}
+
+        async def first():
+            r = self.runner()
+            tasks = [(await self._start(r, jid))[1] for jid in jobs.values()]
+            t = time.monotonic()
+            while not all(os.path.exists(f"{marker}.{f}") for f in jobs) and time.monotonic() - t < 20:
+                await asyncio.sleep(0.05)
+            await r._stop_children()                                     # the stop grace is over: left running
+            for t_ in tasks:
+                self.assertTrue(t_.done())
+            await asyncio.sleep(0.5)                                     # (their groups got SIGTERM: let them go)
+        asyncio.run(first())
+        self.assertEqual({x["key"]: x["status"] for x in store.running_runs(self.conn)},
+                         {jid: "running" for jid in jobs.values()})
+        actions.runner_state_put(self.conn, {"clean_exit": True}, actor="runner", via="runner")
+
+        async def second():
+            r = self.runner()
+            r.boot()
+            dues = [d for d in r.plan(datetime.now(UTC)) if d.key in jobs.values()]
+            self.assertEqual([(d.key, d.rerun) for d in dues], [(jobs["rerun"], True)])
+            await (await self._start_due(r, dues[0]))
+        asyncio.run(second())
+        self.assertEqual([x["status"] for x in store.key_runs(self.conn, "at", jobs["rerun"])], ["interrupted", "ok"])
+        self.assertEqual([x["status"] for x in store.key_runs(self.conn, "at", jobs["fail"])], ["interrupted"])
+        self.assertEqual([f[0] for f in self.fails], ["at interrupted by a runner restart"])
+        self.assertIn(jobs["fail"], self.fails[0][1])
+        self.assertIn("second", self.log_text())
+
+    async def _start_due(self, r, due):
+        self.assertIsNotNone(r.start(due, datetime.now(UTC)))
+        return r.tasks[runner.JOBS["at"].slot(due.key)]
 
 
 if __name__ == "__main__":

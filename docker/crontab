@@ -7,8 +7,10 @@
 # from here into it. S2: stall_scan, prune_runs (new, never cron lines). S3: the usage sampler, the
 # dispatcher, the quickview export, the docs import, the log retention and the hourly usage review
 # (their lines are gone from here; runner.JOBS has their cadences, runner_jobs.HANDLERS their
-# commands, logs and flocks). docker/crontab.legacy is this file as it was before S2 (the rollback
-# mode AFCLAUDE_SCHEDULER=legacy, which keeps every line).
+# commands, logs and flocks). S4: the at-jobs (scheduled_jobs, stored by `at -t`): the runner runs
+# each at its minute as a tracked child; the */1 `at --run-due` line is gone. docker/crontab.legacy
+# is this file as it was before S2 (the rollback mode AFCLAUDE_SCHEDULER=legacy, which keeps every
+# line, `at --run-due` among them).
 # WINDOW-START: every 30 min (the window starts are on the 30-min grid of window_days, D-030);
 # keepalive.py --window-start exits at once unless a session-window start of the configured
 # windows is due in this slot (schedule.due_session_start: start + k x session_hours in window_tz,
@@ -16,7 +18,6 @@
 # schedule.start_key).
 */30 * * * * cd $AFCLAUDE_DIR && python3 keepalive.py --session $AFCLAUDE_MANAGER_SESSION --window-start --arm --take-over-idle >> $KEEPALIVE_STATE_DIR/keepalive.log 2>&1 # AFClaude window-start
 7,22,37,52 * * * * [ -e $AFCLAUDE_DIR/PAUSED ] || $AFCLAUDE_DIR/docker/start_watcher.sh >/dev/null 2>>$KEEPALIVE_STATE_DIR/watchdog.log # AFClaude watcher watchdog (no-op if running)
-* * * * * python3 $AFCLAUDE_DIR/docker/at_shim.py --run-due >> $AFCLAUDE_DIR/data/at_shim.log 2>&1 # AFClaude at-shim (the jobs in the DB: the sampler's pre/post weekly-reset samples, one-off reviews)
 # INBOX API WATCHDOG: inbox_api.py serve (the message box to the task-manager, D-241) is started by the
 # entrypoint; this starts it again if it died, and alerts that it was not running.
 */5 * * * * cd $AFCLAUDE_DIR && python3 inbox_api.py ensure >> $AFCLAUDE_DIR/data/inbox_api.log 2>&1 # AFClaude inbox API watchdog (no-op if running)
