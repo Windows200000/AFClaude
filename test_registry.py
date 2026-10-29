@@ -27,15 +27,10 @@ NOW = datetime(2026, 10, 29, 22, 0, tzinfo=UTC)
 
 
 class Base(unittest.TestCase):
-    """A temp DB with two task-managers (alpha, beta; rank order) and a project without one (gamma).
-    Two are refused until S4 (store.ONE_MANAGER_UNTIL_S4, class OneManager); these tests switch that
-    off to keep the per-session paths S4 builds on tested."""
-    ONE = False
+    """A temp DB with two task-managers (alpha, beta; rank order) and a project without one (gamma)."""
 
     def setUp(self):
         testenv.fresh_db(self)
-        self.addCleanup(setattr, store, "ONE_MANAGER_UNTIL_S4", store.ONE_MANAGER_UNTIL_S4)
-        store.ONE_MANAGER_UNTIL_S4 = self.ONE
         self.addCleanup(testenv.unpause)
         self.conn = store.connect()
         self.addCleanup(self.conn.close)
@@ -267,37 +262,22 @@ class Legacy(Base):
         self.assertEqual(fails[0][0][1], "the manager_session setting disagrees with the task-manager registry")
 
 
-class OneManager(Base):
-    """Until S4's project selection: at most one project has a task-manager session."""
-    ONE = True
-
+class SeveralManagers(Base):
+    """Since S4 (project selection at the start) several projects may have a task-manager session:
+    S3's one-manager switch is gone."""
     def edit(self, name, sid):
         return actions.perform(self.conn, "project.edit", {"project": name, "manager_session": sid},
                                actor="cli", via="cli")
 
-    def test_the_project_edit_refuses_a_second_session(self):
-        with self.assertRaisesRegex(ValueError, "already has a task-manager session .*phase 3b S4"):
-            self.edit("gamma", "cccccccc-0000-4000-8000-000000000003")
-        self.edit("beta", "")
-        self.edit("alpha", SID_A)                     # its own session again: fine
-        with self.assertRaisesRegex(ValueError, "'alpha' already has"):
-            self.edit("beta", SID_B)
-        self.edit("alpha", "")
-        self.assertEqual(self.edit("beta", SID_B)["manager_session"], SID_B)   # the other one cleared first
+    def test_the_project_edit_takes_a_second_session(self):
+        self.assertEqual(self.edit("gamma", "cccccccc-0000-4000-8000-000000000003")["manager_session"],
+                         "cccccccc-0000-4000-8000-000000000003")
+        self.assertEqual(len(store.manager_sessions(self.conn)), 3)
 
-    def test_the_runner_path_fails_on_two(self):
-        with self.assertRaisesRegex(RuntimeError, "2 projects have a task-manager session .*alpha aaaaaaaa"):
-            ka.registry_sessions()
-        with self.assertRaisesRegex(RuntimeError, "2 projects have"):
-            ka.runner_pass("watch")
-        with self.assertRaisesRegex(ValueError, "2 projects have"):
-            store.start_manager(self.conn)
-        with self.assertRaisesRegex(ValueError, "2 projects have"):
-            runner_jobs._argv(runner_jobs.HANDLERS["window_start"], "k")
-        store.update_project(self.conn, "beta", manager_session="")
-        self.conn.commit()
-        self.assertEqual([t["session"] for t in ka.registry_sessions()], [SID_A])
+    def test_the_runner_path_runs_over_both(self):
+        self.assertEqual([t["session"] for t in ka.registry_sessions()], [SID_A, SID_B])
         self.assertEqual(store.start_manager(self.conn)["session"], SID_A)
+        self.assertEqual(runner_jobs._argv(runner_jobs.HANDLERS["window_start"], "k")[1:3], ["--session", SID_A])
 
     def test_pre_s3_act_plans_are_dropped_once(self):
         store.update_project(self.conn, "beta", manager_session="")

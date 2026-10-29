@@ -28,9 +28,9 @@ one pass per invocation does:
      stored with the sessions (3b S2: driven_sessions, readable afc-... names, no name pattern);
      a gone or killed session's stall row is ended (its name free again).
 
-Phase 3b (not built): with several task-managers, the session-window start picks the project by
-rank/priority and continues ITS task-manager; that selection belongs to the start
-(keepalive.window_start_pass), not to this pass. See start_project_seam() below.
+Phase 3b S4: with several task-managers, a session-window start (and a postponed one, a last-stretch
+slot) picks the project (store.pick_project, in keepalive.handle_fire after the gate and the timing)
+and continues ITS task-manager; that selection belongs to the start, not to this pass (D-205).
 
 Default is DRY-RUN: it decides and logs what it WOULD do and changes nothing
 (no stalled.py scan, no DB writes besides store.connect()'s schema check, no
@@ -305,16 +305,6 @@ def task_of(conn, sid):
     """The open AFClaude task this session works on (in_progress / blocked), or None."""
     return next((t for t in store.list_tasks(conn, status=["in_progress", "blocked"])
                  if t["assigned_session"] == sid), None)
-
-
-def start_project_seam(conn):
-    """Design phase 3b seam (NOT built, D-205): with several task-managers, a session-window start
-    (keepalive.window_start_pass, after its gate passed) would pick the project to run by rank /
-    priority (store.execution_order over the managed projects) and continue THAT project's
-    task-manager (projects.manager_session), which works its own tasks. Today only AFClaude has a
-    task-manager, so the start always continues it. The 10-min pass never starts anything.
-    -> the managed projects in rank order (read-only; nothing calls this for a decision yet)."""
-    return sorted(managed_projects(conn).values(), key=lambda p: (p.get("rank") or 1 << 30, p.get("name") or ""))
 
 
 # ---------------------------------------------------------------- the pass

@@ -176,14 +176,22 @@ FUNCTIONS["inbox_verify"] = (INBOX_LOG, inbox_verify_tick)
 # running compaction (COMPACT_LOCK_WAIT), the take-over of an idle holder (stop + TAKE_OVER_WAIT),
 # the resume and its verification (VERIFY_TIMEOUT); or, for a start that does not fire at once, the
 # window-start ping (D-277: its request, WINDOW_PING_TIMEOUT; the wait, WINDOW_PING_VERIFY_AFTER; a
-# second usage refresh). Both paths are summed (the safe side). The host calls' timeouts are literals
-# in keepalive.py: (function, seconds of one call, calls); test_runner checks them against the source.
+# second usage refresh). Phase 3b S4: the project pick passes over up to keepalive.PICK_MAX_PASS_OVER
+# owner-held projects, one preflight each (PICK_PREFLIGHT_CALLS); a project's first start
+# (create_task_manager) adds the free tmux name's checks (a taken name and a free one), a timed-out
+# launch's tmux check and the wait for the new transcript (NEW_TRANSCRIPT_WAIT); its launch and reply
+# are the continue's (fire 120, VERIFY_TIMEOUT). All paths are summed (the safe side). The host
+# calls' timeouts are literals in keepalive.py: (function, seconds of one call, calls); test_runner
+# checks them against the source.
 WINDOW_START_HOST_CALLS: tuple[tuple[str, int, int], ...] = (
     ("refresh_usage", 120, 4), ("poke_auth", 180, 2), ("agent_entries", 60, 1), ("tmux_has", 30, 1),
-    ("tmux_pids", 30, 1), ("owner_typing", 30, 2), ("fire", 60, 1), ("fire", 120, 1),
+    ("tmux_pids", 30, 1), ("owner_typing", 30, 2), ("fire", 60, 1), ("fire", 120, 1), ("tmux_has", 30, 3),
+)
+PICK_PREFLIGHT_CALLS: tuple[tuple[str, int, int], ...] = (
+    ("agent_entries", 60, 1), ("tmux_has", 30, 1), ("tmux_pids", 30, 1),
 )
 WINDOW_START_CONSTANTS = ("COMPACT_LOCK_WAIT", "VERIFY_TIMEOUT", "TAKE_OVER_WAIT", "WINDOW_PING_TIMEOUT",
-                          "WINDOW_PING_VERIFY_AFTER")
+                          "WINDOW_PING_VERIFY_AFTER", "NEW_TRANSCRIPT_WAIT")
 OUTER_MARGIN = timedelta(minutes=5)
 
 
@@ -197,6 +205,8 @@ def window_start_inner() -> dict[str, timedelta]:
         out[name] = v if isinstance(v, timedelta) else timedelta(seconds=float(v))
     for fn, secs, calls in WINDOW_START_HOST_CALLS:
         out[f"host:{fn}"] = out.get(f"host:{fn}", timedelta(0)) + timedelta(seconds=secs * calls)
+    for fn, secs, calls in PICK_PREFLIGHT_CALLS:
+        out[f"host:{fn}"] += timedelta(seconds=secs * calls * ka.PICK_MAX_PASS_OVER)
     return out
 
 
