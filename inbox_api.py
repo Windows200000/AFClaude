@@ -24,7 +24,9 @@ a post or a retry wakes the resident runner (runner.wake, --no-worker) instead o
 and the runner's own `inbox` / `inbox_verify` jobs do the triage, delivery and verification
 (inbox_worker.py). AFCLAUDE_SCHEDULER=legacy keeps the worker thread (inbox_worker.run_forever) in
 this same process, woken by the same events, as before S7; the runner supervises `serve --no-worker`
-as a child (restart + alert) instead of the entrypoint/cron starting and watching `ensure`.
+as a child (restart + alert) instead of the entrypoint/cron starting and watching `ensure`. Its log
+lines go to data/inbox_api.log in both modes (`ensure` redirects the legacy child's output there; under
+the runner `serve --no-worker` does it itself, log_to_file, once it is serving).
 
   inbox_api.py serve [--socket PATH] [--no-worker]   the server (one per data/: a lock file); the
                                          legacy entrypoint starts it with `ensure --boot`; the
@@ -252,6 +254,20 @@ class _WakeRunner:
         runner.wake()
 
 
+def log_to_file() -> None:
+    """Point this process's stdout and stderr at data/inbox_api.log (append), as `ensure`'s Popen does for
+    the legacy server. Under the runner (--no-worker) the child's output is a pipe the runner only reads
+    when the child exits (an alert's tail), so the running server's own lines (posted, http, tracebacks)
+    would otherwise never reach the log the docs name. Opened only once the server really starts: an early
+    exit (lock held, no key) keeps its line on the pipe, which is what the runner's alert quotes."""
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+
+
 def serve(path: str, no_worker: bool = False) -> int:
     lock = take_lock()
     if lock is None:
@@ -263,6 +279,7 @@ def serve(path: str, no_worker: bool = False) -> int:
         return 1
     wake: threading.Event | _WakeRunner
     if no_worker:
+        log_to_file()                  # the runner does not write this child's output to the log
         wake = _WakeRunner()           # S7: the runner's own `inbox` / `inbox_verify` jobs do the work
     else:
         wake = threading.Event()
