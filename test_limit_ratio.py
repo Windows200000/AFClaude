@@ -308,9 +308,21 @@ class CombineSpans(unittest.TestCase):
         runs = [{"start": h(0), "end": h(1), "work_end": h(2), "ongoing": False, "work_ongoing": False},
                 {"start": h(4), "end": h(4.5), "ongoing": False},
                 {"start": h(8), "end": h(8.5), "work_end": h(9), "ongoing": False, "work_ongoing": True}]
-        self.assertEqual(lr.combine_spans(runs, [], now),
-                         [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=4), T0 + timedelta(hours=4.5)),
-                          (T0 + timedelta(hours=8), now)])
+        got = lr.combine_spans(runs, [], now)
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=4), T0 + timedelta(hours=4.5)),
+                               (T0 + timedelta(hours=8), now)])
+        # the parts only a row's end..work_end covers (pacing books them by tokens)
+        self.assertEqual(got.tails, [(T0 + timedelta(hours=1), T0 + timedelta(hours=2)),
+                                     (T0 + timedelta(hours=8.5), now)])
+        # another run inside a tail is no tail; an ongoing run has none; a fallback span is no tail
+        runs[1] = {"start": h(1.5), "end": h(1.75), "ongoing": False}
+        runs.append({"start": h(5), "end": h(5), "work_end": h(6), "ongoing": True})
+        got = lr.combine_spans(runs, [(T0 + timedelta(hours=3), T0 + timedelta(hours=3.5))], now)
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=3), T0 + timedelta(hours=3.5)),
+                               (T0 + timedelta(hours=5), now)])
+        self.assertEqual(got.tails, [(T0 + timedelta(hours=1), T0 + timedelta(hours=1.5)),
+                                     (T0 + timedelta(hours=1.75), T0 + timedelta(hours=2))])
+        self.assertEqual(lr.combine_spans([], [(T0, T0 + timedelta(hours=1))]).tails, [])
 
     def test_overlapping_spans_merge(self):
         got = lr.combine_spans([], [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=1), T0 + timedelta(hours=3))])
