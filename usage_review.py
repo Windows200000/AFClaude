@@ -391,7 +391,7 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     local = now.astimezone(ka.BERLIN)
     d = local.date().isoformat()
     since = st["runs"][-1]["at"][:10] if st.get("runs") else "2026-09-26"
-    msg = prompts.bundle(ONLY_BUNDLES[which], insert=extra, date=d, since=since, report=report_doc(now))
+    msg = prompts.bundle(ONLY_BUNDLES[which], ka.project_prompt_values(), insert=extra, date=d, since=since, report=report_doc(now))
     sid = sid or str(uuid.uuid4())
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
     tmux = ka.claim_tmux(sid, "review", actor="runner:usage_review")   # its readable name, stored first (3b S2)

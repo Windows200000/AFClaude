@@ -611,10 +611,11 @@ def prompt_preview(conn: sqlite3.Connection, project: Optional[str], declared: s
 
 @tool("The prompts AFClaude sends (read-only; an owner override replaces the default system-wide). list: prompts "
       "and bundles, with each override's flags. bundle (name = kind) / render (name = prompt): the text a sender "
-      "sends, for a project's variable values; values: system variables, the rest show as <name>.", read_only=True)
+      "sends, for a project's variable values; values: system variables, the rest show as <name>. bundle: manager=false "
+      "(a neutral session), hooked=true (a session the hook gave the rules) change the rules tail.", read_only=True)
 async def afclaude_prompts(action: Literal["list", "bundle", "render"], name: Optional[str] = None,
                            project: Optional[str] = None, values: Optional[dict[str, str]] = None,
-                           ctx: Optional[Context] = None) -> str:
+                           manager: bool = True, hooked: bool = False, ctx: Optional[Context] = None) -> str:
     conn = db()
     try:
         try:
@@ -640,7 +641,8 @@ async def afclaude_prompts(action: Literal["list", "bundle", "render"], name: Op
                 return out({"kind": kind, "flat": b.flat,
                             "parts": [part.prompt or ("insert: " + part.insert if part.insert else "rules")
                                       for part in b.parts],
-                            "text": prompts.bundle_in(conn, kind, pvals, system)})
+                            "text": prompts.bundle_in(conn, kind, pvals, system, hooked=hooked,
+                                                       manager=manager)})
             prompt_name = prompts.check_name(name)
             pvals, system = prompt_preview(conn, project, set(prompts.PROMPTS[prompt_name].system), values)
             return out({"name": prompt_name, "text": prompts.render_in(conn, prompt_name, pvals, system)})

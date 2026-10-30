@@ -324,6 +324,8 @@ def this_project():
             else:
                 store.update_project(conn, TEST_PROJECT, path=ur.HERE)
             p = store.get_project(conn, ur.HERE)
+        # the one-off review's rules read this project's prompt values (P5: manager.md too): seeded, as a deploy does
+        actions.perform(conn, "prompt_var.migrate", {}, actor="runner:deploy", via="runner")
         return p["name"]
     finally:
         conn.close()

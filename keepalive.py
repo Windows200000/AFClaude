@@ -210,13 +210,12 @@ STANDING_RULES_BUNDLES = {"manager": "manager_rules", "afclaude": "afclaude_rule
 def standing_rules(part):
     """One part of the standing rules (RULES_PARTS; its bundle, STANDING_RULES_BUNDLES), with a
     header line; variables filled as in session_message ({session_stop_pct}, and the AFClaude
-    project's own values for manager_project). Newlines kept: this is hook context, not tmux (the
+    project's own values for manager and manager_project). Newlines kept: this is hook context, not tmux (the
     bundle is not `flat`)."""
     kind = STANDING_RULES_BUNDLES.get(part)
     if kind is None:
         raise ValueError(f"unknown standing-rules part {part!r} (one of {', '.join(RULES_PARTS)})")
-    values = project_prompt_values() if part == "afclaude" else None
-    return prompts.bundle(kind, values, part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part],
+    return prompts.bundle(kind, project_prompt_values(), part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part],
                           session_stop_pct=session_stop_pct(), **prompts.tool_vars())
 
 

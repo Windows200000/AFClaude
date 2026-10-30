@@ -48,6 +48,22 @@ class RegistryTest(unittest.TestCase):
         for name in prompts.PROMPTS:
             self.assertIn(f"`{name}.md`", readme)
 
+    def test_readme_placeholders_match_the_registry(self):
+        """Each row's placeholder cell lists the prompt's variables (a row may say "the project variables"
+        instead of naming the project ones)."""
+        with open(os.path.join(HERE, "prompts", "README.md")) as fh:
+            rows = {}
+            for line in fh:
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if line.startswith("| `") and len(cells) >= 3 and cells[0].endswith(".md`"):
+                    rows[cells[0].strip("`")[:-3]] = cells[-1]
+        for name, spec in prompts.PROMPTS.items():
+            with self.subTest(prompt=name):
+                listed = set(re.findall(r"`\{(\w+)\}`", rows[name]))
+                want = set(spec.system) | set(spec.project)
+                self.assertTrue(listed == want or (listed == set(spec.system) and "project variables" in rows[name]),
+                                f"README lists {sorted(listed)}, the registry has {sorted(want)}")
+
     def test_seed_is_valid(self):
         for k, v in prompts.CHECKOUT_SEED.items():
             self.assertEqual(prompts.check_var(k, v), k)
@@ -112,10 +128,10 @@ class BundleTest(unittest.TestCase):
         base = dict(reason="r", progress="P.md")
         hooked_manager = prompts.bundle("continue", hooked=True, manager=True, **base)
         self.assertIn(prompts.default("rules_pointer").strip(), hooked_manager)
-        self.assertNotIn(prompts.default("manager").strip(), hooked_manager)
+        self.assertNotIn(prompts.render("manager").strip(), hooked_manager)
         neutral = prompts.bundle("continue_foreign", manager=False, reason="r", context="")
         self.assertIn(prompts.default("guard_respect").strip(), neutral)
-        self.assertNotIn(prompts.default("manager").strip(), neutral)
+        self.assertNotIn(prompts.render("manager").strip(), neutral)
 
     def test_system_vars_routed_per_part_not_shared_blindly(self):
         """A bundle with several prompt parts: one **system dict serves all of them, each part
@@ -153,7 +169,7 @@ class BundleTest(unittest.TestCase):
                                            "--set", "session_stop_pct=95"]), 0)
         text = "".join(c.args[0] for c in out.write.call_args_list)
         self.assertIn("continue", text)
-        self.assertIn(" ".join(prompts.default("manager").split()), text)   # the bundle is flat: squashed
+        self.assertIn(" ".join(prompts.render("manager").split()), text)   # the bundle is flat: squashed
         with mock.patch("sys.stderr"):
             self.assertEqual(prompts.main(["bundle", "nope"]), 1)
 
@@ -166,7 +182,8 @@ class RenderTest(unittest.TestCase):
             prompts.render("continue", reason="r")
         with self.assertRaisesRegex(ValueError, r"unknown \['x'\]"):
             prompts.render("continue", reason="r", progress="p", x=1)
-        self.assertEqual(prompts.render("manager"), prompts.default("manager").format())
+        self.assertEqual(prompts.render("manager"), prompts.default("manager").format(
+            progress_location=prompts.PROJECT_VARS["progress_location"].default))
 
     def test_project_variables(self):
         reg = dict(prompts.PROMPTS, t=prompts.Prompt(("a",), ("public_repo_rule", "project_notes"), used_by="test"))
@@ -288,16 +305,25 @@ def _legacy_inbox(name):           # inbox.prompt before phase 4a
     return actions.prompt_default(name + ".md")
 
 
-# manager_afclaude.md as it was before P3 (kept until P5 removes it): the text AFClaude's own rules
-# must still render to, byte for byte. Its one absolute path was the live checkout's.
-OLD_AFCLAUDE_RULES = os.path.join(HERE, "testdata", "manager_afclaude_before_p3.md")
-OLD_CHECKOUT = "/mnt/BlockVolume/Claude/work/AFClaude"
+# AFClaude's own rules as the senders must keep sending them, byte for byte (the P3 fixture, the old
+# manager_afclaude.md rendered once, and manager.md as it was before P5 made its progress
+# file a variable): committed expected renderings, so the texts can't drift silently. Changing a
+# template or a seed value on purpose means changing these files in the same commit. The two
+# sentinels stand for the checkout's directory and the session_stop_pct setting.
+EXPECTED_MANAGER = os.path.join(HERE, "testdata", "afclaude_manager_rendered.md")
+EXPECTED_RULES = os.path.join(HERE, "testdata", "afclaude_manager_project_rendered.md")
+
+
+def expected_text(path, system=None):
+    with open(path) as fh:
+        text = fh.read()
+    if system is not None:
+        text = text.replace("<AFCLAUDE_DIR>", system["afclaude_dir"]).replace("<STOP_PCT>", system["session_stop_pct"])
+    return text
 
 
 def old_afclaude_rules(system):
-    with open(OLD_AFCLAUDE_RULES) as fh:
-        text = fh.read()
-    return text.replace(OLD_CHECKOUT, system["afclaude_dir"]).format(session_stop_pct=system["session_stop_pct"])
+    return expected_text(EXPECTED_RULES, system)
 
 
 def seed_checkout(conn):
@@ -393,9 +419,11 @@ class SameTextTest(unittest.TestCase):
         after = self.renders()
         real_render = prompts._render
 
-        def legacy_render(name, project_values, system, ov):    # P3: manager_project.md = the old file
+        def legacy_render(name, project_values, system, ov):    # AFClaude's rules = the committed expected text
             if name == "manager_project":
                 return old_afclaude_rules(system)
+            if name == "manager":
+                return expected_text(EXPECTED_MANAGER)
             return real_render(name, project_values, system, ov)
         with mock.patch.object(ka, "load_prompt", _legacy_ka), \
                 mock.patch.object(nightly_tasks, "_prompt", _legacy_nightly), \
@@ -404,7 +432,7 @@ class SameTextTest(unittest.TestCase):
             before = self.renders()
         self.assertEqual(sorted(before), sorted(after))
         self.assertGreater(len(after), 60)
-        # the fixture really is in play: the AFClaude rules are in the inline and the hook texts
+        # the expected texts really are in play: the AFClaude rules are in the inline and the hook texts
         inline = after[f"session_message continue True False None"]
         self.assertIn(" ".join(old_afclaude_rules({"afclaude_dir": prompts.HERE, "session_stop_pct": "95"}).split()),
                       inline)
@@ -451,7 +479,7 @@ class SecondProjectTest(unittest.TestCase):
 
     def test_a_second_project_gets_its_own_values_and_none_of_afclaudes(self):
         for k, v in (("public_repo_rule", "- The repo is public: run tools/guard.sh."),
-                     ("goals_location", "docs/goals.md")):
+                     ("goals_location", "docs/goals.md"), ("progress_location", "docs/notes.md")):
             actions.perform(self.conn, "prompt_var.set", {"project": "Other", "name": k, "value": v},
                             actor="cli", via="cli")
         msg = self.message(self.repo)
@@ -459,8 +487,11 @@ class SecondProjectTest(unittest.TestCase):
         self.assertIn("(docs/goals.md: one short line per goal", msg)
         self.assertIn("and OPEN_QUESTIONS.md (only things", msg)                # the default
         rules = self.rules()
-        for name in ("PROGRESS.md", "GOALS.md"):       # (manager.md, a different template, still names PROGRESS.md)
+        for name in ("PROGRESS.md", "GOALS.md"):
             self.assertNotIn(name, rules)
+        self.assertNotIn("Keep PROGRESS.md as", msg)      # manager.md too (P5): the progress file is a variable
+        self.assertNotIn("updating PROGRESS.md", msg)
+        self.assertIn("Keep docs/notes.md as your external memory", msg)
         self.assertIn("docs/goals.md", rules)
         for line in self.afclaude_lines:
             self.assertNotIn(" ".join(line.split()), msg)
@@ -484,6 +515,7 @@ class SecondProjectTest(unittest.TestCase):
         self.assertIn("(the project's goals doc: one short line per goal", plain)
         self.assertEqual(plain.count("(state in the project's progress doc)"), 2)
         self.assertEqual(self.message(self.repo).count("(state in the project's progress doc)"), 2)
+        self.assertIn("Keep the project's progress doc as your external memory", self.message(self.repo))
 
     def test_afclaudes_own_commands_stay_relative(self):
         mine = self.message(None)
