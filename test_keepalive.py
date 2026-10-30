@@ -1778,7 +1778,7 @@ class SessionRules(unittest.TestCase):
         finally:
             ka.standing_rules = old
         self.assertIn("could not be built", text)                    # never a failed hook
-        self.assertIn("manager_afclaude.md", text)
+        self.assertIn("manager_project.md", text)
 
     def test_cli(self):
         """The hook command itself: valid JSON with the filled rules in the repo, nothing elsewhere,

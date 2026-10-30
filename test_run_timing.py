@@ -271,7 +271,7 @@ class PaceText(unittest.TestCase):
             m = ka.session_message(name, reason="r", progress="P.md", insert=pace, hooked=True, **extra)
             self.assertIn("finish only within its last hour", m)
             self.assertNotIn("\n", m)
-        rules = ka.load_prompt("manager_afclaude")
+        rules = ka.load_prompt("manager_project")
         self.assertIn("(D-275)", rules)
 
 

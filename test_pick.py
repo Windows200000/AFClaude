@@ -7,7 +7,7 @@ exists, at most PICK_MAX_PASS_OVER, D-239.1; one at a limit is not, D-204; none:
 row per start (not per owner-busy retry), a chained start and a last-stretch slot keeping the
 running project, a project's first start creating its task-manager (D-281) and taking it back on
 any failure up to the launch, the dedup of one start key, the per-project prompt (inline rules
-without manager_afclaude.md, its length), and the single-task-manager case behaving as before S4
+with manager_project.md and its own values, its length), and the single-task-manager case behaving as before S4
 (no extra preflight or limit check)."""
 import subprocess
 import json
@@ -477,14 +477,18 @@ class DryRunSecondProject(unittest.TestCase):
 
 class Prompts(unittest.TestCase):
     def test_another_projects_inline_rules_fit_one_tmux_line(self):
+        # P3: the inline rules of a hook-less project carry manager_project.md (its own values; here the
+        # defaults) instead of nothing; a first start's description is capped by what is left of the line
+        other = "/srv/another-project"
         msg = ka.session_message("continue", reason="window start, " + "r" * 300, progress="/p/PROGRESS.md",
                                  insert="This run is for the project " + "x" * 64 + ". " + "PACE " * 120,
-                                 hooked=False, afclaude=False)
+                                 hooked=False, repo=other)
         self.assertLess(len(msg.encode()), TMUX_LINE_MAX)
-        self.assertNotIn(" ".join(ka.load_prompt("manager_afclaude").split())[:60], msg)
+        self.assertIn("usage_report.py", msg)                       # manager_project.md is in it ...
+        self.assertNotIn("tools/check_public.py", msg)              # ... without AFClaude's own lines
         self.assertIn(" ".join(ka.load_prompt("manager").split())[:60], msg)
-        first = ka.session_message("manager_first_start", project="x" * 64, path="/p", desc="d" * 2000,
-                                   progress="/p/PROGRESS.md", insert="PACE " * 120, hooked=False, afclaude=False)
+        first = ka.session_message("manager_first_start", project="x" * 64, path="/p", desc="d" * 600,
+                                   progress="/p/PROGRESS.md", insert="PACE " * 120, hooked=False, repo=other)
         self.assertLess(len(first.encode()), TMUX_LINE_MAX)
 
 

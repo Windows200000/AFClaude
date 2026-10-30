@@ -402,7 +402,8 @@ def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[
         if plan == "send-keys":
             msg = inbox.now_message(m, n)
         else:
-            msg = ka.session_message("inbox_now", hooked=ka.rules_hooked(cwd), **inbox.now_fields(m, n))
+            msg = ka.session_message("inbox_now", repo=cwd or None, hooked=ka.rules_hooked(cwd),
+                                   **inbox.now_fields(m, n))
         if inbox.fits(msg):
             return msg, i
     raise RuntimeError(f"the message is too long to type in ({len(msg.encode())} bytes > {inbox.MESSAGE_MAX_BYTES})")

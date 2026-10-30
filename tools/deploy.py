@@ -22,7 +22,7 @@ start missed by the restart gap is one too; the refusal prints the next safe tim
 1) `runner.py drain()` (existing). 2) poll `docker top` for a sampler / usage-review /
 unittest / claude process (any bridge call, including a plain usage read) still running in
 the container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` with
-AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README/prompts/manager_afclaude.md
+AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README and the AFClaude project's deploy_rule
 say to run it; the image has no .git, so without this the build commit is unknown).
 Exit 1 (no rebuild) inside the start guard (checked before the drain and again before the
 rebuild) or if draining or clearing timed out; an aborted deploy lifts its drain again.
