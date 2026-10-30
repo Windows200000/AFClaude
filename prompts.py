@@ -18,8 +18,9 @@ knows each of them:
 Project scope (D-193, D-197): prompts are system-wide (an override is keyed by name only, owner
 only); a project only fills the variables PROJECT_VARS declares. Its values are rows of
 store.prompt_vars, written through actions.py (prompt_var.set / prompt_var.reset, audited; owner
-only until the roles of phase 5a give it to the project's managers and editors). One prompt uses
-them: manager_project.md (P3), the task-manager rules of every project: a few words (the goal list's,
+only until the roles of phase 5a give it to the project's managers and editors). Two prompts use
+them: manager.md (P5: where the progress notes are) and manager_project.md (P3), the task-manager rules
+of every project: a few words (the goal list's,
 the progress notes' and the questions' place) and whole lines (the public-repo rule, the worktree rule, a note, the docs
 rule, the deploy rule; an empty one leaves no line). A session's text is built from its project's
 values: keepalive.session_message(repo=...) reads them (project_values_at), the SessionStart hook
@@ -121,7 +122,8 @@ PROMPTS: dict[str, Prompt] = {
     "continue_foreign": Prompt(("context", "reason"), used_by="dispatcher: the user's own stalled session"),
     "task_start": Prompt(("description", "id", "project", "qa", "title"), used_by="unused since D-205"),
     "guard_respect": Prompt(used_by="standing rule: every session message, the hook part afclaude"),
-    "manager": Prompt(used_by="standing rule: task-manager sessions, the hook part manager"),
+    "manager": Prompt((), ("progress_location",),
+                      used_by="standing rule: task-manager sessions, the hook part manager"),
     "manager_project": Prompt(("afclaude_dir", "session_stop_pct", "tools"),
                               ("goals_location", "progress_location", "questions_location", "public_repo_rule", "worktree_rule",
                                "project_notes", "docs_rule", "deploy_rule"),
@@ -171,7 +173,7 @@ PROJECT_VARS: dict[str, ProjectVar] = {
 
 # The migrate step's values for the project at this checkout's path (AFClaude itself): the lines the
 # old manager_afclaude.md hard-coded, so the generic template manager_project.md renders the same
-# text for it (test_prompts, against testdata/manager_afclaude_before_p3.md).
+# text for it (test_prompts, against testdata/afclaude_manager_project_rendered.md).
 CHECKOUT_SEED: dict[str, str] = {
     "goals_location": "GOALS.md",
     "progress_location": "PROGRESS.md",
@@ -441,8 +443,8 @@ def _rules_tail(hooked: bool, manager: bool, project_values: Optional[Mapping[st
     if not manager:
         return [_text("guard_respect", ov)]
     fields = {k: system[k] for k in variables("manager_project") if k in system}
-    return [_text("guard_respect", ov), _text("manager", ov), _render("manager_project", project_values, fields, ov),
-            _text("afk_rules", ov)]
+    return [_text("guard_respect", ov), _render("manager", project_values, {}, ov),
+            _render("manager_project", project_values, fields, ov), _text("afk_rules", ov)]
 
 
 def bundle(kind: str, project_values: Optional[Mapping[str, str]] = None, /, insert: Optional[str] = None,

@@ -21,7 +21,8 @@ Reads: `overview`, `inbox`, `projects`, `queue`, `tasks/{id}`, `stalls`, `rules`
 | `proposals/{id}` approve / edit / reject (owners, and the project's managers and editors, D-190; task-managers do it through MCP) | applies or drops an agent proposal (§7.9) | 409 unless `proposed`; the payload's version |
 | `settings/{key}` set / reset; `settings/reset` (section, all) | registry-validated; undo from audit | version |
 | `settings/window` | day, start, n, mode | version |
-| `prompts/{name}?project=` PUT / DELETE | override / reset | base_sha256 + version |
+| `prompts/{name}` PUT / DELETE | the owner's system-wide override / reset (D-193; no per-project override) | base_sha256 + version |
+| `projects/{id}/prompt_vars/{name}` PUT / DELETE | a project's value of a prompt variable (D-197) / back to the default | version |
 | `requests` | `continue_now`, `work_on_now` (owners, the project's managers), `review_now` (owners) (wakes the runner, §5.4) | one open per (kind, target) |
 | `messages` | send a message to a project's task-manager (F14): appends to the open thread or opens one, queues `task_manager_message`; wakes the runner when the sender is an owner or a manager of the project, otherwise it waits for the next regular run (D-186); the reply arrives through MCP `afclaude_reply` | thread closed by the reset → a new thread |
 | `users`, `grants` | invite, role, project scope, remove (owners; managers grant and revoke editor and viewer on their project, D-192); machine users take grants the same way | version |

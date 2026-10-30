@@ -104,7 +104,7 @@ class Base(unittest.TestCase):
         with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
             fh.write("Continue ({reason}). Progress: {progress}. Literal {{braces}}.\n")
         with open(os.path.join(actions.PROMPTS_DIR, "manager.md"), "w") as fh:
-            fh.write("Act as a project manager.\n")
+            fh.write("Act as a project manager; notes in {progress_location}.\n")
         self.conn = store.connect(self.db, create=True)
 
     def tearDown(self):
@@ -823,7 +823,7 @@ class PromptActions(Base):
                 self.do("prompt.set", name=bad, body="x")
         with self.assertRaises(store.NotFound):
             self.do("prompt.set", name="nope.md", body="x")
-        self.assertEqual(self.do("prompt.set", name="manager.md", body="Be brief.")["body"], "Be brief.")
+        self.assertEqual(self.do("prompt.set", name="manager.md", body="Be brief {progress_location}.")["body"], "Be brief {progress_location}.")
 
 
 class CodeVersion(unittest.TestCase):
@@ -948,6 +948,26 @@ class PromptDefaultsSync(Base):
             fh.write("Continue now ({reason}). Progress: {progress}.\n")
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # the default moved on
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 1)
+
+    def test_setting_the_same_body_again_reconfirms_it_against_the_new_default(self):
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        body = "Go on ({reason}); {progress}."
+        r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
+        again = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
+        self.assertEqual(again["version"], r["version"])              # nothing moved: still a no-op
+        self.assertEqual(len(self.audit(target_type="prompt")), 1)
+        with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
+            fh.write("Continue now ({reason}). Progress: {progress}.\n")
+        self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        row = store.get_prompt_override(self.conn, "continue.md")
+        self.assertEqual((row["base_outdated"], row["base_sha256"] == self.sha("continue.md")), (1, False))
+        r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)   # re-confirm
+        self.assertEqual((r["base_outdated"], r["base_sha256"], r["body"]), (0, self.sha("continue.md"), body))
+        self.assertEqual(r["version"], row["version"] + 1)
+        last = self.audit(target_type="prompt")[-1]
+        self.assertEqual((last["action"], last["before"]["base_outdated"], last["after"]["base_outdated"]),
+                         ("prompt.set", 1, 0))
+        self.assertEqual(self.do("prompt.set", name="continue.md", body=body)["version"], r["version"])   # a no-op again
 
     def test_an_override_that_no_longer_fits_is_listed_and_alerted_not_a_failed_deploy(self):
         r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
@@ -1082,7 +1102,7 @@ class EveryAction(Base):
             ("automation.set_project", {"project": "P", "paused": True, "reason": "inbox error"}),
             ("setting.import", {"source": "data/dispatcher.json", "values": {"cleanup_idle_hours": 3}}),
             ("window.set", {"day": "fri", "start": "22:00", "n": 2, "mode": "individual"}),
-            ("prompt.set", {"name": "manager.md", "body": "x"}), ("prompt.reset", {"name": "manager.md"}),
+            ("prompt.set", {"name": "manager.md", "body": "{progress_location}"}), ("prompt.reset", {"name": "manager.md"}),
             ("prompt.defaults_sync", {}),
             ("prompt_var.set", {"project": "P", "name": "project_notes", "value": "n"}),
             ("prompt_var.reset", {"project": "P", "name": "project_notes"}),

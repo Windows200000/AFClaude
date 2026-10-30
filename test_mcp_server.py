@@ -549,6 +549,12 @@ class Prompts(Env):
         b = run(ms.afclaude_prompts("bundle", "continue", project="Other", values={"reason": "R"}))
         self.assertIn("(R", b["text"].replace("( ", "("))
         self.assertEqual(run(ms.afclaude_prompts("bundle", "compact"))["text"], "Compact. OVRD")
+        # the rules tail as a sender builds it: hooked (the pointer alone) and neutral (guard_respect alone)
+        hooked = run(ms.afclaude_prompts("bundle", "continue", project="Other", hooked=True))["text"]
+        neutral = run(ms.afclaude_prompts("bundle", "continue", project="Other", manager=False))["text"]
+        self.assertIn(" ".join(prompts.default("rules_pointer").split()), hooked)
+        self.assertNotIn("NOTE-OTHER", hooked + neutral)
+        self.assertLess(len(neutral), len(b["text"]))
         for bad, msg in ((("render", "nope"), "no prompt"), (("bundle", "nope"), "no bundle"),
                          (("render", None), "needs name"), (("render", "compact", "nobody"), "no project")):
             with self.assertRaisesRegex(ToolError, msg):

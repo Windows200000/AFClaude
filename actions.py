@@ -1305,9 +1305,16 @@ def prompt_set(conn: sqlite3.Connection, ctx: Ctx, name: Any, body: Any, version
     row = store.get_prompt_override(conn, name)
     _check_version(row, version, f"prompt {name}")
     old = row["body"] if row else None
+    sha = hashlib.sha256(default.encode()).hexdigest()
     if old == body:
-        return Result(row, name, {"body": old}, {"body": body}, changed=False)
-    r = store.put_prompt_override(conn, name, body, hashlib.sha256(default.encode()).hexdigest(), ctx.actor)
+        if row is None or (row["base_sha256"] == sha and not row["base_outdated"]):
+            return Result(row, name, {"body": old}, {"body": body}, changed=False)
+        # the same body again after the default moved on: the owner re-confirms the override against
+        # the new default (base_outdated cleared, base_sha256 updated), audited as its own change
+        before = {"body": old, "base_sha256": row["base_sha256"], "base_outdated": row["base_outdated"]}
+        r = store.put_prompt_override(conn, name, body, sha, ctx.actor)
+        return Result(r, name, before, {"body": body, "base_sha256": sha, "base_outdated": 0})
+    r = store.put_prompt_override(conn, name, body, sha, ctx.actor)
     return Result(r, name, {"body": old}, {"body": body})
 
 
