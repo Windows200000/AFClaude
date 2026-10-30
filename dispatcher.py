@@ -669,9 +669,10 @@ class Pass:
 
 
 # continue_now waits this long for a running pass, then: error. Above a pass's worst case (the runner
-# kills it after runner_timeout_dispatcher, default 20 min; its rc send + verify alone take up to
-# SEND_TIMEOUT + VERIFY_SECONDS = 5 min): a wait that ends first would be a false alert (test_dispatcher)
-CONTINUE_LOCK_WAIT = timedelta(minutes=25)
+# kills it after runner_timeout_dispatcher, default 25 min; its rc send + verify alone take up to
+# SEND_TIMEOUT + VERIFY_SECONDS = 5 min): a wait that ends first would be a false alert (test_dispatcher).
+# 5 min above the runner's timeout, so a pass killed at its limit has released the lock by then
+CONTINUE_LOCK_WAIT = timedelta(minutes=30)
 
 
 def continue_now(conn, sid, now, request_id):

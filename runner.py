@@ -263,7 +263,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # (cron starts every line on a whole minute), so the three don't contend for the DB at once
     Job("stall_scan", 2, every=3 * MIN, offset=90 * SEC, what="stall scan (stalled.scan)"),
     Job("sampler", 20, every=15 * MIN, cron_tag="AFClaude usage sampler"),
-    Job("dispatcher", 20, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
+    Job("dispatcher", 25, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
     Job("quickview", 2, every=3 * MIN, pause_on_failure=False, cron_tag="AFClaude quickview export"),
     Job("docs_import", 5, every=10 * MIN, cron_tag="AFClaude docs import"),
     Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),

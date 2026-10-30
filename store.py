@@ -3877,18 +3877,25 @@ def _decision_dict(r: sqlite3.Row, topics: Sequence[str] = (), links: Sequence[R
 def _decision_extras(conn: sqlite3.Connection, ids: Sequence[str] | None = None
                      ) -> tuple[dict[str, list[str]], dict[str, list[Row]]]:
     """The topics and links of `ids` (every decision when None), by decision id. A link is listed
-    on both of its entries: {"kind", "id" (the other one), "title", "direction": "out" | "in"}."""
+    on both of its entries: {"kind", "id" (the other one), "title", "direction": "out" | "in"}.
+    A database still at v4 (the deploy gap) has neither table: no topics, no links there (a read
+    only; the writes are refused by check_writable)."""
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
+                                       "AND name IN ('decision_topics', 'decision_links')")}
     where, args = "", []
     if ids is not None:
         where, args = f" WHERE decision_id IN ({', '.join('?' * len(ids))})", list(ids)
     topics: dict[str, list[str]] = {}
-    for did, topic in conn.execute(f"SELECT decision_id, topic FROM decision_topics{where} ORDER BY rowid", args):
-        topics.setdefault(did, []).append(topic)
+    if "decision_topics" in have:
+        for did, topic in conn.execute(f"SELECT decision_id, topic FROM decision_topics{where} ORDER BY rowid", args):
+            topics.setdefault(did, []).append(topic)
     lwhere, largs = "", []
     if ids is not None:
         marks = ", ".join("?" * len(ids))
         lwhere, largs = f" WHERE l.from_id IN ({marks}) OR l.to_id IN ({marks})", list(ids) * 2
     links: dict[str, list[Row]] = {}
+    if "decision_links" not in have:
+        return topics, links
     for f, t, kind, ft, tt in conn.execute(
             "SELECT l.from_id, l.to_id, l.kind, f.title, t.title FROM decision_links l "
             "JOIN decisions f ON f.id = l.from_id JOIN decisions t ON t.id = l.to_id"
@@ -3951,8 +3958,10 @@ def list_decision_entries(conn: sqlite3.Connection, states: Iterable[str] | None
     """Every decision (or those in `states`), in source order, the native ones after the file's (a
     re-import renumbers the file's rows 0..n-1, so `ord` alone would put a native one in the middle)."""
     topics, links = _decision_extras(conn)
+    order = ("(origin = 'db'), ord, id" if "origin" in {r[1] for r in conn.execute("PRAGMA table_info(decisions)")}
+             else "ord, id")                  # a v4 database (the deploy gap) has no origin column
     rows = [_decision_dict(r, topics.get(r["id"], ()), links.get(r["id"], ()))
-            for r in conn.execute("SELECT * FROM decisions ORDER BY (origin = 'db'), ord, id")]
+            for r in conn.execute(f"SELECT * FROM decisions ORDER BY {order}")]
     if states is None:
         return rows
     want = set(states)
