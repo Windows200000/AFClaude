@@ -304,6 +304,21 @@ class Log(unittest.TestCase):
             self.assertEqual(se.score([], {})["n"], 0)
 
 
+def tearDownModule():
+    """The tests above start and add tasks in the process-wide test DB: close what is open, so a later
+    module (test_keepalive's window-start passes) doesn't find projects with work and no path."""
+    conn = store.connect(store.DB_PATH)
+    try:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT t.id FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.status IN (?, ?, ?) "
+            "AND (p.name LIKE 'Share%' OR p.name LIKE 'ETA%' OR p.name = ?)",
+            (*store.OPEN_STATUSES, qv.STAGES_PROJECT))]
+        for tid in ids:
+            actions.perform(conn, "task.cancel", {"task_id": tid, "reason": "test cleanup"}, actor="cli", via="cli")
+    finally:
+        conn.close()
+
+
 class GatherShare(unittest.TestCase):
     """gather() reads the stage_share setting (D-264: a review-tuned figure, not an automatic
     trailing-window measurement -- see the docstring on gather() and StageShare below for why);

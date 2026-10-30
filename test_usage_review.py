@@ -308,15 +308,32 @@ def finalize_records():
             telemetry.write_records("usage.review", [r], actor="cli")
 
 
+TEST_PROJECT = "AFC-test"
+
+
 def this_project():
-    """The test DB's project for this repo (usage_review's report docs live there)."""
+    """The test DB's project for this repo (usage_review's report docs live there). It sits at the
+    checkout's path only while this module runs (tearDownModule): a project there without the seed
+    rows makes the keep-alive's rules raise NotMigrated (D-235) in every later module of the process."""
     conn = store.connect()
     try:
         p = store.get_project(conn, ur.HERE)
         if p is None:
-            store.add_project(conn, "AFC-test", None, ur.HERE)
+            if store.get_project(conn, TEST_PROJECT) is None:
+                store.add_project(conn, TEST_PROJECT, None, ur.HERE)
+            else:
+                store.update_project(conn, TEST_PROJECT, path=ur.HERE)
             p = store.get_project(conn, ur.HERE)
         return p["name"]
+    finally:
+        conn.close()
+
+
+def tearDownModule():
+    conn = store.connect()
+    try:
+        if store.get_project(conn, TEST_PROJECT) is not None:
+            store.update_project(conn, TEST_PROJECT, path="")
     finally:
         conn.close()
 

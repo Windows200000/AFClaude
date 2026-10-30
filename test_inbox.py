@@ -483,6 +483,10 @@ class Delivery(tc.Env):
         self.conn.close()
         super().tearDown()
 
+    def stopped(self, subject):
+        """The alert of an inbox error: it names the project SID manages (D-244, the pause is that project's)."""
+        return f"AFClaude STOPPED (notes-{os.path.basename(os.path.normpath(self.tmp.name))}): {subject}"
+
     def now_msg(self, text="Is the login page live?"):
         m = actions.perform(self.conn, "inbox.post", {"text": text, "session_id": SID}, actor="owner", via="dashboard")
         actions.perform(self.conn, "inbox.triage", {"message_id": m["id"], "verdict": "now", "reason": "a question"},
@@ -589,8 +593,8 @@ class Delivery(tc.Env):
         self.assertIn("held past its window start", r["error"])
         self.assertIn("did not take it along", r["error"])
         self.assertEqual(self.sent, [])
-        self.assertEqual(self.notified, ["AFClaude STOPPED: inbox message held past its window start"])
-        self.assertIn("inbox message held past its window start", failstop.paused()["reason"])
+        self.assertEqual(self.notified, [self.stopped("inbox message held past its window start")])
+        self.assertIn("inbox message held past its window start", failstop.paused(session=SID)["reason"])
         self.assertIsNone(inbox.message_view(r)["hold_until_berlin"])
         self.assertEqual(inbox.message_view(r)["state"], "error")
         self.assertTrue(inbox.message_view(r)["tip"].startswith("Failed "), inbox.message_view(r)["tip"])
@@ -601,7 +605,7 @@ class Delivery(tc.Env):
         m = self.now_msg()
         self.assertEqual(self.deliver(m), "failed")
         self.assertIn("without a window start", self.row(m)["error"])
-        self.assertTrue(failstop.paused()["paused"])
+        self.assertTrue(failstop.paused(session=SID)["paused"])
 
     def test_not_sent_again_after_a_start_took_it_along(self):
         m = self.now_msg()
@@ -635,8 +639,8 @@ class Delivery(tc.Env):
                 r = self.row(m)
                 self.assertEqual(r["status"], "error")
                 self.assertIn(want, r["error"])
-                self.assertEqual(self.notified[-1], "AFClaude STOPPED: inbox message not delivered")
-                self.assertTrue(failstop.paused()["paused"])
+                self.assertEqual(self.notified[-1], self.stopped("inbox message not delivered"))
+                self.assertTrue(failstop.paused(session=SID)["paused"])
         self.assertEqual(self.sent, [])
 
     def test_not_in_the_transcript_is_an_error(self):
@@ -650,7 +654,7 @@ class Delivery(tc.Env):
         r = self.row(m)
         self.assertEqual(r["status"], "error")
         self.assertIn("not in its transcript", r["error"])
-        self.assertTrue(failstop.paused()["paused"])
+        self.assertTrue(failstop.paused(session=SID)["paused"])
 
     def test_verify_resumes_after_a_restart_and_ends_seen_or_failed_at_its_deadline(self):
         """§3.3/§3.4 (S7): the verification is a runner_state 'inbox' entry, not a thread: a
@@ -845,10 +849,16 @@ class HeldInStarts(tc.Env):
         self.assertIn("not in the session's transcript", r["error"])
         self.assertEqual(ka.load_state()["handled"][self.KEY]["inbox_unseen"], [self.held])
         self.assertTrue(any("not in its transcript" in a for a in self.alerts))
-        self.assertTrue(failstop.paused()["paused"])
+        self.assertTrue(failstop.paused(session=SID)["paused"])
 
     def test_not_in_the_transcript_pauses_only_its_project(self):
         """D-244: the keep-alive's inbox helpers pause the project of the session (PA), not all."""
+        conn = store.connect()
+        try:
+            store.update_project(conn, "notes-" + os.path.basename(os.path.normpath(self.tmp.name)),
+                                 manager_session="")                                # ... SID manages PA only
+        finally:
+            conn.close()
         self.addCleanup(testenv.managed_project("PA", SID))
         def fire(sid, cwd, message, plan, new=False, **kw):
             self.sent.append((plan, message))

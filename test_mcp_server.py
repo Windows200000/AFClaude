@@ -353,6 +353,8 @@ class DBErrors(Env):
         return json.loads(text)["error"]
 
     def test_write_on_a_read_only_db(self):
+        if os.geteuid() == 0:     # the permission bits don't bind root (e.g. `unshare -Ur`): nothing is read-only
+            self.skipTest("running as root: a chmod can't make the DB read-only")
         os.chmod(self.db, 0o444)
         self.assertEqual([t["title"] for t in run(ms.afclaude_list_tasks())["tasks"]], ["before"])   # reads go on
         e = self.error(ms.afclaude_add_task("lost?"))
