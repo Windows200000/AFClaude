@@ -949,6 +949,25 @@ class PromptDefaultsSync(Base):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # the default moved on
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 1)
 
+    def test_an_override_that_no_longer_fits_is_listed_and_alerted_not_a_failed_deploy(self):
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(r["unfit_overrides"], [])
+        # as if a deploy changed the prompt's variables after the edit: written past prompt.set's check
+        store.put_prompt_override(self.conn, "continue.md", "Go on ({reason}).", self.sha("continue.md"), "owner")
+        self.conn.commit()
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(r["unfit_overrides"], ["continue"])
+        alerts = []
+        saved = store.NOTIFY
+        store.NOTIFY = lambda s, b="": alerts.append(s) or "sent"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(store.main(["import-prompts", "--db", self.db]), 0)
+        finally:
+            store.NOTIFY = saved
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("continue", alerts[0])
+
 
 class RequestActions(Base):
     def test_one_open_request_per_kind_and_target(self):

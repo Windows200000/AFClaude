@@ -1397,7 +1397,10 @@ def prompt_defaults_sync(conn: sqlite3.Connection, ctx: Ctx) -> Result:
     override exists, also refreshes prompt_overrides.base_outdated: whether its base_sha256 (the
     default it was edited against) still matches the current default's sha256, so a reader can
     flag a stale edit without re-reading the file (no-op, defensive, if that column is somehow
-    missing: store.mark_override_base_outdated). No audit row when nothing changed (is_noop)."""
+    missing: store.mark_override_base_outdated). The result also lists `unfit_overrides`: those whose
+    placeholders no longer equal their prompt's variables (every send of them fails, StaleOverride),
+    which `store.py import-prompts` alerts on without failing the deploy. No audit row when nothing
+    changed (is_noop)."""
     code_version = _code_version()
     files = _prompt_default_files()
     changed = []
@@ -1406,12 +1409,16 @@ def prompt_defaults_sync(conn: sqlite3.Connection, ctx: Ctx) -> Result:
         if did_change:
             changed.append({"name": name, "sha256": sha, "previous_sha256": row.get("previous_sha256")})
     defaults_sha = {name: sha for name, (_b, sha) in files.items()}
+    unfit = []
     for o in store.list_prompt_overrides(conn):
         default_sha = defaults_sha.get(o["name"])
         outdated = None if default_sha is None or o["base_sha256"] is None else o["base_sha256"] != default_sha
         store.mark_override_base_outdated(conn, o["name"], outdated)
+        reg = o["name"][:-3]
+        if reg in prompts.PROMPTS and placeholders(o["body"]) != prompts.variables(reg):
+            unfit.append(reg)       # every send of it fails (prompts.StaleOverride): the CLI alerts now
     after = {"changed": changed, "total_files": len(files), "code_version": code_version}
-    return Result(after, "prompt_defaults", None, after, changed=bool(changed))
+    return Result({**after, "unfit_overrides": unfit}, "prompt_defaults", None, after, changed=bool(changed))
 
 
 # ---------------------------------------------------------------- project prompt variables (D-197)

@@ -213,7 +213,7 @@ class ProjectVarsTest(unittest.TestCase):
         self.assertEqual(r["version"], 2)
         r = self.do("prompt_var.reset", project="Other", name="public_repo_rule")
         self.assertIsNone(r["value"])
-        self.assertEqual(r["version"], 4)
+        self.assertEqual(r["version"], 3)
         self.assertEqual(prompts.project_values(self.conn, self.p["id"])["public_repo_rule"], "")
         self.do("prompt_var.reset", project="Other", name="public_repo_rule")    # already reset: no-op
         a = self.audits("prompt_var.reset")

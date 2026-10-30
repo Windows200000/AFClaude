@@ -4393,6 +4393,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             out = actions.perform(conn, "prompt.defaults_sync", {}, actor="runner:deploy", via="runner")
             print(json.dumps(out, ensure_ascii=False))
+            if out.get("unfit_overrides"):     # an alert, not a failed deploy: the sends of it fail (D-235)
+                names = ", ".join(out["unfit_overrides"])
+                print(f"warning: overrides that no longer fit their prompt: {names}", file=sys.stderr)
+                _notify(f"AFClaude: prompt override(s) no longer fit: {names}",
+                        f"The deployed defaults changed the variables of {names}; every send of these prompts "
+                        f"now fails (StaleOverride). `python3 prompts.py override diff NAME`, then edit or "
+                        f"`override reset NAME`.")
             return 0
         except (DBError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
