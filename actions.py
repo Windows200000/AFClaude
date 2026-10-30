@@ -891,7 +891,7 @@ SETTINGS: dict[str, Setting] = {
                                  "before it is killed and fails (D-234)", "automation"),
     "runner_timeout_run_readings": _num(10, 0.5, 720, "Runner: minutes a run reading (the usage during a run, "
                                         "D-207) may take before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_compaction_check": _num(6, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
+    "runner_timeout_compaction_check": _num(12, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
                                             "before it is killed and fails (D-234)", "automation"),
     "runner_timeout_last_stretch": _num(90, 90, 720, "Runner: minutes a last-stretch slot start may take before "
                                         "it is killed and fails (D-234)", "automation"),
@@ -899,7 +899,7 @@ SETTINGS: dict[str, Setting] = {
                                           "start may take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_fillup": _num(90, 90, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
                                   "killed and fails (D-234)", "automation"),
-    "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
+    "runner_timeout_compaction": _num(65, 65, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
                                       "back, D-238) may take before it is killed and fails (D-234)", "automation"),
     # phase 3b S5: a run-now request; the lower bound is its slowest kind's inner timeouts + 5 min (a
     # work_on_now continues a task-manager as a start does: runner_jobs.request_min_timeout; test_run_now)

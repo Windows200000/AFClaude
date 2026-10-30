@@ -285,7 +285,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         what="keep-alive watch: limit detection; the plans of the last stretch, the postponed / planned starts "
              "and the fill-up"),
     Job("run_readings", 10, every=5 * MIN, offset=50 * SEC, what="usage readings during a run (D-207)"),
-    Job("compaction_check", 6, every=MIN, offset=45 * SEC, paused="handler",
+    Job("compaction_check", 12, every=MIN, offset=45 * SEC, paused="handler",
         what="compaction check (D-238): is one due"),
     # the acts: each types into the task-manager session, at the time its plan step stored; a cut-off
     # one is never rerun (D-257), a drain holds it
@@ -295,7 +295,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         what="postponed or planned session-window start (D-202/D-274)"),
     Job("fillup", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="fill-up start (D-212)"),
-    Job("compaction", 60, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("compaction", 65, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="compaction: save, /compact, the hand-off back (D-238)"),
     # S7: the inbox (docs/phase3a_plan.md §5 S7). Both run while paused (D-186/D-244: the owner's own
     # message is no automation); a rerun after an interrupted one is safe (the message's own status

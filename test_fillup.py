@@ -191,7 +191,7 @@ class FirePath(unittest.TestCase):
         try:
             ka.fillup_pass("s" * 36, RESET - timedelta(minutes=30), None)
             self.assertEqual(self.fired, [])
-            self.assertEqual(json.load(open(ka.FILLUP_FILE))["plan"]["status"], "wait")
+            self.assertEqual(json.load(open(ka.FILLUP_FILE))["plans"]["s" * 36]["status"], "wait")
             ka.fillup_pass("s" * 36, RESET - timedelta(minutes=5), None)
             ka.fillup_pass("s" * 36, RESET - timedelta(minutes=4), None)
         finally:

@@ -943,8 +943,8 @@ def _ts(x):
 
 
 def fillup_block(now):
-    """The next planned fill-up run (D-212), from the watcher's plan in keepalive_fillup.json
-    (fillup.decide, rewritten by the watcher every minute) or a --plan-fillup-test entry of this
+    """The next planned fill-up run (D-212), from the watcher's plan for this session in
+    keepalive_fillup.json (fillup.decide, rewritten by the watcher every minute) or a --plan-fillup-test entry of this
     session: {"planned": True, "at_berlin", "remaining" (session %), "cost" (weekly %),
     "reset_berlin", "status", "reason", "test"} or {"planned": False, "reason"}. Read-only."""
     try:
@@ -960,7 +960,8 @@ def fillup_block(now):
             return {"planned": False, "reason": "fillup_enabled is off"}
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"planned": False, "reason": f"{type(e).__name__}: {e}"}
-    p = f.get("plan")
+    plans = f.get("plans")
+    p = plans.get(SELF_SESSION) if isinstance(plans, dict) else None   # each task-manager's own (3c S1)
     if not isinstance(p, dict):
         return {"planned": False, "reason": "no plan yet (the watcher writes it every minute)"}
     reset, start = _ts(p.get("reset")), _ts(p.get("start"))

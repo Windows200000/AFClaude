@@ -1294,10 +1294,9 @@ class StartSoon(Env):
         ka.defer_window_start("window-start-x", SID, NIGHT - timedelta(hours=3) + timedelta(minutes=10), "user active")
         self.assertIn("a postponed session-window start", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
         ka.save_deferred({})
-        ka.save_fillup({"plan": {"status": "wait", "start": (NIGHT - timedelta(hours=2, minutes=40)).isoformat(),
-                                 "session": SID}})
+        ka.save_fillup({"plans": {SID: {"status": "wait", "start": (NIGHT - timedelta(hours=2, minutes=40)).isoformat()}}})
         self.assertIn("the fill-up run is planned", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
-        ka.save_fillup({"plan": {"status": "hold"}})
+        ka.save_fillup({"plans": {SID: {"status": "hold"}}})
         ka.last_mile_next_start = lambda now, usage=None: now + timedelta(minutes=20)
         self.assertIn("the last-stretch slot starts", ka.start_soon(SID, NIGHT - timedelta(hours=3)))
 
@@ -1317,10 +1316,55 @@ class StartSoon(Env):
 
     def test_the_fill_up_plan_holds_only_its_session(self):
         t = NIGHT - timedelta(hours=3)
-        ka.save_fillup({"plan": {"status": "wait", "start": (t + timedelta(minutes=20)).isoformat(), "session": self.A}})
+        ka.save_fillup({"plans": {self.A: {"status": "wait", "start": (t + timedelta(minutes=20)).isoformat()},
+                                  SID: {"status": "skip"}}})
         self.assertIn("the fill-up run is planned", ka.start_soon(self.A, t))
         self.assertIsNone(ka.start_soon(SID, t))
-        ka.save_fillup({"plan": {"status": "fire"}})                           # stored before 3c S1: nobody's
+        ka.save_fillup({"plan": {"status": "fire"}})                           # the global one before 3c S1: nobody's
+        self.assertIsNone(ka.start_soon(self.A, t))
+
+    def test_each_task_managers_fill_up_plan_is_kept(self):
+        # the watch tick plans the fill-up of every task-manager of the registry in turn: each one's plan
+        # stays its own (one global plan alternated between them, so start_soon saw the other's half the time)
+        t = NIGHT - timedelta(hours=3)
+        plans = {self.A: {"status": "wait", "reason": "planned", "start": t + timedelta(minutes=20),
+                          "recheck_at": t + timedelta(minutes=20), "reset": t + timedelta(minutes=25),
+                          "remaining": 5.0, "rate": 60.0, "rate_src": "default", "time_min": 5.0, "factor": 1.1,
+                          "cost": 0.5, "ratio": 0.1},
+                 SID: {"status": "skip", "reason": "no run in this session window"}}
+        old = (ka.usage_cache_checked, ka.fillup_decision, ka._usage_young)
+        self.addCleanup(lambda: (setattr(ka, "usage_cache_checked", old[0]), setattr(ka, "fillup_decision", old[1]),
+                                 setattr(ka, "_usage_young", old[2])))
+        ka.usage_cache_checked = lambda: {}
+        ka.fillup_decision = lambda sid, now, u: dict(plans[sid])
+        ka._usage_young = lambda u, now: True
+        ka.save_fillup({"plan": {"status": "fire"}})                           # stored before 3c S1: dropped
+        for _ in range(2):
+            ka.fillup_plan(self.A, t)
+            ka.fillup_plan(SID, t)
+        f = ka.load_fillup()
+        self.assertNotIn("plan", f)
+        self.assertEqual({k: v["status"] for k, v in f["plans"].items()}, {self.A: "wait", SID: "skip"})
+        self.assertIn("the fill-up run is planned", ka.start_soon(self.A, t))
+        self.assertIsNone(ka.start_soon(SID, t))
+
+    def test_a_planned_start_holds_the_session_its_pick_continues(self):
+        # D-274: a start planned late in its session window (or postponed) fires from its deferred entry
+        # with pick: True; the entry's session is only the anchor (store.start_manager), so the hold
+        # follows the pick, not the entry
+        t = NIGHT - timedelta(hours=3)
+        self.assertEqual(ka.start_continues(t), self.A)                       # the pick: rank 1
+        ka.defer_window_start("window-start-x", SID, t + timedelta(minutes=10), "planned", planned=True,
+                              deadline=t + timedelta(hours=2))
+        self.assertIn("a postponed session-window start", ka.start_soon(self.A, t))
+        self.assertIsNone(ka.start_soon(SID, t))
+        ka.save_deferred({})
+        ka.defer_window_start("window-start-x", self.A, t + timedelta(minutes=10), "user active")
+        self.assertIsNone(ka.start_soon(SID, t))                               # A's entry, but SID isn't picked either
+        old_rs = ka.running_session
+        ka.running_session = lambda now, st=None: SID                          # SID's run goes on: the start keeps it
+        self.addCleanup(setattr, ka, "running_session", old_rs)
+        self.assertIn("a postponed session-window start", ka.start_soon(SID, t))
         self.assertIsNone(ka.start_soon(self.A, t))
 
     def test_a_failed_pick_raises(self):

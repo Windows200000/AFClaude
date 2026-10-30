@@ -1237,7 +1237,7 @@ def run_active(session_id, now, st=None):
     after it. -> the fire time or None."""
     st = st if st is not None else load_state()
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()     # this session's (3b S4)
-             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") in (None, session_id)]
+             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") == session_id]
     fired = [t for t in fired if t and now - afclaude_config.SESSION_LENGTH <= t <= now]
     if not fired:
         return None
@@ -2832,7 +2832,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
 # fillup_factor (fillup.py). D-202 lets runs begin only at session-window starts; the fill-up is the
 # owner's explicit exception (D-212): it continues a run's own session window, once per window.
 
-FILLUP_FILE = os.path.join(STATE_DIR, "keepalive_fillup.json")   # {"plan": the current plan (quickview),
+FILLUP_FILE = os.path.join(STATE_DIR, "keepalive_fillup.json")   # {"plans": {session: its current plan},
                                                                   #  "test": a --plan-fillup-test entry}
 FILLUP_EVERY = timedelta(seconds=60)
 FILLUP_PREFETCH = timedelta(minutes=2)   # refresh the usage this long before a planned start ...
@@ -3009,9 +3009,10 @@ def fillup_plan(sid, now):
             d = fillup_decision(sid, now, u)
     f = load_fillup()
     plan = {k: (v.astimezone(UTC).isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
-    plan["session"] = sid   # whose start it is: start_soon holds only this session's compaction (3c S1)
-    if f.get("plan") != plan:
-        f["plan"] = plan
+    plans = f.get("plans") if isinstance(f.get("plans"), dict) else {}
+    if plans.get(sid) != plan or "plan" in f:   # one plan per task-manager (3c S1); "plan": the global one before
+        f.pop("plan", None)
+        f["plans"] = dict(plans, **{sid: plan})
         save_fillup(f)
     _fillup_log(f"fill-up: {d['status']}: {d['reason']}" + (f"; {_fillup_text(d)}" if "start" in d else ""))
     return d, d.get("recheck_at"), d["status"] == "fire"
@@ -3793,9 +3794,10 @@ def start_soon(sid, now):
     """A start that types into this session within COMPACT_GUARD (the cron's next session-window
     start, a postponed start's recheck, a planned fill-up, a last-stretch slot): -> why, else None.
     That start uses the warm cache (and the watcher's own starts must not wait behind a ~25-min
-    compaction); its run's end compacts. Only the start's own session is held (3c S1): the fill-up
-    plan's session, and for a session-window start or a last-stretch slot the session the pick
-    would continue (start_continues). A failed read raises (compaction_pass: an error)."""
+    compaction); its run's end compacts. Only the start's own session is held (3c S1): the session's
+    own fill-up plan, and for a session-window start (a postponed or planned one too: its act picks)
+    or a last-stretch slot the session the pick would continue (start_continues). A failed read
+    raises (compaction_pass: an error)."""
     def soon(t):
         return t is not None and now <= t < now + COMPACT_GUARD
     picked = []   # start_continues, evaluated once and only when a pick-made start is soon
@@ -3807,13 +3809,13 @@ def start_soon(sid, now):
     nxt = schedule.next_session_start(now)
     if soon(nxt) and continues():
         return f"the session-window start {berlin(nxt)} is due within {COMPACT_GUARD.total_seconds() / 60:g} min"
-    for v in load_deferred().values():
-        r = parse_ts(v.get("recheck_at")) if isinstance(v, dict) and v.get("session") in (None, sid) else None
-        if soon(r):
+    for v in load_deferred().values():   # its entry's session is the anchor; the act picks (pick: True)
+        r = parse_ts(v.get("recheck_at")) if isinstance(v, dict) else None
+        if soon(r) and continues():
             return f"a postponed session-window start rechecks at {berlin(r)}"
-    plan = load_fillup().get("plan") or {}
+    plan = (load_fillup().get("plans") or {}).get(sid) or {}
     start = parse_ts(plan.get("start")) if plan.get("status") in ("wait", "fire") and plan.get("start") else None
-    if (soon(start) or plan.get("status") == "fire") and plan.get("session") == sid:
+    if soon(start) or plan.get("status") == "fire":
         return f"the fill-up run is planned for {berlin(start) if start else 'now'}"
     lm = last_mile_next_start(now)
     if soon(lm) and continues():
