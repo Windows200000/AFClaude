@@ -1536,17 +1536,24 @@ def _run_id(run_id: Any) -> int | None:
 
 
 @action("request.start", "request")
-def request_start(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, tmux: Any, run_id: Any = None,
-                  session_id: Any = None) -> Result:
+def request_start(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, tmux: Any = None, run_id: Any = None,
+                  session_id: Any = None, note: Any = None) -> Result:
     """open -> started: the runner's run `run_id` started the requested session in tmux `tmux`
-    (session_id: its id, when known). The runner's step, not for MCP callers."""
+    (session_id: its id, when known). Instead of a tmux session, a `note` says what was done
+    (a continue delivered into a live rc thread, D-288: no session of ours exists); it is shown as
+    the request's reason. Exactly one of tmux, note. The runner's step, not for MCP callers."""
     _runner_only(ctx, "request.start")
     before = _request(conn, request_id)
-    name = _tmux_name(tmux)
+    if (tmux is None) == (note is None):
+        raise ValueError("request.start needs a tmux name or a note, not both or neither")
+    name = None if tmux is None else _tmux_name(tmux)
     sid = None if session_id is None else store._session_id(session_id)
     if before["status"] != "open":
         raise store.InvalidTransition(f"request #{before['id']} is {before['status']}, not open")
-    result = json.dumps({"tmux": name, "session_id": sid}, ensure_ascii=False)
+    out: dict[str, Any] = {"tmux": name, "session_id": sid}
+    if note is not None:
+        out["reason"] = _short(note, "note", 2000)
+    result = json.dumps(out, ensure_ascii=False)
     after = store.set_request_state(conn, int(before["id"]), "started", result, _run_id(run_id))
     return Result(after, after["id"], before, after)
 

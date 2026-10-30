@@ -929,6 +929,8 @@ def pid_alive(pid):
 
 ARCHIVED_MARK = "this session was ended or archived from another device"
 RC_HELD = "held by a `claude rc` server"
+RC_LIVE = f"{RC_HELD} thread"                                  # a live holder (pid): the dispatcher messages it
+RC_EXITED = f"{RC_HELD}: rc-server/SDK-hosted thread (idle"    # no live holder: only an app message re-serves it
 OTHER_HELD = "held by another live process"
 
 
@@ -1101,7 +1103,7 @@ def _preflight(session_id, tmux):
     row_pids = [a["pid"] for a in rows]
     held = sorted({p for p in row_pids + reg if rc_held(p)})
     if held:
-        return False, [f"{RC_HELD} thread (pid {held}); a take-over would fork the user's Remote Control "
+        return False, [f"{RC_LIVE} (pid {held}); a take-over would fork the user's Remote Control "
                        "thread, so it is left alone"], None
     extra = [p for p in reg if p not in row_pids]
     if extra:
@@ -1130,7 +1132,7 @@ def _preflight(session_id, tmux):
         # Nothing alive, but the last turn came from an rc-server/SDK host: the rc
         # server re-serves the thread on the next app message, so a resume now would
         # FORK the user's Remote Control thread once it's used again.
-        return False, [f"{RC_HELD}: rc-server/SDK-hosted thread (idle; latest transcript entry has "
+        return False, [f"{RC_EXITED}; latest transcript entry has "
                        "entrypoint sdk-cli); a resume would fork the user's Remote Control thread, "
                        "so it is left alone"], None
     return True, [], "resume"
@@ -1194,15 +1196,21 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None, categ
     return r.returncode, r.stdout, r.stderr
 
 
+def is_real_reply(e):
+    """A transcript entry that is a real model reply: an assistant entry with a model, neither the
+    synthetic notice (<synthetic>: limit, interrupt) nor an API error message."""
+    m = e.get("message") or {}
+    return (e.get("type") == "assistant" and m.get("model") not in (None, "<synthetic>")
+            and not e.get("isApiErrorMessage"))
+
+
 def verify_reply(path, since, timeout=VERIFY_TIMEOUT):
     """Wait for a real (non-synthetic) assistant message newer than `since`."""
     deadline = time.time() + timeout.total_seconds()
     while time.time() < deadline:
         for e in iter_entries(path):
             ts = parse_ts(e.get("timestamp"))
-            m = e.get("message") or {}
-            if (e.get("type") == "assistant" and ts and ts > since
-                    and m.get("model") not in (None, "<synthetic>")):
+            if is_real_reply(e) and ts and ts > since:
                 return e
         time.sleep(10)
     return None

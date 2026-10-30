@@ -21,6 +21,8 @@ import stalled  # noqa: E402
 import store  # noqa: E402
 import pacing as budget  # noqa: E402
 import afclaude_config  # noqa: E402
+import host  # noqa: E402
+import rc_continue  # noqa: E402
 
 _CFG_DIR = tempfile.TemporaryDirectory()
 
@@ -852,7 +854,7 @@ class Prompts(Base):
             self.assertIn(part, m)
 
 
-class Holders(Base):
+class HolderBase(Base):
     """preflight with fake holder processes: an rc-server thread is never taken over,
     an idle plain interactive holder (terminal, `claude --resume` in a tty) is."""
     PROCS = {100: (50, ["/x/versions/2.1.283", "--print", "--sdk-url", "https://x", "--session-id", "cse_1"]),
@@ -876,6 +878,17 @@ class Holders(Base):
         self.sessdir.cleanup()
         super().tearDown()
 
+    def approved_stall(self):
+        self.stalled_session(sid(1))
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+
+    def stall_key(self):
+        r = next(r for r in store.stalled_decisions(self.conn) if r["session_id"] == sid(1))
+        return r.get("stall_uuid") or r.get("stalled_since")
+
+
+class Holders(HolderBase):
     def test_preflight(self):
         ka.TAKE_OVER_IDLE = True
         self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
@@ -895,24 +908,35 @@ class Holders(Base):
         ka.TAKE_OVER_IDLE = False
         self.assertFalse(ka.preflight(sid(1))[0])
 
-    def approved_stall(self):
-        self.stalled_session(sid(1))
-        self.scan()
-        store.decide_session(self.conn, sid(1), "continue")
-
-    def test_dispatcher_skips_rc_held_quietly(self):
+    def test_live_rc_holder_without_registry_entry_is_an_error(self):
+        """A live rc thread child is messaged now (D-288), so one the registry doesn't list is an error."""
         self.approved_stall()
         self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
-        for _ in range(3):
-            rep = self.run_pass(take_over_idle=True)                 # the default, and still refused
-            self.assertTrue(any("held by a `claude rc` server" in s for s in rep["skip"]))
+        with mock.patch.object(host, "rc_send", side_effect=AssertionError("no send")):
+            rep = self.run_pass(take_over_idle=True)                 # the default, and still no take-over
         self.assertEqual(self.resume_calls(), [])
-        self.assertEqual(self.alerts, [])
-        self.assertEqual(self.st["handled"], {})                     # retried once the rc thread is gone
+        self.assertTrue(any("no ~/.claude/sessions registry entry" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("dispatcher did NOT continue the rc thread 00000001", self.alerts[0])
+        self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+
+    def test_exited_rc_thread_is_left_to_the_app_quietly(self):
+        """The child has exited (latest entry sdk-cli, nothing alive): only an app message re-serves
+        it. Skipped quietly, retried every pass, and the stall's state says so ("app-only")."""
+        self.stalled_session(sid(1))
+        path = os.path.join(self.proj, "-work", f"{sid(1)}.jsonl")
+        with open(path) as fh:
+            lines = [dict(json.loads(ln), entrypoint="sdk-cli") for ln in fh]
+        self.transcript(sid(1), lines)
+        self.scan()
+        store.decide_session(self.conn, sid(1), "continue")
+        with mock.patch.object(host, "rc_send", side_effect=AssertionError("no send")):
+            for _ in range(3):
+                rep = self.run_pass(take_over_idle=True)
+                self.assertTrue(any("continue it from the app" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual((self.resume_calls(), self.alerts, self.st["handled"]), ([], [], {}))
+        self.assertEqual(self.st["rc_held"][self.stall_key()]["state"], "app-only")
         self.assertEqual(sum("not continuing" in ln for ln in self.logs), 1)   # logged once per stall
-        self.rows = []
-        rep = self.run_pass()
-        self.assertEqual(self.resumed_sessions(), [sid(1)])
 
     def test_dispatcher_refuses_a_busy_holder_outside_the_window(self):
         """D-206 drops the window and budget gates, never the preflight."""
@@ -929,6 +953,226 @@ class Holders(Base):
         rep = self.run_pass(arm=False, take_over_idle=True)          # dry-run: no SIGTERM to a fake pid
         self.assertEqual([(c["sid"], c["plan"]) for c in rep["continue"]], [(sid(1), "take-over:200")])
         self.assertEqual(self.resume_calls(), [])
+
+
+def sender_out(name, result="Message sent to that session's inbox.", is_error=False, uses=1, target=None, rc=0,
+               text="x"):
+    """The Haiku sender's stream-json (host.rc_send's CompletedProcess)."""
+    evs = [{"type": "system", "subtype": "init"}]
+    for i in range(uses):
+        evs.append({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "SendMessage", "input": {"to": target or name, "message": text}}]}})
+        evs.append({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": result, "is_error": is_error}]}})
+    evs.append({"type": "result", "subtype": "success", "is_error": False, "result": result})
+    return subprocess.CompletedProcess(["claude"], rc, "\n".join(map(json.dumps, evs)) + "\n", "")
+
+
+class RcThreads(HolderBase):
+    """D-288 (docs/rc_server_mode.md §4.1, §8): an approved continue of a stall held by a live
+    `claude rc` thread child messages it through the Haiku sender (host.rc_send, mocked here), by
+    the registry name read at send time, verified in its transcript. Fake registry and pids only:
+    nothing is started or signalled."""
+    PROCS = {**HolderBase.PROCS, 300: (50, ["/x/versions/2.1.314", "--print", "--sdk-url", "https://x",
+                                         "--permission-mode", "bypassPermissions"])}
+
+    def setUp(self):
+        super().setUp()
+        self.saved_rc = (rc_continue.VERIFY_SECONDS, rc_continue.POLL_SECONDS)
+        rc_continue.VERIFY_SECONDS, rc_continue.POLL_SECONDS = 0, 0   # no real wait: one look
+        self.sent = []
+        self.approved_stall()
+
+    def tearDown(self):
+        rc_continue.VERIFY_SECONDS, rc_continue.POLL_SECONDS = self.saved_rc
+        super().tearDown()
+
+    def register(self, pid=100, name="work-a1", status="idle", **kw):
+        with open(os.path.join(self.sessdir.name, f"{pid}.json"), "w") as fh:
+            json.dump(dict({"pid": pid, "sessionId": sid(1), "entrypoint": "sdk-cli", "kind": "interactive",
+                            "name": name, "status": status}, **kw), fh)
+
+    def thread_answers(self, user=True, answer=True):
+        """What the rc thread does with a delivered message: its transcript gets the entries."""
+        path = os.path.join(self.proj, "-work", f"{sid(1)}.jsonl")
+        t = NOW + timedelta(minutes=1)
+        with open(path, "a") as fh:
+            if user:
+                fh.write(json.dumps({"type": "user", "timestamp": Z(t), "isSidechain": False, "entrypoint": "sdk-cli",
+                                     "message": {"role": "user", "content": '<cross-session-message from="x" '
+                                                 'from-mode="prompting">[AFClaude] go</cross-session-message>'}}) + "\n")
+            if answer:
+                fh.write(json.dumps(dict(reply("rc-a", t, self.work), entrypoint="sdk-cli")) + "\n")
+
+    def sender(self, out=None, **thread):
+        def fake(name, text, timeout):
+            self.sent.append((name, text))
+            if out is None:
+                self.thread_answers(**thread)
+                return sender_out(name, text=text)
+            return out(name, text) if callable(out) else out
+        return mock.patch.object(host, "rc_send", side_effect=fake)
+
+    def test_idle_thread_is_messaged_and_verified(self):
+        self.register()
+        with self.sender():
+            rep = self.run_pass()
+            self.assertEqual(self.alerts, [])
+            self.assertEqual(self.resume_calls(), [])                # never resumed or taken over
+            self.assertEqual([(n, t.startswith("[AFClaude] Your usage limit has reset")) for n, t in self.sent],
+                             [("work-a1", True)])
+            self.assertEqual([(c["plan"], c["thread"]) for c in rep["continue"]], [("rc-send", "work-a1")])
+            h = self.st["handled"][self.stall_key()]
+            self.assertEqual((h["result"], h["thread"]), ("rc-delivered", "work-a1"))
+            self.run_pass()                                          # one continue per stall (D-206)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_dry_run_sends_nothing(self):
+        self.register()
+        with self.sender():
+            rep = self.run_pass(arm=False)
+        self.assertEqual((self.sent, self.alerts, self.st["handled"]), ([], [], {}))
+        self.assertEqual([c["plan"] for c in rep["continue"]], ["rc-send"])
+
+    def test_busy_thread_is_left_for_the_next_pass(self):
+        self.register(status="busy")
+        with self.sender():
+            rep = self.run_pass()
+            self.assertEqual((self.sent, self.alerts, self.st["handled"]), ([], [], {}))
+            self.assertTrue(any("is busy" in s for s in rep["skip"]), rep["skip"])
+            self.assertEqual(self.st["rc_held"][self.stall_key()]["state"], "busy")
+            self.register(status="idle")                             # the owner's turn ended: now it goes
+            self.run_pass()
+        self.assertEqual([n for n, _ in self.sent], ["work-a1"])
+        self.assertEqual(self.alerts, [])
+
+    def test_bypass_thread_is_an_error_before_sending(self):
+        self.register(pid=300)
+        with self.sender():
+            rep = self.run_pass()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("bypassPermissions" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+
+    def test_held_message_is_an_error(self):
+        """The thread's mode changed to bypass since it started: the message is held, so the thread's
+        transcript never shows it (no keyword guess on the result text: the transcript is the proof)."""
+        self.register()
+        with self.sender(lambda n, t: sender_out(n, text=t, result="The message is held until accepted.")):
+            rep = self.run_pass()
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(any("no <cross-session-message> entry" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertTrue(dp.failstop.paused()["paused"])                # D-235: automation paused
+
+    def test_name_changed_since_the_scan(self):
+        """Names change on every server restart: the one read at send time is used ..."""
+        self.register(name="work-a1")
+        self.assertEqual(rc_continue.thread_entry(sid(1))["name"], "work-a1")
+        self.register(name="work-4f")                                # the server restarted
+        with self.sender():
+            self.run_pass()
+        self.assertEqual([n for n, _ in self.sent], ["work-4f"])
+        self.assertEqual(self.alerts, [])
+
+    def test_name_changed_after_the_read_is_an_error(self):
+        """... and a name that is gone by the time the sender runs: "No agent named … is reachable"."""
+        self.register()
+        with self.sender(lambda n, t: sender_out(n, text=t, result=f"No agent named {n} is reachable.",
+                                                 is_error=True)):
+            rep = self.run_pass()
+        self.assertTrue(any("is reachable" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_child_gone_at_send_time_is_an_error(self):
+        """preflight saw a live holder (a `claude agents` row), but the registry's child is dead."""
+        self.rows = [{"sessionId": sid(1), "pid": 100, "kind": "interactive", "status": "idle"}]
+        self.register(pid=400)                                       # no such process
+        with self.sender():
+            rep = self.run_pass()
+        self.assertEqual(self.sent, [])
+        self.assertTrue(any("no live child" in s for s in rep["skip"]), rep["skip"])
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_verify_timeout_is_an_error(self):
+        for thread in ({"user": False, "answer": False}, {"user": True, "answer": False}):
+            with self.subTest(thread=thread):
+                testenv.unpause()
+                self.st["handled"].clear()                          # as if never tried (the DB holds the mark)
+                self.st["alerted"].clear()
+                self.alerts.clear()
+                self.register()
+                with self.sender(**thread):
+                    rep = self.run_pass()
+                why = "no real model reply followed" if thread["user"] else "no <cross-session-message> entry"
+                self.assertTrue(any(why in s for s in rep["skip"]), rep["skip"])
+                self.assertEqual(len(self.alerts), 1)
+                self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+
+    def test_marked_before_the_sender_and_a_killed_pass_never_sends_again(self):
+        """The stall is recorded as rc-sending (and saved) before the sender starts. A pass killed in the
+        sender leaves that mark: the next pass sends nothing and alerts (delivery unknown)."""
+        class Killed(BaseException):
+            pass
+        self.register()
+        seen = []
+
+        def fake(name, text, timeout):
+            self.sent.append((name, text))
+            h = dp.load_state()["handled"][self.stall_key()]                  # what a killed pass leaves in the DB
+            seen.append((h["result"], h["thread"]))
+            raise Killed()
+        with mock.patch.object(host, "rc_send", side_effect=fake):
+            with self.assertRaises(Killed):
+                self.run_pass()
+        self.assertEqual(seen, [("rc-sending", "work-a1")])
+        self.st = dp.load_state()                                              # the next pass
+        with self.sender():
+            rep = self.run_pass()
+        self.assertEqual(len(self.sent), 1)                                    # not sent again
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("interrupted", self.alerts[0])
+        self.assertTrue(dp.failstop.paused()["paused"])
+        self.assertEqual(rep["continue"], [])
+        testenv.unpause()
+        self.run_pass()                                                        # the alert is once per stall
+        self.assertEqual((len(self.sent), len(self.alerts)), (1, 1))
+
+    def test_busy_thread_leaves_no_mark(self):
+        self.register(status="busy")
+        with self.sender():
+            self.run_pass()
+        self.assertEqual(dp.load_state()["handled"], {})
+
+    def test_a_failure_stops_the_remaining_continues_of_the_pass(self):
+        PROCS2 = {**self.PROCS, 101: (50, ["/x/versions/2.1.314", "--print", "--sdk-url", "https://x"])}
+        self.stalled_session(sid(2), prefix="b")
+        self.scan()
+        store.decide_session(self.conn, sid(2), "continue")
+        self.register()
+        with open(os.path.join(self.sessdir.name, "101.json"), "w") as fh:
+            json.dump({"pid": 101, "sessionId": sid(2), "entrypoint": "sdk-cli", "name": "work-b2",
+                       "status": "idle"}, fh)
+        with mock.patch.object(type(self), "PROCS", PROCS2), \
+                mock.patch.object(ka, "pid_alive", lambda pid: pid in PROCS2), \
+                mock.patch.object(ka, "proc_argv", lambda pid: PROCS2.get(pid, (None, []))[1]), \
+                mock.patch.object(ka, "proc_ppid", lambda pid: PROCS2.get(pid, (None, []))[0]), \
+                self.sender(lambda n, t: sender_out(n, text=t, rc=124)):
+            rep = self.run_pass()
+        self.assertEqual(len(self.sent), 1)                                    # the second stall is not tried
+        self.assertEqual(len(self.alerts), 1)
+        self.assertTrue(any("automation paused" in s for s in rep["skip"]), rep["skip"])
+
+    def test_the_lock_wait_covers_a_pass_with_an_rc_send(self):
+        import runner
+        import runner_jobs
+        rc_s = rc_continue.SEND_TIMEOUT + rc_continue.VERIFY_SECONDS
+        self.assertGreaterEqual(dp.CONTINUE_LOCK_WAIT.total_seconds(), rc_s)
+        self.assertGreaterEqual(dp.CONTINUE_LOCK_WAIT, timedelta(minutes=runner.JOBS["dispatcher"].timeout_min))
+        inner = runner_jobs.tick_inner("dispatcher")
+        self.assertEqual((inner["rc_continue.SEND_TIMEOUT"], inner["rc_continue.VERIFY_SECONDS"]),
+                         (timedelta(seconds=rc_continue.SEND_TIMEOUT), timedelta(seconds=rc_continue.VERIFY_SECONDS)))
 
 
 class KillTmux(unittest.TestCase):

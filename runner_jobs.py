@@ -272,6 +272,9 @@ TICK_ONCE_CALLS: dict[str, tuple[tuple[str, str, int, str | None], ...]] = {
     "compaction_check": (("host", "usage_cache", 30, None), ("keepalive", "tmux_has", 30, "LONG_RUN_TMUX_MAX")),
 }
 TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
+    # D-288: the approved continue of an rc thread (rc_continue.send replaces the resume): the Haiku
+    # sender's host call (the bridge's ssh timeout), then the poll for the thread's reply
+    "dispatcher": (("rc_continue", "SEND_TIMEOUT"), ("rc_continue", "VERIFY_SECONDS")),
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
 }
 TICK_MARGIN = timedelta(minutes=1)

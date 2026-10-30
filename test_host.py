@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -233,6 +234,118 @@ class Whitelist(unittest.TestCase):
                         ["--tmux", "afc-" + "x" * 37]):
                 with self.assertRaises(SystemExit, msg=bad):
                     he.check_ka_resume(["--session", sid, "--message", "go", *bad])
+
+    @staticmethod
+    def register_thread(sessions, name, pid, fname=None, **kw):
+        with open(os.path.join(sessions, fname or f"{pid}.json"), "w") as fh:
+            json.dump(dict({"pid": pid, "sessionId": "s", "name": name, "entrypoint": "sdk-cli", "status": "idle"},
+                           **kw), fh)
+
+    def test_rc_send_only_to_one_live_idle_thread(self):
+        """D-288: the host checks the name the container sent against ~/.claude/sessions itself."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("host_exec_rc2", HOST_EXEC)
+        he = importlib.util.module_from_spec(spec)
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
+            spec.loader.exec_module(he)
+        sessions = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, sessions)
+        he.SESSIONS = sessions
+        me, start = os.getpid(), he.proc_start(os.getpid())
+        self.assertTrue(start)
+        dead = 2 ** 22 + 12345                                    # above pid_max: no such process
+
+        def denied(msg, name="rc-t"):
+            with self.assertRaises(SystemExit, msg=msg) as cm:
+                he.rc_send_cmd([name], b"go")
+            self.assertEqual(cm.exception.code, 126, msg)
+        denied("no registry entry")
+        self.register_thread(sessions, "rc-t", dead)
+        denied("dead pid")
+        self.register_thread(sessions, "rc-t", me, procStart="1")
+        denied("reused pid (procStart differs)")
+        self.register_thread(sessions, "rc-t", me, procStart=start, status="busy")
+        denied("busy")
+        self.register_thread(sessions, "rc-t", me, procStart=start, status="waiting")
+        denied("unknown status")
+        self.register_thread(sessions, "rc-t", me, procStart=start, entrypoint="cli")
+        denied("a terminal session")
+        self.register_thread(sessions, "other", me, procStart=start)
+        denied("another name")
+        self.register_thread(sessions, "rc-t", me, procStart=start)
+        cmd, _ = he.rc_send_cmd(["rc-t"], b"go")                  # the one live idle sdk-cli thread: allowed
+        self.assertEqual(cmd[0], he.CLAUDE)
+        self.register_thread(sessions, "rc-t", 1, fname="b.json")  # pid 1 is alive too: two live entries
+        denied("two live entries")
+        os.remove(os.path.join(sessions, "b.json"))
+        self.register_thread(sessions, "rc-t", dead, fname="c.json")   # a stale entry of the name is ignored
+        he.rc_send_cmd(["rc-t"], b"go")
+        with open(os.path.join(sessions, "d.json"), "w") as fh:
+            fh.write("{broken")                                    # unreadable: not ours to judge
+        he.rc_send_cmd(["rc-t"], b"go")
+
+    def test_rc_send_is_stopped_on_the_host_below_the_containers_timeout(self):
+        """D-235: the sender can't outlive the dispatcher's own timeout and deliver after it recorded an error."""
+        import importlib.util
+        import io
+        spec = importlib.util.spec_from_file_location("host_exec_rc3", HOST_EXEC)
+        he = importlib.util.module_from_spec(spec)
+        sessions = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, sessions)
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull, SSH_ORIGINAL_COMMAND="rc-send rc-t"):
+            spec.loader.exec_module(he)
+            he.SESSIONS = sessions
+            self.register_thread(sessions, "rc-t", os.getpid())
+            run = mock.Mock(side_effect=subprocess.TimeoutExpired("claude", he.RC_HOST_TIMEOUT))
+            stdin = mock.Mock(buffer=io.BytesIO(b"go"))
+            with mock.patch.object(he.subprocess, "run", run), mock.patch.object(he.sys, "stdin", stdin), \
+                    mock.patch.object(he.sys, "stderr", io.StringIO()):
+                self.assertEqual(he.main(), 124)
+        self.assertEqual(run.call_args.kwargs["timeout"], he.RC_HOST_TIMEOUT)
+
+    def test_rc_send_through_the_forced_command_is_denied_without_a_thread(self):
+        sessions = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, sessions)
+        env = dict(os.environ, SSH_ORIGINAL_COMMAND="rc-send rc-test-f1", AFCLAUDE_HOST_EXEC_LOG=os.devnull,
+                   AFCLAUDE_HOST_EXEC_SESSIONS=sessions)
+        r = subprocess.run([sys.executable, HOST_EXEC], input=b"go", env=env, capture_output=True, timeout=60)
+        self.assertEqual((r.returncode, b"denied" in r.stderr), (126, True))   # no claude was run
+
+    def test_rc_send_shape(self):
+        """D-288: rc-send <name> (text on stdin) runs the fixed Haiku sender; host.py and host_exec.py
+        agree on the flags, prompt and limits. Checked, never run (a real run would message a session)."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("host_exec_rc", HOST_EXEC)
+        he = importlib.util.module_from_spec(spec)
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
+            spec.loader.exec_module(he)
+            for k in ("RC_SEND_FLAGS", "RC_SEND_PROMPT", "RC_TEXT_MAX", "RC_HOST_TIMEOUT"):
+                self.assertEqual(getattr(he, k), getattr(host, k), k)
+            self.assertEqual(he.RC_NAME.pattern, host.RC_NAME.pattern)
+            # the sender has the SendMessage tool and nothing else, auto-approved under dontAsk
+            self.assertIn("--tools=SendMessage", he.RC_SEND_FLAGS)
+            self.assertIn("--allowedTools=SendMessage", he.RC_SEND_FLAGS)
+            self.assertFalse(any("ListAgents" in f for f in he.RC_SEND_FLAGS))
+            import rc_continue
+            self.assertLess(he.RC_HOST_TIMEOUT, rc_continue.SEND_TIMEOUT)   # the container's ssh timeout
+            sessions = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, sessions)
+            he.SESSIONS = sessions
+            self.register_thread(sessions, "rc-test-f1", os.getpid())
+            cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
+            self.assertEqual(cmd, [he.CLAUDE] + host.RC_SEND_FLAGS)
+            self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
+            for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
+                               (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
+                with self.assertRaises(SystemExit, msg=(args, data[:10])):
+                    he.rc_send_cmd(args, data)
+        self.assertEqual(host.bridge_argv(["rc-send", "rc-test-f1"]), ["rc-send", "rc-test-f1"])
+        for bad in (["rc-send"], ["rc-send", "a b"], ["rc-send", "a", "b"]):
+            with self.assertRaises(ValueError, msg=bad):
+                host.bridge_argv(bad)
+        for cmd, stdin in (("rc-send", b"x"), ("rc-send 'a;b'", b"x"), ("rc-send a b", b"x"),
+                           ("rc-send rc-test-f1", b""), ("rc-send rc-test-f1", b"x" * (16 * 1024 + 1))):
+            self.assertEqual(run_host_exec(cmd, stdin).returncode, 126, cmd)   # denied before any claude run
 
     def test_append_note_limits(self):
         self.assertEqual(run_host_exec("append-note PROGRESS.md", b"x" * (16 * 1024 + 1)).returncode, 126)

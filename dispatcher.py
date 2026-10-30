@@ -12,9 +12,12 @@ one pass per invocation does:
      (the windows are only for AFClaude). keepalive.evaluate() checks the reset (and that live
      usage no longer shows the limit at 100%); keepalive.preflight() still applies (send-keys
      / resume / take-over of archived or idle holders; never an RC-server thread, an sdk-url
-     child or a busy session). Never continued (D-204: a limit hit ends an AFClaude run): the
-     task-manager of every project (the registry, projects.manager_session; phase 3b S3: no
-     machine setting, no scan of running watchers), every other driven session
+     child or a busy session). A stall held by a live `claude rc` thread child is messaged
+     instead (rc_continue.py, D-288: the continue text into its inbox, verified; a failure alerts
+     and pauses); one whose child has exited is left: "continue it from the app". Never
+     continued (D-204: a limit hit ends an AFClaude run): the task-manager of every project
+     (the registry, projects.manager_session; phase 3b S3: no machine setting, no scan of
+     running watchers), every other driven session
      (driven_sessions) and AFClaude task sessions (assigned to a task or tracked as one). Forks
      (sessions sharing entry uuids, detected by the uuid of their first message)
      are grouped into families, and at most one per family is continued: the explicitly
@@ -67,6 +70,7 @@ import store  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161; the log dual-written)
 import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
+import rc_continue  # noqa: E402  (an approved continue of a live `claude rc` thread, D-288)
 
 UTC = timezone.utc
 DATA_DIR = os.environ.get("DISPATCHER_DATA_DIR", os.path.join(HERE, "data"))
@@ -385,10 +389,12 @@ class Pass:
 
     def continue_stalled(self, r, key):
         """D-206: right at the reset (+ grace), any time of day, no window / budget / pacing gate;
-        the preflight still refuses RC-server threads, sdk-url children and busy sessions.
+        the preflight still refuses RC-server threads, sdk-url children and busy sessions; a live rc
+        thread child is messaged instead (continue_rc), an exited one is left to the app.
         -> (outcome, detail) for a run-now request (continue_now, phase 3b S5; the pass ignores it):
-        "started" (detail: the tmux name), "refused" (it can't run now: not at its reset, held by the
-        owner, not resumable), "failed" (alerted and paused here already) or "dry-run"."""
+        "started" (detail: the tmux name), "delivered" (an rc thread: detail = its registry name),
+        "refused" (it can't run now: not at its reset, held by the owner, not resumable), "failed"
+        (alerted and paused here already) or "dry-run"."""
         sid = r["session_id"]
         label = f"stalled {sid[:8]}"
         action, detail, _ = ka.evaluate(sid, self.now, self.usage_getter)
@@ -412,14 +418,15 @@ class Pass:
             self.skip(label, f"no tmux name: {type(e).__name__}: {e}"[:300])
             return "failed", f"no tmux name: {type(e).__name__}: {e}"[:300]
         ok, problems, plan = ka.preflight(sid, tmux)
+        if not ok and problems and problems[0].startswith(ka.RC_LIVE):
+            # a live `claude rc` thread: message it, never take it over (D-288, rc_server_mode.md §4.1)
+            return self.continue_rc(r, key, detail, tmux)
         if not ok and problems and problems[0].startswith(ka.RC_HELD):
-            # the user has it open in the Remote Control app: skip, retry next pass, log once per stall
-            self.skip(label, "skipped, " + problems[0])
-            if key not in self.st.setdefault("rc_held", {}):
-                log(f"not continuing {sid[:8]}: {problems[0]}")
-                if self.arm:
-                    self.st["rc_held"][key] = store.iso(self.now)
-            return "refused", f"the owner holds the session ({problems[0]})"
+            # its rc child has exited: only a message from the app re-serves it. Skip, retry next pass,
+            # log once per stall; the state says so (rc_held[key]["state"] "app-only")
+            self.skip(label, "skipped, " + problems[0] + "; continue it from the app")
+            self.note_rc(key, "app-only", f"not continuing {sid[:8]}: {problems[0]}; continue it from the app")
+            return "refused", f"the owner holds the session ({problems[0]}); continue it from the app"
         if not ok:
             self.skip(label, "preflight refused: " + "; ".join(problems))
             if self.arm:
@@ -470,6 +477,58 @@ class Pass:
         self.track(sid, tmux, kind=tracked.get("kind", "continue"), task_id=tracked.get("task_id"), cwd=cwd,
                    own_tmux=plan != "send-keys" or tracked.get("own_tmux", False))
         return "started", tmux
+
+    def note_rc(self, key, state, line):
+        """An rc stall left for now: rc_held[key] = {"at", "state"} (armed), logged once per stall and state."""
+        prev = self.st.setdefault("rc_held", {}).get(key)
+        if not isinstance(prev, dict) or prev.get("state") != state:
+            log(line)
+            if self.arm:
+                self.st["rc_held"][key] = {"at": store.iso(self.now), "state": state}
+
+    def continue_rc(self, r, key, detail, tmux):
+        """The approved continue of a stall held by a live `claude rc` thread child (D-288, D-206):
+        the neutral continue text into the thread's inbox (rc_continue.send: registry name read now,
+        Haiku SendMessage over the host bridge, verified in the thread's transcript). Busy: skipped,
+        retried next pass. Any failure: recorded, alerted, paused (D-234/D-235); one try per stall.
+        -> continue_stalled's (outcome, detail); "delivered" names the rc thread (no tmux session of
+        ours exists: nothing to track or clean up)."""
+        sid = r["session_id"]
+        label = f"stalled {sid[:8]}"
+        msg = ka.session_message("continue_foreign", manager=False, reason="dispatcher, " + detail, context="")
+        entry = {"sid": sid, "plan": "rc-send", "reason": detail}
+        if not self.arm:
+            self.report["continue"].append(entry)
+            log(f"WOULD MESSAGE the rc thread (dry-run) {sid[:8]}: {msg[:160]!r}...")
+            return "dry-run", tmux
+
+        def sending(name):
+            # recorded and saved BEFORE the sender starts: a pass killed from here on never sends again
+            # (the stall is handled; the mark is an error the next pass alerts on, Pass.run)
+            self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-sending",
+                                       "thread": name}
+            save_state(self.st)
+        try:
+            res = rc_continue.send(sid, msg, before_send=sending)
+        except rc_continue.Busy as e:
+            self.skip(label, f"skipped, {e} (the owner is using it)")
+            self.note_rc(key, "busy", f"not continuing {sid[:8]}: {e}")
+            return "refused", f"the owner holds the session ({e})"
+        except Exception as e:   # noqa: BLE001 - RcError or a host-call failure: an error (D-234/D-235)
+            err = f"{type(e).__name__}: {e}"[:500]
+            self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-send-error",
+                                       "error": err}
+            self.alert_once(f"rc-send:{key}", f"dispatcher did NOT continue the rc thread {sid[:8]}", err)
+            self.skip(label, "rc thread continue failed: " + err)
+            return "failed", "rc thread continue failed: " + err
+        entry.update(thread=res["name"], pid=res["pid"], seconds=res["seconds"])
+        self.report["continue"].append(entry)
+        log(f"CONTINUED the rc thread {sid[:8]} ({res['name']}, pid {res['pid']}): message answered "
+            f"after {res['seconds']} s; sender: {res['result']!r}")
+        self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-delivered",
+                                   "thread": res["name"]}
+        self.st["starts"][self.day] = self.st["starts"].get(self.day, 0) + 1   # a count, no cap (D-206)
+        return "delivered", res["name"]
 
     # -- 2. verification of earlier continues, 3. cleanup
     def verify(self):
@@ -575,9 +634,23 @@ class Pass:
         actions.perform(self.conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
                         actor="dispatcher", via="runner")
 
+    def check_rc_sending(self):
+        """An rc continue left at "rc-sending": its pass was killed (or the state lost) between the
+        mark and the outcome, so it is unknown whether the message went out. Never sent again (the
+        stall is handled); an error the owner sees (D-235), once per stall."""
+        if not self.arm:
+            return
+        for key, h in self.st["handled"].items():
+            if isinstance(h, dict) and h.get("result") == "rc-sending":
+                self.alert_once(f"rc-sending:{key}", "an rc continue was interrupted: delivery unknown",
+                                f"the dispatcher's message to the rc thread {h.get('thread')!r} (stall {key}) was "
+                                f"started at {h.get('at')} and its pass ended without an outcome; it is NOT sent "
+                                "again. Check the thread's transcript, then continue it by hand if needed.")
+
     def run(self):
         # the install-wide pause only: the stalled sessions it continues are no AFClaude project's
         # (a task-manager's or a task's are never continued, afclaude_run), so no project pause applies
+        self.check_rc_sending()          # may pause: before the pause is read
         p = failstop.paused()
         self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         excluded = excluded_sessions(self.cfg, self.conn)
@@ -587,13 +660,18 @@ class Pass:
             if self.paused is not None:  # D-234/D-235: no continue until the owner cleared the pause
                 self.skip(f"stalled {r['session_id'][:8]}", f"automation paused ({self.paused})")
                 continue
-            self.continue_stalled(r, key)
+            if self.continue_stalled(r, key)[0] == "failed":
+                p = failstop.paused()    # the failure paused automation: no further continue in this pass
+                self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         # no task-session starts and no in-window starts of task-managers here (D-205): runs
         # begin only at the session-window / last-stretch slot starts (keepalive.py)
         return self.report
 
 
-CONTINUE_LOCK_WAIT = timedelta(minutes=5)   # continue_now waits this long for a running pass, then: error
+# continue_now waits this long for a running pass, then: error. Above a pass's worst case (the runner
+# kills it after runner_timeout_dispatcher, default 20 min; its rc send + verify alone take up to
+# SEND_TIMEOUT + VERIFY_SECONDS = 5 min): a wait that ends first would be a false alert (test_dispatcher)
+CONTINUE_LOCK_WAIT = timedelta(minutes=25)
 
 
 def continue_now(conn, sid, now, request_id):
@@ -603,7 +681,8 @@ def continue_now(conn, sid, now, request_id):
     Refused: not stalled now, an AFClaude run (a task-manager or a task session: D-204, `run-now work`
     is the way for a task-manager), excluded, or this stall continued already. Under the pass's lock
     (one writer of its state); held longer than CONTINUE_LOCK_WAIT: an error (D-234).
-    -> (outcome, detail) as continue_stalled's ("started": detail = the tmux name)."""
+    -> (outcome, detail) as continue_stalled's ("started": detail = the tmux name; "delivered": the
+    rc thread's name)."""
     cfg = load_config()
     os.makedirs(DATA_DIR, exist_ok=True)
     lock = open(LOCK_FILE, "w")
@@ -638,7 +717,7 @@ def continue_now(conn, sid, now, request_id):
             return "refused", f"this stall was already continued at {h.get('at')} ({h.get('result')})"
         ka.TAKE_OVER_IDLE = bool(cfg["take_over_idle"])
         outcome = p.continue_stalled(row, key)
-        if outcome[0] == "started" and isinstance(st["handled"].get(key), dict):
+        if outcome[0] in ("started", "delivered") and isinstance(st["handled"].get(key), dict):
             st["handled"][key]["request"] = request_id
         log(f"run-now request #{request_id}: continue_now {sid[:8]}: {outcome[0]} ({outcome[1]})")
         save_state(st)
@@ -653,7 +732,8 @@ def prune_state(st, now, days=7):
                       if v.get("status") == "running"
                       or (v.get("cleaned_at") or v.get("ended_at") or v.get("released_at") or "9") > cut}
     st["handled"] = {k: v for k, v in st["handled"].items() if (v.get("at") or "9") > cut}
-    st["rc_held"] = {k: v for k, v in st["rc_held"].items() if v > cut}
+    st["rc_held"] = {k: v for k, v in st["rc_held"].items()     # {"at", "state"}; a bare time before rc-continue
+                     if ((v.get("at") or "") if isinstance(v, dict) else v) > cut}
     st["starts"] = dict(sorted(st["starts"].items())[-14:])
     st.pop("launch_failures", None)       # task starts are gone (D-205)
 

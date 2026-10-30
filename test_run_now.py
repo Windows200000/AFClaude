@@ -248,6 +248,33 @@ class ContinueAndReview(Base):
         self.assertEqual(row["status"], "started")
         self.assertEqual(self.result(row)["tmux"], "afc-stall-x-dddd")
 
+    def test_an_rc_thread_continue_is_delivered_not_started(self):
+        """D-288: a message into a live rc thread starts no tmux session: the request says what was done."""
+        with mock.patch.object(dispatcher, "LOCK_FILE", os.path.join(self.dir, "d.lock")), \
+                mock.patch.object(dispatcher.stalled, "scan", lambda conn: None), \
+                mock.patch.object(dispatcher, "load_state", lambda: {"handled": {"u1": None}, "sessions": {},
+                                                                     "alerted": {}, "rc_held": {}, "starts": {}}), \
+                mock.patch.object(dispatcher, "save_state", lambda st: True):
+            r = store.add_request(self.conn, "cli", "continue_now", STALLED)
+            self.conn.commit()
+            stall = {"session_id": STALLED, "stall_uuid": "u1", "title": "x"}
+            with mock.patch.object(store, "stalled_decisions", lambda conn: [stall]), \
+                    mock.patch.object(dispatcher.Pass, "continue_stalled",
+                                      lambda p, rr, key: ("delivered", "work-a1")):
+                row, note = self.decide(r)
+        self.assertEqual(row["status"], "started")
+        res = self.result(row)
+        self.assertEqual((res["tmux"], res["session_id"], res["reason"]),
+                         (None, STALLED, "message delivered to rc thread work-a1"))
+        self.assertIn("delivered (work-a1)", note)
+        self.assertIn("rc thread work-a1", tasks.request_line(dict(row)))     # what `tasks.py run-now` shows
+        r2 = store.add_request(self.conn, "cli", "review_now", None)
+        self.conn.commit()
+        for kw in ({}, {"tmux": "ka-00000000", "note": "x"}):                 # exactly one of tmux, note
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                actions.perform(self.conn, "request.start", {"request_id": r2["id"], **kw},
+                                actor="runner:request", via="runner")
+
     def _refused_preflight_stall(self, quiet):
         """Pass.continue_stalled on a stall whose preflight refuses (a "failed" outcome that alerts)."""
         st = {"handled": {}, "sessions": {}, "alerted": {}, "rc_held": {}, "starts": {}}

@@ -28,8 +28,15 @@ Allowed (exact shapes):
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
   append-note PROGRESS.md|ALERTS.md   append stdin (<= 16 KB UTF-8 text) to that repo file
+  rc-send <name>           a one-shot Haiku `claude -p` (RC_SEND_FLAGS: dontAsk, the SendMessage tool
+                           only) asked to SendMessage stdin (<= 16 KB UTF-8 text) to the session named
+                           <name> (RC_NAME): the dispatcher's continue of a `claude rc` thread
+                           (docs/rc_server_mode.md §4.1); prompt and flags fixed here. Denied unless
+                           <name> is one live ~/.claude/sessions entry, sdk-cli and idle; stopped
+                           after RC_HOST_TIMEOUT seconds (exit 124)
 """
 import datetime
+import glob
 import json
 import os
 import re
@@ -53,6 +60,19 @@ HAIKU_FLAGS = {"-p", "--model", "haiku", "--no-session-persistence", "--output-f
                "stream-json", "--verbose", "--permission-mode", "dontAsk", "--tools=",
                "--tools=PushNotification", "--allowedTools=PushNotification",
                "--strict-mcp-config", "--disable-slash-commands"}
+
+# rc-send: kept identical to host.py's RC_NAME / RC_TEXT_MAX / RC_SEND_FLAGS / RC_SEND_PROMPT (test_host.py)
+RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+RC_TEXT_MAX = 16 * 1024
+RC_SEND_FLAGS = ["-p", "--model", "haiku", "--permission-mode", "dontAsk",
+                 "--tools=SendMessage", "--allowedTools=SendMessage", "--strict-mcp-config",
+                 "--disable-slash-commands", "--output-format", "stream-json", "--verbose"]
+RC_HOST_TIMEOUT = 100       # seconds the sender may run here: below the container's 120 s ssh timeout
+SESSIONS = os.environ.get("AFCLAUDE_HOST_EXEC_SESSIONS") or os.path.expanduser("~/.claude/sessions")   # override: tests only
+RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named exactly {name!r}, with the "
+                  "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
+                  "not reachable, do not try any other name or agent and do not retry. Do nothing else. "
+                  "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 
 
 def log(msg):
@@ -130,6 +150,57 @@ def check_ka_resume(args):
         deny("model")
 
 
+def proc_start(pid):
+    """/proc/<pid>/stat starttime (what the registry's procStart holds), or None: no such process."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def check_rc_thread(name):
+    """Deny unless `name` is the registry name of exactly one live ~/.claude/sessions entry (its pid
+    alive, procStart matching) that is an sdk-cli thread child and idle. The container picks the
+    name, so the host checks it itself: the sender may only ever message such a thread."""
+    live = []
+    for path in sorted(glob.glob(os.path.join(SESSIONS, "*.json"))):
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue                       # being rewritten: not an entry of ours to judge
+        if not isinstance(d, dict) or d.get("name") != name:
+            continue
+        try:
+            pid = int(d.get("pid") or os.path.basename(path)[:-5])
+        except ValueError:
+            continue
+        start = proc_start(pid)
+        if start is not None and (d.get("procStart") is None or str(d["procStart"]) == start):
+            live.append(d)
+    if len(live) != 1:
+        deny(f"rc-send: {len(live)} live sessions named {name}")
+    if live[0].get("entrypoint") != "sdk-cli" or live[0].get("status") != "idle":
+        deny(f"rc-send: {name} is {live[0].get('entrypoint')}/{live[0].get('status')}, not an idle sdk-cli thread")
+
+
+def rc_send_cmd(args, data):
+    """rc-send <name> with the message text `data` (stdin bytes) -> (cmd, stdin bytes), or deny
+    (also when <name> is no idle live thread: check_rc_thread)."""
+    if len(args) != 1 or not RC_NAME.match(args[0]):
+        deny("rc-send needs one thread name")
+    if not data or len(data) > RC_TEXT_MAX or b"\0" in data:
+        deny("rc-send text empty, too long or binary")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        deny("rc-send text not UTF-8")
+    check_rc_thread(args[0])
+    log(f"OK rc-send {args[0]} ({len(data)} bytes)")
+    return [CLAUDE] + RC_SEND_FLAGS, RC_SEND_PROMPT.format(name=args[0], text=text).encode()
+
+
 def main():
     raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     try:
@@ -149,6 +220,8 @@ def main():
         cmd = [CLAUDE] + args
     elif head == "claude" and args[:3] == ["-p", "--model", "haiku"] and set(args) <= HAIKU_FLAGS:
         cmd, stdin = [CLAUDE] + args, sys.stdin.buffer.read(200_000)
+    elif head == "rc-send":
+        cmd, stdin = rc_send_cmd(args, sys.stdin.buffer.read(RC_TEXT_MAX + 1))
     elif head == "claude" and len(args) == 2 and args[0] == "stop" and HEX8.match(args[1]):
         cmd = [CLAUDE] + args
     elif head == "kill-claude" and len(args) == 1 and args[0].isdigit():
@@ -224,8 +297,14 @@ def main():
     else:
         deny("not whitelisted")
     log(f"OK {shlex.join(cmd)[:300]}")
-    cwd = ROOT if head != "claude" or args[:1] != ["-p"] else os.path.join(REPO, "data")
-    return subprocess.run(cmd, input=stdin, env=ENV, cwd=cwd).returncode
+    cwd = os.path.join(REPO, "data") if (head == "claude" and args[:1] == ["-p"]) or head == "rc-send" else ROOT
+    try:
+        return subprocess.run(cmd, input=stdin, env=ENV, cwd=cwd,
+                              timeout=RC_HOST_TIMEOUT if head == "rc-send" else None).returncode
+    except subprocess.TimeoutExpired:      # run() has killed the sender
+        log(f"TIMEOUT rc-send after {RC_HOST_TIMEOUT} s")
+        print(f"host_exec: rc-send stopped after {RC_HOST_TIMEOUT} s", file=sys.stderr)
+        return 124
 
 
 if __name__ == "__main__":
