@@ -50,8 +50,10 @@ NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
 RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")   # a thread's registry `name` (dir + 2 hex)
 RC_TEXT_MAX = 16 * 1024                                          # bytes of UTF-8 message text
 RC_SEND_FLAGS = ["-p", "--model", "haiku", "--permission-mode", "dontAsk",   # D-047: Haiku in dontAsk
-                 "--allowedTools", "SendMessage", "ListAgents", "--strict-mcp-config",
+                 "--tools=SendMessage", "--allowedTools=SendMessage", "--strict-mcp-config",   # only that tool exists
                  "--disable-slash-commands", "--output-format", "stream-json", "--verbose"]
+RC_HOST_TIMEOUT = 100       # seconds the host side lets the sender run: below rc_continue.SEND_TIMEOUT (the ssh
+                            # call's), so it can't deliver after the dispatcher recorded the failure
 RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named exactly {name!r}, with the "
                   "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
                   "not reachable, do not try any other name or agent and do not retry. Do nothing else. "

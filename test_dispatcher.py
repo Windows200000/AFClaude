@@ -955,12 +955,13 @@ class Holders(HolderBase):
         self.assertEqual(self.resume_calls(), [])
 
 
-def sender_out(name, result="Message sent to that session's inbox.", is_error=False, uses=1, target=None, rc=0):
+def sender_out(name, result="Message sent to that session's inbox.", is_error=False, uses=1, target=None, rc=0,
+               text="x"):
     """The Haiku sender's stream-json (host.rc_send's CompletedProcess)."""
     evs = [{"type": "system", "subtype": "init"}]
     for i in range(uses):
         evs.append({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": f"t{i}", "name": "SendMessage", "input": {"to": target or name, "message": "x"}}]}})
+            {"type": "tool_use", "id": f"t{i}", "name": "SendMessage", "input": {"to": target or name, "message": text}}]}})
         evs.append({"type": "user", "message": {"content": [
             {"type": "tool_result", "tool_use_id": f"t{i}", "content": result, "is_error": is_error}]}})
     evs.append({"type": "result", "subtype": "success", "is_error": False, "result": result})
@@ -1008,8 +1009,8 @@ class RcThreads(HolderBase):
             self.sent.append((name, text))
             if out is None:
                 self.thread_answers(**thread)
-                return sender_out(name)
-            return out(name) if callable(out) else out
+                return sender_out(name, text=text)
+            return out(name, text) if callable(out) else out
         return mock.patch.object(host, "rc_send", side_effect=fake)
 
     def test_idle_thread_is_messaged_and_verified(self):
@@ -1055,12 +1056,13 @@ class RcThreads(HolderBase):
         self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
 
     def test_held_message_is_an_error(self):
-        """The thread's mode changed to bypass since it started: the sender says the message is held."""
+        """The thread's mode changed to bypass since it started: the message is held, so the thread's
+        transcript never shows it (no keyword guess on the result text: the transcript is the proof)."""
         self.register()
-        with self.sender(lambda n: sender_out(n, result="The message is held until the session accepts it.")):
+        with self.sender(lambda n, t: sender_out(n, text=t, result="The message is held until accepted.")):
             rep = self.run_pass()
         self.assertEqual(len(self.sent), 1)
-        self.assertTrue(any("held or refused" in s for s in rep["skip"]), rep["skip"])
+        self.assertTrue(any("no <cross-session-message> entry" in s for s in rep["skip"]), rep["skip"])
         self.assertEqual(len(self.alerts), 1)
         self.assertTrue(dp.failstop.paused()["paused"])                # D-235: automation paused
 
@@ -1077,7 +1079,8 @@ class RcThreads(HolderBase):
     def test_name_changed_after_the_read_is_an_error(self):
         """... and a name that is gone by the time the sender runs: "No agent named … is reachable"."""
         self.register()
-        with self.sender(lambda n: sender_out(n, result=f"No agent named {n} is reachable.", is_error=True)):
+        with self.sender(lambda n, t: sender_out(n, text=t, result=f"No agent named {n} is reachable.",
+                                                 is_error=True)):
             rep = self.run_pass()
         self.assertTrue(any("is reachable" in s for s in rep["skip"]), rep["skip"])
         self.assertEqual(len(self.alerts), 1)
@@ -1096,15 +1099,80 @@ class RcThreads(HolderBase):
         for thread in ({"user": False, "answer": False}, {"user": True, "answer": False}):
             with self.subTest(thread=thread):
                 testenv.unpause()
-                self.st = dp.load_state()
+                self.st["handled"].clear()                          # as if never tried (the DB holds the mark)
+                self.st["alerted"].clear()
                 self.alerts.clear()
                 self.register()
                 with self.sender(**thread):
                     rep = self.run_pass()
-                why = "no assistant entry followed" if thread["user"] else "no <cross-session-message> entry"
+                why = "no real model reply followed" if thread["user"] else "no <cross-session-message> entry"
                 self.assertTrue(any(why in s for s in rep["skip"]), rep["skip"])
                 self.assertEqual(len(self.alerts), 1)
                 self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+
+    def test_marked_before_the_sender_and_a_killed_pass_never_sends_again(self):
+        """The stall is recorded as rc-sending (and saved) before the sender starts. A pass killed in the
+        sender leaves that mark: the next pass sends nothing and alerts (delivery unknown)."""
+        class Killed(BaseException):
+            pass
+        self.register()
+        seen = []
+
+        def fake(name, text, timeout):
+            self.sent.append((name, text))
+            h = dp.load_state()["handled"][self.stall_key()]                  # what a killed pass leaves in the DB
+            seen.append((h["result"], h["thread"]))
+            raise Killed()
+        with mock.patch.object(host, "rc_send", side_effect=fake):
+            with self.assertRaises(Killed):
+                self.run_pass()
+        self.assertEqual(seen, [("rc-sending", "work-a1")])
+        self.st = dp.load_state()                                              # the next pass
+        with self.sender():
+            rep = self.run_pass()
+        self.assertEqual(len(self.sent), 1)                                    # not sent again
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("interrupted", self.alerts[0])
+        self.assertTrue(dp.failstop.paused()["paused"])
+        self.assertEqual(rep["continue"], [])
+        testenv.unpause()
+        self.run_pass()                                                        # the alert is once per stall
+        self.assertEqual((len(self.sent), len(self.alerts)), (1, 1))
+
+    def test_busy_thread_leaves_no_mark(self):
+        self.register(status="busy")
+        with self.sender():
+            self.run_pass()
+        self.assertEqual(dp.load_state()["handled"], {})
+
+    def test_a_failure_stops_the_remaining_continues_of_the_pass(self):
+        PROCS2 = {**self.PROCS, 101: (50, ["/x/versions/2.1.314", "--print", "--sdk-url", "https://x"])}
+        self.stalled_session(sid(2), prefix="b")
+        self.scan()
+        store.decide_session(self.conn, sid(2), "continue")
+        self.register()
+        with open(os.path.join(self.sessdir.name, "101.json"), "w") as fh:
+            json.dump({"pid": 101, "sessionId": sid(2), "entrypoint": "sdk-cli", "name": "work-b2",
+                       "status": "idle"}, fh)
+        with mock.patch.object(type(self), "PROCS", PROCS2), \
+                mock.patch.object(ka, "pid_alive", lambda pid: pid in PROCS2), \
+                mock.patch.object(ka, "proc_argv", lambda pid: PROCS2.get(pid, (None, []))[1]), \
+                mock.patch.object(ka, "proc_ppid", lambda pid: PROCS2.get(pid, (None, []))[0]), \
+                self.sender(lambda n, t: sender_out(n, text=t, rc=124)):
+            rep = self.run_pass()
+        self.assertEqual(len(self.sent), 1)                                    # the second stall is not tried
+        self.assertEqual(len(self.alerts), 1)
+        self.assertTrue(any("automation paused" in s for s in rep["skip"]), rep["skip"])
+
+    def test_the_lock_wait_covers_a_pass_with_an_rc_send(self):
+        import runner
+        import runner_jobs
+        rc_s = rc_continue.SEND_TIMEOUT + rc_continue.VERIFY_SECONDS
+        self.assertGreaterEqual(dp.CONTINUE_LOCK_WAIT.total_seconds(), rc_s)
+        self.assertGreaterEqual(dp.CONTINUE_LOCK_WAIT, timedelta(minutes=runner.JOBS["dispatcher"].timeout_min))
+        inner = runner_jobs.tick_inner("dispatcher")
+        self.assertEqual((inner["rc_continue.SEND_TIMEOUT"], inner["rc_continue.VERIFY_SECONDS"]),
+                         (timedelta(seconds=rc_continue.SEND_TIMEOUT), timedelta(seconds=rc_continue.VERIFY_SECONDS)))
 
 
 class KillTmux(unittest.TestCase):

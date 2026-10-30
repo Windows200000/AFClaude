@@ -161,8 +161,10 @@ def run(key, now=None):
                                                          "reason": f"{type(e).__name__}: {e}", "run_id": run_id},
                                 actor=ACTOR, via=VIA)
                 raise
-        if outcome == "started":
-            actions.perform(conn, "request.start", {"request_id": req["id"], "tmux": detail, "run_id": run_id,
+        if outcome in ("started", "delivered"):
+            # "delivered": a message into a live rc thread, no tmux session started (D-288): a note
+            who = {"tmux": detail} if outcome == "started" else {"note": f"message delivered to rc thread {detail}"}
+            actions.perform(conn, "request.start", {"request_id": req["id"], **who, "run_id": run_id,
                                                     "session_id": sid}, actor=ACTOR, via=VIA)
         else:
             actions.perform(conn, "request.finish", {"request_id": req["id"], "status": outcome,

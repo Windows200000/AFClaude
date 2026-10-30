@@ -392,8 +392,9 @@ class Pass:
         the preflight still refuses RC-server threads, sdk-url children and busy sessions; a live rc
         thread child is messaged instead (continue_rc), an exited one is left to the app.
         -> (outcome, detail) for a run-now request (continue_now, phase 3b S5; the pass ignores it):
-        "started" (detail: the tmux name), "refused" (it can't run now: not at its reset, held by the
-        owner, not resumable), "failed" (alerted and paused here already) or "dry-run"."""
+        "started" (detail: the tmux name), "delivered" (an rc thread: detail = its registry name),
+        "refused" (it can't run now: not at its reset, held by the owner, not resumable), "failed"
+        (alerted and paused here already) or "dry-run"."""
         sid = r["session_id"]
         label = f"stalled {sid[:8]}"
         action, detail, _ = ka.evaluate(sid, self.now, self.usage_getter)
@@ -490,7 +491,8 @@ class Pass:
         the neutral continue text into the thread's inbox (rc_continue.send: registry name read now,
         Haiku SendMessage over the host bridge, verified in the thread's transcript). Busy: skipped,
         retried next pass. Any failure: recorded, alerted, paused (D-234/D-235); one try per stall.
-        -> continue_stalled's (outcome, detail); "started" names the stall's claimed tmux name."""
+        -> continue_stalled's (outcome, detail); "delivered" names the rc thread (no tmux session of
+        ours exists: nothing to track or clean up)."""
         sid = r["session_id"]
         label = f"stalled {sid[:8]}"
         msg = ka.session_message("continue_foreign", manager=False, reason="dispatcher, " + detail, context="")
@@ -499,8 +501,15 @@ class Pass:
             self.report["continue"].append(entry)
             log(f"WOULD MESSAGE the rc thread (dry-run) {sid[:8]}: {msg[:160]!r}...")
             return "dry-run", tmux
+
+        def sending(name):
+            # recorded and saved BEFORE the sender starts: a pass killed from here on never sends again
+            # (the stall is handled; the mark is an error the next pass alerts on, Pass.run)
+            self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-sending",
+                                       "thread": name}
+            save_state(self.st)
         try:
-            res = rc_continue.send(sid, msg)
+            res = rc_continue.send(sid, msg, before_send=sending)
         except rc_continue.Busy as e:
             self.skip(label, f"skipped, {e} (the owner is using it)")
             self.note_rc(key, "busy", f"not continuing {sid[:8]}: {e}")
@@ -519,7 +528,7 @@ class Pass:
         self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-delivered",
                                    "thread": res["name"]}
         self.st["starts"][self.day] = self.st["starts"].get(self.day, 0) + 1   # a count, no cap (D-206)
-        return "started", tmux
+        return "delivered", res["name"]
 
     # -- 2. verification of earlier continues, 3. cleanup
     def verify(self):
@@ -625,9 +634,23 @@ class Pass:
         actions.perform(self.conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
                         actor="dispatcher", via="runner")
 
+    def check_rc_sending(self):
+        """An rc continue left at "rc-sending": its pass was killed (or the state lost) between the
+        mark and the outcome, so it is unknown whether the message went out. Never sent again (the
+        stall is handled); an error the owner sees (D-235), once per stall."""
+        if not self.arm:
+            return
+        for key, h in self.st["handled"].items():
+            if isinstance(h, dict) and h.get("result") == "rc-sending":
+                self.alert_once(f"rc-sending:{key}", "an rc continue was interrupted: delivery unknown",
+                                f"the dispatcher's message to the rc thread {h.get('thread')!r} (stall {key}) was "
+                                f"started at {h.get('at')} and its pass ended without an outcome; it is NOT sent "
+                                "again. Check the thread's transcript, then continue it by hand if needed.")
+
     def run(self):
         # the install-wide pause only: the stalled sessions it continues are no AFClaude project's
         # (a task-manager's or a task's are never continued, afclaude_run), so no project pause applies
+        self.check_rc_sending()          # may pause: before the pause is read
         p = failstop.paused()
         self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         excluded = excluded_sessions(self.cfg, self.conn)
@@ -637,13 +660,18 @@ class Pass:
             if self.paused is not None:  # D-234/D-235: no continue until the owner cleared the pause
                 self.skip(f"stalled {r['session_id'][:8]}", f"automation paused ({self.paused})")
                 continue
-            self.continue_stalled(r, key)
+            if self.continue_stalled(r, key)[0] == "failed":
+                p = failstop.paused()    # the failure paused automation: no further continue in this pass
+                self.paused = (p.get("reason") or "no reason given") if p["paused"] else None
         # no task-session starts and no in-window starts of task-managers here (D-205): runs
         # begin only at the session-window / last-stretch slot starts (keepalive.py)
         return self.report
 
 
-CONTINUE_LOCK_WAIT = timedelta(minutes=5)   # continue_now waits this long for a running pass, then: error
+# continue_now waits this long for a running pass, then: error. Above a pass's worst case (the runner
+# kills it after runner_timeout_dispatcher, default 20 min; its rc send + verify alone take up to
+# SEND_TIMEOUT + VERIFY_SECONDS = 5 min): a wait that ends first would be a false alert (test_dispatcher)
+CONTINUE_LOCK_WAIT = timedelta(minutes=25)
 
 
 def continue_now(conn, sid, now, request_id):
@@ -653,7 +681,8 @@ def continue_now(conn, sid, now, request_id):
     Refused: not stalled now, an AFClaude run (a task-manager or a task session: D-204, `run-now work`
     is the way for a task-manager), excluded, or this stall continued already. Under the pass's lock
     (one writer of its state); held longer than CONTINUE_LOCK_WAIT: an error (D-234).
-    -> (outcome, detail) as continue_stalled's ("started": detail = the tmux name)."""
+    -> (outcome, detail) as continue_stalled's ("started": detail = the tmux name; "delivered": the
+    rc thread's name)."""
     cfg = load_config()
     os.makedirs(DATA_DIR, exist_ok=True)
     lock = open(LOCK_FILE, "w")
@@ -688,7 +717,7 @@ def continue_now(conn, sid, now, request_id):
             return "refused", f"this stall was already continued at {h.get('at')} ({h.get('result')})"
         ka.TAKE_OVER_IDLE = bool(cfg["take_over_idle"])
         outcome = p.continue_stalled(row, key)
-        if outcome[0] == "started" and isinstance(st["handled"].get(key), dict):
+        if outcome[0] in ("started", "delivered") and isinstance(st["handled"].get(key), dict):
             st["handled"][key]["request"] = request_id
         log(f"run-now request #{request_id}: continue_now {sid[:8]}: {outcome[0]} ({outcome[1]})")
         save_state(st)

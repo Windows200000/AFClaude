@@ -1196,15 +1196,21 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None, categ
     return r.returncode, r.stdout, r.stderr
 
 
+def is_real_reply(e):
+    """A transcript entry that is a real model reply: an assistant entry with a model, neither the
+    synthetic notice (<synthetic>: limit, interrupt) nor an API error message."""
+    m = e.get("message") or {}
+    return (e.get("type") == "assistant" and m.get("model") not in (None, "<synthetic>")
+            and not e.get("isApiErrorMessage"))
+
+
 def verify_reply(path, since, timeout=VERIFY_TIMEOUT):
     """Wait for a real (non-synthetic) assistant message newer than `since`."""
     deadline = time.time() + timeout.total_seconds()
     while time.time() < deadline:
         for e in iter_entries(path):
             ts = parse_ts(e.get("timestamp"))
-            m = e.get("message") or {}
-            if (e.get("type") == "assistant" and ts and ts > since
-                    and m.get("model") not in (None, "<synthetic>")):
+            if is_real_reply(e) and ts and ts > since:
                 return e
         time.sleep(10)
     return None

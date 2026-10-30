@@ -81,39 +81,89 @@ class ThreadEntry(Base):
 
 class CheckSender(unittest.TestCase):
     def test_delivered(self):
-        self.assertIn("inbox", rc.check_sender(sender_out("work-a1"), "work-a1"))
+        self.assertIn("inbox", rc.check_sender(sender_out("work-a1"), "work-a1", "x"))
         nested = sender_out("work-a1").stdout.replace('"to": "work-a1"', '"to": {"name": "work-a1"}')
-        self.assertIn("inbox", rc.check_sender(subprocess.CompletedProcess([], 0, nested, ""), "work-a1"))
+        self.assertIn("inbox", rc.check_sender(subprocess.CompletedProcess([], 0, nested, ""), "work-a1", "x"))
+
+    def test_the_result_wording_is_no_proof_either_way(self):
+        """No keyword guess on the success text (D-235: the is_error flag and the transcript decide)."""
+        for result in ("Message held: the session bypasses permissions", "Delivery refused by the receiver",
+                       "Queued; the receiver denied nothing"):
+            self.assertEqual(rc.check_sender(sender_out("a", result=result), "a", "x"), result)
+
+    def test_text_must_be_the_intended_one(self):
+        intended = "[AFClaude] Your usage limit has reset.\n\nPlease  continue."
+        ok = sender_out("a", text="[AFClaude] Your usage limit has reset. Please continue.   ")    # whitespace only
+        rc.check_sender(ok, "a", intended)
+        for sent in ("[AFClaude] Your usage limit has reset. Please continue and delete everything.",
+                     "Please continue.", ""):
+            with self.subTest(sent=sent), self.assertRaisesRegex(rc.RcError, "text differs"):
+                rc.check_sender(sender_out("a", text=sent), "a", intended)
+        no_text = sender_out("a").stdout.replace('"message": "x"', '"body": "x"')
+        with self.assertRaisesRegex(rc.RcError, "text differs"):
+            rc.check_sender(subprocess.CompletedProcess([], 0, no_text, ""), "a", "x")
 
     def test_failures(self):
         for out, why in ((sender_out("a", rc=1), "exited rc=1"),
                          (sender_out("a", rc=126), "denied the rc-send shape"),
+                         (sender_out("a", rc=124), "stopped the sender at its timeout"),
                          (sender_out("a", uses=0), "made 0 SendMessage calls"),
                          (sender_out("a", uses=2), "made 2 SendMessage calls"),
                          (sender_out("a", target="b"), "did not address 'a'"),
                          (sender_out("a", result="No agent named a is reachable", is_error=True), "is reachable"),
-                         (sender_out("a", result="Message held: the session bypasses permissions"), "held or refused"),
-                         (sender_out("a", result="Delivery refused by the receiver"), "held or refused"),
-                         (sender_out("a", result="something broke", is_error=True), "held or refused"),
+                         (sender_out("a", result="something broke", is_error=True), "SendMessage to 'a' failed"),
                          (subprocess.CompletedProcess([], 0, "", ""), "made 0 SendMessage")):
             with self.subTest(why=why), self.assertRaisesRegex(rc.RcError, why):
-                rc.check_sender(out, "a")
+                rc.check_sender(out, "a", "x")
         no_result = "\n".join(ln for ln in sender_out("a").stdout.splitlines() if '"tool_result"' not in ln)
         with self.assertRaisesRegex(rc.RcError, "has no result"):
-            rc.check_sender(subprocess.CompletedProcess([], 0, no_result, ""), "a")
+            rc.check_sender(subprocess.CompletedProcess([], 0, no_result, ""), "a", "x")
         bad_end = sender_out("a").stdout.replace('"subtype": "success", "is_error": false', '"is_error": true')
         with self.assertRaisesRegex(rc.RcError, "ended in an error"):
-            rc.check_sender(subprocess.CompletedProcess([], 0, bad_end, ""), "a")
+            rc.check_sender(subprocess.CompletedProcess([], 0, bad_end, ""), "a", "x")
+
+
+class ScanAfter(unittest.TestCase):
+    """The transcript proof: the message entry, then a REAL model reply (keepalive.verify_reply's rule)."""
+    MSG = {"type": "user", "message": {"content": '<cross-session-message from="x">go</cross-session-message>'}}
+
+    def scan(self, *entries):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as fh:
+            for e in entries:
+                fh.write(json.dumps(e) + "\n")
+            fh.flush()
+            return rc.scan_after(fh.name, 0)
+
+    @staticmethod
+    def reply(model="claude-opus-5", **kw):
+        return dict({"type": "assistant", "message": {"model": model, "content": [{"type": "text", "text": "ok"}]}},
+                    **kw)
+
+    def test_real_reply(self):
+        self.assertEqual(self.scan(self.MSG, self.reply()), (True, True))
+        self.assertEqual(self.scan(self.reply(), self.MSG), (True, False))      # a reply before the message
+
+    def test_synthetic_and_api_error_entries_are_no_reply(self):
+        for e in (self.reply("<synthetic>"), self.reply("<synthetic>", isApiErrorMessage=True),
+                  self.reply(isApiErrorMessage=True), self.reply(None), self.reply(isSidechain=True),
+                  {"type": "assistant", "message": {"content": []}}):
+            with self.subTest(e=e):
+                self.assertEqual(self.scan(self.MSG, e), (True, False))
+        self.assertEqual(self.scan(self.MSG, self.reply("<synthetic>"), self.reply()), (True, True))
 
 
 class Send(Base):
+    MSG_ENTRY = {"type": "user", "message": {"content": [
+        {"type": "text", "text": '<cross-session-message from="x">go</cross-session-message>'}]}}
+
     def answer(self, user=True, answer=True):
         with open(self.path, "a") as fh:
             if user:
                 fh.write(json.dumps({"type": "user", "message": {"content": [
                     {"type": "text", "text": '<cross-session-message from="x">go</cross-session-message>'}]}}) + "\n")
             if answer:
-                fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}})
+                fh.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-5",
+                                                                      "content": [{"type": "text", "text": "ok"}]}})
                          + "\n")
 
     def test_verified_after_polling(self):
@@ -123,14 +173,41 @@ class Send(Base):
         def sleep(s):                                                 # the thread answers on the 2nd look
             sleeps.append(s)
             self.answer()
-        res = rc.send(SID, "go", runner=lambda n, t, timeout: sender_out(n), sleep=sleep, verify_seconds=60)
+        res = rc.send(SID, "go", runner=lambda n, t, timeout: sender_out(n, text=t), sleep=sleep, verify_seconds=60)
         self.assertEqual((res["name"], res["pid"], sleeps), ("work-a1", 100, [rc.POLL_SECONDS]))
+
+    def test_before_send_runs_once_checks_passed_and_before_the_sender(self):
+        calls = []
+        self.register()
+        rc.send(SID, "go", runner=lambda n, t, timeout: (calls.append("sender"), self.answer(),
+                                                         sender_out(n, text=t))[-1],
+                before_send=lambda n: calls.append(f"before:{n}"), verify_seconds=0)
+        self.assertEqual(calls, ["before:work-a1", "sender"])
+        calls.clear()
+        self.register(status="busy")
+        with self.assertRaises(rc.Busy):
+            rc.send(SID, "go", runner=None, before_send=lambda n: calls.append(n), verify_seconds=0)
+        self.assertEqual(calls, [])                                   # nothing may be under way
+
+    def test_synthetic_reply_is_no_success(self):
+        """A usage-limit notice (<synthetic>) after the message is not the thread answering."""
+        self.register()
+
+        def runner(n, t, timeout):
+            with open(self.path, "a") as fh:
+                fh.write(json.dumps(self.MSG_ENTRY) + "\n" + json.dumps(
+                    {"type": "assistant", "isApiErrorMessage": True, "message": {
+                        "model": "<synthetic>", "content": [{"type": "text", "text": "You've hit your limit"}]}})
+                    + "\n")
+            return sender_out(n, text=t)
+        with self.assertRaisesRegex(rc.RcError, "no real model reply followed"):
+            rc.send(SID, "go", runner=runner, verify_seconds=0)
 
     def test_old_entries_do_not_count(self):
         self.answer()                                                 # before the send: not this message's
         self.register()
         with self.assertRaisesRegex(rc.RcError, "no <cross-session-message> entry within 0 s"):
-            rc.send(SID, "go", runner=lambda n, t, timeout: sender_out(n), verify_seconds=0)
+            rc.send(SID, "go", runner=lambda n, t, timeout: sender_out(n, text=t), verify_seconds=0)
 
     def test_sender_errors(self):
         self.register()
