@@ -227,6 +227,23 @@ class WorkEnd(unittest.TestCase):
         r = self.compute(every(0, 70), {"tasks": [(M(30), None, False)], "prompts": []}, M(300), stops=[M(60)])
         self.assertEqual((r["work_end"], r["work_ongoing"]), (M(70).isoformat(), False))
 
+    def test_a_timer_does_not_make_the_owners_chat_the_runs(self):
+        """D-309's keep-warm timer (re-armed after the stop, finishing at 90 and re-armed until
+        120) carries the work through the task-manager's own turns, but the owner's prompt at 95
+        ends it; a real worker in flight would carry the owner's turn too."""
+        timer = [(M(30), M(90), False, True), (M(91), M(120), False, True)]
+        work = {"tasks": timer, "prompts": [(F, False), (M(90), False), (M(95), True)]}
+        acts = every(0, 70) + [M(90), M(91), M(95), M(96), M(110)]
+        r = self.compute(acts, work, M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(91).isoformat())
+        r = self.compute(acts, dict(work, tasks=[(M(30), M(90), False, True), (M(91), M(120), False, False)]),
+                         M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(110).isoformat())   # a real worker: the owner's chat is the run's
+        self.assertTrue(rm.is_timer("t=$(( $(date -d '12:00 UTC' +%s) - $(date +%s) )); sleep $t; echo \"a; b\""))
+        self.assertTrue(rm.is_timer('while [ "$(date +%H%M)" -lt 0901 ]; do sleep 30; done; TZ=Europe/Berlin date +%H:%M'))
+        self.assertFalse(rm.is_timer("sleep 660 && python3 tools/deploy.py"))
+        self.assertFalse(rm.is_timer("pytest -q"))
+
     def test_the_next_run_caps_the_work(self):
         work = {"tasks": [(M(30), None, False)], "prompts": []}
         r = self.compute(every(0, 120), work, M(200), stops=[M(60)], next_fire=M(90))
@@ -243,7 +260,9 @@ class MainWork(unittest.TestCase):
             user(0, "[keep-alive] continue"),
             user(1, res, toolUseResult={"backgroundTaskId": "b1"}),
             user(2, res, toolUseResult={"status": "async_launched", "agentId": "a1"}),
-            user(3, res, toolUseResult={"backgroundTaskId": "b2"}),
+            {"type": "assistant", "timestamp": M(3).isoformat(), "message": {"content": [
+                {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "sleep 1800; date", "run_in_background": True}}]}},
+            user(3, [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}], toolUseResult={"backgroundTaskId": "b2"}),
             {"type": "queue-operation", "operation": "enqueue", "timestamp": M(10).isoformat(),
              "content": "<task-notification> <task-id>b1</task-id> done"},
             user(11, "<task-notification> <task-id>b1</task-id> done", origin={"kind": "task-notification"}),
@@ -255,8 +274,8 @@ class MainWork(unittest.TestCase):
             user(41, res, toolUseResult={"backgroundTaskId": "s1"}, isSidechain=True),
         ]
         w = rm.main_work(entries, F, M(100))
-        self.assertEqual(w["tasks"], [(M(1), M(10), False), (M(2), M(20), False), (M(3), M(40), False),
-                                      (M(31), None, True)])
+        self.assertEqual(w["tasks"], [(M(1), M(10), False, False), (M(2), M(20), False, False),
+                                      (M(3), M(40), False, True), (M(31), None, True, False)])   # b2: a timer
         self.assertEqual(w["prompts"], [(M(0), False), (M(11), False), (M(20), False), (M(30), True)])
 
 
@@ -430,13 +449,17 @@ class Update(unittest.TestCase):
         self.assertEqual(limit_ratio.combine_spans([r], [], M(300)), [(F, M(121))])
 
     def test_a_transcript_read_failure_raises(self):
-        """D-235: no run end from part of the session's writes."""
+        """D-235: no run end from part of the session's writes; a transcript removed since the
+        glob listed it is skipped."""
         from unittest import mock
         with mock.patch.object(ka, "iter_entries", side_effect=PermissionError("denied")):
             with self.assertRaises(OSError):
                 rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects)
             with self.assertRaises(OSError):
                 self.up(M(200))
+        with mock.patch.object(ka, "iter_entries", side_effect=FileNotFoundError("cleaned up")):
+            self.assertEqual(rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects),
+                             ([], [], {"tasks": [], "prompts": []}))   # gone since the glob: skipped
 
     def test_load_readings_range(self):
         r = rm.load_readings(M(10), M(40), self.samples, self.watch)

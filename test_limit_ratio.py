@@ -289,11 +289,12 @@ class CombineSpans(unittest.TestCase):
         runs = [{"start": T0.isoformat(), "end": (T0 + timedelta(hours=1)).isoformat(), "ongoing": False},
                 {"start": (T0 + timedelta(hours=8)).isoformat(), "end": (T0 + timedelta(hours=8)).isoformat(),
                  "ongoing": True}]
-        fallback = [(T0 + timedelta(minutes=1), T0 + timedelta(hours=10)),      # the 2nd fire of run 1: covered
+        fallback = [(T0 + timedelta(minutes=1), T0 + timedelta(minutes=50)),    # the 2nd fire of run 1: covered
+                    (T0 + timedelta(minutes=2), T0 + timedelta(hours=1, minutes=20)),   # covered: clipped at its end
                     (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),   # a usage-review run
                     (T0 + timedelta(hours=11), T0 + timedelta(hours=12))]     # after now: ignored
         got = lr.combine_spans(runs, fallback, now)
-        self.assertEqual(got, [(T0, T0 + timedelta(hours=1)),
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=1, minutes=20)),
                                (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),
                                (T0 + timedelta(hours=8), now)])          # ongoing: until now
 

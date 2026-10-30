@@ -755,8 +755,9 @@ def combine_spans(run_rows=(), fallback=(), now=None):
     run_rows: run_metrics rows (data/afclaude_runs.jsonl): start..the end of the run's work
     (work_end, D-310: its background workers and the turns on them after the run's end; a row
     from before it: the run's end), an ongoing run or work until `now`.
-    fallback: [(fire, end)] from pacing.autonomous_spans; used only for fires no run row covers
-    (a fire run_metrics hasn't written yet, a usage-review or dispatcher run)."""
+    fallback: [(fire, end)] from pacing.autonomous_spans; for fires no run row covers (a fire
+    run_metrics hasn't written yet, a usage-review or dispatcher run), and for a covered one the
+    part after the row's end (clipped there, D-310)."""
     spans = []
     for r in run_rows or []:
         if not isinstance(r, dict):
@@ -772,8 +773,11 @@ def combine_spans(run_rows=(), fallback=(), now=None):
         a, b = _parse_ts(a), _parse_ts(b)
         if a is None or b is None or (now is not None and a > now):
             continue
-        if any(x - FIRE_COVER <= a <= y + FIRE_COVER for x, y in rows_spans):
-            continue
+        cover = [y for x, y in rows_spans if x - FIRE_COVER <= a <= y + FIRE_COVER]
+        if cover:   # a fire of a run with a row: only what its fallback span holds past the row's work end
+            a = max(a, max(cover))
+            if b <= a:
+                continue
         spans.append((a, max(a, b)))
     spans.sort()
     out = []

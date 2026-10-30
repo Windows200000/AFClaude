@@ -77,6 +77,8 @@ WORK_SILENCE = timedelta(minutes=60)    # D-310: a worker in flight with no tran
 OWNER_PROMPTS = ("owner", "inbox")      # compact_timing.prompt_kind of the owner's own messages
 _TASK_ID = re.compile(r"<task-id>([^<]+)</task-id>")            # a background task's completion notice
 _AGENT_MSG = re.compile(r'<agent-message from="([^"]+)"')      # a background subagent's hand-back
+_TIMER_STEP = re.compile(r"|sleep\s+\S.*|(?:do\s+)?sleep\s+\S+|echo\b.*|(?:TZ=\S+\s+)?date\b.*|\w+=\$\(\(.*\)\)"
+                         r"|(?:while|until)\s+\[.*\]|done")   # is_timer: one step of a command that only waits
 FIRE_MERGE = timedelta(minutes=15)      # fires closer than this to a run's first fire belong to that run
 START_MAX_AGE = timedelta(minutes=30)   # a reading this old before the fire still gives the start values
 START_SLACK = timedelta(minutes=2)      # a reading up to this long after the fire still is "at the start"
@@ -246,10 +248,12 @@ def work_end(fire, end, activity, work, now, next_fire=None):
     WORK_SILENCE without a transcript write, and through the task-manager's turns written within
     RUN_IDLE of it that no owner prompt after the end started (e.g. the one on a finished
     worker's notification). The owner chatting while a run's worker is in flight counts as the
-    run's. activity: sorted transcript entry times (main + subagents), None if unknown;
-    work: session_activity()'s {"tasks": [(launched, finished or None, launched in an owner's
-    turn)], "prompts": [(time, the owner's)]}. -> (the work's end, still going at `now`); a later
-    run's fire caps it (that run's row goes on from there)."""
+    run's; a timer (is_timer: a keep-warm sleep, D-309) carries the work only through the
+    task-manager's own turns, never the owner's. activity: sorted transcript entry times (main +
+    subagents), None if unknown; work: session_activity()'s {"tasks": [(launched, finished or
+    None, launched in an owner's turn, a timer)], "prompts": [(time, the owner's)]}. -> (the
+    work's end, still going at `now`); a later run's fire caps it (that run's row goes on from
+    there)."""
     if activity is None:
         return end, False
     tasks = (work or {}).get("tasks") or ()
@@ -263,26 +267,32 @@ def work_end(fire, end, activity, work, now, next_fire=None):
             last = (p, own)
         return bool(last and last[1] and last[0] > end)
 
-    def busy_until(w):  # the last finish of the run's workers in flight at w, None if none is
-        fins = [f or _UNFINISHED for a, f, by_owner in tasks
-                if fire - timedelta(minutes=1) <= a <= w and (a <= end or not by_owner) and (f is None or f > w)]
+    def busy_until(w, real=False):  # the last finish of the run's workers in flight at w (real: no timers), None if none is
+        fins = [t[1] or _UNFINISHED for t in tasks
+                if fire - timedelta(minutes=1) <= t[0] <= w and (t[0] <= end or not t[2]) and (t[1] is None or t[1] > w)
+                and not (real and len(t) > 3 and t[3])]
         return max(fins) if fins else None
+
+    def carries(t, w):  # the run's workers carry the work from w to the write at t
+        b = busy_until(w)
+        if b is None or min(t, b) - w > WORK_SILENCE:
+            return False
+        br = busy_until(w, real=True)      # only a real worker makes an owner's turn the run's; a timer
+        return (br is not None and t <= br) or (not owners(t) and (t <= b or t - b <= RUN_IDLE))   # does not
 
     w, going = end, True
     for t in activity:
         if t <= w:
             continue
-        b = busy_until(w)
-        if b is not None and min(t, b) - w <= WORK_SILENCE and (t <= b or (t - b <= RUN_IDLE and not owners(t))):
-            w = t
-        elif t - w <= RUN_IDLE and not owners(t):
+        if carries(t, w) or (t - w <= RUN_IDLE and not owners(t)):
             w = t
         else:
             going = False
             break
     if going:
-        b = busy_until(w)
-        going = (b is not None and b > now and now - w <= WORK_SILENCE) or (now - w < RUN_IDLE and not owners(now))
+        b, br = busy_until(w), busy_until(w, real=True)
+        going = ((b is not None and b > now and now - w <= WORK_SILENCE and (not owners(now) or (br is not None and br > now)))
+                 or (now - w < RUN_IDLE and not owners(now)))
     if next_fire and fire < next_fire <= (now if going else w):
         return max(end, next_fire), False
     return (now, True) if going else (w, False)
@@ -572,9 +582,12 @@ def session_activity(session_id, lo, hi, projects_dir=None):
         return None, [], None
     acts, hits, work = [], [], {"tasks": [], "prompts": []}
     for path in mains + subs:
-        if datetime.fromtimestamp(os.path.getmtime(path), UTC) < lo:
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path), UTC) < lo:
+                continue
+            entries = list(ka.iter_entries(path))
+        except FileNotFoundError:   # cleaned up since the glob listed it: nothing left to read (any other error raises)
             continue
-        entries = list(ka.iter_entries(path))
         if path in mains:
             w = main_work(entries, lo, hi)
             work["tasks"] += w["tasks"]
@@ -600,10 +613,11 @@ def main_work(entries, lo, hi):
     completion notice (a <task-notification> naming its task id, also the one Claude Code sends
     for orphaned tasks on a resume; a subagent's <agent-message> hand-back; a TaskStop / KillShell
     of it), each launch marked if the latest prompt before it was the owner's
-    (compact_timing.prompt_kind: owner or inbox). -> {"tasks": [(launched, finished or None,
-    the owner's)], "prompts": [(time, the owner's)] in [lo, hi]}."""
+    (compact_timing.prompt_kind: owner or inbox) and if it is a timer (a background command that
+    only waits: is_timer, e.g. D-309's keep-warm sleep). -> {"tasks": [(launched, finished or
+    None, the owner's, a timer)], "prompts": [(time, the owner's)] in [lo, hi]}."""
     import compact_timing as ct
-    launched, done, prompts, owner = {}, {}, [], False
+    launched, done, prompts, owner, timers = {}, {}, [], False, {}
     for e in entries:
         if not isinstance(e, dict) or e.get("isSidechain"):
             continue
@@ -624,10 +638,16 @@ def main_work(entries, lo, hi):
                 tid = res.get("backgroundTaskId") or (
                     (res.get("agentId") or res.get("taskId")) if res.get("status") == "async_launched" else None)
                 if isinstance(tid, str) and tid:
-                    launched.setdefault(tid, (t, owner))
+                    content = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+                    use = next((c.get("tool_use_id") for c in content if isinstance(c, dict)
+                                and c.get("type") == "tool_result"), None) if isinstance(content, list) else None
+                    launched.setdefault(tid, (t, owner, bool(res.get("backgroundTaskId")) and timers.get(use, False)))
         elif kind == "assistant":
             content = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
             for c in content if isinstance(content, list) else ():
+                if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "Bash":
+                    inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                    timers[c.get("id")] = is_timer(inp.get("command"))
                 if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") in ("TaskStop", "KillShell"):
                     inp = c.get("input") if isinstance(c.get("input"), dict) else {}
                     tid = inp.get("task_id") or inp.get("shell_id")
@@ -637,9 +657,19 @@ def main_work(entries, lo, hi):
             for tid in _TASK_ID.findall(text) + _AGENT_MSG.findall(text):
                 done.setdefault(tid, []).append(t)
     tasks = []
-    for tid, (t, own) in launched.items():
-        tasks.append((t, min((f for f in done.get(tid, ()) if f >= t), default=None), own))
+    for tid, (t, own, timer) in launched.items():
+        tasks.append((t, min((f for f in done.get(tid, ()) if f >= t), default=None), own, timer))
     return {"tasks": sorted(tasks), "prompts": sorted(prompts)}
+
+
+def is_timer(command):
+    """A background command that only waits (D-310): every step a sleep, a wait-until loop on the
+    clock, an arithmetic assignment, an echo or a date (the keep-warm timers of D-309, the
+    task-manager's wake-up timers). A command with any other step is a real worker."""
+    if not isinstance(command, str) or "sleep" not in command:
+        return False
+    bare = re.sub(r'"[^"]*"|\'[^\']*\'', '""', command)    # a ; or && inside quoted text splits nothing
+    return all(_TIMER_STEP.fullmatch(p.strip()) for p in re.split(r";|&&|\n", bare))
 
 
 def load_states(paths=None):

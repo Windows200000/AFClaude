@@ -429,6 +429,33 @@ class StoreAndDashboard(unittest.TestCase):
             self.assertIn(needle, html)
 
 
+class WorkEndSpans(unittest.TestCase):
+    """D-310: the run spans end at the run's work end (the split agrees with pacing); the capacity's
+    design part sees the runs end at their end, so the work after it stays measured."""
+
+    def test_run_sessions_and_design_sessions_run_ends(self) -> None:
+        from unittest import mock
+        import pacing
+        t0 = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
+        rows = [{"start": t0.isoformat(), "end": (t0 + timedelta(hours=1)).isoformat(),
+                 "work_end": (t0 + timedelta(hours=2)).isoformat(), "work_ongoing": False, "session_delta": 50},
+                {"start": (t0 + timedelta(hours=5)).isoformat(), "end": (t0 + timedelta(hours=6)).isoformat(),
+                 "session_delta": 20}]
+        with mock.patch("run_metrics.read_rows", return_value=rows):
+            self.assertEqual(se.run_sessions("x"), [(t0, t0 + timedelta(hours=2), 0.5),
+                                                    (t0 + timedelta(hours=5), t0 + timedelta(hours=6), 0.2)])
+        seen = []
+        with mock.patch.object(pacing, "tail_rows", return_value=[]), \
+                mock.patch.object(pacing, "fire_times", return_value=[]), \
+                mock.patch.object(pacing, "run_rows", return_value=rows), \
+                mock.patch.object(pacing, "design_intervals", side_effect=lambda r, f, runs: seen.append(runs) or []):
+            se.design_sessions(0.2)
+            se.design_sessions(0.2, run_ends=True)
+        self.assertEqual(seen[0][0]["work_end"], rows[0]["work_end"])
+        self.assertNotIn("work_end", seen[1][0])
+        self.assertNotIn("work_ongoing", seen[1][0])
+
+
 class UsageSplitTest(unittest.TestCase):
     """usage_split (D-221 measurement): run / design / other per weekly cycle."""
 
