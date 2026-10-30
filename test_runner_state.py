@@ -185,7 +185,7 @@ class Schema(Base):
         self.assertEqual(self.gate(), 0)
 
     def test_prune_logs_cli_dry_run_and_real(self):
-        now = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)                                     # the CLI cuts off at the real clock
         actions.app_log_append(self.conn, "at_shim",
                                [(store.iso(now - timedelta(days=d)), "info", f"{d}d") for d in (1, 40)],
                                actor="runner:at_shim", via="runner")
