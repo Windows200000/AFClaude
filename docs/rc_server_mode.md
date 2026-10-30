@@ -175,3 +175,48 @@ A throwaway thread briefly appears in the RC list during the test; stopped and a
 
 Pass → build §4.1 as one worker branch (host-bridge shape, dispatcher path, tests, alert on every
 failure). Fail → keep "continue it from the app" and close goal 11.
+
+## 8. Live test 30.10. (D-288)
+
+Claude Code 2.1.314, 03:07-03:12 UTC (04:07-04:12 Berlin). Server in tmux `afc-rc-test`, scratch dir
+`data/rc-test` (no `.git` of its own: with one, `claude rc` asked for folder trust, which would have
+meant editing `~/.claude.json`; without it the repo's existing trust applied and no prompt came). Three
+Haiku `claude -p --allowedTools SendMessage ListAgents` senders plus one more for the resume check.
+
+**Verdict: partial (step 3 skipped). The core of §4.1 works; build it with the constraints below.**
+
+- **Step 1:** `claude rc --spawn session --name afc-rc-test --permission-mode auto` started with no
+  prompt and printed the claude.ai session link. Its child (`--print --sdk-url …`) registered in
+  `~/.claude/sessions/<pid>.json` with `entrypoint: "sdk-cli"`, `messagingSocketPath`,
+  `bridgeSessionId`, `status: idle`. The thread's name was **derived** (`rc-test-f1`: directory
+  name + 2 hex characters), not the `--name` value, and changed on every start (`rc-test-4f` after the resume).
+- **Step 2:** the Haiku sender's `SendMessage` to `rc-test-f1` returned success ("in that session's
+  inbox"); about 1 s later the idle thread started a turn: the transcript got a user entry
+  `<cross-session-message from=… from-mode="prompting">reply PONG</cross-session-message>` plus the
+  "not typed by your user" frame, then an assistant entry `PONG` (the thread ran on the default model,
+  not on the sender's). `status` went busy and back to idle. Addressing: **by name only**.
+  The session id (`e5409af6-…`) and the short ref `ListAgents` prints (`3de30d`) both failed with "No agent
+  named … is reachable". `ListAgents` shows no socket path; the name has to be read from the
+  session registry (`name` field) when sending. Not checked: that the owner's app shows the message
+  (no way from the host).
+- **Step 3: skipped.** No cheap synthetic usage-limit state exists (it would need a real limit
+  notice in the thread); a busy-thread and a held-message case were not tried either.
+- **Step 4:** `Ctrl-C` in the tmux window ended the server and its child (nothing left, registry
+  entry gone). `claude rc --session-id session_015KMK…` (the `bridgeSessionId`) in the same dir
+  brought the thread back with the same claude.ai link, same transcript (`e5409af6-…`) and a new pid;
+  a message to it ("what were you asked to reply with earlier?") was answered `PONG`, so context
+  survived. Everything was stopped; only the `afc-rc-test` tmux session was created and killed.
+  The thread is not archived: the owner archives it in the app.
+- **Stall scan:** `stalled.py scan` showed no hit for the test thread (it ended on a normal
+  end_turn), and `keepalive` preflight already refuses sdk-cli threads (`RC_HELD`).
+- **Side effect:** the thread ran in a directory under the repo, so it loaded the repo's CLAUDE.md
+  and `UserPromptSubmit` hook (the "you are the manager" reminder). Owner threads will behave the same way.
+
+What §4.1 needs if built: read the thread's current `name` and `status` from the registry at send
+time (names are not stable across server restarts); send through a one-shot Haiku `claude -p`
+(one sender transcript of about 0.006 USD, roughly 3 s) running on the host, via a whitelisted
+host-bridge shape; verify success by a new `<cross-session-message>` user entry followed by an
+assistant entry in the thread's transcript within the window, else error + alert (D-235); treat
+"No agent named … reachable" (child gone, name changed) as that error. Cost of the turn itself is the
+thread's model, not Haiku. Untested and to be covered by the build's own tests: a thread that is
+busy, a bypass-permissions thread holding the message, and a real usage-limit stall.
