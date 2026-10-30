@@ -18,11 +18,15 @@ knows each of them:
 Project scope (D-193, D-197): prompts are system-wide (an override is keyed by name only, owner
 only); a project only fills the variables PROJECT_VARS declares. Its values are rows of
 store.prompt_vars, written through actions.py (prompt_var.set / prompt_var.reset, audited; owner
-only until the roles of phase 5a give it to the project's managers and editors). No prompt uses a
-project variable yet: the generic task-manager template is step P3 of the plan.
+only until the roles of phase 5a give it to the project's managers and editors). One prompt uses
+them: manager_project.md (P3), the task-manager rules of every project: a few words (the goal list's
+and the questions' place) and whole lines (the public-repo rule, the worktree rule, a note, the docs
+rule, the deploy rule; an empty one leaves no line). A session's text is built from its project's
+values: keepalive.session_message(repo=...) reads them (project_values_at), the SessionStart hook
+reads AFClaude's own.
 
-Migrate step: `prompts.py migrate` writes the seed values (CHECKOUT_SEED: what the AFClaude-repo
-rules hard-code today) for the project at this checkout's path, each only where that project has
+Migrate step: `prompts.py migrate` writes the seed values (CHECKOUT_SEED: the lines AFClaude's own
+rules had before P3) for the project at this checkout's path, each only where that project has
 never had a row for it (a value someone set or reset is never overwritten). Idempotent and audited
 (prompt_var.migrate); a project-less checkout has nothing to seed.
 
@@ -41,16 +45,17 @@ P1's per-prompt `flat` was the wrong place for it and is gone). `session_message
     python3 prompts.py render NAME [--project P] [--set KEY=VALUE ...]
     python3 prompts.py bundles                       # every bundle kind and its parts
     python3 prompts.py bundle KIND [--project P] [--set KEY=VALUE ...] [--insert TEXT]
-                                   [--hooked] [--no-manager] [--no-afclaude]
+                                   [--hooked] [--no-manager]
     python3 prompts.py vars [--project P]           # the project variables and their values
     python3 prompts.py set-var PROJECT NAME VALUE | reset-var PROJECT NAME
-    python3 prompts.py migrate [--dry-run]
+    python3 prompts.py migrate [--dry-run] [--deploy]
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sqlite3
 import string
 import sys
@@ -105,8 +110,11 @@ PROMPTS: dict[str, Prompt] = {
     "task_start": Prompt(("description", "id", "project", "qa", "title"), used_by="unused since D-205"),
     "guard_respect": Prompt(used_by="standing rule: every session message, the hook part afclaude"),
     "manager": Prompt(used_by="standing rule: task-manager sessions, the hook part manager"),
-    "manager_afclaude": Prompt(("session_stop_pct",), used_by="standing rule: AFClaude-repo sessions, "
-                               "the hook part afclaude"),
+    "manager_project": Prompt(("afclaude_dir", "session_stop_pct", "tools"),
+                              ("goals_location", "questions_location", "public_repo_rule", "worktree_rule",
+                               "project_notes", "docs_rule", "deploy_rule"),
+                              used_by="standing rule: the project's own rules after manager.md (D-197); the "
+                                      "hook part afclaude for AFClaude itself"),
     "afk_rules": Prompt(used_by="standing rule: unattended runs, the hook part afclaude"),
     "session_rules": Prompt(("part", "what"), used_by="SessionStart hook header (keepalive --session-rules)"),
     "rules_pointer": Prompt(used_by="session messages to a hooked session (D-225)"),
@@ -126,23 +134,66 @@ PROMPTS: dict[str, Prompt] = {
     "usage_haiku": Prompt(("gaps", "n", "name", "prompts", "totals"), used_by="usage_sampler Haiku judge"),
 }
 
-# D-197: what a project fills. Values are text; the design's list: repo facts, the public-repo guard,
-# the live files that need worktrees, where goals and questions live, a short free-text note.
+# D-197: what a project fills. Values are text. goals_location / questions_location are words inside
+# a line of the template; the rest are WHOLE-LINE variables (the value carries its own "- "): a line
+# that can't be phrased with a value (the public-repo rule, the worktree story) is a variable whose
+# default is empty, and render() drops an empty one's line, so a project without it gets no gap.
 PROJECT_VARS: dict[str, ProjectVar] = {
-    "public_guard": ProjectVar("the public-repo guard the commit hooks run (empty: the repo is not public)"),
-    "worktree_files": ProjectVar("files the live system imports: change them only in a git worktree"),
-    "goals_location": ProjectVar("where the project's goal list lives"),
-    "questions_location": ProjectVar("where the project's open questions for the user live"),
-    "project_notes": ProjectVar("a short free-text note for the project's task-manager", max_len=2000),
+    "goals_location": ProjectVar("where the project's goal list lives", "GOALS.md"),
+    "questions_location": ProjectVar("where the project's open questions for the user live", "OPEN_QUESTIONS.md"),
+    "public_repo_rule": ProjectVar("whole line: the public-repo rule and the guard the commit hooks run "
+                                   "(empty: the repo is not public)", max_len=2000),
+    "worktree_rule": ProjectVar("whole line: the files the live system imports, which change only in a git "
+                                "worktree (empty: none)", max_len=2000),
+    "project_notes": ProjectVar("whole line: a short free-text note for the project's task-manager", max_len=2000),
+    "docs_rule": ProjectVar("whole line: how the project docs are read and written",
+                            "- The project docs (progress, goals, exceptions, alerts, review reports) live in the "
+                            "AFClaude DB: read and write them with the afclaude_doc tool (actions list, show, "
+                            "append, set; it knows the calling session's project).", max_len=3000),
+    "deploy_rule": ProjectVar("whole line: how the project is deployed (empty: not covered)", max_len=2000),
 }
 
-# The migrate step's values for the project at this checkout's path (AFClaude itself): what
-# manager_afclaude.md hard-codes today, so the generic template (plan P3) renders the same text.
+# The migrate step's values for the project at this checkout's path (AFClaude itself): the lines the
+# old manager_afclaude.md hard-coded, so the generic template manager_project.md renders the same
+# text for it (test_prompts, against testdata/manager_afclaude_before_p3.md).
 CHECKOUT_SEED: dict[str, str] = {
-    "public_guard": "tools/check_public.py",
-    "worktree_files": "keepalive.py, store.py, stalled.py, usage_sampler.py, export_quickview.py, ka_resume.sh",
     "goals_location": "GOALS.md",
     "questions_location": "OPEN_QUESTIONS.md",
+    "public_repo_rule": (
+        '- The repo will be PUBLIC. Keep personal data, secrets, IP addresses, domains and user-specific '
+        'host details (host inventory, personal projects, usage habits) out of committed files. '
+        'User-specific questions go to OPEN_QUESTIONS.md, which is local only (gitignored). The '
+        'pre-commit/pre-push guard `tools/check_public.py` blocks the obvious cases; never bypass it with'
+        ' `--no-verify`, rephrase instead.'),
+    "worktree_rule": (
+        '- Subagents that change code the live system imports (keepalive.py, store.py, stalled.py, '
+        'usage_sampler.py, export_quickview.py, ka_resume.sh) work in a separate git worktree (`git '
+        'worktree add ../AFClaude-wt-<name>`); you review and merge. Cron and the watcher import the live'
+        ' files, so a half-edited store.py once migrated the live DB.'),
+    "project_notes": (
+        '- In this repo the list of open questions for the user is OPEN_QUESTIONS.md (local only) and the'
+        ' goal list is GOALS.md.'),
+    "docs_rule": (
+        '- The project docs live in the AFClaude DB (design §7.7): progress, goals, exceptions, alerts '
+        'and the review reports (review:<date>). Write through the write path where a command is natural:'
+        ' `python3 tasks.py doc append progress "- HH:MM …"` (or the MCP tool afclaude_doc), `python3 '
+        'tasks.py doc set goals - < file`; read with `python3 tasks.py doc show progress --entries 20`, '
+        "`doc show goals`, `doc show alerts` (the runners' notes and every alert are only in the DB: "
+        'ALERTS.md is no longer written). Editing PROGRESS.md, GOALS.md or EXCEPTIONS.md directly still '
+        "works: an import every 10 minutes takes the edits in, merged with the runners' notes. Before "
+        'each commit that includes PROGRESS.md, GOALS.md or EXCEPTIONS.md, run `python3 tasks.py doc '
+        'export` (it imports your edits first, then regenerates the three files from the DB, public-repo '
+        'checked) and commit what it wrote. If it reports a conflict (the file and the DB changed the '
+        'same lines), merge by hand: put the merged text in the file (`python3 tasks.py doc show NAME` '
+        'has the DB side), run `python3 tasks.py doc import --force`, then export again.'),
+    "deploy_rule": (
+        '- To deploy (rebuild the manager container after a merge to main), run `python3 '
+        'tools/deploy.py`, never the bare `docker compose -f docker/compose.yml up -d --build`: it drains'
+        ' the runner and waits for the container to go quiet (no sampler / usage-review / unittest / '
+        'bridge `claude` call in flight) before rebuilding with the right `AFCLAUDE_CODE_VERSION`, so the'
+        " rebuild can't cut an in-flight usage read the way the 21.10. incident did (D-234/D-235/D-257). "
+        'It refuses within 30 min before or after a session-window start (a restart during a start alerts'
+        " + pauses) and prints the next safe time; don't pass `--force` to get around that."),
 }
 
 
@@ -158,7 +209,7 @@ class Part:
               does not care what is actually passed.
       rules   the standing-rule tail of a session message: rules_pointer alone when the session
               already has the rules (hooked=True and manager=True, D-225); guard_respect, manager,
-              manager_afclaude (if afclaude=True) and afk_rules when manager=True and not hooked;
+              manager_project (the project's own values) and afk_rules when manager=True and not hooked;
               guard_respect alone when manager=False (a neutral message, e.g. the user's own
               session)."""
     prompt: str = ""
@@ -213,7 +264,7 @@ BUNDLES: dict[str, Bundle] = {
     # the standing rules the SessionStart hook injects, in two parts (D-225)
     "manager_rules": Bundle((Part(prompt="session_rules"), Part(prompt="manager")), flat=False,
                             used_by="SessionStart hook, part 1: the task-manager rules"),
-    "afclaude_rules": Bundle((Part(prompt="session_rules"), Part(prompt="manager_afclaude"),
+    "afclaude_rules": Bundle((Part(prompt="session_rules"), Part(prompt="manager_project"),
                               Part(prompt="guard_respect"), Part(prompt="afk_rules")), flat=False,
                              used_by="SessionStart hook, part 2: the AFClaude-repo, guard and AFK rules"),
     # usage review: a one-off, in its own fresh session (the monthly brief goes through nightly_task below)
@@ -240,6 +291,11 @@ class UnknownPrompt(FileNotFoundError):
 
 class UnknownBundle(LookupError):
     """A kind the registry doesn't have (the registry: prompts.BUNDLES)."""
+
+
+class NotMigrated(RuntimeError):
+    """The project at this checkout (AFClaude) misses seed values: its rules would render without
+    its own lines (D-235: an error, not a thinner text). `prompts.py migrate` writes them."""
 
 
 def check_name(name: object) -> str:
@@ -285,10 +341,13 @@ def render(name: str, project_values: Optional[Mapping[str, str]] = None, /, **s
     if missing or unknown:
         raise ValueError(f"prompt {name}: missing variable(s) {sorted(missing)}, unknown {sorted(unknown)}")
     values: dict[str, object] = dict(system)
+    text = default(name)
     for v in spec.project:
         given = (project_values or {}).get(v)
         values[v] = PROJECT_VARS[v].default if given is None else given
-    return default(name).format(**values)
+        if values[v] == "":          # a whole-line variable without a value leaves no empty line
+            text = re.sub(rf"(?m)^\{{{v}\}}\n", "", text)
+    return text.format(**values)
 
 
 # ---------------------------------------------------------------- bundles (P2, §3.2)
@@ -299,28 +358,25 @@ def check_bundle(kind: object) -> str:
     return kind
 
 
-def _rules_tail(hooked: bool, manager: bool, afclaude: bool, project_values: Optional[Mapping[str, str]],
+def _rules_tail(hooked: bool, manager: bool, project_values: Optional[Mapping[str, str]],
                 system: Mapping[str, object]) -> list[str]:
     """The standing-rule tail of a session message (Part(rules=True)): see Part's docstring."""
     if hooked and manager:
         return [default("rules_pointer")]
     if not manager:
         return [default("guard_respect")]
-    tail = [default("guard_respect"), default("manager")]
-    if afclaude:
-        fields = {k: system[k] for k in variables("manager_afclaude") if k in system}
-        tail.append(render("manager_afclaude", project_values, **fields))
-    tail.append(default("afk_rules"))
-    return tail
+    fields = {k: system[k] for k in variables("manager_project") if k in system}
+    return [default("guard_respect"), default("manager"), render("manager_project", project_values, **fields),
+            default("afk_rules")]
 
 
 def bundle(kind: str, project_values: Optional[Mapping[str, str]] = None, /, insert: Optional[str] = None,
-          hooked: bool = False, manager: bool = True, afclaude: bool = True, **system: object) -> str:
+          hooked: bool = False, manager: bool = True, **system: object) -> str:
     """BUNDLES[kind] rendered: each prompt part gets exactly its own declared system variables out
     of **system (one **system serves every part of a bundle; render()'s strict check still applies
     per part; `kind` and `project_values` are positional-only, render()'s own reason), the insert
     part gets `insert` if given (skipped if empty), the rules part gets the standing-rule tail
-    (_rules_tail; a bundle without one ignores hooked/manager/afclaude). Joined
+    (_rules_tail; a bundle without one ignores hooked/manager). Joined
     per the bundle's own `flat` (BUNDLES[kind].flat): one line (tmux send-keys), or a blank line
     between parts, each stripped (hook context)."""
     b = BUNDLES[check_bundle(kind)]
@@ -330,7 +386,7 @@ def bundle(kind: str, project_values: Optional[Mapping[str, str]] = None, /, ins
             fields = {k: system[k] for k in variables(part.prompt) if k in system}
             chunks.append(render(part.prompt, project_values, **fields))
         elif part.rules:
-            chunks.extend(_rules_tail(hooked, manager, afclaude, project_values, system))
+            chunks.extend(_rules_tail(hooked, manager, project_values, system))
         elif insert:
             chunks.append(str(insert))
     if b.flat:
@@ -360,6 +416,34 @@ def project_values(conn: sqlite3.Connection, project_id: int) -> dict[str, str]:
         if r["name"] in out and r["value"] is not None:
             out[r["name"]] = r["value"]
     return out
+
+
+def tool_vars(repo: Optional[str] = None) -> dict[str, str]:
+    """The system variables of manager_project that say where AFClaude's own tools live, for a
+    session working in `repo` (None: this checkout). afclaude_dir: the install directory.
+    tools: the prefix of a command (`python3 {tools}keepalive.py`): empty in this checkout's root,
+    where the commands run as typed (what AFClaude's rules always said), else the install
+    directory and a slash, so another project's task-manager can run them from its own."""
+    here = os.path.realpath(HERE)
+    own = repo is None or os.path.realpath(repo) == here
+    return {"afclaude_dir": HERE, "tools": "" if own else here + "/"}
+
+
+def project_values_at(conn: sqlite3.Connection, repo: Optional[str] = None) -> dict[str, str]:
+    """project_values of the project that owns the directory `repo` (the closest parent project;
+    None: this checkout's), or the declared defaults when no project does. The project at this
+    checkout must have every CHECKOUT_SEED row (the migrate step wrote them): otherwise its
+    rules would go out without its own lines, so NotMigrated (D-235)."""
+    import store
+    p = store.get_project(conn, os.path.abspath(repo or HERE), nearest=True)
+    if p is None:
+        return {k: v.default for k, v in PROJECT_VARS.items()}
+    if os.path.realpath(p["path"]) == os.path.realpath(HERE):
+        missing = sorted(set(CHECKOUT_SEED) - {r["name"] for r in store.list_prompt_vars(conn, p["id"])})
+        if missing:
+            raise NotMigrated(f"project {p['name']!r} (this checkout) has no value for {', '.join(missing)}: "
+                              "run `python3 prompts.py migrate`")
+    return project_values(conn, p["id"])
 
 
 def checkout_project(conn: sqlite3.Connection) -> store.Row | None:
@@ -397,12 +481,28 @@ def _project(conn: sqlite3.Connection, ref: str) -> store.Row:
     return p
 
 
-def _perform(name: str, params: dict[str, Any]) -> Any:
+def _cli_system(project: Optional[store.Row], given: list[tuple[str, str]],
+                declared: set[str]) -> dict[str, Any]:
+    """The system variables the CLI fills itself where `declared` (the prompt's) has them: the tool
+    paths for the project's directory, the session_stop_pct setting; --set overrides them, and a
+    --set of anything else stays for render()'s strict check."""
+    import importlib
+    keepalive: Any = importlib.import_module("keepalive")   # untyped, and heavy: only the CLI needs it
+    auto: dict[str, Any] = dict(tool_vars(project["path"] if project and project["path"] else None))
+    if "session_stop_pct" in declared:
+        auto["session_stop_pct"] = keepalive.session_stop_pct()
+    out = {k: v for k, v in auto.items() if k in declared}
+    out.update(given)
+    return out
+
+
+def _perform(name: str, params: dict[str, Any], deploy: bool = False) -> Any:
     import actions
     import store
     conn = store.connect()
     try:
-        return actions.perform(conn, name, params, actor="cli", via="cli")
+        return actions.perform(conn, name, params, actor="runner:deploy" if deploy else "cli",
+                               via="runner" if deploy else "cli")
     finally:
         conn.close()
 
@@ -416,7 +516,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     r = sub.add_parser("render", help="a prompt filled in (system variables with --set)")
     r.add_argument("name")
     r.add_argument("--project", help="fill the project variables with this project's values")
-    r.add_argument("--set", type=_parse_set, action="append", default=[], metavar="KEY=VALUE")
+    r.add_argument("--set", type=_parse_set, action="append", default=[], metavar="KEY=VALUE",
+                   help="a system variable (the tool paths and session_stop_pct are filled in)")
     v = sub.add_parser("vars", help="the project variables and their values")
     v.add_argument("--project")
     sv = sub.add_parser("set-var", help="set a project's variable (owner, audited)")
@@ -434,9 +535,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     bu.add_argument("--insert", default=None, help="the sender's own text for the insert part, if any")
     bu.add_argument("--hooked", action="store_true", help="the session already has the standing rules")
     bu.add_argument("--no-manager", dest="manager", action="store_false", default=True)
-    bu.add_argument("--no-afclaude", dest="afclaude", action="store_false", default=True)
     m = sub.add_parser("migrate", help="seed the project at this checkout (idempotent, audited)")
     m.add_argument("--dry-run", action="store_true")
+    m.add_argument("--deploy", action="store_true", help="the entrypoint's run: audited as runner:deploy")
     a = ap.parse_args(argv)
     import store
     try:
@@ -448,14 +549,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif a.cmd == "show":
             sys.stdout.write(default(a.name))
         elif a.cmd == "render":
-            values = None
+            values, proj = None, None
             if a.project:
                 conn = store.connect()
                 try:
-                    values = project_values(conn, _project(conn, a.project)["id"])
+                    proj = _project(conn, a.project)
+                    values = project_values(conn, proj["id"])
                 finally:
                     conn.close()
-            sys.stdout.write(render(a.name, values, **dict(a.set)))
+            sys.stdout.write(render(a.name, values, **_cli_system(proj, a.set, set(PROMPTS[check_name(a.name)].system))))
         elif a.cmd == "vars":
             conn = store.connect()
             try:
@@ -479,16 +581,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             check_bundle(a.kind)
             for part in BUNDLES[a.kind].parts:
                 print(f"  - {part.prompt or (f'insert: {part.insert}' if part.insert else 'rules')}")
-            values = None
+            values, proj = None, None
             if a.project:
                 conn = store.connect()
                 try:
-                    values = project_values(conn, _project(conn, a.project)["id"])
+                    proj = _project(conn, a.project)
+                    values = project_values(conn, proj["id"])
                 finally:
                     conn.close()
             print()
             sys.stdout.write(bundle(a.kind, values, insert=a.insert, hooked=a.hooked, manager=a.manager,
-                                    afclaude=a.afclaude, **dict(a.set)))
+                                    **_cli_system(proj, a.set, {"afclaude_dir", "tools", "session_stop_pct"})))
         elif a.cmd == "set-var":
             print(json.dumps(_perform("prompt_var.set", {"project": a.project, "name": a.name, "value": a.value}),
                              ensure_ascii=False))
@@ -504,7 +607,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     conn.close()
                 print(json.dumps({"would_seed": plan}, ensure_ascii=False))
             else:
-                print(json.dumps(_perform("prompt_var.migrate", {}), ensure_ascii=False))
+                print(json.dumps(_perform("prompt_var.migrate", {}, deploy=a.deploy), ensure_ascii=False))
     except (ValueError, LookupError, OSError, sqlite3.Error, store.DBError) as e:
         print(f"prompts.py: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

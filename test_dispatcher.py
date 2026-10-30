@@ -840,6 +840,13 @@ class Prompts(Base):
         self.assertFalse(ka.rc_held(os.getpid()))                   # this test process: no rc server
 
     def test_keepalive_message_keeps_all_manager_rules(self):
+        import actions
+        conn = store.connect()      # AFClaude's own project with its migrated values (P3), as a deploy leaves it
+        try:
+            store.add_project(conn, "AFClaude", path=ka.HERE)
+            actions.perform(conn, "prompt_var.migrate", {}, actor="runner:deploy", via="runner")
+        finally:
+            conn.close()
         m = ka.session_message("continue", reason="r", progress="P.md")
         for part in ("TASK-MANAGER", "usage_report.py", "OPEN_QUESTIONS.md", "PUBLIC", "worktree"):
             self.assertIn(part, m)

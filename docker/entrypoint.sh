@@ -30,6 +30,13 @@ mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; d
 # container start, so its exit status is never allowed to trip `set -e`.
 python3 "$D/store.py" import-prompts >>"$D/data/import_prompts.log" 2>&1 \
   || echo "afclaude: prompt defaults import did not complete this start (see data/import_prompts.log)" >&2
+# Phase 4a P3: the prompt variables of the project at this checkout (AFClaude itself) are seeded
+# after the defaults import, only where a project never had a value (idempotent, audited as
+# runner:deploy). Same rule as above: never fails the container start; until it has run, a
+# session message or the SessionStart hook that needs those values errors visibly instead of
+# going out without them (prompts.NotMigrated).
+python3 "$D/prompts.py" migrate --deploy >>"$D/data/import_prompts.log" 2>&1 \
+  || echo "afclaude: prompt variables migrate did not complete this start (see data/import_prompts.log)" >&2
 MODE="${AFCLAUDE_SCHEDULER:-off}"
 case "$MODE" in
   on|runner|legacy)

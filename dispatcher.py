@@ -433,7 +433,7 @@ class Pass:
         model = None                                  # AFClaude-repo sessions: LAUNCH or their project's (D-260, ka.fire)
         if af:
             prog = os.path.join(cwd, "PROGRESS.md")
-            msg = ka.session_message("continue", reason=reason_txt, hooked=ka.rules_hooked(cwd),  # D-225
+            msg = ka.session_message("continue", reason=reason_txt, repo=cwd, hooked=ka.rules_hooked(cwd),  # D-225
                                      progress=prog if os.path.exists(prog) else ka.PROGRESS_FILE)
         else:                                         # the user's own session: neutral, on its own model
             msg = ka.session_message("continue_foreign", manager=False, reason=reason_txt, context="")

@@ -155,19 +155,34 @@ def load_prompt(name):
     return prompts.default(name)
 
 
-def session_message(name, afclaude=True, manager=True, insert=None, hooked=False, **fields):
+def project_prompt_values(repo=None):
+    """The prompt variable values of the project that owns the directory `repo` (default: this
+    checkout's, AFClaude), read from prompt_vars (prompts.project_values_at). A DB error or a
+    checkout project without its seed values (prompts.NotMigrated) raises: no thinner text
+    goes out instead (D-235)."""
+    import store
+    conn = store.connect()
+    try:
+        return store.retrying(lambda: prompts.project_values_at(conn, repo), conn)
+    finally:
+        conn.close()
+
+
+def session_message(name, repo=None, manager=True, insert=None, hooked=False, **fields):
     """One-line message for a session: name's own bundle (prompts.BUNDLES[name], P2 of the phase 4a
     plan) -- <name>.md, then insert (text that goes right after it, e.g. the hand-off after a
     compaction), then the standing-rule tail.
     hooked=True (a session started in this repo, rules_hooked(cwd)): the standing rules already
     come from the repo's SessionStart hook (D-225), so only the one-line pointer
     (rules_pointer.md) follows. Otherwise they are inline: guard_respect.md + manager.md +
-    manager_afclaude.md (the AFClaude-repo rules) + afk_rules.md; afclaude=False leaves out
-    manager_afclaude.md, manager=False leaves out all but guard_respect.md (the user's own
-    sessions get a neutral message). One line because tmux send-keys would submit at the first
-    newline (every bundle `name` names here is `flat`)."""
-    return prompts.bundle(name, insert=insert, hooked=hooked, manager=manager, afclaude=afclaude,
-                          session_stop_pct=session_stop_pct(), **fields)
+    manager_project.md (the project's own rules, filled with the values of the project that owns
+    `repo`, default this checkout's: project_prompt_values; its commands are typed from `repo`,
+    prompts.tool_vars) + afk_rules.md; manager=False leaves out all but guard_respect.md (the
+    user's own sessions get a neutral message). One line because tmux send-keys would submit at
+    the first newline (every bundle `name` names here is `flat`)."""
+    values = project_prompt_values(repo) if manager and not hooked else None
+    return prompts.bundle(name, values, insert=insert, hooked=hooked, manager=manager,
+                          session_stop_pct=session_stop_pct(), **prompts.tool_vars(repo), **fields)
 
 
 # The standing rules the repo's SessionStart hook injects (.claude/settings.json, D-225), in two
@@ -193,20 +208,25 @@ STANDING_RULES_BUNDLES = {"manager": "manager_rules", "afclaude": "afclaude_rule
 
 def standing_rules(part):
     """One part of the standing rules (RULES_PARTS; its bundle, STANDING_RULES_BUNDLES), with a
-    header line; variables filled as in session_message ({session_stop_pct}). Newlines kept: this
-    is hook context, not tmux (the bundle is not `flat`)."""
+    header line; variables filled as in session_message ({session_stop_pct}, and the AFClaude
+    project's own values for manager_project). Newlines kept: this is hook context, not tmux (the
+    bundle is not `flat`)."""
     kind = STANDING_RULES_BUNDLES.get(part)
     if kind is None:
         raise ValueError(f"unknown standing-rules part {part!r} (one of {', '.join(RULES_PARTS)})")
-    return prompts.bundle(kind, part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part],
-                          session_stop_pct=session_stop_pct())
+    values = project_prompt_values() if part == "afclaude" else None
+    return prompts.bundle(kind, values, part=list(RULES_PARTS).index(part) + 1, what=RULES_PARTS[part],
+                          session_stop_pct=session_stop_pct(), **prompts.tool_vars())
 
 
 def session_rules_hook(part, hook_input, project_dir=None):
     """The SessionStart hook's JSON (D-225) for one part of the standing rules, or None when the
     session did not start in this repo's root (nothing is injected then). hook_input: the hook's
     stdin JSON (its cwd). Never raises: if the rules can't be built, the context says where they
-    are instead."""
+    are instead (a DB error reading the project's values, or a checkout project not yet
+    migrated (prompts.NotMigrated), is that case: a hook must not fail a session start, so the
+    documented fallback is the "read these files" text, which names the template, not the values;
+    phase 4a P3)."""
     cwd = (hook_input or {}).get("cwd") or project_dir or os.getcwd()
     if not rules_hooked(cwd):
         return None
@@ -214,8 +234,9 @@ def session_rules_hook(part, hook_input, project_dir=None):
         text = standing_rules(part)
     except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
         text = (f"[AFClaude standing rules, part {part}: could not be built ({type(e).__name__}: {e}). "
-                f"Read {os.path.join(HERE, 'prompts')}/manager.md, manager_afclaude.md ({{session_stop_pct}} = "
-                f"the session_stop_pct setting, default 95), guard_respect.md and afk_rules.md now and follow them.]")
+                f"Read {os.path.join(HERE, 'prompts')}/manager.md, manager_project.md ({{session_stop_pct}} = "
+                f"the session_stop_pct setting, default 95; the other {{...}} are this project's prompt variables: "
+                f"`python3 prompts.py vars --project <its name>`), guard_respect.md and afk_rules.md now and follow them.]")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
 
 
@@ -2590,8 +2611,8 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
     project's manager_session (project.edit) and its driven_sessions task-manager row (driven.set,
     names.tmux_name) stored first, then ka_resume.sh --new in the project's path with
     manager_first_start.md (the description: the one-off kickstart, D-301; `insert`, e.g. the
-    pacing, after it) and the standing rules (the hook pointer in this checkout, else inline without
-    manager_afclaude.md), then the reply awaited. Anything failing before the launch raises with
+    pacing, after it) and the standing rules (the hook pointer in this checkout, else inline with
+    manager_project.md filled with the project's own values), then the reply awaited. Anything failing before the launch raises with
     nothing written; anything failing from the writes through the launch (an exception, rc != 0)
     takes the session back off the project and ends its row (_take_back), then raises (D-235). A
     launch that timed out is taken back only if its tmux session does not exist; one that does is
@@ -2614,7 +2635,7 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
         tmux = _free_tmux(conn, sid, "task-manager", project["name"], None, arm, actor)
         msg = session_message("manager_first_start", project=project["name"], desc=row.get("description") or "",
                               path=path, progress=PROGRESS_FILE if own else os.path.join(path, "PROGRESS.md"),
-                              insert=insert, hooked=own, afclaude=own)
+                              insert=insert, hooked=own, repo=path)
         out = {"session": sid, "tmux": tmux, "message": msg}
         if not arm:
             return out
@@ -2729,14 +2750,14 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     path = transcript_path(sid)
     cwd = session_cwd(path)
     # 3b S4: AFClaude's task-manager (this checkout) gets the hook pointer and this PROGRESS.md; another
-    # project's gets the rules inline without manager_afclaude.md and its own PROGRESS.md
+    # project's gets the rules inline (manager_project.md with its own values, P3) and its own PROGRESS.md
     own = not cwd or rules_hooked(cwd)
     project = stall.get("project") or project_of(sid)
 
     def build(insert=None):
         # a session in this repo has its standing rules from the SessionStart hook: only a pointer (D-225)
         return session_message(stall.get("prompt", "continue"), reason=f"{reason}; {budget}",
-                               progress=PROGRESS_FILE if own else os.path.join(cwd, "PROGRESS.md"), afclaude=own,
+                               progress=PROGRESS_FILE if own else os.path.join(cwd, "PROGRESS.md"), repo=cwd or None,
                                insert=insert, hooked=rules_hooked(cwd), **(stall.get("fields") or {}))
     pace = run_pace_text(sid, stall, datetime.now(UTC), usage_cache_checked())   # D-274/D-275
     if project:              # D-301: the project's current name on every continue
@@ -4033,9 +4054,11 @@ def _compact_now(sid, path, d, rec, head):
         rec["steps"] = _jsonable(steps)
         notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages, read after the hand-off
         if run is None:
-            msg = session_message("compact_after", hooked=rules_hooked(cwd), resume=with_notes(insert, notes))
+            msg = session_message("compact_after", repo=proj["repo"], hooked=rules_hooked(cwd),
+                                  resume=with_notes(insert, notes))
         else:
-            msg = session_message("compact_after_run", hooked=rules_hooked(cwd), resume=insert, insert=notes, **run)
+            msg = session_message("compact_after_run", repo=proj["repo"], hooked=rules_hooked(cwd), resume=insert,
+                                  insert=notes, **run)
         sent_at = datetime.now(UTC)
         rc, out, err = fire(sid, cwd, msg, "send-keys")
         if rc != 0:
