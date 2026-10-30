@@ -245,7 +245,8 @@ class ProjectVarsTest(unittest.TestCase):
         self.do("prompt_var.reset", project="Here", name="questions_location")
         r = self.do("prompt_var.migrate", actor="runner:deploy")
         self.assertEqual(sorted(w["name"] for w in r["seeded"]),
-                         ["deploy_rule", "docs_rule", "project_notes", "public_repo_rule", "worktree_rule"])
+                         ["deploy_rule", "docs_rule", "progress_location", "project_notes", "public_repo_rule",
+                          "worktree_rule"])
         vals = prompts.project_values(self.conn, me["id"])
         for k in ("public_repo_rule", "worktree_rule", "project_notes", "docs_rule", "deploy_rule"):
             self.assertEqual(vals[k], prompts.CHECKOUT_SEED[k])
@@ -457,6 +458,10 @@ class SecondProjectTest(unittest.TestCase):
         self.assertIn("The repo is public: run tools/guard.sh.", msg)
         self.assertIn("(docs/goals.md: one short line per goal", msg)
         self.assertIn("and OPEN_QUESTIONS.md (only things", msg)                # the default
+        rules = self.rules()
+        for name in ("PROGRESS.md", "GOALS.md"):       # (manager.md, a different template, still names PROGRESS.md)
+            self.assertNotIn(name, rules)
+        self.assertIn("docs/goals.md", rules)
         for line in self.afclaude_lines:
             self.assertNotIn(" ".join(line.split()), msg)
         for word in ("tools/check_public.py", "tools/deploy.py", "ka_resume.sh", "store.py once migrated"):
@@ -466,6 +471,19 @@ class SecondProjectTest(unittest.TestCase):
         self.assertIn(f"python3 {prompts.HERE}/usage_report.py", msg)
         self.assertNotIn("`python3 keepalive.py", msg)
         self.assertNotIn("\n", msg)
+
+    def rules(self):
+        """manager_project.md as rendered for the second project (its stored values, else defaults)."""
+        return prompts.render("manager_project", prompts.project_values(self.conn, self.p["id"]),
+                              afclaude_dir=prompts.HERE, session_stop_pct=90, tools="")
+
+    def test_the_defaults_name_none_of_afclaudes_files(self):
+        plain = self.rules()
+        for name in ("PROGRESS.md", "GOALS.md"):
+            self.assertNotIn(name, plain)
+        self.assertIn("(the project's goals doc: one short line per goal", plain)
+        self.assertEqual(plain.count("(state in the project's progress doc)"), 2)
+        self.assertEqual(self.message(self.repo).count("(state in the project's progress doc)"), 2)
 
     def test_afclaudes_own_commands_stay_relative(self):
         mine = self.message(None)
