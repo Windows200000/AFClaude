@@ -13,11 +13,22 @@ D-224; the session idle after its last turn, keepalive.RUN_IDLE; the session win
 the next run), the session-%/hour rate, an extrapolated time to full when the
 run ended before filling, the weekly delta and the AFClaude vs user token split while it ran.
 
+The end of the run's work (`work_end`, D-310): the run's end (above) stays what the dashboard and
+the fill metrics use, but AFClaude's work often goes on after it: background workers the run
+started (subagents, background commands, timers) and the task-manager's turns on their
+notifications. work_end() follows that work from the end until the task-manager and those workers
+are idle (no worker in flight, RUN_IDLE without a write, or the owner's prompt after the end
+starting the next turn); the usage split (limit_ratio.combine_spans) counts start..work_end as
+AFClaude's run, so the work after an "idle" or "stopped" end is no longer booked as the owner's
+design chats (usage review 29.10., F2).
+
 Sources (read-only):
   - the usage readings of data/samples.jsonl (the sampler, every 15 min) plus
     data/run_usage.jsonl (the watcher's extra readings every RUN_SAMPLE_EVERY while a run is
     active, watch_sample()); stale readings (usage_stale.py) are counted and skipped
-  - the run session's transcripts (main + subagents): entry times (idle end) and limit notices
+  - the run session's transcripts (main + subagents): entry times (idle end) and limit notices;
+    the main transcript's background launches, their completion notices and the prompts' kinds
+    (work_end, D-310)
   - the keepalive state's stop marks (run_stops: the task-manager's --run-stopped, D-224).
 
 compute_run() is pure (fire + readings + activity -> row), so phase 2c can move it into the DB
@@ -60,6 +71,12 @@ ROW_VERSION = 1
 SESSION_LENGTH = timedelta(hours=5)     # afclaude_config.SESSION_LENGTH (kept import-free for the pure part)
 RUN_RESULTS = ("continued-in-place", "no-reply-within-timeout")   # keepalive.RUN_RESULTS
 RUN_IDLE = timedelta(minutes=15)        # keepalive.RUN_IDLE: no transcript entry this long = the run is over
+WORK_SILENCE = timedelta(minutes=60)    # D-310: a worker in flight with no transcript write this long is
+#                                         gone (the process died; D-309: a run's task-manager never idles
+#                                         >= 50 min, its keep-warm timer is a worker that ends sooner)
+OWNER_PROMPTS = ("owner", "inbox")      # compact_timing.prompt_kind of the owner's own messages
+_TASK_ID = re.compile(r"<task-id>([^<]+)</task-id>")            # a background task's completion notice
+_AGENT_MSG = re.compile(r'<agent-message from="([^"]+)"')      # a background subagent's hand-back
 FIRE_MERGE = timedelta(minutes=15)      # fires closer than this to a run's first fire belong to that run
 START_MAX_AGE = timedelta(minutes=30)   # a reading this old before the fire still gives the start values
 START_SLACK = timedelta(minutes=2)      # a reading up to this long after the fire still is "at the start"
@@ -219,7 +236,59 @@ def _cross(points, level):
 
 # ------------------------------------------------------------------ the pure part
 
-def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire=None, stops=()):
+_UNFINISHED = datetime.max.replace(tzinfo=UTC)   # a worker without a completion notice yet
+
+
+def work_end(fire, end, activity, work, now, next_fire=None):
+    """D-310: where the run's work ends, from its end on (pure). It goes on after `end` while a
+    worker the run started is in flight (a background launch at or before the work so far; after
+    the end only from a turn that wasn't the owner's) until its completion notice, at most
+    WORK_SILENCE without a transcript write, and through the task-manager's turns written within
+    RUN_IDLE of it that no owner prompt after the end started (e.g. the one on a finished
+    worker's notification). The owner chatting while a run's worker is in flight counts as the
+    run's. activity: sorted transcript entry times (main + subagents), None if unknown;
+    work: session_activity()'s {"tasks": [(launched, finished or None, launched in an owner's
+    turn)], "prompts": [(time, the owner's)]}. -> (the work's end, still going at `now`); a later
+    run's fire caps it (that run's row goes on from there)."""
+    if activity is None:
+        return end, False
+    tasks = (work or {}).get("tasks") or ()
+    prompts = sorted((work or {}).get("prompts") or ())
+
+    def owners(t):      # the turn at t answers an owner prompt typed after the run's end
+        last = None
+        for p, own in prompts:
+            if p > t:
+                break
+            last = (p, own)
+        return bool(last and last[1] and last[0] > end)
+
+    def busy_until(w):  # the last finish of the run's workers in flight at w, None if none is
+        fins = [f or _UNFINISHED for a, f, by_owner in tasks
+                if fire - timedelta(minutes=1) <= a <= w and (a <= end or not by_owner) and (f is None or f > w)]
+        return max(fins) if fins else None
+
+    w, going = end, True
+    for t in activity:
+        if t <= w:
+            continue
+        b = busy_until(w)
+        if b is not None and min(t, b) - w <= WORK_SILENCE and (t <= b or (t - b <= RUN_IDLE and not owners(t))):
+            w = t
+        elif t - w <= RUN_IDLE and not owners(t):
+            w = t
+        else:
+            going = False
+            break
+    if going:
+        b = busy_until(w)
+        going = (b is not None and b > now and now - w <= WORK_SILENCE) or (now - w < RUN_IDLE and not owners(now))
+    if next_fire and fire < next_fire <= (now if going else w):
+        return max(end, next_fire), False
+    return (now, True) if going else (w, False)
+
+
+def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire=None, stops=(), work=None):
     """One run's metrics row (pure).
 
     run:        {run_id, at, kind, session, fires, usage?} (group_fires); usage = the cache at the fire
@@ -232,6 +301,9 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
     next_fire:  the next run's fire time (a run ends there at the latest)
     stops:      datetimes of the task-manager's clean stops (keepalive.py --run-stopped, D-224): the
                 first one after the fire ends the run, even if the owner chats on afterwards
+    work:       the main transcript's background workers and prompts (session_activity) for
+                work_end (D-310), or None (then the work ends with the run, unless activity
+                follows within RUN_IDLE)
     """
     now = now or datetime.now(UTC)
     fire = run["at"]
@@ -321,6 +393,7 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
         ongoing = False
     else:
         end, reason, limit_kind, ongoing = now, "ongoing", None, True
+    w_end, w_going = work_end(fire, end, activity, work, now, next_fire)
 
     # -- the trajectory inside the window (plus one trailing reading after an idle end)
     traj = [r for r in after if r["t"] <= end and _same_window(r, window_end)]
@@ -414,7 +487,8 @@ def compute_run(run, readings, activity=None, limit_hits=(), now=None, next_fire
         "fires": list(run.get("fires") or [run["run_id"]]),
         "start": iso(fire), "start_berlin": bstr(fire),
         "end": iso(end), "end_berlin": bstr(end), "end_reason": reason, "limit_kind": limit_kind,
-        "ongoing": ongoing, "final": (not ongoing) and now - end >= FINAL_AFTER,
+        "ongoing": ongoing, "final": not (ongoing or w_going) and now - max(end, w_end) >= FINAL_AFTER,
+        "work_end": iso(w_end), "work_end_berlin": bstr(w_end), "work_ongoing": w_going,
         "duration_min": _mins(end - fire),
         "window_end": iso(window_end), "window_end_estimated": estimated,
         "active_after_window_end": active_after if reason == "window-end" else None,
@@ -486,34 +560,86 @@ def load_readings(lo, hi, samples_path=None, watch_path=None):
 
 def session_activity(session_id, lo, hi, projects_dir=None):
     """The session's transcript entry times in [lo, hi] (user/assistant entries of the main
-    transcripts in every project dir plus its subagents) and its limit notices
-    [(time, kind)] (keepalive.stall_info). -> (activity, hits); (None, []) without a transcript."""
+    transcripts in every project dir plus its subagents), its limit notices [(time, kind)]
+    (keepalive.stall_info) and its background work (main_work: the workers and prompts for
+    work_end, D-310). -> (activity, hits, work); (None, [], None) without a transcript. A
+    transcript that can't be read raises (D-235: no run end from part of the session's writes)."""
     import keepalive as ka
     pdir = projects_dir or ka.PROJECTS_DIR
     mains = glob.glob(os.path.join(pdir, "*", f"{session_id}.jsonl"))
     subs = glob.glob(os.path.join(pdir, "*", session_id, "subagents", "*.jsonl"))
     if not mains:
-        return None, []
-    acts, hits = [], []
+        return None, [], None
+    acts, hits, work = [], [], {"tasks": [], "prompts": []}
     for path in mains + subs:
-        try:
-            if datetime.fromtimestamp(os.path.getmtime(path), UTC) < lo:
-                continue
-            entries = ka.iter_entries(path)
-            for e in entries:
-                if not isinstance(e, dict) or e.get("type") not in ("user", "assistant"):
-                    continue
-                t = ts(e.get("timestamp"))
-                if t is None or not lo <= t <= hi:
-                    continue
-                stall = ka.stall_info(e) if path in mains and not e.get("isSidechain") else None
-                if stall:
-                    hits.append((t, stall.get("kind") or "unknown"))
-                else:
-                    acts.append(t)
-        except OSError:
+        if datetime.fromtimestamp(os.path.getmtime(path), UTC) < lo:
             continue
-    return sorted(acts), sorted(hits)
+        entries = list(ka.iter_entries(path))
+        if path in mains:
+            w = main_work(entries, lo, hi)
+            work["tasks"] += w["tasks"]
+            work["prompts"] += w["prompts"]
+        for e in entries:
+            if not isinstance(e, dict) or e.get("type") not in ("user", "assistant"):
+                continue
+            t = ts(e.get("timestamp"))
+            if t is None or not lo <= t <= hi:
+                continue
+            stall = ka.stall_info(e) if path in mains and not e.get("isSidechain") else None
+            if stall:
+                hits.append((t, stall.get("kind") or "unknown"))
+            else:
+                acts.append(t)
+    return sorted(acts), sorted(hits), work
+
+
+def main_work(entries, lo, hi):
+    """D-310: the background workers of a main transcript and its prompts. A worker = a launch
+    (a tool result with a backgroundTaskId: a background command; status async_launched: a
+    background subagent or workflow, its agentId / taskId) in [lo, hi], finished at its first
+    completion notice (a <task-notification> naming its task id, also the one Claude Code sends
+    for orphaned tasks on a resume; a subagent's <agent-message> hand-back; a TaskStop / KillShell
+    of it), each launch marked if the latest prompt before it was the owner's
+    (compact_timing.prompt_kind: owner or inbox). -> {"tasks": [(launched, finished or None,
+    the owner's)], "prompts": [(time, the owner's)] in [lo, hi]}."""
+    import compact_timing as ct
+    launched, done, prompts, owner = {}, {}, [], False
+    for e in entries:
+        if not isinstance(e, dict) or e.get("isSidechain"):
+            continue
+        t = ts(e.get("timestamp"))
+        if t is None:
+            continue
+        kind, text = e.get("type"), None
+        if kind == "queue-operation" and e.get("operation") == "enqueue":
+            text = e.get("content") if isinstance(e.get("content"), str) else None
+        elif kind == "user":
+            text = ct._text(e)
+            if text is not None and not text.startswith("[Request interrupted"):
+                owner = ct.prompt_kind(e, text) in OWNER_PROMPTS
+                if lo <= t <= hi:
+                    prompts.append((t, owner))
+            res = e.get("toolUseResult")
+            if isinstance(res, dict) and lo <= t <= hi:
+                tid = res.get("backgroundTaskId") or (
+                    (res.get("agentId") or res.get("taskId")) if res.get("status") == "async_launched" else None)
+                if isinstance(tid, str) and tid:
+                    launched.setdefault(tid, (t, owner))
+        elif kind == "assistant":
+            content = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+            for c in content if isinstance(content, list) else ():
+                if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") in ("TaskStop", "KillShell"):
+                    inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                    tid = inp.get("task_id") or inp.get("shell_id")
+                    if isinstance(tid, str):
+                        done.setdefault(tid, []).append(t)
+        if text:
+            for tid in _TASK_ID.findall(text) + _AGENT_MSG.findall(text):
+                done.setdefault(tid, []).append(t)
+    tasks = []
+    for tid, (t, own) in launched.items():
+        tasks.append((t, min((f for f in done.get(tid, ()) if f >= t), default=None), own))
+    return {"tasks": sorted(tasks), "prompts": sorted(prompts)}
 
 
 def load_states(paths=None):
@@ -580,14 +706,14 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
     for i in todo:
         run = runs[i]
         nxt = runs[i + 1]["at"] if i + 1 < len(runs) else None
-        acts, hits = (None, [])
-        if run.get("session"):
-            acts, hits = activity_fn(run["session"], run["at"] - timedelta(minutes=1),
-                                     run["at"] + SESSION_LENGTH + RUN_IDLE)
+        acts, hits, work = (None, [], None)
+        if run.get("session"):   # up to now: the run's work may go on past its window (D-310, work_end)
+            acts, hits, work = activity_fn(run["session"], run["at"] - timedelta(minutes=1),
+                                           max(run["at"] + SESSION_LENGTH + RUN_IDLE, min(now, nxt or now)))
         if not hits:   # the watcher's detection times (its own session only)
             hits = [h for h in hits_state if run["at"] <= h[0] <= run["at"] + SESSION_LENGTH]
         own = [t for t, sid in stops if not run.get("session") or sid in (None, run["session"])]
-        rows[run["run_id"]] = compute_run(run, readings, acts, hits, now=now, next_fire=nxt, stops=own)
+        rows[run["run_id"]] = compute_run(run, readings, acts, hits, now=now, next_fire=nxt, stops=own, work=work)
     ordered = [rows[r["run_id"]] for r in runs if r["run_id"] in rows]
     ordered += [r for k, r in rows.items() if k not in {x["run_id"] for x in runs}]   # never drop a row
     ordered.sort(key=lambda r: r.get("start") or "")

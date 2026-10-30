@@ -297,6 +297,20 @@ class CombineSpans(unittest.TestCase):
                                (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),
                                (T0 + timedelta(hours=8), now)])          # ongoing: until now
 
+    def test_the_runs_work_end_counts(self):
+        """D-310: a row's work_end (its workers after the run's end) ends the span; work still
+        going counts until now; a row from before work_end: its end."""
+        now = T0 + timedelta(hours=10)
+
+        def h(x):
+            return (T0 + timedelta(hours=x)).isoformat()
+        runs = [{"start": h(0), "end": h(1), "work_end": h(2), "ongoing": False, "work_ongoing": False},
+                {"start": h(4), "end": h(4.5), "ongoing": False},
+                {"start": h(8), "end": h(8.5), "work_end": h(9), "ongoing": False, "work_ongoing": True}]
+        self.assertEqual(lr.combine_spans(runs, [], now),
+                         [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=4), T0 + timedelta(hours=4.5)),
+                          (T0 + timedelta(hours=8), now)])
+
     def test_overlapping_spans_merge(self):
         got = lr.combine_spans([], [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=1), T0 + timedelta(hours=3))])
         self.assertEqual(got, [(T0, T0 + timedelta(hours=3))])

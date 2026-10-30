@@ -752,17 +752,19 @@ FIRE_COVER = timedelta(minutes=2)       # a fire this close to a run row's span 
 
 def combine_spans(run_rows=(), fallback=(), now=None):
     """Autonomous AFClaude periods [(start, end)], merged and sorted.
-    run_rows: run_metrics rows (data/afclaude_runs.jsonl): start..end, an ongoing run until `now`.
+    run_rows: run_metrics rows (data/afclaude_runs.jsonl): start..the end of the run's work
+    (work_end, D-310: its background workers and the turns on them after the run's end; a row
+    from before it: the run's end), an ongoing run or work until `now`.
     fallback: [(fire, end)] from pacing.autonomous_spans; used only for fires no run row covers
     (a fire run_metrics hasn't written yet, a usage-review or dispatcher run)."""
     spans = []
     for r in run_rows or []:
         if not isinstance(r, dict):
             continue
-        a, b = _parse_ts(r.get("start")), _parse_ts(r.get("end"))
+        a, b = _parse_ts(r.get("start")), _parse_ts(r.get("work_end") or r.get("end"))
         if a is None:
             continue
-        if r.get("ongoing") or b is None:
+        if r.get("ongoing") or r.get("work_ongoing") or b is None:
             b = max(b or a, now or a)
         spans.append((a, max(a, b)))
     rows_spans = list(spans)
