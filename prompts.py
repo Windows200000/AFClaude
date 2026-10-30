@@ -48,7 +48,19 @@ P1's per-prompt `flat` was the wrong place for it and is gone). `session_message
                                    [--hooked] [--no-manager]
     python3 prompts.py vars [--project P]           # the project variables and their values
     python3 prompts.py set-var PROJECT NAME VALUE | reset-var PROJECT NAME
+    python3 prompts.py override list | diff NAME | set NAME FILE | reset NAME   # the owner's edits (P4)
     python3 prompts.py migrate [--dry-run] [--deploy]
+
+Overrides (P4, D-193, D-169): the DB's prompt_overrides holds the owner's edit of a prompt (one per
+prompt, system-wide; the default stays the file). text(name) = override > default is what every
+sender sends: render / bundle / keepalive.load_prompt / nightly_tasks / inbox / usage_sampler all go
+through it, and read the DB on every send, so a DB error fails the send (D-235) and a reset takes
+effect at once. prompt.set (actions.py) validates the body against the registry (the prompt's
+system + project variables) and test-renders it in the prompt and every bundle that uses it
+(try_render) before it writes. An override that no longer fits (the default changed its variables:
+base_outdated) is a StaleOverride error at the send, never a text with missing variables; one whose
+default only changed in wording is used and flagged (override_status, `override list|diff`, MCP
+afclaude_prompts). The SessionStart hook still never fails a session start: its fallback text applies.
 """
 from __future__ import annotations
 
@@ -298,6 +310,12 @@ class UnknownBundle(LookupError):
     """A kind the registry doesn't have (the registry: prompts.BUNDLES)."""
 
 
+class StaleOverride(RuntimeError):
+    """An override that no longer fits its prompt (the default changed its variables after the edit):
+    every send of that prompt fails with this, naming it, until the owner resets or edits it
+    (D-235: no send with missing or unknown variables, no silent fall back to the default)."""
+
+
 class NotMigrated(RuntimeError):
     """The project at this checkout (AFClaude) misses seed values: its rules would render without
     its own lines (D-235: an error, not a thinner text). `prompts.py migrate` writes them."""
@@ -319,6 +337,50 @@ def default(name: str) -> str:
         return fh.read()
 
 
+def override_key(name: str) -> str:
+    """prompt_overrides.name: the file name (the key the DB schema and prompt.set use)."""
+    return check_name(name) + ".md"
+
+
+def load_overrides(conn: Optional[sqlite3.Connection] = None) -> dict[str, str]:
+    """{registry name: body} of every prompt that has an override now (D-193: one per prompt,
+    system-wide). Read on every call (a sender never caches one: a reset takes effect at the next
+    send). A DB error is raised, never answered with the defaults (D-235): the send fails. An
+    override row of a name the registry doesn't know is not loadable (override_status lists it)."""
+    import store
+    own = conn is None
+    c = store.connect() if conn is None else conn
+    try:
+        rows = store.retrying(lambda: store.list_prompt_overrides(c), c)
+    finally:
+        if own:
+            c.close()
+    return {r["name"][:-3]: r["body"] for r in rows if r["name"].endswith(".md") and r["name"][:-3] in PROMPTS}
+
+
+def _text(name: str, ov: Mapping[str, str]) -> str:
+    """Override > default. An override must still fit its prompt's variables: the default may have
+    changed since the edit (base_outdated), so it is checked at every use, not trusted from
+    prompt.set (StaleOverride)."""
+    body = ov.get(check_name(name))
+    if body is None:
+        return default(name)
+    want, have = variables(name), placeholders(body)
+    if have != want:
+        detail = ("unbalanced braces" if have is None
+                  else f"missing {sorted(want - have)}, unknown {sorted(have - want)}")
+        raise StaleOverride(f"the override of prompt {name} no longer fits its variables ({detail}); the default "
+                            f"changed since the edit: `python3 prompts.py override diff {name}`, then edit or "
+                            f"`override reset {name}`")
+    return body
+
+
+def text(name: str, conn: Optional[sqlite3.Connection] = None) -> str:
+    """What a sender sends: the owner's override of `name` if there is one, else the default (D-169,
+    D-193; P4). The senders' one loader; `default` stays the file, for the diff and the import."""
+    return _text(name, load_overrides(conn))
+
+
 def placeholders(text: str) -> set[str] | None:
     """The {placeholder} names of a str.format template; None if it isn't one (unbalanced braces)."""
     try:
@@ -333,26 +395,31 @@ def variables(name: str) -> set[str]:
     return set(spec.system) | set(spec.project)
 
 
-def render(name: str, project_values: Optional[Mapping[str, str]] = None, /, **system: object) -> str:
-    """The default of `name` filled in: exactly its system variables from `system`, its project
-    variables from project_values (a project's values, e.g. project_values()) or their default.
-    A missing or an unknown system variable is a ValueError (no partial text goes out, D-235).
-    `name` and `project_values` are positional-only (P2): a prompt can declare a system variable
-    literally called "name" (nightly_task.md does) or "project_values" without colliding with
-    render()'s own parameters -- callers that pass a bundle's **system straight through are common
-    (nightly_tasks.brief)."""
+def _render(name: str, project_values: Optional[Mapping[str, str]], system: Mapping[str, object],
+            ov: Mapping[str, str]) -> str:
     spec = PROMPTS[check_name(name)]
     missing, unknown = set(spec.system) - set(system), set(system) - set(spec.system)
     if missing or unknown:
         raise ValueError(f"prompt {name}: missing variable(s) {sorted(missing)}, unknown {sorted(unknown)}")
     values: dict[str, object] = dict(system)
-    text = default(name)
+    body = _text(name, ov)
     for v in spec.project:
         given = (project_values or {}).get(v)
         values[v] = PROJECT_VARS[v].default if given is None else given
         if values[v] == "":          # a whole-line variable without a value leaves no empty line
-            text = re.sub(rf"(?m)^\{{{v}\}}\n", "", text)
-    return text.format(**values)
+            body = re.sub(rf"(?m)^\{{{v}\}}\n", "", body)
+    return body.format(**values)
+
+
+def render(name: str, project_values: Optional[Mapping[str, str]] = None, /, **system: object) -> str:
+    """`name` (the override, else the default) filled in: exactly its system variables from
+    `system`, its project variables from project_values (a project's values, e.g. project_values())
+    or their default. A missing or an unknown system variable is a ValueError (no partial text goes
+    out, D-235). `name` and `project_values` are positional-only (P2): a prompt can declare a system
+    variable literally called "name" (nightly_task.md does) or "project_values" without colliding
+    with render()'s own parameters -- callers that pass a bundle's **system straight through are
+    common (nightly_tasks.brief)."""
+    return _render(name, project_values, system, load_overrides())
 
 
 # ---------------------------------------------------------------- bundles (P2, §3.2)
@@ -363,40 +430,158 @@ def check_bundle(kind: object) -> str:
     return kind
 
 
+RULES_PROMPTS = ("rules_pointer", "guard_respect", "manager", "manager_project", "afk_rules")   # the tail's
+
+
 def _rules_tail(hooked: bool, manager: bool, project_values: Optional[Mapping[str, str]],
-                system: Mapping[str, object]) -> list[str]:
+                system: Mapping[str, object], ov: Mapping[str, str]) -> list[str]:
     """The standing-rule tail of a session message (Part(rules=True)): see Part's docstring."""
     if hooked and manager:
-        return [default("rules_pointer")]
+        return [_text("rules_pointer", ov)]
     if not manager:
-        return [default("guard_respect")]
+        return [_text("guard_respect", ov)]
     fields = {k: system[k] for k in variables("manager_project") if k in system}
-    return [default("guard_respect"), default("manager"), render("manager_project", project_values, **fields),
-            default("afk_rules")]
+    return [_text("guard_respect", ov), _text("manager", ov), _render("manager_project", project_values, fields, ov),
+            _text("afk_rules", ov)]
 
 
 def bundle(kind: str, project_values: Optional[Mapping[str, str]] = None, /, insert: Optional[str] = None,
           hooked: bool = False, manager: bool = True, **system: object) -> str:
     """BUNDLES[kind] rendered: each prompt part gets exactly its own declared system variables out
     of **system (one **system serves every part of a bundle; render()'s strict check still applies
-    per part; `kind` and `project_values` are positional-only, render()'s own reason), the insert
+    per part; `kind` and `project_values` are positional-only, render()'s own reason; the overrides
+    are read once for the whole bundle), the insert
     part gets `insert` if given (skipped if empty), the rules part gets the standing-rule tail
     (_rules_tail; a bundle without one ignores hooked/manager). Joined
     per the bundle's own `flat` (BUNDLES[kind].flat): one line (tmux send-keys), or a blank line
     between parts, each stripped (hook context)."""
+    return _bundle(kind, project_values, insert, hooked, manager, system, load_overrides())
+
+
+def _bundle(kind: str, project_values: Optional[Mapping[str, str]], insert: Optional[str], hooked: bool,
+            manager: bool, system: Mapping[str, object], ov: Mapping[str, str]) -> str:
     b = BUNDLES[check_bundle(kind)]
     chunks: list[str] = []
     for part in b.parts:
         if part.prompt:
             fields = {k: system[k] for k in variables(part.prompt) if k in system}
-            chunks.append(render(part.prompt, project_values, **fields))
+            chunks.append(_render(part.prompt, project_values, fields, ov))
         elif part.rules:
-            chunks.extend(_rules_tail(hooked, manager, project_values, system))
+            chunks.extend(_rules_tail(hooked, manager, project_values, system, ov))
         elif insert:
             chunks.append(str(insert))
     if b.flat:
         return " ".join(" ".join(chunks).split())
     return "\n\n".join(c.strip() for c in chunks)
+
+
+# ---------------------------------------------------------------- overrides (P4, D-193)
+
+def bundles_using(name: str) -> list[str]:
+    """The bundle kinds that send `name`: as a part, or as one of the standing-rule tail's prompts."""
+    check_name(name)
+    return sorted(k for k, b in BUNDLES.items()
+                  if any(p.prompt == name or (p.rules and name in RULES_PROMPTS) for p in b.parts))
+
+
+def try_render(name: str, body: str) -> None:
+    """Render `body` as the override of `name`, with dummy values, everywhere it would be sent: the
+    prompt itself and every bundle that uses it (the rules tail in all its hooked / manager
+    variants). The first failure is a ValueError naming where: a bad override must not reach a
+    live session (prompt.set runs this before it writes)."""
+    dummy = {v: "x" for spec in PROMPTS.values() for v in spec.system}
+    ov = {check_name(name): body}
+    runs: list[tuple[str, Any]] = [(f"prompt {name}", lambda: _render(
+        name, None, {v: "x" for v in PROMPTS[name].system}, ov))]
+    for kind in bundles_using(name):
+        for hooked, manager in ((False, True), (True, True), (False, False)):
+            runs.append((f"bundle {kind} (hooked={hooked}, manager={manager})",
+                         lambda kind=kind, hooked=hooked, manager=manager:
+                         _bundle(kind, None, "x", hooked, manager, dummy, ov)))
+    for where, fn in runs:
+        try:
+            fn()
+        except (KeyError, IndexError, ValueError, AttributeError, StaleOverride) as e:
+            raise ValueError(f"the override does not render in {where}: {type(e).__name__}: {e}") from None
+
+
+def bundle_system(kind: str) -> set[str]:
+    """Every system variable a bundle's prompts declare (the rules tail's included): what a sender
+    of this kind fills."""
+    b = BUNDLES[check_bundle(kind)]
+    names: set[str] = set()
+    for part in b.parts:
+        if part.prompt:
+            names |= set(PROMPTS[part.prompt].system)
+        elif part.rules:
+            for r in RULES_PROMPTS:
+                names |= set(PROMPTS[r].system)
+    return names
+
+
+def render_in(conn: sqlite3.Connection, name: str, project_values: Optional[Mapping[str, str]],
+              system: Mapping[str, object]) -> str:
+    """render() with the overrides read through `conn` (a caller that has its own database open)."""
+    return _render(name, project_values, system, load_overrides(conn))
+
+
+def bundle_in(conn: sqlite3.Connection, kind: str, project_values: Optional[Mapping[str, str]],
+              system: Mapping[str, object], insert: Optional[str] = None, hooked: bool = False,
+              manager: bool = True) -> str:
+    """bundle() with the overrides read through `conn`."""
+    return _bundle(kind, project_values, insert, hooked, manager, system, load_overrides(conn))
+
+
+def override_status(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every current override: name, version, who/when, `base_outdated` (the stored flag, refreshed at
+    each deploy's prompt.defaults_sync: None = unknown), `default_changed` (live: the default file is not
+    the one the edit was made against), `fits` (the override still has exactly its prompt's variables;
+    False means every send of it fails, StaleOverride). Read-only."""
+    import hashlib
+    import store
+    out: list[dict[str, Any]] = []
+    for r in store.list_prompt_overrides(conn):
+        reg = r["name"][:-3] if r["name"].endswith(".md") else r["name"]
+        known = reg in PROMPTS
+        row: dict[str, Any] = {"name": reg, "version": r["version"], "updated_at": r["updated_at"],
+                               "updated_by": r["updated_by"], "base_outdated": None if r["base_outdated"] is None
+                               else bool(r["base_outdated"]), "known": known}
+        if known:
+            row["default_changed"] = (r["base_sha256"] is not None and r["base_sha256"]
+                                      != hashlib.sha256(default(reg).encode()).hexdigest())
+            row["fits"] = placeholders(r["body"]) == variables(reg)
+        out.append(row)
+    return out
+
+
+def override_diff(conn: sqlite3.Connection, name: str) -> str:
+    """A unified diff default -> override of `name`, headed by its status; '' when it has none."""
+    import difflib
+    import store
+    key = override_key(name)
+    row = store.get_prompt_override(conn, key)
+    if row is None or row["body"] is None:
+        return ""
+    st = next(x for x in override_status(conn) if x["name"] == name)
+    head = (f"# override of {name} v{row['version']} by {row['updated_by']} at {row['updated_at']}: "
+            f"base_outdated={st['base_outdated']} default_changed={st['default_changed']} fits={st['fits']}\n")
+    return head + "".join(difflib.unified_diff(default(name).splitlines(keepends=True),
+                                               row["body"].splitlines(keepends=True),
+                                               f"default/{name}.md", f"override/{name}.md"))
+
+
+def preview_system(project_path: Optional[str], given: Mapping[str, object], declared: set[str]) -> dict[str, Any]:
+    """The system variables a preview (the CLI, the MCP tool) fills itself where `declared` has them:
+    the tool paths for the project's directory, the session_stop_pct setting; `given` overrides
+    them, and anything else stays for the strict render."""
+    import importlib
+    config: Any = importlib.import_module("afclaude_config")
+    auto: dict[str, Any] = dict(tool_vars(project_path))
+    if "session_stop_pct" in declared:
+        auto["session_stop_pct"] = f"{float(config.setting('session_stop_pct')):g}"
+    out = {k: v for k, v in auto.items() if k in declared}
+    out.update(given)
+    return out
 
 
 # ---------------------------------------------------------------- project values (D-197)
@@ -486,21 +671,6 @@ def _project(conn: sqlite3.Connection, ref: str) -> store.Row:
     return p
 
 
-def _cli_system(project: Optional[store.Row], given: list[tuple[str, str]],
-                declared: set[str]) -> dict[str, Any]:
-    """The system variables the CLI fills itself where `declared` (the prompt's) has them: the tool
-    paths for the project's directory, the session_stop_pct setting; --set overrides them, and a
-    --set of anything else stays for render()'s strict check."""
-    import importlib
-    keepalive: Any = importlib.import_module("keepalive")   # untyped, and heavy: only the CLI needs it
-    auto: dict[str, Any] = dict(tool_vars(project["path"] if project and project["path"] else None))
-    if "session_stop_pct" in declared:
-        auto["session_stop_pct"] = keepalive.session_stop_pct()
-    out = {k: v for k, v in auto.items() if k in declared}
-    out.update(given)
-    return out
-
-
 def _perform(name: str, params: dict[str, Any], deploy: bool = False) -> Any:
     import actions
     import store
@@ -510,6 +680,39 @@ def _perform(name: str, params: dict[str, Any], deploy: bool = False) -> Any:
                                via="runner" if deploy else "cli")
     finally:
         conn.close()
+
+
+def _override_cli(a: argparse.Namespace) -> None:
+    import store
+    if a.ocmd == "list":
+        conn = store.connect()
+        try:
+            rows = override_status(conn)
+        finally:
+            conn.close()
+        for r in rows:
+            print(json.dumps(r, ensure_ascii=False))
+        return
+    name = str(a.name).removesuffix(".md")
+    key = override_key(name)
+    if a.ocmd == "diff":
+        conn = store.connect()
+        try:
+            d = override_diff(conn, name)
+        finally:
+            conn.close()
+        sys.stdout.write(d or f"{name}: no override\n")
+    elif a.ocmd == "set":
+        if a.file == "-":
+            body = sys.stdin.read()
+        else:
+            with open(a.file) as fh:
+                body = fh.read()
+        r = _perform("prompt.set", {"name": key, "body": body})
+        print(json.dumps({k: r[k] for k in ("name", "version", "updated_by", "base_outdated") if k in r}))
+    else:
+        r = _perform("prompt.reset", {"name": key})
+        print(json.dumps({k: r[k] for k in ("name", "version", "updated_by") if k in r}))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -540,6 +743,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     bu.add_argument("--insert", default=None, help="the sender's own text for the insert part, if any")
     bu.add_argument("--hooked", action="store_true", help="the session already has the standing rules")
     bu.add_argument("--no-manager", dest="manager", action="store_false", default=True)
+    ov = sub.add_parser("override", help="the owner's system-wide edit of a prompt (audited, D-193)")
+    ovs = ov.add_subparsers(dest="ocmd", required=True)
+    ovs.add_parser("list", help="every override with its base_outdated / default_changed / fits flags")
+    o1 = ovs.add_parser("set", help="set the override from FILE (- for stdin); validated, test-rendered everywhere")
+    o1.add_argument("name")
+    o1.add_argument("file")
+    o2 = ovs.add_parser("reset", help="back to the default")
+    o2.add_argument("name")
+    o3 = ovs.add_parser("diff", help="default -> override, with its flags")
+    o3.add_argument("name")
     m = sub.add_parser("migrate", help="seed the project at this checkout (idempotent, audited)")
     m.add_argument("--dry-run", action="store_true")
     m.add_argument("--deploy", action="store_true", help="the entrypoint's run: audited as runner:deploy")
@@ -562,7 +775,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     values = project_values(conn, proj["id"])
                 finally:
                     conn.close()
-            sys.stdout.write(render(a.name, values, **_cli_system(proj, a.set, set(PROMPTS[check_name(a.name)].system))))
+            sys.stdout.write(render(a.name, values, **preview_system(proj["path"] if proj and proj["path"] else None, dict(a.set), set(PROMPTS[check_name(a.name)].system))))
         elif a.cmd == "vars":
             conn = store.connect()
             try:
@@ -596,7 +809,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     conn.close()
             print()
             sys.stdout.write(bundle(a.kind, values, insert=a.insert, hooked=a.hooked, manager=a.manager,
-                                    **_cli_system(proj, a.set, {"afclaude_dir", "tools", "session_stop_pct"})))
+                                    **preview_system(proj["path"] if proj and proj["path"] else None, dict(a.set),
+                                                   {"afclaude_dir", "tools", "session_stop_pct"})))
+        elif a.cmd == "override":
+            _override_cli(a)
         elif a.cmd == "set-var":
             print(json.dumps(_perform("prompt_var.set", {"project": a.project, "name": a.name, "value": a.value}),
                              ensure_ascii=False))

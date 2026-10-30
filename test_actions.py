@@ -21,6 +21,7 @@ import testenv  # noqa: E402,F401  (hermetic: a temp DB, config and data dir; be
                                    # does not bind afclaude_config.CONFIG_FILE to the live repo path)
 import actions  # noqa: E402
 import afclaude_config  # noqa: E402
+import prompts  # noqa: E402
 import store  # noqa: E402
 import tasks  # noqa: E402
 
@@ -808,7 +809,7 @@ class PromptActions(Base):
             self.do("prompt.set", name="continue.md", body=body + "!", version=0)
         r = self.do("prompt.reset", name="continue.md", version=1)
         self.assertEqual((r["body"], r["version"]), (None, 2))
-        self.assertTrue(actions.prompt_text(self.conn, "continue.md").startswith("Continue ("))
+        self.assertEqual(actions.prompt_text(self.conn, "continue.md"), prompts.default("continue"))   # back to the file
         self.assertEqual(store.list_prompt_overrides(self.conn), [])
         self.do("prompt.reset", name="continue.md")                          # nothing to reset: no-op
         rows = self.audit(target_type="prompt")
@@ -940,13 +941,32 @@ class PromptDefaultsSync(Base):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
         self.do("prompt.set", actor="owner", via="dashboard", name="continue.md",
                 body="Go on ({reason}); {progress}.")
-        self.assertIsNone(store.get_prompt_override(self.conn, "continue.md")["base_outdated"])
+        self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)   # made against the current one
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # default unchanged: still matches
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)
         with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "w") as fh:
             fh.write("Continue now ({reason}). Progress: {progress}.\n")
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # the default moved on
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 1)
+
+    def test_an_override_that_no_longer_fits_is_listed_and_alerted_not_a_failed_deploy(self):
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(r["unfit_overrides"], [])
+        # as if a deploy changed the prompt's variables after the edit: written past prompt.set's check
+        store.put_prompt_override(self.conn, "continue.md", "Go on ({reason}).", self.sha("continue.md"), "owner")
+        self.conn.commit()
+        r = self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
+        self.assertEqual(r["unfit_overrides"], ["continue"])
+        alerts = []
+        saved = store.NOTIFY
+        store.NOTIFY = lambda s, b="": alerts.append(s) or "sent"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(store.main(["import-prompts", "--db", self.db]), 0)
+        finally:
+            store.NOTIFY = saved
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("continue", alerts[0])
 
 
 class RequestActions(Base):

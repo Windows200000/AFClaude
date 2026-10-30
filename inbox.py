@@ -82,8 +82,9 @@ class TriageLimit(TriageError):
 
 
 def prompt(name: str) -> str:
-    """prompts/<name>.md, the default (D-169), through the registry (prompts.py)."""
-    return prompts.default(name)
+    """prompts/<name>.md through the registry (prompts.py): the owner's override if there is one (D-193),
+    else the default (D-169)."""
+    return prompts.text(name)
 
 
 def one_line(text: str) -> str:

@@ -44,6 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write)
+import prompts  # noqa: E402  (the prompt registry: read-only view, phase 4a P4)
 import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
 
 from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
@@ -592,6 +593,65 @@ async def afclaude_decisions(action: Literal["find", "show"], keywords: Optional
     finally:
         conn.close()
 
+
+
+def prompt_preview(conn: sqlite3.Connection, project: Optional[str], declared: set[str],
+                   values: Optional[Mapping[str, str]]) -> tuple[Optional[dict[str, str]], dict[str, Any]]:
+    """(the project's variable values, the system variables) for a preview: the project's own, its
+    tool paths, the session_stop_pct setting, `values`; any other system variable shows as <name>."""
+    pvals, path = None, None
+    if project is not None and project.strip():
+        p = store.get_project(conn, int(project) if project.isdigit() else project)
+        if p is None:
+            raise store.NotFound(f"no project {project!r}")
+        pvals, path = prompts.project_values(conn, p["id"]), p["path"] or None
+    system = prompts.preview_system(path, dict(values or {}), declared)
+    return pvals, {v: system.get(v, f"<{v}>") for v in declared}
+
+
+@tool("The prompts AFClaude sends (read-only; an owner override replaces the default system-wide). list: prompts "
+      "and bundles, with each override's flags. bundle (name = kind) / render (name = prompt): the text a sender "
+      "sends, for a project's variable values; values: system variables, the rest show as <name>.", read_only=True)
+async def afclaude_prompts(action: Literal["list", "bundle", "render"], name: Optional[str] = None,
+                           project: Optional[str] = None, values: Optional[dict[str, str]] = None,
+                           ctx: Optional[Context] = None) -> str:
+    conn = db()
+    try:
+        try:
+            if action == "list":
+                status = {r["name"]: r for r in prompts.override_status(conn)}
+                return out({"prompts": [compact({
+                    "name": n, "system": sorted(sp.system), "project": sorted(sp.project), "used_by": sp.used_by,
+                    "bundles": prompts.bundles_using(n),
+                    "override": compact({k: status[n][k] for k in ("version", "updated_at", "updated_by", "base_outdated",
+                                                                    "default_changed", "fits")}) if n in status else None})
+                    for n, sp in sorted(prompts.PROMPTS.items())],
+                    "bundles": [{"kind": k, "parts": [part.prompt or ("insert" if part.insert else "rules")
+                                                      for part in b.parts], "flat": b.flat, "used_by": b.used_by}
+                                for k, b in sorted(prompts.BUNDLES.items())]})
+            if not name:
+                raise ValueError(f"{action} needs name")
+            if project is not None:
+                project = await resolve_dir_arg(ctx, project)
+            if action == "bundle":
+                kind = prompts.check_bundle(name)
+                pvals, system = prompt_preview(conn, project, prompts.bundle_system(kind), values)
+                b = prompts.BUNDLES[kind]
+                return out({"kind": kind, "flat": b.flat,
+                            "parts": [part.prompt or ("insert: " + part.insert if part.insert else "rules")
+                                      for part in b.parts],
+                            "text": prompts.bundle_in(conn, kind, pvals, system)})
+            prompt_name = prompts.check_name(name)
+            pvals, system = prompt_preview(conn, project, set(prompts.PROMPTS[prompt_name].system), values)
+            return out({"name": prompt_name, "text": prompts.render_in(conn, prompt_name, pvals, system)})
+        except prompts.UnknownPrompt as e:
+            raise store.NotFound(str(e)) from None
+        except prompts.UnknownBundle as e:
+            raise store.NotFound(str(e)) from None
+        except prompts.StaleOverride as e:
+            raise ValueError(str(e)) from None
+    finally:
+        conn.close()
 
 
 def notice_brief(n: Mapping[str, Any]) -> dict[str, Any]:
