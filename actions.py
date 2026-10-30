@@ -74,6 +74,7 @@ import manager_launch  # noqa: E402
 import remote_control  # noqa: E402
 import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
+import decisions  # noqa: E402  (pure: the parser and the entry text, phase 4b)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -2166,7 +2167,9 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     new entries added, changed ones rewritten (the task-manager's keyword changes kept), entries
     no longer in the file removed. Idempotent: an unchanged file changes nothing (no audit row).
     The audit row names the ids and holds a line diff of each changed entry and the full text of
-    each removed one (D-158: every change in the audit log). The result's "no_status" names every
+    each removed one (D-158: every change in the audit log). Native entries (origin 'db', written by
+    decision.add) are not the file's: never overwritten or removed; one whose id the file also has is
+    listed under "detached" (the file's version is ignored). The result's "no_status" names every
     entry with no Status line (decisions.state_of defaults those to "active", or infers a state
     from a title marker like "SUPERSEDED" -- the list still names them all, so the plain ones stay
     visible without editing DECISIONS.md). Refused (decisions.SourceError): a file without entries
@@ -2183,7 +2186,7 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
         raise dec.SourceError(f"can't read {src}: {err}") from err
     entries = dec.parse(text)
     dec.check_entries(entries, src)
-    have = {r["id"]: r for r in store.list_decision_entries(conn)}
+    have = {r["id"]: r for r in store.list_decision_entries(conn) if r["origin"] == "file"}
     ids = {e.id for e in entries}
     gone = [i for i in have if i not in ids]
     if have and len(gone) * 2 > len(have) and force is not True:
@@ -2194,10 +2197,13 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     changed: dict[str, str] = {}
     restated: dict[str, list[str]] = {}
     moved = 0
+    detached: list[str] = []
     for n, e in enumerate(entries):
         row = dict(e.row(), ord=n)
         outcome, old = store.put_decision_entry(conn, row, ctx.actor)
-        if outcome == "added":
+        if outcome == "detached":
+            detached.append(e.id)
+        elif outcome == "added":
             added.append(e.id)
         elif outcome == "changed" and old is not None:
             changed[e.id] = "\n".join(difflib.unified_diff(old["body"].split("\n"), e.body.split("\n"),
@@ -2210,7 +2216,8 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     no_status = [e.id for e in entries if not e.has_status]   # visible without editing DECISIONS.md
     result = {"file": src, "sha256": sha, "entries": len(entries), "added": added, "changed": list(changed),
               "restated": restated, "removed": list(removed), "moved": moved, "no_status": no_status,
-              "unchanged": len(entries) - len(added) - len(changed) - len(restated) - moved}
+              "detached": detached,
+              "unchanged": len(entries) - len(added) - len(changed) - len(restated) - moved - len(detached)}
     after = {"sha256": sha, "entries": len(entries), "added": added, "changed": changed,
              "restated": restated, "removed": list(removed), "moved": moved}
     return Result(result, os.path.basename(src), {"removed_text": removed}, after,
@@ -2263,6 +2270,258 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
     after = store.set_decision_keywords(conn, cur["id"], added, removed, ctx.actor)
     return Result({"id": after["id"], "keywords": after["effective_keywords"], "version": after["version"]},
                   after["id"], before, {"keywords": after["effective_keywords"]})
+
+
+# ---- native decisions (phase 4b Q1; D-104, D-158, D-176, D-284, D-285, D-286)
+#
+# decision.add writes an entry into the DB itself (origin 'db'); until the seeding step the DECISIONS.md
+# import owns the other rows (origin 'file'), so edit / expire / delete / confirm refuse those: change the
+# file (the import follows within 10 minutes). Topics, keywords and links work on every row.
+# Who may do what: the owner's words recorded by the task-manager are active at once (D-285), through the
+# CLI (author owner, `words` required); the task-manager's own entries are proposed and wait for the
+# owner (author task-manager; MCP propose); confirming is the owner's (owner-only); changing or removing
+# an owner's entry is the owner's too (D-104, an autonomous MCP session is refused), except that an
+# expired one-off ("active until <date>" in its Status, D-278) may be removed by the task-manager (D-286).
+# Deleting, expiring and replacing are audited with the whole old entry (D-158: the change history).
+
+DECISION_TOPIC_NUDGE = ("Topics are free keywords that surface an entry, 'all' if it applies to everything; keep "
+                        "the total low: reuse a topic in use (`tasks.py decision topics`) before adding a new one.")
+DECISION_TOPICS_SOFT_MAX = 30       # distinct topics in use before a result says so (a nudge, never enforced)
+DECISION_EDIT_FIELDS = ("title", "date", "status", "summary", "words", "source", "scope", "interpretation")
+
+
+def _decision_view(d: Mapping[str, Any]) -> dict[str, Any]:
+    """An entry as the audit row and the result carry it (keywords as the effective set)."""
+    return {"id": d["id"], "title": d["title"], "state": d["state"], "author": d["author"], "origin": d["origin"],
+            "slug": d["slug"], "project_id": d["project_id"], "type": d["type"], "date": d["date"],
+            "status": d["status"], "summary": d["summary"], "words": d["words"], "source": d["source"],
+            "scope": d["scope"], "interpretation": d["interpretation"], "keywords": d["effective_keywords"],
+            "topics": d["topics"], "links": [store.link_text(x) for x in d["links"]], "body": d["body"],
+            "version": d["version"]}
+
+
+def _decision_row(conn: sqlite3.Connection, decision: Any, native: bool = False) -> store.Row:
+    cur = store.get_decision_entry(conn, decision)
+    if cur is None:
+        raise store.NotFound(f"no decision {decision}")
+    if native and cur["origin"] != "db":
+        raise ValueError(f"{cur['id']} mirrors DECISIONS.md until the seeding step: change it there (the import "
+                         "follows within 10 minutes); topics, keywords and links can be changed here")
+    return cur
+
+
+def _decision_owner_guard(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any], what: str) -> None:
+    if cur["author"] == "owner" and is_autonomous(conn, ctx):
+        raise Forbidden(f"decision.{what} of an owner's decision {cur['id']} is not allowed for an autonomous AFClaude "
+                        "session (only the owner changes one, D-104): propose a replacement instead")
+
+
+def _topics(value: Any, required: bool) -> list[str]:
+    items = value if isinstance(value, list) else ([] if value is None else [value])
+    out = list(dict.fromkeys(store.decision_topic(t) for t in items))
+    if required and not out:
+        raise ValueError("topics: at least one (D-284); `tasks.py decision topics` lists the ones in use")
+    return out
+
+
+def _topic_note(conn: sqlite3.Connection, new: list[str]) -> dict[str, Any]:
+    """The nudge of a result: which topics are new, and a reminder when the total is high (not enforced)."""
+    counts = store.decision_topic_counts(conn)
+    out: dict[str, Any] = {}
+    fresh = [t for t in new if counts.get(t, 0) <= 1]
+    if fresh:
+        out["new_topics"] = fresh
+    if len(counts) > DECISION_TOPICS_SOFT_MAX:
+        out["topic_note"] = f"{len(counts)} topics in use. " + DECISION_TOPIC_NUDGE
+    return out
+
+
+@action("decision.add", "decision")
+def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, author: Any = "owner",
+                 words: Any = None, summary: Any = None, scope: Any = None, source: Any = None,
+                 interpretation: Any = None, date: Any = None, status: Any = None, keywords: Any = None,
+                 project: Any = None, slug: Any = None, id: Any = None) -> Result:
+    """A new decision. author owner: what the owner said, recorded active at once with their exact `words`
+    (required) and the date (D-285); author task-manager: its own entry, proposed until the owner confirms
+    it (decision.confirm). At least one topic (D-284). The id is the next D-NNN unless `id` is given; the
+    slug (default: from the title) is unique per project; project None = install-wide."""
+    store._enum(author, store.DECISION_AUTHORS, "author")
+    if author == "owner" and is_autonomous(conn, ctx):
+        raise Forbidden("an autonomous AFClaude session records only its own decisions (decision.add with author "
+                        "task-manager, MCP propose); the owner's words are recorded through the CLI (D-285)")
+    f = {k: store._text(v, k) for k, v in (("words", words), ("summary", summary), ("scope", scope),
+                                           ("source", source), ("interpretation", interpretation),
+                                           ("date", date), ("status", status))}
+    t = store._text(title, "title", required=True)
+    if author == "owner" and not f["words"]:
+        raise ValueError("an owner's decision needs the owner's exact words (words)")
+    tops = _topics(topics, True)
+    kws = [_keyword(k) for k in (keywords if isinstance(keywords, list) else [] if keywords is None else [keywords])]
+    pid: int | None = None
+    if project is not None:
+        p = store.get_project(conn, project, nearest=False)
+        if p is None:
+            raise store.NotFound(f"no project {project!r}")
+        pid = p["id"]
+    did = store.decision_id(id) if id is not None else store.next_decision_id(conn)
+    state = "active" if author == "owner" else "proposed"
+    stat = f["status"] or ("active" if state == "active" else decisions.PROPOSED_STATUS)
+    if slug is not None:
+        sl = store.check_decision_slug(conn, slug, pid)
+    else:
+        base = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:store.DECISION_SLUG_MAX - 4].strip("-") or did.lower()
+        sl = base
+        n = 1
+        while conn.execute("SELECT 1 FROM decisions WHERE slug = ? AND COALESCE(project_id, 0) = ?",
+                           (sl, pid or 0)).fetchone():
+            n += 1
+            sl = f"{base}-{n}"
+    day = f["date"] or decisions.now_text()
+    body = decisions.render_body(did, t, type=author, date=day, status=stat, summary=f["summary"], words=f["words"],
+                      source=f["source"], scope=f["scope"], interpretation=f["interpretation"])
+    row = store.add_decision_entry(conn, {
+        "id": did, "title": t, "type": author, "date": day, "status": stat, "state": state, "author": author,
+        "summary": f["summary"], "words": f["words"], "source": f["source"], "scope": f["scope"],
+        "interpretation": f["interpretation"], "body": body, "slug": sl, "project_id": pid, "keywords": kws,
+        "topics": tops}, ctx.actor)
+    view = _decision_view(row)
+    return Result(dict(view, **_topic_note(conn, tops)), did, None, view)
+
+
+def _decision_rerender(cur: Mapping[str, Any], **changes: Any) -> dict[str, Any]:
+    """The editable fields of `cur` with `changes` applied, and the body rendered from them."""
+    f = {k: cur[k] for k in DECISION_EDIT_FIELDS}
+    f.update(changes)
+    f["body"] = decisions.render_body(cur["id"], f["title"], type=cur["type"], date=f["date"], status=f["status"],
+                           summary=f["summary"], words=f["words"], source=f["source"], scope=f["scope"],
+                           interpretation=f["interpretation"])
+    return f
+
+
+@action("decision.edit", "decision", extra=DECISION_EDIT_FIELDS + ("slug",))
+def decision_edit(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None, **fields: Any) -> Result:
+    """Overwrite fields of a native decision (D-158: the old text is in the audit row): title, date, status,
+    summary, words, source, scope, interpretation, slug (None clears an optional field; title can't be
+    empty). An owner's decision can't be edited by an autonomous session (D-104); the state changes
+    through decision.confirm / expire / delete."""
+    cur = _decision_row(conn, decision, native=True)
+    _check_version(cur, version, f"decision {cur['id']}")
+    _decision_owner_guard(conn, ctx, cur, "edit")
+    if not fields:
+        raise ValueError("decision.edit: nothing to change")
+    changes: dict[str, Any] = {}
+    for k, v in fields.items():
+        if k == "slug":
+            changes[k] = store.check_decision_slug(conn, v, cur["project_id"], cur["id"]) if v is not None else None
+        else:
+            changes[k] = store._text(v, k, required=k == "title")
+    if cur["author"] == "owner" and "words" in changes and not changes["words"]:
+        raise ValueError("an owner's decision keeps the owner's exact words")
+    new = _decision_rerender(cur, **{k: v for k, v in changes.items() if k in DECISION_EDIT_FIELDS})
+    new.update({k: v for k, v in changes.items() if k == "slug"})
+    if all(cur[k] == new[k] for k in changes):
+        return Result(_decision_view(cur), cur["id"], None, None, changed=False)
+    after = store.update_decision_entry(conn, cur["id"], new, ctx.actor)
+    return Result(_decision_view(after), cur["id"], _decision_view(cur), _decision_view(after))
+
+
+def _decision_remove(conn: sqlite3.Connection, cur: Mapping[str, Any], version: Any, reason: str) -> Result:
+    """Delete `cur` with its topics and links; the audit row holds the whole old entry and the reason."""
+    _check_version(cur, version, f"decision {cur['id']}")
+    store.delete_decision_entry(conn, cur["id"])
+    return Result({"id": cur["id"], "deleted": True, "reason": reason}, cur["id"], _decision_view(cur),
+                  {"deleted": True, "reason": reason})
+
+
+@action("decision.delete", "decision")
+def decision_delete(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: Any, version: Any = None) -> Result:
+    """Delete a native decision that no longer applies (replaced, withdrawn) with its topics and links; the
+    whole old entry and the reason stay in the audit row (D-158: the change history). An owner's decision:
+    not for an autonomous session (D-104)."""
+    cur = _decision_row(conn, decision, native=True)
+    _decision_owner_guard(conn, ctx, cur, "delete")
+    return _decision_remove(conn, cur, version, store._text(reason, "reason", required=True))
+
+
+@action("decision.expire", "decision")
+def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: Any = None,
+                    version: Any = None) -> Result:
+    """An expired one-off leaves the list for the change history (D-286): deleted with the reason "expired"
+    (plus `reason`) in the audit row. An autonomous session may do this only to an entry whose Status says
+    "active until <date>" with that date past (D-278); any other owner's entry is the owner's to remove."""
+    cur = _decision_row(conn, decision, native=True)
+    if cur["author"] == "owner" and is_autonomous(conn, ctx):
+        until = decisions.until_of(cur["status"] or "")
+        if until is None or datetime.now(decisions.BERLIN) < until:
+            raise Forbidden(f"decision.expire of {cur['id']} is not allowed for an autonomous AFClaude session: "
+                            "its Status is not an 'active until <date>' that has passed (D-278, D-286)")
+    extra = store._text(reason, "reason")
+    return _decision_remove(conn, cur, version, "expired" + (f": {extra}" if extra else ""))
+
+
+@action("decision.confirm", "decision", owner_only=True)
+def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None) -> Result:
+    """The owner confirms a proposal: it becomes active (D-285). Owner-only (an autonomous session is
+    refused). Confirming an entry that is already active is a no-op."""
+    cur = _decision_row(conn, decision, native=True)
+    _check_version(cur, version, f"decision {cur['id']}")
+    if cur["state"] == "active":
+        return Result(_decision_view(cur), cur["id"], None, None, changed=False)
+    if cur["state"] != "proposed":
+        raise store.InvalidTransition(f"{cur['id']} is {cur['state']}, not proposed")
+    status = "active" if cur["status"] == decisions.PROPOSED_STATUS else cur["status"]
+    body = decisions.render_body(cur["id"], cur["title"], type=cur["type"], date=cur["date"], status=status,
+                      summary=cur["summary"], words=cur["words"], source=cur["source"], scope=cur["scope"],
+                      interpretation=cur["interpretation"])
+    after = store.set_decision_state(conn, cur["id"], "active", status, body, ctx.actor)
+    return Result(_decision_view(after), cur["id"], _decision_view(cur), _decision_view(after))
+
+
+@action("decision.topics", "decision")
+def decision_topics(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any, topics: Any,
+                    version: Any = None) -> Result:
+    """Add or remove topics of one decision (any origin; D-284: free keywords, 'all' allowed, few in
+    total: reuse before adding). Adding one it has is a no-op; removing one it lacks, or its last one,
+    is an error (an entry keeps at least one)."""
+    store._enum(op, ("add", "remove"), "op")
+    cur = _decision_row(conn, decision)
+    _check_version(cur, version, f"decision {cur['id']}")
+    words = _topics(topics, True)
+    have = cur["topics"]
+    if op == "add":
+        new = [t for t in words if t not in have]
+        gone: list[str] = []
+    else:
+        missing = [t for t in words if t not in have]
+        if missing:
+            raise ValueError(f"{cur['id']} has no topic {', '.join(missing)} (its topics: {', '.join(have)})")
+        new, gone = [], words
+        if not [t for t in have if t not in words]:
+            raise ValueError(f"{cur['id']} must keep at least one topic (D-284): add the new one first")
+    if not new and not gone:
+        return Result({"id": cur["id"], "topics": have, "version": cur["version"]}, cur["id"], None, None,
+                      changed=False)
+    after = store.set_decision_topics(conn, cur["id"], new, gone, ctx.actor)
+    return Result(dict({"id": after["id"], "topics": after["topics"], "version": after["version"]},
+                       **_topic_note(conn, new)),
+                  cur["id"], {"topics": have}, {"topics": after["topics"]})
+
+
+@action("decision.link", "decision")
+def decision_link(conn: sqlite3.Connection, ctx: Ctx, decision: Any, to: Any, kind: Any, op: Any = "add") -> Result:
+    """Relate two decisions (any origin): `decision` refines | requires | conflicts `to`; shown with every
+    hit. op remove deletes the link (an error when there is none); adding an existing one is a no-op."""
+    store._enum(op, ("add", "remove"), "op")
+    store._enum(kind, store.DECISION_LINK_KINDS, "kind")
+    a, b = _decision_row(conn, decision), _decision_row(conn, to)
+    before = [store.link_text(x) for x in a["links"]]
+    if not store.set_decision_link(conn, a["id"], b["id"], kind, op == "add", ctx.actor):
+        if op == "remove":
+            raise ValueError(f"{a['id']} has no link {kind} {b['id']}")
+        return Result({"id": a["id"], "links": before}, a["id"], None, None, changed=False)
+    after = _decision_row(conn, a["id"])
+    links = [store.link_text(x) for x in after["links"]]
+    return Result({"id": a["id"], "links": links}, a["id"], {"links": before}, {"links": links})
 
 
 # ---------------------------------------------------------------- dashboard browser sessions (phase 6a W5)

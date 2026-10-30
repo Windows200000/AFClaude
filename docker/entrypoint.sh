@@ -21,6 +21,14 @@ CRON_BIN="${AFCLAUDE_SUPERCRONIC:-/usr/local/bin/supercronic}"
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
 mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
+# Phase 4b Q1: the explicit schema step. A non-additive change (store.MIGRATIONS; v5 rebuilds `decisions`)
+# never runs on connect(): until this has run, code at the new version can't write to the DB (MigrationNeeded),
+# and after it code at the old version can't (SchemaTooNew), so it runs first and alone: the old container is
+# gone by now and the runner has not started. It copies the DB to <db>.v<old>-<utc>.bak before changing anything
+# and is a no-op when the DB is current. If it fails the start goes on (a failing entrypoint would restart-loop),
+# but the DB stays read-only for the runner, whose health check then alerts and pauses automation (D-235).
+python3 "$D/store.py" migrate >>"$D/data/migrate.log" 2>&1 \
+  || echo "afclaude: store migrate did not complete (see data/migrate.log; a first install has no database yet): an existing database stays read-only until it succeeds" >&2
 # D-227: every deploy (`docker compose up -d --build`, i.e. every container start) imports
 # prompts/*.md into prompt_defaults, so the DB always has what is currently deployed (prompts
 # still ship as files, D-169; prompt_overrides holds the owner's edits). Now that data/ is

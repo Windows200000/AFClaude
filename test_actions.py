@@ -519,6 +519,7 @@ class Autonomous(Base):
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
+                  "decision.confirm",                                            # D-104/D-285: the owner confirms
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
     def test_owner_only_set(self):
@@ -1138,6 +1139,14 @@ class EveryAction(Base):
             ("notice.dismiss", {"notice_id": 1}),
             ("decision.import", {"path": src.name}),
             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
+            ("decision.add", {"title": "Native", "topics": ["t"], "words": "w"}),
+            ("decision.edit", {"decision": "D-002", "title": "Native 2"}),
+            ("decision.topics", {"decision": "D-002", "op": "add", "topics": ["u"]}),
+            ("decision.link", {"decision": "D-002", "to": "D-001", "kind": "refines"}),
+            ("decision.add", {"title": "Prop", "topics": ["t"], "author": "task-manager"}),
+            ("decision.confirm", {"decision": "D-003"}),
+            ("decision.expire", {"decision": "D-003"}),
+            ("decision.delete", {"decision": "D-002", "reason": "r"}),
             ("install.restored", {"source": {"install_id": store.get_meta(self.conn, "install_id"),
                                              "install_epoch": 0, "created_at": "2026-10-22T03:00:00.000Z",
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
@@ -1176,7 +1185,7 @@ class Handoffs(Base):
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(handoffs)")}
         self.assertEqual(cols, {"id", "session_id", "project_id", "created_at", "created_by", "body", "consumed_at",
                                 "consumed_by_start"})
-        self.assertEqual(store.SCHEMA_VERSION, 4)     # an older running watcher must not see a "newer" DB
+        self.assertEqual(store.SCHEMA_VERSION, 5)     # the decisions rebuild (Q1) is the one bump; handoffs add none
 
     def test_write_validates_normalizes_and_audits(self):
         h = self.do("handoff.write", session_id=SID, body=self.BODY)
@@ -1313,9 +1322,12 @@ class MigrationV4(unittest.TestCase):
             src = sqlite3.connect(path)
             before = self.counts(src)
             src.close()
+            with self.assertRaises(store.MigrationNeeded):         # v5 code: a v3 database needs `store.py migrate` first
+                actions.perform(store.connect(path), "task.answer", {"task_id": 2, "answer": "y"}, actor="cli", via="cli")
+            store.migrate(path)                                    # backup first, then v4's additive part and v5
             conn = store.connect(path)
             try:
-                self.assertEqual(store.get_meta(conn, "schema_version"), "4")
+                self.assertEqual(store.get_meta(conn, "schema_version"), "5")
                 self.assertIsNotNone(store.get_meta(conn, "migrated_v4_at"))
                 baks = [f for f in os.listdir(d) if f.startswith("v3.db.v3-") and f.endswith(".bak")]
                 self.assertEqual(len(baks), 1)
@@ -1341,7 +1353,8 @@ class MigrationV4(unittest.TestCase):
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             finally:
                 conn.close()
-            conn = store.connect(path)                                           # second connect: no-op
+            store.migrate(path)                                                  # second migrate: no-op
+            conn = store.connect(path)
             try:
                 self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".bak")]), 1)
                 self.assertEqual(store.get_task(conn, 2)["version"], 1)
@@ -1350,22 +1363,23 @@ class MigrationV4(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_empty_v3_db_needs_no_backup(self):
+    def test_empty_v3_db_is_migrated_too(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "v3.db")
             self.make_v3(path, data=False)
+            store.migrate(path)
             conn = store.connect(path)
             try:
-                self.assertEqual(store.get_meta(conn, "schema_version"), "4")
-                self.assertEqual([f for f in os.listdir(d) if f.endswith(".bak")], [])
+                self.assertEqual(store.get_meta(conn, "schema_version"), "5")
+                self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".bak")]), 1)   # migrate always backs up
             finally:
                 conn.close()
 
-    def test_fresh_db_is_v4_without_migration_mark(self):
+    def test_fresh_db_is_v5_without_migration_mark(self):
         with tempfile.TemporaryDirectory() as d:
             conn = store.connect(os.path.join(d, "new.db"), create=True)
             try:
-                self.assertEqual(store.get_meta(conn, "schema_version"), "4")
+                self.assertEqual(store.get_meta(conn, "schema_version"), "5")
                 self.assertIsNone(store.get_meta(conn, "migrated_v4_at"))
                 self.assertIsNotNone(store.get_meta(conn, "install_id"))
                 self.assertFalse([f for f in os.listdir(d) if f.endswith(".bak")])
@@ -1378,7 +1392,7 @@ class MigrationV4(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "v3.db")
             self.make_v3(path)
-            store.connect(path).close()
+            store.migrate(path)
             raw = sqlite3.connect(path)
             raw.executescript(V3_SCHEMA.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
                               .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
@@ -1388,7 +1402,7 @@ class MigrationV4(unittest.TestCase):
             raw.execute("UPDATE tasks SET title='by v3' WHERE id=1")
             raw.commit()
             self.assertEqual(raw.execute("SELECT version FROM tasks WHERE id=1").fetchone()[0], 1)
-            self.assertEqual(raw.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "4")
+            self.assertEqual(raw.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "5")
             raw.close()
 
 

@@ -74,8 +74,8 @@ class Base(unittest.TestCase):
 
 class Schema(Base):
     def test_additive_schema_keeps_the_version(self):
-        self.assertEqual(store.SCHEMA_VERSION, 4)     # additive: an older watcher must not see a newer DB
-        self.assertEqual(store.get_meta(self.conn, "schema_version"), "4")
+        self.assertEqual(store.SCHEMA_VERSION, 5)     # the telemetry tables add none (the decisions rebuild did, Q1)
+        self.assertEqual(store.get_meta(self.conn, "schema_version"), "5")
         names = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue(set(store.TELEMETRY_APPEND + store.TELEMETRY_DOCS + ("accounts",)) <= names)
         self.assertEqual([tuple(r) for r in self.conn.execute("SELECT id FROM accounts")], [("default",)])

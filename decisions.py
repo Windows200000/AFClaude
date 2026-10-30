@@ -31,9 +31,14 @@ imports it, and builds what the task-manager reads:
         python3 decisions.py hook --part N --of M        (.claude/settings.json)
     Claude Code caps a hook's additionalContext at 10,000 characters, so the TLDR is split over M
     hook commands (parts); a TLDR that outgrows them says so in its last part (add a part).
-  - lookups: `tasks.py decision find KW...` (full entries, keyword matches first, then full-text
-    hits), `tasks.py decision show D-NNN`, MCP afclaude_decisions (find/show; a find without
-    full=true lists only ids and topic keywords, D-176: expand an entry before acting on it).
+  - lookups: `tasks.py decision find KW...` (full entries, keyword or topic matches first, then
+    full-text hits), `tasks.py decision show D-NNN`, MCP afclaude_decisions (find/show/propose; a
+    find without full=true lists only id, title and topics, D-176/D-284: expand an entry before
+    acting on it).
+  - native entries (phase 4b Q1, actions.decision_add|edit|expire|delete|confirm|link|topics): written
+    in the DB itself (origin 'db'), their text rendered here (render_body) from the fields; an
+    owner's words are active at once, the task-manager's own entries 'proposed' (not in the TLDR)
+    until the owner confirms (D-285). The import above leaves them alone.
 
     python3 decisions.py tldr | import [--file PATH] | hook --part N --of M
 (the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords|import`)
@@ -73,8 +78,9 @@ TRAIL_RE = re.compile(r"(?:\s*(?:·|\n\s*-|\n\s*---))+\s*$")
 FIELDS = {"type": "type", "date": "date", "status": "status", "supersedes": "supersedes",
           "summary": "summary", "keywords": "keywords", "owner's words": "words", "source": "source",
           "scope": "scope"}
-STATES = ("active", "partial", "done", "superseded")
-CURRENT = ("active", "partial")                      # what the TLDR and a default find show
+STATES = store.DECISION_STATES                       # + proposed: the task-manager's own, waiting for the owner
+CURRENT = ("active", "partial")                      # what the TLDR and a default find show (not proposed)
+PROPOSED_STATUS = "proposed (the task-manager's own entry, waiting for the owner's confirmation, D-285)"
 BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active until" date is Berlin time
 
 
@@ -251,6 +257,29 @@ def check_entries(entries: list[Entry], path: str) -> None:
             raise SourceError(f"{path}: {e.id}: {err}") from err
 
 
+# ---------------------------------------------------------------- native entries (Q1)
+
+def now_text() -> str:
+    """A native entry's default date: Berlin time to the minute, as the source writes them."""
+    return datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
+
+
+def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str], status: Optional[str],
+                summary: Optional[str], words: Optional[str], source: Optional[str], scope: Optional[str],
+                interpretation: Optional[str]) -> str:
+    """The entry text of a native decision, in the source's shape ("### D-NNN title", one
+    "- **Name:** value" line per field that is set), so show, find and the full-text index treat
+    it like an imported one. Topics and links are kept apart from the text."""
+    lines = [f"### {did} {title}"]
+    for name, value in (("Type", type), ("Date", date), ("Summary", summary),
+                        ("Owner's words", f'"{words}"' if words else None), ("Source", source),
+                        ("Scope", scope), ("Status", status),
+                        ("Interpretation (task-manager, not binding)", interpretation)):
+        if value:
+            lines.append(f"- **{name}:** {value}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- import
 
 def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor: str = IMPORT_ACTOR,
@@ -273,7 +302,8 @@ def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor
 
 # ---------------------------------------------------------------- output
 
-STATE_TAGS = {"active": "", "partial": "partly superseded", "done": "done", "superseded": "superseded"}
+STATE_TAGS = {"active": "", "partial": "partly superseded", "done": "done", "superseded": "superseded",
+              "proposed": "proposed"}
 
 
 def tldr_line(row: dict[str, Any]) -> str:
@@ -291,8 +321,8 @@ def tldr_lines(conn: sqlite3.Connection) -> list[str]:
 TLDR_HEAD = ("[AFClaude decisions TLDR (D-242){part}: every current decision as its id and title; all "
              "are active unless marked [partly superseded]. A title names the topic only: before acting on a "
              "decision or putting it in a brief, read it in full: `python3 tasks.py decision show D-NNN` "
-             "or `tasks.py decision find KEYWORD...` (MCP afclaude_decisions). Add or fix keywords when a "
-             "lookup misses: `tasks.py decision keywords D-NNN add|remove KW`.]")
+             "or `tasks.py decision find KEYWORD...` (MCP afclaude_decisions; find also matches topics). Add or "
+             "fix keywords when a lookup misses: `tasks.py decision keywords D-NNN add|remove KW`.]")
 
 
 def split_parts(lines: list[str], parts: int, cap: int = HOOK_CONTEXT_CAP) -> list[list[str]]:

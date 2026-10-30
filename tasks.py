@@ -69,6 +69,16 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py decision show ID              one decision's full entry (D-NNN / M-NNN)
     tasks.py decision keywords ID add|remove KW...   keep a decision's keywords current (audited;
                                            kept apart from DECISIONS.md's Keywords line)
+    tasks.py decision topics [ID add|remove T...]   an entry's topics (D-284: free keywords, "all" allowed,
+                                           keep few); without ID: every topic in use, with counts
+    tasks.py decision add --title T --topic T... [--author owner|task-manager] [--words W ...]   write a
+                                           decision into the DB (owner: active at once, exact --words
+                                           required, D-285; task-manager: proposed until the owner confirms)
+    tasks.py decision edit|expire|delete|confirm ID ...   overwrite fields, remove an expired one-off or one
+                                           that no longer applies (audited with the old text), the owner's
+                                           confirmation of a proposal (native entries; the DECISIONS.md ones
+                                           are changed in the file until the seeding step)
+    tasks.py decision link ID refines|requires|conflicts TO [--remove]   relate two decisions
     tasks.py decision import [--file F] [--force]   DECISIONS.md into the DB now (also every 10 min
                                            and at each compaction; the file is never written)
     tasks.py notice post --title T --text TEXT|- [--project P]   a notice for the owner on the
@@ -352,11 +362,63 @@ def run_handoff(conn, args):
         print("   " + store.render_handoff(h))
 
 
+EXPAND_NOTICE = ("(The full entry above is what to act on: a title, a list line or a summary names the topic "
+                 "only, and an interpretation is not binding, D-176.)")
+
+
 def decision_out(d):
-    """A decision's full entry, plus the keywords in the DB when the task-manager changed them."""
+    """A decision's full entry, plus what the DB adds: state, topics, links, changed keywords."""
     print(d["body"])
+    if d["state"] == "proposed":
+        print("- (proposed: not yet confirmed by the owner)")
+    if d["topics"]:
+        print(f"- (topics: {', '.join(d['topics'])})")
+    if d["links"]:
+        print(f"- (links: {', '.join(store.link_text(x) + ' ' + x['title'] for x in d['links'])})")
     if d["keywords_added"] or d["keywords_removed"]:
         print(f"- (keywords in the DB: {', '.join(d['effective_keywords'])})")
+
+
+def decision_write(conn, args):
+    """decision add|edit|expire|delete|confirm|link|topics: one audited action each."""
+    dc = args.decision_cmd
+    if dc == "add":
+        r = act(conn, "decision.add", title=args.title, topics=args.topic, author=args.author, words=args.words,
+                summary=args.summary, scope=args.scope, source=args.source, interpretation=args.interpretation,
+                date=args.date, status=args.status, keywords=args.keyword, project=args.project, slug=args.slug,
+                id=args.id)
+    elif dc == "edit":
+        fields = {k: getattr(args, k) for k in ("title", "date", "status", "summary", "words", "source", "scope",
+                                                "interpretation", "slug") if getattr(args, k) is not None}
+        r = act(conn, "decision.edit", decision=args.id, version=args.version, **fields)
+    elif dc == "expire":
+        r = act(conn, "decision.expire", decision=args.id, reason=args.reason, version=args.version)
+    elif dc == "delete":
+        r = act(conn, "decision.delete", decision=args.id, reason=args.reason, version=args.version)
+    elif dc == "confirm":
+        r = act(conn, "decision.confirm", decision=args.id, version=args.version)
+    elif dc == "link":
+        r = act(conn, "decision.link", decision=args.id, to=args.to, kind=args.kind,
+                op="remove" if args.remove else "add")
+    elif args.id is None:                       # topics: the ones in use
+        counts = store.decision_topic_counts(conn)
+        if args.json:
+            return dump(counts)
+        return print("\n".join(f"{n:>4}  {t}" for t, n in counts.items()) or "no topics yet")
+    else:
+        r = act(conn, "decision.topics", decision=args.id, op=args.op, topics=args.topics)
+    if args.json:
+        return dump(r)
+    if r.get("deleted"):
+        return print(f"{r['id']} removed ({r['reason']}); the old entry is in the audit log")
+    parts = [f"{r['id']}"] + [f"{k}: {', '.join(v) if isinstance(v, list) else v}"
+                              for k, v in r.items() if k in ("state", "topics", "links") and v]
+    print(" ".join(parts[:1]) + (" (" + "; ".join(parts[1:]) + ")" if parts[1:] else ""))
+    for k in ("new_topics", "topic_note"):
+        if r.get(k):
+            print(f"{k.replace('_', ' ')}: {r[k] if isinstance(r[k], str) else ', '.join(r[k])}"
+                  + (f". {actions.DECISION_TOPIC_NUDGE}" if k == "new_topics" else ""))
+    return None
 
 
 def run_decision(conn, args):
@@ -369,6 +431,8 @@ def run_decision(conn, args):
         parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r[k]]
         print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
               + (f" ({r['moved']} moved)" if r["moved"] else ""))
+        if r["detached"]:
+            print(f"native in the DB, so the file's version is ignored: {', '.join(r['detached'])}")
         if r["no_status"]:
             print(f"no Status line ({len(r['no_status'])}, counted as active unless the title names a "
                   f"state): {', '.join(r['no_status'])}")
@@ -376,24 +440,29 @@ def run_decision(conn, args):
     if dc == "tldr":
         rows = store.list_decision_entries(conn, None if args.all else decisions.CURRENT)
         if args.json:
-            return dump([{"id": d["id"], "title": d["title"], "state": d["state"], "status": d["status"]}
-                         for d in rows])
+            return dump([{"id": d["id"], "title": d["title"], "state": d["state"], "status": d["status"],
+                          "topics": d["topics"]} for d in rows])
         return print(decisions.tldr_text([decisions.tldr_line(d) for d in rows]))
     if dc == "show":
         d = store.get_decision_entry(conn, args.id)
         if d is None:
             raise store.NotFound(f"no decision {args.id}")
-        return dump(d) if args.json else decision_out(d)
+        if args.json:
+            return dump(dict(d, notice=EXPAND_NOTICE))
+        decision_out(d)
+        return print(EXPAND_NOTICE)
     if dc == "keywords":
         r = act(conn, "decision.keywords", decision=args.id, op=args.op, keywords=args.keywords)
         return dump(r) if args.json else print(f"{r['id']} keywords: {', '.join(r['keywords'])}")
+    if dc in ("add", "edit", "expire", "delete", "confirm", "link", "topics"):
+        return decision_write(conn, args)
     hits = store.find_decision_entries(conn, args.keywords, None if args.all else decisions.CURRENT)
     shown = hits if args.limit == 0 else hits[:args.limit]
     if args.json:
-        return dump({"hits": shown, "more": len(hits) - len(shown)})
+        return dump({"hits": shown, "more": len(hits) - len(shown), "notice": EXPAND_NOTICE})
     if not hits:
         return print(f"no {'' if args.all else 'current '}decision matches {' / '.join(args.keywords)}"
-                     + ("" if args.all else " (--all: also done and superseded ones)"))
+                     + ("" if args.all else " (--all: also done, superseded and proposed ones)"))
     for n, d in enumerate(shown):
         if n:
             print()
@@ -403,6 +472,7 @@ def run_decision(conn, args):
     if len(hits) > len(shown):
         print(f"\n({len(hits) - len(shown)} more matches not shown: "
               + ", ".join(d["id"] for d in hits[len(shown):]) + "; --limit 0 shows all)")
+    print("\n" + EXPAND_NOTICE)
     return None
 
 
@@ -953,14 +1023,15 @@ def parser():
     q.add_argument("--repo", help="the project's directory (default: this repo)")
     q.add_argument("--project", help="project name (default: the project of --repo)")
     q.add_argument("--check", action="store_true", help="report only, write nothing")
-    p = sub.add_parser("decision", help="the owner's decisions in the DB (D-242): tldr | find | show | keywords | import")
+    p = sub.add_parser("decision", help="the owner's decisions in the DB (D-242): tldr | find | show | keywords | topics | "
+                                      "add | edit | expire | delete | confirm | link | import")
     dcs = p.add_subparsers(dest="decision_cmd", required=True)
     q = dcs.add_parser("tldr", parents=[js], help="one line per current decision: id, title, [state]")
-    q.add_argument("--all", action="store_true", help="also the done and superseded ones")
+    q.add_argument("--all", action="store_true", help="also the done, superseded and proposed ones")
     q = dcs.add_parser("find", parents=[js], help="the full entries matching keywords (keyword matches "
                                                   "first, then full-text hits)")
     q.add_argument("keywords", nargs="+", help="keywords or phrases (quote a phrase); any may match")
-    q.add_argument("--all", action="store_true", help="also the done and superseded ones")
+    q.add_argument("--all", action="store_true", help="also the done, superseded and proposed ones")
     q.add_argument("--limit", type=int, default=10, help="entries shown (default 10; 0 = all)")
     q = dcs.add_parser("show", parents=[js], help="one decision's full entry")
     q.add_argument("id", help="D-NNN or M-NNN")
@@ -968,6 +1039,43 @@ def parser():
     q.add_argument("id", help="D-NNN or M-NNN")
     q.add_argument("op", choices=("add", "remove"))
     q.add_argument("keywords", nargs="+", help="one or more keywords (quote one with spaces)")
+    q = dcs.add_parser("topics", parents=[js], help="topics of a decision, or every topic in use (reuse before "
+                                                    "adding one; keep the total low)")
+    q.add_argument("id", nargs="?", help="D-NNN or M-NNN; without it the topics in use are listed")
+    q.add_argument("op", nargs="?", choices=("add", "remove"))
+    q.add_argument("topics", nargs="*", help="one or more topics")
+    q = dcs.add_parser("add", parents=[js], help="write a decision into the DB")
+    q.add_argument("--title", required=True)
+    q.add_argument("--topic", action="append", required=True, help="a topic (repeat; at least one, D-284)")
+    q.add_argument("--author", choices=store.DECISION_AUTHORS, default="owner",
+                   help="owner: the owner's words, active at once; task-manager: proposed until confirmed")
+    q.add_argument("--words", help="the owner's exact words (required for author owner)")
+    for f in ("summary", "scope", "source", "interpretation", "date", "status", "slug"):
+        q.add_argument(f"--{f}")
+    q.add_argument("--keyword", action="append", help="a keyword (repeat)")
+    q.add_argument("--project", help="a project (default: install-wide)")
+    q.add_argument("--id", help="D-NNN to use instead of the next free number (seeding)")
+    q = dcs.add_parser("edit", parents=[js], help="overwrite fields of a native decision (audited; \"\" clears)")
+    q.add_argument("id")
+    for f in ("title", "date", "status", "summary", "words", "source", "scope", "interpretation", "slug"):
+        q.add_argument(f"--{f}")
+    q.add_argument("--version", type=int, help="the version you read (refuse if it changed)")
+    q = dcs.add_parser("expire", parents=[js], help="an expired one-off leaves the list for the change history")
+    q.add_argument("id")
+    q.add_argument("--reason", help="added to 'expired' in the audit row")
+    q.add_argument("--version", type=int)
+    q = dcs.add_parser("delete", parents=[js], help="remove a decision that no longer applies (audited, old text kept)")
+    q.add_argument("id")
+    q.add_argument("--reason", required=True)
+    q.add_argument("--version", type=int)
+    q = dcs.add_parser("confirm", parents=[js], help="the owner confirms a proposed decision")
+    q.add_argument("id")
+    q.add_argument("--version", type=int)
+    q = dcs.add_parser("link", parents=[js], help="ID refines|requires|conflicts TO (shown with every hit)")
+    q.add_argument("id")
+    q.add_argument("kind", choices=store.DECISION_LINK_KINDS)
+    q.add_argument("to")
+    q.add_argument("--remove", action="store_true")
     q = dcs.add_parser("import", parents=[js], help="import DECISIONS.md now (also every 10 min and at "
                                                     "each compaction; the file is not changed)")
     q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")

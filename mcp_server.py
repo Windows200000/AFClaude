@@ -557,42 +557,60 @@ async def afclaude_doc(action: Literal["list", "show", "append", "set"], name: O
 
 
 DECISION_HITS = 10           # entries a find returns (the rest: their ids under "more")
-EXPAND_NOTICE = ("Topic keywords only: expand an entry (full=true, or action show) and read it before acting "
-                 "on it or passing it on (D-176).")
+EXPAND_NOTICE = ("Titles and topics name the subject only: expand an entry (full=true, or action show) and read it "
+                 "before acting on it or passing it on (D-176).")
+FULL_NOTICE = ("This is the entry to act on; a title, list line or summary names the topic only, and an "
+               "interpretation is not binding (D-176).")
+
+
+def decision_line(d: Mapping[str, Any]) -> dict[str, Any]:
+    """What a find lists without full: id, title, state, topics and links (D-284); no rule text."""
+    return compact({"id": d["id"], "title": d["title"], "state": d["state"], "topics": d["topics"] or None,
+                    "links": [store.link_text(x) for x in d["links"]] or None})
 
 
 def decision_full(d: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"id": d["id"], "title": d["title"], "state": d["state"], "status": d["status"],
-                    "keywords": d["effective_keywords"], "entry": d["body"]})
+                    "topics": d["topics"] or None, "keywords": d["effective_keywords"],
+                    "links": [store.link_text(x) + " " + x["title"] for x in d["links"]] or None, "entry": d["body"]})
 
 
-@tool("The owner's decisions (D-242). find (keywords; all: also done/superseded): ids and topic keywords "
-      "only, NOT enough to act on: expand (full=true, or show) before acting. show (id D-NNN): the full entry.",
-      read_only=True)
-async def afclaude_decisions(action: Literal["find", "show"], keywords: Optional[list[str]] = None,
-                             id: Optional[str] = None, full: bool = False, all: bool = False) -> str:
+@tool("The owner's decisions (D-242). find (keywords/topics; all: also done, superseded, proposed): id, title, "
+      "topics only, NOT enough to act on: expand (full=true, or show) before acting. show (id D-NNN): the full "
+      "entry. propose (title, topics 1+, optional words/scope/interpretation/keywords/project): your own "
+      "decision, waits for the owner; topics are few free keywords ('all' if general), reuse existing ones.")
+async def afclaude_decisions(action: Literal["find", "show", "propose"], keywords: Optional[list[str]] = None,
+                             id: Optional[str] = None, full: bool = False, all: bool = False,
+                             title: Optional[str] = None, topics: Optional[list[str]] = None,
+                             words: Optional[str] = None, scope: Optional[str] = None,
+                             interpretation: Optional[str] = None, project: Optional[str] = None) -> str:
     conn = db()
     try:
+        if action == "propose":
+            if not title:
+                raise ValueError("propose needs title")
+            r = act(conn, "decision.add", title=title, topics=topics, author="task-manager", words=words,
+                    scope=scope, interpretation=interpretation, keywords=keywords, project=project)
+            return out(compact({"id": r["id"], "title": r["title"], "state": r["state"], "topics": r["topics"],
+                                "new_topics": r.get("new_topics"), "topic_note": r.get("topic_note"),
+                                "note": "Proposed: it waits for the owner's confirmation."}))
         if action == "show":
             if not id:
                 raise ValueError("show needs id")
             d = store.get_decision_entry(conn, id)
             if d is None:
                 raise store.NotFound(f"no decision {id}")
-            return out(decision_full(d))
-        hits = store.find_decision_entries(conn, keywords or [], None if all else ("active", "partial"))
+            return out(dict(decision_full(d), note=FULL_NOTICE))
+        hits = store.find_decision_entries(conn, keywords or [],
+                                           None if all else ("active", "partial"))
         shown = hits[:DECISION_HITS]
-        res: dict[str, Any] = {"hits": [decision_full(d) if full else
-                                        {"id": d["id"], "state": d["state"], "keywords": d["effective_keywords"]}
-                                        for d in shown]}
+        res: dict[str, Any] = {"hits": [decision_full(d) if full else decision_line(d) for d in shown]}
         if len(hits) > len(shown):
             res["more"] = [d["id"] for d in hits[len(shown):]]
-        if not full:
-            res["note"] = EXPAND_NOTICE
+        res["note"] = FULL_NOTICE if full else EXPAND_NOTICE
         return out(res)
     finally:
         conn.close()
-
 
 
 def prompt_preview(conn: sqlite3.Connection, project: Optional[str], declared: set[str],
