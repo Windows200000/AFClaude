@@ -179,6 +179,106 @@ class ComputeRun(unittest.TestCase):
         self.assertEqual((r["end_reason"], r["end"]), ("idle", M(40).isoformat()))   # the earliest end wins
 
 
+class WorkEnd(unittest.TestCase):
+    """D-310: the run's work (work_end) goes on after its end while a worker the run started is in
+    flight and through the task-manager's turns on it; the run's end itself (the dashboard's
+    "stopped", D-224) stays."""
+    READS = [rd(-2, 0, 50), rd(30, 40, 55), rd(55, 80, 60)]
+
+    def compute(self, acts, work, now, **kw):
+        return rm.compute_run(run(), self.READS, acts, [], now=now, work=work, **kw)
+
+    def test_a_worker_in_flight_after_the_stop_keeps_the_work_going(self):
+        """Stopped at 60 while a background worker launched at 30 runs until 100 (no write from
+        70 to 100: a long command); the turn on its notification ends at 102."""
+        work = {"tasks": [(M(30), M(100), False)], "prompts": [(F, False), (M(100), False)]}
+        acts = every(0, 70) + [M(100), M(101), M(102)]
+        r = self.compute(acts, work, M(90), stops=[M(60)])
+        self.assertEqual((r["end_reason"], r["end"]), ("stopped", M(60).isoformat()))
+        self.assertEqual((r["work_ongoing"], r["final"]), (True, False))
+        r = self.compute(acts[:-3], dict(work, tasks=[(M(30), None, False)]), M(90), stops=[M(60)])
+        self.assertEqual((r["work_end"], r["work_ongoing"]), (M(90).isoformat(), True))   # still running now
+        r = self.compute(acts, work, M(200), stops=[M(60)])
+        self.assertEqual((r["end_reason"], r["work_end"], r["work_ongoing"], r["final"]),
+                         ("stopped", M(102).isoformat(), False, True))
+        r = self.compute(acts, work, M(120), stops=[M(60)])
+        self.assertFalse(r["final"])                          # final only FINAL_AFTER after the work's end
+
+    def test_all_idle_ends_the_work_with_the_run(self):
+        work = {"tasks": [(M(10), M(20), False)], "prompts": [(F, False)]}
+        r = self.compute(every(0, 40), work, M(200))
+        self.assertEqual((r["end_reason"], r["end"], r["work_end"], r["work_ongoing"]),
+                         ("idle", M(40).isoformat(), M(40).isoformat(), False))
+        r = self.compute(every(0, 70) + [M(80)], {"tasks": [], "prompts": [(F, False), (M(75), True)]},
+                         M(200), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(70).isoformat())   # the owner's prompt after the stop: their chat
+        r = self.compute(every(0, 40), None, M(200))
+        self.assertEqual(r["work_end"], r["end"])            # no workers known: the run's end
+
+    def test_the_owners_workers_and_a_silent_one_do_not_count(self):
+        """A worker launched in the owner's turn after the stop is the owner's chat; a worker with
+        no transcript write for WORK_SILENCE (a dead process) ends the work at the last write."""
+        work = {"tasks": [(M(65), M(150), True)], "prompts": [(F, False), (M(64), True)]}
+        r = self.compute(every(0, 60) + [M(64), M(65), M(150)], work, M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(60).isoformat())
+        work = {"tasks": [(M(30), M(200), False)], "prompts": [(F, False)]}
+        r = self.compute(every(0, 70) + [M(200)], work, M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(70).isoformat())
+        r = self.compute(every(0, 70), {"tasks": [(M(30), None, False)], "prompts": []}, M(300), stops=[M(60)])
+        self.assertEqual((r["work_end"], r["work_ongoing"]), (M(70).isoformat(), False))
+
+    def test_a_timer_does_not_make_the_owners_chat_the_runs(self):
+        """D-309's keep-warm timer (re-armed after the stop, finishing at 90 and re-armed until
+        120) carries the work through the task-manager's own turns, but the owner's prompt at 95
+        ends it; a real worker in flight would carry the owner's turn too."""
+        timer = [(M(30), M(90), False, True), (M(91), M(120), False, True)]
+        work = {"tasks": timer, "prompts": [(F, False), (M(90), False), (M(95), True)]}
+        acts = every(0, 70) + [M(90), M(91), M(95), M(96), M(110)]
+        r = self.compute(acts, work, M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(91).isoformat())
+        r = self.compute(acts, dict(work, tasks=[(M(30), M(90), False, True), (M(91), M(120), False, False)]),
+                         M(300), stops=[M(60)])
+        self.assertEqual(r["work_end"], M(110).isoformat())   # a real worker: the owner's chat is the run's
+        self.assertTrue(rm.is_timer("t=$(( $(date -d '12:00 UTC' +%s) - $(date +%s) )); sleep $t; echo \"a; b\""))
+        self.assertTrue(rm.is_timer('while [ "$(date +%H%M)" -lt 0901 ]; do sleep 30; done; TZ=Europe/Berlin date +%H:%M'))
+        self.assertFalse(rm.is_timer("sleep 660 && python3 tools/deploy.py"))
+        self.assertFalse(rm.is_timer("pytest -q"))
+
+    def test_the_next_run_caps_the_work(self):
+        work = {"tasks": [(M(30), None, False)], "prompts": []}
+        r = self.compute(every(0, 120), work, M(200), stops=[M(60)], next_fire=M(90))
+        self.assertEqual((r["work_end"], r["work_ongoing"]), (M(90).isoformat(), False))
+
+
+class MainWork(unittest.TestCase):
+    """D-310: main_work() reads the background workers and the prompts' kinds from a transcript."""
+    def test_launches_completions_and_owner_turns(self):
+        def user(m, content, **kw):
+            return {"type": "user", "timestamp": M(m).isoformat(), "message": {"role": "user", "content": content}, **kw}
+        res = [{"type": "tool_result", "content": "x"}]
+        entries = [
+            user(0, "[keep-alive] continue"),
+            user(1, res, toolUseResult={"backgroundTaskId": "b1"}),
+            user(2, res, toolUseResult={"status": "async_launched", "agentId": "a1"}),
+            {"type": "assistant", "timestamp": M(3).isoformat(), "message": {"content": [
+                {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "sleep 1800; date", "run_in_background": True}}]}},
+            user(3, [{"type": "tool_result", "tool_use_id": "u1", "content": "x"}], toolUseResult={"backgroundTaskId": "b2"}),
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": M(10).isoformat(),
+             "content": "<task-notification> <task-id>b1</task-id> done"},
+            user(11, "<task-notification> <task-id>b1</task-id> done", origin={"kind": "task-notification"}),
+            user(20, 'Another Claude session sent a message: <agent-message from="a1"> report', origin={"kind": "peer"}),
+            user(30, "what about X?", origin={"kind": "human"}),
+            user(31, res, toolUseResult={"backgroundTaskId": "b3"}),
+            {"type": "assistant", "timestamp": M(40).isoformat(),
+             "message": {"content": [{"type": "tool_use", "name": "TaskStop", "input": {"task_id": "b2"}}]}},
+            user(41, res, toolUseResult={"backgroundTaskId": "s1"}, isSidechain=True),
+        ]
+        w = rm.main_work(entries, F, M(100))
+        self.assertEqual(w["tasks"], [(M(1), M(10), False, False), (M(2), M(20), False, False),
+                                      (M(3), M(40), False, True), (M(31), None, True, False)])   # b2: a timer
+        self.assertEqual(w["prompts"], [(M(0), False), (M(11), False), (M(20), False), (M(30), True)])
+
+
 class FiresAndReadings(unittest.TestCase):
     def test_fire_kind(self):
         self.assertEqual(rm.fire_kind("window-start-2026-10-08-s2"), "window-start")
@@ -295,7 +395,7 @@ class Update(unittest.TestCase):
             self.assertEqual(len(fh.readlines()), 1)
         mtime = os.path.getmtime(self.out)
         calls = []
-        rows2 = self.up(M(400), activity_fn=lambda *a: calls.append(a) or (None, []))
+        rows2 = self.up(M(400), activity_fn=lambda *a: calls.append(a) or (None, [], None))
         self.assertEqual(rows2, rows)                         # final: not recomputed, file not rewritten
         self.assertEqual(calls, [])
         self.assertEqual(os.path.getmtime(self.out), mtime)
@@ -316,11 +416,50 @@ class Update(unittest.TestCase):
         self.assertEqual([r["run_id"] for r in rows], ["old-run", "window-start-2026-10-08-s2"])
 
     def test_session_activity(self):
-        acts, hits = rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects)
+        acts, hits, work = rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects)
         self.assertEqual(hits, [(M(70), "session")])
         self.assertIn(M(68), acts)                            # a subagent entry counts as activity
         self.assertNotIn(M(70), acts)
-        self.assertEqual(rm.session_activity("nope", F, M(300), self.projects), (None, []))
+        self.assertEqual(work, {"tasks": [], "prompts": [(F, False)]})   # "go" has no human origin
+        self.assertEqual(rm.session_activity("nope", F, M(300), self.projects), (None, [], None))
+
+    def test_a_background_worker_after_the_stop_extends_the_work(self):
+        """D-310 end to end: stopped at 30 while a background command launched at 20 runs until
+        its notification at 120; the turn on it ends at 121. The run row says "stopped" at 30, the
+        split (limit_ratio.combine_spans) counts the run until 121."""
+        import limit_ratio
+        main = os.path.join(self.projects, "-proj", f"{SID}.jsonl")
+        entries = [{"type": "user", "timestamp": F.isoformat(), "message": {"role": "user", "content": "go"}}]
+        entries += [{"type": "assistant", "timestamp": M(m).isoformat(), "message": {"content": "x"}} for m in range(1, 32, 3)]
+        entries += [{"type": "user", "timestamp": M(20).isoformat(), "toolUseResult": {"backgroundTaskId": "b1"},
+                     "message": {"content": [{"type": "tool_result", "content": "started"}]}},
+                    {"type": "user", "timestamp": M(120).isoformat(), "origin": {"kind": "task-notification"},
+                     "message": {"content": "<task-notification> <task-id>b1</task-id> </task-notification>"}},
+                    {"type": "assistant", "timestamp": M(121).isoformat(), "message": {"content": "done"}}]
+        _write(main, entries)
+        os.utime(main, (M(121).timestamp(), M(121).timestamp()))
+        with open(self.state) as fh:
+            st = json.load(fh)
+        st["run_stops"] = {M(30).isoformat(): SID}
+        with open(self.state, "w") as fh:
+            json.dump(st, fh)
+        r = self.up(M(300))[0]
+        self.assertEqual((r["end_reason"], r["end"], r["work_end"], r["final"]),
+                         ("stopped", M(30).isoformat(), M(121).isoformat(), True))
+        self.assertEqual(limit_ratio.combine_spans([r], [], M(300)), [(F, M(121))])
+
+    def test_a_transcript_read_failure_raises(self):
+        """D-235: no run end from part of the session's writes; a transcript removed since the
+        glob listed it is skipped."""
+        from unittest import mock
+        with mock.patch.object(ka, "iter_entries", side_effect=PermissionError("denied")):
+            with self.assertRaises(OSError):
+                rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects)
+            with self.assertRaises(OSError):
+                self.up(M(200))
+        with mock.patch.object(ka, "iter_entries", side_effect=FileNotFoundError("cleaned up")):
+            self.assertEqual(rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects),
+                             ([], [], {"tasks": [], "prompts": []}))   # gone since the glob: skipped
 
     def test_load_readings_range(self):
         r = rm.load_readings(M(10), M(40), self.samples, self.watch)
