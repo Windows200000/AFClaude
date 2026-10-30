@@ -75,6 +75,7 @@ import remote_control  # noqa: E402
 import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
 import decisions  # noqa: E402  (pure: the parser and the entry text, phase 4b)
+import owner_words  # noqa: E402  (the owner's stored messages as evidence, phase 4b Q2)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -2206,7 +2207,8 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     ids = {e.id for e in entries}
     clash = sorted(r[0] for r in conn.execute("SELECT id FROM decisions WHERE origin = 'db'") if r[0] in ids)
     if clash:    # D-235: not silently ignored; nothing is written, and the alert is the caller's (cron, hook, CLI)
-        taken = store.next_decision_id(conn, ids)
+        top_in_file = max((int(i[2:]) for i in ids if i.startswith("D-")), default=0)
+        taken = f"D-{max(top_in_file, int(store.next_decision_id(conn)[2:]) - 1) + 1:03d}"
         raise dec.IdCollision(f"{src}: {', '.join(clash)} is in the file and is also a native entry (written by "
                               f"`decision add` or propose); the import is blocked until the file's entry gets "
                               f"another number (the next free one is {taken}) or the native one is deleted "
@@ -2236,15 +2238,20 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
         elif outcome == "moved":
             moved += 1
     removed = {i: store.delete_decision_entry(conn, i)["body"] for i in gone}
+    # the DB alone gives out ids (Q2): its floor passes every id the file holds, so a native entry never takes one
+    raised = store.raise_decision_id_floor(conn, max((int(e.id[2:]) for e in entries if e.id.startswith("D-")),
+                                                     default=0))
     no_status = [e.id for e in entries if not e.has_status]   # visible without editing DECISIONS.md
     result = {"file": src, "sha256": sha, "entries": len(entries), "added": added, "changed": list(changed),
               "restated": restated, "removed": list(removed), "moved": moved, "no_status": no_status,
-              "detached": detached,
+              "detached": detached, "id_floor_raised": raised,
               "unchanged": len(entries) - len(added) - len(changed) - len(restated) - moved - len(detached)}
     after = {"sha256": sha, "entries": len(entries), "added": added, "changed": changed,
              "restated": restated, "removed": list(removed), "moved": moved}
+    if raised:
+        after["id_floor_raised"] = True
     return Result(result, os.path.basename(src), {"removed_text": removed}, after,
-                  changed=bool(added or changed or restated or removed or moved))
+                  changed=bool(added or changed or restated or removed or moved or raised))
 
 
 def _keyword(value: Any) -> str:
@@ -2301,8 +2308,10 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
 # import owns the other rows (origin 'file'), so edit / expire / delete / confirm refuse those: change the
 # file (the import follows within 10 minutes). Topics, keywords and links work on every row.
 # Who may do what: the owner's words recorded by the task-manager are active at once (D-285), through the
-# CLI (author owner, `words` required); the task-manager's own entries are proposed and wait for the
-# owner (author task-manager; MCP propose); confirming is the owner's (owner-only); changing or removing
+# CLI or MCP record (author owner, `words` required; an autonomous session's words must occur in a stored
+# owner message of its own session, owner_words.py, Q2); the task-manager's own entries are proposed and
+# wait for the owner (author task-manager; MCP propose); confirming is the owner's, or an autonomous
+# session's against an owner message that names the id; changing or removing
 # an owner's entry is the owner's too (D-104, an autonomous MCP session is refused), except that an
 # expired one-off ("active until <date>" in its Status, D-278) may be removed by the task-manager (D-286).
 # Deleting, expiring and replacing are audited with the whole old entry (D-158: the change history).
@@ -2318,7 +2327,8 @@ def _decision_view(d: Mapping[str, Any]) -> dict[str, Any]:
     return {"id": d["id"], "title": d["title"], "state": d["state"], "author": d["author"], "origin": d["origin"],
             "slug": d["slug"], "project_id": d["project_id"], "type": d["type"], "date": d["date"],
             "status": d["status"], "summary": d["summary"], "words": d["words"], "source": d["source"],
-            "scope": d["scope"], "interpretation": d["interpretation"], "keywords": d["effective_keywords"],
+            "scope": d["scope"], "interpretation": d["interpretation"], "supersedes": d["supersedes"],
+            "keywords": d["effective_keywords"],
             "topics": d["topics"], "links": [store.link_text(x) for x in d["links"]], "body": d["body"],
             "version": d["version"]}
 
@@ -2359,26 +2369,60 @@ def _topic_note(conn: sqlite3.Connection, new: list[str]) -> dict[str, Any]:
     return out
 
 
+def _quotes(words: Any) -> list[str]:
+    """`words` as a list of quotes: one string, or a list of strings (the CLI's repeated --words)."""
+    items = [] if words is None else words if isinstance(words, list) else [words]
+    return [q for q in (store._text(w, "words") for w in items) if q]
+
+
+def _owner_evidence(conn: sqlite3.Connection, ctx: Ctx, what: str, quotes: list[str], session: Any, ref: Any,
+                    *, word: bool = False, since: datetime | None = None) -> owner_words.Evidence:
+    """The stored owner message an autonomous caller's write rests on (owner_words.find, in the caller's own
+    session: the MCP actor's, else the `session` the CLI passes from CLAUDE_CODE_SESSION_ID); a refusal
+    says what to do (Forbidden, D-235: no write without the owner's words, D-104, D-285)."""
+    try:
+        return owner_words.find(conn, quotes, ctx.session or store._text(session, "session"),
+                                store._text(ref, "from"), word=word, since=since)
+    except owner_words.OwnerWordsError as err:
+        raise Forbidden(f"{what} by an autonomous AFClaude session needs a message of the owner: {err}") from err
+
+
 @action("decision.add", "decision")
 def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, author: Any,
                  words: Any = None, summary: Any = None, scope: Any = None, source: Any = None,
                  interpretation: Any = None, date: Any = None, status: Any = None, keywords: Any = None,
-                 project: Any = None, slug: Any = None, id: Any = None) -> Result:
+                 project: Any = None, slug: Any = None, supersedes: Any = None, ref: Any = None,
+                 session: Any = None) -> Result:
     """A new decision. author owner: what the owner said, recorded active at once with their exact `words`
-    (required) and the date (D-285); author task-manager: its own entry, proposed until the owner confirms
-    it (decision.confirm). `author` is always given (no default). At least one topic (D-284). The id is the
-    next D-NNN, above every id in the DB and in DECISIONS.md, unless `id` is given (it may not be one the
-    file holds); the slug (default: from the title) is unique per project; project None = install-wide."""
+    (required, a string or a list of quotes) and the date (D-285). From an autonomous AFClaude session (MCP
+    or the CLI inside a launched session) every quote must occur in one stored owner message of its own
+    session (owner_words.find: an inbox message or a transcript prompt; `ref` = inbox:N | chat:S:UUID
+    picks one when several match): the entry's date is that message's time and its source names it (D-104,
+    D-285, D-198). author task-manager: its own entry, proposed until the owner confirms it
+    (decision.confirm); `supersedes` (ids of native entries) are deleted when it is confirmed. `author` is
+    always given (no default). At least one topic (D-284). The id is the next D-NNN from the DB alone (no
+    id parameter, never the file's numbers); the slug (default: from the title) is unique per project;
+    project None = install-wide."""
     store._enum(author, store.DECISION_AUTHORS, "author")
-    if author == "owner" and decision_autonomous(conn, ctx):
-        raise Forbidden("an autonomous AFClaude session records only its own decisions (decision.add with author "
-                        "task-manager, MCP propose); the owner's words are recorded through the CLI (D-285)")
-    f = {k: store._text(v, k) for k, v in (("words", words), ("summary", summary), ("scope", scope),
-                                           ("source", source), ("interpretation", interpretation),
-                                           ("date", date), ("status", status))}
+    quotes = _quotes(words)
+    autonomous = author == "owner" and decision_autonomous(conn, ctx)
+    ev: owner_words.Evidence | None = None
+    if ref is not None and not autonomous:
+        raise ValueError("from (ref) names the owner's message an autonomous session records against: it is "
+                         "not used for the owner's own entry or a proposal")
+    if autonomous:
+        if date is not None:
+            raise ValueError("an owner's decision recorded by an autonomous session takes its date from the "
+                             "owner's message: don't pass a date")
+        ev = _owner_evidence(conn, ctx, "decision.add of an owner's decision", quotes, session, ref)
+        quotes = [owner_words.normalise(q) for q in quotes]
+    f = {k: store._text(v, k) for k, v in (("summary", summary), ("scope", scope), ("source", source),
+                                           ("interpretation", interpretation), ("date", date),
+                                           ("status", status))}
     t = store._text(title, "title", required=True)
-    if author == "owner" and not f["words"]:
+    if author == "owner" and not quotes:
         raise ValueError("an owner's decision needs the owner's exact words (words)")
+    f["words"] = '" ... "'.join(quotes) if quotes else None     # rendered inside one pair of quotes
     tops = _topics(topics, True)
     kws = [_keyword(k) for k in (keywords if isinstance(keywords, list) else [] if keywords is None else [keywords])]
     pid: int | None = None
@@ -2387,10 +2431,11 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
         if p is None:
             raise store.NotFound(f"no project {project!r}")
         pid = p["id"]
-    taken = decisions.file_ids()
-    did = store.decision_id(id) if id is not None else store.next_decision_id(conn, taken)
-    if did in taken:
-        raise ValueError(f"{did} is an entry of DECISIONS.md: a native entry needs another number")
+    sup = [_decision_row(conn, i, native=True)["id"] for i in _ids(supersedes)]
+    if sup and author != "task-manager":
+        raise ValueError("supersedes belongs to a task-manager proposal (confirming it replaces the originals); "
+                         "an owner's entry that replaces another is the owner's to delete it")
+    did = store.next_decision_id(conn)
     state = "active" if author == "owner" else "proposed"
     stat = f["status"] or ("active" if state == "active" else decisions.PROPOSED_STATUS)
     if slug is not None:
@@ -2403,16 +2448,29 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
                            (sl, pid or 0)).fetchone():
             n += 1
             sl = f"{base}-{n}"
-    day = f["date"] or decisions.now_text()
+    day, src = f["date"] or decisions.now_text(), f["source"]
+    if ev is not None:
+        day = ev.at.astimezone(decisions.BERLIN).strftime("%Y-%m-%d %H:%M")
+        src = ev.label + (f"; {src}" if src else "")
+    sup_text = ", ".join(sup) or None
     body = decisions.render_body(did, t, type=author, date=day, status=stat, summary=f["summary"], words=f["words"],
-                      source=f["source"], scope=f["scope"], interpretation=f["interpretation"])
+                                 source=src, scope=f["scope"], interpretation=f["interpretation"],
+                                 supersedes=sup_text)
     row = store.add_decision_entry(conn, {
         "id": did, "title": t, "type": author, "date": day, "status": stat, "state": state, "author": author,
-        "summary": f["summary"], "words": f["words"], "source": f["source"], "scope": f["scope"],
+        "summary": f["summary"], "words": f["words"], "source": src, "scope": f["scope"],
         "interpretation": f["interpretation"], "body": body, "slug": sl, "project_id": pid, "keywords": kws,
-        "topics": tops}, ctx.actor)
+        "topics": tops, "supersedes": sup_text}, ctx.actor)
     view = _decision_view(row)
+    if ev is not None:
+        return Result(dict(view, **_topic_note(conn, tops), evidence=ev.ref), did, None, dict(view, evidence=ev.ref))
     return Result(dict(view, **_topic_note(conn, tops)), did, None, view)
+
+
+def _ids(value: Any) -> list[str]:
+    """A list of decision ids (or one, or none), each checked for shape, once each."""
+    items = [] if value is None else value if isinstance(value, list) else [value]
+    return list(dict.fromkeys(store.decision_id(i) for i in items))
 
 
 def _decision_rerender(cur: Mapping[str, Any], **changes: Any) -> dict[str, Any]:
@@ -2421,7 +2479,7 @@ def _decision_rerender(cur: Mapping[str, Any], **changes: Any) -> dict[str, Any]
     f.update(changes)
     f["body"] = decisions.render_body(cur["id"], f["title"], type=cur["type"], date=f["date"], status=f["status"],
                            summary=f["summary"], words=f["words"], source=f["source"], scope=f["scope"],
-                           interpretation=f["interpretation"])
+                           interpretation=f["interpretation"], supersedes=cur["supersedes"])
     return f
 
 
@@ -2489,25 +2547,53 @@ def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
     return _decision_remove(conn, cur, version, "expired" + (f": {extra}" if extra else ""))
 
 
-@action("decision.confirm", "decision", owner_only=True)
-def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None) -> Result:
-    """The owner confirms a proposal: it becomes active (D-285). Owner-only (an autonomous session is
-    refused). Confirming an entry that is already active is a no-op."""
+@action("decision.confirm", "decision")
+def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None, ref: Any = None,
+                     session: Any = None) -> Result:
+    """The owner confirms a proposal: it becomes active (D-285). An autonomous AFClaude session (the
+    task-manager the owner chats with) confirms only against an owner message of its own session that
+    names the id (owner_words.find; `ref` picks one when several do; D-104, D-198). The entries a
+    proposal `supersedes` are deleted in the same transaction, each audited "replaced by D-NNN"; the
+    confirm is refused (nothing written) if one of them no longer exists. Confirming an entry that is
+    already active is a no-op."""
     cur = _decision_row(conn, decision, native=True)
-    if decision_autonomous(conn, ctx):     # owner_only covers MCP; the CLI is told apart by ctx.autonomous
-        raise Forbidden("decision.confirm is the owner's: an autonomous AFClaude session can't confirm its own "
-                        "proposal (D-285); the owner confirms on the dashboard or with `tasks.py decision confirm`")
+    autonomous = decision_autonomous(conn, ctx)
+    if ref is not None and not autonomous:
+        raise ValueError("from (ref) names the owner's message an autonomous session confirms against; "
+                         "the owner confirms without it")
     _check_version(cur, version, f"decision {cur['id']}")
     if cur["state"] == "active":
         return Result(_decision_view(cur), cur["id"], None, None, changed=False)
     if cur["state"] != "proposed":
         raise store.InvalidTransition(f"{cur['id']} is {cur['state']}, not proposed")
+    ev: owner_words.Evidence | None = None
+    if autonomous:
+        ev = _owner_evidence(conn, ctx, f"decision.confirm of {cur['id']}", [cur["id"]], session, ref, word=True,
+                             since=store.parse_iso(cur["imported_at"]))
+    olds = []
+    for i in decisions.supersedes_ids(cur["supersedes"]):
+        old = store.get_decision_entry(conn, i)
+        if old is None:
+            raise store.NotFound(f"{cur['id']} replaces {i}, which no longer exists: nothing was confirmed; edit "
+                                 f"the proposal's replaced list or propose it again (decision.delete {cur['id']})")
+        olds.append(_decision_row(conn, i, native=True))
     status = "active" if cur["status"] == decisions.PROPOSED_STATUS else cur["status"]
     body = decisions.render_body(cur["id"], cur["title"], type=cur["type"], date=cur["date"], status=status,
-                      summary=cur["summary"], words=cur["words"], source=cur["source"], scope=cur["scope"],
-                      interpretation=cur["interpretation"])
+                                 summary=cur["summary"], words=cur["words"], source=cur["source"],
+                                 scope=cur["scope"], interpretation=cur["interpretation"],
+                                 supersedes=cur["supersedes"])
     after = store.set_decision_state(conn, cur["id"], "active", status, body, ctx.actor)
-    return Result(_decision_view(after), cur["id"], _decision_view(cur), _decision_view(after))
+    for old in olds:
+        store.delete_decision_entry(conn, old["id"])
+        store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", old["id"], _decision_view(old),
+                        {"deleted": True, "reason": f"replaced by {cur['id']}"})
+    extra: dict[str, Any] = {}
+    if olds:
+        extra["replaced"] = [o["id"] for o in olds]
+    if ev is not None:
+        extra["evidence"] = ev.ref
+    return Result(dict(_decision_view(after), **extra), cur["id"], _decision_view(cur),
+                  dict(_decision_view(after), **extra))
 
 
 @action("decision.topics", "decision")

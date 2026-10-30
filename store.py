@@ -4079,18 +4079,23 @@ def _decision_refresh(conn: sqlite3.Connection, did: str) -> Row:
     return after
 
 
-def next_decision_id(conn: sqlite3.Connection, taken: Iterable[str] = ()) -> str:
-    """The next free D-NNN: above every D-number in the table, above the highest one ever given out
-    natively (meta decision_id_floor, so a deleted entry's number isn't reused) and above every one in
-    `taken` (the ids DECISIONS.md holds: the owner's next statement is written there as the next
-    number, so a native entry must not have taken it, D-286)."""
+def next_decision_id(conn: sqlite3.Connection) -> str:
+    """The next free D-NNN: above every D-number in the table and above the highest one ever given
+    out or imported (meta decision_id_floor, so a deleted entry's number isn't reused and the
+    DECISIONS.md import's highest id is passed). The DB alone gives out ids (phase 4b Q2): never the file."""
     top = int(get_meta(conn, "decision_id_floor", 0) or 0)
     for (did,) in conn.execute("SELECT id FROM decisions WHERE id LIKE 'D-%'"):
         top = max(top, int(did[2:]))
-    for did in taken:
-        if did.startswith("D-"):
-            top = max(top, int(did[2:]))
     return f"D-{top + 1:03d}"
+
+
+def raise_decision_id_floor(conn: sqlite3.Connection, number: int) -> bool:
+    """Meta decision_id_floor to at least `number` (the DECISIONS.md import's highest D-number: a native
+    id must never be one the file holds). -> True if it moved."""
+    if number <= int(get_meta(conn, "decision_id_floor", 0) or 0):
+        return False
+    set_meta(conn, "decision_id_floor", number)
+    return True
 
 
 def check_decision_slug(conn: sqlite3.Connection, slug: object, project_id: int | None,
@@ -4110,7 +4115,8 @@ def check_decision_slug(conn: sqlite3.Connection, slug: object, project_id: int 
 def add_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) -> Row:
     """Insert a native decision (origin 'db'). e: id, title, state (proposed | active), author, body,
     the optional DECISION_FIELDS (type, date, status, summary, words, source, scope, interpretation),
-    slug, project_id, keywords, topics. -> the row after. The id must be new."""
+    slug, project_id, keywords, topics, supersedes (a proposal's "D-012, D-015", deleted when it is
+    confirmed). -> the row after. The id must be new."""
     did = decision_id(e["id"])
     if e["state"] not in DECISION_NATIVE_STATES or e["author"] not in DECISION_AUTHORS:
         raise ValueError(f"{did}: a native decision is {'|'.join(DECISION_NATIVE_STATES)}, "
@@ -4122,8 +4128,8 @@ def add_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) 
     conn.execute("INSERT INTO decisions(id, title, type, date, status, state, supersedes, keywords, summary, words, "
                  "source, scope, interpretation, section, body, body_sha256, ord, imported_at, updated_at, "
                  "updated_by, slug, project_id, author, origin) "
-                 "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'db')",
-                 (did, e["title"], e.get("type"), e.get("date"), e.get("status"), e["state"],
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'db')",
+                 (did, e["title"], e.get("type"), e.get("date"), e.get("status"), e["state"], e.get("supersedes"),
                   json.dumps(list(e.get("keywords") or []), ensure_ascii=False), e.get("summary"), e.get("words"),
                   e.get("source"), e.get("scope"), e.get("interpretation"), e["body"], sha256_text(e["body"]),
                   top + 1, now, now, by, e.get("slug"), e.get("project_id"), e["author"]))

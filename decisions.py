@@ -244,19 +244,6 @@ def read_source(path: str) -> tuple[str, str]:
     return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
-def file_ids(path: Optional[str] = None) -> set[str]:
-    """The ids the source file holds (none: an install without a file). A file that exists but can't
-    be read or parsed raises SourceError: an id can't be given out safely then (D-235)."""
-    src = os.path.abspath(path or DEFAULT_SOURCE)
-    if not os.path.exists(src):
-        return set()
-    try:
-        text, _ = read_source(src)
-    except (OSError, UnicodeDecodeError) as err:
-        raise SourceError(f"can't read {src}: {err}") from err
-    return {e.id for e in parse(text)}
-
-
 def check_entries(entries: list[Entry], path: str) -> None:
     """Refuse a source that can't be right: no entries, a duplicate id, an entry without a title,
     an "active until" Status without a valid date (until_of)."""
@@ -282,16 +269,25 @@ def now_text() -> str:
     return datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
 
 
+ID_RE = re.compile(r"\b[DM]-\d{3,}\b")
+
+
+def supersedes_ids(text: Optional[str]) -> list[str]:
+    """The ids a native proposal replaces (its `supersedes` column: "D-012, D-015"; the ids in the text, in
+    order, once each). A file entry's free-text Supersedes line is not read through this."""
+    return list(dict.fromkeys(ID_RE.findall(text or "")))
+
+
 def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str], status: Optional[str],
                 summary: Optional[str], words: Optional[str], source: Optional[str], scope: Optional[str],
-                interpretation: Optional[str]) -> str:
+                interpretation: Optional[str], supersedes: Optional[str] = None) -> str:
     """The entry text of a native decision, in the source's shape ("### D-NNN title", one
     "- **Name:** value" line per field that is set), so show, find and the full-text index treat
     it like an imported one. Topics and links are kept apart from the text."""
     lines = [f"### {did} {title}"]
     for name, value in (("Type", type), ("Date", date), ("Summary", summary),
                         ("Owner's words", f'"{words}"' if words else None), ("Source", source),
-                        ("Scope", scope), ("Status", status),
+                        ("Scope", scope), ("Status", status), ("Supersedes", supersedes),
                         ("Interpretation (task-manager, not binding)", interpretation)):
         if value:
             lines.append(f"- **{name}:** {value}")

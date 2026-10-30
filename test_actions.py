@@ -519,7 +519,8 @@ class Autonomous(Base):
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
-                  "decision.confirm",                                            # D-104/D-285: the owner confirms
+                  # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
+                  # message naming the id (phase 4b Q2, owner_words.py), D-104/D-285
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
     def test_owner_only_set(self):
