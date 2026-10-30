@@ -750,15 +750,34 @@ RUN_END_GRACE = timedelta(minutes=10)   # the meter lags the run's last turn a l
 FIRE_COVER = timedelta(minutes=2)       # a fire this close to a run row's span belongs to that run
 
 
+class Spans(list):
+    """combine_spans' result: the merged spans [(start, end)] (a list, as before) plus `tails`:
+    the parts of them only a run row's end..work_end covers (D-310: its workers finishing, the
+    owner chatting with the idle task-manager), merged and sorted. pacing books an interval only
+    a tail covers by its tokens (the AFClaude sessions' share to the run), not all to the run."""
+    tails = ()
+
+
+def _merge(spans):
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
 def combine_spans(run_rows=(), fallback=(), now=None):
-    """Autonomous AFClaude periods [(start, end)], merged and sorted.
+    """Autonomous AFClaude periods [(start, end)], merged and sorted (a Spans: .tails = the parts
+    only a row's end..work_end covers).
     run_rows: run_metrics rows (data/afclaude_runs.jsonl): start..the end of the run's work
     (work_end, D-310: its background workers and the turns on them after the run's end; a row
     from before it: the run's end), an ongoing run or work until `now`.
     fallback: [(fire, end)] from pacing.autonomous_spans; for fires no run row covers (a fire
     run_metrics hasn't written yet, a usage-review or dispatcher run), and for a covered one the
     part after the row's end (clipped there, D-310)."""
-    spans = []
+    spans, main = [], []
     for r in run_rows or []:
         if not isinstance(r, dict):
             continue
@@ -768,6 +787,8 @@ def combine_spans(run_rows=(), fallback=(), now=None):
         if r.get("ongoing") or r.get("work_ongoing") or b is None:
             b = max(b or a, now or a)
         spans.append((a, max(a, b)))
+        e = None if r.get("ongoing") else _parse_ts(r.get("end"))     # the run itself: up to its end
+        main.append((a, max(a, b if e is None else min(e, b))))
     rows_spans = list(spans)
     for a, b in fallback or []:
         a, b = _parse_ts(a), _parse_ts(b)
@@ -779,13 +800,18 @@ def combine_spans(run_rows=(), fallback=(), now=None):
             if b <= a:
                 continue
         spans.append((a, max(a, b)))
-    spans.sort()
-    out = []
-    for a, b in spans:
-        if out and a <= out[-1][1]:
-            out[-1] = (out[-1][0], max(out[-1][1], b))
-        else:
-            out.append((a, b))
+        main.append((a, max(a, b)))
+    out, tails, main = Spans(_merge(spans)), [], _merge(main)
+    for a, b in out:                    # the merged spans minus the runs themselves = the tails
+        at = a
+        for x, y in main:               # each run piece lies inside one merged span
+            if a <= x and y <= b:
+                if at < x:
+                    tails.append((at, x))
+                at = max(at, y)
+        if at < b:
+            tails.append((at, b))
+    out.tails = tails
     return out
 
 

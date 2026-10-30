@@ -474,13 +474,17 @@ def own_other_tokens(row):
 
 
 def _intervals(rows, fires, runs=None, spans=None):
-    """-> [(t0, t1, weekly-% rise, auto, cycle, design)] of consecutive samples in one weekly cycle
-    (<= 1 h apart); auto = the interval overlaps an autonomous AFClaude run; design = the part of
-    the rise outside a run that is the owner's design chats (D-266): rise x own / (own + other)
-    weighted tokens of the sample intervals in (t0, t1] (own_other_tokens; no local tokens: 0,
-    another device), 0 inside a run. Across a one-off reset (the meter >= limit_ratio.RESET_DROP
-    below the previous reading, same reset time) the meter restarted at 0: the rise is the reading
-    after the drop. spans = the run spans if the caller has them (else run_spans())."""
+    """-> [(t0, t1, weekly-% rise, auto, cycle, design, tail)] of consecutive samples in one weekly
+    cycle (<= 1 h apart); auto = the interval overlaps an autonomous AFClaude run; design = the
+    part of the rise outside a run that is the AFClaude sessions' (D-266): rise x own / (own +
+    other) weighted tokens of the sample intervals in (t0, t1] (own_other_tokens; no local tokens:
+    0, another device), 0 inside a run; tail = auto, but only a run's end..work_end tail covers it
+    (limit_ratio.Spans.tails, D-310: the run's workers finishing, the owner chatting with the idle
+    task-manager): its design share is the run's, the rest the owner's other use, as outside a run.
+    Outside a run and its tails the design share is the owner's design chats. Across a one-off
+    reset (the meter >= limit_ratio.RESET_DROP below the previous reading, same reset time) the
+    meter restarted at 0: the rise is the reading after the drop. spans = the run spans if the
+    caller has them (else run_spans())."""
     tok, acc = {}, [0.0, 0.0]
     for r in rows:                      # tokens of skipped (stale) rows go to the next kept one
         if not _ts(_dict(r).get("at")):
@@ -491,6 +495,7 @@ def _intervals(rows, fires, runs=None, spans=None):
             tok[id(r)], acc = tuple(acc), [0.0, 0.0]
     rows = [r for r in rows if _num(_weekly(r).get("percent")) and _ts(r.get("at"))]
     spans = run_spans(rows, fires, runs) if spans is None else spans
+    tails = getattr(spans, "tails", ())
     out = []
     for p, c in zip(rows, rows[1:]):
         t0, t1 = _ts(p["at"]), _ts(c["at"])
@@ -499,10 +504,12 @@ def _intervals(rows, fires, runs=None, spans=None):
             continue
         pw, cw = float(_weekly(p)["percent"]), float(_weekly(c)["percent"])
         dw = limit_ratio.meter_rise(pw, cw)
-        auto = any(a < t1 and t0 < b for a, b in spans)
+        hit = [(max(t0, a), min(t1, b)) for a, b in spans if a < t1 and t0 < b]
+        auto = bool(hit)
+        tail = auto and all(any(x <= a and b <= y for x, y in tails) for a, b in hit)
         own, oth = tok.get(id(c), (0.0, 0.0))
-        design = 0.0 if auto or own + oth <= 0 else dw * own / (own + oth)
-        out.append((t0, t1, dw, auto, cyc, design))
+        design = 0.0 if auto and not tail or own + oth <= 0 else dw * own / (own + oth)
+        out.append((t0, t1, dw, auto, cyc, design, tail))
     return out
 
 
@@ -528,8 +535,9 @@ def cycle_totals(rows):
 
 def cycle_split(rows, spans, cycle):
     """pacing's three-way split of one weekly cycle's weekly % (D-266, D-221; _intervals, the
-    numbers the forecast is fitted on): run = intervals overlapping an AFClaude run, design = the
-    owner's design chats outside runs, other = the rest (other sessions on this host, other
+    numbers the forecast is fitted on): run = intervals overlapping an AFClaude run (one only a
+    run's work tail covers: its design share, D-310), design = the owner's design chats outside
+    runs, other = the rest (other sessions on this host, other
     devices: `other_unseen_pct` = the part in intervals with no local tokens). `total_pct` = the
     cycle's weekly % so far (cycle_totals, one-off resets summed); `uncovered_pct` = the part no
     interval covers (before the first reading, gaps > 1 h, a stale stretch). spans = the AFClaude
@@ -546,14 +554,17 @@ def cycle_split(rows, spans, cycle):
         if _num(_weekly(r).get("percent")):
             tok[_ts(r["at"])], acc = acc, 0.0
     n = 0
-    for t0, t1, dw, auto, cyc, des in _intervals(rows, [], spans=spans):
+    for t0, t1, dw, auto, cyc, des, tail in _intervals(rows, [], spans=spans):
         if cyc != cycle:
             continue
         n += 1
-        if auto:
+        if auto and not tail:
             run += dw
             continue
-        design += des
+        if tail:
+            run += des
+        else:
+            design += des
         other += dw - des
         if dw > 0 and tok.get(t1, 0.0) <= 0:
             unseen += dw
@@ -571,21 +582,25 @@ def cycle_split(rows, spans, cycle):
 
 def user_intervals(rows, fires, runs=None):
     """-> [(t0, t1, weekly-% rise outside AFClaude's runs)] of consecutive samples in one weekly
-    cycle (<= 1 h apart), 0 inside an autonomous AFClaude run (run_spans). Outside the runs = the
-    user's other use + the owner's design chats (other_intervals: without the design chats)."""
-    return [(t0, t1, 0.0 if auto else dw) for t0, t1, dw, auto, _, _ in _intervals(rows, fires, runs)]
+    cycle (<= 1 h apart), 0 inside an autonomous AFClaude run (run_spans; in a run's work tail its
+    other use, D-310). Outside the runs = the user's other use + the owner's design chats
+    (other_intervals: without the design chats)."""
+    return [(t0, t1, dw - d if tail else 0.0 if auto else dw)
+            for t0, t1, dw, auto, _, d, tail in _intervals(rows, fires, runs)]
 
 
 def other_intervals(rows, fires, runs=None):
     """-> [(t0, t1, the user's other weekly-% use)]: outside AFClaude's runs and without the
-    owner's design chats; what the night gate forecasts (forecast_user, D-308)."""
-    return [(t0, t1, 0.0 if auto else dw - d) for t0, t1, dw, auto, _, d in _intervals(rows, fires, runs)]
+    owner's design chats (in a run's work tail: without its design share, the run's, D-310); what
+    the night gate forecasts (forecast_user, D-308)."""
+    return [(t0, t1, 0.0 if auto and not tail else dw - d)
+            for t0, t1, dw, auto, _, d, tail in _intervals(rows, fires, runs)]
 
 
 def design_intervals(rows, fires, runs=None):
     """-> [(t0, t1, design-chat weekly-% rise)] (D-266: the owner's chats with the task-manager
-    outside runs, _intervals' design part)."""
-    return [(t0, t1, d) for t0, t1, _, _, _, d in _intervals(rows, fires, runs)]
+    outside runs and their work tails, _intervals' design part)."""
+    return [(t0, t1, 0.0 if tail else d) for t0, t1, _, _, _, d, tail in _intervals(rows, fires, runs)]
 
 
 # Predictor defaults (generic; the user model's "predictor" object overrides them per user):
@@ -653,12 +668,12 @@ def fit_profile(rows, fires, now, runs=None, params=None):
     closed = sorted({x[4] for x in iv if x[4] is not None and x[4] <= now})[-FIT_CYCLES:]
     keep = set(closed)
     hours, rise, design = [0.0] * 168, [0.0] * 168, 0.0
-    for t0, t1, dw, auto, cyc, des in iv:
+    for t0, t1, dw, auto, cyc, des, tail in iv:
         if cyc in keep:
             k = _how(t1 - timedelta(seconds=1))
             hours[k] += (t1 - t0).total_seconds() / 3600
-            rise[k] += 0.0 if auto else dw - des
-            design += des
+            rise[k] += 0.0 if auto and not tail else dw - des
+            design += 0.0 if tail else des
     covered = sum(hours)
     if covered < MIN_FORECAST_HOURS:
         return None, (f"too little user data for a forecast ({covered:.0f} h of closed weeks < "
@@ -667,14 +682,14 @@ def fit_profile(rows, fires, now, runs=None, params=None):
     rates = Profile((rise[k] + m * mean) / (hours[k] + m) if hours[k] + m > 0 else mean for k in range(168))
     rates.design_week, rates.design_weeks = 168.0 * design / covered, len(closed)
     # the weekly budget: per closed cycle, its final weekly % (one-off resets summed) minus AFClaude's own rise in it
-    # (its runs and the design chats)
+    # (its runs, the design share of their work tails and the design chats)
     ctot = cycle_totals(rows)     # a cycle with a one-off reset: the sum of its segments (§3.5)
     last = {c: r for c, (_, r) in ctot.items()}
     auto, cov = {}, {}
-    for t0, t1, dw, a, cyc, des in iv:
+    for t0, t1, dw, a, cyc, des, tail in iv:
         cov[cyc] = cov.get(cyc, 0.0) + (t1 - t0) / WEEK
         if a or des:
-            auto[cyc] = auto.get(cyc, 0.0) + (dw if a else des)
+            auto[cyc] = auto.get(cyc, 0.0) + (dw if a and not tail else des)
     totals = [max(ctot[c][0] - auto.get(c, 0.0), 0.0) for c in closed
               if c in last and c - _ts(last[c]["at"]) <= FINAL_MAX_GAP and cov.get(c, 0.0) >= BUDGET_MIN_COVERAGE]
     info = (f"forecast from {len(closed)} closed week(s), {covered:.0f} h, {sum(rise):.0f}% other user usage; "
@@ -684,7 +699,7 @@ def fit_profile(rows, fires, now, runs=None, params=None):
     if open_c and P["budget_weight"] > 0:     # the design chats' weekly amount left in the open cycle
         c = min(open_c)
         rates.design_end, rates.design_as_of = c, _ts(last[c]["at"])
-        rates.design_used = sum(des for _, _, _, _, cyc, des in iv if cyc == c)
+        rates.design_used = sum(des for _, _, _, _, cyc, des, tail in iv if cyc == c and not tail)
         rates.design_weight = P["budget_weight"]
         info += f", {rates.design_used:.0f}% used this week (AFClaude's)"
     if totals and open_c and P["budget_weight"] > 0:

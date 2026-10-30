@@ -461,7 +461,7 @@ class Predictor(unittest.TestCase):
         burn = (self.OLD - timedelta(days=2), self.OLD - timedelta(days=2) + timedelta(hours=2))
         old2 = self.week(tue_rate=0.0, other_rate=0.3, burn=burn)
         r2, _ = pm.fit_profile(old2 + cur, [burn[0]], now, params=P)
-        auto = sum(dw for _, _, dw, a, _, _ in pm._intervals(old2, [burn[0]]) if a)
+        auto = sum(dw for _, _, dw, a, _, _, _ in pm._intervals(old2, [burn[0]]) if a)
         self.assertGreaterEqual(auto, 10.0)                        # the run's 2 h x 5 %/h (+ its intervals' user rise)
         self.assertAlmostEqual(r2.week_total, old2[-1]["usage"]["weekly"]["percent"] - auto, places=3)
         # weight 0, no open-cycle reading, or no final reading of the closed cycle: the rates alone
@@ -595,6 +595,56 @@ class Predictor(unittest.TestCase):
         self.assertAlmostEqual(sp["own_share"], 7.0 / 17.0)                 # still AFClaude's
         self.assertEqual(pm.cycle_split(rows, None, R)["status"], "insufficient_data")
         self.assertEqual(pm.cycle_split(rows, [], None)["status"], "insufficient_data")
+
+    def test_a_runs_work_tail_moves_only_its_design_share(self):
+        """D-310: an interval only the run's end..work_end tail covers books its AFClaude-session
+        share (the design share) to the run and the rest as the owner's other use; one the run
+        itself overlaps stays all the run's."""
+        import limit_ratio
+        sonnet = lambda n: {"tokens": {"claude-sonnet-5": {"out": n, "think": 0}}}   # noqa: E731
+        t0 = self.OLD
+        ws = [(4, None, None), (10, sonnet(100), None), (14, sonnet(50), sonnet(50)), (15, None, sonnet(100)),
+              (17, sonnet(100), None)]
+        rows = [row(t0 + timedelta(minutes=15 * (i + 1)), w, reset=R, own=o, other=x) for i, (w, o, x) in enumerate(ws)]
+        m = lambda n: (t0 + timedelta(minutes=n)).isoformat()   # noqa: E731
+        runs = [{"start": m(10), "end": m(20), "work_end": m(50), "ongoing": False, "work_ongoing": False}]
+        now = t0 + timedelta(hours=2)
+        spans = limit_ratio.combine_spans(runs, [], now)
+        self.assertEqual(list(spans), [(t0 + timedelta(minutes=10), t0 + timedelta(minutes=50))])
+        sp = pm.cycle_split(rows, spans, R)
+        # 4 -> 10 the run; 10 -> 14 and 14 -> 15 the tail: half and none of it the run's; 15 -> 17 a design chat
+        self.assertEqual((sp["run_pct"], sp["design_pct"], sp["other_pct"]), (6.0 + 2.0, 2.0, 2.0 + 1.0))
+        self.assertEqual(sp["uncovered_pct"], 4.0)
+        self.assertAlmostEqual(sp["own_share"], 10.0 / 13.0)
+        self.assertEqual([v for _, _, v in pm.other_intervals(rows, [], runs)], [0.0, 2.0, 1.0, 0.0])
+        self.assertEqual([v for _, _, v in pm.user_intervals(rows, [], runs)], [0.0, 2.0, 1.0, 2.0])
+        self.assertEqual([v for _, _, v in pm.design_intervals(rows, [], runs)], [0.0, 0.0, 0.0, 2.0])
+        # without the work_end (a row from before D-310, or stage_eta's run_ends) the tail is outside the run
+        old = [{k: v for k, v in runs[0].items() if k != "work_end"}]
+        self.assertEqual([v for _, _, v in pm.design_intervals(rows, [], old)], [0.0, 2.0, 0.0, 2.0])
+
+    def test_fit_profile_books_a_work_tail_by_its_tokens(self):
+        """D-310: in a run's work tail the other use stays in the profile and the weekly budget;
+        only the design share is AFClaude's (not a design chat, not all of the tail's rise)."""
+        old = self.week()
+        tail = range(400, 408)                                    # 2 h of the closed week
+        for i in tail:
+            old[i]["activity"] = {"own": {"tokens": {"claude-sonnet-5": {"out": 30, "think": 0}}},
+                                  "other": {"tokens": {"claude-sonnet-5": {"out": 10, "think": 0}}}}
+        at = lambda i: old[i]["at"]   # noqa: E731
+        run = {"start": at(390), "end": at(399), "ongoing": False, "work_ongoing": False}
+        now = self.OLD + timedelta(days=2)
+        cur = [row(self.OLD + timedelta(minutes=15 * (i + 1)), round(0.0125 * (i + 1), 4), reset=R) for i in range(192)]
+        P = {"shrink_hours": 0.0, "budget_weight": 0.5}
+        fit = lambda r: pm.fit_profile(old + cur, [], now, runs=[r], params=P)[0]   # noqa: E731
+        plain, tailed, whole = fit(run), fit(dict(run, work_end=at(407))), fit(dict(run, end=at(407)))
+        self.assertAlmostEqual(sum(tailed), sum(plain), places=6)            # the other use: as outside the run
+        self.assertAlmostEqual(tailed.week_total, plain.week_total, places=6)
+        self.assertGreater(sum(tailed), sum(whole) + 1e-6)                   # not all the run's
+        design = sum(0.1 / 4 * 0.75 for _ in tail)                           # 3/4 of the tail's rise: own tokens
+        covered = (len(old) - 1) / 4                                         # hours of the closed week
+        self.assertAlmostEqual(plain.design_week - tailed.design_week, 168.0 * design / covered, places=6)
+        self.assertAlmostEqual(tailed.design_week, whole.design_week, places=6)
 
     def test_own_other_tokens(self):
         import usage_sampler
