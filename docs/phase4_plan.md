@@ -26,7 +26,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 | `prompt_defaults`, `prompt.defaults_sync` | `store.py import-prompts` at every container start (D-227) | built |
 | decision store, first version | `decisions` + `decisions_fts` (LIKE without FTS5), `decisions.py` (importer from `DECISIONS.md`, every 10 min and at the hook), `decision.import` / `decision.keywords` (audited), `tasks.py decision tldr\|find\|show\|keywords\|import`, MCP `afclaude_decisions` (find/show, `full=false` lists ids + keywords), SessionStart TLDR in 3 parts (compact/startup/clear, D-242) | built; `DECISIONS.md` is still the source; states `active\|partial\|done\|superseded`, "expired …" and "active until <date>" Status lines (D-278) |
 | Q1 (built, branch `4b-q1`) | `slug`, `project_id`, `author`, `origin`, `decision_topics`, `decision_links`, state `proposed`; `decision.add\|edit\|expire\|delete\|confirm\|link\|topics`, `tasks.py decision ...`, MCP `propose` | see Q1 |
-| not yet | seeding (Q2), proposals as questions (Q3) | — |
+| not yet | seeding, owner-word evidence, DB-only ids (Q2); proposals as questions (Q3) | — |
 | questions | `tasks` kind `question` (born blocked, closed by `task.answer`), MCP `afclaude_ask`; `OPEN_QUESTIONS.md` (local) read by the quickview in full (D-279) | two sources |
 | messages | `inbox_messages` (verbatim, triage, hold, delivery, `tasks.py inbox reply`), `inbox_api`/`inbox_worker`, quickview box | built for the AFClaude task-manager; no threads, no MCP reply tool |
 
@@ -50,9 +50,15 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 
 ### 3.3 Decisions (4b)
 - Columns added to `decisions`: `slug`, `project_id` (NULL = install-wide), `author` (`owner|task-manager`). A new table `decision_topics(decision_id, topic)` holds the free keywords (D-284): one or more per entry, "all" allowed where it applies to everything, not a predetermined list; the prompts that write a decision encourage a low count without enforcing one. The state set gains `proposed`; the CHECK constraint makes that a table rebuild, so it goes through `store.MIGRATIONS` and `store.py migrate` (backup first, design §7.1). No `expired` state: an expired one-off is deleted like any decision that no longer applies, audited (D-286).
-- Writes: `decision.add`, `decision.edit` (overwrite, old and new in the audit row, D-158), `decision.expire` (deletes with the reason "expired" in the audit row, D-286), `decision.delete`, `decision.confirm` (a proposal becomes active), `decision.link` (`refines|requires|conflicts`, shown with every hit), `decision.topics` (add/remove keywords). Who may write what: question 2 (below; unrelated to the now-answered D-284/285/286).
+- Writes: `decision.add`, `decision.edit` (overwrite, old and new in the audit row, D-158), `decision.expire` (deletes with the reason "expired" in the audit row, D-286), `decision.delete`, `decision.confirm` (a proposal becomes active), `decision.link` (`refines|requires|conflicts`, shown with every hit), `decision.topics` (add/remove keywords). Who may write what: the owner (dashboard, the owner's own CLI, the owner's own sessions on this server, D-290) writes anything. An autonomous session, which includes the task-manager while the owner chats in its tmux session (it runs with `CLAUDE_GUARD_DISABLE=1`, and D-198 makes a session AFClaude started a task-manager/agent whatever it carries), records an owner entry or confirms a proposal only against an owner message it cites (owner words, next item). Its own entries are `proposed` (D-285). It never edits or deletes an owner's entry (D-104).
+- **Owner words (Q2).** The owner's role is never inferred from the owner's presence. What has to be proven is that the owner said it. `decision.add --author owner` from an autonomous caller must quote words that occur in one stored owner message, and `decision.confirm` must cite one that names the entry's id. A stored owner message is either an `inbox_messages` row with `created_by = owner`, or an owner prompt in a session transcript. An owner prompt is a non-sidechain, non-meta user entry with origin kind `human`, not a tool result and not starting with a keep-alive prefix: `compact_timing`'s existing rule, moved into `owner_words.py`. The quote is matched after whitespace normalisation; case and typos must match exactly. The entry's date is the message's time, and the source and audit row carry the reference (`inbox #N` / `chat <session> <time>`). No match, or several messages that match, is refused (D-235). In the second case the caller picks one with `--from inbox:N|chat:<session>:<uuid>`. Inbox deliveries arrive in the transcript behind the `[AFClaude inbox #N]` prefix, so they are cited by inbox id. The owner's own non-autonomous calls are unchanged.
+- **Ids (Q2).** The DB alone gives out ids: `store.next_decision_id` takes the highest id in the table and the meta `decision_id_floor`, never the file. `decision.add` has no `id` parameter, and only the seeding keeps the file's ids. `M-NNN` ids stay as they are; new entries are always `D-NNN`.
 - The TLDR and `find` without `full` list id + **title** (D-284: titles stay; topics are keywords used to find entries, not a label that replaces the title in listings); `show` / `full=true` gives the entry, its topics and D-176's expand-before-acting notice. Keywords as built, reused before a new topic is added.
-- Seeding (§7.6): active owner entries verbatim as `active`; superseded and drift (`DR-NN`) entries into the audit log only; partly superseded entries merged by the task-manager into one `proposed` entry; expired one-offs into the audit log only too (D-286, not kept as rows).
+- Seeding (§7.6, Q2). The rows are in the table already as `origin = file`, imported verbatim, so seeding re-keys them in place:
+  - Active entries (owner's and the task-manager's) become `db` rows unchanged.
+  - Superseded entries, done ones and expired one-offs are deleted, each with its full text in the audit row (D-158/D-286).
+  - The `DR-NN` drift entries and the file's non-entry sections (purpose and rules, unverified, open, extraction notes) get one audit row each, so the file's whole content is in the DB.
+  - A partly superseded entry stays `active` with its owner's words, its state still `partial`, until the owner confirms the task-manager's merged rewording. That rewording is a `proposed` entry whose `supersedes` lists the originals, and confirming it deletes them in the same transaction. Nothing is lost or blocked while it waits (D-104: an entry stays in force until the owner confirms the change).
 
 ### 3.4 Questions and proposals (4b)
 - A question stays a `tasks` row of kind `question` (§7.2: "questions as tasks"), with `project_id`, the full text (D-279) and an optional `payload` (a decision draft) for a proposal. Answering a proposal approve / edit / reject applies `decision.add|edit|confirm` in the same transaction, actor = the answering human (D-104).
@@ -67,7 +73,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 ## 4. Order
 
 - P1 has no dependency (built now). P2 after P1. P3 needs the start to know its project (3b S4); until then 3b sends other projects the rules inline without `manager_afclaude.md`, and P3 replaces that with the generic template. P4 any time after P2. P5 last.
-- 4b Q1–Q3 need no 3b step. Q4's waking needs 3b S5 (run-now). Q5 after Q1–Q4 have run one week.
+- 4b Q1–Q3 need no 3b step. Q2 must come before Q3 and is not merged with it (Q2 "Q1 review findings" 2). Q2's two workers run one after the other. Q4's waking needs 3b S5 (run-now). Q5 after Q1–Q4 have run one week.
 - Code the live system imports (`keepalive.py`, `usage_sampler.py`, `dispatcher.py`, `inbox_worker.py`) changes only in worktrees; P2 and P3 touch `keepalive.session_message`, so they are not run in parallel with a 3b step that edits it.
 
 ## 5. Steps
@@ -111,20 +117,112 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 
 - **Built (branch `4b-q1`):** schema v5 (`store.MIGRATIONS[5]`, `_migrate_v5`: `decisions` rebuilt for the `proposed` state, new columns `slug`, `project_id`, `author` (from the written Type: owner -> owner, else task-manager) and `origin`; new tables `decision_topics`, `decision_links`); the actions in §3.3 with these rules: `decision.add` takes at least one topic (D-284), author `owner` needs the exact `words` and is active at once (D-285; refused for an autonomous MCP session), author `task-manager` is `proposed` (MCP `propose`); `confirm` is owner-only; an autonomous session can't edit or delete an owner's entry (D-104) and may expire one only when its Status is an "active until" date that has passed (D-278/D-286); `expire` / `delete` remove the row with its topics and links and keep the old entry and the reason in the audit row (no `expired` state, D-286). An extra column `origin` (`file` | `db`): until Q2 the 10-min DECISIONS.md import owns the `file` rows and never touches a `db` row (a file entry with the id of a `db` row is refused: `IdCollision`, the import stops and alerts; new ids are above every id in the DB and in DECISIONS.md); `edit` / `expire` / `delete` / `confirm` refuse a `file` row (change the file), topics, keywords and links work on both; Q2's seeding turns `file` rows into `db` rows and then `origin` can go. New ids are the next `D-NNN` (zero-padded to three digits, above every D-number in the table and every one given out before). TLDR and `find` list id + title; `find` also matches topics; `show` / `full=true` / `tasks.py decision show` carry the expand notice; `manager.md` line 16 tells the task-manager to propose its own decisions with one to three reused topics. MCP tool list 16283 -> 17056 bytes (test bound 16500 -> 17500). Deploy: `docker/entrypoint.sh` runs `store.py migrate` first at every container start (backup `<db>.v4-<utc>.bak` first; a no-op when current; a failed migrate alerts out of the DB, writes no further backup while the DB is unchanged (an identical earlier one is reused) and makes the container idle, unhealthy, instead of restarting in a loop; `runner.py health` names the schema state). **Rollback:** there is no down-migration, so rolling back to a v4 image means restoring the `<db>.v4-<utc>.bak` backup over the database first (stop the container, copy it back, start the old image); v4 code refuses to write to a v5 database (`SchemaTooNew`), and a long-running v4 MCP server must be reconnected (`/mcp`) after an update. A v3 database now also needs `store.py migrate` (it used to upgrade on connect). Left for later: the length-capped relevance-only `summary` (D-176's cap; the entry's own Summary is stored as written), `decision_links` in the TLDR, project filter in `find`.
 
-**Q2: seeding.**
-- **Build:** the one-off import per §3.3 (task-manager writes each entry's topics; partly superseded entries merged as `proposed`); the 10-min `DECISIONS.md` import stops.
-- **Tests:** synthetic sources: every active entry once, verbatim; superseded/drift/expired-one-off only in the audit log; counts match.
-- **Done when:** the owner has the merged `proposed` entries as questions; `decision tldr` lists every current entry.
+**Q2: seeding. The DB becomes the only source and the DECISIONS.md import is retired.**
+- **The four Q1 review findings:**
+  1. **Owner presence.** Owner words, not an owner role (§3.3). Treating the task-manager as the owner while the owner is attached would contradict D-198: a session AFClaude started counts as task-manager or agent whatever it carries, and D-290 covers only sessions the owner starts outside AFClaude. It would also let the task-manager put a reading into the owner's mouth whenever the owner happens to be there. That is the drift D-104 guards against (DR-09, DR-13). A quote tied to a stored owner message is the evidence D-285 asks for: the exact words and the date. The inbox (D-241/D-244) and the transcript already hold every owner message verbatim, so nothing new is stored.
+  2. **Confirm UI.** Q2 does not need one. A partly superseded original stays in force, and its rewording waits as `proposed` (§3.3), so nothing waits on the owner. Q3 asks the owner about these proposals together with every other one. Keep the order Q2 then Q3, and don't merge them:
+     - Q3's approve and edit act on native rows, and `edit` refuses `file` rows.
+     - Each step is one worker's scope.
+     - Q3 should start right after Q2.
+     - No interim `OPEN_QUESTIONS.md` items. Q3 imports that file as questions, so the owner would answer twice. If the owner confirms one in chat in the meantime, the task-manager confirms it, citing that message (§3.3).
+  3. **Ids.** The DB is the only owner of ids (§3.3). The seeding raises `decision_id_floor` to the file's highest id, `decision.add` loses `id`, and `decisions.file_ids` goes.
+  4. **Container.** This goes away with 3: no id path reads the file any more. In the short gap between the Q2 deploy and the seeding, every import also raises `decision_id_floor` to the file's highest id, so the container's allocator is at most one import behind. The task-manager writes no native entry in that gap (cut-over step 1).
+- **Build, two Sonnet workers.** Both edit `actions.py`, so they run one after the other, W2 on top of W1.
+  - **W1: owner words and ids.**
+    - `owner_words.py` (mypy --strict): `find(conn, quotes, session, ref=None) -> Evidence(ref, at, text)` over the inbox rows for that session and its transcript (`keepalive.transcript_path`'s lookup, read-only). `compact_timing` imports the prefix list and owner-prompt rule from it.
+    - `decision.add`: author owner from an autonomous caller needs evidence. The date and source come from the evidence. `--words` may be repeated, one quote each.
+    - `decision.confirm` from an autonomous caller needs an owner message that names the id.
+    - A proposal's `supersedes` (a list of ids) is deleted on confirm, audited "replaced by D-NNN". The confirm is refused if one of those ids no longer exists.
+    - MCP `afclaude_decisions` gains `record` (author owner, with `from`); keep the tool-list bound.
+    - Ids as §3.3. `import_file` raises `decision_id_floor`.
+    - A test that every bundle typed into tmux starts with a keep-alive prefix, so AFClaude's own text never passes for the owner's.
+  - **W2: seeding, retirement, texts.**
+    - `python3 decisions.py seed --topics F --merges F [--dry-run] | --undo`, which runs the action `decision.seed`. CLI only, refused through MCP. It re-keys what the import already holds, so the task-manager's CLI may run it.
+    - Preconditions:
+      - The file imports cleanly at the start of the run.
+      - Every surviving entry has 1-3 topics in F (D-284; F is written by the task-manager or a subagent from the keywords, few topics reused).
+      - Every `done` entry whose Status still names an active part (e.g. "done (the guard stays active)") is covered by a merge or listed under `keep`.
+      - Anything else is refused before any write.
+    - Backup `<db>.preseed-<utc>.bak` (`store._backup_copy`).
+    - One transaction:
+      - the classes in §3.3;
+      - merges become `proposed` task-manager entries, whose words are the originals' owner quotes verbatim with their dates and whose `supersedes` lists the originals;
+      - meta `decisions_source=db`, `decisions_seed_sha`, `decision_id_floor`, `decisions_seeded` (ids and versions).
+    - It prints the counts per class against the file's.
+    - After the seeding:
+      - `import_file` / `cron_import` / `tasks.py decision import` no longer import.
+      - A file whose sha differs from `decisions_seed_sha` alerts once per episode: "DECISIONS.md changed after the cut-over; record it with `tasks.py decision add`".
+      - The SessionStart hook builds the TLDR from the DB only, and its failure text names `tasks.py decision find` instead of the file.
+    - `--undo`:
+      - It is refused if a seeded row changed since (version) or a seeded proposal was confirmed.
+      - Otherwise it flips the seeded rows back to `file`, deletes the seed's proposals (audited) and sets the source back to `file`.
+      - The next import re-adds the deleted rows from the untouched file, and native rows written since stay.
+    - A separate last commit, merged only after the seeding (cut-over step 5), holds the text changes:
+      - `CLAUDE.md` line 7 becomes "decisions live only in the DB. Record an owner statement at once with `python3 tasks.py decision add --author owner --title … --words "<verbatim>" --topic …` (the words must be in the owner's message; `--from` when asked), your own with `--author task-manager` (proposed). Look up with `decision find|show`, D-176 as now."
+      - `prompts/manager.md` line 16 gets the same; "DECISIONS.md" and `decision import` go. The standing-rules hook and the inline tail render it unchanged otherwise, and AFClaude's expected-output fixtures are updated.
+      - Update the `decisions.py` docstring and its README row.
+      - `.claude/settings.json` is unchanged (same hook commands).
+    - `origin` stays as a column. After the seeding every row is `db`, and the `file` refusals stay in the code until Q5.
+- **Tests:**
+  - **Owner words:** an inbox match and mismatch; a transcript owner prompt matches, while a keep-alive-prefixed prompt, a sidechain, a peer message or a tool result is refused. Also:
+    - whitespace is normalised, typos are kept;
+    - several matches need `--from`;
+    - the date is taken from the message;
+    - an autonomous caller without evidence is refused, through the CLI and MCP;
+    - the owner's own CLI is unchanged.
+  - **Confirm:** confirming with `supersedes` deletes the originals atomically, and is refused when an original is gone. An autonomous confirm needs a message naming the id.
+  - **Ids:** without a file, the container case, ids come from the floor. An import raises the floor.
+  - **Seeding,** on a synthetic DECISIONS.md:
+    - every surviving entry appears once with an unchanged body;
+    - superseded, done, expired and `DR-NN` entries and the non-entry sections appear only in the audit log, one row each with the full text;
+    - the counts add up to the file's;
+    - `--dry-run` writes nothing;
+    - a missing topic or an uncovered "done … active" entry refuses with nothing written;
+    - a second run is refused;
+    - the backup is made;
+    - `--undo` restores, and is refused after an edit.
+  - **After the seeding:** the import is a no-op; a changed file alerts once; the hook reads the DB only; `edit`, `expire` and `delete` work on seeded rows.
+  - The suites, `test_typing`, `test_mcp_server` and `check_public`.
+- **Cut-over (the task-manager, one day, outside a run's busy phase):**
+  1. Deploy the merged code (no schema change; container rebuild for the runner's import). From here until step 4, no native `decision add`.
+  2. Write any pending owner statement into DECISIONS.md one last time, then `python3 tasks.py decision import`.
+  3. A subagent writes the topics file and the merges file into the task-manager's scratch or `data/` (not committed). The task-manager checks the merges against the originals, so that no owner quote is changed.
+  4. `python3 decisions.py seed … --dry-run`, then compare the counts with the file. Then run it for real.
+  5. Merge the text commit. Update the task-manager's own memory notes that name DECISIONS.md. Record the switch in PROGRESS and GOALS. The file stays on disk untouched until Q5.
+- **Rollback:**
+  - Before step 4: revert the code (no schema change).
+  - After step 4: `decisions.py seed --undo` and revert the text commit.
+  - If `--undo` refuses (a seeded row changed): restore `<db>.preseed-*.bak`. That means stopping the container, copying the backup back and starting it, and it loses the DB writes made since. Only with the owner's OK.
+- **Done when:**
+  - The seeding has run.
+  - `decision tldr` lists every current entry and no superseded one.
+  - The 10-min import is a no-op.
+  - One owner statement from chat has been recorded through `decision add` with evidence.
+  - The merged proposals wait for Q3.
 
 **Q3: questions and proposals.**
 - **Build:** §3.4; the `OPEN_QUESTIONS.md` import; quickview from the DB only; prompts, CLAUDE.md and the worker agent switched.
 - **Tests:** a proposal's approve/edit/reject applies the decision change atomically; import counts; the quickview shows each question in full (D-279).
-- **Done when:** one week with questions asked and closed only through the DB.
+- **Done when:** one week with questions asked and closed only through the DB. Every `proposed` decision waits as a question, including Q2's merged rewordings, and the task-manager's older own entries are put up for confirmation (see below).
+- **From Q2:**
+  - Each `proposed` decision is asked as one question. Approving it is `decision.confirm`, which also deletes the entries its `supersedes` lists.
+  - The 16 task-manager entries active from the file (`M-NNN` and four `D-NNN`) stay in force and are listed for the owner to confirm or drop. They were made under the file's old rule 2 (D-105), before D-285.
+  - Start Q3 right after Q2.
 
 **Q4: message threads.** §3.5. **Tests:** thread open/append/reset; reply via MCP; waking by role (owner now; editors wait, simulated). **Done when:** a quickview message answered through `afclaude_reply`. **Risk:** depends on 3b S5.
 
-**Q5: retire the files.** `DECISIONS.md` and `OPEN_QUESTIONS.md` are no longer read or written (no export, D-181); they stay on disk untouched for the owner to archive. **Done when:** `grep` finds no reader outside tests and the seeding.
+**Q5: retire the files.** `DECISIONS.md` and `OPEN_QUESTIONS.md` are no longer read or written (no export, D-181); they stay on disk untouched for the owner to archive. Q5 also removes:
+- the `file` code paths;
+- the post-seed change check;
+- the `origin` column, in a later schema step bundled with another one; the column alone is not worth a migration.
+
+**Done when:** `grep` finds no reader outside tests and the seeding.
 
 ## 6. Questions for the owner
 
-None open. The three questions this plan raised (what the decision list shows, recording chat decisions, expired one-offs) are answered by D-284, D-285 and D-286 respectively; see §0 and §3.3.
+None open. The three questions this plan raised (what the decision list shows, recording chat decisions, expired one-offs) are answered by D-284, D-285 and D-286 respectively; see §0 and §3.3. Q2 raises none.
+
+Points for the task-manager to note, not to ask:
+- D-160 ("agent" role: no decisions for autonomous sessions) is refined in practice by D-182 (the manager's own role) and D-285 (the task-manager records the owner's words). Q2 allows one exception: an owner quote tied to a stored owner message.
+- D-151's "status superseded" and "generated .md" were already replaced by D-158 and D-181.
+- D-278's clarification "entries are not deleted" was replaced by D-286.
