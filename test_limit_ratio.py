@@ -289,13 +289,28 @@ class CombineSpans(unittest.TestCase):
         runs = [{"start": T0.isoformat(), "end": (T0 + timedelta(hours=1)).isoformat(), "ongoing": False},
                 {"start": (T0 + timedelta(hours=8)).isoformat(), "end": (T0 + timedelta(hours=8)).isoformat(),
                  "ongoing": True}]
-        fallback = [(T0 + timedelta(minutes=1), T0 + timedelta(hours=10)),      # the 2nd fire of run 1: covered
+        fallback = [(T0 + timedelta(minutes=1), T0 + timedelta(minutes=50)),    # the 2nd fire of run 1: covered
+                    (T0 + timedelta(minutes=2), T0 + timedelta(hours=1, minutes=20)),   # covered: clipped at its end
                     (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),   # a usage-review run
                     (T0 + timedelta(hours=11), T0 + timedelta(hours=12))]     # after now: ignored
         got = lr.combine_spans(runs, fallback, now)
-        self.assertEqual(got, [(T0, T0 + timedelta(hours=1)),
+        self.assertEqual(got, [(T0, T0 + timedelta(hours=1, minutes=20)),
                                (T0 + timedelta(hours=3), T0 + timedelta(hours=3, minutes=30)),
                                (T0 + timedelta(hours=8), now)])          # ongoing: until now
+
+    def test_the_runs_work_end_counts(self):
+        """D-310: a row's work_end (its workers after the run's end) ends the span; work still
+        going counts until now; a row from before work_end: its end."""
+        now = T0 + timedelta(hours=10)
+
+        def h(x):
+            return (T0 + timedelta(hours=x)).isoformat()
+        runs = [{"start": h(0), "end": h(1), "work_end": h(2), "ongoing": False, "work_ongoing": False},
+                {"start": h(4), "end": h(4.5), "ongoing": False},
+                {"start": h(8), "end": h(8.5), "work_end": h(9), "ongoing": False, "work_ongoing": True}]
+        self.assertEqual(lr.combine_spans(runs, [], now),
+                         [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=4), T0 + timedelta(hours=4.5)),
+                          (T0 + timedelta(hours=8), now)])
 
     def test_overlapping_spans_merge(self):
         got = lr.combine_spans([], [(T0, T0 + timedelta(hours=2)), (T0 + timedelta(hours=1), T0 + timedelta(hours=3))])

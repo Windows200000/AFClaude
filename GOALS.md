@@ -2,7 +2,7 @@
 
 Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN_QUESTIONS.md)
 
-0a. [ ] Compaction for long-running sessions (D-144, D-155, D-191): built as design phase 3c (needs 3a runner + 3b task-manager unification); store hand-offs in the DB.
+0a. [~] Compaction for long-running sessions (D-144, D-155, D-191): built as design phase 3c (needs 3a runner + 3b task-manager unification); store hand-offs in the DB.
 0c. [x] Usage split fixed 08.10. (b783ff3): time-based (weekly rise during autonomous runs = AFClaude, all else = user); this week 0% AFClaude / 100% user; pacing spans no longer cut at the fire's own message (user share 51% → 47%).
 0e. [ ] NEXT RUN: stage ETA prediction (D-213): cumulative ETA per project stage (done in 3 d, next in 4, next in 6, …) = sessions required per stage (the only new estimate) / (total available − predicted user usage, from the usage prediction), cumulative; shown on the temp dashboard; plus a rare review like the usage review. Research existing approaches first.
 0b. [x] Architecture review with the owner done 04.10. (D-143..D-199); design v2 in docs/dashboard_design/ (index: docs/dashboard_design/README.md).
@@ -12,7 +12,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 4. [x] Local MCP server (`mcp_server.py`, 9 tools), 29.09. registered and verified (task 1 via MCP, 29.09.)
 5. [x] Dispatcher (`dispatcher.py`), cron every 10 min: since 07.10. only verification, cleanup and the owner's approved stalled sessions at their reset, any time (D-205/D-206); no task sessions; project selection among task-managers = phase 3b.
 6. [~] Usage model: forecast-driven night gate live 04.10. (D-141: a full session runs only if the predicted week end ≤ the reserve threshold, auto = one session left; no margin; threshold_info). Follow-ups: stale filter in usage_report.py/usage_review.py; the model error fills in once a clean week closes; new predictor merged 18.10. (rmse 7); monthly review is a nightly task from 29.10. (D-254); ETA re-run nightly task due 23.10. (D-261)
-7. [~] Dashboard: phase 1 done; design v2 (§13 plan: 2a–2d, 3a–3c, 4a–4b, 5a–5e, 6a–6c, 7a–7b, gates 8a–8d; tasks #32–#50, #25–#28). 2a–2d done; 3a runner S1–S8 + S9(b) done 29.10. (S9(a) cleanup after calm days); 3b S1–S5 done 29.10. (S4 project pick, S5 run-now; deploy after 18:00); NEXT: 3b S6 retire (with 3a S9a), then 3c.
+7. [~] Dashboard: phase 1 done; design v2 (§13 plan: 2a–2d, 3a–3c, 4a–4b, 5a–5e, 6a–6c, 7a–7b, gates 8a–8d; tasks #32–#50, #25–#28). 2a–2d done; 3a runner S1–S8 + S9(b) done 29.10. (S9(a) cleanup after calm days); 3b S1–S5 done 29.10. (S4 project pick, S5 run-now); 3c S1 (several task-managers) + S2 detector done 30.10.; 4a P1–P2 done, P3 in progress. NEXT: 3a S9a + 3b S6 retire (~31.10.), 3c S3 after the D-305 review (01.11.).
 8. [x] Pre-public scrub: history squashed into one commit after an audit, with a pre-commit/pre-push guard (`tools/check_public.py`), 29.09.; host-specific values into config still to do
 9. [ ] Usage optimisation (after everything else): use the full limits using the measured session/weekly ratios, AFClaude vs user share
 9b. [ ] Use the monthly extra (API-billed) usage of Team plans too, capped by a buffer or a fixed limit (e.g. $200) (D-231, after the dashboard)

@@ -582,12 +582,13 @@ def active_stage_windows(conn: sqlite3.Connection, now: datetime) -> list[tuple[
 
 
 def run_sessions(path: Optional[str] = None) -> list[tuple[datetime, datetime, float]]:
-    """(start, end, session windows used) per AFClaude run (run_metrics rows)."""
+    """(start, end, session windows used) per AFClaude run (run_metrics rows); the end is the end of
+    the run's work (work_end, D-310; a row from before it: its end), as pacing's split counts it."""
     import run_metrics
     rows = cast(Callable[[Optional[str]], list[dict[str, Any]]], run_metrics.read_rows)(path or RUNS_FILE)
     out = []
     for r in rows:
-        a, b, d = _ts(r.get("start")), _ts(r.get("end")), r.get("session_delta")
+        a, b, d = _ts(r.get("start")), _ts(r.get("work_end") or r.get("end")), r.get("session_delta")
         if a is not None and b is not None and isinstance(d, (int, float)) and not isinstance(d, bool):
             out.append((a, b, float(d) / 100.0))
     return out
@@ -619,15 +620,20 @@ def gate_inputs(usage: Optional[Mapping[str, Any]], now: datetime) -> Gate:
                 float(getattr(rates, "design_week", 0.0) or 0.0), dfc)
 
 
-def design_sessions(ratio: float) -> list[tuple[datetime, datetime, float]]:
+def design_sessions(ratio: float, run_ends: bool = False) -> list[tuple[datetime, datetime, float]]:
     """(start, end, session windows) of the owner's design chats per sample interval (D-264/D-266:
-    pacing.design_intervals over the samples, weekly % / the full session's weekly %)."""
+    pacing.design_intervals over the samples, weekly % / the full session's weekly %). run_ends:
+    the runs end at their end, not their work's end (D-310): for the capacity (gather, --share),
+    whose run part is each run's session_delta up to its end, so the work after it stays measured
+    here instead of lost."""
     import pacing
     full = _full_session_cost(ratio)
     rows = cast(Callable[..., list[dict[str, Any]]], pacing.tail_rows)(max_bytes=pacing.LONG_BYTES)   # sorted
+    runs = cast(Callable[[], list[dict[str, Any]]], pacing.run_rows)()
+    if run_ends:
+        runs = [{k: v for k, v in r.items() if k not in ("work_end", "work_ongoing")} for r in runs]
     iv = cast(Callable[..., list[tuple[datetime, datetime, float]]], pacing.design_intervals)(
-        rows, cast(Callable[[], list[datetime]], pacing.fire_times)(),
-        cast(Callable[[], list[dict[str, Any]]], pacing.run_rows)())
+        rows, cast(Callable[[], list[datetime]], pacing.fire_times)(), runs)
     return [(a, b, d / full) for a, b, d in iv if d > 0] if full > 0 else []
 
 
@@ -650,7 +656,7 @@ def gather(conn: sqlite3.Connection, usage: Optional[Mapping[str, Any]], now: Op
     except Exception:   # noqa: BLE001 - no run history: the fallback
         runs = []
     g = gate_inputs(usage, now)
-    default, n = history_default([(a, b) for _, a, b in done_stages(conn)], runs + design_sessions(g.ratio))
+    default, n = history_default([(a, b) for _, a, b in done_stages(conn)], runs + design_sessions(g.ratio, run_ends=True))
     info = (f"median of {n} measured finished stages (runs + design chats, D-264)" if default is not None else
             f"{n} measured finished stage(s) < {MIN_HISTORY}: fallback {FALLBACK_SESSIONS:g} session/stage")
     share = float(afclaude_config.setting("stage_share")) / 100.0
@@ -675,7 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             import pacing
             now = datetime.now(UTC)
             ratio, _ = cast(Callable[[], tuple[float, str]], pacing.ratio_info)()
-            all_usage = run_sessions() + design_sessions(ratio)
+            all_usage = run_sessions() + design_sessions(ratio, run_ends=True)
             share, staged, measured = stage_share(active_stage_windows(conn, now), all_usage,
                                                   now - STAGE_SHARE_WINDOW, now)
             print(json.dumps({"share": _r(share, 3), "staged_sessions": _r(staged), "measured_sessions": _r(measured),
