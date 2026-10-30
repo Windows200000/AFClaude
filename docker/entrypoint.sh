@@ -22,9 +22,10 @@ KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
 mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
 # Phase 4b Q1: the explicit schema step. A non-additive change (store.MIGRATIONS; v5 rebuilds `decisions`)
-# never runs on connect(): until this has run, code at the new version can't write to the DB (MigrationNeeded),
-# and after it code at the old version can't (SchemaTooNew), so it runs first and alone: the old container is
-# gone by now and the runner has not started. It copies the DB to <db>.v<old>-<utc>.bak before changing anything
+# never runs on connect(): until this has run, code at the new version can't write the tables the migration
+# changes (MigrationNeeded; everything else stays writable, so the host's deploy.py can drain and the old
+# container keeps running meanwhile), and after it code at the old version can't write at all (SchemaTooNew),
+# so it runs first and alone: the old container is gone by now and the runner has not started. It copies the DB to <db>.v<old>-<utc>.bak before changing anything
 # (an unchanged DB that already has such a copy gets no second one) and is a no-op when the DB is current.
 # Exit 3 = no database yet (a first install): the start goes on. Any other failure alerts the owner itself
 # (store.py: the fallback alert file + a push, the DB being unwritable) and the container then IDLES instead of

@@ -14,6 +14,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -106,8 +107,8 @@ class Env(unittest.TestCase):
         self.addCleanup(patch.stop)
 
 
-class Migration(unittest.TestCase):
-    """v4 -> v5 on a copy: `store.py migrate` backs up, rebuilds decisions, keeps every row."""
+class V4Env(unittest.TestCase):
+    """A v4 database (the old decisions table, schema_version 4) under v5 code."""
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="afc-decmig-")
         self.path = os.path.join(self.tmp, "afclaude.db")
@@ -138,6 +139,9 @@ class Migration(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, True)
 
+
+class Migration(V4Env):
+    """v4 -> v5 on a copy: `store.py migrate` backs up, rebuilds decisions, keeps every row."""
     def test_v5_code_refuses_to_write_a_v4_database_until_migrated(self):
         conn = store.connect(self.path)
         try:
@@ -279,6 +283,125 @@ class Migration(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM decision_topics").fetchone()[0], 0)
         finally:
             conn.close()
+
+
+class DeployGap(V4Env):
+    """The deploy gap: v5 code against the live v4 database, while the old container still runs on v4
+    code. Everything but the decision tables stays writable (the host's deploy.py drains and appends
+    to a doc before the rebuild); only the new container's entrypoint migrates."""
+    def open(self):
+        conn = store.connect(self.path)
+        self.addCleanup(conn.close)
+        return conn
+
+    def decision_tables(self, conn):
+        return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in ("decisions", "decisions_fts", "session_decisions")}
+
+    def test_the_drain_and_a_doc_append_write_while_decisions_wait(self):
+        conn = self.open()
+        before = self.decision_tables(conn)
+        p = actions.perform(conn, "project.add", {"name": "P"}, actor="cli", via="cli")
+        actions.perform(conn, "doc.append", {"project": "P", "name": "progress", "text": "- deploy\n"},
+                        actor="cli", via="cli")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'doc.append'").fetchone()[0], 1)
+        self.assertIsNotNone(p)
+        for name, params in (("decision.add", {"title": "T", "topics": ["x"], "author": "owner", "words": "w"}),
+                             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["x"]}),
+                             ("decision.import", {"path": os.path.join(self.tmp, "DECISIONS.md")})):
+            with self.assertRaises(store.MigrationNeeded, msg=name) as cm:
+                actions.perform(conn, name, params, actor="cli", via="cli")
+            self.assertIn("python3 store.py migrate", str(cm.exception))
+        self.assertEqual(self.decision_tables(conn), before)
+        self.assertEqual(store.get_meta(conn, "schema_version"), "4")      # connect() raised nothing
+        self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'decision_topics'").fetchone())
+
+    def test_raw_sql_cant_change_the_pending_tables(self):
+        conn = self.open()
+        for sql in ("INSERT INTO decisions(id) VALUES ('D-999')", "UPDATE decisions SET title = 'x'",
+                    "DELETE FROM decisions", "DROP TABLE decisions", "ALTER TABLE decisions ADD COLUMN z TEXT",
+                    "DELETE FROM decisions_fts", "CREATE INDEX zz ON decisions(title)",
+                    "CREATE TABLE decision_topics(a)", "DROP TRIGGER decisions_version"):
+            try:
+                with self.assertRaisesRegex(sqlite3.DatabaseError, "not authorized", msg=sql):
+                    conn.execute(sql)
+            finally:
+                conn.rollback()
+        with self.assertRaises(store.MigrationNeeded):        # inside a store transaction: the clear error
+            with store.transaction(conn):
+                conn.execute("UPDATE decisions SET title = 'x'")
+        conn.execute("SELECT * FROM decisions").fetchall()    # reads are fine
+        with store.transaction(conn):
+            store.set_meta(conn, "gap_probe", "1")             # so is every other table
+        self.assertEqual(store.get_meta(conn, "gap_probe"), "1")
+
+    def test_a_newer_database_stays_read_only(self):
+        raw = sqlite3.connect(self.path)
+        raw.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
+        raw.commit()
+        raw.close()
+        conn = self.open()
+        with self.assertRaises(store.SchemaTooNew):
+            actions.perform(conn, "project.add", {"name": "P"}, actor="cli", via="cli")
+        with self.assertRaises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO meta(key, value) VALUES ('k', 'v')")
+
+    def test_every_migration_declares_its_tables(self):
+        self.assertEqual(set(store.MIGRATIONS), set(store.MIGRATION_TABLES))
+        self.assertEqual(set(store._gap_tables(4)), {"decisions", "decisions_fts", "decision_topics", "decision_links",
+                                                     "decisions_fts_data", "decisions_fts_idx", "decisions_fts_content",
+                                                     "decisions_fts_docsize", "decisions_fts_config"})
+        self.assertEqual(store._gap_tables(5), frozenset())
+        self.assertEqual((store._in_gap(4), store._in_gap(3), store._in_gap(5)), (True, False, False))
+
+    def test_a_connection_opened_in_the_gap_writes_decisions_once_migrated(self):
+        conn = self.open()
+        with self.assertRaises(store.MigrationNeeded):
+            actions.perform(conn, "decision.expire", {"decision": "D-001"}, actor="cli", via="cli")
+        store.migrate(self.path)                                  # the container's entrypoint, meanwhile
+        actions.perform(conn, "decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["x"]},
+                        actor="cli", via="cli")                    # the authorizer is lifted, no reconnect
+
+    def test_the_entrypoint_migrate_runs_after_the_gap_and_twice(self):
+        conn = self.open()
+        actions.perform(conn, "project.add", {"name": "P"}, actor="cli", via="cli")
+        conn.close()
+        first = store.migrate(self.path)
+        self.assertEqual((first["from"], first["to"], first["steps"]), (4, 5, [5]))
+        self.assertTrue(os.path.isfile(first["backup"]))
+        second = store.migrate(self.path)
+        self.assertEqual((second["from"], second["to"], second["steps"], second["backup"]), (5, 5, [], None))
+        conn = self.open()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM projects WHERE name = 'P'").fetchone()[0], 1)
+        actions.perform(conn, "decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["y"]},
+                        actor="cli", via="cli")
+
+    def test_deploy_py_gets_through_its_first_writes(self):
+        """tools/deploy.py on the host with v5 code against the v4 database: connect, drain
+        (runner_state write through actions) and the rebuild call, nothing refused."""
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+        try:
+            import deploy
+        finally:
+            sys.path.pop(0)
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with mock.patch.object(store, "DB_PATH", self.path), \
+                mock.patch.object(deploy, "check_start_guard", return_value=True), \
+                mock.patch.object(deploy, "wait_clear", return_value=True), \
+                mock.patch.object(deploy, "code_version", return_value="abc1234"), \
+                mock.patch.object(deploy.runner, "wake", return_value=True), \
+                mock.patch.object(deploy.subprocess, "run", side_effect=fake_run), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(deploy.main([]), 0)
+        self.assertIn("drained", out.getvalue())
+        self.assertEqual(calls[-1][:2], ["docker", "compose"])
+        conn = self.open()
+        self.assertIsNotNone(actions.runner_drain(conn))           # the drain mark is in the v4 database
+        self.assertEqual(store.get_meta(conn, "schema_version"), "4")
 
 
 class Add(Env):

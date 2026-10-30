@@ -216,7 +216,7 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
              request_sha: str) -> Any:
     """One try of perform(): the action, its audit row and idempotency key in one transaction."""
     actor, via, key = ctx.actor, ctx.via, ctx.key
-    with store.transaction(conn):
+    with store.transaction(conn, store.DECISION_TABLES if spec.target_type == "decision" else ()):
         if key is not None:
             hit = store.get_idempotency(conn, key)
             if hit is not None:

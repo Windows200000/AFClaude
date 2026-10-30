@@ -36,7 +36,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                store.py migrate`, after a backup copy; the state CHECK gains 'proposed') with the
                columns slug, project_id, author and origin; new tables decision_topics and
                decision_links (DECISIONS_SCHEMA). Code at v4 can't write to a v5 database
-               (SchemaTooNew), v5 code can't write to a v4 one (MigrationNeeded) until migrated.
+               (SchemaTooNew); v5 code on a v4 one can write everything except those decision
+               tables (MigrationNeeded for them) until migrated: the deploy gap (MIGRATION_TABLES).
                Later tables (SCHEMA/TELEMETRY_SCHEMA, no version bump: purely additive, so
                a running older checkout keeps writing): accounts (one 'default' row, D-156)
                and the telemetry tables of dashboard phase 2c (D-161; telemetry.py, the
@@ -87,9 +88,18 @@ database whose schema_version it knows. A newer one (written by newer code) is l
 untouched: connect() opens it read-only (reads go on; transaction() raises
 SchemaTooNew naming both versions; any other write fails in SQLite). Non-additive
 changes (a table rebuild, a dropped or renamed column) never run on connect(): they
-go into MIGRATIONS, and a database that needs one stays read-only (MigrationNeeded)
-until the explicit migrate step, which backs it up first:
+go into MIGRATIONS, and a database that needs one refuses writes to the tables the pending
+migrations rebuild (MIGRATION_TABLES; MigrationNeeded) until the explicit migrate step, which backs
+it up first:
     python3 store.py migrate [--db PATH]
+Every other table stays writable meanwhile, enforced by a SQLite authorizer on the connection
+(_gap_authorizer), so raw SQL can't get round it. That is what makes a deploy work: the host's
+deploy.py (merged code, drain write, doc append) runs against the live database while the old
+container, still at the old schema, keeps running; only the new container's entrypoint migrates,
+after the old one is gone. Running the migration before that would give the old code SchemaTooNew
+mid-run. The additive steps of init() wait for the migration too (they would raise schema_version), so
+the gap holds only for a database already at the version before the first pending migration (_in_gap), and a
+release's other additive changes must not be needed by deploy.py's own writes (a missing table fails loudly).
 Additive changes (new tables, COLUMNS, triggers) still apply on connect(). The v2 -> v3
 rebuild (_migrate_v3) predates this rule and still runs on connect(), after a backup.
 
@@ -134,6 +144,10 @@ _T = TypeVar("_T")
 # with foreign keys off (migrate()). A step gets the database as the previous version
 # left it. Additive changes need no entry (SCHEMA, COLUMNS, VERSION_TRIGGERS).
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}   # filled below, after the DDL it uses
+# The tables each migration rebuilds or changes (every MIGRATIONS entry declares them; a test checks):
+# while the migration is pending the database refuses writes to exactly these (the deploy gap, see the
+# module doc). An FTS5 table stands for its shadow tables too. Everything else stays writable.
+MIGRATION_TABLES: dict[int, tuple[str, ...]] = {}
 
 # The tasks table, v3. {name} so _migrate_v3 can build it as tasks_v3 and rename it.
 TASKS_DDL = """
@@ -923,6 +937,9 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[5] = _migrate_v5
+MIGRATION_TABLES[5] = ("decisions", "decisions_fts", "decision_topics", "decision_links")
+# What the decision actions write (actions._perform announces it to check_writable).
+DECISION_TABLES = MIGRATION_TABLES[5]
 # The tables whose foreign keys a migration's own check looks at: v5 only rebuilds `decisions`, so an
 # orphan row somewhere else (rows the database already had) can't block it.
 MIGRATION_FK_TABLES: dict[int, tuple[str, ...]] = {5: ("decisions",)}
@@ -1032,6 +1049,7 @@ class TimedConnection(sqlite3.Connection):
     _tx_start: float | None = None
     _tx_origin: str = ""
     _tx_reporting: bool = False
+    _gap: bool = False      # a migration-gap authorizer is installed (init); check_writable lifts it
 
     def _tx_mark(self, how: str) -> None:
         if self._tx_reporting:
@@ -1146,11 +1164,16 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
 
 def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     """Create or (additively) upgrade the schema. Schema guard: a database that is newer
-    than this code, or needs a non-additive migration first, is left untouched and the
-    connection becomes read-only (PRAGMA query_only); see the module doc. backed_up: the
+    than this code is left untouched and the connection becomes read-only (PRAGMA query_only);
+    one that needs a non-additive migration first is left untouched too, but stays writable
+    except for the tables that migration changes (_install_gap); see the module doc. backed_up: the
     caller (migrate) copied the database before changing it, so the older steps below take
     no second copy."""
-    if schema_problem(conn) is not None:
+    problem = schema_problem(conn)
+    if isinstance(problem, MigrationNeeded) and _in_gap(problem.db_version):
+        _install_gap(conn, problem.db_version)   # writable except the tables the migration changes
+        return
+    if problem is not None:
         conn.execute("PRAGMA query_only=ON")
         return
     if not _migrate_v3(conn, backup=not backed_up):  # before SCHEMA: its tasks_order index needs the v3 columns
@@ -1267,11 +1290,84 @@ def schema_problem(conn: sqlite3.Connection) -> SchemaMismatch | None:
     return None
 
 
-def check_writable(conn: sqlite3.Connection) -> None:
-    """Raise SchemaMismatch if this code must not write to the database (schema guard)."""
+def _in_gap(version: int) -> bool:
+    """Is a database at `version` in the deploy gap: only non-additive migrations stand between it and
+    this code, i.e. it is at the version just before the first pending one, so every additive change
+    up to there has been applied (init does that on connect). One further behind (say v3 for a v5
+    code: v4's additive part is missing too) isn't: it stays refused wholesale until migrated."""
+    steps = pending_migrations(version)
+    return bool(steps) and version >= steps[0] - 1
+
+
+def _gap_tables(version: int) -> frozenset[str]:
+    """The tables (lower case) a database at `version` refuses writes to: what its pending
+    migrations change (MIGRATION_TABLES), an FTS5 table with its shadow tables."""
+    out: set[str] = set()
+    for v in pending_migrations(version):
+        if v not in MIGRATION_TABLES:
+            raise RuntimeError(f"migration {v} declares no tables: add it to store.MIGRATION_TABLES")
+        for t in MIGRATION_TABLES[v]:
+            out.add(t.lower())
+            if t.endswith("_fts"):
+                out.update(f"{t.lower()}_{x}" for x in ("data", "idx", "content", "docsize", "config"))
+    return frozenset(out)
+
+
+# authorizer action -> which of its two arguments names the table it acts on
+_GAP_ACTIONS: dict[int, int] = {
+    sqlite3.SQLITE_INSERT: 1, sqlite3.SQLITE_UPDATE: 1, sqlite3.SQLITE_DELETE: 1,
+    sqlite3.SQLITE_CREATE_TABLE: 1, sqlite3.SQLITE_DROP_TABLE: 1,
+    sqlite3.SQLITE_CREATE_VTABLE: 1, sqlite3.SQLITE_DROP_VTABLE: 1,
+    sqlite3.SQLITE_ALTER_TABLE: 2, sqlite3.SQLITE_CREATE_INDEX: 2, sqlite3.SQLITE_DROP_INDEX: 2,
+    sqlite3.SQLITE_CREATE_TRIGGER: 2, sqlite3.SQLITE_DROP_TRIGGER: 2}
+
+
+def _gap_authorizer(blocked: frozenset[str]) -> Callable[[int, str | None, str | None, str | None, str | None], int]:
+    """A SQLite authorizer that denies changing any of the `blocked` tables (data or schema,
+    also from a trigger body) and allows everything else, reads included."""
+    def authorize(action: int, arg1: str | None, arg2: str | None, db: str | None, source: str | None) -> int:
+        which = _GAP_ACTIONS.get(action)
+        table = None if which is None else (arg1 if which == 1 else arg2)
+        if table is not None and table.lower() in blocked:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    return authorize
+
+
+def _install_gap(conn: sqlite3.Connection, version: int) -> None:
+    """The deploy gap: this code is ahead of the database by a non-additive migration. Writes
+    to the tables it changes are denied (_gap_authorizer); the rest of the schema is already what
+    this code needs, so those writes go on. check_writable lifts it once the database is migrated."""
+    conn.set_authorizer(_gap_authorizer(_gap_tables(version)))
+    if isinstance(conn, TimedConnection):
+        conn._gap = True
+
+
+def check_writable(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> None:
+    """Raise SchemaMismatch if this code must not write to the database (schema guard). A
+    database that only needs a migration (MigrationNeeded) is writable except for the tables
+    that migration changes: it raises only when `tables` names one of them (the authorizer
+    catches whatever isn't announced, see transaction). Also drops the gap authorizer of a
+    connection opened before the database was migrated."""
     problem = schema_problem(conn)
-    if problem is not None:
-        raise problem
+    if problem is None:
+        if isinstance(conn, TimedConnection) and conn._gap:
+            conn.set_authorizer(None)
+            conn._gap = False
+        return
+    if (isinstance(problem, MigrationNeeded) and _in_gap(problem.db_version)
+            and not _gap_tables(problem.db_version) & {t.lower() for t in tables}):
+        return
+    raise problem
+
+
+def _gap_denial(conn: sqlite3.Connection, exc: BaseException) -> MigrationNeeded | None:
+    """The MigrationNeeded to raise in place of `exc`, a write the gap authorizer refused (a table
+    of the pending migration that the caller didn't announce); None for any other error."""
+    if not isinstance(exc, sqlite3.DatabaseError) or "not authorized" not in str(exc):
+        return None
+    problem = schema_problem(conn)
+    return problem if isinstance(problem, MigrationNeeded) else None
 
 
 def _backup_copy(conn: sqlite3.Connection, path: str, tag: str) -> str:
@@ -1600,10 +1696,13 @@ def iso_ms(dt: datetime) -> str:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> Iterator[sqlite3.Connection]:
     """BEGIN IMMEDIATE ... COMMIT (a savepoint inside a caller's transaction). A new
     transaction checks the schema guard first and again under the write lock (a newer
-    process may have upgraded the database meanwhile): SchemaMismatch, nothing written."""
+    process may have upgraded the database meanwhile): SchemaMismatch, nothing written.
+    `tables`: what the caller is about to write, for a database awaiting a migration that
+    changes some of them (check_writable); a write to one that wasn't announced is refused
+    by the connection's authorizer and surfaces as the same MigrationNeeded."""
     if conn.in_transaction:
         conn.execute("SAVEPOINT afclaude_tx")
         try:
@@ -1614,14 +1713,17 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             raise
         conn.execute("RELEASE afclaude_tx")
     else:
-        check_writable(conn)        # the clear error, before BEGIN fails on a read-only connection
+        check_writable(conn, tables)    # the clear error, before BEGIN fails on a read-only connection
         conn.execute("BEGIN IMMEDIATE")
         try:
-            check_writable(conn)
+            check_writable(conn, tables)
             yield conn
             conn.commit()
-        except BaseException:
+        except BaseException as e:
             conn.rollback()
+            denied = _gap_denial(conn, e)
+            if denied is not None:
+                raise denied from e
             raise
 
 

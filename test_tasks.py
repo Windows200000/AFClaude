@@ -750,7 +750,9 @@ class SchemaGuard(unittest.TestCase):
             conn.execute("UPDATE tasks SET title = upper(title)")
 
         nxt = store.SCHEMA_VERSION + 1
-        with mock.patch.object(store, "SCHEMA_VERSION", nxt), mock.patch.dict(store.MIGRATIONS, {nxt: upper_titles}):
+        with mock.patch.object(store, "SCHEMA_VERSION", nxt), \
+                mock.patch.dict(store.MIGRATIONS, {nxt: upper_titles}), \
+                mock.patch.dict(store.MIGRATION_TABLES, {nxt: ("tasks",)}):
             conn = store.connect(self.db)                # connect never migrates: read-only until migrate
             try:
                 self.assertEqual([t["title"] for t in store.list_tasks(conn)], ["abc"])
