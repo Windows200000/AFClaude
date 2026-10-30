@@ -46,7 +46,9 @@ class Active(tc.Env):
         self._roh = host.run_on_host
         host.run_on_host = lambda argv, **kw: (self.haiku.append(argv), types.SimpleNamespace(
             returncode=0, stdout=haiku_out(*self.verdict), stderr=""))[1]
-        self.addCleanup(testenv.managed_project("PA", SID))
+
+    def manage(self, d):
+        return testenv.managed_project("PA", SID, path=os.path.join(d, "pa"))   # SID's project (tc.Env)
 
     def tearDown(self):
         host.run_on_host = self._roh

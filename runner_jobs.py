@@ -252,7 +252,8 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
 # plan, its next slot start and the fill-up plan (+ one spare), and the fill-up's usage refresh ahead of
 # its start (with its one token-refresh retry). The run readings: one usage refresh with its retry and the
 # cache reads around it. The compaction check: the holds (the usage cache twice, the preflight's tmux /
-# `claude agents` / process calls, the owner-typing check's two tmux reads).
+# `claude agents` / process calls, the owner-typing check's two tmux reads) and, for a start soon, the
+# read-only pick (start_continues, 3c S1: its passes over owner-held projects, TICK_PICKS).
 TICK_HOST_CALLS.update({
     "watch": (("host", "usage_cache", 30, 5), ("keepalive", "refresh_usage", 120, 2),
               ("keepalive", "poke_auth", 180, 1)),
@@ -262,6 +263,7 @@ TICK_HOST_CALLS.update({
                          ("keepalive", "tmux_pids", 30, 1), ("keepalive", "agent_entries", 60, 1),
                          ("host", "proc_snapshot", 30, 1), ("keepalive", "owner_typing", 30, 2)),
 })
+TICK_PICKS = ("compaction_check",)   # ticks that run pick_start's passes (PICK_PREFLIGHT_CALLS, defined below)
 TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
 }
@@ -277,6 +279,11 @@ def tick_inner(job: str) -> dict[str, timedelta]:
     for mod, fn, secs, calls in TICK_HOST_CALLS.get(job, ()):
         k = f"{mod}.{fn}"
         out[k] = out.get(k, timedelta(0)) + timedelta(seconds=secs * calls)
+    if job in TICK_PICKS:
+        ka = importlib.import_module("keepalive")
+        for fn, secs, calls in PICK_PREFLIGHT_CALLS:
+            k = f"keepalive.{fn}"
+            out[k] = out.get(k, timedelta(0)) + timedelta(seconds=secs * calls * ka.PICK_MAX_PASS_OVER)
     return out
 
 

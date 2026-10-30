@@ -273,7 +273,8 @@ try:
     t0 = datetime.now(UTC)
     insert = handoff = None
     try:
-        insert, handoff, rec = ka.compact_with_handoff(sid, cwd, path)
+        # the throwaway session is no project's task-manager: its hand-off text names the temp PROGRESS.md
+        insert, handoff, rec = ka.compact_with_handoff(sid, cwd, path, progress=ka.PROGRESS_FILE)
     except failstop.Failed as e:
         rec = e.record
         res["failed"] = f"{e.why}: {e.detail}" if e.detail else e.why

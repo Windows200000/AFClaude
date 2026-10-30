@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -720,7 +721,7 @@ class FillupBlock(unittest.TestCase):
         return p
 
     def test_planned(self):
-        self.write({"plan": self.plan()})
+        self.write({"plans": {"s" * 36: self.plan()}})
         b = qv.fillup_block(self.now)
         self.assertTrue(b["planned"])
         self.assertEqual(b["at_berlin"], "Sat 10.10. 03:55 CEST")
@@ -730,18 +731,24 @@ class FillupBlock(unittest.TestCase):
 
     def test_none_with_reason(self):
         self.assertEqual(qv.fillup_block(self.now)["planned"], False)            # no file yet
-        self.write({"plan": self.plan(status="skip", reason="the session-window start at 04:00 continues "
-                                                            "this window anyway")})
+        self.write({"plans": {"s" * 36: self.plan(status="skip", reason="the session-window start at 04:00 continues "
+                                                            "this window anyway")}})
         b = qv.fillup_block(self.now)
         self.assertEqual(b, {"planned": False, "reason": "the session-window start at 04:00 continues this "
                                                          "window anyway"})
-        self.write({"plan": {"status": "none", "reason": "no live session window"}})
+        self.write({"plans": {"s" * 36: {"status": "none", "reason": "no live session window"}}})
         self.assertEqual(qv.fillup_block(self.now)["reason"], "no live session window")
-        self.write({"plan": self.plan()})                                        # a stale plan
+        self.write({"plans": {"s" * 36: self.plan()}})                           # a stale plan
         self.assertIn("ended", qv.fillup_block(datetime(2026, 10, 10, 3, 0, tzinfo=self.UTC))["reason"])
 
+    def test_another_sessions_plan_is_not_shown(self):
+        self.write({"plans": {"o" * 36: self.plan()}})                          # 3c S1: one plan per session
+        self.assertEqual(qv.fillup_block(self.now)["planned"], False)
+        self.write({"plan": self.plan()})                                        # the global one before 3c S1
+        self.assertEqual(qv.fillup_block(self.now)["planned"], False)
+
     def test_disabled(self):
-        self.write({"plan": self.plan()})
+        self.write({"plans": {"s" * 36: self.plan()}})
         testenv.set_setting("fillup_enabled", False)
         try:
             self.assertEqual(qv.fillup_block(self.now), {"planned": False, "reason": "fillup_enabled is off"})
@@ -751,7 +758,8 @@ class FillupBlock(unittest.TestCase):
     def test_test_entry_of_this_session(self):
         t = {"session": "s" * 36, "key": "fillup-test-x", "reset": "2026-10-10T02:00:00+00:00",
              "start": "2026-10-10T01:57:01+00:00", "remaining": 3.0, "cost": 0.46}
-        self.write({"plan": self.plan(status="none", reason="no AFClaude run in this session window"), "test": t})
+        self.write({"plans": {"s" * 36: self.plan(status="none", reason="no AFClaude run in this session window")},
+                    "test": t})
         b = qv.fillup_block(self.now)
         self.assertTrue(b["planned"] and b["test"])
         self.assertEqual(b["at_berlin"], "Sat 10.10. 03:57 CEST")
@@ -762,7 +770,7 @@ class FillupBlock(unittest.TestCase):
         with open(qv.ka.FILLUP_FILE, "w") as fh:
             fh.write("{not json")
         self.assertFalse(qv.fillup_block(self.now)["planned"])
-        self.write({"plan": self.plan(start="garbage")})
+        self.write({"plans": {"s" * 36: self.plan(start="garbage")}})
         self.assertFalse(qv.fillup_block(self.now)["planned"])
 
     def test_page_renders_the_tile(self):
@@ -964,6 +972,35 @@ class UsageTiles(unittest.TestCase):
             out = qv.keepalive_and_usage(datetime.now(qv.UTC))
         self.assertNotIn("session", out)
         self.assertIn("usage_error", out)
+
+
+class CompactionRows(unittest.TestCase):
+    """3c S1: the context block lists every task-manager's compaction attempts, each with its project
+    (a record without a session is the quickview's own task-manager's)."""
+    def setUp(self):
+        testenv.fresh_db(self)
+        self.addCleanup(setattr, qv, "SELF_SESSION", qv.SELF_SESSION)
+        qv.SELF_SESSION = testenv.SID
+
+    def test_each_row_names_its_project(self):
+        other = "b" * 36
+        conn = store.connect()
+        try:
+            for name, sid in (("Alpha", testenv.SID), ("Beta", other)):
+                store.add_project(conn, name)
+                store.update_project(conn, name, manager_session=sid)
+        finally:
+            conn.close()
+        comps = {"k1": {"at": "2026-10-29T10:00:00+00:00", "status": "compacted", "session": testenv.SID},
+                 "k2": {"at": "2026-10-29T11:00:00+00:00", "status": "missed", "session": other},
+                 "k0": {"at": "2026-10-01T10:00:00+00:00", "status": "failed"}}
+        import compact_timing
+        with mock.patch.object(compact_timing, "context_block", lambda *a, **kw: {}), \
+                mock.patch.object(qv.ka, "transcript_path", lambda sid: None), \
+                mock.patch.object(qv.ka, "load_state", lambda: {"compactions": comps}):
+            out = qv.context_block(datetime.now(timezone.utc))
+        self.assertEqual([(c["status"], c["project"]) for c in out["compactions"]],
+                         [("missed", "Beta"), ("compacted", "Alpha"), ("failed", "Alpha")])
 
 
 class TmuxTile(unittest.TestCase):

@@ -837,7 +837,8 @@ class BudgetWiring(unittest.TestCase):
             path = ka.transcript_path(SID)
             fresh = now.timestamp() - 60
             os.utime(path, (fresh, fresh))
-            st = {"handled": {"k": {"result": "continued-in-place", "at": (now - timedelta(hours=1)).isoformat()}}}
+            st = {"handled": {"k": {"result": "continued-in-place", "at": (now - timedelta(hours=1)).isoformat(),
+                                    "session": SID}}}
             self.assertEqual(ka.run_active(SID, now, st), now - timedelta(hours=1))
             st["handled"]["k"]["at"] = (now - timedelta(hours=6)).isoformat()   # the 23:00... fire: over
             self.assertIsNone(ka.run_active(SID, now, st))
@@ -1576,11 +1577,14 @@ class RunEnd(unittest.TestCase):
         os.utime(ka.transcript_path(SID), (t.timestamp(), t.timestamp()))
 
     def state(self, **kw):
-        return dict({"handled": {"window-start-2026-10-06-s2": {"at": self.FIRE.isoformat(),
+        return dict({"handled": {"window-start-2026-10-06-s2": {"at": self.FIRE.isoformat(), "session": SID,
                                                                 "result": "continued-in-place"}}}, **kw)
 
     def test_a_fire_with_a_fresh_transcript_is_a_run(self):
         self.assertEqual(ka.run_active(SID, self.NOW, self.state()), self.FIRE)
+        st = self.state()
+        st["handled"]["window-start-2026-10-06-s2"].pop("session")
+        self.assertIsNone(ka.run_active(SID, self.NOW, st))       # a record without its session is nobody's (3c S1)
 
     def test_a_stop_after_the_fire_ends_it_even_while_the_owner_chats(self):
         stop = {(self.FIRE + timedelta(minutes=40)).isoformat(): SID}
@@ -1617,7 +1621,8 @@ class RunEnd(unittest.TestCase):
     def test_a_new_fire_after_the_stop_starts_a_new_run(self):
         st = self.state(run_stops={(self.FIRE + timedelta(minutes=40)).isoformat(): SID})
         nxt = self.FIRE + timedelta(minutes=50)
-        st["handled"]["fillup-2026-10-06T04:00:00+00:00"] = {"at": nxt.isoformat(), "result": "continued-in-place"}
+        st["handled"]["fillup-2026-10-06T04:00:00+00:00"] = {"at": nxt.isoformat(), "session": SID,
+                                                                  "result": "continued-in-place"}
         self.assertEqual(ka.run_active(SID, self.NOW, st), nxt)
 
     def test_mark_run_stopped_merges_into_the_state_on_disk(self):

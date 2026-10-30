@@ -891,7 +891,7 @@ SETTINGS: dict[str, Setting] = {
                                  "before it is killed and fails (D-234)", "automation"),
     "runner_timeout_run_readings": _num(10, 0.5, 720, "Runner: minutes a run reading (the usage during a run, "
                                         "D-207) may take before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_compaction_check": _num(6, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
+    "runner_timeout_compaction_check": _num(12, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
                                             "before it is killed and fails (D-234)", "automation"),
     "runner_timeout_last_stretch": _num(90, 90, 720, "Runner: minutes a last-stretch slot start may take before "
                                         "it is killed and fails (D-234)", "automation"),
@@ -899,7 +899,7 @@ SETTINGS: dict[str, Setting] = {
                                           "start may take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_fillup": _num(90, 90, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
                                   "killed and fails (D-234)", "automation"),
-    "runner_timeout_compaction": _num(60, 60, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
+    "runner_timeout_compaction": _num(65, 65, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
                                       "back, D-238) may take before it is killed and fails (D-234)", "automation"),
     # phase 3b S5: a run-now request; the lower bound is its slowest kind's inner timeouts + 5 min (a
     # work_on_now continues a task-manager as a start does: runner_jobs.request_min_timeout; test_run_now)
@@ -2989,8 +2989,11 @@ def run_log_add(conn: sqlite3.Connection, component: str, decision: str, reason:
 # PICK / HOLD: a start's project (3b S4); GO / HOLD / POSTPONE: the budget gate at a session-window
 # start, a postponed one's re-decision and a last-stretch slot (also HOLD for a start with no
 # project); DEFER / FIRE: the D-274 timing (planned late / now); FILLUP: a fill-up start;
-# START / POSTPONE: a usage review's launch / its quota postponement (component usage_review).
-RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START")
+# START / POSTPONE: a usage review's launch / its quota postponement (component usage_review);
+# COMPACT / FAILED / MISSED: a compaction attempt's outcome (component compaction, 3c S1; armed only,
+# so a dry run's attempt has no row).
+RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START", "COMPACT", "FAILED",
+                     "MISSED")
 
 
 def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,
