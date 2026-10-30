@@ -83,7 +83,7 @@ class Schema(unittest.TestCase):
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(driven_sessions)")}
                 self.assertIn("project_id", cols)
                 self.assertTrue({"run_id", "updated_at"} <= {r[1] for r in conn.execute("PRAGMA table_info(action_requests)")})
-                self.assertEqual(store.get_meta(conn, "schema_version"), "4")      # no version bump
+                self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))   # these columns add no bump
                 own = store.get_driven_session(conn, OWN)
                 self.assertEqual((own["kind"], own["project_id"], own["tmux"]), ("own", None, None))
                 self.assertEqual([r["status"] for r in store.list_requests(conn)], ["open"])

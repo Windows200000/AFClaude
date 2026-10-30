@@ -96,6 +96,8 @@ class StartWatcher(unittest.TestCase):
             fh.write(FAKE_KEEPALIVE)
         with open(os.path.join(d, "runner.py"), "w") as fh:
             fh.write(FAKE_RUNNER)
+        with open(os.path.join(d, "store.py"), "w") as fh:      # the entrypoint's migrate step (done: exit 0)
+            fh.write("")
         os.makedirs(os.path.join(d, "data"))
         for name, text in (("pgrep", STUB_PGREP), ("supercronic", FAKE_SUPERCRONIC)):
             pg = os.path.join(d, "bin", name)

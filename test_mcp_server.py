@@ -18,6 +18,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import actions  # noqa: E402
 import afclaude_config  # noqa: E402
 import store  # noqa: E402
 
@@ -490,20 +491,20 @@ DECISIONS_SRC = """## Budget
 
 class Decisions(Env):
     def test_decisions_tool(self):
-        """afclaude_decisions (D-242): find lists ids + topic keywords only unless full (D-176); show expands."""
+        """afclaude_decisions (D-242): find lists id + title + topics only unless full (D-176, D-284); show expands."""
         import decisions
         src = os.path.join(self.tmp.name, "DECISIONS.md")
         with open(src, "w") as fh:
             fh.write(DECISIONS_SRC)
         decisions.import_file(src, self.db, actor="cli", via="cli")
         r = run(ms.afclaude_decisions("find", keywords=["night window"]))
-        self.assertEqual(r["hits"], [{"id": "D-001", "state": "active", "keywords": ["budget", "night-window"]}])
+        self.assertEqual(r["hits"], [{"id": "D-001", "title": "Night runs fill the week", "state": "active"}])
         self.assertIn("expand an entry", r["note"])
         self.assertNotIn("fill it at night", json.dumps(r))                   # no rule text without full
         r = run(ms.afclaude_decisions("find", keywords=["budget"], full=True))
         self.assertEqual([h["id"] for h in r["hits"]], ["D-001"])              # D-002 is superseded
         self.assertIn('"fill it at night"', r["hits"][0]["entry"])
-        self.assertNotIn("note", r)
+        self.assertIn("D-176", r["note"])                                         # the expanded view says so too
         old, ms.DECISION_HITS = ms.DECISION_HITS, 1
         try:
             r = run(ms.afclaude_decisions("find", keywords=["budget"], all=True))
@@ -512,10 +513,60 @@ class Decisions(Env):
         self.assertEqual(sorted([h["id"] for h in r["hits"]] + r["more"]), ["D-001", "D-002"])
         r = run(ms.afclaude_decisions("show", id="d-002"))
         self.assertEqual((r["id"], r["state"]), ("D-002", "superseded"))
+        self.assertIn("D-176", r["note"])
         with self.assertRaisesRegex(ToolError, "no decision D-009"):
             asyncio.run(ms.afclaude_decisions("show", id="D-009"))
         with self.assertRaisesRegex(ToolError, "at least one keyword"):
             asyncio.run(ms.afclaude_decisions("find"))
+
+    def test_propose_writes_a_proposal_and_find_shows_topics_and_links(self):
+        """propose (Q1): the task-manager's own entry, proposed; find matches its topics once confirmed."""
+        r = run(ms.afclaude_decisions("propose", title="Show titles", topics=["lists", "tldr"], words="as said",
+                                      interpretation="my reading"))
+        self.assertEqual((r["id"], r["state"], r["topics"], r["new_topics"]), ("D-001", "proposed", ["lists", "tldr"],
+                                                                                 ["lists", "tldr"]))
+        self.assertIn("waits for the owner", r["note"])
+        conn = store.connect(self.db)
+        try:
+            self.assertEqual(store.get_decision_entry(conn, "D-001")["author"], "task-manager")
+            a = store.audit_log(conn, 5, target_type="decision")[0]
+            self.assertEqual((a["action"], a["actor"].split(":")[0], a["via"]), ("decision.add", "mcp", "mcp"))
+            actions.perform(conn, "decision.confirm", {"decision": "D-001"}, actor="cli", via="cli")
+            actions.perform(conn, "decision.add", {"title": "Other", "topics": ["x"], "words": "w", "author": "owner"},
+                            actor="cli", via="cli")
+            actions.perform(conn, "decision.link", {"decision": "D-002", "to": "D-001", "kind": "refines"}, actor="cli",
+                            via="cli")
+        finally:
+            conn.close()
+        r = run(ms.afclaude_decisions("find", keywords=["tldr", "x"]))
+        self.assertEqual(sorted(r["hits"], key=lambda h: h["id"]),
+                         [{"id": "D-001", "title": "Show titles", "state": "active", "topics": ["lists", "tldr"],
+                           "links": ["refined by D-002"]},
+                          {"id": "D-002", "title": "Other", "state": "active", "topics": ["x"],
+                           "links": ["refines D-001"]}])
+        with self.assertRaisesRegex(ToolError, "propose needs title"):
+            asyncio.run(ms.afclaude_decisions("propose", topics=["a"]))
+        with self.assertRaisesRegex(ToolError, "at least one"):
+            asyncio.run(ms.afclaude_decisions("propose", title="No topic"))
+
+    def test_a_schema_mismatch_tells_the_caller_what_to_do(self):
+        """A server that stayed up across an update (its code older than the database's schema) can't be fixed in
+        place; the new code says what to do instead of a generic database error."""
+        conn = store.connect(self.db)
+        try:
+            for version, want in (("99", "reconnect the afclaude MCP server \\(/mcp\\) or restart the session"),
+                                  ("4", "waiting for its migration")):
+                conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+                conn.commit()
+                with self.assertRaisesRegex(ToolError, want) as cm:
+                    asyncio.run(ms.afclaude_decisions("propose", title="T", topics=["a"]))
+                err = json.loads(str(cm.exception))["error"]
+                self.assertEqual((err["message"], err["kind"]), (err["next_step"], "schema"))
+                self.assertIn("AFClaude was updated" if version == "99" else "migration", err["message"])
+        finally:
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(store.SCHEMA_VERSION),))
+            conn.commit()
+            conn.close()
 
 
 class Prompts(Env):
@@ -632,8 +683,9 @@ class Stdio(unittest.TestCase):
         self.assertEqual(schema["afclaude_add_task"]["required"], ["title"])
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
-        # 15000 until afclaude_prompts (phase 4a P4)
-        self.assertLess(size, 16500, f"tool list is {size} bytes")
+        # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
+        # action's parameters, about 800 bytes)
+        self.assertLess(size, 17500, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

@@ -530,12 +530,13 @@ class Migration(unittest.TestCase):
             old.commit()
             old.close()
 
+            store.migrate(path)           # v5 code: a database below v5 gets its schema steps from the explicit migrate
             conn = store.connect(path)
             try:
                 tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertTrue({"tasks", "task_events", "session_decisions", "standing_rules"} <= tables)
                 self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))
-                self.assertEqual(store.SCHEMA_VERSION, 4)
+                self.assertEqual(store.SCHEMA_VERSION, 5)
                 self.assertIn("projects", tables)
                 self.assertEqual(store.counts(conn)["hits"], 1)                 # old data intact
                 self.assertEqual(store.get_session(conn, SID)["cwd"], "/home/x/proj")
@@ -583,6 +584,7 @@ class Migration(unittest.TestCase):
             old.commit()
             old.close()
 
+            store.migrate(path)
             conn = store.connect(path)
             try:
                 self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))
@@ -630,16 +632,17 @@ class Migration(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_empty_v2_db_migrates_without_backup(self):
+    def test_empty_v2_db_migrates_with_the_one_backup(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "v2.db")
             old = sqlite3.connect(path)
             old.executescript(V1_SCHEMA + V2_TABLES)
             old.close()
+            store.migrate(path)
             conn = store.connect(path)
             try:
                 self.assertIn("project_id", {r[1] for r in conn.execute("PRAGMA table_info(tasks)")})
-                self.assertEqual([f for f in os.listdir(d) if f.endswith(".bak")], [])   # nothing to back up
+                self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".bak")]), 1)   # migrate's, once
                 self.assertEqual(store.add_task(conn, "x")["priority"], "high")
             finally:
                 conn.close()
@@ -747,7 +750,9 @@ class SchemaGuard(unittest.TestCase):
             conn.execute("UPDATE tasks SET title = upper(title)")
 
         nxt = store.SCHEMA_VERSION + 1
-        with mock.patch.object(store, "SCHEMA_VERSION", nxt), mock.patch.dict(store.MIGRATIONS, {nxt: upper_titles}):
+        with mock.patch.object(store, "SCHEMA_VERSION", nxt), \
+                mock.patch.dict(store.MIGRATIONS, {nxt: upper_titles}), \
+                mock.patch.dict(store.MIGRATION_TABLES, {nxt: ("tasks",)}):
             conn = store.connect(self.db)                # connect never migrates: read-only until migrate
             try:
                 self.assertEqual([t["title"] for t in store.list_tasks(conn)], ["abc"])
@@ -808,7 +813,7 @@ class SchemaGuard(unittest.TestCase):
             self.assertEqual(json.loads(out.getvalue())["steps"], [])
             self.bump(self.NEWER)
             self.assertEqual(store.main(["migrate", "--db", self.db]), 1)       # never on a newer DB
-            self.assertEqual(store.main(["migrate", "--db", self.db + ".missing"]), 1)
+            self.assertEqual(store.main(["migrate", "--db", self.db + ".missing"]), store.MIGRATE_NO_DB)
         self.assertIn(f"schema_version {self.NEWER}", err.getvalue())
         self.assertIn("no database at", err.getvalue())
         self.assertFalse(os.path.exists(self.db + ".missing"))

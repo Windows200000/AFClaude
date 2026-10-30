@@ -22,6 +22,8 @@ atexit.register(shutil.rmtree, DIR, True)
 os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=os.path.join(DIR, "afclaude.json"),
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
+os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no file: the repo's own is never read
+os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
 os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (keepalive.run refuses under `on`)
 
 SID = "00000000-0000-4000-8000-000000000001"   # synthetic manager_session (not a real session anywhere)

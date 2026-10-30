@@ -32,6 +32,12 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                gains the tables/columns/triggers in place (_backup_v3, init).
                Writes from the CLI, the MCP server and the dashboard go through
                actions.py (validation, audit row, idempotency, version checks).
+  v5 (phase 4b Q1, D-284/D-285/D-286): the `decisions` table is rebuilt by _migrate_v5 (`python3
+               store.py migrate`, after a backup copy; the state CHECK gains 'proposed') with the
+               columns slug, project_id, author and origin; new tables decision_topics and
+               decision_links (DECISIONS_SCHEMA). Code at v4 can't write to a v5 database
+               (SchemaTooNew); v5 code on a v4 one can write everything except those decision
+               tables (MigrationNeeded for them) until migrated: the deploy gap (MIGRATION_TABLES).
                Later tables (SCHEMA/TELEMETRY_SCHEMA, no version bump: purely additive, so
                a running older checkout keeps writing): accounts (one 'default' row, D-156)
                and the telemetry tables of dashboard phase 2c (D-161; telemetry.py, the
@@ -82,9 +88,18 @@ database whose schema_version it knows. A newer one (written by newer code) is l
 untouched: connect() opens it read-only (reads go on; transaction() raises
 SchemaTooNew naming both versions; any other write fails in SQLite). Non-additive
 changes (a table rebuild, a dropped or renamed column) never run on connect(): they
-go into MIGRATIONS, and a database that needs one stays read-only (MigrationNeeded)
-until the explicit migrate step, which backs it up first:
+go into MIGRATIONS, and a database that needs one refuses writes to the tables the pending
+migrations rebuild (MIGRATION_TABLES; MigrationNeeded) until the explicit migrate step, which backs
+it up first:
     python3 store.py migrate [--db PATH]
+Every other table stays writable meanwhile, enforced by a SQLite authorizer on the connection
+(_gap_authorizer), so raw SQL can't get round it. That is what makes a deploy work: the host's
+deploy.py (merged code, drain write, doc append) runs against the live database while the old
+container, still at the old schema, keeps running; only the new container's entrypoint migrates,
+after the old one is gone. Running the migration before that would give the old code SchemaTooNew
+mid-run. The additive steps of init() wait for the migration too (they would raise schema_version), so
+the gap holds only for a database already at the version before the first pending migration (_in_gap), and a
+release's other additive changes must not be needed by deploy.py's own writes (a missing table fails loudly).
 Additive changes (new tables, COLUMNS, triggers) still apply on connect(). The v2 -> v3
 rebuild (_migrate_v3) predates this rule and still runs on connect(), after a backup.
 
@@ -100,6 +115,7 @@ the caller commits.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -118,7 +134,7 @@ from typing import Any, Literal, TypeVar, overload
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("AFCLAUDE_DB", os.path.join(HERE, "data", "afclaude.db"))
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 Row = dict[str, Any]        # a table row as a dict (what the read functions return)
 _T = TypeVar("_T")
@@ -127,7 +143,11 @@ _T = TypeVar("_T")
 # runs them; `python3 store.py migrate` does, after a backup, each in one transaction
 # with foreign keys off (migrate()). A step gets the database as the previous version
 # left it. Additive changes need no entry (SCHEMA, COLUMNS, VERSION_TRIGGERS).
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}   # filled below, after the DDL it uses
+# The tables each migration rebuilds or changes (every MIGRATIONS entry declares them; a test checks):
+# while the migration is pending the database refuses writes to exactly these (the deploy gap, see the
+# module doc). An FTS5 table stands for its shadow tables too. Everything else stays writable.
+MIGRATION_TABLES: dict[int, tuple[str, ...]] = {}
 
 # The tasks table, v3. {name} so _migrate_v3 can build it as tasks_v3 and rename it.
 TASKS_DDL = """
@@ -811,21 +831,27 @@ CREATE INDEX IF NOT EXISTS setup_codes_open ON setup_codes(kind, user_id, used_a
 """
 
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
-# owner / task-manager decision, mirrored from DECISIONS.md (the source the task-manager edits for
-# now; actions.decision_import, audited) with the full entry text and its fields. keywords is the
-# source's Keywords line; keywords_added / keywords_removed are the task-manager's own changes
-# (actions.decision_keywords, D-242), kept apart so a re-import never undoes them (the effective
-# set: decision_keywords()). decisions_fts (FTS5, when the SQLite build has it: has_decisions_fts) is
-# the full-text index over it, kept in step by the write functions below; without FTS5 a lookup
-# uses LIKE. Additive, no schema_version bump (as prompt_defaults).
-DECISIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS decisions (
+# owner / task-manager decision. Until the seeding step (Q2) it is still mirrored from DECISIONS.md
+# (origin 'file': actions.decision_import, audited) with the full entry text and its fields; from Q1
+# on entries can also be written natively (origin 'db': actions.decision_add|edit|expire|delete|
+# confirm, the body rendered from the fields) and the import leaves those alone (it neither
+# overwrites nor removes them). keywords is the source's Keywords line; keywords_added /
+# keywords_removed are the task-manager's own changes (actions.decision_keywords, D-242), kept apart
+# so a re-import never undoes them (the effective set: decision_keywords()). topics
+# (decision_topics, D-284) are the free keywords written with an entry, 'all' allowed; they are
+# matched like keywords. decision_links (refines | requires | conflicts) relate two entries.
+# decisions_fts (FTS5, when the SQLite build has it: has_decisions_fts) is the full-text index over
+# it, kept in step by the write functions below; without FTS5 a lookup uses LIKE.
+# The state set gained 'proposed' (the task-manager's own entry, waiting for the owner, D-285): a
+# CHECK change, so schema v5 (MIGRATIONS[5], `python3 store.py migrate`) rebuilds the table.
+DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS {name} (
     id               TEXT PRIMARY KEY,      -- D-NNN | M-NNN, as in the source
     title            TEXT NOT NULL,
     type             TEXT,                  -- owner | manager decision | task-manager (as written)
     date             TEXT,                  -- as written
     status           TEXT,                  -- the Status line as written
-    state            TEXT NOT NULL CHECK (state IN ('active', 'partial', 'done', 'superseded')),
+    state            TEXT NOT NULL CHECK (state IN ('proposed', 'active', 'partial', 'done', 'superseded')),
     supersedes       TEXT,
     keywords         TEXT NOT NULL DEFAULT '[]',   -- JSON list: the source's Keywords line
     keywords_added   TEXT NOT NULL DEFAULT '[]',   -- JSON list: added by the task-manager
@@ -838,17 +864,38 @@ CREATE TABLE IF NOT EXISTS decisions (
     section          TEXT,                  -- the source's "## " heading above the entry
     body             TEXT NOT NULL,         -- the full entry text, heading line included
     body_sha256      TEXT NOT NULL,
-    ord              INTEGER NOT NULL,      -- position in the source
-    imported_at      TEXT NOT NULL,         -- when this body was imported (changed, not every run)
+    ord              INTEGER NOT NULL,      -- position in the source (a native entry: after the last)
+    imported_at      TEXT NOT NULL,         -- when this body was imported (a native entry: written)
     updated_at       TEXT NOT NULL,
     updated_by       TEXT NOT NULL,
-    version          INTEGER NOT NULL DEFAULT 0
+    version          INTEGER NOT NULL DEFAULT 0,
+    slug             TEXT,                  -- stable key, unique per project (and among install-wide ones)
+    project_id       INTEGER REFERENCES projects(id),   -- NULL = install-wide
+    author           TEXT NOT NULL DEFAULT 'owner' CHECK (author IN ('owner', 'task-manager')),
+    origin           TEXT NOT NULL DEFAULT 'file' CHECK (origin IN ('file', 'db'))
 );
+"""
+DECISIONS_SCHEMA = DECISIONS_DDL.format(name="decisions") + """
 CREATE INDEX IF NOT EXISTS decisions_ord ON decisions(ord);
+CREATE UNIQUE INDEX IF NOT EXISTS decisions_slug ON decisions(COALESCE(project_id, 0), slug) WHERE slug IS NOT NULL;
+CREATE TABLE IF NOT EXISTS decision_topics (
+    decision_id TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+    topic       TEXT NOT NULL COLLATE NOCASE,
+    PRIMARY KEY (decision_id, topic)
+);
+CREATE INDEX IF NOT EXISTS decision_topics_topic ON decision_topics(topic);
+CREATE TABLE IF NOT EXISTS decision_links (
+    from_id TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+    to_id   TEXT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL CHECK (kind IN ('refines', 'requires', 'conflicts')),
+    PRIMARY KEY (from_id, to_id, kind),
+    CHECK (from_id <> to_id)
+);
+CREATE INDEX IF NOT EXISTS decision_links_to ON decision_links(to_id);
 """
 DECISIONS_FTS = ("CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(id UNINDEXED, title, keywords, "
                  "summary, words, body, tokenize = 'porter unicode61')")
-DECISION_STATES = ("active", "partial", "done", "superseded")
+DECISION_STATES = ("proposed", "active", "partial", "done", "superseded")
 DECISION_ID_RE = re.compile(r"^[DM]-\d{1,5}$")
 
 # v4: every UPDATE bumps `version` (unless the statement set it itself), so a stale
@@ -867,6 +914,35 @@ VERSION_TRIGGERS = [
     "CREATE TRIGGER IF NOT EXISTS prompt_vars_version AFTER UPDATE ON prompt_vars FOR EACH ROW "
     "WHEN NEW.version IS OLD.version BEGIN "
     "UPDATE prompt_vars SET version = OLD.version + 1 WHERE project_id = NEW.project_id AND name = NEW.name; END"]
+
+
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    """v4 -> v5 (phase 4b Q1): rebuild `decisions` for the wider state CHECK ('proposed') and the new
+    columns (slug, project_id, author, origin), keeping every row and its version as it was. author is
+    derived from the Type written in the source (owner -> owner, anything else -> task-manager); every
+    existing row is origin 'file' (it mirrors DECISIONS.md until the seeding step). The version trigger
+    and the ord index go with the old table and are recreated by init(), which the migrate step runs
+    after this. The topics and links tables are created by init() too (empty)."""
+    old = [r[1] for r in conn.execute("PRAGMA table_info(decisions)")]
+    if not old or "origin" in old:
+        return                                   # a fresh or already-migrated table
+    conn.execute("DROP TABLE IF EXISTS decisions_v5")
+    conn.execute(DECISIONS_DDL.format(name="decisions_v5"))
+    cols = ", ".join(old)
+    conn.execute(f"INSERT INTO decisions_v5 ({cols}, author) SELECT {cols}, "
+                 "CASE WHEN LOWER(TRIM(COALESCE(type, ''))) LIKE 'owner%' THEN 'owner' ELSE 'task-manager' END "
+                 "FROM decisions")
+    conn.execute("DROP TABLE decisions")
+    conn.execute("ALTER TABLE decisions_v5 RENAME TO decisions")
+
+
+MIGRATIONS[5] = _migrate_v5
+MIGRATION_TABLES[5] = ("decisions", "decisions_fts", "decision_topics", "decision_links")
+# What the decision actions write (actions._perform announces it to check_writable).
+DECISION_TABLES = MIGRATION_TABLES[5]
+# The tables whose foreign keys a migration's own check looks at: v5 only rebuilds `decisions`, so an
+# orphan row somewhere else (rows the database already had) can't block it.
+MIGRATION_FK_TABLES: dict[int, tuple[str, ...]] = {5: ("decisions",)}
 
 # Columns added after a table first shipped: {table: [(name, decl), ...]}.
 # connect() adds any that an existing database lacks.
@@ -973,6 +1049,7 @@ class TimedConnection(sqlite3.Connection):
     _tx_start: float | None = None
     _tx_origin: str = ""
     _tx_reporting: bool = False
+    _gap: bool = False      # a migration-gap authorizer is installed (init); check_writable lifts it
 
     def _tx_mark(self, how: str) -> None:
         if self._tx_reporting:
@@ -1085,15 +1162,23 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
     return retrying(open_)
 
 
-def init(conn: sqlite3.Connection) -> None:
+def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     """Create or (additively) upgrade the schema. Schema guard: a database that is newer
-    than this code, or needs a non-additive migration first, is left untouched and the
-    connection becomes read-only (PRAGMA query_only); see the module doc."""
-    if schema_problem(conn) is not None:
+    than this code is left untouched and the connection becomes read-only (PRAGMA query_only);
+    one that needs a non-additive migration first is left untouched too, but stays writable
+    except for the tables that migration changes (_install_gap); see the module doc. backed_up: the
+    caller (migrate) copied the database before changing it, so the older steps below take
+    no second copy."""
+    problem = schema_problem(conn)
+    if isinstance(problem, MigrationNeeded) and _in_gap(problem.db_version):
+        _install_gap(conn, problem.db_version)   # writable except the tables the migration changes
+        return
+    if problem is not None:
         conn.execute("PRAGMA query_only=ON")
         return
-    if not _migrate_v3(conn):  # before SCHEMA: its tasks_order index needs the v3 columns
-        _backup_v3(conn)       # (a v2 database was just backed up by _migrate_v3)
+    if not _migrate_v3(conn, backup=not backed_up):  # before SCHEMA: its tasks_order index needs the v3 columns
+        if not backed_up:
+            _backup_v3(conn)   # (a v2 database was just backed up by _migrate_v3)
     before = _stored_version(conn)
     conn.executescript(SCHEMA)
     conn.executescript(TELEMETRY_SCHEMA)
@@ -1205,11 +1290,84 @@ def schema_problem(conn: sqlite3.Connection) -> SchemaMismatch | None:
     return None
 
 
-def check_writable(conn: sqlite3.Connection) -> None:
-    """Raise SchemaMismatch if this code must not write to the database (schema guard)."""
+def _in_gap(version: int) -> bool:
+    """Is a database at `version` in the deploy gap: only non-additive migrations stand between it and
+    this code, i.e. it is at the version just before the first pending one, so every additive change
+    up to there has been applied (init does that on connect). One further behind (say v3 for a v5
+    code: v4's additive part is missing too) isn't: it stays refused wholesale until migrated."""
+    steps = pending_migrations(version)
+    return bool(steps) and version >= steps[0] - 1
+
+
+def _gap_tables(version: int) -> frozenset[str]:
+    """The tables (lower case) a database at `version` refuses writes to: what its pending
+    migrations change (MIGRATION_TABLES), an FTS5 table with its shadow tables."""
+    out: set[str] = set()
+    for v in pending_migrations(version):
+        if v not in MIGRATION_TABLES:
+            raise RuntimeError(f"migration {v} declares no tables: add it to store.MIGRATION_TABLES")
+        for t in MIGRATION_TABLES[v]:
+            out.add(t.lower())
+            if t.endswith("_fts"):
+                out.update(f"{t.lower()}_{x}" for x in ("data", "idx", "content", "docsize", "config"))
+    return frozenset(out)
+
+
+# authorizer action -> which of its two arguments names the table it acts on
+_GAP_ACTIONS: dict[int, int] = {
+    sqlite3.SQLITE_INSERT: 1, sqlite3.SQLITE_UPDATE: 1, sqlite3.SQLITE_DELETE: 1,
+    sqlite3.SQLITE_CREATE_TABLE: 1, sqlite3.SQLITE_DROP_TABLE: 1,
+    sqlite3.SQLITE_CREATE_VTABLE: 1, sqlite3.SQLITE_DROP_VTABLE: 1,
+    sqlite3.SQLITE_ALTER_TABLE: 2, sqlite3.SQLITE_CREATE_INDEX: 2, sqlite3.SQLITE_DROP_INDEX: 2,
+    sqlite3.SQLITE_CREATE_TRIGGER: 2, sqlite3.SQLITE_DROP_TRIGGER: 2}
+
+
+def _gap_authorizer(blocked: frozenset[str]) -> Callable[[int, str | None, str | None, str | None, str | None], int]:
+    """A SQLite authorizer that denies changing any of the `blocked` tables (data or schema,
+    also from a trigger body) and allows everything else, reads included."""
+    def authorize(action: int, arg1: str | None, arg2: str | None, db: str | None, source: str | None) -> int:
+        which = _GAP_ACTIONS.get(action)
+        table = None if which is None else (arg1 if which == 1 else arg2)
+        if table is not None and table.lower() in blocked:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    return authorize
+
+
+def _install_gap(conn: sqlite3.Connection, version: int) -> None:
+    """The deploy gap: this code is ahead of the database by a non-additive migration. Writes
+    to the tables it changes are denied (_gap_authorizer); the rest of the schema is already what
+    this code needs, so those writes go on. check_writable lifts it once the database is migrated."""
+    conn.set_authorizer(_gap_authorizer(_gap_tables(version)))
+    if isinstance(conn, TimedConnection):
+        conn._gap = True
+
+
+def check_writable(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> None:
+    """Raise SchemaMismatch if this code must not write to the database (schema guard). A
+    database that only needs a migration (MigrationNeeded) is writable except for the tables
+    that migration changes: it raises only when `tables` names one of them (the authorizer
+    catches whatever isn't announced, see transaction). Also drops the gap authorizer of a
+    connection opened before the database was migrated."""
     problem = schema_problem(conn)
-    if problem is not None:
-        raise problem
+    if problem is None:
+        if isinstance(conn, TimedConnection) and conn._gap:
+            conn.set_authorizer(None)
+            conn._gap = False
+        return
+    if (isinstance(problem, MigrationNeeded) and _in_gap(problem.db_version)
+            and not _gap_tables(problem.db_version) & {t.lower() for t in tables}):
+        return
+    raise problem
+
+
+def _gap_denial(conn: sqlite3.Connection, exc: BaseException) -> MigrationNeeded | None:
+    """The MigrationNeeded to raise in place of `exc`, a write the gap authorizer refused (a table
+    of the pending migration that the caller didn't announce); None for any other error."""
+    if not isinstance(exc, sqlite3.DatabaseError) or "not authorized" not in str(exc):
+        return None
+    problem = schema_problem(conn)
+    return problem if isinstance(problem, MigrationNeeded) else None
 
 
 def _backup_copy(conn: sqlite3.Connection, path: str, tag: str) -> str:
@@ -1221,6 +1379,35 @@ def _backup_copy(conn: sqlite3.Connection, path: str, tag: str) -> str:
     finally:
         dst.close()
     return dst_path
+
+
+def _content_hash(conn: sqlite3.Connection) -> str:
+    """A hash of everything in the database (its SQL dump), whatever its page layout."""
+    h = hashlib.sha256()
+    for line in conn.iterdump():
+        h.update(line.encode("utf-8", "surrogatepass"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _reusable_backup(conn: sqlite3.Connection, path: str, tag: str) -> str | None:
+    """A backup <path>.<tag>-*.bak with exactly the database's current content (an earlier migrate
+    that failed made it; the database has not changed since), newest first; None if there is none.
+    A failed migrate that is started again (a restarting container, a retry after a fix) then
+    doesn't write another copy of the whole database every time."""
+    for bak in sorted(glob.glob(f"{glob.escape(path)}.{tag}-*.bak"), reverse=True):
+        try:
+            other = sqlite3.connect(f"file:{bak}?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            if _content_hash(other) == _content_hash(conn):
+                return bak
+        except sqlite3.Error:
+            continue
+        finally:
+            other.close()
+    return None
 
 
 def migrate(path: str | None = None) -> dict[str, Any]:
@@ -1241,10 +1428,15 @@ def migrate(path: str | None = None) -> dict[str, Any]:
         if isinstance(problem, SchemaTooNew):
             raise problem
         steps = pending_migrations(stored) if stored is not None else []
-        backup = _backup_copy(conn, path, f"v{stored}") if steps else None
+        backup = None
+        if steps:
+            backup = _reusable_backup(conn, path, f"v{stored}") or _backup_copy(conn, path, f"v{stored}")
         for v in steps:
             _run_migration(conn, v)
-        init(conn)
+        init(conn, backed_up=backup is not None)
+        if stored is not None and stored < 4 and get_meta(conn, "migrated_v4_at") is None:
+            with transaction(conn):     # init() saw the version the steps had already raised
+                set_meta(conn, "migrated_v4_at", now_iso())
         return {"db": path, "from": stored, "to": SCHEMA_VERSION, "steps": steps, "backup": backup}
     finally:
         conn.close()
@@ -1261,7 +1453,11 @@ def _run_migration(conn: sqlite3.Connection, version: int) -> None:
                 conn.rollback()
                 return
             MIGRATIONS[version](conn)
-            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            tables = MIGRATION_FK_TABLES.get(version)    # None: every table (the migration touched many)
+            bad = (conn.execute("PRAGMA foreign_key_check").fetchall() if tables is None else
+                   [r for t in tables if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                                                      (t,)).fetchone()
+                    for r in conn.execute(f"PRAGMA foreign_key_check({t})").fetchall()])
             if bad:
                 raise sqlite3.IntegrityError(f"migration to v{version} left dangling references: "
                                              f"{[tuple(b) for b in bad]}")
@@ -1500,10 +1696,13 @@ def iso_ms(dt: datetime) -> str:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> Iterator[sqlite3.Connection]:
     """BEGIN IMMEDIATE ... COMMIT (a savepoint inside a caller's transaction). A new
     transaction checks the schema guard first and again under the write lock (a newer
-    process may have upgraded the database meanwhile): SchemaMismatch, nothing written."""
+    process may have upgraded the database meanwhile): SchemaMismatch, nothing written.
+    `tables`: what the caller is about to write, for a database awaiting a migration that
+    changes some of them (check_writable); a write to one that wasn't announced is refused
+    by the connection's authorizer and surfaces as the same MigrationNeeded."""
     if conn.in_transaction:
         conn.execute("SAVEPOINT afclaude_tx")
         try:
@@ -1514,14 +1713,17 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             raise
         conn.execute("RELEASE afclaude_tx")
     else:
-        check_writable(conn)        # the clear error, before BEGIN fails on a read-only connection
+        check_writable(conn, tables)    # the clear error, before BEGIN fails on a read-only connection
         conn.execute("BEGIN IMMEDIATE")
         try:
-            check_writable(conn)
+            check_writable(conn, tables)
             yield conn
             conn.commit()
-        except BaseException:
+        except BaseException as e:
             conn.rollback()
+            denied = _gap_denial(conn, e)
+            if denied is not None:
+                raise denied from e
             raise
 
 
@@ -3627,7 +3829,8 @@ def doc_counts(conn: sqlite3.Connection) -> dict[str, int]:
 # ---------------------------------------------------------------- the decision store (D-242)
 #
 # DECISIONS_SCHEMA above. The reads, the lookup (find_decision_entries) and the raw writes;
-# actions.py (decision.import, decision.keywords) is the only caller of the writes.
+# actions.py (decision.import|keywords|add|edit|expire|delete|confirm|link|topics) is the only
+# caller of the writes.
 
 DECISION_FIELDS = ("title", "type", "date", "status", "state", "supersedes", "summary", "words", "source",
                    "scope", "interpretation", "section", "body")
@@ -3645,20 +3848,72 @@ def _init_decisions_fts(conn: sqlite3.Connection) -> None:
     n = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
     if conn.execute("SELECT COUNT(*) FROM decisions_fts").fetchone()[0] != n:
         conn.execute("DELETE FROM decisions_fts")
-        for r in conn.execute("SELECT * FROM decisions").fetchall():
-            _decision_fts_put(conn, _decision_dict(r))
+        for d in list_decision_entries(conn):
+            _decision_fts_put(conn, d)
 
 
 def has_decisions_fts(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'decisions_fts'").fetchone() is not None
 
 
-def _decision_dict(r: sqlite3.Row) -> Row:
+DECISION_AUTHORS = ("owner", "task-manager")
+DECISION_LINK_KINDS = ("refines", "requires", "conflicts")
+DECISION_NATIVE_STATES = ("proposed", "active")      # what a native (origin 'db') entry can be
+DECISION_TOPIC_MAX = 40
+DECISION_SLUG_RE = re.compile(r"^[a-z0-9]+(?:[-/][a-z0-9]+)*$")
+DECISION_SLUG_MAX = 80
+
+
+def _decision_dict(r: sqlite3.Row, topics: Sequence[str] = (), links: Sequence[Row] = ()) -> Row:
     d = dict(r)
     for k in ("keywords", "keywords_added", "keywords_removed"):
         d[k] = json.loads(d[k] or "[]")
     d["effective_keywords"] = decision_keywords(d)
+    d["topics"] = list(topics)
+    d["links"] = list(links)
     return d
+
+
+def _decision_extras(conn: sqlite3.Connection, ids: Sequence[str] | None = None
+                     ) -> tuple[dict[str, list[str]], dict[str, list[Row]]]:
+    """The topics and links of `ids` (every decision when None), by decision id. A link is listed
+    on both of its entries: {"kind", "id" (the other one), "title", "direction": "out" | "in"}."""
+    where, args = "", []
+    if ids is not None:
+        where, args = f" WHERE decision_id IN ({', '.join('?' * len(ids))})", list(ids)
+    topics: dict[str, list[str]] = {}
+    for did, topic in conn.execute(f"SELECT decision_id, topic FROM decision_topics{where} ORDER BY rowid", args):
+        topics.setdefault(did, []).append(topic)
+    lwhere, largs = "", []
+    if ids is not None:
+        marks = ", ".join("?" * len(ids))
+        lwhere, largs = f" WHERE l.from_id IN ({marks}) OR l.to_id IN ({marks})", list(ids) * 2
+    links: dict[str, list[Row]] = {}
+    for f, t, kind, ft, tt in conn.execute(
+            "SELECT l.from_id, l.to_id, l.kind, f.title, t.title FROM decision_links l "
+            "JOIN decisions f ON f.id = l.from_id JOIN decisions t ON t.id = l.to_id"
+            f"{lwhere} ORDER BY l.rowid", largs):
+        if ids is None or f in ids:
+            links.setdefault(f, []).append({"kind": kind, "id": t, "title": tt, "direction": "out"})
+        if ids is None or t in ids:
+            links.setdefault(t, []).append({"kind": kind, "id": f, "title": ft, "direction": "in"})
+    return topics, links
+
+
+def link_text(link: Mapping[str, Any]) -> str:
+    """'refines D-12' (this entry refines D-12) or 'refined by D-30' (D-30 refines this one)."""
+    kind = str(link["kind"])
+    if link["direction"] == "out":
+        return f"{kind} {link['id']}"
+    return {"refines": "refined by", "requires": "required by", "conflicts": "conflicts with"}[kind] + f" {link['id']}"
+
+
+def decision_topic(value: object) -> str:
+    """One topic: lower case, spaces collapsed, at most DECISION_TOPIC_MAX characters, no comma."""
+    t = " ".join(_text(value, "topic", required=True).lower().split())
+    if not t or len(t) > DECISION_TOPIC_MAX or "," in t:
+        raise ValueError(f"a topic is 1-{DECISION_TOPIC_MAX} characters, without commas: {value!r}")
+    return t
 
 
 def decision_keywords(d: Mapping[str, Any]) -> list[str]:
@@ -3684,23 +3939,42 @@ def decision_id(value: object) -> str:
 
 
 def get_decision_entry(conn: sqlite3.Connection, decision: object) -> Row | None:
-    r = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id(decision),)).fetchone()
-    return _decision_dict(r) if r is not None else None
+    did = decision_id(decision)
+    r = conn.execute("SELECT * FROM decisions WHERE id = ?", (did,)).fetchone()
+    if r is None:
+        return None
+    topics, links = _decision_extras(conn, [did])
+    return _decision_dict(r, topics.get(did, ()), links.get(did, ()))
 
 
 def list_decision_entries(conn: sqlite3.Connection, states: Iterable[str] | None = None) -> list[Row]:
-    """Every decision (or those in `states`), in source order."""
-    rows = [_decision_dict(r) for r in conn.execute("SELECT * FROM decisions ORDER BY ord, id")]
+    """Every decision (or those in `states`), in source order, the native ones after the file's (a
+    re-import renumbers the file's rows 0..n-1, so `ord` alone would put a native one in the middle)."""
+    topics, links = _decision_extras(conn)
+    rows = [_decision_dict(r, topics.get(r["id"], ()), links.get(r["id"], ()))
+            for r in conn.execute("SELECT * FROM decisions ORDER BY (origin = 'db'), ord, id")]
     if states is None:
         return rows
     want = set(states)
     return [r for r in rows if r["state"] in want]
 
 
+def decision_titles(conn: sqlite3.Connection, states: Iterable[str]) -> list[Row]:
+    """id, title and state of the decisions in `states`, in the order of list_decision_entries: the
+    TLDR's read. Only the columns every schema version has, so it still reads a database that
+    needs the migration (the hook builds the TLDR read-only then)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(decisions)")}
+    order = "(origin = 'db'), ord, id" if "origin" in cols else "ord, id"
+    want = set(states)
+    return [dict(r) for r in conn.execute(f"SELECT id, title, state FROM decisions ORDER BY {order}")
+            if r["state"] in want]
+
+
 def _decision_fts_put(conn: sqlite3.Connection, d: Mapping[str, Any]) -> None:
     conn.execute("DELETE FROM decisions_fts WHERE id = ?", (d["id"],))
     conn.execute("INSERT INTO decisions_fts(id, title, keywords, summary, words, body) VALUES (?, ?, ?, ?, ?, ?)",
-                 (d["id"], d["title"], ", ".join(decision_keywords(d)), d.get("summary") or "",
+                 (d["id"], d["title"], ", ".join(decision_keywords(d) + list(d.get("topics") or [])),
+                  d.get("summary") or "",
                   d.get("words") or "", d["body"]))
 
 
@@ -3715,7 +3989,8 @@ def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) 
     leaving the task-manager's keyword changes alone. -> (outcome, the row before): 'added',
     'changed' (the entry text differs), 'restated' (the text is the same but a derived field, e.g.
     state, comes out different -- the derivation logic changed, not the source), 'moved' (only its
-    position/section), 'unchanged'."""
+    position/section), 'unchanged', 'detached' (the id is a native entry, origin 'db': the source
+    doesn't own it, nothing is written)."""
     did = decision_id(e["id"])
     if e["state"] not in DECISION_STATES:
         raise ValueError(f"{did}: state must be one of {'|'.join(DECISION_STATES)}")
@@ -3723,22 +3998,26 @@ def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) 
     sha = sha256_text(body)
     kw = json.dumps(list(e.get("keywords") or []), ensure_ascii=False)
     cur = get_decision_entry(conn, did)
+    if cur is not None and cur["origin"] == "db":
+        return "detached", cur
     now = now_iso()
     vals = [e.get(k) for k in DECISION_FIELDS]
+    author = "owner" if str(e.get("type") or "").strip().lower().startswith("owner") else "task-manager"
     if cur is None:
         conn.execute(f"INSERT INTO decisions(id, {', '.join(DECISION_FIELDS)}, keywords, body_sha256, ord, "
-                     f"imported_at, updated_at, updated_by) VALUES ({', '.join('?' * (len(DECISION_FIELDS) + 7))})",
-                     [did, *vals, kw, sha, int(e["ord"]), now, now, by])
+                     f"imported_at, updated_at, updated_by, author) "
+                     f"VALUES ({', '.join('?' * (len(DECISION_FIELDS) + 8))})",
+                     [did, *vals, kw, sha, int(e["ord"]), now, now, by, author])
         outcome = "added"
     elif cur["body_sha256"] != sha or cur["keywords"] != list(e.get("keywords") or []):
         conn.execute(f"UPDATE decisions SET {', '.join(k + ' = ?' for k in DECISION_FIELDS)}, keywords = ?, "
-                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                     [*vals, kw, sha, int(e["ord"]), now, now, by, did])
+                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ?, author = ? "
+                     "WHERE id = ?", [*vals, kw, sha, int(e["ord"]), now, now, by, author, did])
         outcome = "changed"
     elif any(cur.get(k) != e.get(k) for k in DECISION_DERIVED_FIELDS):
         conn.execute(f"UPDATE decisions SET {', '.join(k + ' = ?' for k in DECISION_FIELDS)}, keywords = ?, "
-                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ? WHERE id = ?",
-                     [*vals, kw, sha, int(e["ord"]), now, now, by, did])
+                     "body_sha256 = ?, ord = ?, imported_at = ?, updated_at = ?, updated_by = ?, author = ? "
+                     "WHERE id = ?", [*vals, kw, sha, int(e["ord"]), now, now, by, author, did])
         outcome = "restated"
     elif cur["ord"] != int(e["ord"]) or cur["section"] != e.get("section"):
         conn.execute("UPDATE decisions SET ord = ?, section = ? WHERE id = ?", (int(e["ord"]), e.get("section"), did))
@@ -3753,10 +4032,13 @@ def put_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) 
 
 
 def delete_decision_entry(conn: sqlite3.Connection, decision: object) -> Row:
-    """Remove a decision that left the source. -> the row as it was."""
+    """Remove a decision (it left the source, expired or no longer applies), with its topics and
+    links. -> the row as it was (topics and links included)."""
     cur = get_decision_entry(conn, decision)
     if cur is None:
         raise NotFound(f"no decision {decision}")
+    conn.execute("DELETE FROM decision_topics WHERE decision_id = ?", (cur["id"],))
+    conn.execute("DELETE FROM decision_links WHERE from_id = ? OR to_id = ?", (cur["id"], cur["id"]))
     conn.execute("DELETE FROM decisions WHERE id = ?", (cur["id"],))
     if has_decisions_fts(conn):
         conn.execute("DELETE FROM decisions_fts WHERE id = ?", (cur["id"],))
@@ -3778,6 +4060,144 @@ def set_decision_keywords(conn: sqlite3.Connection, decision: object, added: Seq
     if has_decisions_fts(conn):
         _decision_fts_put(conn, after)
     return after
+
+
+def _decision_refresh(conn: sqlite3.Connection, did: str) -> Row:
+    after = get_decision_entry(conn, did)
+    assert after is not None
+    if has_decisions_fts(conn):
+        _decision_fts_put(conn, after)
+    return after
+
+
+def next_decision_id(conn: sqlite3.Connection, taken: Iterable[str] = ()) -> str:
+    """The next free D-NNN: above every D-number in the table, above the highest one ever given out
+    natively (meta decision_id_floor, so a deleted entry's number isn't reused) and above every one in
+    `taken` (the ids DECISIONS.md holds: the owner's next statement is written there as the next
+    number, so a native entry must not have taken it, D-286)."""
+    top = int(get_meta(conn, "decision_id_floor", 0) or 0)
+    for (did,) in conn.execute("SELECT id FROM decisions WHERE id LIKE 'D-%'"):
+        top = max(top, int(did[2:]))
+    for did in taken:
+        if did.startswith("D-"):
+            top = max(top, int(did[2:]))
+    return f"D-{top + 1:03d}"
+
+
+def check_decision_slug(conn: sqlite3.Connection, slug: object, project_id: int | None,
+                        own: str | None = None) -> str:
+    """A slug: lower-case words joined by - or /, unique per project (install-wide ones together)."""
+    sl = _text(slug, "slug", required=True)
+    if len(sl) > DECISION_SLUG_MAX or not DECISION_SLUG_RE.match(sl):
+        raise ValueError(f"a slug is lower-case letters and digits joined by - or /, at most "
+                         f"{DECISION_SLUG_MAX} characters: {slug!r}")
+    clash = conn.execute("SELECT id FROM decisions WHERE slug = ? AND COALESCE(project_id, 0) = ? AND id IS NOT ?",
+                         (sl, project_id or 0, own)).fetchone()
+    if clash is not None:
+        raise ValueError(f"slug {sl!r} is already {clash[0]}'s ({'in this project' if project_id else 'install-wide'})")
+    return sl
+
+
+def add_decision_entry(conn: sqlite3.Connection, e: Mapping[str, Any], by: str) -> Row:
+    """Insert a native decision (origin 'db'). e: id, title, state (proposed | active), author, body,
+    the optional DECISION_FIELDS (type, date, status, summary, words, source, scope, interpretation),
+    slug, project_id, keywords, topics. -> the row after. The id must be new."""
+    did = decision_id(e["id"])
+    if e["state"] not in DECISION_NATIVE_STATES or e["author"] not in DECISION_AUTHORS:
+        raise ValueError(f"{did}: a native decision is {'|'.join(DECISION_NATIVE_STATES)}, "
+                         f"by {'|'.join(DECISION_AUTHORS)}")
+    if get_decision_entry(conn, did) is not None:
+        raise ValueError(f"{did} already exists")
+    now = now_iso()
+    top = conn.execute("SELECT COALESCE(MAX(ord), -1) FROM decisions").fetchone()[0]
+    conn.execute("INSERT INTO decisions(id, title, type, date, status, state, supersedes, keywords, summary, words, "
+                 "source, scope, interpretation, section, body, body_sha256, ord, imported_at, updated_at, "
+                 "updated_by, slug, project_id, author, origin) "
+                 "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'db')",
+                 (did, e["title"], e.get("type"), e.get("date"), e.get("status"), e["state"],
+                  json.dumps(list(e.get("keywords") or []), ensure_ascii=False), e.get("summary"), e.get("words"),
+                  e.get("source"), e.get("scope"), e.get("interpretation"), e["body"], sha256_text(e["body"]),
+                  top + 1, now, now, by, e.get("slug"), e.get("project_id"), e["author"]))
+    for t in e.get("topics") or []:
+        conn.execute("INSERT OR IGNORE INTO decision_topics(decision_id, topic) VALUES (?, ?)", (did, t))
+    if did.startswith("D-"):
+        floor = int(get_meta(conn, "decision_id_floor", 0) or 0)
+        if int(did[2:]) > floor:
+            set_meta(conn, "decision_id_floor", int(did[2:]))
+    return _decision_refresh(conn, did)
+
+
+def update_decision_entry(conn: sqlite3.Connection, decision: object, fields: Mapping[str, Any],
+                          by: str) -> Row:
+    """Overwrite fields of a native decision (D-158): title, type, date, status, summary, words,
+    source, scope, interpretation, slug, and the body rendered from them. -> the row after."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    cols = [k for k in fields if k in DECISION_FIELDS or k == "slug"]
+    sets = ", ".join(f"{k} = ?" for k in cols)
+    extra = ", body_sha256 = ?" if "body" in cols else ""
+    args: list[Any] = [fields[k] for k in cols]
+    if "body" in cols:
+        args.append(sha256_text(str(fields["body"])))
+    conn.execute(f"UPDATE decisions SET {sets}{extra}, updated_at = ?, updated_by = ? WHERE id = ?",
+                 [*args, now_iso(), by, cur["id"]])
+    return _decision_refresh(conn, cur["id"])
+
+
+def set_decision_state(conn: sqlite3.Connection, decision: object, state: str, status: str | None, body: str,
+                       by: str) -> Row:
+    """Move a native decision to `state` (a confirmed proposal becomes active), with its Status line and
+    the re-rendered body."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    conn.execute("UPDATE decisions SET state = ?, status = ?, body = ?, body_sha256 = ?, updated_at = ?, "
+                 "updated_by = ? WHERE id = ?", (state, status, body, sha256_text(body), now_iso(), by, cur["id"]))
+    return _decision_refresh(conn, cur["id"])
+
+
+def set_decision_topics(conn: sqlite3.Connection, decision: object, add: Sequence[str],
+                        remove: Sequence[str], by: str) -> Row:
+    """Add and remove topics (already normalised by decision_topic). -> the row after."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    for t in remove:
+        conn.execute("DELETE FROM decision_topics WHERE decision_id = ? AND topic = ?", (cur["id"], t))
+    for t in add:
+        conn.execute("INSERT OR IGNORE INTO decision_topics(decision_id, topic) VALUES (?, ?)", (cur["id"], t))
+    conn.execute("UPDATE decisions SET updated_at = ?, updated_by = ? WHERE id = ?", (now_iso(), by, cur["id"]))
+    return _decision_refresh(conn, cur["id"])
+
+
+def decision_topic_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Every topic in use and how many entries carry it (most used first): reuse before adding one."""
+    return {t: n for t, n in conn.execute(
+        "SELECT topic, COUNT(*) AS n FROM decision_topics GROUP BY topic ORDER BY n DESC, topic")}
+
+
+def set_decision_link(conn: sqlite3.Connection, from_id: object, to_id: object, kind: str, present: bool,
+                      by: str) -> bool:
+    """Add or remove the link `from_id kind to_id`. -> whether anything changed."""
+    a, b = get_decision_entry(conn, from_id), get_decision_entry(conn, to_id)
+    for ref, row in ((from_id, a), (to_id, b)):
+        if row is None:
+            raise NotFound(f"no decision {ref}")
+    assert a is not None and b is not None
+    _enum(kind, DECISION_LINK_KINDS, "kind")
+    if present:
+        if a["id"] == b["id"]:
+            raise ValueError("a decision can't link to itself")
+        n = conn.execute("INSERT OR IGNORE INTO decision_links(from_id, to_id, kind) VALUES (?, ?, ?)",
+                         (a["id"], b["id"], kind)).rowcount
+    else:
+        n = conn.execute("DELETE FROM decision_links WHERE from_id = ? AND to_id = ? AND kind = ?",
+                         (a["id"], b["id"], kind)).rowcount
+    if n:
+        conn.execute("UPDATE decisions SET updated_at = ?, updated_by = ? WHERE id IN (?, ?)",
+                     (now_iso(), by, a["id"], b["id"]))
+    return n > 0
 
 
 def _kw_forms(s: str) -> set[str]:
@@ -3803,7 +4223,7 @@ def _kw_match(term: str, keyword: str) -> bool:
 
 def find_decision_entries(conn: sqlite3.Connection, terms: Sequence[str],
                           states: Iterable[str] | None = None) -> list[Row]:
-    """The decisions matching any of `terms`, best first: those with a matching keyword (most
+    """The decisions matching any of `terms`, best first: those with a matching keyword or topic (most
     matched terms first), then those whose text matches (FTS5 rank when the index exists, else
     LIKE, most matched terms first). Each row gets "match" ('keyword' | 'text') and "matched"
     (the terms that hit its keywords, for a keyword match)."""
@@ -3820,13 +4240,13 @@ def find_decision_entries(conn: sqlite3.Connection, terms: Sequence[str],
     else:
         for r in rows:
             hay = " ".join(str(r.get(k) or "") for k in ("title", "summary", "words", "body")).lower()
-            hay += " " + " ".join(r["effective_keywords"]).lower()
+            hay += " " + " ".join(r["effective_keywords"] + r["topics"]).lower()
             n = sum(1 for t in terms if t.lower() in hay)
             if n:
                 text_rank[r["id"]] = -n + r["ord"] / 1e6
     hits: list[tuple[tuple[float, ...], Row]] = []
     for r in rows:
-        matched = [t for t in terms if any(_kw_match(t, k) for k in r["effective_keywords"])]
+        matched = [t for t in terms if any(_kw_match(t, k) for k in r["effective_keywords"] + r["topics"])]
         rank = text_rank.get(r["id"])
         if matched:
             hits.append(((0, -len(matched), rank if rank is not None else 1e9, r["ord"]),
@@ -3883,6 +4303,8 @@ FALLBACK_HEADER = ("# AFClaude: database failures recorded outside the database 
                    "the alerts sent and when it was healthy again. Imported into the database later.\n\n")
 PAYLOAD_MAX = 4096                                       # characters of a payload kept for a replay
 NOTIFY: Callable[[str, str], object] | None = None       # None = notify.notify (tests set a recorder)
+MIGRATE_NO_DB = 3        # `store.py migrate`: no database file (the entrypoint goes on: a first install)
+
 NEXT_STEP = ("Wait about 30 seconds and retry this once. If it fails again, stop the work that needs the "
              "AFClaude database, don't work around it (no hand-edited files or other stores instead), and "
              "tell the user it needs their intervention (they are alerted outside the database).")
@@ -4229,6 +4651,13 @@ def _alert(path: str, subject: str, body: str, who: str, scope: str) -> str:
     return "the owner has been alerted (notify.py)"
 
 
+def alert_once(path: str, subject: str, body: str, who: str) -> str:
+    """Alert the owner out of the DB (the fallback file + a push, once per runner episode: the one the
+    migrate step or db_gate opened, closed when the database is healthy again). For a failure that
+    leaves the DB unwritable, e.g. the schema guard. -> what happened."""
+    return _alert(path, subject, body, who, scope="runner")
+
+
 def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[str, Any] | None = None,
                     write: bool = True, db_path: str | None = None, payload_sha: str | None = None,
                     payload_max: int = PAYLOAD_MAX, runner: bool = False) -> DBError:
@@ -4457,10 +4886,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"db": os.path.abspath(db), "schema_version": SCHEMA_VERSION,
                           "created": not existed}, ensure_ascii=False))
         return 0
+    db = os.path.abspath(args.db or DB_PATH)
     try:
-        r = migrate(args.db)
-    except (SchemaMismatch, NotFound) as e:
+        r = migrate(db)
+    except NotFound as e:       # no database yet (a first install): nothing to migrate, not a failure
         print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return MIGRATE_NO_DB
+    except Exception as e:   # noqa: BLE001 - any failure: told to the owner, the exit status says it (D-235)
+        print(f"error: {type(e).__name__}: {e.args[0] if e.args else e}", file=sys.stderr)
+        alert_once(fallback_path(db), "AFClaude: the database migration failed",
+               f"python3 store.py migrate on {db}: {type(e).__name__}: {e}\nThe database stays as it was "
+               "(read-only for this code until it migrates; the container idles, unhealthy, instead of "
+               "restarting). See data/migrate.log; fix it, then restart the container. After an image "
+               "rollback restore the <db>.v<N>-<utc>.bak backup instead (there is no down-migration).",
+               "migrate")
         return 1
     print(json.dumps(r, ensure_ascii=False))
     return 0

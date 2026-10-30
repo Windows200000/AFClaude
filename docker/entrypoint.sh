@@ -21,6 +21,25 @@ CRON_BIN="${AFCLAUDE_SUPERCRONIC:-/usr/local/bin/supercronic}"
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
 mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
+# Phase 4b Q1: the explicit schema step. A non-additive change (store.MIGRATIONS; v5 rebuilds `decisions`)
+# never runs on connect(): until this has run, code at the new version can't write the tables the migration
+# changes (MigrationNeeded; everything else stays writable, so the host's deploy.py can drain and the old
+# container keeps running meanwhile), and after it code at the old version can't write at all (SchemaTooNew),
+# so it runs first and alone: the old container is gone by now and the runner has not started. It copies the DB to <db>.v<old>-<utc>.bak before changing anything
+# (an unchanged DB that already has such a copy gets no second one) and is a no-op when the DB is current.
+# Exit 3 = no database yet (a first install): the start goes on. Any other failure alerts the owner itself
+# (store.py: the fallback alert file + a push, the DB being unwritable) and the container then IDLES instead of
+# starting the runner: a runner on a read-only DB crashes at boot, the container exits, `restart: unless-stopped`
+# loops, and every loop would run migrate again. Idle, it stays up and unhealthy: `runner.py health` reports the
+# schema state, `docker exec` works for the fix, and the next container start retries the migration (D-235).
+rc=0
+python3 "$D/store.py" migrate >>"$D/data/migrate.log" 2>&1 || rc=$?
+if [ "$rc" -eq 3 ]; then
+  echo "afclaude: store migrate: no database yet (a first install), nothing to migrate" >&2
+elif [ "$rc" -ne 0 ]; then
+  echo "afclaude: store migrate FAILED (exit $rc, see data/migrate.log; the owner was alerted): not starting the scheduler; idling, unhealthy, until the next container start" >&2
+  exec sleep infinity
+fi
 # D-227: every deploy (`docker compose up -d --build`, i.e. every container start) imports
 # prompts/*.md into prompt_defaults, so the DB always has what is currently deployed (prompts
 # still ship as files, D-169; prompt_overrides holds the owner's edits). Now that data/ is

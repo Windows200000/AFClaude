@@ -874,6 +874,15 @@ class Misc(Base):
         conn2 = store.connect(os.path.join(self.tmp, "empty.db"), create=True)
         self.addCleanup(conn2.close)
         self.assertEqual(runner.health(conn2, on, self.now, pids=live), "the runner has no heartbeat")
+        # the schema state first: a database this code must not write to (a failed migrate) is the reason
+        conn3 = store.connect(os.path.join(self.tmp, "old.db"), create=True)
+        self.addCleanup(conn3.close)
+        for version, kind in (("4", "needs the non-additive migration"), ("99", "newer than this code")):
+            conn3.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+            conn3.commit()
+            why = runner.health(conn3, on, self.now, pids=live)
+            self.assertTrue(why.startswith("schema: ") and kind in why, why)
+            self.assertIsNone(runner.health(conn3, off, self.now, pids=live))     # no runner mode: nothing checked
 
     def test_health_cli_reports_and_fails(self):
         out = io.StringIO()
