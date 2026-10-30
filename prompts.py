@@ -19,8 +19,8 @@ Project scope (D-193, D-197): prompts are system-wide (an override is keyed by n
 only); a project only fills the variables PROJECT_VARS declares. Its values are rows of
 store.prompt_vars, written through actions.py (prompt_var.set / prompt_var.reset, audited; owner
 only until the roles of phase 5a give it to the project's managers and editors). One prompt uses
-them: manager_project.md (P3), the task-manager rules of every project: a few words (the goal list's
-and the questions' place) and whole lines (the public-repo rule, the worktree rule, a note, the docs
+them: manager_project.md (P3), the task-manager rules of every project: a few words (the goal list's,
+the progress notes' and the questions' place) and whole lines (the public-repo rule, the worktree rule, a note, the docs
 rule, the deploy rule; an empty one leaves no line). A session's text is built from its project's
 values: keepalive.session_message(repo=...) reads them (project_values_at), the SessionStart hook
 reads AFClaude's own.
@@ -111,7 +111,7 @@ PROMPTS: dict[str, Prompt] = {
     "guard_respect": Prompt(used_by="standing rule: every session message, the hook part afclaude"),
     "manager": Prompt(used_by="standing rule: task-manager sessions, the hook part manager"),
     "manager_project": Prompt(("afclaude_dir", "session_stop_pct", "tools"),
-                              ("goals_location", "questions_location", "public_repo_rule", "worktree_rule",
+                              ("goals_location", "progress_location", "questions_location", "public_repo_rule", "worktree_rule",
                                "project_notes", "docs_rule", "deploy_rule"),
                               used_by="standing rule: the project's own rules after manager.md (D-197); the "
                                       "hook part afclaude for AFClaude itself"),
@@ -134,12 +134,16 @@ PROMPTS: dict[str, Prompt] = {
     "usage_haiku": Prompt(("gaps", "n", "name", "prompts", "totals"), used_by="usage_sampler Haiku judge"),
 }
 
-# D-197: what a project fills. Values are text. goals_location / questions_location are words inside
+# D-197: what a project fills. Values are text. goals_location / progress_location / questions_location are words inside
 # a line of the template; the rest are WHOLE-LINE variables (the value carries its own "- "): a line
 # that can't be phrased with a value (the public-repo rule, the worktree story) is a variable whose
 # default is empty, and render() drops an empty one's line, so a project without it gets no gap.
 PROJECT_VARS: dict[str, ProjectVar] = {
-    "goals_location": ProjectVar("where the project's goal list lives", "GOALS.md"),
+    # defaults fit a project whose docs live in the AFClaude DB (docs_rule's default); read as "(the
+    # project's goals doc: one short line ...)" and "stop cleanly (state in the project's progress doc)"
+    "goals_location": ProjectVar("where the project's goal list lives", "the project's goals doc"),
+    "progress_location": ProjectVar("where the project's progress notes (the state of a stopped run) live",
+                                    "the project's progress doc"),
     "questions_location": ProjectVar("where the project's open questions for the user live", "OPEN_QUESTIONS.md"),
     "public_repo_rule": ProjectVar("whole line: the public-repo rule and the guard the commit hooks run "
                                    "(empty: the repo is not public)", max_len=2000),
@@ -158,6 +162,7 @@ PROJECT_VARS: dict[str, ProjectVar] = {
 # text for it (test_prompts, against testdata/manager_afclaude_before_p3.md).
 CHECKOUT_SEED: dict[str, str] = {
     "goals_location": "GOALS.md",
+    "progress_location": "PROGRESS.md",
     "questions_location": "OPEN_QUESTIONS.md",
     "public_repo_rule": (
         '- The repo will be PUBLIC. Keep personal data, secrets, IP addresses, domains and user-specific '
