@@ -28,6 +28,10 @@ Allowed (exact shapes):
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
   append-note PROGRESS.md|ALERTS.md   append stdin (<= 16 KB UTF-8 text) to that repo file
+  rc-send <name>           a one-shot Haiku `claude -p` (RC_SEND_FLAGS: dontAsk, only SendMessage +
+                           ListAgents) asked to SendMessage stdin (<= 16 KB UTF-8 text) to the live
+                           session named <name> (RC_NAME): the dispatcher's continue of a `claude rc`
+                           thread (docs/rc_server_mode.md §4.1); prompt and flags fixed here
 """
 import datetime
 import json
@@ -53,6 +57,17 @@ HAIKU_FLAGS = {"-p", "--model", "haiku", "--no-session-persistence", "--output-f
                "stream-json", "--verbose", "--permission-mode", "dontAsk", "--tools=",
                "--tools=PushNotification", "--allowedTools=PushNotification",
                "--strict-mcp-config", "--disable-slash-commands"}
+
+# rc-send: kept identical to host.py's RC_NAME / RC_TEXT_MAX / RC_SEND_FLAGS / RC_SEND_PROMPT (test_host.py)
+RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+RC_TEXT_MAX = 16 * 1024
+RC_SEND_FLAGS = ["-p", "--model", "haiku", "--permission-mode", "dontAsk",
+                 "--allowedTools", "SendMessage", "ListAgents", "--strict-mcp-config",
+                 "--disable-slash-commands", "--output-format", "stream-json", "--verbose"]
+RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named exactly {name!r}, with the "
+                  "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
+                  "not reachable, do not try any other name or agent and do not retry. Do nothing else. "
+                  "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 
 
 def log(msg):
@@ -130,6 +145,20 @@ def check_ka_resume(args):
         deny("model")
 
 
+def rc_send_cmd(args, data):
+    """rc-send <name> with the message text `data` (stdin bytes) -> (cmd, stdin bytes), or deny."""
+    if len(args) != 1 or not RC_NAME.match(args[0]):
+        deny("rc-send needs one thread name")
+    if not data or len(data) > RC_TEXT_MAX or b"\0" in data:
+        deny("rc-send text empty, too long or binary")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        deny("rc-send text not UTF-8")
+    log(f"OK rc-send {args[0]} ({len(data)} bytes)")
+    return [CLAUDE] + RC_SEND_FLAGS, RC_SEND_PROMPT.format(name=args[0], text=text).encode()
+
+
 def main():
     raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     try:
@@ -149,6 +178,8 @@ def main():
         cmd = [CLAUDE] + args
     elif head == "claude" and args[:3] == ["-p", "--model", "haiku"] and set(args) <= HAIKU_FLAGS:
         cmd, stdin = [CLAUDE] + args, sys.stdin.buffer.read(200_000)
+    elif head == "rc-send":
+        cmd, stdin = rc_send_cmd(args, sys.stdin.buffer.read(RC_TEXT_MAX + 1))
     elif head == "claude" and len(args) == 2 and args[0] == "stop" and HEX8.match(args[1]):
         cmd = [CLAUDE] + args
     elif head == "kill-claude" and len(args) == 1 and args[0].isdigit():
@@ -224,7 +255,7 @@ def main():
     else:
         deny("not whitelisted")
     log(f"OK {shlex.join(cmd)[:300]}")
-    cwd = ROOT if head != "claude" or args[:1] != ["-p"] else os.path.join(REPO, "data")
+    cwd = os.path.join(REPO, "data") if (head == "claude" and args[:1] == ["-p"]) or head == "rc-send" else ROOT
     return subprocess.run(cmd, input=stdin, env=ENV, cwd=cwd).returncode
 
 

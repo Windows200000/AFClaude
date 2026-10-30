@@ -234,6 +234,32 @@ class Whitelist(unittest.TestCase):
                 with self.assertRaises(SystemExit, msg=bad):
                     he.check_ka_resume(["--session", sid, "--message", "go", *bad])
 
+    def test_rc_send_shape(self):
+        """D-288: rc-send <name> (text on stdin) runs the fixed Haiku sender; host.py and host_exec.py
+        agree on the flags, prompt and limits. Checked, never run (a real run would message a session)."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("host_exec_rc", HOST_EXEC)
+        he = importlib.util.module_from_spec(spec)
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
+            spec.loader.exec_module(he)
+            for k in ("RC_SEND_FLAGS", "RC_SEND_PROMPT", "RC_TEXT_MAX"):
+                self.assertEqual(getattr(he, k), getattr(host, k), k)
+            self.assertEqual(he.RC_NAME.pattern, host.RC_NAME.pattern)
+            cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
+            self.assertEqual(cmd, [he.CLAUDE] + host.RC_SEND_FLAGS)
+            self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
+            for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
+                               (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
+                with self.assertRaises(SystemExit, msg=(args, data[:10])):
+                    he.rc_send_cmd(args, data)
+        self.assertEqual(host.bridge_argv(["rc-send", "rc-test-f1"]), ["rc-send", "rc-test-f1"])
+        for bad in (["rc-send"], ["rc-send", "a b"], ["rc-send", "a", "b"]):
+            with self.assertRaises(ValueError, msg=bad):
+                host.bridge_argv(bad)
+        for cmd, stdin in (("rc-send", b"x"), ("rc-send 'a;b'", b"x"), ("rc-send a b", b"x"),
+                           ("rc-send rc-test-f1", b""), ("rc-send rc-test-f1", b"x" * (16 * 1024 + 1))):
+            self.assertEqual(run_host_exec(cmd, stdin).returncode, 126, cmd)   # denied before any claude run
+
     def test_append_note_limits(self):
         self.assertEqual(run_host_exec("append-note PROGRESS.md", b"x" * (16 * 1024 + 1)).returncode, 126)
         self.assertEqual(run_host_exec("append-note ALERTS.md", b"a\0b").returncode, 126)

@@ -220,3 +220,37 @@ assistant entry in the thread's transcript within the window, else error + alert
 "No agent named … reachable" (child gone, name changed) as that error. Cost of the turn itself is the
 thread's model, not Haiku. Untested and to be covered by the build's own tests: a thread that is
 busy, a bypass-permissions thread holding the message, and a real usage-limit stall.
+
+## 9. Built (branch rc-continue, D-288)
+
+§4.1 as specified, with the constraints of §8. `dispatcher.py` `Pass.continue_stalled`: when the preflight
+refuses an approved stall as `keepalive.RC_LIVE` (a live rc-server thread child holds it), `continue_rc`
+sends the neutral `continue_foreign` text into the thread instead of skipping; `keepalive.RC_EXITED` (the
+child has exited) stays a quiet "continue it from the app" skip, retried every pass, now recorded in the
+dispatcher state as `rc_held[<stall>] = {"at", "state": "app-only"}` (a busy thread: `"busy"`).
+
+`rc_continue.send` (new module): reads the thread's registry entry at send time (one live `sdk-cli`
+process with `--sdk-url` or an rc-server parent; its current `name` and `status`), refuses a busy thread
+(skip, next pass) and, as errors, an unknown status, an unusable name or a child started with
+`bypassPermissions` (it would hold the message); runs the Haiku sender `host.rc_send(name, text)`:
+`claude -p --model haiku --permission-mode dontAsk --allowedTools SendMessage ListAgents
+--strict-mcp-config --disable-slash-commands --output-format stream-json --verbose`, a fixed prompt, the
+text between BEGIN/END; checks its stream-json (exactly one SendMessage whose input names that thread,
+a result that is not "No agent named … is reachable", not an error, not held/refused); then polls the
+thread's transcript for a new `<cross-session-message>` user entry followed by an assistant entry
+within 180 s. Every failure (no registry entry, no live child, not reachable, held/refused, sender
+timeout of 120 s or exit code, no verified entry) is recorded as `handled[<stall>]` result
+`rc-send-error`, alerted and pauses automation (D-234/D-235); one try per stall (D-206). A success is
+`rc-delivered` with the thread's name. Dry-run logs "WOULD MESSAGE" and sends nothing.
+
+Host bridge: new whitelisted shape `rc-send <name>` (text on stdin, at most 16 KB UTF-8) in
+`docker/host_exec.py`, which builds the same flags and prompt itself (the container chooses only the
+name and the text). The forced command points at the live checkout's `docker/host_exec.py`, so the
+merge activates it; `install_host_bridge.sh` does not need to run again.
+
+Switched on by deploying (merge + container rebuild with `tools/deploy.py`); there is no separate
+setting: it replaces the RC_HELD skip for live threads. Not live-tested here (no real server or message):
+the sender's flags differ from §8 only by `--permission-mode dontAsk` (D-047), `--strict-mcp-config`,
+`--disable-slash-commands` and stream-json output; the success text of a delivered SendMessage, a held
+message's wording and the busy / bypass / usage-limit cases are covered by unit tests with a mocked
+sender and registry only.
