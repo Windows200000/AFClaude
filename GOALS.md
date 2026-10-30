@@ -18,7 +18,7 @@ Status: `[x]` done · `[~]` in progress · `[ ]` open · `[!]` blocked (see OPEN
 9b. [ ] Use the monthly extra (API-billed) usage of Team plans too, capped by a buffer or a fixed limit (e.g. $200) (D-231, after the dashboard)
 10. [ ] Shared review + experience store across AFClaude users (usage-limit experience, prediction functions); consider the design
 
-11. [~] `claude rc` server mode: researched 22.10. (docs/rc_server_mode.md): no launch/adopt; a message hook into server threads looks possible; live test passed 30.10. (§8: message into an idle thread answered); continue hook (§4.1) being built
+11. [x] `claude rc` server mode: researched 22.10.; live test passed 30.10. (D-288); continue hook built and deployed 30.10. (approved continues of live rc threads are delivered into the thread; first real use is its live check)
 
 12. [~] Usage split autonomous vs manual (plan docs/usage_split_plan.md; S1 in progress; S2+ after 3a S6): tag AFClaude-driven periods in user sessions; estimate other-device usage; a separate session→weekly ratio per side from single-side intervals
 
