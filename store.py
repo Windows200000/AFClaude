@@ -2407,16 +2407,19 @@ def list_prompt_overrides(conn: sqlite3.Connection) -> list[Row]:
 
 def put_prompt_override(conn: sqlite3.Connection, name: str, body: str, base_sha256: str | None,
                         updated_by: str | None = None) -> Row | None:
-    conn.execute("INSERT INTO prompt_overrides(name, body, base_sha256, updated_at, updated_by) "
-                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body, "
-                 "base_sha256=excluded.base_sha256, updated_at=excluded.updated_at, "
+    # a new edit is made against the current default: base_outdated back to 0 (in the same statement,
+    # so the version trigger bumps once; prompt.defaults_sync sets it later when a default moves on)
+    conn.execute("INSERT INTO prompt_overrides(name, body, base_sha256, base_outdated, updated_at, updated_by) "
+                 "VALUES (?, ?, ?, 0, ?, ?) ON CONFLICT(name) DO UPDATE SET body=excluded.body, "
+                 "base_sha256=excluded.base_sha256, base_outdated=0, updated_at=excluded.updated_at, "
                  "updated_by=excluded.updated_by", (name, body, base_sha256, now_iso(), updated_by))
     return get_prompt_override(conn, name)
 
 
 def reset_prompt_override(conn: sqlite3.Connection, name: str, updated_by: str | None = None) -> Row | None:
     """Back to the default file: body and base_sha256 NULL (the row and its version stay)."""
-    conn.execute("UPDATE prompt_overrides SET body=NULL, base_sha256=NULL, updated_at=?, updated_by=? "
+    conn.execute("UPDATE prompt_overrides SET body=NULL, base_sha256=NULL, base_outdated=NULL, "
+                 "updated_at=?, updated_by=? "
                  "WHERE name=?", (now_iso(), updated_by, name))
     return get_prompt_override(conn, name)
 

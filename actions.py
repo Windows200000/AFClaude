@@ -1268,30 +1268,35 @@ def check_prompt(name: object, body: object) -> str:
     """An override must keep the default's placeholder set (literal braces doubled) and
     render with dummy values. -> the default text."""
     default = prompt_default(name)
+    assert isinstance(name, str)
+    try:
+        reg = prompts.check_name(name[:-3])       # the registry's name; prompt_default checked the file's
+    except prompts.UnknownPrompt as e:
+        raise store.NotFound(f"prompt {name} is not in the prompt registry (prompts.PROMPTS)") from e
     if not isinstance(body, str) or not body.strip():
         raise ValueError("the prompt body must not be empty")
     if len(body) > PROMPT_MAX:
         raise ValueError(f"the prompt is too long ({len(body)} > {PROMPT_MAX} characters)")
-    want, have = placeholders(default), placeholders(body)
+    want, have = prompts.variables(reg), placeholders(body)     # the registry's: system + project variables
     if have is None:
         raise ValueError("unbalanced braces: write literal braces as {{ and }}")
-    if want is not None and have != want:
+    if have != want:
         raise ValueError(f"placeholders must be exactly those of the default {sorted(want)}; "
                          f"missing {sorted(want - have)}, unknown {sorted(have - want)}")
     try:
         body.format(**{p: "x" for p in have})
     except (KeyError, IndexError, ValueError, AttributeError) as e:
         raise ValueError(f"the prompt does not render: {type(e).__name__}: {e}") from None
+    prompts.try_render(reg, body)      # in the prompt and every bundle that sends it: nothing bad reaches a session
     return default
 
 
 def prompt_text(conn: sqlite3.Connection, name: str) -> str:
-    """What a sender should use: the override if there is one, else the file (phase 4a P4 wires it in)."""
-    o = store.get_prompt_override(conn, name)
-    if o and o["body"] is not None:
-        body: str = o["body"]
-        return body
-    return prompt_default(name)
+    """What a sender sends: the override if there is one, else the file (prompts.text, phase 4a P4;
+    name = file name, e.g. continue.md)."""
+    prompt_default(name)
+    assert isinstance(name, str)
+    return prompts.text(name[:-3], conn)
 
 
 @action("prompt.set", "prompt", owner_only=True)

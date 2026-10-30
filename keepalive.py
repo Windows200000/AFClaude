@@ -151,8 +151,9 @@ SCRUBBED_ENV = {
 }
 
 def load_prompt(name):
-    """prompts/<name>.md, the default prompts, through the registry (prompts.py)."""
-    return prompts.default(name)
+    """prompts/<name>.md through the registry (prompts.py): the owner's override if there is one, else
+    the default file (D-169, D-193; a DB error is raised: no send with the wrong text, D-235)."""
+    return prompts.text(name)
 
 
 def project_prompt_values(repo=None):

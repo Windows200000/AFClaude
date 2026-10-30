@@ -66,8 +66,9 @@ ALWAYS_FIELDS = ("name", "title", "report")
 
 
 def _prompt(name: str) -> str:
-    """prompts/<name>.md, through the registry (prompts.py; an unknown name is an OSError)."""
-    return prompt_registry.default(name)
+    """prompts/<name>.md, through the registry (prompts.py; an unknown name is an OSError): the owner's
+    override if there is one, else the default."""
+    return prompt_registry.text(name)
 
 
 def _ts(s: object) -> Optional[datetime]:

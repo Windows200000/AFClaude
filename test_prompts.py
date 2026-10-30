@@ -213,7 +213,7 @@ class ProjectVarsTest(unittest.TestCase):
         self.assertEqual(r["version"], 2)
         r = self.do("prompt_var.reset", project="Other", name="public_repo_rule")
         self.assertIsNone(r["value"])
-        self.assertEqual(r["version"], 3)
+        self.assertEqual(r["version"], 4)
         self.assertEqual(prompts.project_values(self.conn, self.p["id"])["public_repo_rule"], "")
         self.do("prompt_var.reset", project="Other", name="public_repo_rule")    # already reset: no-op
         a = self.audits("prompt_var.reset")
@@ -391,16 +391,16 @@ class SameTextTest(unittest.TestCase):
 
     def test_byte_identical_before_and_after(self):
         after = self.renders()
-        real_render = prompts.render
+        real_render = prompts._render
 
-        def legacy_render(name, project_values=None, /, **system):    # P3: manager_project.md = the old file
+        def legacy_render(name, project_values, system, ov):    # P3: manager_project.md = the old file
             if name == "manager_project":
                 return old_afclaude_rules(system)
-            return real_render(name, project_values, **system)
+            return real_render(name, project_values, system, ov)
         with mock.patch.object(ka, "load_prompt", _legacy_ka), \
                 mock.patch.object(nightly_tasks, "_prompt", _legacy_nightly), \
                 mock.patch.object(inbox, "prompt", _legacy_inbox), \
-                mock.patch.object(prompts, "render", legacy_render):
+                mock.patch.object(prompts, "_render", legacy_render):
             before = self.renders()
         self.assertEqual(sorted(before), sorted(after))
         self.assertGreater(len(after), 60)
@@ -415,7 +415,7 @@ class SameTextTest(unittest.TestCase):
                 self.assertIsInstance(after[k], str)
                 self.assertEqual(after[k].encode(), before[k].encode())
         import usage_sampler
-        self.assertEqual(usage_sampler.HAIKU_PROMPT, _legacy_nightly("usage_haiku").rstrip("\n"))
+        self.assertEqual(usage_sampler.haiku_prompt(), _legacy_nightly("usage_haiku").rstrip("\n"))
 
     def test_every_path_goes_through_the_registry(self):
         loaded = []
@@ -542,6 +542,214 @@ class SecondProjectTest(unittest.TestCase):
     def test_the_template_and_the_seed_cover_each_other(self):
         self.assertEqual(set(prompts.PROMPTS["manager_project"].project), set(prompts.PROJECT_VARS))
         self.assertEqual(set(prompts.CHECKOUT_SEED), set(prompts.PROJECT_VARS))
+
+
+# ---------------------------------------------------------------- overrides (P4, D-193)
+
+def set_override(conn, name, body, actor="owner", via="dashboard"):
+    return actions.perform(conn, "prompt.set", {"name": name + ".md", "body": body}, actor=actor, via=via)
+
+
+def marked(name):
+    """The default plus a marker token: the same variables, so it is a valid override."""
+    return prompts.default(name) + f" OVRD_{name}"
+
+
+class OverrideSenderTest(SameTextTest):
+    """An override reaches every sender of its prompt (and only those): each registered prompt gets a
+    marked override in turn, and every sender path is rendered again (SameTextTest.renders)."""
+    test_byte_identical_before_and_after = None      # SameTextTest's own, not repeated
+    test_every_path_goes_through_the_registry = None
+
+    def test_every_prompt_reaches_its_senders_and_only_them(self):
+        base = self.renders()
+        for name in sorted(prompts.PROMPTS):
+            if name in ("task_start", "usage_haiku"):       # unused since D-205; the sampler: its own test
+                continue
+            marker = f"OVRD_{name}"
+            conn = store.connect(self.db)
+            try:
+                set_override(conn, name, marked(name))
+                got = self.renders()
+                actions.perform(conn, "prompt.reset", {"name": name + ".md"}, actor="owner", via="dashboard")
+            finally:
+                conn.close()
+            hit = {k for k, v in got.items() if marker in v}
+            with self.subTest(prompt=name):
+                self.assertTrue(hit, f"no sender path carries the override of {name}")
+                self.assertEqual({k for k in got if got[k] != base[k]}, hit)    # nothing else moved
+        self.assertEqual(self.renders(), base)                                  # all reset: the defaults again
+
+
+class OverrideTest(unittest.TestCase):
+    def setUp(self):
+        self.db = testenv.fresh_db(self)
+        self.conn = store.connect(self.db)
+        self.addCleanup(self.conn.close)
+        seed_checkout(self.conn)
+
+    def stale(self, name, body):
+        """An override that stopped fitting its prompt (the default moved on after the edit), written
+        under prompt.set's checks, as a default that gained or lost a variable would leave it."""
+        store.put_prompt_override(self.conn, name + ".md", body, "0" * 64, "owner")
+        self.conn.commit()
+
+    def test_text_is_override_then_default(self):
+        self.assertEqual(prompts.text("compact"), prompts.default("compact"))
+        set_override(self.conn, "compact", "Compact now. OVRD")
+        self.assertEqual(prompts.text("compact"), "Compact now. OVRD")
+        self.assertEqual(ka.compact_command(), "/compact Compact now. OVRD")
+        self.assertEqual(prompts.default("compact"), _legacy_ka("compact"))      # the file itself is untouched
+        actions.perform(self.conn, "prompt.reset", {"name": "compact.md"}, actor="owner", via="dashboard")
+        self.assertEqual(prompts.text("compact"), prompts.default("compact"))
+
+    def test_every_loader_sees_it(self):
+        for name, loader in (("run_pace", ka.load_prompt), ("nightly_tasks_due", nightly_tasks._prompt),
+                             ("inbox_held", inbox.prompt), ("run_pace", prompts.text)):
+            set_override(self.conn, name, marked(name))
+            self.assertTrue(loader(name).endswith(f"OVRD_{name}"), name)
+        set_override(self.conn, "usage_haiku", marked("usage_haiku"))
+        import usage_sampler
+        self.assertTrue(usage_sampler.haiku_prompt().endswith("OVRD_usage_haiku"))
+        set_override(self.conn, "inbox_triage", marked("inbox_triage"))
+        self.assertIn("OVRD_inbox_triage", inbox.triage_prompt("t"))
+        self.assertIn("OVRD_inbox_triage", prompts.bundle("inbox_triage", text="t"))
+
+    def test_the_project_template_override_gets_the_project_values(self):
+        set_override(self.conn, "manager_project", marked("manager_project"))
+        other = store.add_project(self.conn, "Other", path="/srv/other")
+        store.put_prompt_var(self.conn, other["id"], "project_notes", "- NOTE-OTHER", "owner")
+        self.conn.commit()
+        msg = ka.session_message("continue", repo="/srv/other", reason="r", progress="P")
+        self.assertIn("NOTE-OTHER", msg)
+        self.assertIn("OVRD_manager_project", msg)
+        self.assertIn("OVRD_manager_project", ka.standing_rules("afclaude"))
+
+    def test_set_validates_against_the_registry(self):
+        with self.assertRaisesRegex(ValueError, r"missing \['deploy_rule'\]"):      # a project variable
+            set_override(self.conn, "manager_project",
+                         prompts.default("manager_project").replace("{deploy_rule}\n", ""))
+        with self.assertRaisesRegex(ValueError, r"unknown \['nope'\]"):
+            set_override(self.conn, "manager_project", prompts.default("manager_project") + " {nope}")
+        with self.assertRaises(store.NotFound):
+            set_override(self.conn, "zz_unknown", "x")
+        self.assertEqual(store.list_prompt_overrides(self.conn), [])
+
+    def test_set_test_renders_every_bundle_that_uses_the_prompt(self):
+        seen = []
+        real = prompts._bundle
+
+        def spy(kind, pv, insert, hooked, manager, system, ov):
+            seen.append(kind)
+            return real(kind, pv, insert, hooked, manager, system, ov)
+        with mock.patch.object(prompts, "_bundle", spy):
+            set_override(self.conn, "guard_respect", marked("guard_respect"))
+        self.assertEqual(sorted(set(seen)), prompts.bundles_using("guard_respect"))
+        self.assertIn("continue", seen)           # through the rules tail
+        self.assertIn("usage_review_oneoff", seen)
+        # a body that does not render anywhere it is sent is refused, and never written
+        with self.assertRaisesRegex(ValueError, "does not render in prompt continue"):
+            prompts.try_render("continue", "no variables")
+        with mock.patch.object(prompts, "try_render", side_effect=ValueError("does not render in bundle x")):
+            with self.assertRaisesRegex(ValueError, "bundle x"):
+                set_override(self.conn, "compact", "Another compaction text")
+        self.assertEqual(prompts.text("compact"), prompts.default("compact"))
+
+    def test_a_stale_override_is_an_error_not_a_text_with_missing_variables(self):
+        set_override(self.conn, "continue", marked("continue"))
+        self.stale("continue", "Go on ({reason}).")                    # the default has {progress} too
+        with self.assertRaisesRegex(prompts.StaleOverride, r"continue.*missing \['progress'\]"):
+            ka.session_message("continue", reason="r", progress="P")
+        with self.assertRaises(prompts.StaleOverride):
+            ka.load_prompt("continue")
+        st = {r["name"]: r for r in prompts.override_status(self.conn)}
+        self.assertFalse(st["continue"]["fits"])
+        # the hook never fails a session start: its fallback text, and the cause named in it
+        self.stale("manager", "{gone}")
+        hook = ka.session_rules_hook("manager", {"cwd": prompts.HERE})
+        self.assertIn("could not be built (StaleOverride", hook["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(prompts.check_name("manager"), "manager")
+
+    def test_base_outdated_is_reported_and_the_fitting_override_still_used(self):
+        set_override(self.conn, "compact", "Compact the way I said. OVRD")
+        self.assertEqual(prompts.override_status(self.conn)[0]["base_outdated"], False)
+        # the default moves on (wording only): the deploy's sync flags the edit, it keeps being used
+        self.conn.execute("UPDATE prompt_overrides SET base_sha256=? WHERE name='compact.md'", ("1" * 64,))
+        self.conn.commit()
+        actions.perform(self.conn, "prompt.defaults_sync", {}, actor="runner:deploy", via="runner")
+        row = prompts.override_status(self.conn)[0]
+        self.assertEqual((row["base_outdated"], row["default_changed"], row["fits"]), (True, True, True))
+        self.assertEqual(prompts.text("compact"), "Compact the way I said. OVRD")
+        diff = prompts.override_diff(self.conn, "compact")
+        self.assertIn("base_outdated=True", diff)
+        self.assertIn("+Compact the way I said. OVRD", diff)
+        # a fresh edit is made against the current default again
+        set_override(self.conn, "compact", "Compact once more. OVRD")
+        self.assertEqual(prompts.override_status(self.conn)[0]["base_outdated"], False)
+        self.assertEqual(store.get_prompt_override(self.conn, "compact.md")["version"], 4)
+
+    def test_a_db_error_fails_the_send(self):
+        set_override(self.conn, "run_pace", marked("run_pace"))
+        boom = store.DBUnavailable("database is locked", "locked")
+        senders = {
+            "load_prompt": lambda: ka.load_prompt("run_pace"),
+            "text": lambda: prompts.text("compact"),
+            "render": lambda: prompts.render("compact"),
+            "bundle": lambda: prompts.bundle("compact"),
+            "compact_command": ka.compact_command,
+            "save_text": lambda: ka.save_text(SID, "manual"),
+            "nightly": lambda: nightly_tasks._prompt("nightly_tasks_due"),
+            "inbox": lambda: inbox.triage_prompt("t"),
+            "haiku": lambda: __import__("usage_sampler").haiku_prompt(),
+            "rules": lambda: ka.standing_rules("manager"),
+        }
+        for what, send in senders.items():
+            with self.subTest(sender=what), mock.patch.object(store, "connect", side_effect=boom), \
+                    mock.patch.object(store, "_sleep"):
+                with self.assertRaises(store.DBError):
+                    send()
+        with mock.patch.object(store, "connect", side_effect=boom):     # the hook alone keeps its fallback
+            hook = ka.session_rules_hook("manager", {"cwd": prompts.HERE})
+        self.assertIn("could not be built", hook["hookSpecificOutput"]["additionalContext"])
+
+    def test_no_override_changes_nothing(self):
+        before = ka.session_message("continue", reason="r", progress="P")
+        set_override(self.conn, "continue", marked("continue"))
+        actions.perform(self.conn, "prompt.reset", {"name": "continue.md"}, actor="owner", via="dashboard")
+        self.assertEqual(ka.session_message("continue", reason="r", progress="P"), before)
+
+    def test_autonomous_sessions_cannot_edit(self):
+        with self.assertRaises(actions.Forbidden):
+            actions.perform(self.conn, "prompt.set", {"name": "compact.md", "body": "x"}, actor="mcp:" + SID,
+                            via="mcp", autonomous=True)
+
+    def test_cli(self):
+        path = os.path.join(os.path.dirname(self.db), "body.md")
+        with open(path, "w") as fh:
+            fh.write("Compact it. OVRD")
+
+        def run(*argv):
+            with mock.patch("sys.stdout") as out:
+                rc = prompts.main(list(argv))
+            return rc, "".join(c.args[0] for c in out.write.call_args_list)
+        rc, text = run("override", "set", "compact", path)
+        self.assertEqual(rc, 0)
+        self.assertIn('"base_outdated": 0', text)
+        self.assertEqual(prompts.text("compact"), "Compact it. OVRD")
+        rc, text = run("override", "list")
+        self.assertIn('"name": "compact"', text)
+        self.assertIn('"base_outdated": false', text)
+        rc, text = run("override", "diff", "compact.md")
+        self.assertIn("+Compact it. OVRD", text)
+        self.assertIn("-" + prompts.default("compact").splitlines()[0], text)
+        rc, text = run("render", "compact")
+        self.assertEqual(text, "Compact it. OVRD")                   # render shows what a sender sends
+        rc, text = run("override", "reset", "compact")
+        self.assertEqual(prompts.text("compact"), prompts.default("compact"))
+        self.assertIn("no override", run("override", "diff", "compact")[1])
+        with mock.patch("sys.stderr"):
+            self.assertEqual(run("override", "set", "nope", path)[0], 1)
+            self.assertEqual(run("override", "reset", "nope")[0], 1)
 
 
 if __name__ == "__main__":

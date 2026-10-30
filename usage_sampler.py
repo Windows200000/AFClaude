@@ -360,7 +360,10 @@ def track_cycle(usage, t, tag):
 
 # ------------------------------------------------------------------ haiku
 
-HAIKU_PROMPT = prompt_registry.default("usage_haiku").rstrip("\n")  # default prompt, editable
+def haiku_prompt():
+    """The Haiku judge's prompt template: the owner's override, else the default file (read at each
+    call, so an edit or a reset takes effect at the next judgment)."""
+    return prompt_registry.text("usage_haiku").rstrip("\n")
 
 
 def fmt_tokens(tok_by_model):
@@ -395,8 +398,8 @@ def haiku_judgement(st, t):
                "gap_tokens": gaps, "tokens_since_last": since}
         prompt_txt = "\n".join(f"{i + 1}. {p['text']}" for i, p in enumerate(prompts))
         gaps_txt = "\n".join(f"after msg {i + 1}: {fmt_tokens(g)}" for i, g in enumerate(gaps)) or "(none yet)"
-        prompt = HAIKU_PROMPT.format(name=name, n=len(prompts), prompts=prompt_txt,
-                                     gaps=gaps_txt, totals=fmt_tokens(since))
+        prompt = haiku_prompt().format(name=name, n=len(prompts), prompts=prompt_txt,
+                                       gaps=gaps_txt, totals=fmt_tokens(since))
         try:
             # prompt via stdin: --tools is variadic and would swallow a positional prompt
             r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",

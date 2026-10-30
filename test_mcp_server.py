@@ -38,7 +38,7 @@ CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
                   "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions",
-                  "afclaude_notice", "afclaude_request"}
+                  "afclaude_notice", "afclaude_request", "afclaude_prompts"}
 
 
 def run(coro):
@@ -518,6 +518,59 @@ class Decisions(Env):
             asyncio.run(ms.afclaude_decisions("find"))
 
 
+class Prompts(Env):
+    def test_prompts_tool(self):
+        """afclaude_prompts (phase 4a P4): read-only list / bundle / render, an override visible, a project's values."""
+        import actions
+        import prompts
+        r = run(ms.afclaude_prompts("list"))
+        self.assertEqual({p["name"] for p in r["prompts"]}, set(prompts.PROMPTS))
+        self.assertEqual({b["kind"] for b in r["bundles"]}, set(prompts.BUNDLES))
+        compact = next(p for p in r["prompts"] if p["name"] == "compact")
+        self.assertNotIn("override", compact)
+        self.assertEqual(run(ms.afclaude_prompts("render", "compact"))["text"], prompts.default("compact"))
+        conn = self.conn()
+        try:
+            actions.perform(conn, "prompt.set", {"name": "compact.md", "body": "Compact. OVRD"}, actor="owner",
+                            via="dashboard")
+            p = store.add_project(conn, "Other", path="/srv/other")
+            store.put_prompt_var(conn, p["id"], "project_notes", "- NOTE-OTHER", "owner")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(run(ms.afclaude_prompts("render", "compact"))["text"], "Compact. OVRD")
+        compact = next(p for p in run(ms.afclaude_prompts("list"))["prompts"] if p["name"] == "compact")
+        self.assertEqual((compact["override"]["version"], compact["override"]["fits"], compact["override"]["base_outdated"]),
+                         (1, True, False))
+        b = run(ms.afclaude_prompts("bundle", "continue", project="Other"))
+        self.assertEqual(b["parts"], ["continue", "insert: the run-pace line, held inbox messages, inbox notes, due nightly tasks", "rules"])
+        self.assertIn("NOTE-OTHER", b["text"])
+        self.assertIn("<reason>", b["text"])                                  # a variable nobody gave
+        b = run(ms.afclaude_prompts("bundle", "continue", project="Other", values={"reason": "R"}))
+        self.assertIn("(R", b["text"].replace("( ", "("))
+        self.assertEqual(run(ms.afclaude_prompts("bundle", "compact"))["text"], "Compact. OVRD")
+        for bad, msg in ((("render", "nope"), "no prompt"), (("bundle", "nope"), "no bundle"),
+                         (("render", None), "needs name"), (("render", "compact", "nobody"), "no project")):
+            with self.assertRaisesRegex(ToolError, msg):
+                asyncio.run(ms.afclaude_prompts(*bad))
+        conn = self.conn()                       # a stale override is an error here too, not a thin text
+        try:
+            store.put_prompt_override(conn, "compact.md", "{gone}", "0" * 64, "owner")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ToolError, "no longer fits"):
+            asyncio.run(ms.afclaude_prompts("render", "compact"))
+
+    def test_no_write_action_and_read_only_annotation(self):
+        import inspect
+        self.assertEqual(inspect.signature(ms.afclaude_prompts).parameters["action"].annotation.__args__,
+                         ("list", "bundle", "render"))
+        tool = asyncio.run(ms.server.list_tools())
+        t = next(x for x in tool if x.name == "afclaude_prompts")
+        self.assertTrue(t.annotations.read_only_hint)
+
+
 @unittest.skipIf(bool(SKIP), SKIP)
 class Stdio(unittest.TestCase):
     """Spawn the server like Claude Code does (stdio, initialize handshake) on a temp DB."""
@@ -572,8 +625,9 @@ class Stdio(unittest.TestCase):
         schema = {t.name: t.input_schema for t in tools}
         self.assertEqual(schema["afclaude_add_task"]["required"], ["title"])
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
-        # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields
-        self.assertLess(size, 15000, f"tool list is {size} bytes")
+        # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
+        # 15000 until afclaude_prompts (phase 4a P4)
+        self.assertLess(size, 16500, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))
