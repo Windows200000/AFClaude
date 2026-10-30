@@ -869,7 +869,7 @@ SETTINGS: dict[str, Setting] = {
                                       "and fails (D-234)", "automation"),
     "runner_timeout_sampler": _num(20, 0.5, 720, "Runner: minutes a usage-sampler run may take before it is "
                                    "killed and fails (D-234)", "automation"),
-    "runner_timeout_dispatcher": _num(20, 0.5, 720, "Runner: minutes a dispatcher pass may take before it is "
+    "runner_timeout_dispatcher": _num(25, 0.5, 720, "Runner: minutes a dispatcher pass may take before it is "
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_quickview": _num(2, 0.5, 720, "Runner: minutes a quickview export may take before it is "
                                      "killed (an alert, no pause: D-239)", "automation"),

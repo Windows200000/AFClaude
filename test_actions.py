@@ -582,7 +582,7 @@ class SettingActions(Base):
                           "remote_control_continue": True, "remote_control_test": True,
                           "log_retention_days": 30.0, "log_retention_overrides": {},
                           "runner_timeout_stall_scan": 2.0, "runner_timeout_sampler": 20.0,
-                          "runner_timeout_dispatcher": 20.0, "runner_timeout_quickview": 2.0,
+                          "runner_timeout_dispatcher": 25.0, "runner_timeout_quickview": 2.0,
                           "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
                           "runner_timeout_prune_runs": 10.0, "runner_timeout_status_snapshot": 2.0,
                           "runner_timeout_usage_review": 30.0, "runner_timeout_at": 30.0,

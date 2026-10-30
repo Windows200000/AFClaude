@@ -316,6 +316,23 @@ class DeployGap(V4Env):
         self.assertEqual(store.get_meta(conn, "schema_version"), "4")      # connect() raised nothing
         self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'decision_topics'").fetchone())
 
+    def test_reads_degrade_without_the_new_tables(self):
+        conn = self.open()
+        d = store.get_decision_entry(conn, "D-001")
+        self.assertEqual((d["id"], d["topics"], d["links"]), ("D-001", [], []))
+        self.assertIn("fill-up", d["effective_keywords"])
+        self.assertEqual(len(store.list_decision_entries(conn)), len(self.before))
+        self.assertIn("D-001", [h["id"] for h in store.find_decision_entries(conn, ["fill-up"], None)])
+        cli = CliEnv.cli
+        env = type("E", (), {"db": self.path})()
+        for argv, want in ((("show", "D-001"), "D-001"), (("find", "fill-up"), "D-001"), (("tldr",), "D-001")):
+            code, out, err = cli(env, *argv)
+            self.assertEqual(code, 0, (argv, err))
+            self.assertIn(want, out)
+        with self.assertRaises(store.MigrationNeeded):        # the writes stay refused
+            actions.perform(conn, "decision.topics", {"decision": "D-001", "op": "add", "topics": ["x"]},
+                            actor="cli", via="cli")
+
     def test_raw_sql_cant_change_the_pending_tables(self):
         conn = self.open()
         for sql in ("INSERT INTO decisions(id) VALUES ('D-999')", "UPDATE decisions SET title = 'x'",

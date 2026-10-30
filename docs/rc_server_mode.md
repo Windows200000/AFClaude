@@ -260,7 +260,7 @@ idle (else denied, exit 126), and stops it after 100 s (`RC_HOST_TIMEOUT`, exit 
 The forced command points at the live checkout's `docker/host_exec.py`, so the merge activates it;
 `install_host_bridge.sh` does not need to run again.
 
-`dispatcher.CONTINUE_LOCK_WAIT` is 25 min, above a pass's worst case (the runner's 20 min timeout; the
+`dispatcher.CONTINUE_LOCK_WAIT` is 30 min, above a pass's worst case (the runner's 25 min timeout; the
 rc send plus verify alone are up to 5 min, `runner_jobs.TICK_CONSTANTS["dispatcher"]`), so a run-now
 continue waiting for a pass in an rc send is not a false alert.
 
