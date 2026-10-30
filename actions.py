@@ -891,8 +891,9 @@ SETTINGS: dict[str, Setting] = {
                                  "before it is killed and fails (D-234)", "automation"),
     "runner_timeout_run_readings": _num(10, 0.5, 720, "Runner: minutes a run reading (the usage during a run, "
                                         "D-207) may take before it is killed and fails (D-234)", "automation"),
-    "runner_timeout_compaction_check": _num(12, 0.5, 720, "Runner: minutes the compaction check (D-238) may take "
-                                            "before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_compaction_check": _num(15, 0.5, 720, "Runner: minutes the compaction check (D-238, and the "
+                                            "long-running session check of 3c S2) may take before it is killed "
+                                            "and fails (D-234)", "automation"),
     "runner_timeout_last_stretch": _num(90, 90, 720, "Runner: minutes a last-stretch slot start may take before "
                                         "it is killed and fails (D-234)", "automation"),
     "runner_timeout_deferred_start": _num(90, 90, 720, "Runner: minutes a postponed or planned session-window "
@@ -2991,9 +2992,10 @@ def run_log_add(conn: sqlite3.Connection, component: str, decision: str, reason:
 # project); DEFER / FIRE: the D-274 timing (planned late / now); FILLUP: a fill-up start;
 # START / POSTPONE: a usage review's launch / its quota postponement (component usage_review);
 # COMPACT / FAILED / MISSED: a compaction attempt's outcome (component compaction, 3c S1; armed only,
-# so a dry run's attempt has no row).
+# so a dry run's attempt has no row); ELIGIBLE: a review / request session passed D-218's age test
+# (component compaction, 3c S2's detector: one row per session, the record of its one alert).
 RUN_LOG_DECISIONS = ("PICK", "HOLD", "GO", "POSTPONE", "DEFER", "FIRE", "FILLUP", "START", "COMPACT", "FAILED",
-                     "MISSED")
+                     "MISSED", "ELIGIBLE")
 
 
 def app_log_sync(conn: sqlite3.Connection, component: str, entries: Iterable[tuple[object, object, object]], *,

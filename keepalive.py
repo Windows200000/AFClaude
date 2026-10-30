@@ -2466,8 +2466,8 @@ def _run_log(decision, reason, sid=None, once=None, component="keepalive", actor
     import store
     conn = store.connect()
     try:
-        actions.run_log_add(conn, component, decision, reason, session_id=sid, actor=actor, via="runner",
-                            once=once)
+        return actions.run_log_add(conn, component, decision, reason, session_id=sid, actor=actor, via="runner",
+                                   once=once)
     finally:
         conn.close()
 
@@ -4344,7 +4344,97 @@ def run_readings_tick(sid, now, args):
     return {"status": "ok", "note": ""}
 
 
+# ---- 3c S2's detector (docs/phase3c_plan.md §6 question 1, D-144's "other long-running agents"): a
+# review or request session that is not ended, passed D-218's age test (its transcript's first entry
+# is before the current session window started, compact_timing.ran_before_window) and is live in its
+# tmux session gets one alert: S2 (its compaction) is built on the first hit. Nothing is compacted or
+# typed. Its record is a run_log row (component compaction, ELIGIBLE, once per session), written before
+# the alert, so a session alerts once, across the runner's restarts. Once per compaction_check tick
+# (TICK_ONCE), not per task-manager. The tmux checks run only for the rows that passed the age test and
+# have no row yet: more than LONG_RUN_TMUX_MAX of them is an error (the tick's timeout counts that many
+# tmux_has calls, runner_jobs.TICK_HOST_CALLS), not a partial check.
+LONG_RUN_KINDS = ("review", "request")
+LONG_RUN_TMUX_MAX = 6
+
+
+def window_start_now(now):
+    """The start of the session window open now: its reset (the usage cache) - one session length.
+    None while none is open (no reset, or a past one: nothing ran for a session length, so no
+    session is working into this window). A failed read raises."""
+    reset = ((usage_cache_checked() or {}).get("session") or {}).get("resets_at")
+    if not isinstance(reset, datetime) or reset <= now:
+        return None
+    return _round_reset(reset) - afclaude_config.SESSION_LENGTH
+
+
+def _long_once(sid):
+    return f"long-running {sid}:"
+
+
+def long_running_sessions(now):
+    """The sessions 3c S2's detector reports now (see the section comment): [(row, first activity,
+    window start)], those already reported left out. A DB, transcript or tmux failure raises."""
+    import compact_timing as ct
+    import store
+    start = window_start_now(now)
+    if start is None:
+        return []
+    conn = store.connect()
+    try:
+        rows = store.retrying(lambda: [r for r in store.driven_sessions(conn, include_ended=False)
+                                       if r["kind"] in LONG_RUN_KINDS
+                                       and not store.has_run_log(conn, "compaction", "ELIGIBLE",
+                                                                 _long_once(r["session_id"]))], conn)
+    finally:
+        conn.close()
+    aged = []
+    for r in rows:
+        path = transcript_path(r["session_id"])
+        first = ct.first_activity(path) if path else None
+        if ct.ran_before_window(first, start):
+            aged.append((r, first))
+    if len(aged) > LONG_RUN_TMUX_MAX:
+        raise RuntimeError(f"{len(aged)} review / request sessions passed the age test (at most {LONG_RUN_TMUX_MAX} "
+                           "are checked in one tick): end the stale driven_sessions rows ("
+                           + ", ".join(str(r["session_id"])[:8] for r, _ in aged) + ")")
+    return [(r, first, start) for r, first in aged if r.get("tmux") and tmux_has(r["tmux"])]
+
+
+def long_running_check(now, arm):
+    """3c S2's detector: one alert per session long_running_sessions finds, after its run_log row
+    (armed only; a dry run logs what it would alert). -> the sessions alerted (id8). A failure raises."""
+    out = []
+    for r, first, start in long_running_sessions(now):
+        sid = str(r["session_id"])
+        line = (f"{r['kind']} session {sid[:8]} (tmux {r['tmux']}, task {r.get('task_id')}) ran longer than one "
+                f"session length (D-218): its first activity {berlin(first)} is before the session window that "
+                f"started {berlin(start)}")
+        if not arm:
+            log(f"long-running session: WOULD ALERT (dry-run): {line}")
+            continue
+        if not _run_log("ELIGIBLE", f"{_long_once(sid)} {line}", sid, _long_once(sid), component="compaction"):
+            continue                       # another pass wrote its row (and alerted) in between
+        log(f"long-running session: {line}")
+        alert(f"a {r['kind']} session ran longer than one session length: {sid[:8]}",
+              f"{line}. Nothing compacts it yet: phase 3c S2 is built on the first such session "
+              "(docs/phase3c_plan.md §6 question 1); until then it runs on as it is.")
+        out.append(sid[:8])
+    return out
+
+
+def long_running_tick(now, args):
+    """long_running_check for the compaction_check tick; a failure is reported as the watcher's
+    (fail_stop) and the tick goes on."""
+    try:
+        hits = long_running_check(now, getattr(args, "arm", False))
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235), reported as the watcher did
+        fail_stop(f"long-running session check failed: {type(e).__name__}", str(e)[:500])
+        return {"note": "the long-running session check failed"}
+    return {"note": f"long-running: {', '.join(hits)} alerted" if hits else ""}
+
+
 TICKS = {"watch": watch_tick, "compaction_check": compaction_check_tick, "run_readings": run_readings_tick}
+TICK_ONCE = {"compaction_check": long_running_tick}   # once per tick, after its task-managers' passes
 
 
 def _act_last_stretch(sid, now, args, key):
@@ -4470,8 +4560,8 @@ def lines_of(sid, fn, *a):
 
 def run_tick(job, tms, now):
     """The tick `job` over every task-manager of the registry `tms` (phase 3b S3): each session's plan
-    steps in rank order; the result's next_due is the earliest of theirs, the note names the sessions
-    that had one."""
+    steps in rank order, then its once-per-tick part (TICK_ONCE); the result's next_due is the earliest
+    of theirs, the note names the sessions that had one."""
     notes, dues = [], []
     for t in tms:
         sid = t["session"]
@@ -4481,6 +4571,10 @@ def run_tick(job, tms, now):
         due = parse_ts(res.get("next_due"))
         if due is not None:
             dues.append(due)
+    if job in TICK_ONCE:
+        once = TICK_ONCE[job](now, _pass_args(None))
+        if once.get("note"):
+            notes.append(str(once["note"]))
     return {"status": "ok", "note": "; ".join(notes),
             "next_due": min(dues).astimezone(UTC).isoformat() if dues else None}
 

@@ -253,7 +253,9 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
 # its start (with its one token-refresh retry). The run readings: one usage refresh with its retry and the
 # cache reads around it. The compaction check: the holds (the usage cache twice, the preflight's tmux /
 # `claude agents` / process calls, the owner-typing check's two tmux reads) and, for a start soon, the
-# read-only pick (start_continues, 3c S1: its passes over owner-held projects, TICK_PICKS).
+# read-only pick (start_continues, 3c S1: its passes over owner-held projects, TICK_PICKS); once per tick,
+# 3c S2's detector (keepalive.long_running_check: one usage cache read, at most LONG_RUN_TMUX_MAX tmux
+# checks; TICK_ONCE_CALLS, not part of the compaction act, which re-runs only the check).
 TICK_HOST_CALLS.update({
     "watch": (("host", "usage_cache", 30, 5), ("keepalive", "refresh_usage", 120, 2),
               ("keepalive", "poke_auth", 180, 1)),
@@ -264,14 +266,20 @@ TICK_HOST_CALLS.update({
                          ("host", "proc_snapshot", 30, 1), ("keepalive", "owner_typing", 30, 2)),
 })
 TICK_PICKS = ("compaction_check",)   # ticks that run pick_start's passes (PICK_PREFLIGHT_CALLS, defined below)
+# a tick's once-per-tick part (keepalive.TICK_ONCE): (module, function, timeout s, the keepalive constant
+# that bounds its calls, or None for one call)
+TICK_ONCE_CALLS: dict[str, tuple[tuple[str, str, int, str | None], ...]] = {
+    "compaction_check": (("host", "usage_cache", 30, None), ("keepalive", "tmux_has", 30, "LONG_RUN_TMUX_MAX")),
+}
 TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
 }
 TICK_MARGIN = timedelta(minutes=1)
 
 
-def tick_inner(job: str) -> dict[str, timedelta]:
-    """{what: worst-case time} of one run of the tick `job` (TICK_HOST_CALLS, TICK_CONSTANTS)."""
+def tick_inner(job: str, once: bool = True) -> dict[str, timedelta]:
+    """{what: worst-case time} of one run of the tick `job` (TICK_HOST_CALLS, TICK_CONSTANTS, and with
+    `once` its once-per-tick part, TICK_ONCE_CALLS)."""
     out: dict[str, timedelta] = {}
     for mod, name in TICK_CONSTANTS.get(job, ()):
         v = getattr(importlib.import_module(mod), name)
@@ -284,6 +292,10 @@ def tick_inner(job: str) -> dict[str, timedelta]:
         for fn, secs, calls in PICK_PREFLIGHT_CALLS:
             k = f"keepalive.{fn}"
             out[k] = out.get(k, timedelta(0)) + timedelta(seconds=secs * calls * ka.PICK_MAX_PASS_OVER)
+    for mod, fn, secs, bound in TICK_ONCE_CALLS.get(job, ()) if once else ():
+        n = int(getattr(importlib.import_module("keepalive"), bound)) if bound else 1
+        k = f"{mod}.{fn}"
+        out[k] = out.get(k, timedelta(0)) + timedelta(seconds=secs * n)
     return out
 
 
@@ -312,7 +324,7 @@ def act_inner(job: str) -> dict[str, timedelta]:
     if job != "compaction":
         raise KeyError(f"{job} is not an act")
     ka = importlib.import_module("keepalive")
-    out = dict(tick_inner("compaction_check"))
+    out = dict(tick_inner("compaction_check", once=False))
     for name, n in COMPACTION_CONSTANTS:
         out[name] = out.get(name, timedelta(0)) + getattr(ka, name) * n
     for fn, secs, calls in COMPACTION_HOST_CALLS:

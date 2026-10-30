@@ -254,6 +254,25 @@ def _int(x: object) -> int:
     return int(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
 
 
+def first_activity(path: str) -> Optional[datetime]:
+    """The time of the transcript's first user or assistant entry (D-218's age test reads only the
+    head), None when it has none yet. A read failure raises."""
+    for e in _iter_entries(path):
+        if e.get("type") in ("user", "assistant"):
+            t = _ts(e.get("timestamp"))
+            if t is not None:
+                return t
+    return None
+
+
+def ran_before_window(first: Optional[datetime], window_start: datetime) -> bool:
+    """D-218's "longer than one session length" test for a session that isn't a task-manager
+    (docs/phase3c_plan.md §3.2): its conversation had activity (`first`, first_activity) before the
+    current session window started (`window_start`: its reset - one session length). No activity:
+    False. Aware times, so a DST night changes nothing."""
+    return first is not None and first < window_start
+
+
 @dataclass
 class Request:
     ts: datetime

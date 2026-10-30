@@ -285,8 +285,8 @@ JOBS: dict[str, Job] = {j.name: j for j in (
         what="keep-alive watch: limit detection; the plans of the last stretch, the postponed / planned starts "
              "and the fill-up"),
     Job("run_readings", 10, every=5 * MIN, offset=50 * SEC, what="usage readings during a run (D-207)"),
-    Job("compaction_check", 12, every=MIN, offset=45 * SEC, paused="handler",
-        what="compaction check (D-238): is one due"),
+    Job("compaction_check", 15, every=MIN, offset=45 * SEC, paused="handler",
+        what="compaction check (D-238): is one due; a long-running review / request session (3c S2's detector)"),
     # the acts: each types into the task-manager session, at the time its plan step stored; a cut-off
     # one is never rerun (D-257), a drain holds it
     Job("last_stretch", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
