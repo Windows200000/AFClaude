@@ -105,6 +105,7 @@ the caller commits.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -922,6 +923,9 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[5] = _migrate_v5
+# The tables whose foreign keys a migration's own check looks at: v5 only rebuilds `decisions`, so an
+# orphan row somewhere else (rows the database already had) can't block it.
+MIGRATION_FK_TABLES: dict[int, tuple[str, ...]] = {5: ("decisions",)}
 
 # Columns added after a table first shipped: {table: [(name, decl), ...]}.
 # connect() adds any that an existing database lacks.
@@ -1281,6 +1285,35 @@ def _backup_copy(conn: sqlite3.Connection, path: str, tag: str) -> str:
     return dst_path
 
 
+def _content_hash(conn: sqlite3.Connection) -> str:
+    """A hash of everything in the database (its SQL dump), whatever its page layout."""
+    h = hashlib.sha256()
+    for line in conn.iterdump():
+        h.update(line.encode("utf-8", "surrogatepass"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _reusable_backup(conn: sqlite3.Connection, path: str, tag: str) -> str | None:
+    """A backup <path>.<tag>-*.bak with exactly the database's current content (an earlier migrate
+    that failed made it; the database has not changed since), newest first; None if there is none.
+    A failed migrate that is started again (a restarting container, a retry after a fix) then
+    doesn't write another copy of the whole database every time."""
+    for bak in sorted(glob.glob(f"{glob.escape(path)}.{tag}-*.bak"), reverse=True):
+        try:
+            other = sqlite3.connect(f"file:{bak}?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            if _content_hash(other) == _content_hash(conn):
+                return bak
+        except sqlite3.Error:
+            continue
+        finally:
+            other.close()
+    return None
+
+
 def migrate(path: str | None = None) -> dict[str, Any]:
     """The explicit migrate step (§7.1): if the database needs non-additive migrations,
     copy it to <db>.v<old>-<utc>.bak first, then run each (MIGRATIONS, in order; one
@@ -1299,7 +1332,9 @@ def migrate(path: str | None = None) -> dict[str, Any]:
         if isinstance(problem, SchemaTooNew):
             raise problem
         steps = pending_migrations(stored) if stored is not None else []
-        backup = _backup_copy(conn, path, f"v{stored}") if steps else None
+        backup = None
+        if steps:
+            backup = _reusable_backup(conn, path, f"v{stored}") or _backup_copy(conn, path, f"v{stored}")
         for v in steps:
             _run_migration(conn, v)
         init(conn, backed_up=backup is not None)
@@ -1322,7 +1357,11 @@ def _run_migration(conn: sqlite3.Connection, version: int) -> None:
                 conn.rollback()
                 return
             MIGRATIONS[version](conn)
-            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            tables = MIGRATION_FK_TABLES.get(version)    # None: every table (the migration touched many)
+            bad = (conn.execute("PRAGMA foreign_key_check").fetchall() if tables is None else
+                   [r for t in tables if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                                                      (t,)).fetchone()
+                    for r in conn.execute(f"PRAGMA foreign_key_check({t})").fetchall()])
             if bad:
                 raise sqlite3.IntegrityError(f"migration to v{version} left dangling references: "
                                              f"{[tuple(b) for b in bad]}")
@@ -3807,14 +3846,26 @@ def get_decision_entry(conn: sqlite3.Connection, decision: object) -> Row | None
 
 
 def list_decision_entries(conn: sqlite3.Connection, states: Iterable[str] | None = None) -> list[Row]:
-    """Every decision (or those in `states`), in source order (a native entry after them)."""
+    """Every decision (or those in `states`), in source order, the native ones after the file's (a
+    re-import renumbers the file's rows 0..n-1, so `ord` alone would put a native one in the middle)."""
     topics, links = _decision_extras(conn)
     rows = [_decision_dict(r, topics.get(r["id"], ()), links.get(r["id"], ()))
-            for r in conn.execute("SELECT * FROM decisions ORDER BY ord, id")]
+            for r in conn.execute("SELECT * FROM decisions ORDER BY (origin = 'db'), ord, id")]
     if states is None:
         return rows
     want = set(states)
     return [r for r in rows if r["state"] in want]
+
+
+def decision_titles(conn: sqlite3.Connection, states: Iterable[str]) -> list[Row]:
+    """id, title and state of the decisions in `states`, in the order of list_decision_entries: the
+    TLDR's read. Only the columns every schema version has, so it still reads a database that
+    needs the migration (the hook builds the TLDR read-only then)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(decisions)")}
+    order = "(origin = 'db'), ord, id" if "origin" in cols else "ord, id"
+    want = set(states)
+    return [dict(r) for r in conn.execute(f"SELECT id, title, state FROM decisions ORDER BY {order}")
+            if r["state"] in want]
 
 
 def _decision_fts_put(conn: sqlite3.Connection, d: Mapping[str, Any]) -> None:
@@ -3917,12 +3968,17 @@ def _decision_refresh(conn: sqlite3.Connection, did: str) -> Row:
     return after
 
 
-def next_decision_id(conn: sqlite3.Connection) -> str:
-    """The next free D-NNN: above every D-number in the table and above the highest one ever given
-    out natively (meta decision_id_floor, so a deleted entry's number isn't reused)."""
+def next_decision_id(conn: sqlite3.Connection, taken: Iterable[str] = ()) -> str:
+    """The next free D-NNN: above every D-number in the table, above the highest one ever given out
+    natively (meta decision_id_floor, so a deleted entry's number isn't reused) and above every one in
+    `taken` (the ids DECISIONS.md holds: the owner's next statement is written there as the next
+    number, so a native entry must not have taken it, D-286)."""
     top = int(get_meta(conn, "decision_id_floor", 0) or 0)
     for (did,) in conn.execute("SELECT id FROM decisions WHERE id LIKE 'D-%'"):
         top = max(top, int(did[2:]))
+    for did in taken:
+        if did.startswith("D-"):
+            top = max(top, int(did[2:]))
     return f"D-{top + 1:03d}"
 
 
@@ -4145,6 +4201,8 @@ FALLBACK_HEADER = ("# AFClaude: database failures recorded outside the database 
                    "the alerts sent and when it was healthy again. Imported into the database later.\n\n")
 PAYLOAD_MAX = 4096                                       # characters of a payload kept for a replay
 NOTIFY: Callable[[str, str], object] | None = None       # None = notify.notify (tests set a recorder)
+MIGRATE_NO_DB = 3        # `store.py migrate`: no database file (the entrypoint goes on: a first install)
+
 NEXT_STEP = ("Wait about 30 seconds and retry this once. If it fails again, stop the work that needs the "
              "AFClaude database, don't work around it (no hand-edited files or other stores instead), and "
              "tell the user it needs their intervention (they are alerted outside the database).")
@@ -4491,6 +4549,13 @@ def _alert(path: str, subject: str, body: str, who: str, scope: str) -> str:
     return "the owner has been alerted (notify.py)"
 
 
+def alert_once(path: str, subject: str, body: str, who: str) -> str:
+    """Alert the owner out of the DB (the fallback file + a push, once per runner episode: the one the
+    migrate step or db_gate opened, closed when the database is healthy again). For a failure that
+    leaves the DB unwritable, e.g. the schema guard. -> what happened."""
+    return _alert(path, subject, body, who, scope="runner")
+
+
 def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[str, Any] | None = None,
                     write: bool = True, db_path: str | None = None, payload_sha: str | None = None,
                     payload_max: int = PAYLOAD_MAX, runner: bool = False) -> DBError:
@@ -4719,10 +4784,20 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"db": os.path.abspath(db), "schema_version": SCHEMA_VERSION,
                           "created": not existed}, ensure_ascii=False))
         return 0
+    db = os.path.abspath(args.db or DB_PATH)
     try:
-        r = migrate(args.db)
-    except (SchemaMismatch, NotFound) as e:
+        r = migrate(db)
+    except NotFound as e:       # no database yet (a first install): nothing to migrate, not a failure
         print(f"error: {e.args[0] if e.args else e}", file=sys.stderr)
+        return MIGRATE_NO_DB
+    except Exception as e:   # noqa: BLE001 - any failure: told to the owner, the exit status says it (D-235)
+        print(f"error: {type(e).__name__}: {e.args[0] if e.args else e}", file=sys.stderr)
+        alert_once(fallback_path(db), "AFClaude: the database migration failed",
+               f"python3 store.py migrate on {db}: {type(e).__name__}: {e}\nThe database stays as it was "
+               "(read-only for this code until it migrates; the container idles, unhealthy, instead of "
+               "restarting). See data/migrate.log; fix it, then restart the container. After an image "
+               "rollback restore the <db>.v<N>-<utc>.bak backup instead (there is no down-migration).",
+               "migrate")
         return 1
     print(json.dumps(r, ensure_ascii=False))
     return 0

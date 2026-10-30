@@ -1139,7 +1139,7 @@ class EveryAction(Base):
             ("notice.dismiss", {"notice_id": 1}),
             ("decision.import", {"path": src.name}),
             ("decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["k2"]}),
-            ("decision.add", {"title": "Native", "topics": ["t"], "words": "w"}),
+            ("decision.add", {"title": "Native", "topics": ["t"], "words": "w", "author": "owner"}),
             ("decision.edit", {"decision": "D-002", "title": "Native 2"}),
             ("decision.topics", {"decision": "D-002", "op": "add", "topics": ["u"]}),
             ("decision.link", {"decision": "D-002", "to": "D-001", "kind": "refines"}),

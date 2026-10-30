@@ -811,7 +811,7 @@ class SchemaGuard(unittest.TestCase):
             self.assertEqual(json.loads(out.getvalue())["steps"], [])
             self.bump(self.NEWER)
             self.assertEqual(store.main(["migrate", "--db", self.db]), 1)       # never on a newer DB
-            self.assertEqual(store.main(["migrate", "--db", self.db + ".missing"]), 1)
+            self.assertEqual(store.main(["migrate", "--db", self.db + ".missing"]), store.MIGRATE_NO_DB)
         self.assertIn(f"schema_version {self.NEWER}", err.getvalue())
         self.assertIn("no database at", err.getvalue())
         self.assertFalse(os.path.exists(self.db + ".missing"))

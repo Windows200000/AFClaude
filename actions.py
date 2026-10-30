@@ -293,6 +293,15 @@ def is_autonomous(conn: sqlite3.Connection, ctx: Ctx) -> bool:
     return ctx.autonomous or (ctx.session is not None and ctx.session in autonomous_sessions(conn))
 
 
+def decision_autonomous(conn: sqlite3.Connection, ctx: Ctx) -> bool:
+    """An autonomous AFClaude session writing decisions, through MCP (is_autonomous) or through the CLI
+    (tasks.py decision ...; the caller says so: ctx.autonomous, set from CLAUDE_GUARD_DISABLE=1, which
+    every session AFClaude launches carries, or from a session id the registry knows). The CLI is
+    otherwise the owner's (is_autonomous), but a task-manager working through Bash must not confirm its
+    own proposal or change an owner's entry, D-104, D-285."""
+    return ctx.autonomous or is_autonomous(conn, ctx)
+
+
 # ---------------------------------------------------------------- tasks
 
 def _task(conn: sqlite3.Connection, task_id: Any) -> store.Row:
@@ -2168,8 +2177,8 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     no longer in the file removed. Idempotent: an unchanged file changes nothing (no audit row).
     The audit row names the ids and holds a line diff of each changed entry and the full text of
     each removed one (D-158: every change in the audit log). Native entries (origin 'db', written by
-    decision.add) are not the file's: never overwritten or removed; one whose id the file also has is
-    listed under "detached" (the file's version is ignored). The result's "no_status" names every
+    decision.add) are not the file's: never overwritten or removed; a file entry with the id of a native
+    one is refused (decisions.IdCollision) before anything is written, D-235. The result's "no_status" names every
     entry with no Status line (decisions.state_of defaults those to "active", or infers a state
     from a title marker like "SUPERSEDED" -- the list still names them all, so the plain ones stay
     visible without editing DECISIONS.md). Refused (decisions.SourceError): a file without entries
@@ -2188,6 +2197,13 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     dec.check_entries(entries, src)
     have = {r["id"]: r for r in store.list_decision_entries(conn) if r["origin"] == "file"}
     ids = {e.id for e in entries}
+    clash = sorted(r[0] for r in conn.execute("SELECT id FROM decisions WHERE origin = 'db'") if r[0] in ids)
+    if clash:    # D-235: not silently ignored; nothing is written, and the alert is the caller's (cron, hook, CLI)
+        taken = store.next_decision_id(conn, ids)
+        raise dec.IdCollision(f"{src}: {', '.join(clash)} is in the file and is also a native entry (written by "
+                              f"`decision add` or propose); the import is blocked until the file's entry gets "
+                              f"another number (the next free one is {taken}) or the native one is deleted "
+                              "(DECISIONS.md is not edited by code)")
     gone = [i for i in have if i not in ids]
     if have and len(gone) * 2 > len(have) and force is not True:
         raise dec.SourceError(f"{src}: the import would remove {len(gone)} of {len(have)} decisions "
@@ -2311,7 +2327,7 @@ def _decision_row(conn: sqlite3.Connection, decision: Any, native: bool = False)
 
 
 def _decision_owner_guard(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any], what: str) -> None:
-    if cur["author"] == "owner" and is_autonomous(conn, ctx):
+    if cur["author"] == "owner" and decision_autonomous(conn, ctx):
         raise Forbidden(f"decision.{what} of an owner's decision {cur['id']} is not allowed for an autonomous AFClaude "
                         "session (only the owner changes one, D-104): propose a replacement instead")
 
@@ -2337,16 +2353,17 @@ def _topic_note(conn: sqlite3.Connection, new: list[str]) -> dict[str, Any]:
 
 
 @action("decision.add", "decision")
-def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, author: Any = "owner",
+def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, author: Any,
                  words: Any = None, summary: Any = None, scope: Any = None, source: Any = None,
                  interpretation: Any = None, date: Any = None, status: Any = None, keywords: Any = None,
                  project: Any = None, slug: Any = None, id: Any = None) -> Result:
     """A new decision. author owner: what the owner said, recorded active at once with their exact `words`
     (required) and the date (D-285); author task-manager: its own entry, proposed until the owner confirms
-    it (decision.confirm). At least one topic (D-284). The id is the next D-NNN unless `id` is given; the
-    slug (default: from the title) is unique per project; project None = install-wide."""
+    it (decision.confirm). `author` is always given (no default). At least one topic (D-284). The id is the
+    next D-NNN, above every id in the DB and in DECISIONS.md, unless `id` is given (it may not be one the
+    file holds); the slug (default: from the title) is unique per project; project None = install-wide."""
     store._enum(author, store.DECISION_AUTHORS, "author")
-    if author == "owner" and is_autonomous(conn, ctx):
+    if author == "owner" and decision_autonomous(conn, ctx):
         raise Forbidden("an autonomous AFClaude session records only its own decisions (decision.add with author "
                         "task-manager, MCP propose); the owner's words are recorded through the CLI (D-285)")
     f = {k: store._text(v, k) for k, v in (("words", words), ("summary", summary), ("scope", scope),
@@ -2363,7 +2380,10 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
         if p is None:
             raise store.NotFound(f"no project {project!r}")
         pid = p["id"]
-    did = store.decision_id(id) if id is not None else store.next_decision_id(conn)
+    taken = decisions.file_ids()
+    did = store.decision_id(id) if id is not None else store.next_decision_id(conn, taken)
+    if did in taken:
+        raise ValueError(f"{did} is an entry of DECISIONS.md: a native entry needs another number")
     state = "active" if author == "owner" else "proposed"
     stat = f["status"] or ("active" if state == "active" else decisions.PROPOSED_STATUS)
     if slug is not None:
@@ -2402,8 +2422,9 @@ def _decision_rerender(cur: Mapping[str, Any], **changes: Any) -> dict[str, Any]
 def decision_edit(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None, **fields: Any) -> Result:
     """Overwrite fields of a native decision (D-158: the old text is in the audit row): title, date, status,
     summary, words, source, scope, interpretation, slug (None clears an optional field; title can't be
-    empty). An owner's decision can't be edited by an autonomous session (D-104); the state changes
-    through decision.confirm / expire / delete."""
+    empty). An owner's decision can't be edited by an autonomous session (D-104), and nobody edits its
+    words or summary (a rewording is a proposal, D-285); the state changes through decision.confirm /
+    expire / delete."""
     cur = _decision_row(conn, decision, native=True)
     _check_version(cur, version, f"decision {cur['id']}")
     _decision_owner_guard(conn, ctx, cur, "edit")
@@ -2415,8 +2436,10 @@ def decision_edit(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: An
             changes[k] = store.check_decision_slug(conn, v, cur["project_id"], cur["id"]) if v is not None else None
         else:
             changes[k] = store._text(v, k, required=k == "title")
-    if cur["author"] == "owner" and "words" in changes and not changes["words"]:
-        raise ValueError("an owner's decision keeps the owner's exact words")
+    if cur["author"] == "owner" and ("words" in changes or "summary" in changes):
+        raise ValueError(f"{cur['id']} is the owner's: its words and summary are not edited, by anyone (D-104, "
+                         "D-285). A rewording is the task-manager's proposal: add it as its own entry "
+                         "(author task-manager) and link it; the owner's own correction is a delete + add")
     new = _decision_rerender(cur, **{k: v for k, v in changes.items() if k in DECISION_EDIT_FIELDS})
     new.update({k: v for k, v in changes.items() if k == "slug"})
     if all(cur[k] == new[k] for k in changes):
@@ -2450,7 +2473,7 @@ def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
     (plus `reason`) in the audit row. An autonomous session may do this only to an entry whose Status says
     "active until <date>" with that date past (D-278); any other owner's entry is the owner's to remove."""
     cur = _decision_row(conn, decision, native=True)
-    if cur["author"] == "owner" and is_autonomous(conn, ctx):
+    if cur["author"] == "owner" and decision_autonomous(conn, ctx):
         until = decisions.until_of(cur["status"] or "")
         if until is None or datetime.now(decisions.BERLIN) < until:
             raise Forbidden(f"decision.expire of {cur['id']} is not allowed for an autonomous AFClaude session: "
@@ -2464,6 +2487,9 @@ def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version:
     """The owner confirms a proposal: it becomes active (D-285). Owner-only (an autonomous session is
     refused). Confirming an entry that is already active is a no-op."""
     cur = _decision_row(conn, decision, native=True)
+    if decision_autonomous(conn, ctx):     # owner_only covers MCP; the CLI is told apart by ctx.autonomous
+        raise Forbidden("decision.confirm is the owner's: an autonomous AFClaude session can't confirm its own "
+                        "proposal (D-285); the owner confirms on the dashboard or with `tasks.py decision confirm`")
     _check_version(cur, version, f"decision {cur['id']}")
     if cur["state"] == "active":
         return Result(_decision_view(cur), cur["id"], None, None, changed=False)

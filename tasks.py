@@ -71,13 +71,16 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            kept apart from DECISIONS.md's Keywords line)
     tasks.py decision topics [ID add|remove T...]   an entry's topics (D-284: free keywords, "all" allowed,
                                            keep few); without ID: every topic in use, with counts
-    tasks.py decision add --title T --topic T... [--author owner|task-manager] [--words W ...]   write a
+    tasks.py decision add --title T --topic T... --author owner|task-manager [--words W ...]   write a
                                            decision into the DB (owner: active at once, exact --words
-                                           required, D-285; task-manager: proposed until the owner confirms)
-    tasks.py decision edit|expire|delete|confirm ID ...   overwrite fields, remove an expired one-off or one
-                                           that no longer applies (audited with the old text), the owner's
-                                           confirmation of a proposal (native entries; the DECISIONS.md ones
-                                           are changed in the file until the seeding step)
+                                           required, D-285; task-manager: proposed until the owner confirms).
+                                           A session AFClaude launched (CLAUDE_GUARD_DISABLE=1) is refused
+                                           author owner, confirm, and changes to the owner's entries (D-104)
+    tasks.py decision edit|expire|delete|confirm ID ...   overwrite fields (not the words or summary of an
+                                           owner's entry), remove an expired one-off or one that no longer
+                                           applies (audited with the old text), the owner's confirmation of a
+                                           proposal (native entries; the DECISIONS.md ones are changed in the
+                                           file until the seeding step)
     tasks.py decision link ID refines|requires|conflicts TO [--remove]   relate two decisions
     tasks.py decision import [--file F] [--force]   DECISIONS.md into the DB now (also every 10 min
                                            and at each compaction; the file is never written)
@@ -277,9 +280,21 @@ def resolve_session(conn: sqlite3.Connection, prefix: str) -> str:
     raise store.NotFound(f"no session matches {prefix!r}")
 
 
+def autonomous_caller(conn):
+    """True when this process runs inside a session AFClaude launched (unattended): the guard-hook
+    bypass every such session carries (CLAUDE_GUARD_DISABLE=1, also in its Bash tool and subagents),
+    or a session id the registry knows as driven. The CLI is the owner's otherwise (actions.is_autonomous),
+    but the decision commands refuse an autonomous caller what MCP refuses it (confirm, the owner's
+    entries, author owner: actions.decision_autonomous)."""
+    if os.environ.get("CLAUDE_GUARD_DISABLE") == "1":
+        return True
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    return bool(sid) and sid in actions.autonomous_sessions(conn)
+
+
 def act(conn, action, /, **params):
     """One write through the shared write path (actions.py), as the CLI."""
-    return actions.perform(conn, action, params, actor="cli", via="cli")
+    return actions.perform(conn, action, params, actor="cli", via="cli", autonomous=autonomous_caller(conn))
 
 
 def maybe_scan(conn, args):
@@ -1047,8 +1062,9 @@ def parser():
     q = dcs.add_parser("add", parents=[js], help="write a decision into the DB")
     q.add_argument("--title", required=True)
     q.add_argument("--topic", action="append", required=True, help="a topic (repeat; at least one, D-284)")
-    q.add_argument("--author", choices=store.DECISION_AUTHORS, default="owner",
-                   help="owner: the owner's words, active at once; task-manager: proposed until confirmed")
+    q.add_argument("--author", choices=store.DECISION_AUTHORS, required=True,
+                   help="owner: the owner's words, active at once (not for an autonomous session); "
+                        "task-manager: proposed until the owner confirms")
     q.add_argument("--words", help="the owner's exact words (required for author owner)")
     for f in ("summary", "scope", "source", "interpretation", "date", "status", "slug"):
         q.add_argument(f"--{f}")

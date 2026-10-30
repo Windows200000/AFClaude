@@ -194,6 +194,16 @@ async def resolve_dir_arg(ctx: Optional[Context], value: str | None) -> str | No
     return v
 
 
+# What a schema mismatch tells the calling session. A server process that stays up across an update
+# keeps its old code: when the database moved to a newer schema (the explicit migrate step ran), that
+# old code is refused here (SchemaTooNew) and can't be fixed in place: a reconnect starts the new one.
+SCHEMA_MESSAGES = {
+    True: "AFClaude was updated: reconnect the afclaude MCP server (/mcp) or restart the session",
+    False: "AFClaude's database is waiting for its migration (the container's start step runs it): "
+           "retry in a minute; if it stays, tell the owner (the owner was alerted by the migrate step)",
+}
+
+
 def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> ToolError:
     """A database error -> the structured hand-back (§7.8, D-171) as the tool error: JSON
     {"error": {error_class, kind, message, not_saved, escalation, next_step}}. A write that
@@ -203,7 +213,10 @@ def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> Too
     if err.escalation is None:
         store.report_db_error(err, actor=actor(), action=f"mcp:{tool_name}", params=params, write=False,
                               db_path=os.environ.get("AFCLAUDE_DB") or store.DB_PATH)
-    return ToolError(json.dumps({"error": store.handback(err)}, ensure_ascii=False))
+    h = store.handback(err)
+    if isinstance(err, store.SchemaMismatch):    # not a fault to retry: say what the caller does
+        h["message"] = h["next_step"] = SCHEMA_MESSAGES[isinstance(err, store.SchemaTooNew)]
+    return ToolError(json.dumps({"error": h}, ensure_ascii=False))
 
 
 def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:

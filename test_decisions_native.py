@@ -13,8 +13,10 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -67,6 +69,9 @@ class Env(unittest.TestCase):
         with open(self.src, "w", encoding="utf-8") as fh:
             fh.write(SOURCE)
         self.conn = store.connect(self.db, create=True)
+        patch = mock.patch.object(dec, "DEFAULT_SOURCE", os.path.join(self.tmp, "none.md"))   # no file: ids from D-001
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self):
         self.conn.close()
@@ -81,10 +86,24 @@ class Env(unittest.TestCase):
 
     def add(self, title="Show titles", topics=("lists",), **kw):
         kw.setdefault("words", OWNER_WORDS)
+        kw.setdefault("author", "owner")
         return self.do("decision.add", title=title, topics=list(topics), **kw)
 
     def imp(self):
         return dec.import_file(self.src, self.db, actor="cli", via="cli", conn=self.conn)
+
+    def drop_from_source(self, *ids):
+        """The synthetic source without the entries `ids` (a native entry took their numbers)."""
+        with open(self.src, encoding="utf-8") as fh:
+            parts = fh.read().split("\n### ")
+        with open(self.src, "w", encoding="utf-8") as fh:
+            fh.write("\n### ".join(p for p in parts if not any(p.startswith(i + " ") for i in ids)))
+
+    def use_source_for_ids(self):
+        """A new id now looks for the numbers in the synthetic DECISIONS.md."""
+        patch = mock.patch.object(dec, "DEFAULT_SOURCE", self.src)
+        patch.start()
+        self.addCleanup(patch.stop)
 
 
 class Migration(unittest.TestCase):
@@ -184,6 +203,73 @@ class Migration(unittest.TestCase):
         finally:
             raw.close()
 
+    def baks(self):
+        return sorted(f for f in os.listdir(self.tmp) if f.endswith(".bak"))
+
+    def failing(self):
+        return mock.patch.dict(store.MIGRATIONS, {5: lambda c: (_ for _ in ()).throw(sqlite3.OperationalError("boom"))})
+
+    def test_a_retried_migrate_reuses_the_backup_of_an_unchanged_database(self):
+        for _ in range(3):                                   # a restarting container
+            with self.failing(), self.assertRaises(sqlite3.OperationalError):
+                store.migrate(self.path)
+        self.assertEqual(len(self.baks()), 1)                # not one ~whole-DB copy per start
+        r = store.migrate(self.path)                         # fixed: the same copy is the backup
+        self.assertEqual(os.path.basename(r["backup"]), self.baks()[0])
+        self.assertEqual(len(self.baks()), 1)
+
+    def test_a_changed_database_gets_its_own_backup(self):
+        with self.failing(), self.assertRaises(sqlite3.OperationalError):
+            store.migrate(self.path)
+        raw = sqlite3.connect(self.path)
+        raw.execute("UPDATE decisions SET title = 'edited meanwhile' WHERE id = 'D-001'")
+        raw.commit()
+        raw.close()
+        time.sleep(1.1)                                      # the backup's name has second resolution
+        with self.failing(), self.assertRaises(sqlite3.OperationalError):
+            store.migrate(self.path)
+        self.assertEqual(len(self.baks()), 2)
+
+    def test_the_migrate_command_alerts_once_and_says_so_in_its_exit_status(self):
+        err = io.StringIO()
+        for _ in range(2):
+            with self.failing(), contextlib.redirect_stderr(err):
+                self.assertEqual(store.main(["migrate", "--db", self.path]), 1)
+        self.assertIn("boom", err.getvalue())
+        events = store.fallback_events(store.fallback_path(self.path))
+        self.assertEqual([e["event"] for e in events if e.get("event") == "alert"], ["alert"])   # one per episode
+        self.assertIn("migration failed", events[0]["subject"])
+        self.assertEqual(len(self.baks()), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(store.main(["migrate", "--db", self.path]), 0)                       # fixed
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(store.main(["migrate", "--db", self.path + ".none"]), store.MIGRATE_NO_DB)
+
+    def test_an_orphan_row_elsewhere_does_not_block_the_migration(self):
+        raw = sqlite3.connect(self.path)
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute("INSERT INTO tasks(title, project_id, created_at, updated_at) VALUES ('orphan', 999, 'x', 'x')")
+        raw.commit()
+        raw.close()
+        self.assertEqual(store.migrate(self.path)["to"], 5)
+
+    def test_the_tldr_is_built_read_only_while_the_database_cant_be_written(self):
+        src = os.path.join(self.tmp, "DECISIONS.md")
+        for version, kind in (("4", "MigrationNeeded"), ("6", "SchemaTooNew")):
+            raw = sqlite3.connect(self.path)
+            raw.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+            raw.commit()
+            raw.close()
+            for part in (1, 2):
+                out = dec.hook_output(part, 2, {"source": "compact", "cwd": dec.HERE}, src, self.path)
+                text = out["hookSpecificOutput"]["additionalContext"] if out else ""
+                if part == 1:
+                    self.assertIn("D-001 Night runs fill the week", text, kind)
+                    self.assertIn(f"was not imported, the database's schema doesn't fit this code ({kind})", text)
+                    self.assertNotIn("could NOT be built", text)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(dec.main(["--db", self.path, "tldr"]), 0)
+
     def test_a_fresh_database_is_v5_with_the_new_columns(self):
         conn = store.connect(os.path.join(self.tmp, "new.db"), create=True)
         try:
@@ -264,29 +350,39 @@ class Edit(Env):
         self.d = self.add(title="Old title", summary="old summary", scope="all")
 
     def test_overwrites_and_audits_old_and_new(self):
-        r = self.do("decision.edit", decision="d-001", title="New title", summary="new summary")
-        self.assertEqual((r["title"], r["summary"], r["version"]), ("New title", "new summary", 1))
+        r = self.do("decision.edit", decision="d-001", title="New title", scope="some")
+        self.assertEqual((r["title"], r["scope"], r["version"]), ("New title", "some", 1))
         d = store.get_decision_entry(self.conn, "D-001")
         self.assertIn("### D-001 New title", d["body"])
         self.assertNotIn("Old title", d["body"])                              # overwritten, not kept (D-158)
-        self.assertIn("- **Scope:** all", d["body"])
+        self.assertIn("- **Scope:** some", d["body"])
         a = self.audit("decision.edit")[0]
-        self.assertEqual((a["before"]["title"], a["after"]["title"], a["before"]["summary"], a["after"]["summary"]),
-                         ("Old title", "New title", "old summary", "new summary"))
-        self.assertNotIn("scope", a["before"])                                # only what changed
+        self.assertEqual((a["before"]["title"], a["after"]["title"], a["before"]["scope"], a["after"]["scope"]),
+                         ("Old title", "New title", "all", "some"))
+        self.assertNotIn("source", a["before"])                               # only what changed
         self.assertEqual(len(self.audit("decision.edit")), 1)
 
     def test_noop_writes_no_audit_row_and_clearing_works(self):
-        self.do("decision.edit", decision="D-001", summary="old summary")
+        self.do("decision.edit", decision="D-001", scope="all")
         self.assertEqual(self.audit("decision.edit"), [])
-        self.do("decision.edit", decision="D-001", summary="")
-        self.assertIsNone(store.get_decision_entry(self.conn, "D-001")["summary"])
+        self.do("decision.edit", decision="D-001", scope="")
+        self.assertIsNone(store.get_decision_entry(self.conn, "D-001")["scope"])
         with self.assertRaisesRegex(ValueError, "nothing to change"):
             self.do("decision.edit", decision="D-001")
         with self.assertRaisesRegex(ValueError, "title must not be empty"):
             self.do("decision.edit", decision="D-001", title="")
-        with self.assertRaisesRegex(ValueError, "exact words"):
-            self.do("decision.edit", decision="D-001", words="")
+
+    def test_nobody_edits_the_words_or_summary_of_an_owners_entry(self):
+        for kw in ({"words": "other"}, {"words": ""}, {"summary": "new"}, {"summary": ""}):
+            for who in (dict(), dict(actor="mcp:abc", via="mcp")):        # the owner on the CLI too (D-104, D-285)
+                with self.assertRaisesRegex((ValueError, actions.Forbidden), "words and summary|autonomous"):
+                    self.do("decision.edit", decision="D-001", **kw, **who)
+        d = store.get_decision_entry(self.conn, "D-001")
+        self.assertEqual((d["words"], d["summary"], d["version"]), (OWNER_WORDS, "old summary", 0))
+        own = self.do("decision.add", title="Mine", topics=["t"], author="task-manager", words="a", summary="b")
+        self.assertEqual(self.do("decision.edit", decision=own["id"], summary="c")["summary"], "c")   # its own: free
+        self.do("decision.topics", decision="D-001", op="add", topics=["more"])                       # topics stay allowed
+        self.do("decision.keywords", decision="D-001", op="add", keywords=["k"])
 
     def test_stale_version_conflicts(self):
         self.do("decision.edit", decision="D-001", title="B")
@@ -295,7 +391,8 @@ class Edit(Env):
         self.do("decision.edit", decision="D-001", title="C", version=1)
 
     def test_only_native_entries_and_the_owners_stay_with_the_owner(self):
-        self.imp()                                                              # D-002.. come from the file
+        self.drop_from_source("D-001")                                          # D-002.. come from the file
+        self.imp()
         with self.assertRaisesRegex(ValueError, "mirrors DECISIONS.md"):
             self.do("decision.edit", decision="D-003", title="x")
         with self.assertRaises(actions.Forbidden):                              # D-104
@@ -348,6 +445,7 @@ class Remove(Env):
         self.do("decision.expire", decision="D-001", **kw)                          # lapsed (2001)
 
     def test_file_entries_are_removed_in_the_file(self):
+        self.drop_from_source("D-001", "D-002")
         self.imp()
         with self.assertRaisesRegex(ValueError, "mirrors DECISIONS.md"):
             self.do("decision.expire", decision="D-004")
@@ -432,22 +530,88 @@ class Links(Env):
 class Import(Env):
     def test_the_file_import_leaves_native_entries_alone(self):
         self.imp()
+        self.use_source_for_ids()
         self.assertEqual(self.add(title="Native")["id"], "D-005")                  # above the file's D-004
         r = self.imp()
         self.assertEqual((r["entries"], r["removed"], r["detached"]), (5, [], []))   # not removed, not counted
         self.assertEqual(store.get_decision_entry(self.conn, "D-005")["origin"], "db")
-        # the file later gets the same id: the native one stays, the file's is listed as ignored
-        with open(self.src, "a", encoding="utf-8") as fh:
-            fh.write("\n### D-005 From the file\n- **Keywords:** k\n")
-        r = self.imp()
-        self.assertEqual(r["detached"], ["D-005"])
-        self.assertEqual(store.get_decision_entry(self.conn, "D-005")["title"], "Native")
         self.assertEqual(self.imp()["removed"], [])
+
+    def test_a_file_entry_with_a_native_id_stops_the_import_loudly(self):
+        self.imp()
+        self.add(title="Native", id="D-050")
+        with open(self.src, "a", encoding="utf-8") as fh:
+            fh.write("\n### D-050 From the file\n- **Keywords:** k\n")
+            fh.write("\n### D-051 Another new one\n- **Keywords:** k\n")
+        with self.assertRaisesRegex(dec.IdCollision, r"D-050 is in the file.*next free one is D-052"):
+            self.imp()
+        self.assertIsNone(store.get_decision_entry(self.conn, "D-051"))             # nothing was written
+        self.assertEqual(store.get_decision_entry(self.conn, "D-050")["title"], "Native")
+        # the 10-minute import: an error line, exit 1, and an alert once per episode
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        shutil.copy(self.src, os.path.join(repo, "DECISIONS.md"))
+        alerts = []
+        for _ in range(2):
+            code, line = dec.cron_import(self.db, repo, alert=lambda subject, body: alerts.append((subject, body)))
+            self.assertEqual(code, 1)
+            self.assertIn("IdCollision", line)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("D-050", alerts[0][1])
+        # fixed in the file: the import goes on and the episode ends
+        self.drop_from_source("D-050")
+        shutil.copy(self.src, os.path.join(repo, "DECISIONS.md"))
+        self.assertEqual(dec.cron_import(self.db, repo, alert=lambda *a: alerts.append(a))[0], 0)
+        self.assertEqual(store.get_meta(self.conn, dec.CRON_MARK), "")
+
+    def test_the_hook_alerts_on_a_collision_and_still_builds_the_tldr(self):
+        self.imp()
+        self.add(title="Native", id="D-050")
+        with open(self.src, "a", encoding="utf-8") as fh:
+            fh.write("\n### D-050 From the file\n- **Keywords:** k\n")
+        alerts = []
+        with mock.patch.object(dec, "_alert", lambda subject, body: alerts.append(subject)):
+            out = dec.hook_output(1, 1, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
+            dec.hook_output(1, 1, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
+        text = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("NOT imported, the owner was alerted", text)
+        self.assertIn("D-050 Native", text)
+        self.assertIn("D-001 Night runs fill the week", text)
+        self.assertEqual(alerts, ["decisions import failed"])                      # once for both hook runs
+
+    def test_new_ids_are_above_every_id_in_the_file_and_the_db(self):
+        self.use_source_for_ids()                                                  # the file has D-004 at most
+        self.assertEqual(self.add(title="First")["id"], "D-005")                   # before any import
+        with open(self.src, "a", encoding="utf-8") as fh:                          # the owner's next statement
+            fh.write("\n### D-006 Written into the file\n- **Keywords:** k\n")
+        self.assertEqual(self.add(title="Second")["id"], "D-007")
+        self.imp()                                                                 # D-006 imports, nothing detached
+        self.assertEqual(store.get_decision_entry(self.conn, "D-006")["origin"], "file")
+        with self.assertRaisesRegex(ValueError, "entry of DECISIONS.md"):
+            self.add(title="Explicit", id="D-006")
+        os.remove(self.src)
+        self.assertEqual(self.add(title="No file")["id"], "D-008")                 # the DB's own ids and floor
+        with open(self.src, "wb") as fh:
+            fh.write(b"\xff\xfe")
+        with self.assertRaisesRegex(dec.SourceError, "can't read"):                # an unreadable file: no id is given
+            self.add(title="Bad file")
+
+    def test_native_entries_stay_after_the_file_ones_across_reimports(self):
+        self.use_source_for_ids()
+        self.add(title="Native")                                                   # D-005, ord 0 in an empty table
+        self.imp()                                                                 # the file's rows get ord 0..4
+        ids = [d["id"] for d in store.list_decision_entries(self.conn)]
+        self.assertEqual(ids, ["D-001", "D-002", "D-003", "M-001", "D-004", "D-005"])
+        with open(self.src, "a", encoding="utf-8") as fh:
+            fh.write("\n### D-006 Later in the file\n- **Keywords:** k\n")
+        self.imp()
+        self.assertEqual([d["id"] for d in store.list_decision_entries(self.conn)][-2:], ["D-006", "D-005"])
+        self.assertEqual(dec.tldr_lines(self.conn)[-1], "D-005 Native")
 
     def test_mass_removal_guard_counts_only_file_entries(self):
         self.imp()
         for n in range(8):
-            self.add(title=f"Native {n}")
+            self.add(title=f"Native {n}", id=f"D-{50 + n}")
         with open(self.src, "w", encoding="utf-8") as fh:
             fh.write("### D-001 Only one\n- **Status:** active\n")
         with self.assertRaisesRegex(dec.SourceError, "remove 4 of 5"):
@@ -464,7 +628,7 @@ class Tldr(Env):
     def test_titles_only_proposals_left_out_and_under_the_hook_cap(self):
         for n in range(1, 241):             # about the size of the live store
             self.do("decision.add", title=f"Decision number {n} about some topic of the project", topics=["t"],
-                    words="w", id=f"D-{n:03d}")
+                    words="w", author="owner", id=f"D-{n:03d}")
         self.do("decision.add", title="Waiting for the owner", topics=["t"], author="task-manager")
         lines = dec.tldr_lines(self.conn)
         self.assertEqual(len(lines), 240)
@@ -479,6 +643,7 @@ class Tldr(Env):
 
     def test_hook_output_still_works_with_native_entries(self):
         self.imp()
+        self.use_source_for_ids()
         self.add(title="Native one")
         out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
         text = out["hookSpecificOutput"]["additionalContext"]
@@ -486,19 +651,23 @@ class Tldr(Env):
         self.assertIn("D-001 Night runs fill the week", text)               # the import ran too
 
 
-class Cli(Env):
+class CliEnv(Env):
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = tasks.main(["--db", self.db, "decision", *argv])
         return code, out.getvalue(), err.getvalue()
 
+
+class Cli(CliEnv):
     def test_commands(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):   # --author is required
+            self.cli("add", "--title", "Keep titles", "--topic", "lists", "--words", "exact words")
         code, out, _ = self.cli("add", "--title", "Keep titles", "--topic", "lists", "--words", "exact words",
-                                "--keyword", "tldr")
+                                "--author", "owner", "--keyword", "tldr")
         self.assertEqual((code, out.splitlines()[0]), (0, "D-001 (state: active; topics: lists)"))
         self.assertIn("new topics: lists", out)
-        code, _, err = self.cli("add", "--title", "No words", "--topic", "x")
+        code, _, err = self.cli("add", "--title", "No words", "--topic", "x", "--author", "owner")
         self.assertEqual(code, 1)
         self.assertIn("exact words", err)
         code, out, _ = self.cli("add", "--title", "Mine", "--topic", "lists", "--topic", "naming", "--author", "task-manager")
@@ -528,6 +697,103 @@ class Cli(Env):
         self.assertEqual(self.cli("tldr")[1].count("\nD-"), 1)
         self.assertEqual(self.cli("delete", "D-001", "--reason", "gone")[0], 0)
         self.assertEqual(self.cli("delete", "D-001", "--reason", "again")[0], 1)
+
+
+class CliAuthority(CliEnv):
+    """The CLI as an autonomous session uses it (through Bash): refused what MCP refuses (D-104, D-285)."""
+    def setUp(self):
+        super().setUp()
+        self.owner = self.add(title="Owner's", words="exact")["id"]                      # D-001, active
+        self.tm = self.do("decision.add", title="Mine", topics=["t"], author="task-manager")["id"]
+        self.oneoff = self.add(title="Lapsed", status="active until 2001-01-01 19:00 (one-off, D-278)")["id"]
+        self.future = self.add(title="Future", status="active until 2999-01-01 19:00")["id"]
+        env = mock.patch.dict(os.environ, {"CLAUDE_GUARD_DISABLE": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def refused(self, *argv):
+        code, _, err = self.cli(*argv)
+        self.assertEqual(code, 1, argv)
+        self.assertIn("autonomous", err, argv)
+
+    def test_an_unattended_session_may_not_record_confirm_or_change_the_owners(self):
+        self.refused("add", "--title", "Fake", "--topic", "t", "--author", "owner", "--words", "w")
+        self.refused("confirm", self.tm)                                              # its own proposal either
+        self.refused("edit", self.owner, "--title", "Changed")
+        self.refused("delete", self.owner, "--reason", "x")
+        self.refused("expire", self.owner)                                            # not a one-off
+        self.refused("expire", self.future)                                           # its date isn't past
+        self.assertEqual(store.get_decision_entry(self.conn, self.tm)["state"], "proposed")
+        self.assertEqual(store.get_decision_entry(self.conn, self.owner)["title"], "Owner's")
+        self.assertEqual(store.get_decision_entry(self.conn, "D-005"), None)
+
+    def test_what_it_may_do(self):
+        code, out, _ = self.cli("add", "--title", "Its own", "--topic", "t", "--author", "task-manager")
+        self.assertEqual((code, out.splitlines()[0]), (0, "D-005 (state: proposed; topics: t)"))
+        self.assertEqual(self.cli("edit", self.tm, "--title", "Reworded")[0], 0)           # its own entry
+        self.assertEqual(self.cli("topics", self.owner, "add", "more")[0], 0)              # topics and keywords
+        self.assertEqual(self.cli("keywords", self.owner, "add", "kw")[0], 0)
+        self.assertEqual(self.cli("expire", self.oneoff)[0], 0)                            # a lapsed one-off (D-286)
+        a = self.audit("decision.add")[-1]
+        self.assertEqual((a["actor"], a["via"]), ("cli", "cli"))
+
+    def test_a_session_the_registry_knows_is_unattended_too(self):
+        os.environ.pop("CLAUDE_GUARD_DISABLE")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-known"}), \
+                mock.patch.object(actions, "autonomous_sessions", return_value={"sid-known"}):
+            self.refused("confirm", self.tm)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-other"}), \
+                mock.patch.object(actions, "autonomous_sessions", return_value={"sid-known"}):
+            self.assertEqual(self.cli("confirm", self.tm)[0], 0)
+
+    def test_the_owner_at_a_plain_shell_may(self):
+        os.environ.pop("CLAUDE_GUARD_DISABLE")
+        self.assertEqual(self.cli("confirm", self.tm)[0], 0)
+        self.assertEqual(self.cli("edit", self.owner, "--title", "Fixed typo")[0], 0)
+        self.assertEqual(self.cli("add", "--title", "Said", "--topic", "t", "--author", "owner", "--words", "w")[0], 0)
+        self.assertEqual(self.cli("expire", self.future, "--reason", "done")[0], 0)
+        code, _, err = self.cli("edit", self.owner, "--summary", "reworded")                # words / summary: nobody
+        self.assertEqual(code, 1)
+        self.assertIn("words and summary", err)
+
+
+class Entrypoint(unittest.TestCase):
+    """docker/entrypoint.sh's migrate step, with fake python3 and sleep: a failed migrate idles the container
+    (no runner, so no restart loop writing a backup per start); no database yet or success goes on."""
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "entrypoint.sh")
+
+    def run_entry(self, migrate_rc):
+        tmp = tempfile.mkdtemp(prefix="afc-entry-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, "data"))
+        os.makedirs(os.path.join(tmp, "bin"))
+        log = os.path.join(tmp, "calls.log")
+        for name, body in (("python3", f'echo "python3 $*" >> {log}\ncase "$*" in *"store.py migrate"*) exit '
+                                       f'{migrate_rc};; esac\nexit 0\n'),
+                           ("sleep", f'echo "sleep $*" >> {log}\nexit 0\n')):
+            path = os.path.join(tmp, "bin", name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], AFCLAUDE_DIR=tmp,
+                   KEEPALIVE_STATE_DIR=os.path.join(tmp, "ka"), AFCLAUDE_BRIDGE_KNOWN_HOSTS=os.path.join(tmp, "kh"),
+                   AFCLAUDE_SCHEDULER="runner")
+        r = subprocess.run(["sh", self.SCRIPT], env=env, capture_output=True, text=True, timeout=60)
+        with open(log) as fh:
+            return r, fh.read().splitlines()
+
+    def test_a_failed_migrate_idles_instead_of_starting_the_runner(self):
+        r, calls = self.run_entry(1)
+        self.assertEqual(len(calls), 2, calls)                   # the migrate, then the idle: nothing else ran
+        self.assertIn("store.py migrate", calls[0])
+        self.assertEqual(calls[1], "sleep infinity")
+        self.assertIn("migrate FAILED", r.stderr)
+
+    def test_no_database_yet_and_success_go_on_to_the_runner(self):
+        for rc in (0, store.MIGRATE_NO_DB):
+            r, calls = self.run_entry(rc)
+            self.assertTrue(any("runner.py serve" in c for c in calls), (rc, calls))
+            self.assertNotIn("sleep infinity", calls)
 
 
 if __name__ == "__main__":

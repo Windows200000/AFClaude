@@ -62,7 +62,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 
-DEFAULT_SOURCE = os.path.join(HERE, "DECISIONS.md")
+DEFAULT_SOURCE = os.environ.get("AFCLAUDE_DECISIONS_FILE") or os.path.join(HERE, "DECISIONS.md")
 IMPORT_ACTOR = "runner:import"
 HOOK_ACTOR = "runner:session-start"
 HOOK_SOURCES = ("startup", "compact", "clear")        # D-242: not resume (nor a run's continue)
@@ -86,6 +86,11 @@ BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active
 
 class SourceError(ValueError):
     """DECISIONS.md can't be imported as it is (no entries, a duplicate id, a mass removal)."""
+
+
+class IdCollision(SourceError):
+    """The file has an entry whose id a native entry already holds (both would be D-NNN): the import
+    stops, nothing is written, the owner is alerted (D-235); the file is never edited by code."""
 
 
 @dataclass
@@ -239,6 +244,19 @@ def read_source(path: str) -> tuple[str, str]:
     return data.decode("utf-8"), hashlib.sha256(data).hexdigest()
 
 
+def file_ids(path: Optional[str] = None) -> set[str]:
+    """The ids the source file holds (none: an install without a file). A file that exists but can't
+    be read or parsed raises SourceError: an id can't be given out safely then (D-235)."""
+    src = os.path.abspath(path or DEFAULT_SOURCE)
+    if not os.path.exists(src):
+        return set()
+    try:
+        text, _ = read_source(src)
+    except (OSError, UnicodeDecodeError) as err:
+        raise SourceError(f"can't read {src}: {err}") from err
+    return {e.id for e in parse(text)}
+
+
 def check_entries(entries: list[Entry], path: str) -> None:
     """Refuse a source that can't be right: no entries, a duplicate id, an entry without a title,
     an "active until" Status without a valid date (until_of)."""
@@ -315,7 +333,7 @@ def tldr_line(row: dict[str, Any]) -> str:
 
 def tldr_lines(conn: sqlite3.Connection) -> list[str]:
     """One line per current decision (active or partly superseded), in file order."""
-    return [tldr_line(r) for r in store.list_decision_entries(conn, CURRENT)]
+    return [tldr_line(r) for r in store.decision_titles(conn, CURRENT)]
 
 
 TLDR_HEAD = ("[AFClaude decisions TLDR (D-242){part}: every current decision as its id and title; all "
@@ -352,9 +370,10 @@ def split_parts(lines: list[str], parts: int, cap: int = HOOK_CONTEXT_CAP) -> li
     return out
 
 
-def tldr_text(lines: list[str], part: Optional[int] = None, of: Optional[int] = None) -> str:
+def tldr_text(lines: list[str], part: Optional[int] = None, of: Optional[int] = None,
+              note: Optional[str] = None) -> str:
     head = TLDR_HEAD.format(part=f", part {part} of {of}" if part is not None else "")
-    return "\n".join([head] + lines)
+    return "\n".join([head] + ([note] if note else []) + lines)
 
 
 # ---------------------------------------------------------------- the SessionStart hook
@@ -365,6 +384,25 @@ def rules_hooked(cwd: str) -> bool:
         return bool(cwd) and os.path.realpath(cwd) == os.path.realpath(HERE)
     except (OSError, ValueError):
         return False
+
+
+def _hook_import(conn: sqlite3.Connection, source_path: Optional[str], db_path: Optional[str]) -> Optional[str]:
+    """The hook's import. A database this code can't write to (a migration still to run, D-235's
+    schema guard) or a file that can't be imported because of an id collision doesn't stop the TLDR:
+    it is built from what the DB holds, read-only, and the returned note (shown at the top of part 1)
+    says what is stale. A collision also alerts the owner (once per episode, as the 10-min import).
+    Any other failure raises: the hook then says it could not build the TLDR."""
+    problem = store.schema_problem(conn)
+    if problem is not None:
+        return (f"[NOTE: DECISIONS.md was not imported, the database's schema doesn't fit this code "
+                f"({type(problem).__name__}); this list is what the database held and may lack the newest "
+                f"entries. Tell the owner: `python3 store.py migrate`, or update the code.]")
+    try:
+        import_file(source_path, db_path, actor=HOOK_ACTOR, conn=conn)
+    except IdCollision as e:
+        _import_failed(db_path, source_path or DEFAULT_SOURCE, f"{type(e).__name__}: {e}")
+        return f"[NOTE: DECISIONS.md was NOT imported, the owner was alerted: {e}]"
+    return None
 
 
 def hook_output(part: int, of: int, hook_input: dict[str, Any], source_path: Optional[str] = None,
@@ -381,13 +419,13 @@ def hook_output(part: int, of: int, hook_input: dict[str, Any], source_path: Opt
     try:
         conn = store.connect(db_path)
         try:
-            import_file(source_path, actor=HOOK_ACTOR, conn=conn)
-            chunk = split_parts(tldr_lines(conn), of)[part - 1]
+            note = _hook_import(conn, source_path, db_path)
+            chunk = split_parts(tldr_lines(conn), of, HOOK_CONTEXT_CAP - len(note or ""))[part - 1]
         finally:
             conn.close()
         if not chunk:
             return None
-        text = tldr_text(chunk, part, of)
+        text = tldr_text(chunk, part, of, note if part == 1 else None)
     except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
         if part != 1:
             return None          # part 1 reports it (once, not per part)
@@ -425,31 +463,59 @@ def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
     path = os.path.join(os.path.abspath(repo or HERE), "DECISIONS.md")
     if not os.path.exists(path):
         return 0, ""
+    mismatch = False
     try:
+        conn = store.connect(db_path)
+        try:
+            problem = store.schema_problem(conn)       # no doomed write: the failure is the alert
+        finally:
+            conn.close()
+        if problem is not None:
+            raise problem
         r = import_file(path, db_path)
         err = None
     except (OSError, ValueError, LookupError, store.DBError, sqlite3.Error) as e:
-        r, err = {}, f"{type(e).__name__}: {e}"
-    conn = store.connect(db_path)
-    try:
-        alerted = store.get_meta(conn, CRON_MARK)
-        if err and not alerted:
-            (alert or _alert)("decisions import failed",
-                              f"{path}: {err}\nThe decision store in the DB stays as it was until the file "
-                              "imports again (python3 tasks.py decision import).")
-            with store.transaction(conn):
-                store.set_meta(conn, CRON_MARK, store.now_iso())
-        elif not err and alerted:
-            with store.transaction(conn):
-                store.set_meta(conn, CRON_MARK, "")
-    finally:
-        conn.close()
+        r, err, mismatch = {}, f"{type(e).__name__}: {e}", isinstance(e, store.SchemaMismatch)
+    if err and mismatch:      # the episode's mark can't be written either: the out-of-DB alert, once
+        store.alert_once(store.fallback_path(db_path), "AFClaude decisions import failed: the schema",
+                         f"{path}: {err}\nNo write to the database until it is migrated "
+                         "(python3 store.py migrate) or the code is updated.", "decisions-import")
+    elif err:
+        _import_failed(db_path, path, err, alert)
+    else:
+        _import_ok(db_path)
     if err:
         return 1, f"{store.now_iso()} decisions import: {err}"
     if r.get("added") or r.get("changed") or r.get("removed"):
         parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r.get(k)]
         return 0, f"{store.now_iso()} decisions import: " + "; ".join(parts)
     return 0, ""
+
+
+def _import_failed(db_path: Optional[str], path: str, err: str,
+                   alert: Optional[Callable[[str, str], None]] = None) -> None:
+    """Alert the owner that the import failed, once per episode (CRON_MARK, shared by the 10-min
+    import and the hook; the episode ends when an import succeeds, _import_ok)."""
+    conn = store.connect(db_path)
+    try:
+        if not store.get_meta(conn, CRON_MARK):
+            (alert or _alert)("decisions import failed",
+                              f"{path}: {err}\nThe decision store in the DB stays as it was until the file "
+                              "imports again (python3 tasks.py decision import).")
+            with store.transaction(conn):
+                store.set_meta(conn, CRON_MARK, store.now_iso())
+    finally:
+        conn.close()
+
+
+def _import_ok(db_path: Optional[str]) -> None:
+    conn = store.connect(db_path)
+    try:
+        if store.get_meta(conn, CRON_MARK):
+            with store.transaction(conn):
+                store.set_meta(conn, CRON_MARK, "")
+    finally:
+        conn.close()
 
 
 def _alert(subject: str, body: str) -> None:

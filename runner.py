@@ -1618,10 +1618,16 @@ def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[dateti
     (AFCLAUDE_SCHEDULER on/runner) has a runner to check (legacy and off: healthy). The runner
     must be a live process and its loop heartbeat (runner_jobs 'runner', written at most every
     HEARTBEAT_EVERY and at every loop pass, so at most MAX_SLEEP + HEARTBEAT_EVERY old) younger
-    than HEALTH_STALE. It only reports: the restart is the loop watchdog's (Watchdog) and compose's."""
+    than HEALTH_STALE. It only reports: the restart is the loop watchdog's (Watchdog) and compose's.
+    The schema state comes first: a database this code must not write to (a migration that failed,
+    a database from newer code) is the reason, whatever else follows from it (the entrypoint idles
+    the container then, no runner)."""
     mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
     if mode not in RUNNER_MODES:
         return None
+    problem = store.schema_problem(conn)
+    if problem is not None:
+        return f"schema: {problem}"
     if not pids():
         return "no runner process (runner.py serve) is running"
     row = store.get_runner_job(conn, actions.RUNNER_ROW)

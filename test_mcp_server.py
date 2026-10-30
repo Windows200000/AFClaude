@@ -532,7 +532,8 @@ class Decisions(Env):
             a = store.audit_log(conn, 5, target_type="decision")[0]
             self.assertEqual((a["action"], a["actor"].split(":")[0], a["via"]), ("decision.add", "mcp", "mcp"))
             actions.perform(conn, "decision.confirm", {"decision": "D-001"}, actor="cli", via="cli")
-            actions.perform(conn, "decision.add", {"title": "Other", "topics": ["x"], "words": "w"}, actor="cli", via="cli")
+            actions.perform(conn, "decision.add", {"title": "Other", "topics": ["x"], "words": "w", "author": "owner"},
+                            actor="cli", via="cli")
             actions.perform(conn, "decision.link", {"decision": "D-002", "to": "D-001", "kind": "refines"}, actor="cli",
                             via="cli")
         finally:
@@ -547,6 +548,25 @@ class Decisions(Env):
             asyncio.run(ms.afclaude_decisions("propose", topics=["a"]))
         with self.assertRaisesRegex(ToolError, "at least one"):
             asyncio.run(ms.afclaude_decisions("propose", title="No topic"))
+
+    def test_a_schema_mismatch_tells_the_caller_what_to_do(self):
+        """A server that stayed up across an update (its code older than the database's schema) can't be fixed in
+        place; the new code says what to do instead of a generic database error."""
+        conn = store.connect(self.db)
+        try:
+            for version, want in (("99", "reconnect the afclaude MCP server \\(/mcp\\) or restart the session"),
+                                  ("4", "waiting for its migration")):
+                conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
+                conn.commit()
+                with self.assertRaisesRegex(ToolError, want) as cm:
+                    asyncio.run(ms.afclaude_decisions("propose", title="T", topics=["a"]))
+                err = json.loads(str(cm.exception))["error"]
+                self.assertEqual((err["message"], err["kind"]), (err["next_step"], "schema"))
+                self.assertIn("AFClaude was updated" if version == "99" else "migration", err["message"])
+        finally:
+            conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(store.SCHEMA_VERSION),))
+            conn.commit()
+            conn.close()
 
 
 class Prompts(Env):
