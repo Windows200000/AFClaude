@@ -1,9 +1,11 @@
 """Offline tests for phase 3c S2's detector (docs/phase3c_plan.md §3.2, §6 question 1; D-144, D-218):
 compact_timing's age test (first_activity, ran_before_window) at the window edges and on a DST night,
 and keepalive.long_running_check: a review / request session past the test that is live in tmux alerts
-once (its run_log ELIGIBLE row), below the test, not live, ended, a task-manager or an owner's session
-nothing, a read failure raises (the tick reports it: fail_stop), the once-per-tick part runs once over
-several task-managers, and its calls are in the compaction_check tick's timeout (not the act's)."""
+once (its run_log ELIGIBLE row), one whose tmux session is gone is ended once (driven.set) and not
+checked again, below the test, ended, a task-manager or an owner's session nothing, a read or the
+ending write failing raises (the tick reports it: fail_stop), more rows than one tick checks are the
+next ticks', the once-per-tick part runs once over several task-managers, and its calls are in the
+compaction_check tick's timeout (not the act's)."""
 import json
 import os
 import sys
@@ -13,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
+import actions  # noqa: E402
 import compact_timing as ct  # noqa: E402
 import keepalive as ka  # noqa: E402
 import runner  # noqa: E402
@@ -103,6 +106,21 @@ class Detector(unittest.TestCase):
         if live:
             self.live.add("ka-" + sid[:8])
 
+    def driven(self, sid):
+        conn = store.connect()
+        try:
+            return store.get_driven_session(conn, sid)
+        finally:
+            conn.close()
+
+    def audits(self, sid):
+        conn = store.connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='driven.set' AND target_id=? "
+                                "AND actor='keepalive' AND via='runner'", (sid,)).fetchone()[0]
+        finally:
+            conn.close()
+
     def rows(self):
         conn = store.connect()
         try:
@@ -139,13 +157,41 @@ class Detector(unittest.TestCase):
         self.assertEqual(ka.long_running_check(NOW, True), [])
         self.assertEqual((self.alerts, self.rows(), self.tmux_calls), ([], [], []))
 
-    def test_an_ended_review_not_live_or_without_transcript_nothing(self):
+    def test_an_ended_review_or_one_without_transcript_nothing(self):
         self.row(REV, ended=store.now_iso())
-        self.row(REQ, kind="request", live=False)
         self.row(TM, first=None)                                                   # a review with no transcript
         self.assertEqual(ka.long_running_check(NOW, True), [])
-        self.assertEqual((self.alerts, self.rows()), ([], []))
+        self.assertEqual((self.alerts, self.rows(), self.tmux_calls), ([], [], []))
+
+    def test_a_dead_tmux_row_is_ended_once_and_not_rechecked(self):
+        self.row(REQ, kind="request", live=False)
+        self.assertEqual(ka.long_running_check(NOW, True), [])
+        self.assertIsNotNone(self.driven(REQ)["ended_at"])
+        self.assertEqual(self.audits(REQ), 1)                                      # through driven.set, audited
+        self.assertEqual(ka.long_running_check(NOW, True), [])
         self.assertEqual(self.tmux_calls, ["ka-" + REQ[:8]])
+        self.assertEqual((self.alerts, self.rows(), self.audits(REQ)), ([], [], 1))
+
+    def test_a_dry_run_ends_no_row(self):
+        self.row(REQ, kind="request", live=False)
+        ka.long_running_check(NOW, False)
+        self.assertIsNone(self.driven(REQ)["ended_at"])
+
+    def test_the_ending_write_failing_raises(self):
+        self.row(REQ, kind="request", live=False)
+        real = actions.perform
+
+        def refuse(conn, name, params, **kw):
+            if name == "driven.set":
+                raise RuntimeError("database is locked")
+            return real(conn, name, params, **kw)
+        actions.perform = refuse
+        self.addCleanup(setattr, actions, "perform", real)
+        with self.assertRaisesRegex(RuntimeError, "database is locked"):
+            ka.long_running_check(NOW, True)
+        self.assertIsNone(self.driven(REQ)["ended_at"])
+        res = ka.long_running_tick(NOW, ka._pass_args(None))                      # the tick: a fail-stop
+        self.assertEqual((res["note"], len(self.stops)), ("the long-running session check failed", 1))
 
     def test_no_open_window_nothing(self):
         self.row(REV)
@@ -190,13 +236,16 @@ class Detector(unittest.TestCase):
         self.assertEqual(len(self.stops), 1)
         self.assertIn("bridge down", self.stops[0][1])
 
-    def test_more_aged_rows_than_the_tick_checks_raise(self):
+    def test_more_rows_than_one_tick_checks_are_the_next_ticks(self):
         ka.LONG_RUN_TMUX_MAX = 1
-        self.row(REV)
-        self.row(REQ, kind="request")
-        with self.assertRaisesRegex(RuntimeError, "2 review / request sessions passed the age test"):
-            ka.long_running_check(NOW, True)
-        self.assertEqual(self.tmux_calls, [])
+        self.row(REV, live=False, first=START - timedelta(hours=2))
+        self.row(REQ, kind="request", first=START - timedelta(hours=1))
+        self.assertEqual(ka.long_running_check(NOW, True), [])                    # the oldest: ended
+        self.assertEqual(self.tmux_calls, ["ka-" + REV[:8]])
+        self.assertEqual(ka.long_running_check(NOW, True), [REQ[:8]])             # then the next
+        self.assertEqual(ka.long_running_check(NOW, True), [])
+        self.assertEqual(self.tmux_calls, ["ka-" + REV[:8], "ka-" + REQ[:8]])
+        self.assertEqual((len(self.alerts), self.stops), (1, []))
 
     def test_once_per_tick_over_several_task_managers(self):
         self.row(REV)

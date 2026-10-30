@@ -4349,10 +4349,13 @@ def run_readings_tick(sid, now, args):
 # is before the current session window started, compact_timing.ran_before_window) and is live in its
 # tmux session gets one alert: S2 (its compaction) is built on the first hit. Nothing is compacted or
 # typed. Its record is a run_log row (component compaction, ELIGIBLE, once per session), written before
-# the alert, so a session alerts once, across the runner's restarts. Once per compaction_check tick
-# (TICK_ONCE), not per task-manager. The tmux checks run only for the rows that passed the age test and
-# have no row yet: more than LONG_RUN_TMUX_MAX of them is an error (the tick's timeout counts that many
-# tmux_has calls, runner_jobs.TICK_HOST_CALLS), not a partial check.
+# the alert, so a session alerts once, across the runner's restarts. One whose tmux session is gone is
+# a stale row (a one-off review that finished): it is ended (driven.set ended_at, audited), so it is
+# checked once. Once per compaction_check tick (TICK_ONCE), not per task-manager. The tmux checks run
+# only for the rows that passed the age test and are neither reported nor ended, oldest first, at most
+# LONG_RUN_TMUX_MAX in one tick (the tick's timeout counts that many tmux_has calls,
+# runner_jobs.TICK_ONCE_CALLS); every row checked is reported or ended, so the rest are the next
+# tick's (logged), and no number of stale rows makes the check fail.
 LONG_RUN_KINDS = ("review", "request")
 LONG_RUN_TMUX_MAX = 6
 
@@ -4372,8 +4375,9 @@ def _long_once(sid):
 
 
 def long_running_sessions(now):
-    """The sessions 3c S2's detector reports now (see the section comment): [(row, first activity,
-    window start)], those already reported left out. A DB, transcript or tmux failure raises."""
+    """The rows 3c S2's detector checks in tmux now (see the section comment): [(row, first
+    activity, window start)], oldest first, those already reported left out. A DB or transcript
+    failure raises."""
     import compact_timing as ct
     import store
     start = window_start_now(now)
@@ -4391,20 +4395,42 @@ def long_running_sessions(now):
     for r in rows:
         path = transcript_path(r["session_id"])
         first = ct.first_activity(path) if path else None
-        if ct.ran_before_window(first, start):
-            aged.append((r, first))
-    if len(aged) > LONG_RUN_TMUX_MAX:
-        raise RuntimeError(f"{len(aged)} review / request sessions passed the age test (at most {LONG_RUN_TMUX_MAX} "
-                           "are checked in one tick): end the stale driven_sessions rows ("
-                           + ", ".join(str(r["session_id"])[:8] for r, _ in aged) + ")")
-    return [(r, first, start) for r, first in aged if r.get("tmux") and tmux_has(r["tmux"])]
+        if ct.ran_before_window(first, start) and r.get("tmux"):
+            aged.append((r, first, start))
+    return sorted(aged, key=lambda a: (a[1], str(a[0]["session_id"])))
+
+
+def _end_stale(r, arm):
+    """End the driven_sessions row `r` whose tmux session is gone (driven.set, audited; a dry run
+    only logs it). A failed write raises."""
+    import actions
+    import store
+    sid = str(r["session_id"])
+    line = f"long-running check: the {r['kind']} row of {sid[:8]} ended, its tmux session {r['tmux']} is gone"
+    if not arm:
+        log(f"{line} (dry-run: not ended)")
+        return
+    conn = store.connect()
+    try:
+        actions.perform(conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
+                        actor="keepalive", via="runner")
+    finally:
+        conn.close()
+    log(line)
 
 
 def long_running_check(now, arm):
-    """3c S2's detector: one alert per session long_running_sessions finds, after its run_log row
-    (armed only; a dry run logs what it would alert). -> the sessions alerted (id8). A failure raises."""
+    """3c S2's detector: of the rows long_running_sessions finds (at most LONG_RUN_TMUX_MAX), a live
+    one alerts once after its run_log row, one whose tmux session is gone is ended (_end_stale);
+    armed only (a dry run logs both). -> the sessions alerted (id8). A failure raises."""
     out = []
-    for r, first, start in long_running_sessions(now):
+    todo = long_running_sessions(now)
+    if len(todo) > LONG_RUN_TMUX_MAX:
+        log(f"long-running check: {len(todo)} rows to check, {LONG_RUN_TMUX_MAX} now, the rest in the next ticks")
+    for r, first, start in todo[:LONG_RUN_TMUX_MAX]:
+        if not tmux_has(r["tmux"]):
+            _end_stale(r, arm)
+            continue
         sid = str(r["session_id"])
         line = (f"{r['kind']} session {sid[:8]} (tmux {r['tmux']}, task {r.get('task_id')}) ran longer than one "
                 f"session length (D-218): its first activity {berlin(first)} is before the session window that "
