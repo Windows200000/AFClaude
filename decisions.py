@@ -6,8 +6,10 @@ FTS5 index `decisions_fts` when the SQLite build has FTS5, else lookups use LIKE
 actions.py (decision.import, decision.keywords, audited). This module parses the Markdown source,
 imports it, and builds what the task-manager reads:
 
-  - DECISIONS.md (local only, gitignored) stays the source the task-manager edits for now. The
-    importer reads it (never writes it) and mirrors it into the table: one row per "### D-NNN" or
+  - DECISIONS.md (local only, gitignored) was the source until the seeding below (phase 4b Q2); since then the
+    DB is the only source and the file is neither read nor written (`import` below reports "retired"; a file
+    whose sha differs from the seeded one alerts once per episode). Until then the importer read it (never
+    wrote it) and mirrored it into the table: one row per "### D-NNN" or
     "### M-NNN" entry (the drift log's DR-NN entries and other headings are not decisions), with
     the fields of its "**Name:** value" lines (Type, Date, Status, Supersedes, Summary, Keywords,
     Owner's words, Source, Scope, Interpretation) and the full entry text. An entry with no Status
@@ -18,16 +20,30 @@ imports it, and builds what the task-manager reads:
     an unchanged file is a no-op (no audit row) -- but an entry whose text is unchanged while a
     derived field (e.g. state) now comes out different, because the derivation logic itself
     changed, is still updated ("restated": store.put_decision_entry / DECISION_DERIVED_FIELDS).
-    It runs every 10 min with the docs import
+    It ran every 10 min with the docs import
     (project_docs.py import --cron), at every SessionStart hook below, and by hand:
         python3 decisions.py import [--file PATH]        (= python3 tasks.py decision import)
+  - the seeding (Q2, the cut-over, run once by the task-manager; it re-keys what the import already holds):
+        python3 decisions.py seed --topics F --merges F [--file PATH] [--dry-run]     action decision.seed
+        python3 decisions.py seed --undo
+    F = two JSON files (see seed_plan): topics {"D-001": ["topic", ...]} for every surviving entry (1-3 each,
+    D-284), and merges {"merges": [{title, summary, topics, supersedes, scope?, interpretation?}], "keep": [ids]}.
+    The classes: active and partly superseded entries become the DB's own (origin db), unchanged, with their
+    topics; superseded, done and expired ones are deleted with the full text in the audit log (D-158, D-286);
+    the file's DR-NN entries and non-entry sections get one audit row each; a merge becomes a proposed
+    task-manager entry carrying the originals' owner words with their dates, the originals staying in force
+    until the owner confirms it (D-104, D-285). Refused before any write: a DB that does not mirror the file,
+    a surviving entry without 1-3 topics, a done entry whose Status names a part that stays and that is in no
+    merge or `keep`. A backup <db>.preseed-<utc>.bak first, one transaction, the counts per class against the
+    file's in the result; meta decisions_source=db, decisions_seed_sha, decision_id_floor, decisions_seeded.
+    --undo is refused if a seeded row changed since or a seeded proposal was confirmed.
   - keywords: the file's Keywords line, plus the task-manager's own additions and removals
     (`tasks.py decision keywords D-NNN add|remove KW...`, action decision.keywords, D-242). Those are
     kept apart from the file's list, so a re-import never undoes them.
   - the TLDR (D-242): every current decision (not done, expired or superseded) as one line, id + title
     (+ the status when it isn't plain "active"). The repo's SessionStart hook injects it after a
     compaction and in a brand-new conversation (sources compact, startup, clear; not resume, and so
-    not a run's continue), importing the file first so it is current:
+    not a run's continue), from the DB only (before the seeding it imported the file first):
         python3 decisions.py hook --part N --of M        (.claude/settings.json)
     Claude Code caps a hook's additionalContext at 10,000 characters, so the TLDR is split over M
     hook commands (parts); a TLDR that outgrows them says so in its last part (add a part).
@@ -40,7 +56,7 @@ imports it, and builds what the task-manager reads:
     owner's words are active at once, the task-manager's own entries 'proposed' (not in the TLDR)
     until the owner confirms (D-285). The import above leaves them alone.
 
-    python3 decisions.py tldr | import [--file PATH] | hook --part N --of M
+    python3 decisions.py tldr | import [--file PATH] | seed ... | hook --part N --of M
 (the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords|import`)
 """
 from __future__ import annotations
