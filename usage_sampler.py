@@ -236,9 +236,9 @@ def track_driver(sid, meta, entries, typed, now, problems):
     "typed"). State: meta["driver"] (in force now), meta["drivers"] (changes of the last DRIVER_KEEP:
     at, driver, via, source) and meta["driver_before"] / ["driver_before_source"] (in force before the
     oldest kept one). A classification error (usage_split.SplitError: an unknown origin kind, an entry
-    without a time, out of order) or an AFClaude-prefixed prompt without a typed row (a send the record
-    lacks) goes into `problems` (the sampler reports them after the row, D-235); after an error the
-    driver is unknown (a None change) until the next prompt. -> the uuids of the chunk's prompts that
+    without a time, out of order) goes into `problems` (the sampler reports it after the row, D-235); after
+    an error the driver is unknown (a None change) until the next prompt. An AFClaude-prefixed prompt without a
+    typed row (a "missed send") is no error: a logged line and meta["missed_sends"] (a count, for S3 to decide on). -> the uuids of the chunk's prompts that
     AFClaude typed (driver auto), which Haiku leaves out (D-131)."""
     since = typed.record_since()
     cut = _ts(since) if since else None
@@ -270,10 +270,10 @@ def track_driver(sid, meta, entries, typed, now, problems):
         for v in verdicts:
             if v.driver == "auto":
                 auto.add(v.uuid)
-            if v.missed:
-                problems.append(("an AFClaude-prefixed prompt has no typed_messages row",
-                                 f"session {sid[:8]}, entry {v.uuid} at {v.at.isoformat()}: sent around "
-                                 "keepalive.fire (every send must be recorded), or the owner typed such a text"))
+            if v.missed:    # no error: owner-typed or pasted prefixes, a queued prompt landing late, the deploy changeover
+                meta["missed_sends"] = meta.get("missed_sends", 0) + 1
+                log(f"usage split: missed send, session {sid[:8]}, entry {v.uuid} at {v.at.isoformat()}: "
+                    "AFClaude prefix without a typed_messages row (counted in the session's missed_sends)")
     except usage_split.SplitError as e:
         times = [t for t in (_ts(x.get("timestamp")) for x in entries if x.get("timestamp")) if t]
         rows.append({"at": (min(times) if times else now).isoformat(), "driver": None, "via": "error",

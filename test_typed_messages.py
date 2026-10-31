@@ -179,6 +179,29 @@ class Callers(unittest.TestCase):
                 self.assertEqual(kw["driver"].value, "owner" if path == "inbox_worker.py" else "auto")
         self.assertEqual(found, self.EXPECTED)
 
+    def test_every_send_without_fire_records_first(self):
+        """The sends that bypass fire(): rc_continue.send (the dispatcher's continue of a live rc thread) has
+        exactly one call site, and record_typed has exactly one call outside fire(): the dispatcher's, with
+        driver "auto" (§3.1: a send nothing records is a prompt the sampler calls the owner's)."""
+        sends, records = [], []
+        for root, dirs, files in os.walk(HERE):
+            dirs[:] = [d for d in dirs if not d.startswith((".", "__")) and d not in ("data", "node_modules")]
+            for f in files:
+                if not f.endswith(".py") or f.startswith("test"):
+                    continue
+                path = os.path.join(root, f)
+                with open(path, encoding="utf-8") as fh:
+                    tree = ast.parse(fh.read(), path)
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
+                        if n.func.attr == "send" and n.func.value.id == "rc_continue":
+                            sends.append(os.path.relpath(path, HERE))
+                        if n.func.attr == "record_typed" and n.func.value.id == "ka":
+                            records.append((os.path.relpath(path, HERE), [a.value for a in n.args[2:3]
+                                                                         if isinstance(a, ast.Constant)]))
+        self.assertEqual(sends, ["dispatcher.py"])
+        self.assertEqual(records, [("dispatcher.py", ["auto"])])
+
     def test_the_live_compaction_tool_too(self):
         with open(os.path.join(HERE, "tools", "test_compact_live.sh")) as fh:
             lines = [ln for ln in fh if re.search(r"\bka\.fire\(", ln)]
@@ -250,14 +273,13 @@ class Sampler(DB):
 
     def test_another_sessions_row_or_an_old_one_is_refused(self):
         """Refused matches: the keep-alive text then counts as the owner's, and the cross-check against
-        the keep-alive prefixes reports it (an AFClaude send the record lacks)."""
+        the keep-alive prefixes counts it as a missed send (a logged line and meta["missed_sends"], no error)."""
         self.record(OTHER, "[keep-alive] Continue the run: budget 20%.", t("09:59:50"))
         self.record(SID, "[keep-alive] Continue the run: budget 20%.", t("09:49:59"))     # 10 min 1 s before
         st, meta, problems = self.scan()
         self.assertEqual(self.seq(meta)[0], ("10:00:00", "owner", "unmatched", "typed"))
-        self.assertEqual([p[0] for p in problems], ["an AFClaude-prefixed prompt has no typed_messages row"] * 2)
-        self.assertIn("entry u1 at 2026-10-20T10:00:00", problems[0][1])
-        self.assertIn("entry u11", problems[1][1])
+        self.assertEqual(problems, [])                  # a missed send alerts and pauses nothing
+        self.assertEqual(meta["missed_sends"], 2)
 
     def test_before_the_record_the_prefix_list_decides(self):
         """Prompts from before the record's first row go through the prefix matcher, labelled "prefix"

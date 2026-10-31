@@ -112,7 +112,7 @@ AFClaude keeps long-running Claude Code sessions going while nobody is at the ke
 | `docker/` | The AFClaude container (see below): `Dockerfile`, `compose.yml` (+ `compose.dev.yml`), `entrypoint.sh`, `at_shim.py`, `env.example` (the crontabs and `start_watcher.sh` are gone since phase 3a S9); `host_exec.py` + `install_host_bridge.sh` are the host side of the bridge. |
 | `test_host.py` | Offline tests for `host.py`: host path, ssh argv, the mapping onto `host_exec.py`'s whitelist, denied shapes, and keepalive's `/proc` readers in container mode. |
 | `PROGRESS.md`, `EXCEPTIONS.md` | The build log (findings, dead ends) and the log of rule exceptions. |
-| `launch_nightly.sh`, `nightly_prompt.md` | Legacy: the `at` launcher of the first AFK build session (still `--bg`; Remote Control per the `task_manager` category's setting, D-269). |
+| `launch_nightly.sh`, `nightly_prompt.md` | Legacy, unsupported since usage split S2 (it sends without `keepalive.fire`: no typed row): the `at` launcher of the first AFK build session (still `--bg`; Remote Control per the `task_manager` category's setting, D-269). |
 
 **Legacy data files (D-161):** the telemetry and runner-state files in `data/` (`samples.jsonl`, `weekly_series.jsonl`, `session_windows.jsonl`, `forecast_log.jsonl`, `haiku.jsonl`, `usage_reports.jsonl`, `run_usage.jsonl`, `stage_eta_log.jsonl`, `weekly_cycles.json`, `afclaude_runs.jsonl`, `user_model.json`, `sampler_state.json`, `dispatcher_state.json`, `usage_review_state.json`, `own_sessions.txt`, `keepalive/*_state.json`, `keepalive/keepalive_{deferred,fillup}.json`, `at_spool/`) are no longer written: the DB is the only copy. They are frozen legacy copies, safe to archive (the logs `*.log` are still written).
 

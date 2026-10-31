@@ -12,7 +12,7 @@ transcript entries, typed-message rows and cost-model records as plain data.
     `DriverTrack.at(ts)` is the driver in force at a time, which is what a subagent's request (its own
     transcript) takes from its parent session. `classify()` is either matcher plus each prompt's verdict
     (`PromptDriver`), with `missed` set where the typed matcher found no row for a text the prefix list
-    calls AFClaude's (a send the record lacks: the sampler reports it).
+    calls AFClaude's (a "missed send": the sampler logs and counts it, no alert).
   - `cost_of()`: one request's modeled cost in session-% from compact_timing's cost model (`per_token`, the
     API-price features by token kind, the 5-min and 1-h cache writes apart). A model with no price raises
     `UnpricedModel` (D-235): no default price.
@@ -214,7 +214,8 @@ class PromptDriver:
     """One real prompt's verdict (classify): its driver and `via` as in DriverChange; `missed` = no typed
     row matched although the text starts with a keep-alive prefix (prefix_driver says auto): an AFClaude
     send the record lacks (a send path around keepalive.fire), or the owner typing such a text. The
-    caller reports it (D-235); the verdict stays the typed matcher's (owner), never guessed."""
+    caller logs and counts it (no alert: owner-typed prefixes, late queued prompts and the deploy
+    changeover fire it falsely); the verdict stays the typed matcher's (owner), never guessed."""
     at: datetime
     uuid: str
     driver: Driver

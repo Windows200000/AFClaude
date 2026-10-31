@@ -254,11 +254,13 @@ class Main(unittest.TestCase):
         self.assertTrue(os.path.exists(us.STATE))                         # no double count next run
         self.assertEqual(self.alerts, ["AFClaude STOPPED: run metrics update failed"])
 
-    def test_a_missed_typed_message_is_an_error_after_the_row(self):
+    def test_a_missed_typed_message_is_counted_not_an_error(self):
         """Usage split S2 (D-235): a keep-alive-prefixed prompt with no typed_messages row (a send around
-        keepalive.fire) is reported after the sample row; the state is saved, so it isn't reported twice."""
+        keepalive.fire) is logged and counted in the session's state (S3 decides on it later): no alert, no pause."""
         import json
         import os
+        import afclaude_config
+        import runner_state
         import store
         testenv.fresh_db(self)                       # its own DB: the typed row stays out of the shared one
         conn = store.connect()
@@ -274,10 +276,12 @@ class Main(unittest.TestCase):
         with open(os.path.join(proj, sid + ".jsonl"), "w") as fh:
             fh.write(json.dumps({"type": "user", "uuid": "k1", "timestamp": store.now_iso(), "origin": {"kind": "human"},
                                  "message": {"role": "user", "content": "[keep-alive] sent around fire"}}) + "\n")
-        self.assertEqual(us.main(["--no-haiku"]), 1)
+        self.assertEqual(us.main(["--no-haiku"]), 0)
         self.assertEqual(len(self.rows()), 1)
         self.assertTrue(os.path.exists(us.STATE))
-        self.assertEqual(self.alerts, ["AFClaude STOPPED: an AFClaude-prefixed prompt has no typed_messages row"])
+        self.assertEqual(self.alerts, [])
+        self.assertFalse(afclaude_config.automation_pause()["paused"])
+        self.assertEqual(runner_state.load("sampler", us.STATE)["sessions"][sid]["missed_sends"], 1)
 
     def test_agents_snapshot_failure_aborts(self):
         def roh(*a, **k):

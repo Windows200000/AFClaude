@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# UNSUPPORTED since usage split S2 (goal 12): do not use. It sends its first prompt without keepalive.fire,
+# so no typed_messages row exists and the sampler would count that prompt as the owner's. Legacy, not in cron.
 # Launches the AFK keep-alive build session (scheduled via `at` for 00:00 Europe/Berlin).
 # Scrubs the scheduling session's Claude env vars (CLAUDECODE, CLAUDE_CODE_*, sockets)
 # with env -i so the new session starts as a clean top-level session.

@@ -506,6 +506,9 @@ class Pass:
         def sending(name):
             # recorded and saved BEFORE the sender starts: a pass killed from here on never sends again
             # (the stall is handled; the mark is an error the next pass alerts on, Pass.run)
+            # The typed_messages row first (usage split S2: rc_continue.send has no fire): a failed record
+            # raises out of send() before anything is sent, into the error handler below (D-235).
+            ka.record_typed(sid, msg, "auto", ka.remote_control.CONTINUE, "continue_foreign", "dispatcher")
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-sending",
                                        "thread": name}
             save_state(self.st)
