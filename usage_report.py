@@ -5,8 +5,7 @@ main session itself) has consumed, so the manager can watch the session cap.
 
     usage_report.py [--session UUID] [--since ISO|--last] [--json] [--fresh] [--record]
 
---session      defaults to $CLAUDE_CODE_SESSION_ID, else the AFClaude manager
-               session (manager_session in data/afclaude.json).
+--session      defaults to $CLAUDE_CODE_SESSION_ID, else an error.
 --since ISO    only count assistant turns whose timestamp is after ISO.
 --last         only count usage since the previous --record'ed report for
                this session (a delta). Ignored if --since is also given.

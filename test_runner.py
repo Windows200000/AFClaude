@@ -805,10 +805,12 @@ class Misc(Base):
     def test_health(self):
         r = self.runner(owns={"sampler"})
         r.boot()
-        on, off = {"AFCLAUDE_SCHEDULER": "runner"}, {"AFCLAUDE_SCHEDULER": "legacy"}
+        on, off = {"AFCLAUDE_SCHEDULER": "runner"}, {"AFCLAUDE_SCHEDULER": "off"}
         live = lambda: [7]   # noqa: E731
         self.assertIsNone(runner.health(self.conn, on, self.now, pids=live))
-        self.assertIsNone(runner.health(self.conn, {"AFCLAUDE_SCHEDULER": "on"}, self.now, pids=live))
+        for bad in ("on", "legacy", "Runner"):      # S9: no alias, no rollback mode: the entrypoint idles
+            self.assertEqual(runner.health(self.conn, {"AFCLAUDE_SCHEDULER": bad}, self.now, pids=live),
+                             f"unknown AFCLAUDE_SCHEDULER={bad} (runner or off; the container idles)")
         self.assertIn("no runner process", runner.health(self.conn, on, self.now, pids=lambda: []))
         late = self.now + runner.HEALTH_STALE + timedelta(seconds=1)
         self.assertIn("heartbeat is", runner.health(self.conn, on, late, pids=live))
@@ -831,7 +833,7 @@ class Misc(Base):
 
     def test_health_cli_reports_and_fails(self):
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "legacy"}), contextlib.redirect_stdout(out):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "off"}), contextlib.redirect_stdout(out):
             self.assertEqual(runner.main(["health"]), 0)
         self.assertEqual(out.getvalue().strip(), "healthy")
         out = io.StringIO()

@@ -42,11 +42,11 @@ class Base(unittest.TestCase):
         self.logs = []
         self.addCleanup(setattr, ka, "log", ka.log)
         ka.log = self.logs.append
-        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE"):
+        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE"):
             self.addCleanup(setattr, ka, n, getattr(ka, n))
         self.addCleanup(setattr, ka, "_LINES", {})
         self.addCleanup(setattr, ka, "_PAUSE_LOGGED", {})
-        ka._LINES, ka._PAUSE_LOGGED, ka._STOP_LINE = {}, {}, None
+        ka._LINES, ka._PAUSE_LOGGED = {}, {}
 
     def pause_project(self, name, paused=True):
         actions.perform(self.conn, "automation.set_project", {"project": name, "paused": paused,

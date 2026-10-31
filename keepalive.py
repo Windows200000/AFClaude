@@ -108,7 +108,6 @@ PROC_DIR = os.environ.get("KEEPALIVE_PROC_DIR", "/proc")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR", HERE)
 STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")   # names the state; the DB holds it (D-161)
-LOCK_FILE = os.path.join(STATE_DIR, "keepalive.lock")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 

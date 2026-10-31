@@ -1342,7 +1342,8 @@ DECISION_WINDOW = timedelta(minutes=10)   # a window start's decision line comes
 def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[datetime] = None,
            pids: Callable[[], list[int]] = runner_pids) -> Optional[str]:
     """The container's health check (S8): None when healthy, else why not. Only the runner mode
-    (AFCLAUDE_SCHEDULER=runner) has a runner to check (off: healthy). The runner
+    (AFCLAUDE_SCHEDULER=runner) has a runner to check (off: healthy; any other value is unhealthy:
+    the entrypoint idles the container then, phase 3a S9 removed `on` and `legacy`). The runner
     must be a live process and its loop heartbeat (runner_jobs 'runner', written at most every
     HEARTBEAT_EVERY and at every loop pass, so at most MAX_SLEEP + HEARTBEAT_EVERY old) younger
     than HEALTH_STALE. It only reports: the restart is the loop watchdog's (Watchdog) and compose's.
@@ -1350,8 +1351,10 @@ def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[dateti
     a database from newer code) is the reason, whatever else follows from it (the entrypoint idles
     the container then, no runner)."""
     mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
-    if mode not in RUNNER_MODES:
+    if mode == "off":
         return None
+    if mode not in RUNNER_MODES:
+        return f"unknown AFCLAUDE_SCHEDULER={mode} (runner or off; the container idles)"
     problem = store.schema_problem(conn)
     if problem is not None:
         return f"schema: {problem}"

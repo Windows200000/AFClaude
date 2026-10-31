@@ -22,6 +22,7 @@ os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
 os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no file: the repo's own is never read
+os.environ["AFCLAUDE_DIR"] = HERE   # docker/at_shim.py imports from it: a worktree run never loads the live checkout
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
 os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (health, the quickview read it)
 
@@ -204,7 +205,7 @@ def runner_pass(ka, job, key=None, now=None, session=SID):
     from unittest import mock
 
     def fresh():
-        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE", "_DB_PAUSE"):
+        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_DB_PAUSE"):
             setattr(ka, n, None)
         ka._PAUSE_LOGGED, ka._FILLUP_BUSY, ka._LINES = {}, {}, {}
         ka._COMPACT_TRIED.clear()

@@ -2031,13 +2031,14 @@ def pick_project(conn: sqlite3.Connection, chained: object = None) -> Row:
 
 
 def check_manager_setting(conn: sqlite3.Connection, setting: str) -> None:
-    """The boot check of phase 3b S3 (docs/phase3b_plan.md §3.3), while the machine setting
-    manager_session (or a legacy --session) still exists: it must be a registered task-manager
-    session, else ValueError (the caller fail-stops, D-235)."""
+    """Phase 3b S3's check (docs/phase3b_plan.md §3.3), today for keepalive.py's `--session` (the
+    runner's window_start child, keepalive.check_registry; the machine setting manager_session is
+    gone since 3b S6): it must be a registered task-manager session, else ValueError (the caller
+    fail-stops, D-235)."""
     tms = manager_sessions(conn)
     if setting not in {str(t["session"]) for t in tms}:
         have = ", ".join(f"{t['name']} {str(t['session'])[:8]}" for t in tms) or "none"
-        raise ValueError(f"the session {setting[:8]} (setting manager_session / --session) is no project's "
+        raise ValueError(f"the session {setting[:8]} (--session) is no project's "
                          f"task-manager in the registry (projects.manager_session: {have})")
 
 

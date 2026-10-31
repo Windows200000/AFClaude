@@ -1218,7 +1218,7 @@ class PassesThroughTheRunner(unittest.TestCase):
     NIGHT = Z("2026-10-04T21:00:00Z")                   # Sun 23:00 Berlin, a session-window start
     R = Z("2026-10-01T16:59:59Z")                       # a weekly reset (the last stretch)
     NAMES = ("PROJECTS_DIR", "STATE_FILE", "DEFER_FILE", "FILLUP_FILE", "PROGRESS_FILE",
-             "LOCK_FILE", "read_usage_cache", "fresh_usage", "handle_fire", "budget_eval", "stall_status",
+             "read_usage_cache", "fresh_usage", "handle_fire", "budget_eval", "stall_status",
              "last_mile_next_start", "fillup_decision", "log")
 
     def setUp(self):
@@ -1231,7 +1231,7 @@ class PassesThroughTheRunner(unittest.TestCase):
         setcfg(usage_model="linear", run_start_factor=0)
         ka.PROJECTS_DIR = d
         for n, f in (("STATE_FILE", "st.json"), ("DEFER_FILE", "deferred.json"), ("FILLUP_FILE", "fillup.json"),
-                     ("PROGRESS_FILE", "P.md"), ("LOCK_FILE", "ka.lock")):
+                     ("PROGRESS_FILE", "P.md")):
             setattr(ka, n, os.path.join(d, f))
         testenv.notes_project(d)
         self.cache = {"fetched_at": self.NIGHT, "weekly": {"percent": 30.0, "resets_at": self.NIGHT + timedelta(days=3)},

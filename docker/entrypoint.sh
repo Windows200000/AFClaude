@@ -11,6 +11,21 @@
 # (phase 3a S9 removed the rollback mode `legacy`, supercronic and its crontabs, and the alias `on`)
 set -eu
 D="${AFCLAUDE_DIR:?}"
+# The mode first, before migrate: an unknown one (e.g. a stale `on` after phase 3a S9) must not exit,
+# or `restart: unless-stopped` loops silently through migrate/import-prompts. It alerts the owner out of
+# the DB (the fallback file + a push, as a failed migrate does) and idles, unhealthy (`runner.py health`).
+MODE="${AFCLAUDE_SCHEDULER:-off}"
+case "$MODE" in
+  runner|off) ;;
+  *)
+    echo "afclaude: AFCLAUDE_SCHEDULER must be runner or off, not ${MODE}: not starting; idling, unhealthy" >&2
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import store; store.alert_once(store.fallback_path(), sys.argv[2], sys.argv[3], "entrypoint")' "$D" \
+      "AFClaude: unknown AFCLAUDE_SCHEDULER=${MODE}" \
+      "The container idles instead of starting the runner. Set AFCLAUDE_SCHEDULER=runner (or off) in docker/.env, then docker compose up -d. (phase 3a S9 removed the modes on and legacy.)" \
+      >&2 || true
+    exec sleep infinity
+    ;;
+esac
 # Strict host key checking against the host's own public host key (mounted read-only).
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
@@ -50,7 +65,6 @@ python3 "$D/store.py" import-prompts >>"$D/data/import_prompts.log" 2>&1 \
 # going out without them (prompts.NotMigrated).
 python3 "$D/prompts.py" migrate --deploy >>"$D/data/import_prompts.log" 2>&1 \
   || echo "afclaude: prompt variables migrate did not complete this start (see data/import_prompts.log)" >&2
-MODE="${AFCLAUDE_SCHEDULER:-off}"
 case "$MODE" in
   runner)
     echo "afclaude: scheduler RUNNER ($(date -u +%FT%TZ))"
@@ -64,5 +78,4 @@ case "$MODE" in
     echo "afclaude: scheduler OFF ($(date -u +%FT%TZ)); idling"
     exec sleep infinity
     ;;
-  *) echo "AFCLAUDE_SCHEDULER must be runner or off, not ${MODE}" >&2; exit 2 ;;
 esac
