@@ -26,7 +26,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 | `prompt_defaults`, `prompt.defaults_sync` | `store.py import-prompts` at every container start (D-227) | built |
 | decision store, first version | `decisions` + `decisions_fts` (LIKE without FTS5), `decisions.py` (importer from `DECISIONS.md`, every 10 min and at the hook), `decision.import` / `decision.keywords` (audited), `tasks.py decision tldr\|find\|show\|keywords\|import`, MCP `afclaude_decisions` (find/show, `full=false` lists ids + keywords), SessionStart TLDR in 3 parts (compact/startup/clear, D-242) | built; `DECISIONS.md` is still the source; states `active\|partial\|done\|superseded`, "expired …" and "active until <date>" Status lines (D-278) |
 | Q1 (built, branch `4b-q1`) | `slug`, `project_id`, `author`, `origin`, `decision_topics`, `decision_links`, state `proposed`; `decision.add\|edit\|expire\|delete\|confirm\|link\|topics`, `tasks.py decision ...`, MCP `propose` | see Q1 |
-| not yet | seeding, owner-word evidence, DB-only ids (Q2); proposals as questions (Q3) | — |
+| not yet | proposals as questions, answers on the dashboard, the `OPEN_QUESTIONS.md` import (Q3) | — |
 | questions | `tasks` kind `question` (born blocked, closed by `task.answer`), MCP `afclaude_ask`; `OPEN_QUESTIONS.md` (local) read by the quickview in full (D-279) | two sources |
 | messages | `inbox_messages` (verbatim, triage, hold, delivery, `tasks.py inbox reply`), `inbox_api`/`inbox_worker`, quickview box | built for the AFClaude task-manager; no threads, no MCP reply tool |
 
@@ -61,7 +61,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
   - A partly superseded entry stays `active` with its owner's words, its state still `partial`, until the owner confirms the task-manager's merged rewording. That rewording is a `proposed` entry whose `supersedes` lists the originals, and confirming it deletes them in the same transaction. Nothing is lost or blocked while it waits (D-104: an entry stays in force until the owner confirms the change).
 
 ### 3.4 Questions and proposals (4b)
-- A question stays a `tasks` row of kind `question` (§7.2: "questions as tasks"), with `project_id`, the full text (D-279) and an optional `payload` (a decision draft) for a proposal. Answering a proposal approve / edit / reject applies `decision.add|edit|confirm` in the same transaction, actor = the answering human (D-104).
+- A question stays a `tasks` row of kind `question` (§7.2: "questions as tasks"), with `project_id` and the full text (D-279). A proposal is already a `proposed` decision row, so its question only points at it (`decision_id`, Q3). Answering approve / edit / reject applies `decision.confirm|edit|delete` in the same transaction, actor = the answering human (D-104).
 - `OPEN_QUESTIONS.md` items are imported once as questions (one item = one question, full text); the quickview's needs-your-input reads only the DB.
 - CLAUDE.md and the manager prompts: "delete resolved items from OPEN_QUESTIONS.md first" becomes "close the question in the DB first" (`tasks.py answer` / MCP).
 
@@ -208,14 +208,57 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
   - One owner statement from chat has been recorded through `decision add` with evidence.
   - The merged proposals wait for Q3.
 
-**Q3: questions and proposals.**
-- **Build:** §3.4; the `OPEN_QUESTIONS.md` import; quickview from the DB only; prompts, CLAUDE.md and the worker agent switched.
-- **Tests:** a proposal's approve/edit/reject applies the decision change atomically; import counts; the quickview shows each question in full (D-279).
-- **Done when:** one week with questions asked and closed only through the DB. Every `proposed` decision waits as a question, including Q2's merged rewordings, and the task-manager's older own entries are put up for confirmation (see below).
-- **From Q2:**
-  - Each `proposed` decision is asked as one question. Approving it is `decision.confirm`, which also deletes the entries its `supersedes` lists.
-  - The 16 task-manager entries active from the file (`M-NNN` and four `D-NNN`) stay in force and are listed for the owner to confirm or drop. They were made under the file's old rule 2 (D-105), before D-285.
-  - Start Q3 right after Q2.
+**Q3: questions and proposals. The DB becomes the only question list.**
+- **State at the start (31.10.):** Q2 is live; 9 proposals (D-311..D-319, merged rewordings with `supersedes`) and 12 active task-manager entries from the file (M-001, -002, -004, -006..-010, D-239, D-264, D-265, D-310; the "16" above was counted before the seeding dropped the done and superseded ones) wait for the owner. `OPEN_QUESTIONS.md` holds 2 questions written as `## ` sections, which the quickview's parser (top-level `- ` items only) does not show at all.
+- **What exists:** `tasks` kind `question` (`task.ask`, born blocked; `task.answer` closes it; `reopen` asks again), MCP `afclaude_ask` / `afclaude_answer_task` / `afclaude_inbox`, `tasks.py answer`; the inbox (verbatim owner messages, triage now/note, delivery or inclusion in the next start, `tasks.py inbox reply`, the questions section's answered threads until dismissed, D-304) and notices (D-306); `store.COLUMNS` for additive columns. Missing: a CLI to ask or list questions, an answer box per question (D-300), any link from a question to a decision, a way for the owner's answer to reach the task-manager, protection of a confirmed entry (today the task-manager may edit or delete D-311 once it is confirmed, although it carries the owner's words: D-104).
+- **Design:**
+  - **Columns (additive, `store.COLUMNS`, no schema bump):** `tasks.decision_id` (the entry a question asks about), `tasks.options` (JSON list of short answer choices, optional), `inbox_messages.question_id` (the question an owner's text answers), `decisions.confirmed_at` / `confirmed_by`. A unique partial index allows one open question per decision.
+  - **Decision questions.** Two kinds, set by the entry's state when asked:
+    - a `proposed` entry: **approve** = `decision.confirm` (deletes its `supersedes`, as built); **edit** = the owner's text replaces the summary (title optional), then confirm, one transaction; **reject** = `decision.delete` with the reason "rejected by the owner" plus the owner's note; the originals stay in force.
+    - an active, unconfirmed task-manager entry: **confirm** = sets `confirmed_at`; **drop** = `decision.delete` ("dropped by the owner").
+    - One action `question.decide(task_id, choice, text?, note?, decision_version)`, owner-only, applies the change, closes the question with the choice as its answer, and audits both, in one transaction. A stale `decision_version` is refused (the page reloads).
+    - Invariant, kept by the decision actions in their own transaction: a new proposal (`decision.add` author task-manager, MCP `propose`) asks its question; editing an open proposal re-renders the question's text; confirming, deleting or expiring the entry another way (e.g. the task-manager confirming against an owner chat message) closes it with that reason. `task.answer` (CLI, MCP `afclaude_answer_task`) refuses a decision question.
+    - The question text is rendered from the entry in plain words (D-263) and in full (D-279): the title, the summary, and for a merge each replaced entry's title and the owner's words with their dates.
+    - Confirmed = protected: `_decision_owner_guard` treats an entry with `confirmed_at` like an owner's (no autonomous edit or delete; words and summary not edited by anyone, a change is a new proposal; D-104).
+  - **Plain questions.** `tasks.py question ask "text" [--title T] [--option O ...] [--project P]`, `question list [--answered]`, `question close ID --reason R` (the task-manager closes what no longer needs the owner, D-102/D-105; cancelled with the reason, audited); MCP `afclaude_ask` gains `options`. The tool-list bound stays.
+  - **How the owner answers (D-300, temp dashboard).** `inbox.view` gains `questions`: every open question in full, with its options or, for a decision question, its choices and the entry's version. The quickview's needs-input section reads them live from the inbox API, like the threads and notices, and shows per question an answer box (plus one button per option), or the decision choices (approve / edit / reject, or confirm / drop) with an optional note. Decision questions are grouped under one heading (21 at the cut-over). New owner-only endpoints, same key and JSON rules as the box: `POST /afclaude/api/questions/<id>/answer {"answer"}` (`task.answer`) and `POST /afclaude/api/questions/<id>/decide {"choice", "text"?, "note"?, "version"}` (`question.decide`). An answered item leaves the list at once (D-102).
+  - **How answers reach the task-manager.** Through the inbox, the one delivery path (§0). A plain answer is stored on the question (`tasks.answer`) and as an inbox message from the owner with `question_id`, triaged and delivered like any other (now, or noted and included in the next start); the delivery header names the question ("answer to your question #N <title>"). A decision answer writes an inbox message only when the owner typed an edit text or a note; it gets the verdict `note` without a Haiku call (the change is already applied) and goes along with the next message into the session. The inbox text is only what the owner typed, so `owner_words` never sees AFClaude's own wording as the owner's. A `tasks.py inbox reply` to such a message keeps question, answer and reply in the questions section until the owner dismisses it (D-304, as built).
+  - **Source switch.** Meta `questions_source` (`file` until the import). While it is `file`, the quickview shows the file's items and the DB questions; once it is `db`, the DB only. The file parser learns `## ` sections (today's format) as items, both for the import and for the quickview until then.
+- **The import (one-time).** `python3 questions.py import [--file P] [--dry-run] | --undo`, action `question.import`, CLI only (refused through MCP).
+  - Preconditions: `questions_source` is `file`; the file parses into items (`## ` sections and top-level `- ` items; the text before the first item is no question) with nothing left over; no item is empty. Anything else is refused before any write.
+  - Backup `<db>.preqimport-<utc>.bak`, then one transaction: each item becomes a `task.ask` question for the checkout's project (title = the heading without its `Q-…:` label, D-263; text = the item verbatim, D-279); every proposal and every unconfirmed active task-manager entry without an open question gets its decision question; meta `questions_source=db`, `questions_file_sha`, `questions_imported` (the new question ids).
+  - The result lists every item (title, characters) and the counts per class; the dry run prints the same and writes nothing. A second run is refused.
+  - After the import, the runner's 10-min decision check also compares the file's sha and alerts once per episode: "OPEN_QUESTIONS.md changed after the cut-over; ask with `tasks.py question ask`".
+  - `--undo` is refused if one of the imported questions was answered, decided or closed; otherwise it cancels them (audited "import undone") and sets the source back to `file`.
+- **Build, three Sonnet workers, one after the other** (W1 and W2 share `actions.py` and `store.py`, W3 needs both):
+  - **W1: the question model.** The columns; `question.decide`; the decision-question invariant in `decision.add|edit|confirm|delete|expire`; `confirmed_at` and the guard; `task.answer` refusing decision questions; `tasks.py question ...`; MCP `afclaude_ask` options and `afclaude_answer_task`'s refusal.
+  - **W2: the owner's answer path.** `inbox.view` questions; the two endpoints in `inbox_api.py`; `question_id` messages in `inbox_worker.py` (note without triage for decision answers, the delivery header) and the `inbox_now` / `inbox_notes` prompts; the quickview's needs-input section (answer box, options, decision choices, grouped); `export_quickview.needs_input` by `questions_source` (blocked tasks of kind `task` stay as they are); the `## ` parser.
+  - **W3: import and texts.** `questions.py` (import, dry run, undo, backup), the file check, the README row. Then a separate last commit, merged only after the import (cut-over step 5):
+    - `CLAUDE.md` line 5: "The moment an item no longer needs the user, close its question in the DB before anything else (`python3 tasks.py question close ID --reason …`); ask the owner only with `tasks.py question ask` / MCP `afclaude_ask` (plain words, the whole question in the text); then fix GOALS.md."
+    - `prompts/manager.md` line 14 says "close its question in the AFClaude DB" instead of "DELETE it from the list"; `hooks/delegation_reminder.py` likewise.
+    - `prompts.py`: the `questions_location` default and AFClaude's seed become the DB wording, and `public_repo_rule` / `project_notes` drop `OPEN_QUESTIONS.md`. `prompts.py migrate` moves a project value that still equals the old seed (written by the migrate, never changed by anyone) to the new seed, audited `prompt_var.migrate`; a value someone set is kept. Expected-output fixtures and the tests that look for `OPEN_QUESTIONS.md` are updated.
+    - `.claude/agents/afclaude-worker.md`: a question for the owner goes into the report, never into a file or the DB (the task-manager asks).
+- **Tests:**
+  - **Decide:** approve deletes the originals in the same transaction and is refused (nothing written) when one is gone; edit changes the summary and confirms; reject deletes the proposal and keeps the originals; confirm sets `confirmed_at`; drop deletes; each closes its question; a stale version is refused; MCP and an autonomous CLI are refused.
+  - **Invariant:** a new proposal asks once; an edit re-renders; a confirm from chat evidence, a delete or an expire closes the question; `task.answer` refuses a decision question.
+  - **Protection:** a confirmed task-manager entry can't be edited or deleted by an autonomous session.
+  - **Answer path:** the endpoints (key, JSON, version, rate); a plain answer becomes a triaged inbox message with `question_id`; a decision note is noted without a Haiku call; no inbox row for a bare approve; the delivery header names the question; a reply keeps the thread until dismissed.
+  - **Quickview:** each question in full (D-279), with options or choices; file items only while the source is `file`; both file formats parse.
+  - **Import** on a synthetic file in both formats: one question per item with the text verbatim; counts; the decision questions are added once; the dry run writes nothing; a second run is refused; the backup is made; `--undo` restores and is refused after an answer; a changed file alerts once.
+  - **Migrate:** an untouched seed value moves, a changed one stays.
+  - The suites, `test_typing`, `test_mcp_server` and `check_public`.
+- **Cut-over (the task-manager, outside a run's busy phase):**
+  1. Deploy the merged code (`tools/deploy.py`: the columns come at connect; container rebuild for the runner's and the inbox API's imports; reconnect MCP with `/mcp`). The quickview still shows the file's items. From here on no new item goes into the file.
+  2. `python3 questions.py import --dry-run`; check every item against the file (none missing, text whole) and the decision questions (9 + 12).
+  3. Run it for real. Check the quickview: every question in full with its answer controls.
+  4. Answer one plain question from the quickview as a test with the owner's OK (or wait for the owner's first answer) and see it delivered.
+  5. Merge the text commit and deploy (the migrate moves AFClaude's untouched values). Update the task-manager's memory notes that name `OPEN_QUESTIONS.md`. Record the switch in PROGRESS and GOALS. The file stays on disk untouched until Q5.
+- **Rollback:**
+  - Before step 3: revert the code. The added columns stay, unused.
+  - After step 3: `questions.py import --undo` and revert the text commit.
+  - If `--undo` refuses (an answer was given): stay on the DB and fix forward. Restoring `<db>.preqimport-*.bak` loses every DB write since and needs the owner's OK.
+- **Accepted limits:** only the temp dashboard (the final dashboard, 6c/7a, builds its view on the same actions and endpoints); only the owner answers (managers and editors, D-196, come with 5a); options are not parsed out of imported texts; plain wording is a prompt rule, not checked; no conversation beyond answer and one reply (Q4).
+- **Done when:** the import has run; every proposal and every unconfirmed task-manager entry waits as a question or is decided; one proposal approved from the quickview with its originals deleted; one plain answer delivered to the task-manager through the inbox; then one week with questions asked and closed only through the DB.
 
 **Q4: message threads.** §3.5. **Tests:** thread open/append/reset; reply via MCP; waking by role (owner now; editors wait, simulated). **Done when:** a quickview message answered through `afclaude_reply`. **Risk:** depends on 3b S5.
 
@@ -228,9 +271,11 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 
 ## 6. Questions for the owner
 
-None open. The three questions this plan raised (what the decision list shows, recording chat decisions, expired one-offs) are answered by D-284, D-285 and D-286 respectively; see §0 and §3.3. Q2 raises none.
+None open. The three questions this plan raised (what the decision list shows, recording chat decisions, expired one-offs) are answered by D-284, D-285 and D-286 respectively; see §0 and §3.3. Q2 and Q3 raise none.
 
 Points for the task-manager to note, not to ask:
 - D-160 ("agent" role: no decisions for autonomous sessions) is refined in practice by D-182 (the manager's own role) and D-285 (the task-manager records the owner's words). Q2 allows one exception: an owner quote tied to a stored owner message.
 - D-151's "status superseded" and "generated .md" were already replaced by D-158 and D-181.
 - D-278's clarification "entries are not deleted" was replaced by D-286.
+- Q3's "confirmed = protected" reads D-104 onto entries the owner confirmed: once confirmed, a task-manager entry (often a rewording of owner words) changes only through the owner, like an owner's entry.
+- `prompt_var.set` is owner-only, so the task-manager can't switch AFClaude's question wording by hand; Q3's migrate moves only values still equal to the old seed (never changed by anyone). If the owner prefers to set them, step 5 waits for that instead.
