@@ -413,6 +413,7 @@ class DeployGap(V4Env):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         with mock.patch.object(store, "DB_PATH", self.path), \
                 mock.patch.object(deploy, "check_start_guard", return_value=True), \
+                mock.patch.object(deploy, "check_scheduler_mode", return_value=True), \
                 mock.patch.object(deploy, "wait_clear", return_value=True), \
                 mock.patch.object(deploy, "code_version", return_value="abc1234"), \
                 mock.patch.object(deploy.runner, "wake", return_value=True), \
