@@ -1601,7 +1601,8 @@ class SessionRules(unittest.TestCase):
     """D-225: the standing rules come from the repo's SessionStart hook (.claude/settings.json,
     keepalive.py --session-rules); continue messages to a session in the repo only point at them."""
     REASON = "window start, CONTINUE: test; budget for this run: +14%"
-    FULL = ("TASK-MANAGER", "usage_report.py", "Guard hooks", "AFK rules (unattended runs)", "OPEN_QUESTIONS.md")
+    FULL = ("TASK-MANAGER", "usage_report.py", "Guard hooks", "AFK rules (unattended runs)",
+            "open questions in the AFClaude DB")
 
     def tearDown(self):
         testenv.set_setting("session_stop_pct", None)

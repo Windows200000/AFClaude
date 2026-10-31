@@ -28,8 +28,9 @@ reads AFClaude's own.
 
 Migrate step: `prompts.py migrate` writes the seed values (CHECKOUT_SEED: the lines AFClaude's own
 rules had before P3) for the project at this checkout's path, each only where that project has
-never had a row for it (a value someone set or reset is never overwritten). Idempotent and audited
-(prompt_var.migrate); a project-less checkout has nothing to seed.
+never had a row for it, and moves a value that still equals the previous seed (OLD_CHECKOUT_SEED:
+the questions moved into the DB, phase 4b Q3) to the new one (a value someone set or reset is never
+overwritten). Idempotent and audited (prompt_var.migrate); a project-less checkout has nothing to seed.
 
 Bundles (P2, §3.2): one session kind of message is more than one prompt -- a head prompt, the
 sender's own free-text insert (a hand-off, a pacing line, held/noted inbox messages, the due
@@ -158,7 +159,8 @@ PROJECT_VARS: dict[str, ProjectVar] = {
     "goals_location": ProjectVar("where the project's goal list lives", "the project's goals doc"),
     "progress_location": ProjectVar("where the project's progress notes (the state of a stopped run) live",
                                     "the project's progress doc"),
-    "questions_location": ProjectVar("where the project's open questions for the user live", "OPEN_QUESTIONS.md"),
+    "questions_location": ProjectVar("where the project's open questions for the user live",
+                                    "the project's open questions in the AFClaude DB (afclaude_ask)"),
     "public_repo_rule": ProjectVar("whole line: the public-repo rule and the guard the commit hooks run "
                                    "(empty: the repo is not public)", max_len=2000),
     "worktree_rule": ProjectVar("whole line: the files the live system imports, which change only in a git "
@@ -177,21 +179,22 @@ PROJECT_VARS: dict[str, ProjectVar] = {
 CHECKOUT_SEED: dict[str, str] = {
     "goals_location": "GOALS.md",
     "progress_location": "PROGRESS.md",
-    "questions_location": "OPEN_QUESTIONS.md",
+    "questions_location": (
+        "the open questions in the AFClaude DB, kept with `python3 tasks.py question ask` and `question close`"),
     "public_repo_rule": (
         '- The repo will be PUBLIC. Keep personal data, secrets, IP addresses, domains and user-specific '
         'host details (host inventory, personal projects, usage habits) out of committed files. '
-        'User-specific questions go to OPEN_QUESTIONS.md, which is local only (gitignored). The '
-        'pre-commit/pre-push guard `tools/check_public.py` blocks the obvious cases; never bypass it with'
-        ' `--no-verify`, rephrase instead.'),
+        'User-specific questions go into the AFClaude DB (`python3 tasks.py question ask`), never into a '
+        'committed file. The pre-commit/pre-push guard `tools/check_public.py` blocks the obvious cases; '
+        'never bypass it with `--no-verify`, rephrase instead.'),
     "worktree_rule": (
         '- Subagents that change code the live system imports (keepalive.py, store.py, stalled.py, '
         'usage_sampler.py, export_quickview.py, ka_resume.sh) work in a separate git worktree (`git '
         'worktree add ../AFClaude-wt-<name>`); you review and merge. Cron and the watcher import the live'
         ' files, so a half-edited store.py once migrated the live DB.'),
     "project_notes": (
-        '- In this repo the list of open questions for the user is OPEN_QUESTIONS.md (local only) and the'
-        ' goal list is GOALS.md.'),
+        '- In this repo the open questions for the user are in the AFClaude DB (`python3 tasks.py question '
+        'ask` / `question close`) and the goal list is GOALS.md.'),
     "docs_rule": (
         '- The project docs live in the AFClaude DB (design §7.7): progress, goals, exceptions, alerts '
         'and the review reports (review:<date>). Write through the write path where a command is natural:'
@@ -213,6 +216,21 @@ CHECKOUT_SEED: dict[str, str] = {
         " rebuild can't cut an in-flight usage read the way the 21.10. incident did (D-234/D-235/D-257). "
         'It refuses within 30 min before or after a session-window start (a restart during a start alerts'
         " + pauses) and prints the next safe time; don't pass `--force` to get around that."),
+}
+
+# What the migrate step wrote before the questions moved into the DB (phase 4b Q3 W3): a project value that
+# still equals one of these was never changed by anyone, so `prompts.py migrate` moves it to the new seed.
+OLD_CHECKOUT_SEED: dict[str, str] = {
+    "questions_location": "OPEN_QUESTIONS.md",
+    "public_repo_rule": (
+        '- The repo will be PUBLIC. Keep personal data, secrets, IP addresses, domains and user-specific '
+        'host details (host inventory, personal projects, usage habits) out of committed files. '
+        'User-specific questions go to OPEN_QUESTIONS.md, which is local only (gitignored). The '
+        'pre-commit/pre-push guard `tools/check_public.py` blocks the obvious cases; never bypass it with'
+        ' `--no-verify`, rephrase instead.'),
+    "project_notes": (
+        '- In this repo the list of open questions for the user is OPEN_QUESTIONS.md (local only) and the'
+        ' goal list is GOALS.md.'),
 }
 
 
@@ -654,14 +672,22 @@ def checkout_project(conn: sqlite3.Connection) -> store.Row | None:
 
 def migrate_plan(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """What the migrate step would write: [{project_id, project, name, value}], the seeds of the
-    project at this checkout that it never had a row for. Read-only."""
+    project at this checkout that it never had a row for, and (with "was": the old value) a row that still
+    equals the old seed (OLD_CHECKOUT_SEED, written by an earlier migrate and never changed since), which
+    moves to the new one. A value someone set or reset is kept. Read-only."""
     import store
     p = checkout_project(conn)
     if p is None:
         return []
-    have = {r["name"] for r in store.list_prompt_vars(conn, p["id"])}
-    return [{"project_id": p["id"], "project": p["name"], "name": k, "value": v}
-            for k, v in CHECKOUT_SEED.items() if k not in have]
+    have = {r["name"]: r["value"] for r in store.list_prompt_vars(conn, p["id"])}
+    out: list[dict[str, Any]] = []
+    for k, v in CHECKOUT_SEED.items():
+        item: dict[str, Any] = {"project_id": p["id"], "project": p["name"], "name": k, "value": v}
+        if k not in have:
+            out.append(item)
+        elif k in OLD_CHECKOUT_SEED and have[k] == OLD_CHECKOUT_SEED[k] != v:
+            out.append(dict(item, was=have[k]))
+    return out
 
 
 # ---------------------------------------------------------------- CLI
