@@ -323,21 +323,6 @@ class Triage(FakeHaiku):
         self.assertTrue(ka.automation_paused("the start", SID))
         self.assertFalse(ka.automation_paused("the start", other))
 
-    def test_a_failed_pass_is_an_error_and_pauses(self):
-        """A DB failure in a pass (D-244): alerted, automation paused; the worker goes on."""
-        wake, stop = threading.Event(), threading.Event()
-        def boom(conn, now=None, verify=None):
-            stop.set()
-            wake.set()                                                        # no POLL wait after the pass
-            raise store.DBUnavailable("database is locked", "error")
-        old, iw.process = iw.process, boom
-        try:
-            iw.run_forever(wake, stop)
-        finally:
-            iw.process = old
-        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox worker pass failed: DBUnavailable"])
-        self.assertIn("inbox worker pass failed", failstop.paused()["reason"])
-
     def test_bad_answer_is_an_error(self):
         self.answer = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=haiku_out(raw="hmm"), stderr="")
         m = self.post()
@@ -537,7 +522,7 @@ class Delivery(tc.Env):
         self.assertIsNone(self.row(m)["hold"])
 
     def test_held_while_the_owner_types(self):
-        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (5 characters)"
         m = self.now_msg()
         self.assertEqual(self.deliver(m), "held")
         self.assertIn("a draft", self.row(m)["hold"])
@@ -572,7 +557,7 @@ class Delivery(tc.Env):
         old_utcnow = store._utcnow
         store._utcnow = lambda: since
         self.addCleanup(setattr, store, "_utcnow", old_utcnow)
-        self.typing = "the owner typed in a terminal attached to ka-abcdef01 1 min ago"
+        self.typing = "the owner typed in a terminal attached to afc-abcdef01 1 min ago"
         m = self.now_msg()
         self.assertEqual(self.deliver(m, since), "held")
         self.assertEqual(store.parse_iso(self.row(m)["hold_since"]), since)
@@ -600,7 +585,7 @@ class Delivery(tc.Env):
         self.assertTrue(inbox.message_view(r)["tip"].startswith("Failed "), inbox.message_view(r)["tip"])
 
     def test_a_hold_without_any_window_start_is_an_error(self):
-        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (5 characters)"
         testenv.set_setting("window_days", {d: None for d in schedule.DAYS})
         m = self.now_msg()
         self.assertEqual(self.deliver(m), "failed")
@@ -620,11 +605,11 @@ class Delivery(tc.Env):
         """A refused preflight (not the owner), an unreadable pane, a failed send: an error on the
         message and an alert; nothing (more) is sent."""
         def unreadable(sid, now):
-            raise RuntimeError("can't read ka-abcdef01's pane")
+            raise RuntimeError("can't read afc-abcdef01's pane")
         cases = [("preflight", lambda: setattr(ka, "preflight", lambda sid: (False, ["host process info unavailable"], None)),
                   "preflight refused"),
                  ("pane", lambda: setattr(ka, "owner_typing", unreadable), "can't read"),
-                 ("send", lambda: setattr(ka, "fire", lambda *a, **kw: (1, "", "send-keys to ka-abcdef01 failed")),
+                 ("send", lambda: setattr(ka, "fire", lambda *a, **kw: (1, "", "send-keys to afc-abcdef01 failed")),
                   "rc=1")]
         for what, arrange, want in cases:
             with self.subTest(what):
@@ -645,7 +630,7 @@ class Delivery(tc.Env):
 
     def test_not_in_the_transcript_is_an_error(self):
         m = self.now_msg()
-        ka.fire = lambda *a, **kw: (0, "sent-keys ka-abcdef01", "")          # typed, but nothing arrives
+        ka.fire = lambda *a, **kw: (0, "sent-keys afc-abcdef01", "")          # typed, but nothing arrives
         now = datetime.now(UTC)
         self.assertEqual(iw.deliver(self.conn, self.row(m), now,
                                     verify=lambda mid, path, off, t: iw.store_verify(mid, path, off, t, timedelta(0))),
@@ -694,7 +679,7 @@ class Delivery(tc.Env):
         self.assertTrue(len(msg) > len(inbox.now_message(self.row(m), None)))   # + the standing rules / pointer
 
     def test_a_held_message_is_tried_again_by_the_next_pass(self):
-        self.typing = "a dialog or menu is open on ka-abcdef01's pane"
+        self.typing = "a dialog or menu is open on afc-abcdef01's pane"
         m = self.now_msg()
         self.assertEqual(iw.process(self.conn, verify=lambda *a: None), {"held": 1})
         self.typing = None
@@ -841,7 +826,7 @@ class HeldInStarts(tc.Env):
         def fire(sid, cwd, message, plan, new=False, **kw):                 # a reply, but the message never shows
             self.sent.append((plan, message))
             self.write([tc.assistant(datetime.now(UTC))], "a")
-            return 0, "sent-keys ka-abcdef01", ""
+            return 0, "sent-keys afc-abcdef01", ""
         ka.fire = fire
         self.start()
         r = self.row(self.held)
@@ -863,7 +848,7 @@ class HeldInStarts(tc.Env):
         def fire(sid, cwd, message, plan, new=False, **kw):
             self.sent.append((plan, message))
             self.write([tc.assistant(datetime.now(UTC))], "a")
-            return 0, "sent-keys ka-abcdef01", ""
+            return 0, "sent-keys afc-abcdef01", ""
         ka.fire = fire
         self.start()
         self.assertEqual(self.row(self.held)["status"], "error")
@@ -896,30 +881,6 @@ class HeldInStarts(tc.Env):
         self.assertIn(f"its text: python3 tasks.py inbox show {long[2]}", text)   # past HELD_MAX: the id only
         self.assertNotIn("z" * 10, text)
 
-
-class Watchdog(DB):
-    def test_api_not_running_is_an_error_once_per_outage(self):
-        """The */5 watchdog found the API down (D-244): alert + automation paused, once per outage."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        started = []
-        saved = (inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen)
-        inbox_api.take_lock = lambda: open(os.devnull)
-        inbox_api.LOG, inbox_api.DOWN = os.path.join(tmp.name, "api.log"), os.path.join(tmp.name, ".down")
-        inbox_api.subprocess.Popen = lambda argv, **kw: started.append(argv)
-        try:
-            self.assertEqual(inbox_api.ensure(boot=True), 0)                  # the container start: no error
-            self.assertEqual((len(started), self.alerts), (1, []))
-            inbox_api.ensure(boot=False)
-            inbox_api.ensure(boot=False)                                      # still down: not alerted again
-        finally:
-            inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen = saved
-        self.assertEqual(len(started), 3)
-        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox API was not running"])
-        self.assertTrue(failstop.paused()["paused"])
-
-
-# ---------------------------------------------------------------- the dashboard view (D-178)
 
 class View(DB):
     def at(self, m, created, **more):
@@ -1085,7 +1046,7 @@ class Endpoint(DB):
         self.assertEqual((st, m["status"], m["text"]), (201, "pending", "Line 1\nLine 2"))
         self.assertTrue(self.wake.is_set())
         row = store.get_inbox(self.conn, m["id"])
-        self.assertEqual((row["created_by"], row["session_id"]), ("owner", ka.afclaude_config.manager_session()))
+        self.assertEqual((row["created_by"], row["session_id"]), ("owner", store.manager_sessions(self.conn)[0]["session"]))
         self.assertEqual(store.audit_log(self.conn, 1, "inbox", m["id"])[0]["via"], "dashboard")
         st, v = self.call("GET")
         self.assertEqual((st, [x["id"] for x in v["messages"]], v["max_chars"]), (200, [m["id"]], store.INBOX_TEXT_MAX))
@@ -1166,14 +1127,14 @@ class Endpoint(DB):
             inbox_api.KEY_FILE, inbox_api.LOCK = old
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x.sock")))
 
-    def test_no_worker_serve_writes_its_log_lines_to_the_log_file(self):
+    def test_serve_writes_its_log_lines_to_the_log_file(self):
         """S7 follow-up: under the runner the child's stdout is a pipe nobody reads while it runs;
-        `serve --no-worker` must put its lines (posted, http) in data/inbox_api.log itself."""
+        `serve` must put its lines (posted, http) in data/inbox_api.log itself."""
         data = os.path.join(self.tmp.name, "data")
         sock = os.path.join(self.tmp.name, "child", "inbox.sock")
         env = dict(os.environ, AFCLAUDE_DATA_DIR=data, AFCLAUDE_INBOX_KEY_FILE=self.keyfile,
                    AFCLAUDE_INBOX_SOCKET=sock)
-        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve", "--no-worker",
+        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve",
                                  "--socket", sock], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             for _ in range(100):

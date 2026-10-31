@@ -172,7 +172,7 @@ class Env(unittest.TestCase):
             mode = {SAVE: self.saves, RESEND: self.resaves, REFRESH: self.refreshes}[
                 next(p for p in (SAVE, RESEND, REFRESH) if message.startswith(p))]
             if mode == "ignore":
-                return 0, "sent-keys ka-abcdef01", ""
+                return 0, "sent-keys afc-abcdef01", ""
             self.write([keepalive_msg(now, message)], "a")
             if mode == "write":
                 self.handoff(self.save_summary, next_steps=["go on"])
@@ -183,7 +183,7 @@ class Env(unittest.TestCase):
         else:
             self.write([keepalive_msg(now, message), assistant(now + timedelta(seconds=1))], "a")
         self.make_old()
-        return 0, "sent-keys ka-abcdef01", ""
+        return 0, "sent-keys afc-abcdef01", ""
 
     def arrive(self, kind, polls):
         """Something reaches the session right after its hand-off (D-307): a background subagent's
@@ -359,7 +359,7 @@ class CompactWhenIdle(Env):
         self.assertEqual((self.sent, rec), ([], None))
 
     def test_the_owner_typing_holds_it(self):
-        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (5 characters)"
         d, rec = self.compact()
         self.assertFalse(d.due)
         self.assertEqual(d.reason, self.typing)
@@ -825,28 +825,21 @@ class CompactionFailures(Env):
         self.assertEqual((rec["status"], rec["replied"]), ("compacted", False))
         self.assertIn("no reply from abcdef01 to its hand-off after the compaction", self.paused()["reason"])
 
-    def test_a_failing_pass_is_reported_by_the_watcher(self):
-        """An error before the compaction (here the cost model can't be read) raises out of the pass;
-        run() reports it (fail_stop) and goes on."""
-        names = ("LOCK_FILE", "STOP_FILE", "last_mile_pass", "deferred_window_start_pass", "fillup_pass",
-                 "watch_run_usage", "stall_status", "last_mile_next_start")
-        old_w = {n: getattr(ka, n) for n in names}
-        ka.LOCK_FILE, ka.STOP_FILE = os.path.join(self.tmp.name, "ka.lock"), os.path.join(self.tmp.name, "STOP")
-        for n in names[2:]:
-            setattr(ka, n, lambda *a, **k: None)
-        ka.stall_status = lambda sid, now: ("NO_STALL", "x", None)
+    def test_a_failing_check_is_reported(self):
+        """An error before the compaction (here the cost model can't be read) raises out of the
+        check; the runner's compaction_check reports it (fail_stop) and stores no act."""
         old_load = ct.load
 
         def boom(conn=None):
             raise ValueError("the cost model's weights.cache_read must be a positive number")
         ct.load = boom
         try:
-            ka.run(types.SimpleNamespace(session=SID, arm=True, once=True, now=False))
+            res = testenv.runner_pass(ka, "compaction_check", now=datetime.now(UTC), session=SID)
         finally:
             ct.load = old_load
-            for n, v in old_w.items():
-                setattr(ka, n, v)
+        self.assertEqual(res["note"], "the check failed")
         self.assertIn("compaction pass failed: ValueError", self.paused()["reason"])
+        self.assertIsNone(testenv.act_of(ka, "compaction", SID))
         self.assertEqual(self.sent, [])
 
 
@@ -1249,28 +1242,28 @@ class OwnerTyping(unittest.TestCase):
         now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC).timestamp()
         why, calls = self.run_typing("", CAPTURE_IDLE)
         self.assertIsNone(why)
-        self.assertEqual(calls, [["tmux", "list-clients", "-t", "=ka-abcdef01", "-F", "#{client_activity}"],
-                                 ["tmux", "capture-pane", "-e", "-p", "-t", "=ka-abcdef01:"]])
+        self.assertEqual(calls, [["tmux", "list-clients", "-t", "=afc-abcdef01", "-F", "#{client_activity}"],
+                                 ["tmux", "capture-pane", "-e", "-p", "-t", "=afc-abcdef01:"]])
         why, calls = self.run_typing(f"{int(now - 120)}\n", CAPTURE_IDLE)
-        self.assertIn("the owner typed in a terminal attached to ka-abcdef01 2 min ago", why)
+        self.assertIn("the owner typed in a terminal attached to afc-abcdef01 2 min ago", why)
         self.assertEqual(len(calls), 1)
         why, _ = self.run_typing(f"{int(now - 3600)}\n", CAPTURE_DRAFT)
-        self.assertEqual(why, "a draft in ka-abcdef01's input box (13 characters)")
+        self.assertEqual(why, "a draft in afc-abcdef01's input box (13 characters)")
         why, _ = self.run_typing("", CAPTURE_DIALOG)
-        self.assertEqual(why, "a dialog or menu is open on ka-abcdef01's pane")
+        self.assertEqual(why, "a dialog or menu is open on afc-abcdef01's pane")
         why, _ = self.run_typing("", CAPTURE_TITLED)
         self.assertIsNone(why)
-        with self.assertRaisesRegex(RuntimeError, r"can't read ka-abcdef01's pane: .*\(last lines: Welcome back \| \$\)"):
+        with self.assertRaisesRegex(RuntimeError, r"can't read afc-abcdef01's pane: .*\(last lines: Welcome back \| \$\)"):
             self.run_typing("", CAPTURE_UNKNOWN)
-        with self.assertRaisesRegex(RuntimeError, "tmux list-clients ka-abcdef01 failed rc=1"):
+        with self.assertRaisesRegex(RuntimeError, "tmux list-clients afc-abcdef01 failed rc=1"):
             self.run_typing("", "", rc=1)
 
     def test_the_bridge_shapes(self):
         import host
-        self.assertEqual(host.bridge_argv(["tmux", "list-clients", "-t", "=ka-abcdef01", "-F", "#{client_activity}"]),
-                         ["tmux-clients", "ka-abcdef01"])
-        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=ka-abcdef01:"]),
-                         ["tmux-capture", "ka-abcdef01"])
+        self.assertEqual(host.bridge_argv(["tmux", "list-clients", "-t", "=afc-abcdef01", "-F", "#{client_activity}"]),
+                         ["tmux-clients", "afc-abcdef01"])
+        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=afc-abcdef01:"]),
+                         ["tmux-capture", "afc-abcdef01"])
 
 
 class StartSoon(Env):
@@ -1579,7 +1572,7 @@ class FailStopAtStart(Env):
 class KaResumeFailures(unittest.TestCase):
     """ka_resume.sh: a tmux call that fails exits 1 (the keep-alive sees it), never a silent
     "sent-keys" / "started" with exit 0 (D-234/D-235). A stub tmux on PATH; nothing real runs."""
-    def run_script(self, fail_on, tmux_args=("--tmux", "ka-abcdef01"), extra=()):
+    def run_script(self, fail_on, tmux_args=("--tmux", "afc-abcdef01"), extra=()):
         import subprocess
         with tempfile.TemporaryDirectory() as d:
             tmux = os.path.join(d, "tmux")
@@ -1600,7 +1593,7 @@ class KaResumeFailures(unittest.TestCase):
     def test_send_keys_failure_exits_1(self):
         r = self.run_script("send-keys")
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertIn("send-keys to ka-abcdef01 failed", r.stderr)
+        self.assertIn("send-keys to afc-abcdef01 failed", r.stderr)
         self.assertNotIn("sent-keys", r.stdout)
 
     def test_the_tmux_name_is_the_callers(self):

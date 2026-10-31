@@ -4,9 +4,8 @@ Points the DB ($AFCLAUDE_DB), the local config ($AFCLAUDE_CONFIG) and the data d
 ($AFCLAUDE_DATA_DIR, $DISPATCHER_DATA_DIR) at a fresh temp directory, so a test run in
 the main checkout never reads the live settings or triggers the one-time settings import
 on the live data/ (afclaude_config). The temp DB starts empty (every setting = its code
-default); set_setting() / clear_settings() change it. $AFCLAUDE_CONFIG gets a synthetic
-manager_session (SID) so afclaude_config.manager_session() does not raise ConfigError in a
-test that doesn't set up its own identity (D-235: manager_session has no code default any more).
+default); set_setting() / clear_settings() change it. $AFCLAUDE_CONFIG is an empty identity file
+(SID: a synthetic task-manager session id the tests use, not a real session anywhere).
 """
 import atexit
 import json
@@ -23,12 +22,13 @@ os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
 os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no file: the repo's own is never read
+os.environ["AFCLAUDE_DIR"] = HERE   # docker/at_shim.py imports from it: a worktree run never loads the live checkout
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
-os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (keepalive.run refuses under `on`)
+os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (health, the quickview read it)
 
-SID = "00000000-0000-4000-8000-000000000001"   # synthetic manager_session (not a real session anywhere)
+SID = "00000000-0000-4000-8000-000000000001"   # synthetic task-manager session (not a real session anywhere)
 with open(os.environ["AFCLAUDE_CONFIG"], "w") as _fh:
-    json.dump({"manager_session": SID}, _fh)
+    json.dump({}, _fh)
 
 import store  # noqa: E402
 import actions  # noqa: E402
@@ -81,9 +81,9 @@ def set_setting(key, value, db=None):
 def tmux_row(session_id, tmux=None, kind="task-manager", db=None, project_id=None):
     """A live driven_sessions row naming the session's tmux session (3b S2: keepalive.tmux_name
     reads it; a launcher stores it, a task-manager's comes from its project, 3b S1), written
-    around actions.py as a backfill would. tmux: default today's ka-<id8>; project_id: a
+    around actions.py as a backfill would. tmux: default afc-<id8> (a valid name; launchers use names.tmux_name); project_id: a
     task-manager row's project (needed for a later driven.set on it). -> the name."""
-    name = tmux or "ka-" + session_id[:8]
+    name = tmux or "afc-" + session_id[:8]
     conn = store.connect(db or store.DB_PATH)
     try:
         with store.transaction(conn):
@@ -205,7 +205,7 @@ def runner_pass(ka, job, key=None, now=None, session=SID):
     from unittest import mock
 
     def fresh():
-        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE", "_DB_PAUSE"):
+        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_DB_PAUSE"):
             setattr(ka, n, None)
         ka._PAUSE_LOGGED, ka._FILLUP_BUSY, ka._LINES = {}, {}, {}
         ka._COMPACT_TRIED.clear()

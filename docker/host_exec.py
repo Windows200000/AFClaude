@@ -23,7 +23,7 @@ Allowed (exact shapes):
   tmux-capture <name>      tmux capture-pane -e -p (read-only: a draft in the input box holds a compaction)
   tmux-rename <name> <new>
                            tmux rename-session (the one-time rename to a readable name, D-281)
-  (<name>: a tmux session name, ka-<8 hex> or afc-<[a-z0-9-], at most 36>: TMUX below, names.py)
+  (<name>: a tmux session name, afc-<[a-z0-9-], at most 36>: TMUX below, names.py)
   proc-snapshot            JSON {pid: [ppid, starttime, argv|null]} of every process; argv only
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
@@ -52,7 +52,7 @@ CLAUDE = os.path.expanduser("~/.local/bin/claude")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
 # the tmux session names (names.TMUX_RE; kept here: this file runs alone as the SSH forced command)
-TMUX = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")
+TMUX = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")
 ENV = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", "opc"), "LANG": "C.UTF-8",
        "PATH": os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:/bin",
        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "TERM": "xterm-256color"}

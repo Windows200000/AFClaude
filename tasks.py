@@ -47,7 +47,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py automation pause [REASON] [--project P]   pause every runner (or one project's) by hand
     tasks.py driven list [--all]           the sessions AFClaude drives (phase 3b): kind, tmux name, project
     tasks.py driven check                  rows vs. the task-managers and the live tmux sessions (exit 1
-                                           on a mismatch; the backfill is `store.py import-driven`)
+                                           on a mismatch)
     tasks.py run-now work PROJECT          run now (phase 3b S5, D-153): continue the project's task-manager
                                            at once, no window or budget gate (refused while it runs, at its
                                            limit or held by the owner; a project without one gets it created)

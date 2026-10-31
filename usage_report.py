@@ -5,8 +5,7 @@ main session itself) has consumed, so the manager can watch the session cap.
 
     usage_report.py [--session UUID] [--since ISO|--last] [--json] [--fresh] [--record]
 
---session      defaults to $CLAUDE_CODE_SESSION_ID, else the AFClaude manager
-               session (manager_session in data/afclaude.json).
+--session      defaults to $CLAUDE_CODE_SESSION_ID, else an error.
 --since ISO    only count assistant turns whose timestamp is after ISO.
 --last         only count usage since the previous --record'ed report for
                this session (a delta). Ignored if --since is also given.
@@ -48,7 +47,6 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache, PROJECTS_DIR, berlin/parse_ts helpers)
-import afclaude_config  # noqa: E402  (local machine-specific values: the manager session)
 import telemetry  # noqa: E402  (phase 2c: --record also writes the DB table usage_reports)
 
 UTC = timezone.utc
@@ -350,8 +348,7 @@ def print_json(session_id, rows, main_row, tot, usage, since):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip(),
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--session", help="session UUID (default $CLAUDE_CODE_SESSION_ID, "
-                                       "else the AFClaude manager session, data/afclaude.json)")
+    ap.add_argument("--session", help="session UUID (default $CLAUDE_CODE_SESSION_ID)")
     ap.add_argument("--since", help="only count usage after this ISO timestamp")
     ap.add_argument("--last", action="store_true", help="only count usage since the "
                                                           "previous --record'ed report")
@@ -360,8 +357,10 @@ def main(argv=None):
     ap.add_argument("--record", action="store_true", help="append a row to the usage reports (the DB)")
     args = ap.parse_args(argv)
 
-    # lazy (D-235): manager_session() raises if unconfigured, but only when actually needed
-    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or afclaude_config.manager_session()
+    # its own session or the one named, never a guessed one (phase 3b S6 retired the manager_session setting)
+    session_id = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        ap.error("--session is needed outside a Claude Code session ($CLAUDE_CODE_SESSION_ID is not set)")
 
     since = None
     if args.since:

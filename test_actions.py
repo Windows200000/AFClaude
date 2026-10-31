@@ -1111,7 +1111,7 @@ class EveryAction(Base):
             ("project.add", {"name": "Here", "path": __import__("prompts").HERE}),
             ("prompt_var.migrate", {}),
             ("request.add", {"kind": "continue_now", "target": SID}),
-            ("request.start", {"request_id": 1, "tmux": "ka-00000000", "run_id": 7}),
+            ("request.start", {"request_id": 1, "tmux": "afc-00000000", "run_id": 7}),
             ("request.add", {"kind": "work_on_now", "target": "P"}),
             ("request.finish", {"request_id": 2, "status": "refused", "reason": "running"}),
             ("driven.set", {"session_id": SID, "kind": "review", "tmux": "afc-review"}),
@@ -1411,8 +1411,8 @@ class MigrationV4(unittest.TestCase):
 
 class DrivenSessionsAndRunLog(Base):
     def test_low_level_rows(self):
-        s = store.upsert_driven_session(self.conn, SID, kind="task", tmux="ka-00000000", task_id=1)
-        self.assertEqual((s["kind"], s["tmux"], s["ended_at"]), ("task", "ka-00000000", None))
+        s = store.upsert_driven_session(self.conn, SID, kind="task", tmux="afc-00000000", task_id=1)
+        self.assertEqual((s["kind"], s["tmux"], s["ended_at"]), ("task", "afc-00000000", None))
         store.upsert_driven_session(self.conn, SID, ended_at=self.clock.t)
         self.assertEqual(store.driven_sessions(self.conn, include_ended=False), [])
         with self.assertRaisesRegex(ValueError, "needs kind"):

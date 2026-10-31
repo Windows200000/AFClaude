@@ -1,26 +1,35 @@
 #!/bin/sh
 # Entrypoint of the AFClaude manager container (PID 1 is tini).
-#   AFCLAUDE_SCHEDULER=runner  the resident runner only (runner.py serve, phase 3a S8): this script
+#   AFCLAUDE_SCHEDULER=runner  the resident runner (runner.py serve, phase 3a S8): this script
 #                              `exec`s it, so it is tini's only child and `docker stop`'s SIGTERM
 #                              reaches it directly (its clean exit within compose's 90-s stop grace);
-#                              no supercronic, no cron. The runner owns every job (runner.RUNNER_OWNS,
-#                              the keep-alive watcher's passes and the inbox API's supervision
-#                              included). Its own loop watchdog exits the process when the loop is
-#                              stuck, and `restart: unless-stopped` starts the container again
-#   AFCLAUDE_SCHEDULER=on      the same as `runner` (S8: the name the S2-S7 deploys set; supercronic
-#                              beside the runner is gone, docker/crontab has no job line left)
-#   AFCLAUDE_SCHEDULER=legacy  the phase 3a rollback (docs/phase3a_plan.md §4): supercronic with
-#                              docker/crontab.legacy (the crontab before the runner), the watcher and
-#                              the inbox API (with its worker thread); no runner
+#                              no cron. The runner owns every job (runner.JOBS; the inbox API is its
+#                              supervised child). Its own loop watchdog exits the process when the
+#                              loop is stuck, and `restart: unless-stopped` starts the container again
 #   AFCLAUDE_SCHEDULER=off     (default) nothing is scheduled; the container only idles, so
 #                              `docker exec` works (tests, the MCP server, manual runs)
+# (phase 3a S9 removed the rollback mode `legacy`, supercronic and its crontabs, and the alias `on`)
 set -eu
 D="${AFCLAUDE_DIR:?}"
-CRON_BIN="${AFCLAUDE_SUPERCRONIC:-/usr/local/bin/supercronic}"
+# The mode first, before migrate: an unknown one (e.g. a stale `on` after phase 3a S9) must not exit,
+# or `restart: unless-stopped` loops silently through migrate/import-prompts. It alerts the owner out of
+# the DB (the fallback file + a push, as a failed migrate does) and idles, unhealthy (`runner.py health`).
+MODE="${AFCLAUDE_SCHEDULER:-off}"
+case "$MODE" in
+  runner|off) ;;
+  *)
+    echo "afclaude: AFCLAUDE_SCHEDULER must be runner or off, not ${MODE}: not starting; idling, unhealthy" >&2
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import store; store.alert_once(store.fallback_path(), sys.argv[2], sys.argv[3], "entrypoint")' "$D" \
+      "AFClaude: unknown AFCLAUDE_SCHEDULER=${MODE}" \
+      "The container idles instead of starting the runner. Set AFCLAUDE_SCHEDULER=runner (or off) in docker/.env, then docker compose up -d. (phase 3a S9 removed the modes on and legacy.)" \
+      >&2 || true
+    exec sleep infinity
+    ;;
+esac
 # Strict host key checking against the host's own public host key (mounted read-only).
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
 printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
-mkdir -p "${KEEPALIVE_STATE_DIR:?}"   # (the at-shim keeps its jobs in the DB; data/at_spool is legacy)
+mkdir -p "${KEEPALIVE_STATE_DIR:?}"
 # Phase 4b Q1: the explicit schema step. A non-additive change (store.MIGRATIONS; v5 rebuilds `decisions`)
 # never runs on connect(): until this has run, code at the new version can't write the tables the migration
 # changes (MigrationNeeded; everything else stays writable, so the host's deploy.py can drain and the old
@@ -56,28 +65,12 @@ python3 "$D/store.py" import-prompts >>"$D/data/import_prompts.log" 2>&1 \
 # going out without them (prompts.NotMigrated).
 python3 "$D/prompts.py" migrate --deploy >>"$D/data/import_prompts.log" 2>&1 \
   || echo "afclaude: prompt variables migrate did not complete this start (see data/import_prompts.log)" >&2
-MODE="${AFCLAUDE_SCHEDULER:-off}"
 case "$MODE" in
-  on|runner|legacy)
-    echo "afclaude: scheduler $(echo "$MODE" | tr '[:lower:]' '[:upper:]') ($(date -u +%FT%TZ))"
-    # legacy: the watcher starts right away (the host crontab's "@reboot ... start_keepalive.sh"
-    # line), not only at the next :07/:22/:37/:52 watchdog: retried until it runs (the bridge may
-    # need a moment after a rebuild), never while PAUSED exists, never a second one
-    # (start_watcher.sh). on: the runner runs the watcher's passes (phase 3a S6), no watcher.
-    if [ "$MODE" = legacy ]; then
-      "$D/docker/start_watcher.sh" --boot &
-      # The message box's API (D-241): a unix socket in data/api/ for the quickview's nginx; the
-      # cron watchdog restarts it (and alerts) if it dies. S7: `on` mode no longer starts it here;
-      # the runner keeps it running itself (runner.SUPERVISED).
-      python3 "$D/inbox_api.py" ensure --boot >>"$D/data/inbox_api.log" 2>&1 \
-        || echo "afclaude: the inbox API did not start (see data/inbox_api.log)" >&2
-      AFCLAUDE_CRONTAB="$D/docker/crontab.legacy"
-      export AFCLAUDE_CRONTAB             # export_quickview.py lists the lines that run
-      exec "$CRON_BIN" -passthrough-logs "$AFCLAUDE_CRONTAB"
-    fi
-    # on / runner: the runner is the container's main process (its stdout is docker logs; it writes
-    # data/runner.log itself). No shell stays behind, no watchdog line: a stuck loop is the runner's
-    # own watchdog thread (exit 70), a crash its exit code; either ends the container and
+  runner)
+    echo "afclaude: scheduler RUNNER ($(date -u +%FT%TZ))"
+    # the runner is the container's main process (its stdout is docker logs; it writes
+    # data/runner.log itself). No shell stays behind: a stuck loop is the runner's own watchdog
+    # thread (exit 70), a crash its exit code; either ends the container and
     # `restart: unless-stopped` starts it again (the next boot alerts + pauses, D-257).
     exec python3 -u "$D/runner.py" serve
     ;;
@@ -85,5 +78,4 @@ case "$MODE" in
     echo "afclaude: scheduler OFF ($(date -u +%FT%TZ)); idling"
     exec sleep infinity
     ;;
-  *) echo "AFCLAUDE_SCHEDULER must be runner, on, legacy or off, not ${MODE}" >&2; exit 2 ;;
 esac

@@ -914,7 +914,7 @@ class Entrypoint(unittest.TestCase):
     (no runner, so no restart loop writing a backup per start); no database yet or success goes on."""
     SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "entrypoint.sh")
 
-    def run_entry(self, migrate_rc):
+    def run_entry(self, migrate_rc, mode="runner"):
         tmp = tempfile.mkdtemp(prefix="afc-entry-")
         self.addCleanup(shutil.rmtree, tmp, True)
         os.makedirs(os.path.join(tmp, "data"))
@@ -929,7 +929,7 @@ class Entrypoint(unittest.TestCase):
             os.chmod(path, 0o755)
         env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], AFCLAUDE_DIR=tmp,
                    KEEPALIVE_STATE_DIR=os.path.join(tmp, "ka"), AFCLAUDE_BRIDGE_KNOWN_HOSTS=os.path.join(tmp, "kh"),
-                   AFCLAUDE_SCHEDULER="runner")
+                   AFCLAUDE_SCHEDULER=mode)
         r = subprocess.run(["sh", self.SCRIPT], env=env, capture_output=True, text=True, timeout=60)
         with open(log) as fh:
             return r, fh.read().splitlines()
@@ -946,6 +946,20 @@ class Entrypoint(unittest.TestCase):
             r, calls = self.run_entry(rc)
             self.assertTrue(any("runner.py serve" in c for c in calls), (rc, calls))
             self.assertNotIn("sleep infinity", calls)
+
+    def test_an_unknown_mode_alerts_and_idles_before_migrate(self):
+        """Phase 3a S9 review: a stale `on` (or any value but runner/off) must not exit (a silent restart
+        loop through migrate): the fallback alert, then the idle; neither migrate nor the runner runs."""
+        for mode in ("on", "legacy"):
+            r, calls = self.run_entry(0, mode)
+            self.assertEqual(len(calls), 2, (mode, calls))
+            self.assertIn("store.alert_once", calls[0])
+            self.assertIn(f"AFClaude: unknown AFCLAUDE_SCHEDULER={mode}", calls[0])
+            self.assertEqual(calls[1], "sleep infinity")
+            self.assertIn("must be runner or off", r.stderr)
+        r, calls = self.run_entry(0, "off")
+        self.assertIn("store.py migrate", calls[0])
+        self.assertEqual(calls[-1], "sleep infinity")
 
 
 if __name__ == "__main__":

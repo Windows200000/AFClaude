@@ -565,7 +565,7 @@ class Cleanup(Base):
                                                      reply("s5a", NOW - timedelta(hours=4), self.work, "tool_use")])
         self.track(sid(6), own_tmux=False); self.idle(sid(6), 300)  # only typed into: release, never kill
         with open(self.alive, "a") as fh:                           # untracked + the manager
-            fh.write("ka-99999999\n" + tname(sid(9)) + "\n")
+            fh.write("afc-99999999\n" + tname(sid(9)) + "\n")
         mgr = sid(9)
         self.st["sessions"][mgr] = {"tmux": tname(mgr), "status": "running", "own_tmux": True}
         testenv.tmux_row(mgr, tname(mgr))                           # its task-manager row: never killed
@@ -578,7 +578,7 @@ class Cleanup(Base):
         for s in (sid(3), sid(4), sid(5)):
             self.assertEqual(self.st["sessions"][s]["status"], "running")
         alive = open(self.alive).read().split()
-        self.assertIn("ka-99999999", alive)
+        self.assertIn("afc-99999999", alive)
         self.assertIn(tname(mgr), alive)
         self.assertIn(tname(sid(6)), alive)
         rows = {r["session_id"]: r for r in store.driven_sessions(self.conn)}   # 3b S2: a killed one's name is free

@@ -203,36 +203,6 @@ class Tables(Base):
         for fn, secs in declared.items():
             self.assertEqual(found.get(fn), secs, fn)
 
-    def test_cut_over_one_owner_per_job(self):
-        with open(os.path.join(HERE, "docker", "crontab"), encoding="utf-8") as fh:
-            cron = [ln for ln in fh.read().splitlines() if ln.strip() and not ln.startswith("#")]
-        for name in runner.RUNNER_OWNS:
-            tag = runner.JOBS[name].cron_tag
-            self.assertFalse(tag and any(tag in ln for ln in cron), f"{name} is run by cron AND the runner")
-        for name, job in runner.JOBS.items():
-            if job.cron_tag and name not in runner.RUNNER_OWNS:
-                self.assertTrue(any(job.cron_tag in ln for ln in cron), f"{name}: no cron line tagged {job.cron_tag!r}")
-        self.assertEqual(set(runner.JOBS), set(runner_jobs.HANDLERS) | set(runner_jobs.FUNCTIONS)
-                         | set(runner_jobs.PASSES) | {runner_jobs.AT_JOB, runner_jobs.REQUEST_JOB})
-
-    def test_the_legacy_crontab_runs_every_job_and_no_runner(self):
-        def lines(name):
-            with open(os.path.join(HERE, "docker", name), encoding="utf-8") as fh:
-                return [ln for ln in fh.read().splitlines() if ln.strip() and not ln.startswith("#")]
-        legacy, cron = lines("crontab.legacy"), lines("crontab")
-        for name, job in runner.JOBS.items():
-            if job.cron_tag:
-                self.assertTrue(any(job.cron_tag in ln for ln in legacy), name)
-        self.assertFalse(any("runner.py" in ln for ln in legacy))
-        self.assertEqual(cron, [])                      # S8: the runner is the only schedule, no watchdog line either
-        # S7: the inbox API watchdog has no Job of its own (the runner supervises it directly,
-        # runner.SUPERVISED), so it is not matched by a cron_tag; it is the one extra line removed
-        # from `on` mode that no owned job's tag accounts for.
-        tagged = {ln for ln in legacy if any(
-            runner.JOBS[n].cron_tag in ln for n in runner.RUNNER_OWNS if runner.JOBS[n].cron_tag)}
-        untagged = {ln for ln in legacy if "AFClaude inbox API watchdog" in ln}
-        self.assertEqual(set(legacy) - set(cron), tagged | untagged)
-
 
 # ---------------------------------------------------------------- boot: recovery and catch-up
 
@@ -605,8 +575,6 @@ class SignalGuard(unittest.TestCase):
             with self.subTest(pid=pid), mock.patch.object(os, "killpg") as killpg, mock.patch.object(os, "kill") as kill:
                 with self.assertRaises(ValueError):
                     runner._signal_group(pid, signal.SIGTERM)
-                with self.assertRaises(ValueError):
-                    runner.stop(pids=lambda pid=pid: [pid], out=lambda m: None)
                 killpg.assert_not_called()
                 kill.assert_not_called()
 
@@ -769,7 +737,7 @@ class Process(unittest.TestCase):
             self.assertIsNot(actions.runner_state_get(conn).get("clean_exit"), True)
             self.assertEqual([r["status"] for r in store.running_runs(conn) if r["job"] == "stall_scan"], ["running"])
             fails = []                                        # the restarted container's boot: D-257, alert + pause
-            runner.Runner(conn, owns=frozenset(), log_fn=lambda m: None, shadow=lambda m: None,
+            runner.Runner(conn, owns=frozenset(), log_fn=lambda m: None,
                           fail=lambda component, subject, detail="", **kw: fails.append(subject)).boot()
             self.assertEqual(fails, ["the previous runner did not exit cleanly"])
             self.assertEqual(store.running_runs(conn), [])    # and the cut-off run is recorded interrupted
@@ -778,29 +746,6 @@ class Process(unittest.TestCase):
         fd = runner.acquire_lock()
         self.assertIsNotNone(fd)                              # the lock went with the process
         os.close(fd)
-
-    def test_stop_ends_the_runner_cleanly(self):
-        p = self.popen()
-        out = []
-        try:
-            self.booted(p)
-            mine = lambda: [x for x in runner.runner_pids() if x == p.pid]   # noqa: E731 - never another runner
-            self.assertEqual(mine(), [p.pid])
-            self.assertEqual(runner.stop(30, pids=mine, out=out.append), 0)
-            p.wait(10)
-        finally:
-            if p.poll() is None:
-                p.kill()
-                p.wait(10)
-        self.assertEqual(p.returncode, 0)
-        self.assertIn("stopped", out[-1])
-        conn = store.connect()
-        try:
-            self.assertTrue(actions.runner_state_get(conn)["clean_exit"])
-        finally:
-            conn.close()
-        self.assertEqual(runner.stop(pids=lambda: [], out=out.append), 0)
-        self.assertIn("none running", out[-1])
 
 
 # ---------------------------------------------------------------- drain, status, watchdog, watcher check
@@ -860,10 +805,12 @@ class Misc(Base):
     def test_health(self):
         r = self.runner(owns={"sampler"})
         r.boot()
-        on, off = {"AFCLAUDE_SCHEDULER": "runner"}, {"AFCLAUDE_SCHEDULER": "legacy"}
+        on, off = {"AFCLAUDE_SCHEDULER": "runner"}, {"AFCLAUDE_SCHEDULER": "off"}
         live = lambda: [7]   # noqa: E731
         self.assertIsNone(runner.health(self.conn, on, self.now, pids=live))
-        self.assertIsNone(runner.health(self.conn, {"AFCLAUDE_SCHEDULER": "on"}, self.now, pids=live))
+        for bad in ("on", "legacy", "Runner"):      # S9: no alias, no rollback mode: the entrypoint idles
+            self.assertEqual(runner.health(self.conn, {"AFCLAUDE_SCHEDULER": bad}, self.now, pids=live),
+                             f"unknown AFCLAUDE_SCHEDULER={bad} (runner or off; the container idles)")
         self.assertIn("no runner process", runner.health(self.conn, on, self.now, pids=lambda: []))
         late = self.now + runner.HEALTH_STALE + timedelta(seconds=1)
         self.assertIn("heartbeat is", runner.health(self.conn, on, late, pids=live))
@@ -886,7 +833,7 @@ class Misc(Base):
 
     def test_health_cli_reports_and_fails(self):
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "legacy"}), contextlib.redirect_stdout(out):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": "off"}), contextlib.redirect_stdout(out):
             self.assertEqual(runner.main(["health"]), 0)
         self.assertEqual(out.getvalue().strip(), "healthy")
         out = io.StringIO()
@@ -920,26 +867,20 @@ class Misc(Base):
         self.assertLessEqual(interval, runner.HEALTH_STALE.total_seconds())
 
     def test_the_runner_modes_run_no_cron(self):
-        """S8: `runner` and `on` exec the runner alone; only `legacy` runs supercronic."""
+        """S8/S9: `runner` execs the runner alone; no other scheduling mode, no supercronic, no crontab."""
         with open(os.path.join(HERE, "docker", "entrypoint.sh"), encoding="utf-8") as fh:
             sh = fh.read()
-        self.assertEqual(runner.RUNNER_MODES, ("on", "runner"))
-        self.assertIn("on|runner|legacy)", sh)
+        with open(os.path.join(HERE, "docker", "Dockerfile"), encoding="utf-8") as fh:
+            df = fh.read()
+        self.assertEqual(runner.RUNNER_MODES, ("runner",))
+        self.assertIn("\n  runner)\n", sh)
+        self.assertNotIn("legacy)", sh)
+        self.assertNotIn("on|", sh)
         self.assertEqual(sh.count("exec python3 -u \"$D/runner.py\" serve"), 1)
-        self.assertNotIn("runner.py\" stop", sh)
-        self.assertNotIn("&\n    CRON=", sh)
+        self.assertNotIn("supercronic", df)
+        for f in ("crontab", "crontab.legacy", "start_watcher.sh"):
+            self.assertFalse(os.path.exists(os.path.join(HERE, "docker", f)), f)
 
-    def test_watcher_conflict_only_once_it_owns_a_watcher_pass(self):
-        def boom():
-            raise OSError("no bridge")
-        self.assertIsNone(runner.watcher_conflict(frozenset({"sampler"}), local=lambda: [5], on_host=boom))
-        own = frozenset({"watch"})
-        self.assertIn("runs here", runner.watcher_conflict(own, local=lambda: [5], on_host=lambda: []))
-        self.assertIn("unavailable", runner.watcher_conflict(own, local=lambda: [], on_host=boom))
-        self.assertIn("HOST", runner.watcher_conflict(own, local=lambda: [], on_host=lambda: [7]))
-        self.assertIsNone(runner.watcher_conflict(own, local=lambda: [], on_host=lambda: []))
-        self.assertTrue(runner._is_watcher(["python3", "-u", "/x/keepalive.py", "--session", "u", "--arm"]))
-        self.assertFalse(runner._is_watcher(["python3", "keepalive.py", "--session", "u", "--window-start"]))
 
     def test_next_tick(self):
         t = datetime(2026, 10, 19, 23, 59, 30, tzinfo=UTC)
@@ -968,94 +909,6 @@ def cron_line(t, tag):
             'job.position=1 job.schedule="* * * * *"')
 
 
-class Shadow(Base):
-    def test_the_stall_scan_runs_90_s_off_the_minute(self):
-        j = runner.JOBS["stall_scan"]
-        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 19, 23, 59, tzinfo=UTC)),
-                         datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC))
-        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC)),
-                         datetime(2026, 10, 20, 0, 4, 30, tzinfo=UTC))
-        self.assertEqual(runner.next_tick(j, datetime(2026, 10, 20, 0, 0, 10, tzinfo=UTC)),
-                         datetime(2026, 10, 20, 0, 1, 30, tzinfo=UTC))
-        with self.assertRaises(ValueError):
-            runner.Job("x", 1, every=MIN, offset=MIN)
-        with self.assertRaises(ValueError):
-            runner.Job("x", 1, daily=(1, 1), offset=SEC)
-
-
-    def test_shadow_lines_for_the_jobs_cron_runs(self):
-        lines = []
-        self.now = START - 2 * MIN
-        r = self.runner(owns={"stall_scan", "watch"}, shadow=lines.append)
-        self.assertEqual([j.name for j in r.shadow_jobs],
-                         ["dispatcher", "docs_import", "prune_logs", "quickview", "sampler", "usage_review",
-                          "window_start"])            # cron's jobs; not the owned stall scan / watch, not prune_runs
-        r.shadow_pass(self.now)
-        self.assertEqual(lines, [])
-        self.assertEqual(r.shadow_next["quickview"], START)
-        self.assertEqual(r.shadow_next["window_start"], START)
-        self.assertEqual(r.shadow_next["prune_logs"], datetime(2026, 10, 20, 3, 17, tzinfo=UTC))
-        self.assertEqual(r.sleep_for(START - 30 * SEC), 30.0)          # it wakes for a shadow time too
-        self.now = START + timedelta(milliseconds=12)
-        r.shadow_pass(self.now)
-        key = schedule.start_key(START, CFG)
-        self.assertEqual(lines, [f"{n} due 2026-10-19T21:00:00.000Z at 2026-10-19T21:00:00.012Z" for n in
-                                 ("dispatcher", "docs_import", "quickview", "sampler", "usage_review")]
-                         + [f"window_start {key} due 2026-10-19T21:00:00.000Z at 2026-10-19T21:00:00.012Z"])
-        r.shadow_pass(self.now)
-        self.assertEqual(len(lines), 6)                                 # once per time
-        self.assertEqual(r.shadow_next["quickview"], START + 3 * MIN)
-        self.assertEqual(r.shadow_next["window_start"], START + 5 * 60 * MIN)
-        self.assertEqual(self.runner(owns={"stall_scan"}).shadow_jobs, [])   # no writer: no shadow
-
-    def entries(self, quickview_until=30, window_start=True):
-        lines = [BERLIN_PREFIX + f"quickview due {runner._iso_ms(START + k * MIN)} at "
-                 f"{runner._iso_ms(START + k * MIN + timedelta(milliseconds=9))}" for k in range(0, quickview_until + 1, 3)]
-        if window_start:
-            lines.append(BERLIN_PREFIX + f"window_start {schedule.start_key(START, CFG)} due {runner._iso_ms(START)} "
-                         f"at {runner._iso_ms(START + timedelta(milliseconds=20))}")
-        return runner.parse_shadow(lines)
-
-    def report(self, shadow, cron_lines, decision_lines):
-        cron = runner.parse_cron(cron_lines, runner.JOBS)
-        return runner.shadow_report(shadow, cron, runner.parse_decisions(decision_lines),
-                                    since=START - 60 * MIN, until=START + 60 * MIN)
-
-    def test_shadow_report_matches(self):
-        qv, ws = runner.JOBS["quickview"].cron_tag, runner.JOBS["window_start"].cron_tag
-        cron = [cron_line(START + k * MIN, qv) for k in range(0, 31, 3)]
-        cron += [cron_line(START + k * MIN, ws) for k in (-30, 0, 30)]      # */30: acts only at a start
-        cron.append(cron_line(START, "AFClaude at-shim (the jobs in the DB)"))  # no runner job: ignored
-        cron.append(cron_line(START - 9 * MIN, qv))                          # the runner was not up yet
-        dec = ["[2026-10-19 23:00:05 CEST] window-start: HOLD: no run", "[2026-10-19 23:15:07 CEST] window-start "
-               "(postponed): HOLD: user active"]
-        lines, bad = self.report(self.entries(), cron, dec)
-        self.assertEqual(bad, 0, "\n".join(lines))
-        self.assertIn("OK", lines[-1])
-        self.assertTrue(any("window_start" in ln and "HOLD" in ln for ln in lines))
-        self.assertTrue(any("1 cron start(s) while the runner was not running" in ln for ln in lines))
-
-    def test_shadow_report_mismatches(self):
-        qv, ws = runner.JOBS["quickview"].cron_tag, runner.JOBS["window_start"].cron_tag
-        cron = [cron_line(START + k * MIN, qv) for k in range(0, 31, 3) if k != 9]   # cron missed 21:09
-        cron.append(cron_line(START + 13 * MIN, qv))                                  # an off-grid cron start
-        cron.append(cron_line(START + 2 * SEC + 1 * SEC, ws))                         # 3 s late: no match
-        dec = ["[2026-10-19 23:20:05 CEST] window-start: FIRE: run"]                  # no start then
-        lines, bad = self.report(self.entries(), cron, dec)
-        text = "\n".join(lines)
-        self.assertIn("21:09:00.000Z has no cron start", text)
-        self.assertIn("cron started at 2026-10-19T21:13:00Z; the runner had no time", text)
-        self.assertIn("MISMATCH window_start", text)
-        self.assertIn("decided FIRE at 2026-10-19T21:20:05Z", text)
-        self.assertEqual(bad, 4, text)
-
-    def test_the_parsers(self):
-        self.assertEqual(runner.parse_shadow(["no", BERLIN_PREFIX + "quickview due x at y"]), [])
-        self.assertEqual(runner.parse_cron(['time="2026-10-19T21:00:00Z" level=info msg="job succeeded" '
-                                            'job.command="x # AFClaude quickview export"'], runner.JOBS), [])
-        self.assertEqual(runner.parse_decisions(["[2026-10-19 23:00:05 CEST] window-start: FIRE: x"]),
-                         [(START + 5 * SEC, "FIRE")])
-
 
 class FakeProc:
     def __init__(self, rc):
@@ -1064,87 +917,6 @@ class FakeProc:
     def poll(self):
         return self.rc
 
-
-class Ensure(Base):
-    def ensure(self, running=(), rc=None):
-        spawned = []
-
-        def spawn():
-            spawned.append(1)
-            return FakeProc(rc)
-        n = runner.ensure(connect=lambda: store.connect(os.path.join(self.tmp, "t.db")), pids=lambda: list(running),
-                          spawn=spawn, settle=0.05, clock=lambda: self.now, sleep=lambda s: None, fail=self.record_fail,
-                          log_fn=self.logs.append)
-        self.assertEqual(n, 0)
-        return spawned
-
-    def test_a_running_runner_with_a_fresh_heartbeat(self):
-        self.prev_boot(self.now - MIN, clean=False)
-        self.assertEqual(self.ensure(running=[7]), [])
-        self.assertEqual(self.fails, [])
-
-    def test_a_stale_heartbeat_alerts(self):
-        self.prev_boot(self.now - 20 * MIN, clean=False)
-        self.assertEqual(self.ensure(running=[7]), [])
-        self.assertEqual(self.subjects(), ["the runner's heartbeat is stale"])
-        self.assertTrue(self.fails[0][3])                                         # and pauses (D-235)
-
-    def test_a_cleanly_stopped_runner_is_started_and_alerted(self):
-        self.prev_boot(self.now - 20 * MIN, clean=True)
-        self.assertEqual(self.ensure(), [1])
-        self.assertEqual(self.subjects(), ["the runner was not running"])
-        self.assertIn("exited cleanly", self.fails[0][2])
-
-    def test_never_booted(self):
-        self.assertEqual(self.ensure(), [1])
-        self.assertEqual(self.subjects(), ["the runner was not running"])
-        self.assertIn("never booted", self.fails[0][2])
-
-    def test_an_unclean_exit_or_a_reported_crash_is_reported_by_others(self):
-        self.prev_boot(self.now - 20 * MIN, clean=False)
-        self.assertEqual(self.ensure(), [1])
-        self.assertIn("unclean exit", self.logs[-1])
-        actions.runner_state_put(self.conn, {"crashed": {"boot_id": OTHER_BOOT, "at": "x"}}, actor="runner",
-                                 via="runner")
-        self.ensure()
-        self.assertIn("its crash", self.logs[-1])
-        self.assertEqual(self.fails, [])
-
-    def test_a_start_that_fails(self):
-        self.prev_boot(self.now - 20 * MIN, clean=False)
-        self.ensure(rc=1)
-        self.assertEqual(self.subjects(), ["the runner did not start"])
-        self.ensure(rc=runner.EXIT_REPORTED)                                      # it said why itself
-        self.ensure(rc=runner.EXIT_LOCKED)                                        # another one runs
-        self.assertEqual(len(self.fails), 1)
-
-    def test_one_ensure_at_a_time(self):
-        fd = runner._ensure_lock()
-        try:
-            self.assertEqual(self.ensure(), [])
-        finally:
-            os.close(fd)
-
-    def test_runner_pids(self):
-        proc = os.path.join(self.tmp, "proc")
-        for pid, argv in ((11, [sys.executable, "-u", "/x/runner.py", "serve"]), (12, ["python3", "runner.py", "status"]),
-                          (13, []), (14, ["python3", "/x/runner_jobs.py", "serve"])):
-            os.makedirs(os.path.join(proc, str(pid)))
-            with open(os.path.join(proc, str(pid), "cmdline"), "wb") as fh:
-                fh.write(b"".join(a.encode() + b"\0" for a in argv))
-        self.assertEqual(runner.runner_pids(proc), [11])
-
-    def test_wake_with_a_full_queue_counts_as_sent(self):
-        path = os.path.join(self.tmp, "full.sock")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as rx:
-            rx.bind(path)
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as tx:
-                tx.setblocking(False)
-                with self.assertRaises(BlockingIOError):
-                    for _ in range(100000):
-                        tx.sendto(b"w", path)
-            self.assertTrue(runner.wake(path))
-        self.assertFalse(runner.wake(os.path.join(self.tmp, "none.sock")))
 
 
 # ---------------------------------------------------------------- S3: the simple ticks
@@ -1194,47 +966,6 @@ class SimpleTicks(Base):
                                                        | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4-S7, S9b, 3b S5
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
-    def test_crontab_per_mode(self):
-        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
-        for name in S3_TICKS:
-            tag = runner.JOBS[name].cron_tag
-            self.assertEqual([ln for ln in cron if tag in ln], [], f"{name}: still a cron line in `on` mode")
-            self.assertEqual(len([ln for ln in legacy if tag in ln]), 1, f"{name}: legacy mode lost its line")
-        # legacy = the ticks + the at-shim (S4), the window start (S5), the watcher watchdog (S6), the inbox API watchdog
-        # (the runner supervises it directly since S7); S8: the S2-S7 runner watchdog line is gone too,
-        # so `on`/`runner` has no cron line at all
-        self.assertEqual(cron, [])
-        self.assertEqual(len(legacy), len(S3_TICKS) + 4)
-
-    def test_each_tick_runs_what_its_cron_line_ran(self):
-        """Registration: the handler has the legacy line's script, arguments, log file and flock."""
-        legacy = crontab_lines("crontab.legacy")
-        for name in S3_TICKS:
-            with self.subTest(name):
-                h = runner_jobs.HANDLERS[name]
-                line, = [ln for ln in legacy if runner.JOBS[name].cron_tag in ln]
-                cmd = line.split(" # ")[0]
-                self.assertIn(f"{h.script} {' '.join(h.args)}".strip(), cmd)
-                log = ("$KEEPALIVE_STATE_DIR/" + h.log[len("keepalive/"):] if h.log.startswith("keepalive/")
-                       else f"$AFCLAUDE_DIR/data/{h.log}")
-                self.assertIn(f">> {log} 2>&1", cmd)
-                self.assertEqual(f"flock -n $AFCLAUDE_DIR/data/{h.lock} " in cmd, h.lock is not None)
-
-    def test_each_cadence_is_its_cron_lines(self):
-        legacy = crontab_lines("crontab.legacy")
-        a = datetime(2026, 10, 24, 22, 0, tzinfo=UTC)                    # over the DST night (UTC: no change)
-        b = a + timedelta(days=2)
-        for name in S3_TICKS:
-            with self.subTest(name):
-                job = runner.JOBS[name]
-                line, = [ln for ln in legacy if job.cron_tag in ln]
-                ticks, t = [], a - TINY
-                while True:
-                    t = runner.next_tick(job, t)
-                    if t >= b:
-                        break
-                    ticks.append(t)
-                self.assertEqual(ticks, cron_times(line, a, b))
 
     def test_tick_timeouts_exceed_their_inner_timeouts_and_the_measured_p99(self):
         for name in runner.RUNNER_OWNS:
@@ -1333,12 +1064,6 @@ class AtJobs(Base):
             await task
         return run_id
 
-    def test_s4_owns_the_at_jobs_and_the_legacy_crontab_keeps_run_due(self):
-        self.assertIn("at", runner.RUNNER_OWNS)
-        self.assertEqual([ln for ln in crontab_lines("crontab") if "at_shim" in ln or "AFClaude at-shim" in ln], [])
-        self.assertEqual([ln for ln in crontab_lines("crontab.legacy") if "at_shim" in ln], [AT_SHIM_LINE])
-        self.assertEqual(runner.JOBS["at"].cron_tag, "AFClaude at-shim")
-        self.assertEqual(runner_jobs.log_path("at"), os.path.join(testenv.DIR, "at_shim.log"))   # the line's log
 
     async def test_an_at_job_runs_at_its_minute_and_is_claimed_once(self):
         jid = self.add("job1", START + MIN)
@@ -1653,20 +1378,6 @@ class WindowStarts(Base):
     with the 30-min catch-up; cron's */30 line is gone (legacy keeps it); one claim per start shared
     with that legacy line (keepalive "window_starts"); the DST nights; window-report."""
 
-    def test_s5_crontab_per_mode_and_the_handler_is_the_legacy_line_plus_its_key(self):
-        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
-        tag = runner.JOBS["window_start"].cron_tag
-        self.assertEqual([ln for ln in cron if tag in ln], [])
-        line, = [ln for ln in legacy if tag in ln]
-        self.assertTrue(line.startswith("*/30 * * * * "), line)
-        h = runner_jobs.HANDLERS["window_start"]
-        cmd = line.split(" && ", 1)[1].split(" >> ")[0].split()
-        self.assertEqual(cmd[1], h.script)
-        legacy_args = [a.replace("$AFCLAUDE_MANAGER_SESSION", "{session}") for a in cmd[2:]]
-        self.assertEqual([a for a in h.args if a not in ("--start-key", "{key}")], legacy_args)
-        self.assertEqual(h.args[h.args.index("--start-key") + 1], "{key}")
-        self.assertIn("$KEEPALIVE_STATE_DIR/keepalive.log", line)
-        self.assertEqual(h.log, "keepalive/keepalive.log")
 
     def test_the_child_gets_the_runs_key(self):
         h = runner_jobs.HANDLERS["window_start"]
@@ -1890,36 +1601,6 @@ class WatcherPasses(Base):
                            mode="file", actor="runner:keepalive", via="runner")
         return ent["run"]
 
-    def test_s6_owns_the_passes_the_crontabs_and_the_watcher_check(self):
-        self.assertLessEqual(runner.WATCHER_PASSES, runner.RUNNER_OWNS)
-        self.assertEqual(set(runner_jobs.PASSES), set(runner.WATCHER_PASSES))
-        self.assertIsNotNone(runner.watcher_conflict(runner.RUNNER_OWNS, local=lambda: [5], on_host=lambda: []))
-        cron, legacy = crontab_lines("crontab"), crontab_lines("crontab.legacy")
-        self.assertFalse(any("start_watcher.sh" in ln for ln in cron))
-        self.assertEqual(len([ln for ln in legacy if "start_watcher.sh" in ln]), 1)
-        for name in runner.WATCHER_PASSES:
-            job = runner.JOBS[name]
-            self.assertEqual(runner_jobs.log_path(name), os.path.join(runner_state.data_dir(), "keepalive",
-                                                                     "keepalive.log"))
-            if job.planned:
-                self.assertEqual((job.on_interrupt, job.session, job.paused), ("fail", True, "handler"), name)
-            else:
-                self.assertEqual(job.on_interrupt, "rerun", name)
-        self.assertEqual(runner.JOBS["watch"].paused, "runs")           # detection runs while paused
-
-    def test_runner_conflict_keeps_a_watcher_from_starting_beside_the_runner(self):
-        """The reverse of watcher_conflict: keepalive.run, start_watcher.sh and start_keepalive.sh
-        (runner.py watcher-check) refuse under AFCLAUDE_SCHEDULER=on or a fresh heartbeat of a
-        runner that did not exit cleanly; legacy after the runner's clean stop does not."""
-        legacy = {"AFCLAUDE_SCHEDULER": "legacy"}
-        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now))           # never ran
-        self.assertIn("AFCLAUDE_SCHEDULER=on", runner.runner_conflict(self.conn, {"AFCLAUDE_SCHEDULER": "on"}, self.now))
-        self.prev_boot(self.now - 30 * SEC, clean=False)
-        self.assertIn("heartbeat is 30 s old", runner.runner_conflict(self.conn, legacy, self.now))
-        self.assertIn("heartbeat", runner.runner_conflict(self.conn, {}, self.now + runner.STALE_BEAT - 31 * SEC))
-        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now + runner.STALE_BEAT - 29 * SEC))
-        self.prev_boot(self.now - 30 * SEC, clean=True)
-        self.assertIsNone(runner.runner_conflict(self.conn, legacy, self.now))
 
     def test_the_act_timeouts_exceed_their_inner_timeouts(self):
         for name in runner_jobs.START_ACTS + ("compaction",):
@@ -2084,8 +1765,6 @@ class Inbox(Base):
 
     def test_s7_owns_the_inbox_jobs(self):
         self.assertLessEqual({"inbox", "inbox_verify"}, runner.RUNNER_OWNS)
-        self.assertIsNone(runner.JOBS["inbox"].cron_tag)            # no cron line ever ran it (S7 is new)
-        self.assertIsNone(runner.JOBS["inbox_verify"].cron_tag)
         self.assertLessEqual({"inbox", "inbox_verify"}, set(runner_jobs.FUNCTIONS))
         self.assertEqual(runner.JOBS["inbox"].poll, timedelta(seconds=30))
         self.assertEqual(runner.JOBS["inbox_verify"].poll, timedelta(seconds=5))
@@ -2151,7 +1830,7 @@ class FakeSupervisor:
 
 
 class Supervised(Base):
-    """S7: the runner keeps `inbox_api.py serve --no-worker` running as a long-lived child
+    """S7: the runner keeps `inbox_api.py serve` running as a long-lived child
     (SUPERVISED): started at boot without an alert, restarted with one on an unexpected exit, ended
     (not restarted) once a stop was requested."""
 
@@ -2163,7 +1842,7 @@ class Supervised(Base):
         self.addCleanup(patch.stop)
 
     def start(self):
-        r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve", "--no-worker")}, spawner=self.sup)
+        r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve")}, spawner=self.sup)
         r.boot()
         r.start_supervised("inbox_api")
         return r
@@ -2172,7 +1851,7 @@ class Supervised(Base):
         r = self.start()
         await asyncio.sleep(0)
         self.assertEqual(len(self.sup.calls), 1)
-        self.assertEqual(self.sup.calls[0][-2:], ["serve", "--no-worker"])
+        self.assertEqual(self.sup.calls[0][-1], "serve")
         self.assertEqual(self.sup.calls[0][0], sys.executable)
         self.assertEqual(self.fails, [])
         self.assertIn("inbox_api", r.sup_tasks)

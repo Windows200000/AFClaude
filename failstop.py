@@ -6,7 +6,7 @@ owner sees and stops automation until the owner has looked at it.
      before going public" (D-235)
 
 fail(component, subject, detail) is the one door for that, used by the runners (keepalive.py,
-dispatcher.py, usage_sampler.py, usage_review.py, docker/at_shim.py, inbox_worker.py, inbox_api.py).
+dispatcher.py, usage_sampler.py, usage_review.py, inbox_worker.py, inbox_api.py).
 It never raises (it IS the error path) and does, in this order:
   1. an ERROR line in the component's log (= app_log level "error": runner_state.line_level),
   2. sets the pause with the reason (audited, actor runner:<component>): no runner starts or

@@ -24,7 +24,9 @@ unittest / claude process (any bridge call, including a plain usage read) still 
 the container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` with
 AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README and the AFClaude project's deploy_rule
 say to run it; the image has no .git, so without this the build commit is unknown).
-Exit 1 (no rebuild) inside the start guard (checked before the drain and again before the
+Exit 1 (no rebuild, nothing drained, even with --force) when AFCLAUDE_SCHEDULER (the environment,
+else docker/.env, else compose's default off) is neither runner nor off: phase 3a S9 removed `on` and
+`legacy`, and the new entrypoint would only alert and idle. Exit 1 (no rebuild) inside the start guard (checked before the drain and again before the
 rebuild) or if draining or clearing timed out; an aborted deploy lifts its drain again.
 --force rebuilds anyway, printing what was still running.
 """
@@ -47,6 +49,8 @@ import store  # noqa: E402
 
 CONTAINER = "afclaude"
 COMPOSE_FILE = os.path.join(HERE, "docker", "compose.yml")
+ENV_FILE = os.path.join(HERE, "docker", ".env")      # compose's own: the scheduler mode the rebuild gets
+SCHEDULER_MODES = ("runner", "off")
 CLEAR_POLL = 5.0                              # seconds between docker-top polls
 DEFAULT_CLEAR_WAIT = timedelta(minutes=10)
 START_GUARD = timedelta(minutes=30)           # no rebuild this close to a session-window start
@@ -144,6 +148,35 @@ def lift_drain(conn: object) -> int:
     return 1
 
 
+def scheduler_mode(env_file: Optional[str] = None, environ: Optional[dict] = None) -> str:
+    """AFCLAUDE_SCHEDULER as compose resolves it: the shell environment, else the last line of
+    docker/.env, else compose.yml's default `off`."""
+    environ = os.environ if environ is None else environ
+    if environ.get("AFCLAUDE_SCHEDULER"):
+        return str(environ["AFCLAUDE_SCHEDULER"])
+    mode = ""
+    try:
+        with open(env_file or ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, value = line.strip().partition("=")
+                if sep and key.strip() == "AFCLAUDE_SCHEDULER":
+                    mode = value.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return mode or "off"
+
+
+def check_scheduler_mode() -> bool:
+    """False (printed why) unless the mode the rebuild gets is runner or off."""
+    mode = scheduler_mode()
+    if mode in SCHEDULER_MODES:
+        return True
+    print(f"deploy refused: AFCLAUDE_SCHEDULER={mode} (docker/.env or the environment) must be runner or off "
+          "(phase 3a S9 removed `on` and `legacy`; the new container would alert and idle). Fix docker/.env "
+          "first; nothing was drained.")
+    return False
+
+
 def code_version(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> str:
     return run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
               check=True).stdout.strip()
@@ -162,6 +195,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "clearing timed out (prints what was still running)")
     args = ap.parse_args(argv)
 
+    if not check_scheduler_mode():             # before anything: --force does not skip it
+        return 1
     if not check_start_guard(args.force):
         return 1
     conn = store.connect()

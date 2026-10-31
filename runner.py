@@ -8,7 +8,6 @@
     python3 runner.py undrain             lift a drain (a deploy that did not happen)
     python3 runner.py wake                re-read the DB now (what the senders do after a write)
     python3 runner.py window-report [--hours H]   S5: each session-window start vs its run and decision
-    python3 runner.py watcher-check       exit 1 when a keep-alive watcher must not start (runner_conflict)
     python3 runner.py health              S8: the container's health check (a live runner, a fresh heartbeat)
 
 One asyncio loop: read the due times, wait for the earliest of them, a wake datagram
@@ -44,20 +43,16 @@ their groups get SIGTERM and their rows stay `running` (the next boot: interrupt
 records the clean exit. A watchdog thread exits the process (70) when the loop's heartbeat is
 older than 5 min (a wedged loop; Docker's restart policy then restarts the container).
 
-S8, the runner only (AFCLAUDE_SCHEDULER=runner, `on` is the same): docker/entrypoint.sh `exec`s
-`runner.py serve` as tini's only child; no supercronic, no cron. A `docker stop` reaches the runner
-as SIGTERM (clean exit within compose's 90-s grace); a crash or the watchdog's exit ends the
-container and `restart: unless-stopped` starts it again, whose boot alerts + pauses for the unclean
+S8, the runner only (AFCLAUDE_SCHEDULER=runner): docker/entrypoint.sh `exec`s `runner.py serve` as
+tini's only child; no cron (S9 removed supercronic, its crontabs and the rollback mode `legacy`).
+A `docker stop` reaches the runner as SIGTERM (clean exit within compose's 90-s grace); a crash or
+the watchdog's exit ends the container and `restart: unless-stopped` starts it again, whose boot alerts + pauses for the unclean
 exit (D-257). The docker HEALTHCHECK is `runner.py health` (a live runner process and a loop
 heartbeat under HEALTH_STALE); it only reports, the watchdog thread is the one that acts.
 
-Ownership: RUNNER_OWNS is what this image's runner runs; the cut-over (§4) moves jobs from
-docker/crontab into it step by step (test_runner checks they never overlap). S2: the runner runs
-live (docker/entrypoint.sh, AFCLAUDE_SCHEDULER=on) and owns its heartbeat and the new jobs
-(stall_scan, prune_runs). S3: it owns the simple ticks too (sampler, dispatcher, quickview,
-docs_import, prune_logs, usage_review). S4: the at-jobs. S5: the session-window starts. S6: the
-keep-alive watcher's passes (no watcher runs beside it any more). S7: the inbox (inbox,
-inbox_verify) and the inbox API as a supervised child (SUPERVISED); no cron watchdog for it.
+Ownership: RUNNER_OWNS is what this image's runner runs: every job since the cut-over (§4: S2-S7
+moved them from docker/crontab into it step by step; S9 removed the crontabs). S7 added the inbox
+API as a supervised child (SUPERVISED).
 
 Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
 `run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
@@ -72,29 +67,21 @@ Window starts (S5, the job "window_start"): a keyed run at each session-window s
 (schedule.next_session_start is the job row's next_due; key schedule.start_key), as
 `keepalive.py --window-start --start-key KEY` (keepalive's window_start_pass unchanged: its run
 timing, D-274/D-275, and its window-start ping, D-277/D-280). A start is settled by its run row or
-by the keep-alive's own records (handled, a postponed start, its "window_starts" claim, which cron's
-legacy line writes too), so neither the runner nor a legacy rollback decides one start twice. A
+by the keep-alive's own records (handled, a postponed start, its "window_starts" claim), so a start
+is never decided twice. A
 start the runner was not up for runs late only within runner_start_catchup (30 min); later it is a
 missed start (alert + pause, D-257), never started late. `runner.py window-report` checks the
 starts of the last nights against the runner's runs and the keep-alive's decision lines.
 
 At-jobs (S4, the job "at"): every pending scheduled_jobs row (stored by `at -t`, which then wakes
 the runner) is a keyed run `at <id>` at its run_at: its run claims the job in its own begin
-(actions.run_begin(claim=): never twice, also against a legacy `at --run-due`) and runs its command
+(actions.run_begin(claim=): never twice) and runs its command
 as a tracked child (runner_jobs.at_job) with the job's payload `timeout` (minutes; default the
 setting runner_timeout_at). Several at-jobs may run at once (one slot per key). A run a restart cut
 off follows the job's payload `on_interrupt`: "rerun" (the sampler's samples, the review chain's
 steps) runs it again at the boot, "fail" (the default: a one-off review start) is an alert + pause
 (D-257); a "fail" job is held by a drain, a "rerun" one is not. The runner_jobs row "at" has the
 earliest future run_at as its next_due.
-
-Shadow (S2-S7, §5 S2): for every job cron still runs, the runner logs when it WOULD start it
-(data/runner_shadow.log, component runner_shadow), waking at that time as it would for its own
-job; `runner.py shadow-report` compares those lines with cron's actual starts (supercronic's
-lines, which the entrypoint copies to data/cron_runs.log) and, for the window starts, with the
-keep-alive's decision lines. Since S5 no job with a runner counterpart is left in docker/crontab
-(the watcher and inbox API watchdogs have none), so the shadow is empty; window-report replaces it
-for the window starts.
 
 The inbox (S7, the jobs "inbox" and "inbox_verify"; §3.2/§3.3): a Job with `poll` only runs while
 POLL_PENDING[name](conn, now) says there is work, at most once every `poll` while that lasts (no
@@ -103,7 +90,7 @@ inbox_api after a post or a retry, §3.7) triages and delivers "now" messages ev
 pending or held; `inbox_verify` (inbox_worker.verify_tick) checks every 5 s the post-send
 verifications a delivery stored (runner_state "inbox" entries {msg, path, offset, deadline}), so a
 restart resumes one from the same offset and deadline and ends it seen or as an error at its
-deadline. The runner also keeps `inbox_api.py serve --no-worker` running (SUPERVISED, started at
+deadline. The runner also keeps `inbox_api.py serve` running (SUPERVISED, started at
 boot and again, with an alert, whenever it exits before a stop was requested): it only serves HTTP,
 stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
 messages are not automation (D-186/D-244), so both run while paused.
@@ -115,15 +102,6 @@ refused / failed, through request.start / request.finish). It runs while paused 
 holds it, and a restart during one fails it (on_interrupt "fail": the request is recorded failed,
 alert + pause, D-257); a run that ends without deciding its request records it failed (alert + pause).
 
-S2-S7 supercronic was the container's main schedule and this runner ran beside it (nothing runs
-`ensure` and `stop` since S8; S9 removes them with the legacy mode):
-    python3 runner.py ensure     the temporary cron watchdog (*/5): starts `serve` detached
-                                 unless one runs (an alert + pause when it had stopped without a
-                                 crash or unclean exit its own boot reports, D-235/D-257); a
-                                 running one whose heartbeat is stale is an alert + pause too
-    python3 runner.py stop       SIGTERM to the running runner and wait for its clean exit (the
-                                 entrypoint's TERM trap: tini signals only the entrypoint shell)
-    python3 runner.py shadow-report [--hours H]   the shadow comparison (exit 1 on a mismatch)
 """
 from __future__ import annotations
 
@@ -131,14 +109,12 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
-import importlib
 import json
 import math
 import os
 import re
 import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -177,19 +153,16 @@ DRAIN_MARGIN = timedelta(minutes=5)
 DRAIN_POLL = 5.0
 EXIT_LOCKED = 2
 EXIT_REPORTED = runner_jobs.EXIT_REPORTED
-EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail): `ensure` does not alert again
+EXIT_CRASH = EXIT_REPORTED                # serve() failed and reported it (failstop.fail)
 TINY = timedelta(microseconds=1)
 SUPERVISE_DELAY = 5.0                     # S7: a supervised child that exited is started again after this long
-# The keep-alive watcher's passes (S6). The runner refuses to start next to a running watcher only
-# once it owns one of them: until then (S2-S5) the watcher ran beside it by design (§4).
+# The keep-alive watcher's passes (S6; the watcher itself is gone since S9).
 WATCHER_PASSES = frozenset({"watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
                             "compaction"})
 # Where a planned job's next act is (S6): the keep-alive's runner state, acts.<job>:<sid8> = {key, at, run,
 # session} per task-manager of the registry (3b S3; its plan step writes it, keepalive.store_act; the runner
 # only reads it).
 PLANS_COMPONENT = "keepalive.watch"
-WATCHER_ONE_SHOT = frozenset({"--window-start", "--plan-fillup-test", "--decide", "--last-mile", "--once",
-                              "--work-on", "--run-stopped", "--session-rules"})
 
 
 @dataclass(frozen=True)
@@ -202,9 +175,8 @@ class Job:
     the "handler" checks (and runs anyway here), or the runner "skip"s it; on_interrupt: a run cut
     off by a restart is rerun or "fail"s (alert + pause, D-257); session: it types into the
     task-manager session (a drain holds it); pause_on_failure: False = a failure alerts only
-    (D-239.3); cron_tag: its docker/crontab line's tag (the cut-over check, the shadow); argv: the
-    child's command instead of runner_jobs.py (tests); offset: see every; what: what it does, for
-    the quickview's schedule list (default: the cron tag); at_jobs: the scheduled_jobs rows, one keyed
+    (D-239.3); argv: the child's command instead of runner_jobs.py (tests); offset: see every; what:
+    what it does, for the quickview's schedule list (default: the job's name); at_jobs: the scheduled_jobs rows, one keyed
     run per row at its run_at (S4; on_interrupt and timeout_min are the defaults of the row's payload
     fields on_interrupt and timeout); planned: a keyed act at the time its pass's plan step stored
     (S6, planned_act: the run's key is the plan's `run`); poll: it only runs while POLL_PENDING[name]
@@ -225,7 +197,6 @@ class Job:
     on_interrupt: str = "rerun"
     session: bool = False
     pause_on_failure: bool = True
-    cron_tag: Optional[str] = None
     argv: Optional[tuple[str, ...]] = None
     offset: timedelta = timedelta(0)
     what: str = ""
@@ -262,26 +233,26 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # 90 s off the minute: never at the same second as the quickview's and the dispatcher's scans
     # (cron starts every line on a whole minute), so the three don't contend for the DB at once
     Job("stall_scan", 2, every=3 * MIN, offset=90 * SEC, what="stall scan (stalled.scan)"),
-    Job("sampler", 20, every=15 * MIN, cron_tag="AFClaude usage sampler"),
-    Job("dispatcher", 25, every=10 * MIN, paused="handler", cron_tag="AFClaude dispatcher"),
-    Job("quickview", 2, every=3 * MIN, pause_on_failure=False, cron_tag="AFClaude quickview export"),
-    Job("docs_import", 5, every=10 * MIN, cron_tag="AFClaude docs import"),
-    Job("prune_logs", 10, daily=(3, 17), cron_tag="AFClaude log retention"),
+    Job("sampler", 20, every=15 * MIN, what="usage sampler"),
+    Job("dispatcher", 25, every=10 * MIN, paused="handler", what="dispatcher"),
+    Job("quickview", 2, every=3 * MIN, pause_on_failure=False, what="quickview export"),
+    Job("docs_import", 5, every=10 * MIN, what="docs import"),
+    Job("prune_logs", 10, daily=(3, 17), what="log retention"),
     Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
     # S9(b): the status snapshot rows (usage, next run, pause, running runs), once a minute and also while
     # paused (the pause is part of it); 30 s off the minute, between the other ticks' offsets
     Job("status_snapshot", 2, every=MIN, offset=30 * SEC, what="status snapshot (status_snapshot.py): the DB rows "
                                                                "the dashboard reads"),
-    Job("usage_review", 30, every=60 * MIN, paused="handler", cron_tag="AFClaude usage-model review"),
+    Job("usage_review", 30, every=60 * MIN, paused="handler", what="usage-model review"),
     Job("window_start", 90, window_start=True, paused="handler", on_interrupt="fail", session=True,
-        cron_tag="AFClaude window-start"),
+        what="window-start"),
     # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
-    Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail", cron_tag="AFClaude at-shim",
+    Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail",
         what="at-jobs (scheduled_jobs: the weekly-reset samples, one-off reviews, the review chain's steps)"),
     # S6: the keep-alive watcher's passes (keepalive.runner_pass). The ticks only read and plan (a rerun
     # is safe); off the minute, never at the second of the other ticks (cron's grid, stall_scan's +90 s).
     # The watch runs while paused (detection only); the compaction check and the acts check the pause.
-    Job("watch", 12, every=MIN, offset=15 * SEC, cron_tag="AFClaude watcher watchdog",
+    Job("watch", 12, every=MIN, offset=15 * SEC,
         what="keep-alive watch: limit detection; the plans of the last stretch, the postponed / planned starts "
              "and the fill-up"),
     Job("run_readings", 10, every=5 * MIN, offset=50 * SEC, what="usage readings during a run (D-207)"),
@@ -322,19 +293,12 @@ def _inbox_verify_pending(conn: Any, now: datetime) -> bool:
 # due time while there is none (_plan_poll), only a wake.
 POLL_PENDING: dict[str, Callable[[Any, datetime], bool]] = {"inbox": _inbox_pending, "inbox_verify": _inbox_verify_pending}
 # S7: a long-lived child the runner keeps alive (not a tick: no run row, no outer timeout) -> its
-# argv. inbox_api.py serve --no-worker only serves HTTP, stores the message and wakes this runner
+# argv. inbox_api.py serve only serves HTTP, stores the message and wakes this runner
 # (§3.7); the runner's own `inbox` / `inbox_verify` jobs above do the triage, delivery and
-# verification that AFCLAUDE_SCHEDULER=legacy still runs from its worker thread.
-SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve", "--no-worker")}
-# What this image's runner runs (§4: one owner per job per image; each cut-over step moves jobs
-# here and removes their cron lines in the same commit). S2: the new jobs (no cron line): the
-# stall_scan tick and the daily prune of the runner's own run records. S3: the simple ticks, whose
-# cron lines are gone from docker/crontab (docker/crontab.legacy, the rollback, keeps them). S4: the
-# at-jobs (the */1 `at --run-due` line is gone; legacy keeps it). S5: the session-window starts (the
-# */30 `--window-start` line is gone; legacy keeps it). S6: the keep-alive watcher's passes (the
-# entrypoint no longer starts the watcher, its :07/:22/:37/:52 watchdog line is gone; legacy keeps both).
-# S7: the inbox jobs (the entrypoint no longer starts inbox_api.py, SUPERVISED does; its */5 ensure
-# cron line is gone; legacy keeps both).
+# verification.
+SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve")}
+# What this image's runner runs: every job (§4: each cut-over step S2-S7 moved jobs here and removed
+# their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
                                          "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
                                          "inbox", "inbox_verify", "request"}
@@ -396,11 +360,6 @@ def _parse_text(s: object) -> Optional[datetime]:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def _iso_ms(dt: datetime) -> str:
-    """UTC ISO to the millisecond, 'Z' (the shadow lines)."""
-    return dt.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def next_tick(job: Job, now: datetime) -> datetime:
@@ -530,7 +489,7 @@ class Runner:
                  boot_id: Optional[str] = None, log_fn: Optional[Callable[[str], None]] = None,
                  fail: Optional[FailFn] = None, paused: Optional[Callable[[], dict[str, Any]]] = None,
                  schedule_cfg: Optional[schedule.Config] = None, sock: Optional[str] = None,
-                 stop_grace: float = STOP_GRACE, shadow: Optional[Callable[[str], None]] = None,
+                 stop_grace: float = STOP_GRACE,
                  supervise: Optional[dict[str, tuple[str, ...]]] = None) -> None:
         self.conn = conn
         self.jobs = dict(JOBS if jobs is None else jobs)
@@ -564,13 +523,6 @@ class Runner:
         self.beat_mono = time.monotonic()
         self.logged: set[str] = set()
         self.reruns: list[tuple[str, str]] = []
-        # the shadow (S2-S7): the jobs cron still runs that have a cron line, and when this runner
-        # would start each next (in memory: a restart only starts the comparison afresh)
-        self.shadow = shadow
-        # (not the at-jobs: they have no cadence of their own to compare, S4)
-        self.shadow_jobs = [j for n, j in sorted(self.jobs.items()) if j.cron_tag and n not in self.owns
-                            and not j.at_jobs] if shadow is not None else []
-        self.shadow_next: dict[str, datetime] = {}
 
     # ---- small parts
 
@@ -606,25 +558,6 @@ class Runner:
     def _next_due(self, name: str) -> Optional[datetime]:
         row = store.get_runner_job(self.conn, name)
         return _parse(row["next_due"]) if row else None
-
-    # ---- the registry (phase 3b S3)
-
-    def check_registry(self, setting: Optional[str] = None) -> bool:
-        """The boot check of docs/phase3b_plan.md §3.3: while the machine setting manager_session still
-        exists (legacy mode and the SessionStart-era scripts read it until 3a S9), it must be a task-manager
-        of the registry, else an alert + pause (D-235). The runner's jobs never read it. -> ok."""
-        import afclaude_config
-        want = setting if setting is not None else afclaude_config.identity("manager_session")
-        if not isinstance(want, str) or not want.strip():
-            return True
-        try:
-            store.check_manager_setting(self.conn, want.strip())
-        except ValueError as e:
-            self.fail("the manager_session setting disagrees with the task-manager registry", str(e))
-            return False
-        return True
-
-    # ---- boot (§3.4)
 
     def boot(self) -> None:
         now = self.clock()
@@ -869,8 +802,7 @@ class Runner:
     def _settled(self, job: Job, key: str) -> bool:
         """The keyed run (job, key) was decided already: a run row (for a job that never reruns an
         interrupted run, also an interrupted one), or the keep-alive's own dedup for a window start
-        (handled, its "window_starts" claim, a postponed start; the runner and a legacy rollback
-        share it)."""
+        (handled, its "window_starts" claim, a postponed start)."""
         rows = store.key_runs(self.conn, job.name, key)
         if any(job.on_interrupt == "fail" or r["status"] != "interrupted" for r in rows):
             return True
@@ -917,33 +849,6 @@ class Runner:
             return None
         self.ws_anchor = pending[0] - TINY      # until its run row exists (a drain may hold it)
         return Due(job, pending[1], pending[0])
-
-    # ---- the shadow (S2-S7)
-
-    def _shadow_due(self, job: Job, now: datetime) -> Optional[datetime]:
-        if job.window_start:
-            return schedule.next_session_start(now, self.schedule_cfg())
-        return next_tick(job, now)
-
-    def shadow_pass(self, now: datetime) -> None:
-        """For each job cron still runs: when its time has come, a shadow line `<job> [<key>] due
-        <time> at <now>` (what this runner would start, to the millisecond), then its next time.
-        A window start's next time is re-read every pass (the window settings can change)."""
-        write = self.shadow
-        if write is None:
-            return
-        for job in self.shadow_jobs:
-            due = self.shadow_next.get(job.name)
-            if due is not None and due <= now:
-                key = f" {schedule.start_key(due, self.schedule_cfg())}" if job.window_start else ""
-                write(f"{job.name}{key} due {_iso_ms(due)} at {_iso_ms(now)}")
-                due = None
-            if due is None or job.window_start:
-                nxt = self._shadow_due(job, now)
-                if nxt is None:
-                    self.shadow_next.pop(job.name, None)
-                else:
-                    self.shadow_next[job.name] = nxt
 
     # ---- runs
 
@@ -1141,14 +1046,12 @@ class Runner:
     # ---- the loop
 
     def sleep_for(self, now: datetime) -> float:
-        """Seconds until the earliest due time of an owned job or a shadow time (at most MAX_SLEEP)."""
+        """Seconds until the earliest due time of an owned job (at most MAX_SLEEP)."""
         best = MAX_SLEEP
         for name in self.owns:
             nd = self._next_due(name)
             if nd is not None and name not in self.tasks:
                 best = min(best, max(0.0, (nd - now).total_seconds()))
-        for t in self.shadow_next.values():
-            best = min(best, max(0.0, (t - now).total_seconds()))
         return best
 
     def request_stop(self) -> None:
@@ -1208,7 +1111,6 @@ class Runner:
                     self.scans += 1
                     for due in self.plan(now):
                         self.start(due, now)
-                    self.shadow_pass(now)
                     delay = self.sleep_for(now)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.wake_event.wait(), delay)
@@ -1283,11 +1185,6 @@ def acquire_lock(path: Optional[str] = None) -> Optional[int]:
     return fd
 
 
-def _is_watcher(argv: list[str]) -> bool:
-    return ("--session" in argv and any(a.endswith("keepalive.py") for a in argv[:3])
-            and not WATCHER_ONE_SHOT & set(argv))
-
-
 def _proc_argvs(proc: str = "/proc") -> Iterable[tuple[int, list[str]]]:
     """(pid, argv) of every process in this container / host (a zombie has an empty argv)."""
     for d in os.listdir(proc) if os.path.isdir(proc) else []:
@@ -1301,11 +1198,6 @@ def _proc_argvs(proc: str = "/proc") -> Iterable[tuple[int, list[str]]]:
         yield int(d), argv
 
 
-def local_watchers() -> list[int]:
-    """Pids of keep-alive watchers in this container / host (/proc)."""
-    return [pid for pid, argv in _proc_argvs() if _is_watcher(argv)]
-
-
 def _is_serve(argv: list[str]) -> bool:
     return any(a.endswith("runner.py") and argv[i + 1:i + 2] == ["serve"] for i, a in enumerate(argv[:4]))
 
@@ -1315,52 +1207,7 @@ def runner_pids(proc: str = "/proc") -> list[int]:
     return [pid for pid, argv in _proc_argvs(proc) if pid != os.getpid() and _is_serve(argv)]
 
 
-def host_watchers() -> list[int]:
-    """Pids of keep-alive watchers on the HOST (over the bridge, as start_watcher.sh checks);
-    raises if the host's process list can't be read (the caller then does not start)."""
-    host = importlib.import_module("host")
-    snap = host.proc_snapshot()
-    return [int(pid) for pid, p in snap.items() if p.get("argv") and _is_watcher(list(p["argv"]))]
-
-
-def watcher_conflict(owns: frozenset[str], local: Callable[[], list[int]] = local_watchers,
-                     on_host: Callable[[], list[int]] = host_watchers) -> Optional[str]:
-    """Why the runner must not start next to a keep-alive watcher, or None: only once it owns
-    one of the watcher's passes (WATCHER_PASSES); a host list that can't be read is a reason too."""
-    if not owns & WATCHER_PASSES:
-        return None
-    pids = local()
-    if pids:
-        return f"a keep-alive watcher runs here (pid {', '.join(map(str, pids))})"
-    try:
-        hp = on_host()
-    except Exception as e:   # noqa: BLE001 - can't tell: don't start (as start_watcher.sh)
-        return f"the host's process list is unavailable ({type(e).__name__}: {e})"
-    return f"a keep-alive watcher runs on the HOST (pid {', '.join(map(str, hp))})" if hp else None
-
-
-RUNNER_MODES = ("on", "runner")           # AFCLAUDE_SCHEDULER values with the resident runner (as export_quickview)
-
-
-def runner_conflict(conn: Any, env: Optional[dict[str, str]] = None,
-                    now: Optional[datetime] = None) -> Optional[str]:
-    """Why a keep-alive watcher (keepalive.run, docker/start_watcher.sh, start_keepalive.sh) must
-    not start, or None: the reverse of watcher_conflict, since S6 the runner runs the watcher's
-    passes and both would fire. AFCLAUDE_SCHEDULER=on, or a runner that did not exit cleanly whose
-    heartbeat is less than STALE_BEAT old (`ensure`'s bound: a runner on the other side of the
-    bridge, or one that crashed a moment ago). AFCLAUDE_SCHEDULER=legacy after a clean stop: None."""
-    mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
-    if mode in RUNNER_MODES:
-        return f"AFCLAUDE_SCHEDULER={mode}: the resident runner runs the watcher's passes (phase 3a S6)"
-    row = store.get_runner_job(conn, actions.RUNNER_ROW)
-    beat = _parse(row["heartbeat_at"]) if row else None
-    if beat is None or actions.runner_state_get(conn).get("clean_exit") is True:
-        return None
-    age = (now or _utcnow()) - beat
-    if age > STALE_BEAT:
-        return None
-    return (f"the resident runner's heartbeat is {int(age.total_seconds())} s old (fresh: under {STALE_BEAT}) and it "
-            "did not exit cleanly: it runs the watcher's passes; stop it first (`runner.py stop`)")
+RUNNER_MODES = ("runner",)                # AFCLAUDE_SCHEDULER values with the resident runner (as export_quickview)
 
 
 def planned_act(conn: Any, name: str) -> Optional[tuple[str, datetime]]:
@@ -1392,7 +1239,7 @@ def status(conn: Any, now: Optional[datetime] = None) -> dict[str, Any]:
     for name, job in JOBS.items():
         r = rows.get(name) or {}
         jobs.append({"job": name, "owned": name in RUNNER_OWNS,
-                     "owner": "runner" if name in RUNNER_OWNS else "cron" if job.cron_tag else None,
+                     "owner": "runner" if name in RUNNER_OWNS else None,
                      "next_due": r.get("next_due"),
                      "last_status": r.get("last_status"), "last_ok_at": r.get("last_ok_at"),
                      "consecutive_failures": r.get("consecutive_failures", 0)})
@@ -1486,136 +1333,17 @@ def undrain(conn: Any) -> None:
     wake()
 
 
-# ---------------------------------------------------------------- beside supercronic (S2-S7): ensure, stop, the shadow
+# ---------------------------------------------------------------- the health check and the window report
 
-ENSURE_SETTLE = 5.0                       # ensure: a runner it started that exits within this did not start
-STALE_BEAT = timedelta(minutes=10)        # ensure: a running runner's heartbeat older than this is an error
-SHADOW = "runner_shadow"                  # the shadow lines' component (runner_state.LOG_FILES)
-CRON_RUNS = "cron_runs.log"               # supercronic's job-start lines, copied by docker/entrypoint.sh
-SHADOW_TOLERANCE = 2.0                    # seconds between a shadow time and cron's start that still match
+WINDOW_TOLERANCE = 2.0                    # seconds between a start and its run's start that still match
 DECISION_WINDOW = timedelta(minutes=10)   # a window start's decision line comes within this of it
-
-
-def _spawn_serve() -> Any:
-    """`runner.py serve`, detached (its own session, parent: tini), its output to data/runner.log
-    (never the caller's stdout: supercronic would wait for the pipe to close)."""
-    path = runner_state.live_path(COMPONENT, runner_state.LOG_FILES)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as out:
-        return subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "serve"], stdout=out,
-                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
-                                cwd=HERE)
-
-
-def _ensure_lock() -> Optional[int]:
-    path = os.path.join(run_dir(), ".ensure.lock")
-    os.makedirs(run_dir(), exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return None
-    return fd
-
-
-def ensure(*, connect: Callable[[], Any] = store.connect, pids: Callable[[], list[int]] = runner_pids,
-           spawn: Callable[[], Any] = _spawn_serve,
-           settle: float = ENSURE_SETTLE, clock: Callable[[], datetime] = _utcnow,
-           sleep: Callable[[float], object] = time.sleep, fail: FailFn = failstop.fail,
-           log_fn: Callable[[str], None] = log) -> int:
-    """The temporary cron watchdog (docker/crontab */5, S2-S7; since S8 nothing runs it: the runner
-    is the container's main process and its own Watchdog thread plus the restart policy replace it;
-    S9 removes it). A runner runs: its heartbeat
-    must be fresh (else an alert + pause: its watchdog thread should have ended it). None runs: it
-    starts one detached and reports what nobody else reports (D-235): a runner that stopped
-    without a crash it reported or an unclean exit its new boot reports (D-257), or one that does
-    not start. -> 0."""
-    lock = _ensure_lock()
-    if lock is None:
-        return 0                    # another ensure is at it
-    try:
-        conn = connect()
-        try:
-            running = pids()
-            st = actions.runner_state_get(conn)
-            if running:
-                row = store.get_runner_job(conn, actions.RUNNER_ROW)
-                beat = _parse(row["heartbeat_at"]) if row else None
-                b = st.get("boot")
-                since = _parse_text(b.get("started_at")) if isinstance(b, dict) else None
-                now = clock()
-                if (beat is None or now - beat > STALE_BEAT) and (since is None or now - since > STALE_BEAT):
-                    fail(COMPONENT, "the runner's heartbeat is stale",
-                         f"runner pid {', '.join(map(str, running))} runs, but its loop's last heartbeat is "
-                         f"{_iso(beat) if beat else 'none'} (more than {STALE_BEAT} ago); its watchdog thread "
-                         "should have ended it. Look at data/runner.log; restart the container if it hangs",
-                         log=log_fn)
-                return 0
-        finally:
-            conn.close()
-        proc = spawn()
-        deadline = time.monotonic() + settle
-        rc = proc.poll()
-        while rc is None and time.monotonic() < deadline:
-            sleep(0.2)
-            rc = proc.poll()
-        prev = st.get("boot") if isinstance(st.get("boot"), dict) else None
-        crashed = st.get("crashed") if isinstance(st.get("crashed"), dict) else None
-        if rc == EXIT_LOCKED:
-            log_fn("ensure: another runner took the lock meanwhile")
-        elif rc == EXIT_REPORTED:
-            log_fn(f"ensure: the runner it started (pid {proc.pid}) exited at once; it reported why itself")
-        elif rc is not None:
-            fail(COMPONENT, "the runner did not start",
-                 f"`runner.py serve` (pid {proc.pid}) exited {rc} within {settle:g} s; see data/runner.log",
-                 log=log_fn)
-        elif prev is not None and st.get("clean_exit") is not True:
-            why = ("its crash (reported then)" if crashed is not None and crashed.get("boot_id") == prev.get("boot_id")
-                   else "an unclean exit (its new boot reports it)")
-            log_fn(f"ensure: the runner was not running after {why}; started again (pid {proc.pid})")
-        else:
-            fail(COMPONENT, "the runner was not running",
-                 f"the watchdog (runner.py ensure) started it again (pid {proc.pid}); the previous runner "
-                 + (f"(boot {str(prev.get('boot_id'))[:8]}) had exited cleanly, i.e. it was stopped while the "
-                    "container ran" if prev is not None else "never booted (the entrypoint's start failed?)")
-                 + "; see data/runner.log", log=log_fn)
-        return 0
-    finally:
-        os.close(lock)
-
-
-def stop(wait_s: float = STOP_GRACE + 5, *, pids: Callable[[], list[int]] = runner_pids,
-         sleep: Callable[[float], object] = time.sleep, out: Callable[[str], object] = print) -> int:
-    """SIGTERM to every running `runner.py serve`, then wait until they are gone (a stopping runner
-    gives its running runs up to STOP_GRACE). The entrypoint's TERM trap in the S2-S7 `on` mode (tini
-    signals only its child, the entrypoint shell, which kept supercronic AND the runner); since S8
-    the runner is tini's child itself and gets the SIGTERM directly; S9 removes this.
-    -> 0 stopped (or none ran), 1 still running after wait_s."""
-    targets = pids()
-    if not targets:
-        out("runner: none running")
-        return 0
-    for pid in targets:
-        _check_pid(pid)
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + wait_s
-    while True:
-        left = sorted(set(targets) & set(pids()))
-        if not left:
-            out(f"runner: stopped (pid {', '.join(map(str, targets))})")
-            return 0
-        if time.monotonic() >= deadline:
-            out(f"runner: still running after {wait_s:g} s (pid {', '.join(map(str, left))})")
-            return 1
-        sleep(0.2)
 
 
 def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[datetime] = None,
            pids: Callable[[], list[int]] = runner_pids) -> Optional[str]:
-    """The container's health check (S8): None when healthy, else why not. Only a runner mode
-    (AFCLAUDE_SCHEDULER on/runner) has a runner to check (legacy and off: healthy). The runner
+    """The container's health check (S8): None when healthy, else why not. Only the runner mode
+    (AFCLAUDE_SCHEDULER=runner) has a runner to check (off: healthy; any other value is unhealthy:
+    the entrypoint idles the container then, phase 3a S9 removed `on` and `legacy`). The runner
     must be a live process and its loop heartbeat (runner_jobs 'runner', written at most every
     HEARTBEAT_EVERY and at every loop pass, so at most MAX_SLEEP + HEARTBEAT_EVERY old) younger
     than HEALTH_STALE. It only reports: the restart is the loop watchdog's (Watchdog) and compose's.
@@ -1623,8 +1351,10 @@ def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[dateti
     a database from newer code) is the reason, whatever else follows from it (the entrypoint idles
     the container then, no runner)."""
     mode = (os.environ if env is None else env).get("AFCLAUDE_SCHEDULER", "off")
-    if mode not in RUNNER_MODES:
+    if mode == "off":
         return None
+    if mode not in RUNNER_MODES:
+        return f"unknown AFCLAUDE_SCHEDULER={mode} (runner or off; the container idles)"
     problem = store.schema_problem(conn)
     if problem is not None:
         return f"schema: {problem}"
@@ -1641,57 +1371,7 @@ def health(conn: Any, env: Optional[dict[str, str]] = None, now: Optional[dateti
     return None
 
 
-def shadow_log(line: str) -> None:
-    """A shadow line: data/runner_shadow.log + app_log (component runner_shadow). Never raises."""
-    text = f"[{datetime.now(BERLIN):%Y-%m-%d %H:%M:%S %Z}] {line}"
-    path = runner_state.live_path(SHADOW, runner_state.LOG_FILES)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(text + "\n")
-    except OSError as e:
-        sys.stderr.write(f"runner shadow log: {type(e).__name__}: {e}\n")
-    runner_state.log_lines(SHADOW, text)
-
-
-_SHADOW_RE = re.compile(r"\] (?P<job>[a-z][a-z0-9_]*)(?: (?P<key>\S+))? due (?P<due>\S+) at (?P<at>\S+)\s*$")
-_CRON_RE = re.compile(r'time="(?P<t>[^"]+)".*\bmsg=starting\b')
 _DECISION_RE = re.compile(r"\] window-start: (?P<word>[A-Z]+)")
-
-
-@dataclass(frozen=True)
-class ShadowEntry:
-    job: str
-    key: Optional[str]
-    due: datetime
-    at: datetime
-
-
-def parse_shadow(lines: Iterable[str]) -> list[ShadowEntry]:
-    out: list[ShadowEntry] = []
-    for ln in lines:
-        m = _SHADOW_RE.search(ln)
-        due, at = (_parse_text(m.group("due")), _parse_text(m.group("at"))) if m else (None, None)
-        if m and due is not None and at is not None:
-            out.append(ShadowEntry(m.group("job"), m.group("key"), due, at))
-    return out
-
-
-def parse_cron(lines: Iterable[str], jobs: dict[str, Job]) -> list[tuple[str, datetime]]:
-    """(job, start) of supercronic's `msg=starting` lines whose command carries a job's cron tag
-    (not the at-shim's per-minute `--run-due` line: the at-jobs are not shadowed)."""
-    tags = [(j.cron_tag, n) for n, j in jobs.items() if j.cron_tag and not j.at_jobs]
-    out: list[tuple[str, datetime]] = []
-    for ln in lines:
-        m = _CRON_RE.search(ln)
-        t = _parse_text(m.group("t")) if m else None
-        if t is None:
-            continue
-        for tag, name in tags:
-            if f"# {tag}" in ln:
-                out.append((name, t))
-                break
-    return out
 
 
 def parse_decisions(lines: Iterable[str]) -> list[tuple[datetime, str]]:
@@ -1707,78 +1387,8 @@ def parse_decisions(lines: Iterable[str]) -> list[tuple[datetime, str]]:
     return out
 
 
-def shadow_report(shadow: list[ShadowEntry], cron: list[tuple[str, datetime]], decisions: list[tuple[datetime, str]],
-                  *, since: datetime, until: datetime, jobs: Optional[dict[str, Job]] = None,
-                  tolerance: float = SHADOW_TOLERANCE) -> tuple[list[str], int]:
-    """The shadow (when the runner would have started each job cron runs) against cron's actual
-    starts between since and until. An interval job: every shadow time has a cron start within
-    `tolerance` and every cron start a shadow time, as long as the runner ran then (its shadow lines
-    of that job on both sides); a window start: a cron start within `tolerance` (to the second) and
-    the keep-alive's decision line after it, and no decision line without a shadow start while the
-    runner ran. -> (report lines, number of mismatches)."""
-    js = JOBS if jobs is None else jobs
-    tol = timedelta(seconds=tolerance)
-    sh = [e for e in shadow if since <= e.due <= until]
-    cr = [(n, t) for n, t in cron if since <= t <= until]
-    out = [f"shadow vs cron, {_iso(since)} .. {_iso(until)} (tolerance {tolerance:g} s)"]
-    bad: list[str] = []
-    for name in sorted({e.job for e in sh} | {n for n, _ in cr}):
-        job = js.get(name)
-        mine = sorted((e for e in sh if e.job == name), key=lambda e: e.due)
-        theirs = sorted(t for n, t in cr if n == name)
-        used: set[int] = set()
-        matched, worst, lag = 0, 0.0, 0.0
-        decided: list[str] = []
-        for e in mine:
-            hit = next((i for i, t in enumerate(theirs) if i not in used and abs(t - e.due) <= tol), None)
-            lag = max(lag, (e.at - e.due).total_seconds())
-            if hit is None:
-                bad.append(f"MISMATCH {name}{' ' + e.key if e.key else ''}: the runner's time {_iso_ms(e.due)} has "
-                           "no cron start")
-                continue
-            used.add(hit)
-            matched += 1
-            worst = max(worst, abs((theirs[hit] - e.due).total_seconds()))
-            if job is not None and job.window_start:
-                d = next((w for t, w in decisions if e.due <= t <= e.due + DECISION_WINDOW), None)
-                decided.append(f"{_iso(e.due)} {d or 'no decision line'}")
-                if d is None:
-                    bad.append(f"MISMATCH {name} {e.key}: cron started at {_iso(e.due)} but the keep-alive logged no "
-                               "window-start decision")
-        if job is not None and job.window_start:
-            # cron runs every 30 min and acts only at a start: a decision line is what must match
-            for t, w in decisions:
-                if not since <= t <= until or any(e.due <= t <= e.due + DECISION_WINDOW for e in mine):
-                    continue
-                if any(abs(x.at - t) <= DECISION_WINDOW for x in sh):
-                    bad.append(f"MISMATCH {name}: the keep-alive decided {w} at {_iso(t)}; the runner foresaw "
-                               "no start then")
-            out.append(f"  {name:<13} shadow {len(mine):>4}  matched {matched:>4}  max |cron-due| {worst:.0f} s  "
-                       f"runner lag max {lag:.3f} s" + (f"; {', '.join(decided)}" if decided else ""))
-            continue
-        step = job.every if job is not None and job.every is not None else timedelta(days=1)
-        extra = 0
-        for i, t in enumerate(theirs):
-            if i in used:
-                continue
-            before = any(t - step - tol <= e.due < t for e in mine)
-            after = any(t < e.due <= t + step + tol for e in mine)
-            if before and after:
-                extra += 1
-                bad.append(f"MISMATCH {name}: cron started at {_iso(t)}; the runner had no time for it")
-        out.append(f"  {name:<13} shadow {len(mine):>4}  cron {len(theirs):>4}  matched {matched:>4}  "
-                   f"max |cron-due| {worst:.0f} s  runner lag max {lag:.3f} s"
-                   + (f"  ({len(theirs) - matched - extra} cron start(s) while the runner was not running)"
-                      if len(theirs) - matched - extra else ""))
-    out.extend(bad[:50])
-    if len(bad) > 50:
-        out.append(f"... and {len(bad) - 50} more")
-    out.append(f"{len(bad)} mismatch(es)" if bad else "OK: the shadow times match cron's starts")
-    return out, len(bad)
-
-
 def window_report(starts: list[tuple[datetime, str]], runs: list[store.Row], decisions: list[tuple[datetime, str]],
-                  *, since: datetime, until: datetime, tolerance: float = SHADOW_TOLERANCE) -> tuple[list[str], int]:
+                  *, since: datetime, until: datetime, tolerance: float = WINDOW_TOLERANCE) -> tuple[list[str], int]:
     """S5's check (docs/phase3a_plan.md §5 S5, "Done when"): every session-window start between
     since and until (`starts`: (time, schedule.start_key)) has the runner's window_start run under
     its key, started within `tolerance` of the start (to the second) and ended ok, and the
@@ -1838,17 +1448,12 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
     if fd is None:
         log("another runner holds data/run/runner.lock; this one exits")
         return EXIT_LOCKED
-    why = watcher_conflict(o)
-    if why is not None:
-        failstop.fail(COMPONENT, "the runner did not start next to a keep-alive watcher", why, log=log)
-        return EXIT_CRASH
     runner: Optional[Runner] = None
     try:
         conn = store.connect()
-        runner = Runner(conn, owns=o, shadow=shadow_log)
+        runner = Runner(conn, owns=o)
         r = runner
         Watchdog(lambda: r.beat_mono, stale=STALE_LOOP, every=WATCHDOG_EVERY).start()   # (read now: tests patch them)
-        runner.check_registry()
         runner.boot()
         return asyncio.run(runner.serve())
     except Exception as e:   # noqa: BLE001 - the runner's own failure: report, exit non-zero (no clean exit)
@@ -1907,55 +1512,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                                                                  "session-run timeout + 5)")
     sub.add_parser("undrain", help="lift a drain")
     sub.add_parser("wake", help="make the runner re-read the DB now")
-    sub.add_parser("ensure", help="the S2-S7 cron watchdog (nothing runs it since S8): start the runner unless one "
-                                  "runs, check its heartbeat")
-    sub.add_parser("stop", help="SIGTERM to the runner and wait for its exit (the S2-S7 entrypoint's TERM trap)")
     sub.add_parser("health", help="the container's health check (S8): exit 1 (the reason on stdout) when no runner "
-                                  "runs or its loop heartbeat is stale; healthy in the legacy and off modes")
-    sub.add_parser("watcher-check", help="exit 1 (the reason on stderr) when a keep-alive watcher must not start "
-                                         "(runner_conflict); start_watcher.sh / start_keepalive.sh ask it")
-    r = sub.add_parser("shadow-report", help="the shadow times against cron's actual starts (exit 1 on a mismatch)")
-    r.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
-    r.add_argument("--cron-log", default=None, help=f"supercronic's lines (default data/{CRON_RUNS}; - = stdin, "
-                                                     "e.g. `docker logs afclaude 2>&1`)")
-    r.add_argument("--shadow-log", default=None, help="the shadow lines (default data/runner_shadow.log)")
-    r.add_argument("--decisions-log", default=None, help="the keep-alive's log (default data/keepalive/keepalive.log)")
-    r.add_argument("--tolerance", type=float, default=SHADOW_TOLERANCE, help="seconds (default 2)")
+                                  "runs or its loop heartbeat is stale; healthy in the off mode")
     w = sub.add_parser("window-report", help="S5: each session-window start against the runner's run and the "
                                              "keep-alive's decision line (exit 1 on a mismatch)")
     w.add_argument("--hours", type=float, default=48.0, help="the last H hours (default 48)")
     w.add_argument("--decisions-log", default=None, help="the keep-alive's log (default data/keepalive/keepalive.log)")
-    w.add_argument("--tolerance", type=float, default=SHADOW_TOLERANCE, help="seconds (default 2)")
+    w.add_argument("--tolerance", type=float, default=WINDOW_TOLERANCE, help="seconds (default 2)")
     args = ap.parse_args(argv)
     if args.cmd == "serve":
         return serve()
     if args.cmd == "wake":
         return 0 if wake() else 1
-    if args.cmd == "stop":
-        return stop()
     if args.cmd == "health":
         return _health_cli()
-    if args.cmd == "ensure":
-        try:
-            return ensure()
-        except Exception as e:   # noqa: BLE001 - the watchdog itself failed: report it (D-235)
-            failstop.fail(COMPONENT, "the runner watchdog failed", f"{type(e).__name__}: {e}\n"
-                          f"{traceback.format_exc()[-1500:]}", log=log)
-            return EXIT_REPORTED
-    if args.cmd == "shadow-report":
-        until = _utcnow()
-        data = runner_state.data_dir()
-        try:
-            shadow = parse_shadow(_read_lines(args.shadow_log or runner_state.live_path(SHADOW, runner_state.LOG_FILES)))
-            cron = parse_cron(_read_lines(args.cron_log or os.path.join(data, CRON_RUNS)), JOBS)
-            decisions = parse_decisions(_read_lines(args.decisions_log or runner_jobs.log_path("window_start")))
-        except OSError as e:
-            print(f"shadow-report: {type(e).__name__}: {e}", file=sys.stderr)
-            return 2
-        lines, bad = shadow_report(shadow, cron, decisions, since=until - timedelta(hours=args.hours), until=until,
-                                   tolerance=args.tolerance)
-        print("\n".join(lines))
-        return 1 if bad else 0
     conn = store.connect()
     try:
         if args.cmd == "window-report":
@@ -1966,12 +1536,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(json.dumps(st, indent=2, default=str))
             else:
                 print_status(st)
-            return 0
-        if args.cmd == "watcher-check":
-            why = runner_conflict(conn)
-            if why:
-                print(f"not starting a keep-alive watcher: {why}", file=sys.stderr)
-                return 1
             return 0
         if args.cmd == "drain":
             return drain(conn, timedelta(minutes=args.max_wait) if args.max_wait is not None else None)

@@ -107,7 +107,7 @@ class Active(tc.Env):
     def test_a_delivery_check_still_holds_an_untriaged_message(self):
         """No triage is no shortcut past the delivery's checks: the owner typing holds it."""
         self.run_going()
-        self.typing = "a draft in ka-abcdef01's input box (12 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (12 characters)"
         m = self.post()
         out = self.process()
         r = self.row(m)

@@ -71,8 +71,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                status_snapshot (phase 3a S9(b), additive the same way, STATUS_SNAPSHOT_SCHEMA): the
                latest usage / next-run / pause / running-runs sections the runner writes each minute.
                Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
-               row's project) and action_requests.run_id / updated_at (run-now, D-153); the
-               driven_sessions backfill is `python3 store.py import-driven` (driven.py).
+               row's project) and action_requests.run_id / updated_at (run-now, D-153); S1's
+               driven_sessions backfill (`import-driven`) is retired since 3b S6.
                prompt_vars (phase 4a, D-197, additive the same way): a project's values of the
                prompt variables prompts.PROJECT_VARS declares (prompts.py; actions.py writes).
                auth_sessions (phase 6a W5, additive the same way, AUTH_SCHEMA): the dashboard's
@@ -2031,13 +2031,14 @@ def pick_project(conn: sqlite3.Connection, chained: object = None) -> Row:
 
 
 def check_manager_setting(conn: sqlite3.Connection, setting: str) -> None:
-    """The boot check of phase 3b S3 (docs/phase3b_plan.md §3.3), while the machine setting
-    manager_session (or a legacy --session) still exists: it must be a registered task-manager
-    session, else ValueError (the caller fail-stops, D-235)."""
+    """Phase 3b S3's check (docs/phase3b_plan.md §3.3), today for keepalive.py's `--session` (the
+    runner's window_start child, keepalive.check_registry; the machine setting manager_session is
+    gone since 3b S6): it must be a registered task-manager session, else ValueError (the caller
+    fail-stops, D-235)."""
     tms = manager_sessions(conn)
     if setting not in {str(t["session"]) for t in tms}:
         have = ", ".join(f"{t['name']} {str(t['session'])[:8]}" for t in tms) or "none"
-        raise ValueError(f"the session {setting[:8]} (setting manager_session / --session) is no project's "
+        raise ValueError(f"the session {setting[:8]} (--session) is no project's "
                          f"task-manager in the registry (projects.manager_session: {have})")
 
 
@@ -4812,17 +4813,7 @@ def main(argv: list[str] | None = None) -> int:
                                                "(docker/entrypoint.sh), audited as prompt.defaults_sync")
     pp.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     pp.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
-    dv = sub.add_parser("import-driven", help="the driven_sessions backfill of phase 3b (idempotent; driven.py): "
-                                              "a row per task-manager and per running review / continued "
-                                              "session, then `tasks.py driven check`")
-    dv.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
-    dv.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
     args = ap.parse_args(argv)
-    if args.cmd == "import-driven":
-        import importlib
-        driven = importlib.import_module("driven")
-        return int(driven.main(["import"] + (["--db", args.db] if args.db else [])
-                               + (["--dry-run"] if args.dry_run else [])))
     if args.cmd == "import-prompts":
         import importlib
         actions = importlib.import_module("actions")

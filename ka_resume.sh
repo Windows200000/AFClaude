@@ -2,7 +2,7 @@
 # Continue a Claude Code session WITHOUT --bg (bg sessions get retired by the
 # daemon after 60 min idle and inherit the daemon's env). The session lives in a
 # detached tmux session named by --tmux (the caller's stored name, driven_sessions; names.py:
-# ka-<8 hex> or afc-<[a-z0-9-], at most 36>), as a normal interactive process
+# afc-<[a-z0-9-], at most 36>), as a normal interactive process
 # (Remote-Control-visible unless --no-remote-control) whose env is exactly what this script sets.
 #
 #   ka_resume.sh --session <full-uuid> --tmux NAME --message <text> [--cwd DIR] [--name RC-NAME]
@@ -35,8 +35,8 @@ done
 [[ "$SID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "need full --session uuid" >&2; exit 2; }
 [ -n "$MSG" ] || { echo "need --message" >&2; exit 2; }
 # the same names as docker/host_exec.py and names.py; also keeps run/<name>.sh inside run/
-[[ "$T" =~ ^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})$ ]] ||
-  { echo "need --tmux ka-<8 hex> or afc-<[a-z0-9-], at most 36>" >&2; exit 2; }
+[[ "$T" =~ ^(afc-[a-z0-9-]{1,36})$ ]] ||
+  { echo "need --tmux afc-<[a-z0-9-], at most 36>" >&2; exit 2; }
 NAME="${NAME:-$T}"
 
 if tmux has-session -t "=$T" 2>/dev/null; then

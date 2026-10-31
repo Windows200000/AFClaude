@@ -170,10 +170,10 @@ class HostBridge(unittest.TestCase):
         os.environ.pop("AFCLAUDE_HOST_EXEC_LOG", None)
 
     def test_flag_accepted(self):
-        self.he.check_ka_resume(["--session", SID, "--tmux", "ka-abcdef01", "--message", "go", rcs.NO_RC_FLAG,
+        self.he.check_ka_resume(["--session", SID, "--tmux", "afc-abcdef01", "--message", "go", rcs.NO_RC_FLAG,
                                  "--new"])   # no exit
         with self.assertRaises(SystemExit):
-            self.he.check_ka_resume(["--session", SID, "--tmux", "ka-abcdef01", "--message", "go",
+            self.he.check_ka_resume(["--session", SID, "--tmux", "afc-abcdef01", "--message", "go",
                                      "--remote-control", "off"])
 
 

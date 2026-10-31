@@ -24,9 +24,8 @@ Exit codes (runner.py records the run by them):
 
 An at-job (`at --key ID`): the scheduled job's command (scheduled_jobs, stored by `at -t`; the runner
 claimed it in the run's own begin, actions.run_begin(claim=)) runs with /bin/sh in its working
-directory as the at-shim's `--run-due` started it, but as this child (same process group: the
-runner's timeout ends it), not detached; its stdout goes to data/at_shim.log (the --run-due cron
-line's redirect). A fail() inside the command is seen through failstop.REPORTS_ENV (exit 3).
+directory, as this child (same process group: the runner's timeout ends it), not detached; its
+stdout goes to data/at_shim.log (the at-jobs' log since the at-shim's cron runner, gone since 3a S9). A fail() inside the command is seen through failstop.REPORTS_ENV (exit 3).
 
 The window start's inner timeouts (window_start_inner) and the ticks' (tick_inner, S3) are here
 too: the runner's outer timeout for each must exceed their sum (actions.SETTINGS runner_timeout_*;
@@ -60,10 +59,9 @@ EXIT_USAGE = 2
 @dataclass(frozen=True)
 class Handler:
     """A job's existing code: `script` (in the repo) run with `args` as its cron line runs it.
-    log: its log file under the data dir (the cron line's redirect); lock: its flock file under
+    log: its log file under the data dir (the one its cron line wrote to before 3a); lock: its flock file under
     the data dir, or None. "{session}" in args is the task-manager session the start continues, from
-    the registry (keepalive.start_session, phase 3b S3; the crontab's $AFCLAUDE_MANAGER_SESSION is
-    not read), "{key}" the run's key (a keyed run: the window start's schedule.start_key, S5)."""
+    the registry (keepalive.start_session, phase 3b S3), "{key}" the run's key (a keyed run: the window start's schedule.start_key, S5)."""
     script: str
     args: tuple[str, ...]
     log: str
@@ -79,7 +77,7 @@ HANDLERS: dict[str, Handler] = {
     "prune_logs": Handler("store.py", ("prune-logs",), "prune_logs.log", ".prune_logs.lock"),
     "usage_review": Handler("usage_review.py", (), "keepalive/keepalive.log"),
     # S5: the start the runner planned (--start-key: keepalive refuses it unless it is still the current
-    # one, and claims it in its "window_starts", the dedup it shares with cron's legacy line)
+    # one, and claims it in its "window_starts" dedup)
     "window_start": Handler("keepalive.py", ("--session", "{session}", "--window-start", "--start-key", "{key}",
                                              "--arm", "--take-over-idle"), "keepalive/keepalive.log"),
 }
@@ -93,7 +91,7 @@ PASS_LOG = "keepalive/keepalive.log"
 PASSES: tuple[str, ...] = ("watch", "run_readings", "compaction_check", "last_stretch", "deferred_start", "fillup",
                            "compaction")
 AT_JOB = "at"               # the at-jobs (runner.JOBS "at", keyed by the scheduled job's id): at_job()
-AT_LOG = "at_shim.log"      # the --run-due cron line's log
+AT_LOG = "at_shim.log"      # the at-jobs' log (the name it had under cron)
 # phase 3b S5: the run-now requests (runner.JOBS "request", keyed by the action_requests id): run_now.run(key),
 # its lines in the keep-alive's log (it starts and continues sessions as the starts do)
 REQUEST_JOB = "request"
@@ -136,7 +134,7 @@ def status_snapshot_tick() -> str:
 FUNCTIONS["status_snapshot"] = ("status_snapshot.log", status_snapshot_tick)
 
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
-# thread AFCLAUDE_SCHEDULER=legacy still runs (inbox_api.py serve's worker, inbox_worker.run_forever).
+# legacy mode's worker thread (gone since S9).
 INBOX_LOG = "inbox_worker.log"
 
 
@@ -244,7 +242,7 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
     "usage_review": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
                      ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
                      ("keepalive", "tmux_has", 30, 1)),
-    "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_has", 30, 1)),
+    "quickview": (("keepalive", "tmux_has", 30, 1),),   # S9: watcher_running reads the DB, no host call
     # S9(b): the usage cache read (host.usage_cache) once for the sections and once by the last-mile slot
     "status_snapshot": (("host", "usage_cache", 30, 2),),
 }

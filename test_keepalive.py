@@ -283,7 +283,7 @@ class Files(unittest.TestCase):
     def test_scripts_executable(self):
         # 2026-09-29 00:00: the window-start fire died on "Permission denied: ka_resume.sh"
         d = os.path.dirname(ka.__file__)
-        for f in ("ka_resume.sh", "start_keepalive.sh", "notify.py"):
+        for f in ("ka_resume.sh", "notify.py"):
             self.assertTrue(os.access(os.path.join(d, f), os.X_OK), f)
 
 
@@ -1208,96 +1208,6 @@ class FakeProcHolders(unittest.TestCase):
         self.assertEqual(ka.preflight(self.SID), (True, [], "take-over:200"))
 
 
-class WatcherNoContinue(unittest.TestCase):
-    """D-204: the watcher (run loop) never continues the task-manager at a limit reset; it logs
-    the limit hit once (PROGRESS note), and the start passes (last-stretch slot, postponed
-    session-window start) still run while the session is stalled."""
-    def test_limit_hit_is_logged_never_continued(self):
-        with tempfile.TemporaryDirectory() as d:
-            write_transcript(d, SID, [USER, REPLY, STALL] + TRAILING)     # reset long passed
-            names = ("PROJECTS_DIR", "STATE_FILE", "LOCK_FILE", "STOP_FILE", "PROGRESS_FILE", "DEFER_FILE",
-                     "handle_fire", "fire", "fresh_usage", "read_usage_cache", "last_mile_pass",
-                     "deferred_window_start_pass", "log")
-            old = {n: getattr(ka, n) for n in names}
-            calls, logs = [], []
-            ka.PROJECTS_DIR = d
-            ka.STATE_FILE, ka.LOCK_FILE = os.path.join(d, "st.json"), os.path.join(d, "ka.lock")
-            ka.STOP_FILE, ka.PROGRESS_FILE = os.path.join(d, "STOP"), os.path.join(d, "P.md")
-            testenv.notes_project(d)
-            ka.DEFER_FILE = os.path.join(d, "deferred.json")
-            ka.handle_fire = lambda *a, **k: calls.append("handle_fire")
-            ka.fire = lambda *a, **k: calls.append("fire") or (0, "", "")
-            ka.fresh_usage = lambda n, force=False: calls.append("usage")
-            ka.read_usage_cache = lambda: None
-            ka.last_mile_pass = lambda sid, now, st, args: calls.append("last_mile_pass")
-            ka.deferred_window_start_pass = lambda sid, now, st, args: calls.append("deferred")
-            ka.log = logs.append
-
-            class A:
-                session, arm, once, now = SID, True, True, False
-            try:
-                ka.run(A())
-                ka.run(A())                                                # same stall: noted once
-            finally:
-                for n, v in old.items():
-                    setattr(ka, n, v)
-            self.assertEqual(calls, ["last_mile_pass", "deferred"] * 2)     # never handle_fire / fire
-            self.assertTrue(any(ln.startswith("LIMIT_HIT:") and "D-204" in ln for ln in logs), logs)
-            notes = testenv.notes(d)
-            self.assertEqual(notes.count("hit its session limit"), 1)
-            self.assertIn("no continue at the limit reset (D-204)", notes)
-            with open(os.path.join(d, "st.json")) as fh:
-                st = json.load(fh)
-            self.assertEqual(list(st["limit_hits"]), ["stall-1"])
-            self.assertEqual(st["handled"], {})
-
-
-class NoWatcherBesideTheRunner(unittest.TestCase):
-    """Phase 3a S6 follow-up: the watcher (run) refuses to start under AFCLAUDE_SCHEDULER=on or
-    next to a live resident runner (it runs the watcher's passes: both would fire); legacy after
-    the runner's clean stop starts it as before."""
-    def setUp(self):
-        self.conn = store.connect()
-        self.addCleanup(self.conn.close)
-        self.old = ka.LOCK_FILE, ka.STOP_FILE, ka.log
-        self.tmp = tempfile.TemporaryDirectory()
-        ka.LOCK_FILE = os.path.join(self.tmp.name, "ka.lock")
-        ka.STOP_FILE = os.path.join(self.tmp.name, "STOP")       # a watcher that starts exits at its first pass
-        open(ka.STOP_FILE, "w").close()
-        ka.log = lambda line: None
-        self.addCleanup(self.restore)
-
-    def restore(self):
-        ka.LOCK_FILE, ka.STOP_FILE, ka.log = self.old
-        actions.runner_state_put(self.conn, {"clean_exit": True}, actor="runner", via="runner")
-        self.tmp.cleanup()
-
-    def beat(self, age, clean):
-        t = datetime.now(UTC) - age
-        actions.runner_job_set(self.conn, "runner", actor="runner", via="runner", heartbeat_at=t.isoformat())
-        actions.runner_state_put(self.conn, {"clean_exit": clean}, actor="runner", via="runner")
-
-    def refused(self, env):
-        class A:
-            session, arm, once, now = SID, False, True, False
-        from unittest import mock
-        with mock.patch.dict(os.environ, env):
-            try:
-                ka.run(A())
-            except SystemExit as e:
-                return str(e)
-        return None
-
-    def test_on_mode_or_a_live_runner_refuses_legacy_after_a_clean_stop_starts(self):
-        self.beat(timedelta(hours=1), clean=False)
-        self.assertIn("AFCLAUDE_SCHEDULER=on", self.refused({"AFCLAUDE_SCHEDULER": "on"}))
-        self.assertIsNone(self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))          # stale beat: the watcher runs
-        self.beat(timedelta(seconds=40), clean=False)
-        self.assertIn("heartbeat is", self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))
-        self.beat(timedelta(seconds=40), clean=True)                               # `docker stop`, then legacy
-        self.assertIsNone(self.refused({"AFCLAUDE_SCHEDULER": "legacy"}))
-
-
 class PassesThroughTheRunner(unittest.TestCase):
     """Phase 3a S6: the watcher's passes with the resident runner as the caller (the `watch` tick
     stores the acts, the runner starts each under its run key; testenv.runner_pass = one child, a
@@ -1307,8 +1217,8 @@ class PassesThroughTheRunner(unittest.TestCase):
     the watcher's STOP / PAUSED files holding the passes."""
     NIGHT = Z("2026-10-04T21:00:00Z")                   # Sun 23:00 Berlin, a session-window start
     R = Z("2026-10-01T16:59:59Z")                       # a weekly reset (the last stretch)
-    NAMES = ("PROJECTS_DIR", "STATE_FILE", "DEFER_FILE", "FILLUP_FILE", "PROGRESS_FILE", "STOP_FILE", "PAUSED_FILE",
-             "LOCK_FILE", "read_usage_cache", "fresh_usage", "handle_fire", "budget_eval", "stall_status",
+    NAMES = ("PROJECTS_DIR", "STATE_FILE", "DEFER_FILE", "FILLUP_FILE", "PROGRESS_FILE",
+             "read_usage_cache", "fresh_usage", "handle_fire", "budget_eval", "stall_status",
              "last_mile_next_start", "fillup_decision", "log")
 
     def setUp(self):
@@ -1321,8 +1231,7 @@ class PassesThroughTheRunner(unittest.TestCase):
         setcfg(usage_model="linear", run_start_factor=0)
         ka.PROJECTS_DIR = d
         for n, f in (("STATE_FILE", "st.json"), ("DEFER_FILE", "deferred.json"), ("FILLUP_FILE", "fillup.json"),
-                     ("PROGRESS_FILE", "P.md"), ("STOP_FILE", "STOP"), ("PAUSED_FILE", "PAUSED"),
-                     ("LOCK_FILE", "ka.lock")):
+                     ("PROGRESS_FILE", "P.md")):
             setattr(ka, n, os.path.join(d, f))
         testenv.notes_project(d)
         self.cache = {"fetched_at": self.NIGHT, "weekly": {"percent": 30.0, "resets_at": self.NIGHT + timedelta(days=3)},
@@ -1480,27 +1389,6 @@ class PassesThroughTheRunner(unittest.TestCase):
         self.assertEqual(testenv.notes(self.tmp.name).count("hit its session limit"), 1)
         self.assertEqual(self.fired, [])
 
-    def test_the_stop_or_paused_file_holds_every_pass(self):
-        ka.defer_window_start(schedule.start_key(self.NIGHT), SID, self.NIGHT + timedelta(minutes=5), "r")
-        for f in (ka.STOP_FILE, ka.PAUSED_FILE):
-            open(f, "w").close()
-            res = self.tick(self.NIGHT + timedelta(minutes=1))
-            self.assertEqual(res["status"], "skipped")
-            self.assertIsNone(testenv.act_of(ka, "deferred_start"))
-            os.unlink(f)
-        self.assertEqual(len([ln for ln in self.logs if "keep-alive passes held" in ln]), 2)
-        self.assertEqual(self.tick(self.NIGHT + timedelta(minutes=2))["status"], "ok")
-        a = testenv.act_of(ka, "deferred_start")
-        open(ka.STOP_FILE, "w").close()                    # an act due while held: not run, dropped
-        self.assertEqual(self.act("deferred_start", ka.parse_ts(a["at"]))["status"], "skipped")
-        self.assertIsNone(testenv.act_of(ka, "deferred_start"))
-        os.unlink(ka.STOP_FILE)
-        t = ka.parse_ts(a["at"]) + timedelta(minutes=1)
-        self.tick(t)                                       # planned anew (a new run key), then fired
-        b = testenv.act_of(ka, "deferred_start")
-        self.assertNotEqual(b["run"], a["run"])
-        self.act("deferred_start", t)
-        self.assertEqual([k for k, _ in self.fired], [schedule.start_key(self.NIGHT)])
 
     def test_a_failing_part_is_reported_and_the_others_still_plan(self):
         def boom(sid, now):

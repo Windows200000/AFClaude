@@ -177,6 +177,7 @@ class MainGuardTest(unittest.TestCase):
     def _main(self, guards, drained=0):
         calls = []
         with mock.patch.object(deploy, "check_start_guard", side_effect=guards), \
+             mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: calls.append("drain") or drained), \
              mock.patch.object(deploy.runner, "undrain", side_effect=lambda *a: calls.append("undrain")), \
@@ -194,6 +195,32 @@ class MainGuardTest(unittest.TestCase):
 
     def test_not_drained_lifts_it(self):
         self.assertEqual(self._main([True, True], drained=1), (1, ["drain", "undrain"]))
+
+    def test_a_bad_scheduler_mode_is_refused_before_anything_even_forced(self):
+        for argv in ([], ["--force"]):
+            with mock.patch.object(deploy, "scheduler_mode", return_value="on"), \
+                 mock.patch.object(deploy, "check_start_guard", side_effect=AssertionError("no guard")), \
+                 mock.patch.object(deploy.store, "connect", side_effect=AssertionError("no drain")), \
+                 mock.patch("builtins.print") as out:
+                self.assertEqual(deploy.main(argv), 1)
+            self.assertIn("AFCLAUDE_SCHEDULER=on", out.call_args[0][0])
+
+
+class SchedulerModeTest(unittest.TestCase):
+    """The mode compose gives the new container: the environment, else docker/.env, else `off`."""
+
+    def test_resolution(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, ".env")
+            self.assertEqual(deploy.scheduler_mode(env, {}), "off")                  # no file
+            with open(env, "w") as fh:
+                fh.write("# c\nAFCLAUDE_SCHEDULER=on\nOTHER=x\nAFCLAUDE_SCHEDULER='runner'\n")
+            self.assertEqual(deploy.scheduler_mode(env, {}), "runner")              # the last line, unquoted
+            self.assertEqual(deploy.scheduler_mode(env, {"AFCLAUDE_SCHEDULER": "legacy"}), "legacy")
+            with open(env, "w") as fh:
+                fh.write("AFCLAUDE_SCHEDULER=on\n")
+            self.assertEqual(deploy.scheduler_mode(env, {}), "on")
 
 
 if __name__ == "__main__":

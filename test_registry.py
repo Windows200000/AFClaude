@@ -42,11 +42,11 @@ class Base(unittest.TestCase):
         self.logs = []
         self.addCleanup(setattr, ka, "log", ka.log)
         ka.log = self.logs.append
-        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE", "_STOP_LINE"):
+        for n in ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE"):
             self.addCleanup(setattr, ka, n, getattr(ka, n))
         self.addCleanup(setattr, ka, "_LINES", {})
         self.addCleanup(setattr, ka, "_PAUSE_LOGGED", {})
-        ka._LINES, ka._PAUSE_LOGGED, ka._STOP_LINE = {}, {}, None
+        ka._LINES, ka._PAUSE_LOGGED = {}, {}
 
     def pause_project(self, name, paused=True):
         actions.perform(self.conn, "automation.set_project", {"project": name, "paused": paused,
@@ -250,16 +250,6 @@ class Legacy(Base):
             os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
             code, _, _ = self.run_main("--run-stopped")
         self.assertIn("--run-stopped needs the session", str(code))
-
-    def test_the_runner_checks_the_setting_at_boot(self):
-        r = runner.Runner(self.conn, owns=frozenset(), fail=lambda *a, **kw: fails.append((a, kw)),
-                          log_fn=lambda s: None, sock=os.path.join(testenv.DIR, "r.sock"))
-        fails = []
-        self.assertTrue(r.check_registry(SID_A))
-        self.assertTrue(r.check_registry(""))              # no setting any more: nothing to check
-        self.assertEqual(fails, [])
-        self.assertFalse(r.check_registry("cccccccc-0000-4000-8000-000000000003"))
-        self.assertEqual(fails[0][0][1], "the manager_session setting disagrees with the task-manager registry")
 
 
 class SeveralManagers(Base):

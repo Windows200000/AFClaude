@@ -18,7 +18,7 @@ whitelist. So every host call is mapped onto one of those shapes here:
   tmux list-clients -t =NAME -F #{client_activity} -> tmux-clients NAME
   tmux capture-pane -e -p -t =NAME:       -> tmux-capture NAME   (the compaction's owner-typing check)
   tmux rename-session -t =NAME NEW        -> tmux-rename NAME NEW   (the one-time rename, D-281)
-  (NAME, NEW: a tmux session name, ka-<8 hex> or afc-<[a-z0-9-], at most 36>, names.TMUX_RE)
+  (NAME, NEW: a tmux session name, afc-<[a-z0-9-], at most 36>, names.TMUX_RE)
   os.kill(pid, SIGTERM)                   -> kill-claude <pid>   (claude pids only)
   /proc/<pid>/environ                     -> claude-env <pid>    (CLAUDE* lines, claude pids only)
   /proc/<pid>/{stat,cmdline} (preflight)  -> proc-snapshot       (ppid + start of every pid, argv of
@@ -41,9 +41,9 @@ import subprocess
 import time
 
 # names.TMUX_RE with the target's "=" (exact match) and capture-pane's ":" (the current pane)
-TMUX_NAME = re.compile(r"^=?(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")
-TMUX_PANE = re.compile(r"^=(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36}):\Z")
-TMUX_NEW = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
+TMUX_NAME = re.compile(r"^=?(afc-[a-z0-9-]{1,36})\Z")
+TMUX_PANE = re.compile(r"^=(afc-[a-z0-9-]{1,36}):\Z")
+TMUX_NEW = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
 NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
 # rc_send (docs/rc_server_mode.md §4.1, §8; D-288). Kept identical in docker/host_exec.py (it runs
 # alone as the SSH forced command; test_host.py compares them).
