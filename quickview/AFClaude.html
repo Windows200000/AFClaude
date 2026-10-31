@@ -755,9 +755,13 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       if (note) body.note = note;
       path = "decide";
     } else {
-      var text = act === "option" ? q.options[Number(b.getAttribute("data-i"))] : qDraft["a" + id] || "";
-      if (!text.trim()) return;
-      body = { answer: text };
+      if (act === "option") {          // the server resolves the index: the option's text is the task-manager's wording
+        body = { option: Number(b.getAttribute("data-i")) };
+      } else {
+        var text = qDraft["a" + id] || "";
+        if (!text.trim()) return;
+        body = { answer: text };
+      }
       path = "answer";
     }
     Array.prototype.forEach.call(item.querySelectorAll("button"), function (x) { x.disabled = true; });

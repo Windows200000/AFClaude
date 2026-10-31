@@ -250,12 +250,34 @@ class QuestionsSource(unittest.TestCase):
         out = qv.needs_input()
         self.assertEqual((out["source"], out["open_questions"], out["count"], out["error"]), ("db", [], 0, None))
 
-    def test_an_unknown_source_is_an_error_on_the_page_and_the_file_stays(self):
+    def test_an_unknown_source_or_a_db_error_shows_the_error_and_no_file_items(self):
         self.write(self.FILE)
         self.source("both")
         out = qv.needs_input()
         self.assertIn("questions_source", out["error"])
-        self.assertEqual(len(out["open_questions"]), 2)
+        self.assertEqual((out["source"], out["open_questions"]), (None, []))
+        with mock.patch.object(qv.store, "connect", side_effect=RuntimeError("db is gone")):
+            out = qv.needs_input()
+        self.assertEqual((out["source"], out["open_questions"], out["error"]), (None, [], "db is gone"))
+
+    def test_fenced_code_starts_no_item(self):
+        md = ("## Q-1: With a code block\n"
+              "Run this:\n"
+              "```\n## not a heading\n- not an item\n```\n"
+              "and then\n"
+              "~~~sh\n- nor this\n## nor this\n~~~\n"
+              "- inside the section's body\n"
+              "- A dash item after fences\n")
+        items = qv.parse_open_questions(md)
+        self.assertEqual([s for s, _ in items], ["##"])
+        self.assertIn("## not a heading", items[0][1])
+        self.assertIn("- nor this", items[0][1])
+        self.assertIn("- A dash item after fences", items[0][1])         # in a ## section a '- ' line is body
+        dash = qv.parse_open_questions("- First\n```\n- fenced\n## fenced\n```\n- Second\n")
+        self.assertEqual([(s, l[0]) for s, l in dash], [("-", "First"), ("-", "Second")])
+        self.assertEqual(dash[0][1][1:], ["```", "- fenced", "## fenced", "```"])
+        unclosed = qv.parse_open_questions("- One\n```\n- never closed\n- Two\n")
+        self.assertEqual(len(unclosed), 1)                              # an unclosed fence runs to the end
 
     def test_blocked_tasks_stay_but_a_question_is_not_one(self):
         conn = store.connect()

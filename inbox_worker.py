@@ -297,6 +297,16 @@ def manager_active(sid: str, now: datetime) -> str | None:
     return None
 
 
+def triage_text(conn: Any, m: dict[str, Any]) -> str:
+    """What Haiku is asked about: the message's text, and for an answer to a question the question in
+    front of it ("(answer to the task-manager's question #N <title>)"), so a short "Daily" is judged as an
+    answer. Only for this call: the stored text stays what the owner wrote."""
+    about = inbox.question_about(conn, m)
+    if about is None:
+        return str(m["text"])
+    return "(" + about.replace("your question", "the task-manager's question", 1) + ")\n" + str(m["text"])
+
+
 def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | None:
     """Sort one message: "now" without a Haiku call while its task-manager is active (D-252),
     else the Haiku verdict. A call refused at the account's usage limit holds the message until
@@ -317,7 +327,7 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
                              "cost_usd": None, "usage": None}
     else:
         try:
-            t = triage_call(m["text"])
+            t = triage_call(triage_text(conn, m))
         except inbox.TriageError as e:
             if retry is not None:
                 failed(conn, m, "inbox message triage failed after the usage limit's reset",

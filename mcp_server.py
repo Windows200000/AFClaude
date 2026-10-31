@@ -329,7 +329,7 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
 
 
 @tool("Answer a blocked AFClaude task's question; it becomes pending (ready for the next run) again. Not for a "
-      "question about a decision entry (the owner decides those).")
+      "question to the owner (afclaude_ask): the owner answers those.")
 async def afclaude_answer_task(id: int, answer: str) -> str:
     conn = db()
     try:

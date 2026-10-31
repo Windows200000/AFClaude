@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -184,7 +185,9 @@ class Endpoints(Base):
         with mock.patch.object(inbox_worker, "triage_call", haiku), \
                 mock.patch.object(inbox_worker, "manager_active", return_value=None):
             self.assertEqual(inbox_worker.process(self.conn), {"note": 1})
-        self.assertEqual(calls, ["Daily"])
+        # Haiku is told which question this answers; the stored text is untouched
+        self.assertEqual(calls, ["(answer to the task-manager's question #%d Nightly run)\nDaily" % q["id"]])
+        self.assertEqual(store.get_inbox(self.conn, m["id"])["text"], "Daily")
         self.assertEqual(store.get_inbox(self.conn, m["id"])["status"], "noted")
         notes, ids = inbox.notes_insert(self.conn, SID)
         self.assertEqual(ids, [m["id"]])
@@ -227,6 +230,65 @@ class Endpoints(Base):
         self.assertEqual(th["question"], {"id": q["id"], "title": "Nightly run", "text": "Which way?"})
         self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{m['id']}/dismiss", {})[0], 200)
         self.assertEqual(inbox.view(self.conn)["threads"], [])
+
+
+class OwnerEvidence(Base):
+    """F1 (D-285): text the task-manager wrote never counts as the owner's words."""
+
+    def evidence(self):
+        return [e.text for e in owner_words.inbox_messages(self.conn, SID)]
+
+    def test_an_option_button_sends_its_index_and_the_server_stores_the_options_text(self):
+        q = self.ask(title="Nightly run", options=["Weekly", "Daily"])
+        for bad in ({"option": 2}, {"option": -1}, {"option": "1"}, {"option": True}, {"option": 1, "answer": "x"}):
+            self.assertEqual(self.post(q["id"], "answer", bad)[0], 400, bad)
+        self.assertEqual(self.messages(), [])
+        st, r = self.post(q["id"], "answer", {"option": 1})
+        self.assertEqual(st, 200)
+        t = store.get_task(self.conn, q["id"])
+        self.assertEqual((t["status"], t["answer"]), ("done", "Daily"))
+        (m,) = self.messages()
+        self.assertEqual((m["text"], m["origin"], m["question_id"], m["created_by"]), ("Daily", "option", q["id"], "owner"))
+        self.assertEqual(self.evidence(), [])                      # the task-manager's wording is no owner evidence
+        self.assertEqual(inbox.question_about(self.conn, m),
+                         f"answer to your question #{q['id']} Nightly run (the owner chose option 2: Daily)")
+        # the same option twice: a no-op, one row; another option: refused
+        self.assertEqual(self.post(q["id"], "answer", {"option": 1})[0], 200)
+        self.assertEqual(len(self.messages()), 1)
+        self.assertEqual(self.post(q["id"], "answer", {"option": 0})[0], 409)
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_a_question_without_options_takes_no_option(self):
+        q = self.ask()
+        st, r = self.post(q["id"], "answer", {"option": 0})
+        self.assertEqual(st, 400)
+        self.assertIn("no options", r["error"])
+
+    def test_a_typed_answer_equal_to_an_option_is_still_typed(self):
+        q = self.ask(options=["Weekly", "Daily"])
+        self.post(q["id"], "answer", {"answer": "Daily"})
+        (m,) = self.messages()
+        self.assertEqual((m["origin"], self.evidence()), ("typed", ["Daily"]))
+        self.assertEqual(inbox.question_about(self.conn, m), f"answer to your question #{q['id']} Which way for the nightly run?")
+
+    def test_the_same_answer_twice_is_one_row_and_a_different_one_is_refused(self):
+        q = self.ask()
+        self.assertEqual(self.post(q["id"], "answer", {"answer": "Yes"})[0], 200)
+        self.assertEqual(self.post(q["id"], "answer", {"answer": "Yes"})[0], 200)
+        self.assertEqual(len(self.messages()), 1)
+        self.assertEqual(self.post(q["id"], "answer", {"answer": "No"})[0], 409)
+        self.assertEqual((len(self.messages()), store.get_task(self.conn, q["id"])["answer"]), (1, "Yes"))
+
+    def test_rows_without_the_origin_column_count_as_typed(self):
+        db = os.path.join(self.tmp.name, "old.db")
+        raw = sqlite3.connect(db)
+        raw.row_factory = sqlite3.Row
+        raw.execute("CREATE TABLE inbox_messages (id INTEGER PRIMARY KEY, created_at TEXT, created_by TEXT, "
+                    "session_id TEXT, text TEXT)")
+        raw.execute("INSERT INTO inbox_messages VALUES (1, '2026-10-30T10:00:00Z', 'owner', ?, 'keep it plain, always')",
+                    (SID,))
+        self.assertEqual([e.text for e in owner_words.inbox_messages(raw, SID)], ["keep it plain, always"])
+        raw.close()
 
 
 class Decisions(Base):
@@ -284,16 +346,30 @@ class Decisions(Base):
                       notes)
         self.assertIn('"not now, thanks"', notes)
 
-    def test_an_edit_text_and_a_note_are_one_message_of_exactly_the_typed_words(self):
+    def test_an_edit_text_and_a_note_are_two_rows_and_only_the_note_is_typed(self):
         p = self.proposal()
         q = self.question_of(p["id"])
-        st, _ = self.post(q["id"], "decide", {"choice": "edit", "version": p["version"],
+        st, r = self.post(q["id"], "decide", {"choice": "edit", "version": p["version"],
                                               "text": "Titles stay short and plain.", "note": "closer"})
         self.assertEqual(st, 200)
-        (m,) = self.messages()
-        self.assertEqual((m["text"], m["status"], m["verdict"]), ("Titles stay short and plain.\n\ncloser", "noted", "note"))
+        ms = self.messages()
+        self.assertEqual([(m["text"], m["origin"], m["status"], m["verdict"]) for m in ms],
+                         [("Titles stay short and plain.", "edit", "noted", "note"), ("closer", "typed", "noted", "note")])
+        self.assertEqual(r["inbox"], ms[0]["id"])
         e = self.entry(p["id"])
         self.assertEqual((e["state"], e["summary"]), ("active", "Titles stay short and plain."))
+        # owner_words counts the typed note, never the edit of the task-manager's summary (D-285)
+        self.assertEqual([x.text for x in owner_words.inbox_messages(self.conn, SID)], ["closer"])
+
+    def test_an_edit_that_changes_nothing_is_refused_and_says_to_approve(self):
+        p = self.proposal()
+        q = self.question_of(p["id"])
+        for same in ("A rewording.", "  A   rewording.\n"):
+            st, r = self.post(q["id"], "decide", {"choice": "edit", "version": p["version"], "text": same})
+            self.assertEqual(st, 400, same)
+            self.assertIn("approve it instead", r["error"])
+        self.assertEqual((self.entry(p["id"])["state"], store.get_task(self.conn, q["id"])["status"], self.messages()),
+                         ("proposed", "blocked", []))
 
     def test_confirm_and_drop_an_unconfirmed_task_manager_entry_through_the_endpoint(self):
         ids = []

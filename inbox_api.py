@@ -11,7 +11,9 @@ nothing new is published and the request has passed nginx's X-AFClaude-Key check
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200
   POST /afclaude/api/inbox/<id>/dismiss  an answered thread leaves the questions section (D-304) -> 200
   POST /afclaude/api/inbox/notice/<id>/dismiss   a notice leaves the questions section (D-306) -> 200
-  POST /afclaude/api/questions/<id>/answer   {"answer": "..."} -> 200: a plain question is answered
+  POST /afclaude/api/questions/<id>/answer   {"answer": "..."} or {"option": i} (the 0-based index of one of
+                                         its options; the server stores the option's text) -> 200: a plain
+                                         question is answered
                                          (question.answer: stored on it and as an inbox message from the
                                          owner, triaged and delivered like any other; Q3 W2, D-300)
   POST /afclaude/api/questions/<id>/decide   {"choice": "...", "text"?, "note"?, "version": N} -> 200: a
@@ -65,7 +67,7 @@ PREFIX = "/afclaude/api/inbox"
 MSG_RE = re.compile(r"^/afclaude/api/inbox/(\d{1,9})/(retry|dismiss)$")
 NOTICE_RE = re.compile(r"^/afclaude/api/inbox/notice/(\d{1,9})/dismiss$")
 QUESTION_RE = re.compile(r"^/afclaude/api/questions/(\d{1,9})/(answer|decide)$")
-QUESTION_FIELDS = {"answer": {"answer"}, "decide": {"choice", "text", "note", "version"}}
+QUESTION_FIELDS = {"answer": {"answer", "option"}, "decide": {"choice", "text", "note", "version"}}
 BODY_MAX = 16 * 1024
 ACTOR, VIA = "owner", "dashboard"
 
@@ -223,7 +225,8 @@ class Handler(BaseHTTPRequestHandler):
         if (verb == "answer" or typed) and not inbox.rate_ok(conn):
             raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
         if verb == "answer":
-            r = actions.perform(conn, "question.answer", {"task_id": qid, "answer": body.get("answer")},
+            r = actions.perform(conn, "question.answer",
+                                {"task_id": qid, **{k: body[k] for k in ("answer", "option") if k in body}},
                                 actor=ACTOR, via=VIA)
         else:
             r = actions.perform(conn, "question.decide",

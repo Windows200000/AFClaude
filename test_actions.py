@@ -401,7 +401,9 @@ class Questions(Base):
         self.assertEqual(store.execution_order(self.conn, kind="task"), [])  # the dispatcher never sees it
         with self.assertRaisesRegex(store.InvalidTransition, "is a question"):
             self.do("task.start", task_id=q["id"], session=SID)
-        a = self.do("task.answer", task_id=q["id"], answer="Yes, go.")
+        with self.assertRaisesRegex(ValueError, "question for the owner"):
+            self.do("task.answer", task_id=q["id"], answer="Yes, go.")       # only the owner answers a question
+        a = store.answer_task(self.conn, q["id"], "Yes, go.")            # question.answer: test_question_answers
         self.assertEqual((a["status"], a["answer"]), ("done", "Yes, go."))
         self.assertIsNotNone(a["done_at"])
         self.assertEqual(store.pending_user_input(self.conn)["blocked_tasks"], [])

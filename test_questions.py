@@ -397,9 +397,14 @@ class Plain(Env):
             with self.assertRaises(ValueError, msg=str(bad)):
                 self.do("task.ask", question="q", options=bad)
 
-    def test_a_plain_answer_still_closes_it(self):
+    def test_a_plain_answer_closes_it_through_question_answer_not_task_answer(self):
+        self.manager()
         t = self.do("task.ask", question="Which one?", options=["a", "b"])
-        r = self.do("task.answer", task_id=t["id"], answer="b", actor="owner", via="dashboard")
+        for kw in (dict(), dict(actor="owner", via="dashboard"), dict(actor="mcp:abc", via="mcp")):
+            with self.assertRaisesRegex(ValueError, "question for the owner.*question.answer.*question.close"):
+                self.do("task.answer", task_id=t["id"], answer="b", **kw)
+        self.assertEqual(self.task(t["id"])["status"], "blocked")
+        r = self.dash("question.answer", task_id=t["id"], answer="b")
         self.assertEqual((r["status"], r["answer"]), ("done", "b"))
 
 
@@ -448,6 +453,22 @@ class Cli(Env):
         self.assertIn("still waits for the owner", err)
         out = self.cli("list")[1]
         self.assertIn(f"[about {p['id']}]", out)
+
+    def test_question_answer_is_the_owners_cli_and_refused_to_an_autonomous_session(self):
+        self.manager()
+        t = self.do("task.ask", question="Which one?", title="Pick", options=["a", "b"])
+        with mock.patch.dict(os.environ, {"CLAUDE_GUARD_DISABLE": "1"}):       # a session AFClaude launched
+            code, _, err = self.cli("answer", str(t["id"]), "a")
+        self.assertEqual(code, 1)
+        self.assertIn("owner's", err)
+        self.assertEqual(self.task(t["id"])["status"], "blocked")
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_GUARD_DISABLE", "CLAUDE_CODE_SESSION_ID")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, _ = self.cli("answer", str(t["id"]), "a, then b")
+        self.assertEqual((code, out.strip()), (0, "question #1: done"))
+        self.assertEqual(self.task(t["id"])["answer"], "a, then b")
+        (m,) = store.list_inbox(self.conn)
+        self.assertEqual((m["text"], m["question_id"], m["origin"], m["created_by"]), ("a, then b", t["id"], "typed", "cli"))
 
     def test_answer_refuses_a_decision_question(self):
         p = self.proposal()
@@ -543,7 +564,7 @@ class DeployPath(unittest.TestCase):
         self.addCleanup(conn.close)
         t = [x for x in store.list_tasks(conn, kind="question")][0]
         self.assertEqual((t["title"], t["options"], t["decision_id"]), ("old", None, None))
-        r = actions.perform(conn, "task.answer", {"task_id": t["id"], "answer": "ok"}, actor="owner", via="dashboard")
+        r = store.answer_task(conn, t["id"], "ok")
         self.assertEqual(r["status"], "done")                    # a question the older code asked is a plain one
 
 

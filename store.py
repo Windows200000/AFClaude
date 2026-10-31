@@ -982,7 +982,11 @@ COLUMNS = {
                        ("dismissed_at", "TEXT"),
                        # phase 4b Q3: the question an owner's text answers (a plain answer, or the edit
                        # text / note of a decision answer), so the delivery can name it
-                       ("question_id", "INTEGER")],
+                       ("question_id", "INTEGER"),
+                       # phase 4b Q3 W2: who wrote the text: typed (the owner), option (an option button: the
+                       # task-manager's wording), edit (an edit of the task-manager's summary). owner_words
+                       # counts only typed rows as the owner's words (D-285); a row without it is typed
+                       ("origin", "TEXT NOT NULL DEFAULT 'typed'")],
     # phase 4b Q3: the owner confirmed this task-manager entry (decision.confirm, question.decide); from then
     # on it is protected like an owner's entry (D-104)
     "decisions": [("confirmed_at", "TEXT"), ("confirmed_by", "TEXT")],
@@ -3623,17 +3627,22 @@ def inbox_row(conn: sqlite3.Connection, msg_id: object) -> Row:
     return m
 
 
+INBOX_ORIGINS = ("typed", "option", "edit")
+
+
 def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str,
-              question_id: int | None = None, noted: str | None = None) -> Row:
+              question_id: int | None = None, noted: str | None = None, origin: str = "typed") -> Row:
     """A new message. question_id: the question the text answers (the delivery names it). noted: the reason of a
     verdict "note" given at once, without a triage (a decision answer's note: the change is already
-    applied); the message is then noted, not pending."""
+    applied); the message is then noted, not pending. origin: typed | option | edit (INBOX_ORIGINS); only a
+    typed text is the owner's own words."""
+    _enum(origin, INBOX_ORIGINS, "origin")
     clean = inbox_text(text)
     sid = _session_id(session_id)
     with transaction(conn):
         ts = now_iso()
-        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, question_id) "
-                           "VALUES (?, ?, ?, ?, ?)", (ts, created_by, sid, clean, question_id))
+        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, question_id, origin) "
+                           "VALUES (?, ?, ?, ?, ?, ?)", (ts, created_by, sid, clean, question_id, origin))
         if noted is not None:
             conn.execute("UPDATE inbox_messages SET status='noted', verdict='note', verdict_reason=?, triaged_at=? "
                          "WHERE id=?", (noted, ts, _rowid(cur)))

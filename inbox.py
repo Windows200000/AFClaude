@@ -140,8 +140,8 @@ def parse_triage(returncode: int, stdout: str, stderr: str = "") -> dict[str, An
 
 def question_about(conn: sqlite3.Connection, m: dict[str, Any]) -> str | None:
     """The delivery header of a message that answers a question (phase 4b Q3): "answer to your question #N
-    <title>", and for a decision question what the owner chose (the choice is on the question, not in the
-    message's text). None for any other message."""
+    <title>", and what the owner chose: for a decision question its choice (on the question, not in the
+    message's text), for an option button the option's number. None for any other message."""
     qid = m.get("question_id")
     if qid is None:
         return None
@@ -151,6 +151,10 @@ def question_about(conn: sqlite3.Connection, m: dict[str, Any]) -> str | None:
     about = f"answer to your question #{qid} {one_line(q['title'])}"
     if q.get("decision_id") and q.get("answer"):
         about += f" (the owner chose: {q['answer']})"
+    elif m.get("origin") == "option":       # the text is one of the question's own options: say so
+        opts = list(q.get("options") or [])
+        n = opts.index(m["text"]) + 1 if m["text"] in opts else None
+        about += f" (the owner chose option {n}: {one_line(m['text'])})" if n else " (the owner chose an option)"
     return about
 
 

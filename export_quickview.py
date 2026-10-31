@@ -398,10 +398,19 @@ def parse_open_questions(oq_md):
     with its '- ' / '## ' stripped. A line is part of the current item unless it starts a new one: a '-'
     with no leading indentation (not inside a '## ' section, whose own '- ' lines are its body) or a '## '
     heading. Indented continuation lines and nested numbered/bulleted sub-items (D-279: a multi-line item
-    must not collapse to its first line) stay with the item. Text before the first item (title, blank,
-    comments) is no question."""
-    items, cur, style = [], None, None
+    must not collapse to its first line) stay with the item, and so does a fenced code block (``` or ~~~).
+    Text before the first item (title, blank, comments) is no question."""
+    items, cur, style, fence = [], None, None, None
     for line in oq_md.splitlines():
+        m = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence is not None or m:     # a fenced code block is body text: its '## ' and '- ' lines start no item
+            if fence is None:
+                fence = m.group(1)[0] * 3
+            elif re.match(r"^\s*" + re.escape(fence[0]) + "{3,}\\s*$", line):
+                fence = None
+            if cur is not None:
+                cur.append(line.rstrip())
+            continue
         if re.match(r"^##\s+\S", line):
             if cur is not None:
                 items.append((style, cur))
@@ -469,15 +478,16 @@ def needs_input():
     """What waits for the owner. Questions: while meta questions_source is "file" (until Q3's import) the
     items of OPEN_QUESTIONS.md, both formats; the DB's open questions (decision questions, asked ones) are
     shown by the page live from the inbox API, with their answer controls (D-300), in both states. Blocked
-    tasks (kind task) as before; a blocked question is not one of them. A DB error or an unknown source
-    is shown in `error`, and the file's items stay."""
-    source, err = "file", None
+    tasks (kind task) as before; a blocked question is not one of them. The file's items show only when the
+    DB said "file": a DB error or an unknown source gives `source` None, no items and the error (D-235: no
+    old list passed off as current)."""
+    source, err = None, None
     try:
         conn = store.connect()
         try:
             source = store.get_meta(conn, "questions_source", "file")
             if source not in QUESTIONS_SOURCES:
-                err, source = "questions_source is %r (want file|db)" % source, "file"
+                err, source = "questions_source is %r (want file|db)" % source, None
             import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
             stalled.scan(conn)
             inbox = store.pending_user_input(conn)
@@ -487,7 +497,7 @@ def needs_input():
                     "question": t.get("blocked_question")}
                    for t in inbox["blocked_tasks"] if t.get("kind") != "question"]
     except Exception as e:  # noqa: BLE001 - never let a DB hiccup break the export
-        blocked, err = [], str(e)[:300]
+        blocked, err, source = [], str(e)[:300], None
     open_questions = []
     if source == "file":
         oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
