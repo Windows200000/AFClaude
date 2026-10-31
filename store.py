@@ -79,6 +79,10 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                browser sessions (dashboard/sessions.py; actions.py's auth.session_* writes).
                notices (D-306, additive the same way): the owner's dashboard notices (title, text,
                dismissed_at; actions.py's notice.* writes, inbox.view shows them).
+               Phase 4b Q3 (COLUMNS, no version bump; AFTER_COLUMNS holds the index that needs one):
+               tasks.options / decision_id (a question's answer choices; the decision it asks about,
+               one open question per decision), inbox_messages.question_id and decisions.confirmed_at /
+               confirmed_by (an owner-confirmed task-manager entry is protected, D-104).
                setup_codes (phase 6a W7, additive the same way, SETUP_SCHEMA): the one-time setup
                code (first owner) and admin reset-auth codes (dashboard/setup.py; actions.py's
                setup.mint_code / setup.claim_code write it; only a code's hash is ever stored).
@@ -952,7 +956,10 @@ COLUMNS = {
                  ("manager_model", "TEXT"), ("manager_effort", "TEXT")],   # D-260: manager_launch.py
     "sessions": [],
     "limit_hits": [],
-    "tasks": [VERSION_COL, ("estimated_sessions", "REAL")],   # D-213: stage_eta.py
+    # D-213: stage_eta.py. Phase 4b Q3: a question's answer choices (options: a JSON list of short strings,
+    # optional) and the decision it asks about (decision_id, no FK: the decision may go while the closed
+    # question stays; a unique index below allows one open question per decision)
+    "tasks": [VERSION_COL, ("estimated_sessions", "REAL"), ("options", "TEXT"), ("decision_id", "TEXT")],
     "task_events": [],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
@@ -972,8 +979,18 @@ COLUMNS = {
     "inbox_messages": [("retry_after", "TEXT"),
                        # D-304: the owner dismissed the answered thread on the dashboard (inbox.dismiss);
                        # until then it stays in the questions section; a later reply clears it again
-                       ("dismissed_at", "TEXT")],
+                       ("dismissed_at", "TEXT"),
+                       # phase 4b Q3: the question an owner's text answers (a plain answer, or the edit
+                       # text / note of a decision answer), so the delivery can name it
+                       ("question_id", "INTEGER")],
+    # phase 4b Q3: the owner confirmed this task-manager entry (decision.confirm, question.decide); from then
+    # on it is protected like an owner's entry (D-104)
+    "decisions": [("confirmed_at", "TEXT"), ("confirmed_by", "TEXT")],
 }
+# DDL that needs a COLUMNS column, run right after them (an older database lacks the column until then)
+AFTER_COLUMNS = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_open_decision_question ON tasks(decision_id) "
+    "WHERE decision_id IS NOT NULL AND status NOT IN ('done', 'cancelled')"]
 
 SESSION_FIELDS = (
     "project_dir", "path", "cwd", "title", "title_rank", "first_seen", "last_activity", "own",
@@ -1200,7 +1217,7 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
             for name, decl in cols:
                 if name not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-        for ddl in VERSION_TRIGGERS:
+        for ddl in AFTER_COLUMNS + VERSION_TRIGGERS:
             conn.execute(ddl)
         if before is not None and before < 4 and get_meta(conn, "migrated_v4_at") is None:
             set_meta(conn, "migrated_v4_at", now_iso())
@@ -1797,6 +1814,8 @@ def _task_dict(r: sqlite3.Row) -> Row:
     kept for readers like export_quickview.py), plus 'project_rank'."""
     d = dict(r)
     d["project"] = d["project_name"]
+    if d.get("options"):
+        d["options"] = json.loads(d["options"])
     return d
 
 
@@ -2271,11 +2290,16 @@ def _update(conn: sqlite3.Connection, task_id: int, event: str, fields: Mapping[
 def update_task(conn: sqlite3.Connection, task_id: int, **fields: object) -> Row:
     """Change title/description/project/priority/kind/estimated_sessions. Logs one 'updated'
     event with {field: [old, new]} (nothing is logged if nothing changed).
-    A new project appends the task as that project's last stage."""
+    A new project appends the task as that project's last stage. A decision question's kind, title and
+    description follow its entry (reword_question), nobody edits them."""
     bad = set(fields) - set(TASK_EDITABLE)
     if bad:
         raise ValueError(f"not editable: {sorted(bad)} (editable: {', '.join(TASK_EDITABLE)}; "
                          "status changes go through block/answer/start/finish/cancel/reopen)")
+    fixed = sorted(set(fields) & {"kind", "title", "description"})
+    if fixed and _task_row(conn, task_id).get("decision_id"):
+        raise ValueError(f"task #{task_id} is a decision question: its {', '.join(fixed)} doesn't change "
+                         "(it is rendered from the entry)")
     return _update(conn, task_id, "updated", fields)
 
 
@@ -2356,19 +2380,68 @@ def answer_task(conn: sqlite3.Connection, task_id: int, answer: object) -> Row:
                            answer=a, answered_at=NOW)
 
 
+QUESTION_OPTIONS_MAX = 8
+QUESTION_OPTION_MAX = 120
+
+
+def question_options(options: object) -> list[str] | None:
+    """The answer choices of a question: None / empty = none, else a list of up to QUESTION_OPTIONS_MAX
+    distinct short strings (a single string is one choice). Anything else is a ValueError."""
+    if options is None:
+        return None
+    items = options if isinstance(options, list) else [options]
+    out = [_text(o, "option", required=True) for o in items]
+    if not out:
+        return None
+    if len(set(out)) != len(out) or len(out) > QUESTION_OPTIONS_MAX or any(len(o) > QUESTION_OPTION_MAX for o in out):
+        raise ValueError(f"options: at most {QUESTION_OPTIONS_MAX} different choices of at most "
+                         f"{QUESTION_OPTION_MAX} characters each")
+    return out
+
+
 def ask_question(conn: sqlite3.Connection, question: object, project: object = None,
-                 created_by_session: object = None, title: object = None) -> Row:
+                 created_by_session: object = None, title: object = None, options: object = None,
+                 decision_id: str | None = None) -> Row:
     """v4: a question for the user from a (manager) session, as a task of kind
     'question' that is born blocked, so it is in the inbox like any blocked task.
     Its answer closes it (done); the dispatcher never starts it (it only takes
-    kind 'task'). title defaults to the question's first line, cut at 120 chars."""
+    kind 'task'). title defaults to the question's first line, cut at 120 chars.
+    options: the answer choices (question_options). decision_id: the decision entry it asks about (set
+    by actions' decision questions; at most one open question per decision)."""
     q = _text(question, "question", required=True)
+    opts = question_options(options)
     if title is None:
         first = q.splitlines()[0].strip()
         title = first if len(first) <= 120 else first[:119] + "…"
     with transaction(conn):
+        if decision_id is not None and open_decision_question(conn, decision_id) is not None:
+            raise InvalidTransition(f"{decision_id} already has an open question")
         t = _add_task(conn, title, None, project, DEFAULT_PRIORITY, QUESTION_KIND, created_by_session)
+        if opts or decision_id:
+            conn.execute("UPDATE tasks SET options = ?, decision_id = ? WHERE id = ?",
+                         (json.dumps(opts, ensure_ascii=False) if opts else None, decision_id, t["id"]))
         return block_task(conn, t["id"], q)
+
+
+def open_decision_question(conn: sqlite3.Connection, decision: str) -> Row | None:
+    """The open (not done, not cancelled) question that asks about decision `decision`, if any."""
+    r = conn.execute(TASK_SELECT + " WHERE t.decision_id = ? AND t.status NOT IN ('done', 'cancelled')",
+                     (decision,)).fetchone()
+    return _task_dict(r) if r else None
+
+
+def reword_question(conn: sqlite3.Connection, task_id: int, title: str, question: str,
+                    options: Sequence[str] | None = None) -> Row:
+    """A decision question's text, title and choices follow its entry (decision.edit): the blocked question
+    is overwritten, the old text goes into the history."""
+    with transaction(conn):
+        t = _task_row(conn, task_id)
+        ts = now_iso()
+        conn.execute("UPDATE tasks SET title = ?, blocked_question = ?, options = ?, updated_at = ? WHERE id = ?",
+                     (title, question, json.dumps(list(options), ensure_ascii=False) if options else None, ts,
+                      task_id))
+        _event(conn, task_id, ts, "reworded", {"was": t["blocked_question"]})
+        return _task_row(conn, task_id)
 
 
 def start_task(conn: sqlite3.Connection, task_id: int, session: object) -> Row:
@@ -2402,6 +2475,9 @@ def reopen_task(conn: sqlite3.Connection, task_id: int, reason: object = None) -
     question goes back to blocked (asked again, the old answer cleared)."""
     r = _text(reason, "reason")
     with transaction(conn):
+        if _task_row(conn, task_id).get("decision_id"):
+            raise InvalidTransition(f"task #{task_id} is a decision question: it isn't reopened (an entry "
+                                    "that still needs the owner has its open question already)")
         if _task_row(conn, task_id)["kind"] == QUESTION_KIND:
             return _transition(conn, task_id, ("done", "cancelled"), "blocked", "reopened",
                                {"reason": r} if r else None, done_at=None, answer=None, answered_at=None,
@@ -4164,12 +4240,26 @@ def update_decision_entry(conn: sqlite3.Connection, decision: object, fields: Ma
 def set_decision_state(conn: sqlite3.Connection, decision: object, state: str, status: str | None, body: str,
                        by: str) -> Row:
     """Move a native decision to `state` (a confirmed proposal becomes active), with its Status line and
-    the re-rendered body."""
+    the re-rendered body. The owner's confirmation is stored with it (confirmed_at / confirmed_by:
+    protected from then on, D-104)."""
     cur = get_decision_entry(conn, decision)
     if cur is None:
         raise NotFound(f"no decision {decision}")
+    now = now_iso()
     conn.execute("UPDATE decisions SET state = ?, status = ?, body = ?, body_sha256 = ?, updated_at = ?, "
-                 "updated_by = ? WHERE id = ?", (state, status, body, sha256_text(body), now_iso(), by, cur["id"]))
+                 "updated_by = ?, confirmed_at = ?, confirmed_by = ? WHERE id = ?",
+                 (state, status, body, sha256_text(body), now, by, now, by, cur["id"]))
+    return _decision_refresh(conn, cur["id"])
+
+
+def set_decision_confirmed(conn: sqlite3.Connection, decision: object, by: str) -> Row:
+    """An active task-manager entry the owner confirms: confirmed_at / confirmed_by, nothing else."""
+    cur = get_decision_entry(conn, decision)
+    if cur is None:
+        raise NotFound(f"no decision {decision}")
+    now = now_iso()
+    conn.execute("UPDATE decisions SET confirmed_at = ?, confirmed_by = ?, updated_at = ?, updated_by = ? "
+                 "WHERE id = ?", (now, by, now, by, cur["id"]))
     return _decision_refresh(conn, cur["id"])
 
 

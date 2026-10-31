@@ -28,6 +28,12 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py decide SESSION continue|ignore|clear [--note N]   (current stall only)
     tasks.py rule add session|project MATCH continue|ignore [--note N]
     tasks.py rule list | rule rm ID
+    tasks.py question ask "text" [--title T] [--option O ...] [--project P]
+                                           ask the owner (plain words, the whole question in the text;
+                                           D-279); --option: a short answer choice, repeatable
+    tasks.py question list [--answered]    the open questions (--answered: the recent answered or closed ones)
+    tasks.py question close ID --reason R  a question that no longer needs the owner (D-102); one about a
+                                           decision entry closes with the entry
     tasks.py inbox                         everything that needs the user's input
     tasks.py inbox list [--all]            the owner's messages from the dashboard (D-241): open ones
                                            (--all: the recent ones), newest first
@@ -391,6 +397,9 @@ def decision_out(d):
     print(d["body"])
     if d["state"] == "proposed":
         print("- (proposed: not yet confirmed by the owner)")
+    if d.get("confirmed_at"):
+        print(f"- (confirmed by the owner, {berlin(d['confirmed_at'])}, via {d['confirmed_by']}: protected, "
+              "changed only through the owner)")
     if d["topics"]:
         print(f"- (topics: {', '.join(d['topics'])})")
     if d["links"]:
@@ -670,6 +679,8 @@ def run(conn, args):
         return run_now(conn, args) or 0
     elif c == "notice":
         run_notice(conn, args)
+    elif c == "question":
+        run_question(conn, args)
     elif c == "inbox" and args.inbox_cmd:
         run_inbox_messages(conn, args)
     elif c == "inbox":
@@ -856,6 +867,45 @@ def print_notice(n):
     about = f"  [{n['project_name']}]" if n["project_name"] else ""
     print(f"#{n['id']}  {berlin(n['created_at'])}  {state}{about}  {n['title']}")
     print("   " + n["text"].replace("\n", "\n   "))
+
+
+def print_question(q):
+    where = f"  {q['project']}" if q["project_id"] else ""
+    about = f"  [about {q['decision_id']}]" if q.get("decision_id") else ""
+    print(f"#{q['id']}  {q['status']}{where}{about}  {q['title']}")
+    if q["status"] == "blocked":
+        print("   " + (q["blocked_question"] or "").replace("\n", "\n   "))
+    if q.get("options"):
+        print("   options: " + " | ".join(q["options"]))
+    if q["answer"]:
+        print(f"   answer ({berlin(q['answered_at'])}): {q['answer']}")
+
+
+def run_question(conn, args):
+    """Phase 4b Q3: questions for the owner (ask, list, close). The owner answers on the dashboard."""
+    qc = args.question_cmd
+    if qc == "list":
+        rows = store.list_tasks(conn, kind=store.QUESTION_KIND,
+                                status=("done", "cancelled") if args.answered else "blocked")
+        if args.answered:
+            rows = sorted(rows, key=lambda t: t["done_at"] or "", reverse=True)[:args.limit]
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print("no answered or closed questions" if args.answered else "no open questions")
+        for q in rows:
+            print_question(q)
+        return None
+    if qc == "ask":
+        project = project_ref(args.project)
+        if project is None:     # the project of the directory the command runs in, if there is one
+            p = store.get_project(conn, os.getcwd())
+            project = p["name"] if p else None
+        q = act(conn, "task.ask", question=args.text, title=args.title, options=args.option, project=project,
+                created_by_session=os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    else:   # close
+        q = act(conn, "question.close", task_id=args.id, reason=args.reason)
+    return dump(q) if args.json else print(f"question #{q['id']}: {q['status']}")
 
 
 def run_notice(conn, args):
@@ -1119,6 +1169,20 @@ def parser():
                                                     "each compaction; the file is not changed)")
     q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")
     q.add_argument("--force", action="store_true", help="allow removing more than half of the decisions")
+    p = sub.add_parser("question", help="questions for the owner (phase 4b Q3): ask | list | close")
+    qs = p.add_subparsers(dest="question_cmd", required=True)
+    q = qs.add_parser("ask", parents=[js], help="ask the owner: plain words, the whole question in the text")
+    q.add_argument("text")
+    q.add_argument("--title", help="a short heading (default: the first line of the text)")
+    q.add_argument("--option", action="append", help="a short answer choice (repeat for more); the owner may "
+                                                     "always type an answer of their own")
+    q.add_argument("--project", help="name or directory (default: the project of the current directory)")
+    q = qs.add_parser("list", parents=[js], help="the open questions")
+    q.add_argument("--answered", action="store_true", help="the recent answered or closed ones instead")
+    q.add_argument("--limit", type=int, default=30, help="with --answered: how many (default 30)")
+    q = qs.add_parser("close", parents=[js], help="a question that no longer needs the owner (cancelled, audited)")
+    q.add_argument("id", type=int)
+    q.add_argument("--reason", required=True)
     p = sub.add_parser("notice", help="notices for the owner on the dashboard (D-306): post | list | dismiss")
     ns = p.add_subparsers(dest="notice_cmd", required=True)
     q = ns.add_parser("post", parents=[js], help="post a notice (shown until the owner dismisses it)")

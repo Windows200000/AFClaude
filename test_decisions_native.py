@@ -126,7 +126,7 @@ class V4Env(unittest.TestCase):
                         actor="cli", via="cli")
         # make it a v4 database: the old table shape, the old version mark, no new tables
         rows = [dict(r) for r in conn.execute("SELECT * FROM decisions")]
-        self.old_cols = [c for c in rows[0] if c not in ("slug", "project_id", "author", "origin")]
+        self.old_cols = [c for c in rows[0] if c not in ("slug", "project_id", "author", "origin", "confirmed_at", "confirmed_by")]
         conn.executescript("DROP TABLE decision_topics; DROP TABLE decision_links; DROP TABLE decisions;")
         conn.executescript(V4_DDL)
         conn.execute("CREATE TRIGGER decisions_version AFTER UPDATE ON decisions FOR EACH ROW WHEN NEW.version IS "

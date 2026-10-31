@@ -100,6 +100,7 @@ def task_brief(t: Mapping[str, Any]) -> dict[str, Any]:
                     "project": t["project"], "stage": t["stage_seq"],
                     "kind": t["kind"] if t["kind"] != "task" else None,
                     "estimated_sessions": t.get("estimated_sessions"),
+                    "options": t.get("options"), "decision": t.get("decision_id"),
                     "question": t["blocked_question"] if t["status"] == "blocked" else None,
                     "updated": bt(t["updated_at"])})
 
@@ -327,7 +328,8 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
         conn.close()
 
 
-@tool("Answer a blocked AFClaude task's question; it becomes pending (ready for the next run) again.")
+@tool("Answer a blocked AFClaude task's question; it becomes pending (ready for the next run) again. Not for a "
+      "question about a decision entry (the owner decides those).")
 async def afclaude_answer_task(id: int, answer: str) -> str:
     conn = db()
     try:
@@ -339,15 +341,18 @@ async def afclaude_answer_task(id: int, answer: str) -> str:
 
 @tool("Ask the user a question you can't decide yourself: it becomes a blocked AFClaude task (kind question) in "
       "their inbox; their answer closes it (read it with afclaude_get_task). project: name or directory; default = "
-      "the calling session's directory. Returns the task.")
-async def afclaude_ask(question: str, project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+      "the calling session's directory. options: short answer choices (the owner can always type their own). "
+      "Returns the task.")
+async def afclaude_ask(question: str, project: Optional[str] = None, options: Optional[list[str]] = None,
+                       ctx: Optional[Context] = None) -> str:
     if project is None or not project.strip():
         project, _ = await caller_dir(ctx)
     else:
         project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
-        t = act(conn, "task.ask", question=question, project=project, created_by_session=session_id_env())
+        t = act(conn, "task.ask", question=question, project=project, options=options,
+                created_by_session=session_id_env())
     finally:
         conn.close()
     return out(task_brief(t))

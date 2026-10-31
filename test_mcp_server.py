@@ -132,6 +132,21 @@ class Tasks(Env):
         t = run(ms.afclaude_add_task("from env"))
         self.assertEqual((t["project"], t["project_source"]), ("Proj", "env"))
 
+    def test_ask_with_options_and_a_decision_question_is_not_answered_here(self):
+        t = run(ms.afclaude_ask("Which port?", project="A", options=["80", "8080"]))
+        self.assertEqual((t["kind"], t["options"]), ("question", ["80", "8080"]))
+        self.assertEqual(run(ms.afclaude_get_task(t["id"]))["options"], ["80", "8080"])
+        with self.assertRaisesRegex(ToolError, "at most 8 different choices"):
+            asyncio.run(ms.afclaude_ask("Which?", project="A", options=["x", "x"]))
+        c = store.connect(self.db)
+        try:
+            p = actions.perform(c, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager"},
+                                actor="cli", via="cli")
+        finally:
+            c.close()
+        with self.assertRaisesRegex(ToolError, f"asks about decision {p['id']}"):
+            asyncio.run(ms.afclaude_answer_task(p["question"], "yes"))
+
     def test_list_get_update_answer(self):
         a = run(ms.afclaude_add_task("A1", project="A"))
         b = run(ms.afclaude_add_task("B1", project="B"))
@@ -710,7 +725,8 @@ class Stdio(unittest.TestCase):
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
-        # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535)
+        # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
+        # then afclaude_ask's options (phase 4b Q3 W1: 17800)
         self.assertLess(size, 18000, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
