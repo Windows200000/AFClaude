@@ -107,11 +107,19 @@ def _preamble_problems(lines: list[str]) -> list[str]:
     return out
 
 
+def _quickview() -> Any:
+    """export_quickview, imported on first use. Importing it loads keepalive and the settings, which read
+    the DB on their own connection: never inside a write transaction (the write lock would make that read
+    wait out its busy timeout), so import_questions loads it before it connects."""
+    import export_quickview
+    return export_quickview
+
+
 def parse_items(text: str) -> tuple[list[Item], list[str]]:
     """(items, problems) of the file's text. problems: text before the first item, an item without a
     title, and an item that only points to a .md file (D-279). No item at all is a problem too."""
-    import export_quickview
-    raw = export_quickview.parse_open_questions(text)  # type: ignore[no-untyped-call]  # the quickview's own parser (D-279)
+    qv = _quickview()
+    raw = qv.parse_open_questions(text)
     lines = text.splitlines()
     kept = sum(len(part) for _style, part in raw)
     problems = _preamble_problems(lines[:len(lines) - kept])
@@ -123,7 +131,7 @@ def parse_items(text: str) -> tuple[list[Item], list[str]]:
         item = Item(style, item_title(body[0]), "\n".join(body))
         if not item.title:
             problems.append(f"item {n} ({body[0][:40]!r}) has no title after its label")
-        warn = export_quickview._open_question_warning(part)  # type: ignore[no-untyped-call]  # D-279's pointer check
+        warn = qv._open_question_warning(part)         # D-279's pointer check
         if warn:
             problems.append(f"item {n} ({item.title[:40]!r}) {warn}")
         items.append(item)
@@ -167,6 +175,7 @@ def import_questions(db_path: Optional[str] = None, path: Optional[str] = None, 
     (<db>.preqimport-<utc>.bak) and the action question.import in one transaction. undo: the action's undo
     (no backup: it only cancels the imported questions). -> the action's result."""
     import actions
+    _quickview()                  # before the connection: see _quickview
     params: dict[str, Any] = {"dry_run": True}
     if undo:
         params["undo"] = True
