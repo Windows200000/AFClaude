@@ -1170,9 +1170,10 @@ class EveryAction(Base):
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
-        # (both in test_questions)
+        # (both in test_questions); question.import is CLI-only too (test_question_import)
         self.assertEqual({n for n, _ in script},
-                         set(actions.ACTIONS) - {"decision.seed", "question.decide", "question.answer"})
+                         set(actions.ACTIONS) - {"decision.seed", "question.decide", "question.answer",
+                                                 "question.import"})
         for i, (name, params) in enumerate(script, 1):
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
