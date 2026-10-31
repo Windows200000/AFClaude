@@ -212,9 +212,12 @@ def cron_check(db_path: Optional[str] = None, repo: Optional[str] = None,
         if source_of(conn) != "db":
             return 0, ""
         try:
-            sha: Optional[str] = read_source(path)[1]
+            with open(path, "rb") as fh:          # the raw bytes: a save that is not UTF-8 is a change too
+                sha: Optional[str] = hashlib.sha256(fh.read()).hexdigest()
         except FileNotFoundError:
             sha = None
+        except OSError as err:                    # unreadable (a directory, permissions): changed, once
+            sha = f"unreadable:{type(err).__name__}"
         imported = store.get_meta(conn, FILE_SHA_META)
         mark = store.get_meta(conn, CHANGED_MARK)
         if sha is None or sha == imported:
@@ -231,7 +234,7 @@ def cron_check(db_path: Optional[str] = None, repo: Optional[str] = None,
         if alert is None:
             import project_docs
             alert = project_docs._alert
-        alert(subject, body)
+        alert(subject, body)                      # raises when it cannot go out: no mark, the next run retries
         with store.transaction(conn):
             store.set_meta(conn, CHANGED_MARK, sha)
         return 0, f"{store.now_iso()} questions: {subject}"

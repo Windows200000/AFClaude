@@ -427,6 +427,41 @@ class FileCheck(Env):
         self.assertEqual(self.check(), (0, ""))
         self.assertEqual(self.alerts, [])
 
+    def test_a_non_utf8_save_is_a_change_not_a_traceback(self):
+        self.run_import()
+        with open(self.src, "wb") as fh:
+            fh.write(DASH.encode("utf-8") + b"\n- caf\xe9\n")        # latin-1 save
+        code, line = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("changed after the cut-over", line)
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_an_unreadable_file_alerts_once(self):
+        self.run_import()
+        os.remove(self.src)
+        os.mkdir(self.src)                                     # reading it raises IsADirectoryError
+        code, line = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("changed after the cut-over", line)
+        self.assertEqual(self.check(), (0, ""))
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_a_failed_alert_sets_no_mark_and_is_retried(self):
+        self.run_import()
+        self.write(DASH + "\n- x\n")
+        calls = []
+
+        def broken(subject, body):
+            calls.append(subject)
+            raise RuntimeError("push down")
+        with self.assertRaises(RuntimeError):
+            qs.cron_check(self.db, self.tmp, alert=broken)
+        self.assertFalse(self.meta(qs.CHANGED_MARK))
+        code, line = self.check()                              # the next run alerts again
+        self.assertIn("changed after the cut-over", line)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertTrue(self.meta(qs.CHANGED_MARK))
+
 
 if __name__ == "__main__":
     unittest.main()
