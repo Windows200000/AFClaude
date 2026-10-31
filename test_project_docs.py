@@ -13,8 +13,10 @@ import io
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import testenv  # noqa: F401  (hermetic DB/config; before any AFClaude module)
 import actions
@@ -451,6 +453,39 @@ class CronImport(Env):
             self.assertEqual(pd.main(["import", "--cron", "--db", self.db, "--repo", self.repo,
                                       "--reviews-dir", self.reviews]), 0)
         self.assertIn("goals: imported", out.getvalue())
+
+    def test_a_failing_question_check_does_not_hide_the_docs_import(self):
+        import questions
+        self.write("GOALS.md", "# G\n")
+        out = io.StringIO()
+        with mock.patch.object(questions, "cron_check", side_effect=RuntimeError("check broke")), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(RuntimeError):
+                pd.main(["import", "--cron", "--db", self.db, "--repo", self.repo,
+                         "--reviews-dir", self.reviews])
+        self.assertIn("goals: imported", out.getvalue())               # the docs import ran before the check
+        with self.conn() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM docs WHERE name = 'goals'").fetchone()[0], 1)
+
+    def test_a_failed_alert_is_logged_raised_and_the_episode_stays_unmarked(self):
+        self.write("PROGRESS.md", "- 1\n")
+        self.cron()
+        self.act("doc.set", project="P", name="progress", text="- 1 db\n")
+        self.write("PROGRESS.md", "- 1 file\n")
+        err = io.StringIO()
+
+        def real_alert(subject, body):
+            with mock.patch.dict(sys.modules, {"notify": mock.Mock(notify=mock.Mock(side_effect=OSError("down")))}):
+                self.saved_alert(subject, body)
+        pd._alert = real_alert
+        with contextlib.redirect_stderr(err), self.assertRaises(OSError):
+            self.cron()
+        self.assertIn("alert failed: OSError: down", err.getvalue())
+        with self.conn() as c:
+            self.assertFalse(store.get_meta(c, f"{pd.CONFLICT_MARK}P/progress"))
+        pd._alert = lambda subject, body: self.alerts.append(subject)
+        self.cron()                                                    # the next run retries
+        self.assertEqual(self.alerts, ["docs import: conflict in P/progress"])
 
 
 class Cli(Env):

@@ -20,7 +20,7 @@ REMINDER = (
     "request to a subagent (Agent tool) unless it is so small that delegating would cost "
     "more context than doing it (a one-line check, a status-file update, a commit). This "
     "also applies when the user asks you directly to do or test something. If the user "
-    "just resolved or answered something, delete it from OPEN_QUESTIONS.md first."
+    "just resolved or answered something, close its question in the AFClaude DB first."
 )
 
 

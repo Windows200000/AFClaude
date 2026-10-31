@@ -10,6 +10,7 @@ You are a worker subagent of the AFClaude task-manager. The brief you get names 
 - Work only in the directory you were given (the AFClaude repo or a worktree of it). The brief names the branch; commit there. Code the live system imports (keepalive.py, store.py, stalled.py, usage_sampler.py, export_quickview.py, ka_resume.sh and everything they import) is only changed in a worktree, never on main in the live checkout.
 - Don't merge into main, push main, deploy, rebuild or restart containers, change crontabs, or touch scheduled jobs unless the brief says so. The task-manager reviews and merges.
 - Never edit ~/.claude.json or user-level Claude settings. Never run tools/test_e2e_tmux.sh.
+- A question for the owner goes into your report, never into a file or the DB (the task-manager asks).
 - If a permission check blocks something, don't work around it (no other command that does the same); stop that part and report it.
 - Guard hooks: before any state-changing or destructive command or an edit outside your work dir, read /mnt/BlockVolume/Claude/.claude/hooks/guard-destructive-bash.sh and guard-sensitive-edit.sh; anything they would "ask" about needs the owner's approval: report it instead of doing it.
 - The repo is public: no personal data, secrets, IP addresses, domains or host details in committed files. Never bypass tools/check_public.py (no --no-verify); rephrase instead.

@@ -274,6 +274,29 @@ class ProjectVarsTest(unittest.TestCase):
         self.assertEqual(self.do("prompt_var.migrate")["seeded"], [])   # idempotent, no audit row
         self.assertEqual(len(self.audits("prompt_var.migrate")), 1)
 
+    def test_migrate_moves_an_untouched_old_seed_and_keeps_a_changed_value(self):
+        """Phase 4b Q3 W3: the questions moved into the DB; a value that still equals the old seed (what the
+        earlier migrate wrote) moves to the new one, audited with the old value; one someone changed stays."""
+        me = store.add_project(self.conn, "Here", path=prompts.HERE)
+        for k, v in prompts.CHECKOUT_SEED.items():                       # an install migrated before: the old seeds
+            self.do("prompt_var.set", project="Here", name=k, value=prompts.OLD_CHECKOUT_SEED.get(k, v))
+        self.do("prompt_var.set", project="Here", name="project_notes", value="- my own note about OPEN_QUESTIONS.md")
+        before = len(self.audits("prompt_var.migrate"))
+        r = self.do("prompt_var.migrate", actor="runner:deploy")
+        self.assertEqual(sorted(w["name"] for w in r["seeded"]), ["public_repo_rule", "questions_location"])
+        self.assertEqual({w["name"]: w["was"] for w in r["seeded"]},
+                         {k: prompts.OLD_CHECKOUT_SEED[k] for k in ("public_repo_rule", "questions_location")})
+        vals = prompts.project_values(self.conn, me["id"])
+        self.assertEqual(vals["questions_location"], prompts.CHECKOUT_SEED["questions_location"])
+        self.assertEqual(vals["public_repo_rule"], prompts.CHECKOUT_SEED["public_repo_rule"])
+        self.assertEqual(vals["project_notes"], "- my own note about OPEN_QUESTIONS.md")     # changed: kept
+        for k in ("questions_location", "public_repo_rule", "project_notes"):
+            self.assertNotIn("OPEN_QUESTIONS.md", prompts.CHECKOUT_SEED[k])
+        self.assertEqual(len(self.audits("prompt_var.migrate")), before + 1)
+        self.assertIn('"was"', self.audits("prompt_var.migrate")[-1]["after"])
+        self.assertEqual(self.do("prompt_var.migrate")["seeded"], [])    # idempotent, no second audit row
+        self.assertEqual(len(self.audits("prompt_var.migrate")), before + 1)
+
     def test_cli(self):
         with mock.patch("sys.stdout") as out:
             self.assertEqual(prompts.main(["set-var", "Other", "project_notes", "hi"]), 0)
@@ -485,7 +508,8 @@ class SecondProjectTest(unittest.TestCase):
         msg = self.message(self.repo)
         self.assertIn("The repo is public: run tools/guard.sh.", msg)
         self.assertIn("(docs/goals.md: one short line per goal", msg)
-        self.assertIn("and OPEN_QUESTIONS.md (only things", msg)                # the default
+        self.assertIn("and " + prompts.PROJECT_VARS["questions_location"].default + " (only things", msg)   # the default
+        self.assertNotIn("OPEN_QUESTIONS.md", msg)
         rules = self.rules()
         for name in ("PROGRESS.md", "GOALS.md"):
             self.assertNotIn(name, rules)
