@@ -490,21 +490,29 @@ def try_render(name: str, body: str) -> None:
     """Render `body` as the override of `name`, with dummy values, everywhere it would be sent: the
     prompt itself and every bundle that uses it (the rules tail in all its hooked / manager
     variants). The first failure is a ValueError naming where: a bad override must not reach a
-    live session (prompt.set runs this before it writes)."""
+    live session (prompt.set runs this before it writes). A bundle typed into tmux must still start with
+    an AFClaude prefix (owner_words.KEEPALIVE_PREFIXES): the transcript can't tell it from the owner's
+    typing otherwise (D-198)."""
+    import owner_words
     dummy = {v: "x" for spec in PROMPTS.values() for v in spec.system}
     ov = {check_name(name): body}
-    runs: list[tuple[str, Any]] = [(f"prompt {name}", lambda: _render(
-        name, None, {v: "x" for v in PROMPTS[name].system}, ov))]
+    runs: list[tuple[str, Any, bool]] = [(f"prompt {name}", lambda: _render(
+        name, None, {v: "x" for v in PROMPTS[name].system}, ov), False)]
     for kind in bundles_using(name):
         for hooked, manager in ((False, True), (True, True), (False, False)):
             runs.append((f"bundle {kind} (hooked={hooked}, manager={manager})",
                          lambda kind=kind, hooked=hooked, manager=manager:
-                         _bundle(kind, None, "x", hooked, manager, dummy, ov)))
-    for where, fn in runs:
+                         _bundle(kind, None, "x", hooked, manager, dummy, ov),
+                         BUNDLES[kind].flat and kind != "compact"))   # typed into tmux (/compact is put in front by code)
+    for where, fn, typed in runs:
         try:
-            fn()
+            text = fn()
         except (KeyError, IndexError, ValueError, AttributeError, StaleOverride) as e:
             raise ValueError(f"the override does not render in {where}: {type(e).__name__}: {e}") from None
+        if typed and not text.lstrip().startswith(owner_words.KEEPALIVE_PREFIXES):
+            raise ValueError(f"the override does not start with an AFClaude prefix in {where} (one of "
+                             f"{', '.join(owner_words.KEEPALIVE_PREFIXES)}): a text typed into tmux that does "
+                             "not would pass for the owner's words (D-198)")
 
 
 def bundle_system(kind: str) -> set[str]:

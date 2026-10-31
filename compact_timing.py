@@ -47,7 +47,7 @@ its context = input + cache_creation + cache_read tokens; a re-read is a request
 of at least REREAD_MIN_TOKENS whose cache_creation is at least REREAD_FRACTION of its context
 (D-237). A prompt is a non-sidechain user entry with text (not a tool result); an owner prompt is
 one with origin kind "human" that is not a keep-alive message (KEEPALIVE_PREFIXES: those are
-typed into tmux too).
+typed into tmux too); the rule lives in owner_words.py, which decision writes use as well.
 """
 from __future__ import annotations
 
@@ -66,6 +66,7 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import owner_words  # noqa: E402  (the prefix list and the owner-prompt rule)
 import store  # noqa: E402
 
 UTC = timezone.utc
@@ -81,9 +82,8 @@ RUN_END_SLACK = timedelta(seconds=5)
 MID_RUN_GAP = timedelta(minutes=60)          # D-307 (c): no mid-run compaction this soon after the last one
 MID_RUN_OWNER_QUIET = timedelta(minutes=10)  # ... nor this soon after the owner's last message
 MID_RUN_UNCHECKED = "no mid-run compaction checked"   # decide()'s default: a run holds it
-INBOX_PREFIX = "[AFClaude inbox #"           # the owner's dashboard message delivered into the session
-KEEPALIVE_PREFIXES = ("[keep-alive]", "This session was compacted", "You are the long-running", "[AFClaude",
-                      "/compact", "<command-name>/compact")
+INBOX_PREFIX = owner_words.INBOX_PREFIX      # the owner's dashboard message delivered into the session
+KEEPALIVE_PREFIXES = owner_words.KEEPALIVE_PREFIXES   # owner_words.py holds the owner-prompt rule (phase 4b Q2)
 
 # USD per 1M tokens: (input, 5-min cache write, 1-hour cache write, cache read, output). The
 # prices the evaluation's calibration used (14.10.2026); a fit converts every model's tokens to
@@ -340,32 +340,8 @@ def request_of(e: Mapping[str, Any]) -> Optional[tuple[str, Request]]:
     return str(key), r
 
 
-def _text(e: Mapping[str, Any]) -> Optional[str]:
-    """A user entry's prompt text, None for a tool result or no text."""
-    msg = e.get("message")
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
-            return None
-        parts = [str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type") == "text"]
-        return " ".join(parts) if parts else None
-    return None
-
-
-def prompt_kind(e: Mapping[str, Any], text: str) -> str:
-    if e.get("isCompactSummary"):
-        return "summary"
-    if text.lstrip().startswith(INBOX_PREFIX):
-        return "inbox"
-    if text.lstrip().startswith(KEEPALIVE_PREFIXES):
-        return "keepalive"
-    origin = e.get("origin")
-    kind = origin.get("kind") if isinstance(origin, dict) else None
-    if kind == "human" and not e.get("isMeta"):
-        return "owner"
-    return "other"
+_text = owner_words.prompt_text
+prompt_kind = owner_words.prompt_kind
 
 
 def scan(path: str) -> Scan:

@@ -590,23 +590,38 @@ def decision_full(d: Mapping[str, Any]) -> dict[str, Any]:
 
 @tool("The owner's decisions (D-242). find (keywords/topics; all: also done, superseded, proposed): id, title, "
       "topics only, NOT enough to act on: expand (full=true, or show) before acting. show (id D-NNN): the full "
-      "entry. propose (title, topics 1+, optional words/scope/interpretation/keywords/project): your own "
-      "decision, waits for the owner; topics are few free keywords ('all' if general), reuse existing ones.")
-async def afclaude_decisions(action: Literal["find", "show", "propose"], keywords: Optional[list[str]] = None,
+      "entry. propose (title, topics 1+, optional words/scope/interpretation/keywords/project/supersedes ids): your "
+      "own decision, waits for the owner; topics are few free keywords ('all' if general), reuse existing ones. "
+      "record (title, topics, words = the owner's verbatim quote(s) from one owner message of this session, inbox "
+      "or chat; ref only if several match): the owner's decision, active at once.")
+async def afclaude_decisions(action: Literal["find", "show", "propose", "record"],
+                             keywords: Optional[list[str]] = None,
                              id: Optional[str] = None, full: bool = False, all: bool = False,
                              title: Optional[str] = None, topics: Optional[list[str]] = None,
-                             words: Optional[str] = None, scope: Optional[str] = None,
-                             interpretation: Optional[str] = None, project: Optional[str] = None) -> str:
+                             words: Optional[str | list[str]] = None, scope: Optional[str] = None,
+                             interpretation: Optional[str] = None, project: Optional[str] = None,
+                             supersedes: Optional[list[str]] = None, ref: Optional[str] = None) -> str:
     conn = db()
     try:
         if action == "propose":
             if not title:
                 raise ValueError("propose needs title")
             r = act(conn, "decision.add", title=title, topics=topics, author="task-manager", words=words,
-                    scope=scope, interpretation=interpretation, keywords=keywords, project=project)
+                    scope=scope, interpretation=interpretation, keywords=keywords, project=project,
+                    supersedes=supersedes)
             return out(compact({"id": r["id"], "title": r["title"], "state": r["state"], "topics": r["topics"],
-                                "new_topics": r.get("new_topics"), "topic_note": r.get("topic_note"),
+                                "supersedes": r["supersedes"], "new_topics": r.get("new_topics"),
+                                "topic_note": r.get("topic_note"),
                                 "note": "Proposed: it waits for the owner's confirmation."}))
+        if action == "record":
+            if not title or not words:
+                raise ValueError("record needs title and words (the owner's exact quote)")
+            r = act(conn, "decision.add", title=title, topics=topics, author="owner", words=words,
+                    scope=scope, interpretation=interpretation, keywords=keywords, project=project, ref=ref)
+            return out(compact({"id": r["id"], "title": r["title"], "state": r["state"], "date": r["date"],
+                                "source": r["source"], "topics": r["topics"], "new_topics": r.get("new_topics"),
+                                "topic_note": r.get("topic_note"),
+                                "note": "Recorded as the owner's decision, active, against their message."}))
         if action == "show":
             if not id:
                 raise ValueError("show needs id")

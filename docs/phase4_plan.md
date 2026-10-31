@@ -136,6 +136,8 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
     - MCP `afclaude_decisions` gains `record` (author owner, with `from`); keep the tool-list bound.
     - Ids as §3.3. `import_file` raises `decision_id_floor`.
     - A test that every bundle typed into tmux starts with a keep-alive prefix, so AFClaude's own text never passes for the owner's.
+    - Review fixes: a `<pasted_content>` block (how Claude Code stores a long tmux-typed text) is unwrapped before the prefix check, and a prompt whose leading block has an AFClaude prefix is AFClaude's; a confirm counts only owner messages newer than the later of the proposal's `imported_at` and `updated_at`; quotes match on word boundaries and need at least 3 words or 12 characters (a decision id is exempt); `prompt.set` refuses a body that makes a tmux-typed bundle start without a keep-alive prefix.
+    - Accepted limits: the session binding comes from the environment (`CLAUDE_CODE_SESSION_ID` can be set, and subagents inherit it); an autonomous session can type into its own tmux pane, which then reads as an owner prompt; Claude Code itself injects texts such as "I hit my usage limit..." as human prompts. The check proves that a quoted message exists in the stored messages of the session, not who typed it.
   - **W2: seeding, retirement, texts.**
     - `python3 decisions.py seed --topics F --merges F [--dry-run] | --undo`, which runs the action `decision.seed`. CLI only, refused through MCP. It re-keys what the import already holds, so the task-manager's CLI may run it.
     - Preconditions:

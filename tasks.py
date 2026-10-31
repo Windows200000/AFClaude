@@ -71,11 +71,16 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            kept apart from DECISIONS.md's Keywords line)
     tasks.py decision topics [ID add|remove T...]   an entry's topics (D-284: free keywords, "all" allowed,
                                            keep few); without ID: every topic in use, with counts
-    tasks.py decision add --title T --topic T... --author owner|task-manager [--words W ...]   write a
-                                           decision into the DB (owner: active at once, exact --words
-                                           required, D-285; task-manager: proposed until the owner confirms).
-                                           A session AFClaude launched (CLAUDE_GUARD_DISABLE=1) is refused
-                                           author owner, confirm, and changes to the owner's entries (D-104)
+    tasks.py decision add --title T --topic T... --author owner|task-manager [--words W ...]
+                          [--from inbox:N|chat:S:UUID] [--supersedes ID ...]   write a decision into the DB
+                                           (owner: active at once, exact --words required, D-285; task-manager:
+                                           proposed until the owner confirms; --supersedes: native entries the
+                                           proposal replaces, deleted on its confirm). A session AFClaude
+                                           launched (CLAUDE_GUARD_DISABLE=1) records author owner only
+                                           against an owner message of its own session that contains every
+                                           --words quote (--from when several do; the date and source come
+                                           from that message), confirms only against one that names the id,
+                                           and may not change the owner's entries (D-104)
     tasks.py decision edit|expire|delete|confirm ID ...   overwrite fields (not the words or summary of an
                                            owner's entry), remove an expired one-off or one that no longer
                                            applies (audited with the old text), the owner's confirmation of a
@@ -401,7 +406,7 @@ def decision_write(conn, args):
         r = act(conn, "decision.add", title=args.title, topics=args.topic, author=args.author, words=args.words,
                 summary=args.summary, scope=args.scope, source=args.source, interpretation=args.interpretation,
                 date=args.date, status=args.status, keywords=args.keyword, project=args.project, slug=args.slug,
-                id=args.id)
+                supersedes=args.supersedes, ref=args.ref, session=os.environ.get("CLAUDE_CODE_SESSION_ID"))
     elif dc == "edit":
         fields = {k: getattr(args, k) for k in ("title", "date", "status", "summary", "words", "source", "scope",
                                                 "interpretation", "slug") if getattr(args, k) is not None}
@@ -411,7 +416,8 @@ def decision_write(conn, args):
     elif dc == "delete":
         r = act(conn, "decision.delete", decision=args.id, reason=args.reason, version=args.version)
     elif dc == "confirm":
-        r = act(conn, "decision.confirm", decision=args.id, version=args.version)
+        r = act(conn, "decision.confirm", decision=args.id, version=args.version, ref=args.ref,
+                session=os.environ.get("CLAUDE_CODE_SESSION_ID"))
     elif dc == "link":
         r = act(conn, "decision.link", decision=args.id, to=args.to, kind=args.kind,
                 op="remove" if args.remove else "add")
@@ -429,6 +435,10 @@ def decision_write(conn, args):
     parts = [f"{r['id']}"] + [f"{k}: {', '.join(v) if isinstance(v, list) else v}"
                               for k, v in r.items() if k in ("state", "topics", "links") and v]
     print(" ".join(parts[:1]) + (" (" + "; ".join(parts[1:]) + ")" if parts[1:] else ""))
+    if r.get("evidence"):
+        print(f"recorded against the owner's message {r['evidence']}")
+    if r.get("replaced"):
+        print(f"replaced (deleted, in the audit log): {', '.join(r['replaced'])}")
     for k in ("new_topics", "topic_note"):
         if r.get(k):
             print(f"{k.replace('_', ' ')}: {r[k] if isinstance(r[k], str) else ', '.join(r[k])}"
@@ -1065,12 +1075,17 @@ def parser():
     q.add_argument("--author", choices=store.DECISION_AUTHORS, required=True,
                    help="owner: the owner's words, active at once (not for an autonomous session); "
                         "task-manager: proposed until the owner confirms")
-    q.add_argument("--words", help="the owner's exact words (required for author owner)")
+    q.add_argument("--words", action="append", help="the owner's exact words (required for author owner; repeat "
+                   "for several quotes, all from one message; an autonomous session's must occur in a message "
+                   "of the owner in its own session: inbox or chat)")
+    q.add_argument("--from", dest="ref", metavar="inbox:N|chat:SESSION:UUID",
+                   help="which owner message the words are from, when several contain them (autonomous session)")
+    q.add_argument("--supersedes", action="append", metavar="ID",
+                   help="a native decision this proposal replaces (repeat): deleted when it is confirmed")
     for f in ("summary", "scope", "source", "interpretation", "date", "status", "slug"):
         q.add_argument(f"--{f}")
     q.add_argument("--keyword", action="append", help="a keyword (repeat)")
     q.add_argument("--project", help="a project (default: install-wide)")
-    q.add_argument("--id", help="D-NNN to use instead of the next free number (seeding)")
     q = dcs.add_parser("edit", parents=[js], help="overwrite fields of a native decision (audited; \"\" clears)")
     q.add_argument("id")
     for f in ("title", "date", "status", "summary", "words", "source", "scope", "interpretation", "slug"):
@@ -1084,8 +1099,11 @@ def parser():
     q.add_argument("id")
     q.add_argument("--reason", required=True)
     q.add_argument("--version", type=int)
-    q = dcs.add_parser("confirm", parents=[js], help="the owner confirms a proposed decision")
+    q = dcs.add_parser("confirm", parents=[js], help="the owner confirms a proposed decision (an autonomous "
+                                                     "session: against an owner message that names the id)")
     q.add_argument("id")
+    q.add_argument("--from", dest="ref", metavar="inbox:N|chat:SESSION:UUID",
+                   help="which owner message names the id, when several do (autonomous session)")
     q.add_argument("--version", type=int)
     q = dcs.add_parser("link", parents=[js], help="ID refines|requires|conflicts TO (shown with every hit)")
     q.add_argument("id")

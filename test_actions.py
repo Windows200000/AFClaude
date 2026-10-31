@@ -519,7 +519,8 @@ class Autonomous(Base):
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
-                  "decision.confirm",                                            # D-104/D-285: the owner confirms
+                  # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
+                  # message naming the id (phase 4b Q2, owner_words.py), D-104/D-285
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
 
     def test_owner_only_set(self):
@@ -792,7 +793,7 @@ class WindowActions(Base):
 
 class PromptActions(Base):
     def test_set_validate_reset(self):
-        body = "Go on ({reason}); {progress}. {{literal}}"
+        body = "[keep-alive] Go on ({reason}); {progress}. {{literal}}"
         r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         self.assertEqual((r["body"], r["version"], r["updated_by"]), (body, 1, "owner"))
         with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "rb") as fh:
@@ -941,7 +942,7 @@ class PromptDefaultsSync(Base):
     def test_marks_an_override_s_base_outdated_against_the_current_default(self):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
         self.do("prompt.set", actor="owner", via="dashboard", name="continue.md",
-                body="Go on ({reason}); {progress}.")
+                body="[keep-alive] Go on ({reason}); {progress}.")
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)   # made against the current one
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # default unchanged: still matches
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)
@@ -952,7 +953,7 @@ class PromptDefaultsSync(Base):
 
     def test_setting_the_same_body_again_reconfirms_it_against_the_new_default(self):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
-        body = "Go on ({reason}); {progress}."
+        body = "[keep-alive] Go on ({reason}); {progress}."
         r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         again = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         self.assertEqual(again["version"], r["version"])              # nothing moved: still a no-op

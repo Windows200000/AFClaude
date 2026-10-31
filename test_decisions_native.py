@@ -100,11 +100,16 @@ class Env(unittest.TestCase):
         with open(self.src, "w", encoding="utf-8") as fh:
             fh.write("\n### ".join(p for p in parts if not any(p.startswith(i + " ") for i in ids)))
 
-    def use_source_for_ids(self):
-        """A new id now looks for the numbers in the synthetic DECISIONS.md."""
-        patch = mock.patch.object(dec, "DEFAULT_SOURCE", self.src)
-        patch.start()
-        self.addCleanup(patch.stop)
+    def floor(self, n):
+        """The next native id is D-(n+1): a test that needs a particular number (ids come from the DB alone)."""
+        store.set_meta(self.conn, "decision_id_floor", n)
+        self.conn.commit()
+
+
+@contextlib.contextmanager
+def patch_source(path):
+    with mock.patch.object(dec, "DEFAULT_SOURCE", path):
+        yield
 
 
 class V4Env(unittest.TestCase):
@@ -459,12 +464,13 @@ class Add(Env):
         self.assertEqual(r["state"], "proposed")
 
     def test_ids_slugs_and_projects(self):
-        self.assertEqual(self.add(id="D-300")["id"], "D-300")
+        self.floor(299)
+        self.assertEqual(self.add()["id"], "D-300")
         self.assertEqual(self.add(title="Second")["id"], "D-301")             # above the highest one
         self.do("decision.delete", decision="D-301", reason="test")
         self.assertEqual(self.add(title="Third")["id"], "D-302")              # a deleted number isn't reused
-        with self.assertRaisesRegex(ValueError, "already exists"):
-            self.add(id="D-300")
+        with self.assertRaisesRegex(ValueError, "unknown parameter"):          # the DB alone gives out ids (Q2)
+            self.add(id="D-500")
         self.assertEqual(self.add(title="Same title", slug=None)["slug"], "same-title")
         self.assertEqual(self.add(title="Same title")["slug"], "same-title-2")
         with self.assertRaisesRegex(ValueError, "already"):
@@ -670,8 +676,7 @@ class Links(Env):
 class Import(Env):
     def test_the_file_import_leaves_native_entries_alone(self):
         self.imp()
-        self.use_source_for_ids()
-        self.assertEqual(self.add(title="Native")["id"], "D-005")                  # above the file's D-004
+        self.assertEqual(self.add(title="Native")["id"], "D-005")                  # above the file's D-004 (the import raised the floor)
         r = self.imp()
         self.assertEqual((r["entries"], r["removed"], r["detached"]), (5, [], []))   # not removed, not counted
         self.assertEqual(store.get_decision_entry(self.conn, "D-005")["origin"], "db")
@@ -679,7 +684,8 @@ class Import(Env):
 
     def test_a_file_entry_with_a_native_id_stops_the_import_loudly(self):
         self.imp()
-        self.add(title="Native", id="D-050")
+        self.floor(49)
+        self.add(title="Native")
         with open(self.src, "a", encoding="utf-8") as fh:
             fh.write("\n### D-050 From the file\n- **Keywords:** k\n")
             fh.write("\n### D-051 Another new one\n- **Keywords:** k\n")
@@ -706,7 +712,8 @@ class Import(Env):
 
     def test_the_hook_alerts_on_a_collision_and_still_builds_the_tldr(self):
         self.imp()
-        self.add(title="Native", id="D-050")
+        self.floor(49)
+        self.add(title="Native")
         with open(self.src, "a", encoding="utf-8") as fh:
             fh.write("\n### D-050 From the file\n- **Keywords:** k\n")
         alerts = []
@@ -719,25 +726,30 @@ class Import(Env):
         self.assertIn("D-001 Night runs fill the week", text)
         self.assertEqual(alerts, ["decisions import failed"])                      # once for both hook runs
 
-    def test_new_ids_are_above_every_id_in_the_file_and_the_db(self):
-        self.use_source_for_ids()                                                  # the file has D-004 at most
-        self.assertEqual(self.add(title="First")["id"], "D-005")                   # before any import
+    def test_ids_come_from_the_db_alone_and_an_import_raises_the_floor(self):
+        self.assertEqual(self.imp()["id_floor_raised"], True)                      # the file's highest is D-004
+        self.assertEqual(store.get_meta(self.conn, "decision_id_floor"), "4")
+        with patch_source(self.src):                                               # a readable file changes nothing
+            self.assertEqual(self.add(title="First")["id"], "D-005")
         with open(self.src, "a", encoding="utf-8") as fh:                          # the owner's next statement
-            fh.write("\n### D-006 Written into the file\n- **Keywords:** k\n")
-        self.assertEqual(self.add(title="Second")["id"], "D-007")
-        self.imp()                                                                 # D-006 imports, nothing detached
-        self.assertEqual(store.get_decision_entry(self.conn, "D-006")["origin"], "file")
-        with self.assertRaisesRegex(ValueError, "entry of DECISIONS.md"):
-            self.add(title="Explicit", id="D-006")
+            fh.write("\n### D-009 Written into the file\n- **Keywords:** k\n")
+        self.assertEqual(self.add(title="Second")["id"], "D-006")                  # the file is not looked at ...
+        self.imp()                                                                 # ... but its import raises the floor
+        self.assertEqual(self.add(title="Third")["id"], "D-010")
         os.remove(self.src)
-        self.assertEqual(self.add(title="No file")["id"], "D-008")                 # the DB's own ids and floor
+        self.assertEqual(self.add(title="No file")["id"], "D-011")                 # the container: no file at all
         with open(self.src, "wb") as fh:
             fh.write(b"\xff\xfe")
-        with self.assertRaisesRegex(dec.SourceError, "can't read"):                # an unreadable file: no id is given
-            self.add(title="Bad file")
+        self.assertEqual(self.add(title="Bad file")["id"], "D-012")                # an unreadable file is not read
+
+    def test_the_import_reports_a_raised_floor_once(self):
+        r = self.imp()
+        self.assertEqual((r["id_floor_raised"], store.get_meta(self.conn, "decision_id_floor")), (True, "4"))
+        self.assertEqual(self.imp()["id_floor_raised"], False)                     # idempotent: no change, no audit
+        self.assertEqual(len([a for a in self.audit("decision.import")]), 1)
 
     def test_native_entries_stay_after_the_file_ones_across_reimports(self):
-        self.use_source_for_ids()
+        self.floor(4)
         self.add(title="Native")                                                   # D-005, ord 0 in an empty table
         self.imp()                                                                 # the file's rows get ord 0..4
         ids = [d["id"] for d in store.list_decision_entries(self.conn)]
@@ -750,8 +762,9 @@ class Import(Env):
 
     def test_mass_removal_guard_counts_only_file_entries(self):
         self.imp()
+        self.floor(49)
         for n in range(8):
-            self.add(title=f"Native {n}", id=f"D-{50 + n}")
+            self.add(title=f"Native {n}")
         with open(self.src, "w", encoding="utf-8") as fh:
             fh.write("### D-001 Only one\n- **Status:** active\n")
         with self.assertRaisesRegex(dec.SourceError, "remove 4 of 5"):
@@ -768,7 +781,7 @@ class Tldr(Env):
     def test_titles_only_proposals_left_out_and_under_the_hook_cap(self):
         for n in range(1, 241):             # about the size of the live store
             self.do("decision.add", title=f"Decision number {n} about some topic of the project", topics=["t"],
-                    words="w", author="owner", id=f"D-{n:03d}")
+                    words="w", author="owner")
         self.do("decision.add", title="Waiting for the owner", topics=["t"], author="task-manager")
         lines = dec.tldr_lines(self.conn)
         self.assertEqual(len(lines), 240)
@@ -783,7 +796,6 @@ class Tldr(Env):
 
     def test_hook_output_still_works_with_native_entries(self):
         self.imp()
-        self.use_source_for_ids()
         self.add(title="Native one")
         out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
         text = out["hookSpecificOutput"]["additionalContext"]
