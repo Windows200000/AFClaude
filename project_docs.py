@@ -59,7 +59,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -251,12 +251,14 @@ def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
 
 
 def _alert(subject: str, body: str) -> None:
-    """notify.py (a push, and the alert in the DB), never raising."""
+    """notify.py (a push, and the alert in the DB). A failure is logged and raised (D-235): the caller
+    marks the episode as alerted only after this returned, so the next run retries."""
     try:
         notify = importlib.import_module("notify")
         getattr(notify, "notify")(subject, body)
-    except Exception as e:   # noqa: BLE001 - an alert must never take the import down
+    except Exception as e:
         sys.stderr.write(f"project_docs: alert failed: {type(e).__name__}: {e}\n")
+        raise
 
 
 def public_findings(label: str, text: str) -> list[str]:
@@ -380,17 +382,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if args.cmd == "import" and args.cron:
             import decisions          # the repo's DECISIONS.md too (D-242), in the same 10-min pass
-            dcode, dline = decisions.cron_import(args.db, args.repo)
-            if dline:
-                print(dline)
             import questions          # after the cut-over OPEN_QUESTIONS.md must be the imported file (Q3)
-            qcode, qline = questions.cron_check(args.db, args.repo)
-            if qline:
-                print(qline)
-            code, line = cron_import(args.db, args.repo, args.reviews_dir, args.project)
-            if line:
-                print(line)
-            return max(code, dcode, qcode)
+            # One failing stage (e.g. an alert that cannot go out) must not hide the others: run them all,
+            # print every line, then raise the first error (D-235); the docs import runs before the question
+            # check so that a failure of the latter cannot hide it.
+            stages: tuple[Callable[[], tuple[int, str]], ...] = (
+                lambda: decisions.cron_import(args.db, args.repo),
+                lambda: cron_import(args.db, args.repo, args.reviews_dir, args.project),
+                lambda: questions.cron_check(args.db, args.repo))
+            code, first_error = 0, None
+            for stage in stages:
+                try:
+                    scode, sline = stage()
+                except Exception as err:   # noqa: BLE001 - re-raised below, after the other stages ran
+                    first_error = first_error or err
+                    continue
+                if sline:
+                    print(sline)
+                code = max(code, scode)
+            if first_error is not None:
+                raise first_error
+            return code
         if args.cmd == "import":
             r = import_all(args.db, args.repo, args.reviews_dir, args.project, force=args.force)
             print(json.dumps(r, indent=1, ensure_ascii=False))
