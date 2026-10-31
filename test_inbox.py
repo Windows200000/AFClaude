@@ -323,21 +323,6 @@ class Triage(FakeHaiku):
         self.assertTrue(ka.automation_paused("the start", SID))
         self.assertFalse(ka.automation_paused("the start", other))
 
-    def test_a_failed_pass_is_an_error_and_pauses(self):
-        """A DB failure in a pass (D-244): alerted, automation paused; the worker goes on."""
-        wake, stop = threading.Event(), threading.Event()
-        def boom(conn, now=None, verify=None):
-            stop.set()
-            wake.set()                                                        # no POLL wait after the pass
-            raise store.DBUnavailable("database is locked", "error")
-        old, iw.process = iw.process, boom
-        try:
-            iw.run_forever(wake, stop)
-        finally:
-            iw.process = old
-        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox worker pass failed: DBUnavailable"])
-        self.assertIn("inbox worker pass failed", failstop.paused()["reason"])
-
     def test_bad_answer_is_an_error(self):
         self.answer = lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=haiku_out(raw="hmm"), stderr="")
         m = self.post()
@@ -897,30 +882,6 @@ class HeldInStarts(tc.Env):
         self.assertNotIn("z" * 10, text)
 
 
-class Watchdog(DB):
-    def test_api_not_running_is_an_error_once_per_outage(self):
-        """The */5 watchdog found the API down (D-244): alert + automation paused, once per outage."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        started = []
-        saved = (inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen)
-        inbox_api.take_lock = lambda: open(os.devnull)
-        inbox_api.LOG, inbox_api.DOWN = os.path.join(tmp.name, "api.log"), os.path.join(tmp.name, ".down")
-        inbox_api.subprocess.Popen = lambda argv, **kw: started.append(argv)
-        try:
-            self.assertEqual(inbox_api.ensure(boot=True), 0)                  # the container start: no error
-            self.assertEqual((len(started), self.alerts), (1, []))
-            inbox_api.ensure(boot=False)
-            inbox_api.ensure(boot=False)                                      # still down: not alerted again
-        finally:
-            inbox_api.take_lock, inbox_api.LOG, inbox_api.DOWN, inbox_api.subprocess.Popen = saved
-        self.assertEqual(len(started), 3)
-        self.assertEqual([a[0] for a in self.alerts], ["AFClaude STOPPED: inbox API was not running"])
-        self.assertTrue(failstop.paused()["paused"])
-
-
-# ---------------------------------------------------------------- the dashboard view (D-178)
-
 class View(DB):
     def at(self, m, created, **more):
         with store.transaction(self.conn):
@@ -1085,7 +1046,7 @@ class Endpoint(DB):
         self.assertEqual((st, m["status"], m["text"]), (201, "pending", "Line 1\nLine 2"))
         self.assertTrue(self.wake.is_set())
         row = store.get_inbox(self.conn, m["id"])
-        self.assertEqual((row["created_by"], row["session_id"]), ("owner", ka.afclaude_config.manager_session()))
+        self.assertEqual((row["created_by"], row["session_id"]), ("owner", store.manager_sessions(self.conn)[0]["session"]))
         self.assertEqual(store.audit_log(self.conn, 1, "inbox", m["id"])[0]["via"], "dashboard")
         st, v = self.call("GET")
         self.assertEqual((st, [x["id"] for x in v["messages"]], v["max_chars"]), (200, [m["id"]], store.INBOX_TEXT_MAX))
@@ -1166,14 +1127,14 @@ class Endpoint(DB):
             inbox_api.KEY_FILE, inbox_api.LOCK = old
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x.sock")))
 
-    def test_no_worker_serve_writes_its_log_lines_to_the_log_file(self):
+    def test_serve_writes_its_log_lines_to_the_log_file(self):
         """S7 follow-up: under the runner the child's stdout is a pipe nobody reads while it runs;
-        `serve --no-worker` must put its lines (posted, http) in data/inbox_api.log itself."""
+        `serve` must put its lines (posted, http) in data/inbox_api.log itself."""
         data = os.path.join(self.tmp.name, "data")
         sock = os.path.join(self.tmp.name, "child", "inbox.sock")
         env = dict(os.environ, AFCLAUDE_DATA_DIR=data, AFCLAUDE_INBOX_KEY_FILE=self.keyfile,
                    AFCLAUDE_INBOX_SOCKET=sock)
-        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve", "--no-worker",
+        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve",
                                  "--socket", sock], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             for _ in range(100):

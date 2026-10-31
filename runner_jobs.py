@@ -77,7 +77,7 @@ HANDLERS: dict[str, Handler] = {
     "prune_logs": Handler("store.py", ("prune-logs",), "prune_logs.log", ".prune_logs.lock"),
     "usage_review": Handler("usage_review.py", (), "keepalive/keepalive.log"),
     # S5: the start the runner planned (--start-key: keepalive refuses it unless it is still the current
-    # one, and claims it in its "window_starts", the dedup it shares with cron's legacy line)
+    # one, and claims it in its "window_starts" dedup)
     "window_start": Handler("keepalive.py", ("--session", "{session}", "--window-start", "--start-key", "{key}",
                                              "--arm", "--take-over-idle"), "keepalive/keepalive.log"),
 }
@@ -134,7 +134,7 @@ def status_snapshot_tick() -> str:
 FUNCTIONS["status_snapshot"] = ("status_snapshot.log", status_snapshot_tick)
 
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
-# legacy mode's worker thread (inbox_api.py serve without --no-worker, inbox_worker.run_forever).
+# legacy mode's worker thread (gone since S9).
 INBOX_LOG = "inbox_worker.log"
 
 
@@ -242,7 +242,7 @@ TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
     "usage_review": (("keepalive", "refresh_usage", 120, 2), ("keepalive", "poke_auth", 180, 1),
                      ("keepalive", "fire", 60, 1), ("keepalive", "fire", 120, 1),
                      ("keepalive", "tmux_has", 30, 1)),
-    "quickview": (("export_quickview", "watcher_running", 10, 1), ("keepalive", "tmux_has", 30, 1)),
+    "quickview": (("keepalive", "tmux_has", 30, 1),),   # S9: watcher_running reads the DB, no host call
     # S9(b): the usage cache read (host.usage_cache) once for the sections and once by the last-mile slot
     "status_snapshot": (("host", "usage_cache", 30, 2),),
 }

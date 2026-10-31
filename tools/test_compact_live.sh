@@ -28,7 +28,7 @@
 #      one-line test question instead of the run's continue prompt) and
 #      keepalive.consume_handoff(). Only keepalive.fire is replaced: it types into
 #      `afc-compacttest` the keep-alive's way (tmux send-keys -l, 1 s, Enter; ka_resume.sh would
-#      target ka-<id>) and saves pane captures; keepalive.log / progress_note / alert only print.
+#      target the row's afc- name) and saves pane captures; keepalive.log / progress_note / alert only print.
 #      No fire or run record is made, no real session is involved;
 #   4. checks: a new handoffs row of THIS session in the temp DB; the compaction marker and
 #      keepalive.compacted_since(); the continue text is the fresh template (compact_resume.md)

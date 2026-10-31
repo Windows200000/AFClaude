@@ -90,7 +90,7 @@ inbox_api after a post or a retry, §3.7) triages and delivers "now" messages ev
 pending or held; `inbox_verify` (inbox_worker.verify_tick) checks every 5 s the post-send
 verifications a delivery stored (runner_state "inbox" entries {msg, path, offset, deadline}), so a
 restart resumes one from the same offset and deadline and ends it seen or as an error at its
-deadline. The runner also keeps `inbox_api.py serve --no-worker` running (SUPERVISED, started at
+deadline. The runner also keeps `inbox_api.py serve` running (SUPERVISED, started at
 boot and again, with an alert, whenever it exits before a stop was requested): it only serves HTTP,
 stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
 messages are not automation (D-186/D-244), so both run while paused.
@@ -293,10 +293,10 @@ def _inbox_verify_pending(conn: Any, now: datetime) -> bool:
 # due time while there is none (_plan_poll), only a wake.
 POLL_PENDING: dict[str, Callable[[Any, datetime], bool]] = {"inbox": _inbox_pending, "inbox_verify": _inbox_verify_pending}
 # S7: a long-lived child the runner keeps alive (not a tick: no run row, no outer timeout) -> its
-# argv. inbox_api.py serve --no-worker only serves HTTP, stores the message and wakes this runner
+# argv. inbox_api.py serve only serves HTTP, stores the message and wakes this runner
 # (§3.7); the runner's own `inbox` / `inbox_verify` jobs above do the triage, delivery and
 # verification.
-SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve", "--no-worker")}
+SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve")}
 # What this image's runner runs: every job (§4: each cut-over step S2-S7 moved jobs here and removed
 # their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",

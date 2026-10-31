@@ -1828,7 +1828,7 @@ class FakeSupervisor:
 
 
 class Supervised(Base):
-    """S7: the runner keeps `inbox_api.py serve --no-worker` running as a long-lived child
+    """S7: the runner keeps `inbox_api.py serve` running as a long-lived child
     (SUPERVISED): started at boot without an alert, restarted with one on an unexpected exit, ended
     (not restarted) once a stop was requested."""
 
@@ -1840,7 +1840,7 @@ class Supervised(Base):
         self.addCleanup(patch.stop)
 
     def start(self):
-        r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve", "--no-worker")}, spawner=self.sup)
+        r = self.runner(supervise={"inbox_api": ("inbox_api.py", "serve")}, spawner=self.sup)
         r.boot()
         r.start_supervised("inbox_api")
         return r
@@ -1849,7 +1849,7 @@ class Supervised(Base):
         r = self.start()
         await asyncio.sleep(0)
         self.assertEqual(len(self.sup.calls), 1)
-        self.assertEqual(self.sup.calls[0][-2:], ["serve", "--no-worker"])
+        self.assertEqual(self.sup.calls[0][-1], "serve")
         self.assertEqual(self.sup.calls[0][0], sys.executable)
         self.assertEqual(self.fails, [])
         self.assertIn("inbox_api", r.sup_tasks)

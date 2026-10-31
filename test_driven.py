@@ -112,21 +112,21 @@ class DrivenSet(Base):
     def test_new_row_validation_audit_and_noop(self):
         self.project("AFClaude", TM)
         r = self.do("driven.set", actor="runner:import", via="runner", session_id=TM, kind="task-manager",
-                    tmux="ka-f0000000", project="AFClaude")
-        self.assertEqual((r["kind"], r["tmux"], r["ended_at"]), ("task-manager", "ka-f0000000", None))
+                    tmux="afc-afclaude", project="AFClaude")
+        self.assertEqual((r["kind"], r["tmux"], r["ended_at"]), ("task-manager", "afc-afclaude", None))
         self.assertEqual(r["project_id"], store.get_project(self.conn, "AFClaude")["id"])
         rows = self.audit(target_type="driven_session")
         self.assertEqual([(a["action"], a["actor"], a["target_id"]) for a in rows], [("driven.set", "runner:import", TM)])
-        again = self.do("driven.set", session_id=TM, tmux="ka-f0000000")                   # nothing changes
-        self.assertEqual(again["tmux"], "ka-f0000000")
+        again = self.do("driven.set", session_id=TM, tmux="afc-afclaude")                   # nothing changes
+        self.assertEqual(again["tmux"], "afc-afclaude")
         self.assertEqual(len(self.audit(target_type="driven_session")), 1)
         renamed = self.do("driven.set", session_id=TM, tmux="afc-afclaude-task-manager")
         self.assertEqual(renamed["tmux"], "afc-afclaude-task-manager")
-        self.assertEqual(self.audit(target_type="driven_session")[-1]["before"], {"tmux": "ka-f0000000"})
+        self.assertEqual(self.audit(target_type="driven_session")[-1]["before"], {"tmux": "afc-afclaude"})
 
     def test_bad_input(self):
         self.project("P")
-        for bad in ("afc-Upper", "afc-a b", "afc-a;b", "afc-" + "a" * 37, "ka-1234567", "ka-1234567g", "tmux", ""):
+        for bad in ("afc-Upper", "afc-a b", "afc-a;b", "afc-" + "a" * 37, "ka-1234567", "ka-f0000000", "tmux", ""):
             with self.assertRaises(ValueError, msg=bad):
                 self.do("driven.set", session_id=REV, kind="review", tmux=bad)
         self.do("driven.set", session_id=REV, kind="review", tmux="afc-" + "a" * 36)       # 40 characters
@@ -155,7 +155,7 @@ class DrivenSet(Base):
 
     def test_one_live_task_manager_per_project(self):
         self.project("AFClaude", TM)
-        self.do("driven.set", session_id=TM, kind="task-manager", tmux="ka-f0000000", project="AFClaude")
+        self.do("driven.set", session_id=TM, kind="task-manager", tmux="afc-afclaude-task-manager", project="AFClaude")
         with self.assertRaisesRegex(actions.Conflict, "already has the live task-manager"):
             self.do("driven.set", session_id=REV, kind="task-manager", tmux="afc-x", project="AFClaude")
         self.do("driven.set", session_id=TM, ended_at="2026-10-21T10:00:00Z")
@@ -205,12 +205,12 @@ class Requests(Base):
         a = self.do("request.add", kind="work_on_now", target="AFClaude")
         b = self.do("request.add", kind="review_now")
         s = self.do("request.start", actor="runner:request", via="runner", request_id=a["id"], run_id=12,
-                    tmux="ka-f0000000", session_id=TM)
+                    tmux="afc-afclaude-task-manager", session_id=TM)
         self.assertEqual((s["status"], s["run_id"], json.loads(s["result"])),
-                         ("started", 12, {"tmux": "ka-f0000000", "session_id": TM}))
+                         ("started", 12, {"tmux": "afc-afclaude-task-manager", "session_id": TM}))
         self.assertIsNotNone(s["handled_at"])
         with self.assertRaisesRegex(store.InvalidTransition, "not open"):
-            self.do("request.start", request_id=a["id"], tmux="ka-f0000000")
+            self.do("request.start", request_id=a["id"], tmux="afc-afclaude-task-manager")
         with self.assertRaisesRegex(store.InvalidTransition, "can't become refused"):
             self.do("request.finish", request_id=a["id"], status="refused", reason="running")
         f = self.do("request.finish", actor="runner:request", via="runner", request_id=a["id"], status="failed",
@@ -247,20 +247,20 @@ class TaskManagers(Base):
         self.do("project.move", project="C", rank=1)
         self.do("project.manager_launch", project="A", model="claude-sonnet-5-5")
         self.do("automation.set_project", project="A", paused=True, reason="inbox error")
-        self.do("driven.set", session_id=TM, kind="task-manager", tmux="ka-f0000000", project="A")
+        self.do("driven.set", session_id=TM, kind="task-manager", tmux="afc-afclaude-task-manager", project="A")
         self.do("task.add", title="t", project="A")
         tm = store.task_managers(self.conn)
         self.assertEqual([(t["name"], t["rank"], t["session"]) for t in tm], [("C", 1, REV), ("A", 2, TM), ("B", 3, None)])
         a = tm[1]
         self.assertEqual((a["tmux"], a["model"], a["paused"], a["pause_reason"]),
-                         ("ka-f0000000", "claude-sonnet-5-5", True, "inbox error"))
+                         ("afc-afclaude-task-manager", "claude-sonnet-5-5", True, "inbox error"))
         self.assertEqual(a["ready"]["high"], 1)
         self.assertEqual((tm[0]["tmux"], tm[0]["paused"], tm[0]["pause_reason"]), (None, False, None))
         self.do("automation.set_project", project="A", paused=False)
         self.assertFalse(store.task_managers(self.conn)[1]["paused"])
 
 
-# ---------------------------------------------------------------- backfill and check
+# ---------------------------------------------------------------- check
 
 class FakeTmux:
     def __init__(self, *names):
@@ -273,108 +273,71 @@ class FakeTmux:
         return sorted(self.names | {"Claude", "tsmb"})
 
 
-class Backfill(Base):
+class Check(Base):
+    """driven check (S1's backfill is retired since S6: the launchers write the rows)."""
     def setUp(self):
         super().setUp()
         self.project("AFClaude", TM)
         self.project("Claude")
         actions.own_session_add(self.conn, OWN, actor="runner:import", via="runner")
-        with store.transaction(self.conn):
-            store.state_set(self.conn, "usage_review", json.dumps(["runs"]), json.dumps(
-                [{"at": "2026-10-01T15:00:00.122733+00:00", "session": REV_DEAD, "rc": 0}]), "test", "runner")
-            store.state_set(self.conn, "usage_review", json.dumps(["one_off_runs"]), json.dumps(
-                [{"at": "2026-10-16T22:48:03.797728+00:00", "only": "usage", "session": REV, "rc": 0},
-                 {"at": "2026-10-17T00:00:00+00:00", "session": "not-a-uuid"}]), "test", "runner")
-            for sid, entry in ((STALL, {"kind": "continue", "status": "running", "own_tmux": True,
-                                        "tmux": "ka-c0000000", "sent_at": "2026-10-20T10:00:00Z"}),
-                               (FOREIGN, {"kind": "continue", "status": "running", "own_tmux": False,
-                                          "tmux": "ka-d0000000"})):
-                store.state_set(self.conn, "dispatcher", json.dumps(["sessions", sid]), json.dumps(entry), "test",
-                                "runner")
-        self.tmux = FakeTmux("ka-f0000000", "ka-a0000000", "ka-c0000000", "ka-d0000000")
+        self.tmux = FakeTmux("afc-afclaude-task-manager", "afc-review-a0000000", "afc-stall-c0000000",
+                             "afc-stall-d0000000")
 
-    def run_backfill(self, **kw):
-        return driven.backfill(self.conn, alive=self.tmux.alive, listed=self.tmux.listed, **kw)
+    def rows(self):
+        self.do("driven.set", session_id=TM, kind="task-manager", tmux="afc-afclaude-task-manager",
+                project="AFClaude", actor="runner", via="runner")
+        self.do("driven.set", session_id=REV, kind="review", tmux="afc-review-a0000000", actor="runner", via="runner")
+        self.do("driven.set", session_id=STALL, kind="stall", tmux="afc-stall-c0000000", actor="runner",
+                via="runner")
 
-    def test_twice_and_the_check(self):
-        dry = self.run_backfill(dry_run=True)
-        self.assertEqual(len(dry["added"]), 3)
-        self.assertEqual(len(store.driven_sessions(self.conn)), 1)                 # wrote nothing
-        out = self.run_backfill()
-        self.assertEqual({(a["session_id"], a["kind"], a["tmux"]) for a in out["added"]},
-                         {(TM, "task-manager", "ka-f0000000"), (REV, "review", "ka-a0000000"),
-                          (STALL, "stall", "ka-c0000000")})
-        self.assertEqual(out["not_running"], [REV_DEAD])
-        self.assertTrue(any("not-a-uuid" in n for n in out["notes"]))
-        self.assertIsNone(store.get_driven_session(self.conn, FOREIGN))            # someone else's tmux
-        tm = store.get_driven_session(self.conn, TM)
-        self.assertEqual(tm["project_id"], store.get_project(self.conn, "AFClaude")["id"])
-        self.assertEqual(store.get_driven_session(self.conn, REV)["started_at"], "2026-10-16T22:48:03.797Z")
-        self.assertEqual(store.get_driven_session(self.conn, OWN)["kind"], "own")  # untouched
-        chk = out["check"]
-        # ka-d0000000 (typed into, not started by the dispatcher) runs without a row: the check names it
-        self.assertEqual(chk["problems"], ["tmux ka-d0000000 runs without a live driven_sessions row"])
+    def check(self, listed=None):
+        return driven.check(self.conn, alive=self.tmux.alive, listed=listed or self.tmux.listed)
+
+    def test_a_tmux_session_without_a_row_and_a_gone_review(self):
+        self.rows()
+        chk = self.check()
+        # afc-stall-d0000000 (started by someone else) runs without a row: the check names it
+        self.assertEqual(chk["problems"], ["tmux afc-stall-d0000000 runs without a live driven_sessions row"])
         self.assertTrue(any("Claude: no task-manager session yet" in n for n in chk["notes"]))
-        self.tmux.names.discard("ka-d0000000")
-        n_audit = len(self.audit())
-        again = self.run_backfill()
-        self.assertEqual((again["added"], again["ended"]), ([], []))
-        self.assertEqual(sorted(again["kept"]), sorted([TM, REV, STALL]))
-        self.assertTrue(again["check"]["ok"], again["check"])
-        self.assertEqual(len(self.audit()), n_audit)                                # no change the second time
-        self.assertEqual(store.task_managers(self.conn)[0]["tmux"], "ka-f0000000")
-
-    def test_a_gone_review_is_ended_and_a_renamed_row_kept(self):
-        self.tmux.names.discard("ka-d0000000")
-        self.run_backfill()
-        self.do("driven.set", session_id=TM, tmux="afc-afclaude-task-manager")       # S2's rename
-        self.tmux.names = {"afc-afclaude-task-manager", "ka-c0000000"}               # the review ended
-        chk = driven.check(self.conn, alive=self.tmux.alive, listed=self.tmux.listed)
-        self.assertEqual(len(chk["problems"]), 1)
-        self.assertIn("review row a0000000: tmux ka-a0000000 is gone", chk["problems"][0])
-        out = self.run_backfill()
-        self.assertEqual(out["ended"], [{"session_id": REV, "kind": "review", "tmux": "ka-a0000000"}])
-        self.assertTrue(out["check"]["ok"], out["check"])
-        self.assertEqual(store.get_driven_session(self.conn, TM)["tmux"], "afc-afclaude-task-manager")
+        self.tmux.names.discard("afc-stall-d0000000")
+        self.assertTrue(self.check()["ok"])
+        self.tmux.names.discard("afc-review-a0000000")                               # the review ended
+        chk = self.check()
+        self.assertEqual(chk["problems"], ["review row a0000000: tmux afc-review-a0000000 is gone"])
 
     def test_check_mismatches_and_notes(self):
-        self.tmux.names.discard("ka-d0000000")
-        chk = driven.check(self.conn, alive=self.tmux.alive, listed=lambda: None)
-        self.assertEqual(chk["problems"], ["project AFClaude: task-manager f0000000: no live task-manager row "
-                                           "(python3 store.py import-driven)"])
+        self.tmux.names.discard("afc-stall-d0000000")
+        chk = self.check(listed=lambda: None)
+        self.assertEqual(chk["problems"], ["project AFClaude: task-manager f0000000: no live task-manager row"])
         self.assertTrue(any("not checked" in n for n in chk["notes"]))
-        self.run_backfill()
-        self.tmux.names.discard("ka-f0000000")                                       # not running: a note only
-        chk = driven.check(self.conn, alive=self.tmux.alive, listed=self.tmux.listed)
+        self.rows()
+        self.tmux.names.discard("afc-afclaude-task-manager")                         # not running: a note only
+        chk = self.check()
         self.assertTrue(chk["ok"], chk)
         self.assertTrue(any("isn't running now" in n for n in chk["notes"]))
         self.do("project.edit", project="AFClaude", manager_session=FOREIGN)          # the registry moved on
-        chk = driven.check(self.conn, alive=self.tmux.alive, listed=self.tmux.listed)
+        chk = self.check()
         self.assertFalse(chk["ok"])
         self.assertEqual(len(chk["problems"]), 2)
         self.assertTrue(any("live task-manager row(s) are f0000000" in p for p in chk["problems"]))
 
     def test_a_failing_tmux_call_stops_it(self):
+        self.rows()
         bad = mock.Mock(returncode=255, stderr="ssh: connect refused")
         with mock.patch("host.run_on_host", return_value=bad):
             with self.assertRaisesRegex(RuntimeError, "rc 255"):
-                driven.backfill(self.conn, listed=lambda: [])
-        self.assertEqual(len(store.driven_sessions(self.conn)), 2)    # the own row + the task-manager (no tmux call)
+                driven.check(self.conn, listed=lambda: [])
         for rc, want in ((0, True), (1, False)):
             with mock.patch("host.run_on_host", return_value=mock.Mock(returncode=rc, stderr="")):
-                self.assertIs(driven.tmux_alive("ka-f0000000"), want)
+                self.assertIs(driven.tmux_alive("afc-afclaude-task-manager"), want)
 
     def test_cli(self):
-        self.tmux.names.discard("ka-d0000000")
+        self.tmux.names.discard("afc-stall-d0000000")
         with mock.patch.object(driven, "tmux_alive", self.tmux.alive), \
                 mock.patch.object(driven, "tmux_list", self.tmux.listed):
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                self.assertEqual(store.main(["import-driven", "--db", self.db, "--dry-run"]), 0)
-            self.assertEqual(len(json.loads(out.getvalue())["added"]), 3)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(tasks.main(["--db", self.db, "driven", "check"]), 1)
-                self.assertEqual(store.main(["import-driven", "--db", self.db]), 0)
+            self.rows()
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(tasks.main(["--db", self.db, "driven", "check"]), 0)

@@ -433,17 +433,15 @@ class AutomationPaused(unittest.TestCase):
 
 
 class ScheduleSection(unittest.TestCase):
-    """The page's schedule ("cron") section, phase 3a S3: the crontab's AFClaude lines, plus the
-    resident runner's jobs from runner_jobs while it runs (AFCLAUDE_SCHEDULER on/runner)."""
-    REPO = os.path.dirname(os.path.abspath(__file__))
+    """The page's schedule ("cron") section: the resident runner's jobs from runner_jobs while it
+    runs (AFCLAUDE_SCHEDULER=runner; phase 3a S9 removed the crontabs and the `on` alias)."""
 
-    def entries(self, mode, crontab):
+    def entries(self, mode):
         from unittest import mock
-        env = {"AFCLAUDE_SCHEDULER": mode, "AFCLAUDE_CRONTAB": os.path.join(self.REPO, "docker", crontab)}
-        with mock.patch.dict(os.environ, env):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_SCHEDULER": mode}):
             return qv.cron_entries()
 
-    def test_on_mode_lists_the_runners_jobs_with_their_rows(self):
+    def test_runner_mode_lists_the_runners_jobs_with_their_rows(self):
         import runner
         conn = store.connect()
         try:
@@ -452,26 +450,21 @@ class ScheduleSection(unittest.TestCase):
                                    last_status="timeout", consecutive_failures=2)
         finally:
             conn.close()
-        out = self.entries("on", "crontab")
-        self.assertEqual(self.entries("runner", "crontab"), out)                 # S8: `on` is `runner`
-        cron = [e for e in out if e["owner"] == "cron"]
-        mine = {e.get("job"): e for e in out if e["owner"] == "runner"}
-        self.assertEqual(cron, [])                                              # S8: no cron line left at all
-        self.assertFalse(any("inbox API watchdog" in e["what"] for e in cron))   # S7: the runner supervises it
-        self.assertFalse(any("watcher watchdog" in e["what"] for e in cron))  # S6: the runner's passes now
-        self.assertFalse(any("usage sampler" in e["what"] for e in cron))   # S3: the runner's now
-        self.assertFalse(any("window-start" in e["what"] for e in cron))    # S5: the runner's now
-        self.assertEqual(mine["window_start"]["what"], "AFClaude window-start")
+        out = self.entries("runner")
+        self.assertEqual(self.entries("on"), [])                                # S9: no `on` alias any more
+        self.assertEqual(self.entries("off"), [])
+        self.assertEqual({e["owner"] for e in out}, {"runner"})                 # no cron line at all
+        mine = {e.get("job"): e for e in out}
+        self.assertEqual(mine["window_start"]["what"], "window-start")
         self.assertEqual(set(mine) - {None}, set(runner.RUNNER_OWNS))
         self.assertIsNotNone(mine[None]["heartbeat_berlin"])
         s = mine["sampler"]
         self.assertEqual((s["schedule_utc"], s["what"], s["last_status"], s["consecutive_failures"]),
-                         ("every 15 min", "AFClaude usage sampler", "timeout", 2))
+                         ("every 15 min", "usage sampler", "timeout", 2))
         self.assertIn("21.10. 12:15", s["next_due_berlin"])
         self.assertEqual(mine["prune_logs"]["schedule_utc"], "daily 03:17 UTC")
         self.assertEqual(mine["stall_scan"]["schedule_utc"], "every 3 min (+90 s)")
         self.assertEqual(mine["at"]["schedule_utc"], "each at-job's minute")      # S4
-        self.assertFalse(any("at-shim" in e["what"] for e in cron))
 
 
     def test_a_runner_read_that_fails_is_shown(self):

@@ -825,28 +825,21 @@ class CompactionFailures(Env):
         self.assertEqual((rec["status"], rec["replied"]), ("compacted", False))
         self.assertIn("no reply from abcdef01 to its hand-off after the compaction", self.paused()["reason"])
 
-    def test_a_failing_pass_is_reported_by_the_watcher(self):
-        """An error before the compaction (here the cost model can't be read) raises out of the pass;
-        run() reports it (fail_stop) and goes on."""
-        names = ("LOCK_FILE", "STOP_FILE", "last_mile_pass", "deferred_window_start_pass", "fillup_pass",
-                 "watch_run_usage", "stall_status", "last_mile_next_start")
-        old_w = {n: getattr(ka, n) for n in names}
-        ka.LOCK_FILE, ka.STOP_FILE = os.path.join(self.tmp.name, "ka.lock"), os.path.join(self.tmp.name, "STOP")
-        for n in names[2:]:
-            setattr(ka, n, lambda *a, **k: None)
-        ka.stall_status = lambda sid, now: ("NO_STALL", "x", None)
+    def test_a_failing_check_is_reported(self):
+        """An error before the compaction (here the cost model can't be read) raises out of the
+        check; the runner's compaction_check reports it (fail_stop) and stores no act."""
         old_load = ct.load
 
         def boom(conn=None):
             raise ValueError("the cost model's weights.cache_read must be a positive number")
         ct.load = boom
         try:
-            ka.run(types.SimpleNamespace(session=SID, arm=True, once=True, now=False))
+            res = testenv.runner_pass(ka, "compaction_check", now=datetime.now(UTC), session=SID)
         finally:
             ct.load = old_load
-            for n, v in old_w.items():
-                setattr(ka, n, v)
+        self.assertEqual(res["note"], "the check failed")
         self.assertIn("compaction pass failed: ValueError", self.paused()["reason"])
+        self.assertIsNone(testenv.act_of(ka, "compaction", SID))
         self.assertEqual(self.sent, [])
 
 

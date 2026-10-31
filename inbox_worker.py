@@ -3,8 +3,8 @@
 type the "now" ones into the task-manager's session. Phase 3a S7 (docs/phase3a_plan.md §5 S7, §3.2):
 the resident runner calls process() as its `inbox` job (woken by inbox_api's wake, plus a 30-s tick
 while a message is pending or held) and verify_tick() as its `inbox_verify` job (5 s while a
-verification is pending). AFCLAUDE_SCHEDULER=legacy still runs both from inbox_api.py serve's
-worker thread (run_forever), woken by each post and every POLL seconds.
+verification is pending). The legacy mode's worker thread in inbox_api.py (run_forever) is gone
+since phase 3a S9.
 
 A delivered message's post-send check is a stored runner_state "inbox" entry ({msg, path, offset,
 deadline}, store_verify/verify_tick), not a thread: a restart resumes it from the same offset and
@@ -49,7 +49,7 @@ is asking, that is no automation) goes through the keep-alive's own send path an
     box, a dialog) holds it; an unreadable pane is an error (D-235);
   - keepalive.fire (ka_resume.sh: send-keys into the live tmux session, else a resume into one).
 A hold is shown on the message and tried again by the next pass while it lasts (the `inbox` job's
-wake-or-30-s-tick, or the legacy thread's POLL), at most until the next session-window start after
+wake-or-30-s-tick), at most until the next session-window start after
 it began (D-244, inbox.hold_deadline; the dashboard shows "held until"):
 that start's message takes the message along (keepalive._fire_start, inbox.held_insert: with its
 marker and how to answer) and marks it delivered. Still pending START_GRACE after that start (the
@@ -75,8 +75,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
-import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -96,7 +94,6 @@ import usage_stale  # noqa: E402
 UTC = timezone.utc
 ACTOR = "runner:inbox"
 DATA = os.path.join(HERE, "data")
-POLL = 30                                 # seconds between passes (a held message is tried again)
 TRIAGE_TIMEOUT = 120                      # seconds for the Haiku call
 TRIAGE_RETRY_MARGIN = timedelta(minutes=2)  # a triage held at a usage limit is tried again this long after its reset
 LIMIT_KINDS = ("session", "weekly", "")     # the usage limits a triage waits for ("": a plain "hit your limit")
@@ -548,25 +545,3 @@ def process(conn: Any, now: datetime | None = None, verify: Callable[..., Any] |
             r = deliver(conn, m, now or datetime.now(UTC), verify)
             out[r] = out.get(r, 0) + 1
     return out
-
-
-def run_forever(wake: threading.Event, stop: threading.Event | None = None) -> None:
-    """AFCLAUDE_SCHEDULER=legacy only (S7: the runner's `inbox` / `inbox_verify` jobs replace this
-    thread otherwise): a pass on every wake-up (a new message, a retry) and every POLL seconds,
-    triage/delivery then the verify checks. A failed pass (a DB failure, ...) is an error
-    (fail_stop: alert + automation paused, install-wide: it is about no one message); the next pass
-    still runs (the owner's messages are no automation)."""
-    stop = stop or threading.Event()
-    log("inbox worker started")
-    while not stop.is_set():
-        wake.clear()
-        try:
-            conn = store.connect()
-            try:
-                process(conn)
-                verify_tick(conn)
-            finally:
-                conn.close()
-        except Exception as e:   # noqa: BLE001 - an error (D-235/D-244), reported; the next pass runs
-            fail_stop(f"inbox worker pass failed: {type(e).__name__}", f"{e}\n{traceback.format_exc()[-1200:]}")
-        wake.wait(POLL)

@@ -134,23 +134,14 @@ class DefaultWindow(unittest.TestCase):
 
 
 class CronFiring(unittest.TestCase):
-    """docker/crontab.legacy (the legacy mode; phase 3a S5 moved the starts to the runner) runs
-    --window-start every 30 min; due_session_start acts once per start."""
-
-    def crontab_step(self):
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "crontab.legacy")) as fh:
-            line = next(x for x in fh if x.rstrip().endswith("# AFClaude window-start"))
-        minute, hour = line.split()[:2]
-        self.assertEqual((minute, hour), ("*/30", "*"))
-        self.assertIn("--window-start", line)
-        return timedelta(minutes=30)
+    """due_session_start, called every CRON_STEP (the grid the old */30 cron ran --window-start
+    on), finds every start exactly once, under one start_key each."""
 
     def fires(self, cfg, a, b):
-        """(start, key) per acting cron run between a and b (UTC, every crontab step)."""
-        step, t, out = self.crontab_step(), a, []
-        self.assertEqual(step, schedule.CRON_STEP)
+        """(start, key) per acting call between a and b (UTC, every CRON_STEP)."""
+        step, t, out = schedule.CRON_STEP, a, []
         while t < b:
-            run = t + timedelta(seconds=5)                                    # supercronic is a little late
+            run = t + timedelta(seconds=5)                                    # a call a little late
             s = schedule.due_session_start(run, cfg)
             if s is not None:
                 out.append((s, schedule.start_key(run, cfg)))

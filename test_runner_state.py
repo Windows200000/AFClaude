@@ -592,21 +592,17 @@ class Writes(Base):
         return shim
 
     def test_at_shim_jobs(self):
+        """`at -t` writes the job to the DB (the runner starts it: test_runner); the old spool
+        reader never marks a DB job."""
         shim = self._shim()
         jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
         self.assertEqual(store.get_job(self.conn, jid)["status"], "pending")
         self.assertFalse(os.path.exists(shim.SPOOL))                 # no spool file any more
-        self.assertEqual(shim.run_due(), 0)
-        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
-        self.assertEqual(shim.run_due(), 0)                          # never twice
         self.assertEqual([a["action"] for a in store.audit_log(self.conn, target_type="scheduled_job")],
-                         ["job.started", "job.put"])
-        later = shim.spool(datetime(2099, 1, 1, tzinfo=timezone.utc), "true\n")
-        shim.run_due()
-        self.assertEqual(store.get_job(self.conn, later)["status"], "pending")   # not due yet
+                         ["job.put"])
         r = rs.import_jobs(self.conn, shim.SPOOL)                    # the DB owns the jobs: never marks them
         self.assertEqual(r["status"], rs.RETIRED)
-        self.assertEqual(store.get_job(self.conn, later)["status"], "pending")
+        self.assertEqual(store.get_job(self.conn, jid)["status"], "pending")
 
 
     def _locked_shim(self, fail_times, kind="locked", target="jobs"):

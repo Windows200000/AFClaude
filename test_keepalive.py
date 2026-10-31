@@ -1208,51 +1208,6 @@ class FakeProcHolders(unittest.TestCase):
         self.assertEqual(ka.preflight(self.SID), (True, [], "take-over:200"))
 
 
-class WatcherNoContinue(unittest.TestCase):
-    """D-204: the watcher (run loop) never continues the task-manager at a limit reset; it logs
-    the limit hit once (PROGRESS note), and the start passes (last-stretch slot, postponed
-    session-window start) still run while the session is stalled."""
-    def test_limit_hit_is_logged_never_continued(self):
-        with tempfile.TemporaryDirectory() as d:
-            write_transcript(d, SID, [USER, REPLY, STALL] + TRAILING)     # reset long passed
-            names = ("PROJECTS_DIR", "STATE_FILE", "LOCK_FILE", "STOP_FILE", "PROGRESS_FILE", "DEFER_FILE",
-                     "handle_fire", "fire", "fresh_usage", "read_usage_cache", "last_mile_pass",
-                     "deferred_window_start_pass", "log")
-            old = {n: getattr(ka, n) for n in names}
-            calls, logs = [], []
-            ka.PROJECTS_DIR = d
-            ka.STATE_FILE, ka.LOCK_FILE = os.path.join(d, "st.json"), os.path.join(d, "ka.lock")
-            ka.STOP_FILE, ka.PROGRESS_FILE = os.path.join(d, "STOP"), os.path.join(d, "P.md")
-            testenv.notes_project(d)
-            ka.DEFER_FILE = os.path.join(d, "deferred.json")
-            ka.handle_fire = lambda *a, **k: calls.append("handle_fire")
-            ka.fire = lambda *a, **k: calls.append("fire") or (0, "", "")
-            ka.fresh_usage = lambda n, force=False: calls.append("usage")
-            ka.read_usage_cache = lambda: None
-            ka.last_mile_pass = lambda sid, now, st, args: calls.append("last_mile_pass")
-            ka.deferred_window_start_pass = lambda sid, now, st, args: calls.append("deferred")
-            ka.log = logs.append
-
-            class A:
-                session, arm, once, now = SID, True, True, False
-            try:
-                ka.run(A())
-                ka.run(A())                                                # same stall: noted once
-            finally:
-                for n, v in old.items():
-                    setattr(ka, n, v)
-            self.assertEqual(calls, ["last_mile_pass", "deferred"] * 2)     # never handle_fire / fire
-            self.assertTrue(any(ln.startswith("LIMIT_HIT:") and "D-204" in ln for ln in logs), logs)
-            notes = testenv.notes(d)
-            self.assertEqual(notes.count("hit its session limit"), 1)
-            self.assertIn("no continue at the limit reset (D-204)", notes)
-            with open(os.path.join(d, "st.json")) as fh:
-                st = json.load(fh)
-            self.assertEqual(list(st["limit_hits"]), ["stall-1"])
-            self.assertEqual(st["handled"], {})
-
-
-
 class PassesThroughTheRunner(unittest.TestCase):
     """Phase 3a S6: the watcher's passes with the resident runner as the caller (the `watch` tick
     stores the acts, the runner starts each under its run key; testenv.runner_pass = one child, a

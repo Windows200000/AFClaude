@@ -161,6 +161,7 @@ Gaps against the decisions: `--work-on` contradicts D-189/D-205 (no separate tas
 - **Done when:** `grep` finds no `manager_session()` / `AFCLAUDE_MANAGER_SESSION` / `ka-[0-9a-f]` outside tests; 7 calm days.
 - **Also:** the compose env vars `AFCLAUDE_MANAGER_SESSION` and `QUICKVIEW_SELF_SESSION` (docker/compose.yml) go; S3 left them in place.
 - **Risk:** a forgotten reader of the env (compose); `docker compose config` must succeed without it.
+- **As built (with 3a S9a, branch `retire-legacy`):** `afclaude_config.manager_session()` and the env `AFCLAUDE_MANAGER_SESSION` / `DISPATCHER_MANAGER_SESSION` / `QUICKVIEW_SELF_SESSION` are gone (compose, `env.example`; `usage_report.py` needs `--session` or `$CLAUDE_CODE_SESSION_ID`); the `ka-` alternative is gone from `names.TMUX_RE` (so `actions.driven_set`), `host.py`, `docker/host_exec.py` and `ka_resume.sh`; S1's backfill (`store.py import-driven`, `driven.legacy_tmux` / `candidates` / `backfill`) is retired (the launchers write the rows; `driven check` stays). The grep of "Done when" finds `ka-` only in history notes and `usage_sampler.OWN_NAME_RE` (it still recognises old sessions' names in the usage data). Left to the task-manager: `driven check` on the host showing no live `ka-` name before the deploy, and D-036 marked superseded by D-153.
 
 ## 6. Owner's answers (D-281, D-282)
 
