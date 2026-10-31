@@ -1164,7 +1164,9 @@ class EveryAction(Base):
                                     "factors": ["oidc"]}),
             ("auth.session_revoke", {"user_id": 7}),
         ]
-        self.assertEqual({n for n, _ in script}, set(actions.ACTIONS))      # a new action needs a line here
+        # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
+        # are in test_decisions_seed
+        self.assertEqual({n for n, _ in script}, set(actions.ACTIONS) - {"decision.seed"})
         for i, (name, params) in enumerate(script, 1):
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
