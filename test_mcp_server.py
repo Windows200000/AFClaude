@@ -15,6 +15,7 @@ import tempfile
 import time
 import types as pytypes
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -549,6 +550,31 @@ class Decisions(Env):
         with self.assertRaisesRegex(ToolError, "at least one"):
             asyncio.run(ms.afclaude_decisions("propose", title="No topic"))
 
+    def test_record_writes_the_owners_decision_against_their_message(self):
+        """record (Q2 W1): an autonomous session's quote must occur in an owner message of its own session; the date
+        and source come from that message; a quote that isn't there, or a second matching message, is refused."""
+        sid = "11111111-1111-4111-8111-111111111111"
+        conn = store.connect(self.db)
+        try:
+            n = store.add_inbox(conn, "Decided: a verbatim quote of the owner", sid, "owner")["id"]
+        finally:
+            conn.close()
+        with mock.patch.dict(os.environ, {"CLAUDE_GUARD_DISABLE": "1", "CLAUDE_CODE_SESSION_ID": sid}):
+            with self.assertRaisesRegex(ToolError, "none of the owner's messages"):
+                asyncio.run(ms.afclaude_decisions("record", title="T", topics=["x"], words="was never said"))
+            with self.assertRaisesRegex(ToolError, "record needs title and words"):
+                asyncio.run(ms.afclaude_decisions("record", title="T", topics=["x"]))
+            r = run(ms.afclaude_decisions("record", title="Said", topics=["x"], words="a verbatim quote"))
+            self.assertEqual((r["state"], r["source"].split(" ")[:2]), ("active", ["inbox", f"#{n}"]))
+            r2 = run(ms.afclaude_decisions("propose", title="Reword", topics=["x"], supersedes=[r["id"]]))
+            self.assertEqual((r2["state"], r2["supersedes"]), ("proposed", r["id"]))
+        conn = store.connect(self.db)
+        try:
+            d = store.get_decision_entry(conn, r["id"])
+            self.assertEqual((d["author"], d["words"]), ("owner", "a verbatim quote"))
+        finally:
+            conn.close()
+
     def test_a_schema_mismatch_tells_the_caller_what_to_do(self):
         """A server that stayed up across an update (its code older than the database's schema) can't be fixed in
         place; the new code says what to do instead of a generic database error."""
@@ -684,8 +710,8 @@ class Stdio(unittest.TestCase):
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
-        # action's parameters, about 800 bytes)
-        self.assertLess(size, 17500, f"tool list is {size} bytes")
+        # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535)
+        self.assertLess(size, 18000, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

@@ -687,6 +687,17 @@ class OverrideTest(unittest.TestCase):
                 set_override(self.conn, "compact", "Another compaction text")
         self.assertEqual(prompts.text("compact"), prompts.default("compact"))
 
+    def test_a_text_typed_into_tmux_must_keep_its_afclaude_prefix(self):
+        """An override of a prompt that opens a tmux-typed bundle can't drop the keep-alive prefix: the
+        transcript would take the text for the owner's words (D-198). The compaction instruction, which
+        the code prefixes with /compact, and hook context are not typed bodies."""
+        with self.assertRaisesRegex(ValueError, "does not start with an AFClaude prefix in bundle continue"):
+            set_override(self.conn, "continue", prompts.default("continue").replace("[keep-alive] ", ""))
+        self.assertEqual(store.list_prompt_overrides(self.conn), [])
+        set_override(self.conn, "continue", "[keep-alive] " + prompts.default("continue").replace("[keep-alive] ", ""))
+        set_override(self.conn, "compact", "Another compaction text")
+        set_override(self.conn, "nightly_task", prompts.default("nightly_task") + " ok")
+
     def test_a_stale_override_is_an_error_not_a_text_with_missing_variables(self):
         set_override(self.conn, "continue", marked("continue"))
         self.stale("continue", "Go on ({reason}).")                    # the default has {progress} too
