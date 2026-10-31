@@ -395,12 +395,13 @@ def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[
     would get too long for one send). A live session gets inbox_now.md alone; a resumed one also
     the standing rules (or the hook's pointer), like every message that starts a session."""
     notes, ids = inbox.notes_insert(conn, m["session_id"])
+    about = inbox.question_about(conn, m)       # a plain answer to a question names it
     for n, i in ((notes, ids), (None, [])):
         if plan == "send-keys":
-            msg = inbox.now_message(m, n)
+            msg = inbox.now_message(m, n, about)
         else:
             msg = ka.session_message("inbox_now", repo=cwd or None, hooked=ka.rules_hooked(cwd),
-                                   **inbox.now_fields(m, n))
+                                   **inbox.now_fields(m, n, about))
         if inbox.fits(msg):
             return msg, i
     raise RuntimeError(f"the message is too long to type in ({len(msg.encode())} bytes > {inbox.MESSAGE_MAX_BYTES})")

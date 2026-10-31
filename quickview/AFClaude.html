@@ -35,6 +35,16 @@ section h2 { font-size: 19px; margin-bottom: 12px; display: flex; align-items: c
 .thr-end .t { color: #fecaca; font-size: 13px; }
 /* D-306: a notice for the owner (title, text) stays here until dismissed */
 .item.ntc { border-left-color: #0ea5e9; display: flex; flex-direction: column; gap: 4px; }
+/* phase 4b Q3 (D-300): an open question with its answer controls; decision questions sit under one heading */
+.item.qst { display: flex; flex-direction: column; gap: 6px; }
+.qgrp { margin: 14px 0 6px; }
+.qgrp > h3 { font-size: 15px; display: flex; align-items: center; gap: 10px; }
+.q-opts, .q-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.q-acts .t { color: #fecaca; font-size: 13px; min-width: 0; word-break: break-word; }
+.qst textarea { width: 100%; min-height: 40px; resize: vertical; background: #161616; color: #e8eaed; border: 1px solid rgba(255,255,255,.15);
+    border-radius: 8px; padding: 6px 10px; font: inherit; }
+.qst textarea:focus { outline: none; border-color: #7e22ce; }
+.qst .q-edit { display: none; } .qst.editing .q-edit { display: block; }
 .goals { list-style: none; }
 .goals li { padding: 5px 0; display: flex; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.06); }
 .goals li:last-child { border-bottom: none; }
@@ -619,7 +629,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   // D-304: the message-box threads the task-manager answered (inbox.view's threads, live from the
   // inbox API like the box) follow the open questions until the owner dismisses them (inbox.dismiss);
   // D-306: so do the notices (inbox.view's notices; Dismiss = notice.dismiss on the same API)
-  var inputHtml = "", inputCount = 0, threads = [], notices = [], threadErr = "", threadKey = null;
+  var inputHtml = "", inputCount = 0, threads = [], notices = [], questions = [], threadErr = "", threadKey = null;
+  var qDraft = {};     // typed answers / notes by field key, kept over a repaint (a poll must not eat them)
   function noticeItem(n) {
     var src = (n.source ? "review" : "notice") + (n.project ? " · " + esc(n.project) : "") + " · " +
       esc(n.updated_berlin || n.posted_berlin);
@@ -627,16 +638,60 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       '<div class="thr-end"><span class="t"></span><button type="button" data-notice="' + n.id + '">Dismiss</button></div></div>';
   }
   function threadItem(m) {
-    return '<div class="item thr"><div class="m-row"><div class="m-me">' + esc(m.text) + '</div></div><div class="m-ai">' +
+    var q = m.question;     // an answer to a question: the thread shows the question, the answer, the reply (D-304)
+    return '<div class="item thr">' +
+      (q ? '<details><summary>Question #' + q.id + ": " + esc(q.title) + "</summary>" + md(q.text) + "</details>" : "") +
+      '<div class="m-row"><div class="m-me">' + esc(m.text) + '</div></div><div class="m-ai">' +
       md(m.answer) + '</div><div class="thr-end"><span class="t"></span><button type="button" data-dismiss="' + m.id +
       '" data-tip="Answered ' + esc(m.answered_berlin) + '">Dismiss</button></div></div>';
   }
-  function setThreads(list, nlist, err) {
-    var key = JSON.stringify([list, nlist, err]);
+  function draft(key, rows, label, value) {
+    return '<textarea rows="' + rows + '" data-draft="' + key + '" aria-label="' + esc(label) + '">' +
+      esc(value != null ? value : qDraft[key] || "") + "</textarea>";
+  }
+  // a plain question (D-300): the whole text, one button per option, an answer box
+  function questionItem(q) {
+    var opts = (q.options || []).map(function (o, i) {
+      return '<button type="button" data-qact="option" data-q="' + q.id + '" data-i="' + i + '">' + esc(o) + "</button>";
+    }).join("");
+    return '<div class="item qst" data-qid="' + q.id + '"><div class="src">question #' + q.id + (q.project ? " · " + esc(q.project) : "") +
+      " · " + esc(q.asked_berlin) + "</div><strong>" + esc(q.title) + "</strong>" + md(q.text) +
+      (opts ? '<div class="q-opts">' + opts + "</div>" : "") + draft("a" + q.id, 2, "Your answer to question " + q.id) +
+      '<div class="q-acts"><button type="button" data-qact="answer" data-q="' + q.id + '">Answer</button><span class="t"></span></div></div>';
+  }
+  var CHOICE_LABEL = { approve: "Approve", edit: "Edit", reject: "Reject", confirm: "Confirm", drop: "Drop" };
+  // a question about a decision entry: the full text, its choices, an optional note; "edit" opens a box
+  // that starts from the entry's summary (the owner's text replaces it, then it is approved)
+  function decisionItem(q) {
+    var d = q.decision, btns = "";
+    if (!d.kind) {
+      return '<div class="item qst" data-qid="' + q.id + '"><div class="src">question #' + q.id + " · " + esc(q.asked_berlin) +
+        '</div><strong>' + esc(q.title) + "</strong>" + md(q.text) +
+        '<div class="mut">' + esc(d.id) + " needs no decision any more; the task-manager closes this question.</div></div>";
+    }
+    d.choices.forEach(function (c) {
+      btns += '<button type="button" data-qact="' + (c === "edit" ? "edit-open" : "decide") + '" data-choice="' + c + '" data-q="' + q.id + '">' +
+        CHOICE_LABEL[c] + (c === "edit" ? "…" : "") + "</button>";
+    });
+    return '<div class="item qst' + (qDraft["e" + q.id] != null ? " editing" : "") + '" data-qid="' + q.id + '" data-version="' + d.version +
+      '"><div class="src">question #' + q.id + " · " + esc(q.asked_berlin) + "</div><strong>" + esc(q.title) + "</strong>" + md(q.text) +
+      '<div class="q-edit">' + draft("e" + q.id, 4, "Your new summary for " + d.id, qDraft["e" + q.id] != null ? null : d.summary) +
+      '<div class="q-acts"><button type="button" data-qact="decide" data-choice="edit" data-q="' + q.id + '">Save edit and approve</button></div></div>' +
+      draft("n" + q.id, 1, "Optional note on " + d.id) +
+      '<div class="q-acts">' + btns + '<span class="t"></span></div></div>';
+  }
+  function questionsHtml(list) {
+    var plain = list.filter(function (q) { return !q.decision; }), dec = list.filter(function (q) { return q.decision; });
+    return plain.map(questionItem).join("") + (dec.length ? '<div class="qgrp"><h3>Decisions waiting for you <span class="count">' +
+      dec.length + "</span></h3>" + dec.map(decisionItem).join("") + "</div>" : "");
+  }
+  function setThreads(list, nlist, qlist, err) {
+    var key = JSON.stringify([list, nlist, qlist, err]);
     if (key === threadKey) return;         // unchanged: keep the DOM
     threadKey = key;
     threads = list;
     notices = nlist;
+    questions = qlist;
     threadErr = err;
     paintInput();
   }
@@ -656,19 +711,67 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     });
   }
   function paintInput() {
-    var html = inputHtml + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
+    var html = inputHtml + questionsHtml(questions) + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
       (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
-    $("input").innerHTML = html || '<p class="mut">Nothing open.</p>';
+    var box = $("input"), on = document.activeElement, key = on && box.contains(on) ? on.getAttribute("data-draft") : null,
+      at = key ? on.selectionStart : 0;
+    box.innerHTML = html || '<p class="mut">Nothing open.</p>';
+    if (key) {        // a repaint keeps the cursor where the owner was typing
+      var again = box.querySelector('textarea[data-draft="' + key + '"]');
+      if (again) { again.focus(); again.setSelectionRange(at, at); }
+    }
     dismissButtons("data-dismiss", function (id) { return "/" + id + "/dismiss"; }, function (id) {
-      setThreads(threads.filter(function (m) { return m.id !== id; }), notices, threadErr);
+      setThreads(threads.filter(function (m) { return m.id !== id; }), notices, questions, threadErr);
     });
     dismissButtons("data-notice", function (id) { return "/notice/" + id + "/dismiss"; }, function (id) {
-      setThreads(threads, notices.filter(function (n) { return n.id !== id; }), threadErr);
+      setThreads(threads, notices.filter(function (n) { return n.id !== id; }), questions, threadErr);
     });
-    var count = inputCount + notices.length + threads.length;
+    var count = inputCount + questions.length + notices.length + threads.length;
     $("c-input").textContent = count;
     $("c-input").className = "count" + (count ? "" : " zero");
   }
+  // one listener for the questions' controls (their DOM is rebuilt on a repaint)
+  $("input").addEventListener("input", function (ev) {
+    var k = ev.target.getAttribute && ev.target.getAttribute("data-draft");
+    if (k) qDraft[k] = ev.target.value;
+  });
+  $("input").addEventListener("click", function (ev) {
+    var b = ev.target.closest && ev.target.closest("button[data-qact]");
+    if (!b) return;
+    var id = Number(b.getAttribute("data-q")), act = b.getAttribute("data-qact"), item = b.closest(".qst"),
+      q = questions.filter(function (x) { return x.id === id; })[0];
+    if (!q) return;
+    if (act === "edit-open") {            // the edit box opens, starting from the entry's summary
+      if (qDraft["e" + id] == null) qDraft["e" + id] = q.decision.summary || "";
+      item.classList.add("editing");
+      item.querySelector('textarea[data-draft="e' + id + '"]').value = qDraft["e" + id];
+      return;
+    }
+    var path, body;
+    if (act === "decide") {
+      var edit = b.getAttribute("data-choice") === "edit", note = (qDraft["n" + id] || "").trim();
+      body = { choice: b.getAttribute("data-choice"), version: q.decision.version };
+      if (edit) body.text = qDraft["e" + id] || "";
+      if (note) body.note = note;
+      path = "decide";
+    } else {
+      var text = act === "option" ? q.options[Number(b.getAttribute("data-i"))] : qDraft["a" + id] || "";
+      if (!text.trim()) return;
+      body = { answer: text };
+      path = "answer";
+    }
+    Array.prototype.forEach.call(item.querySelectorAll("button"), function (x) { x.disabled = true; });
+    var msg = item.querySelector(".q-acts .t");
+    qapi(id, path, body).then(function (r) {
+      delete qDraft["a" + id]; delete qDraft["e" + id]; delete qDraft["n" + id];
+      setThreads(threads, notices, questions.filter(function (x) { return x.id !== id; }), threadErr);   // gone at once (D-102)
+      pollMessages(!!(r && r.inbox && path === "answer"));     // an answer is a message on its way: look often
+    }).catch(function (e) {
+      Array.prototype.forEach.call(item.querySelectorAll("button"), function (x) { x.disabled = false; });
+      if (msg) msg.textContent = "Not saved: " + e.message;
+      if (/changed since|answered or closed|no longer/.test(e.message)) pollMessages(false);   // stale: the page reloads
+    });
+  });
 
   // D-178/D-241/D-246: the message box to the task-manager. The messages come live from the inbox API
   // (inbox_api.py behind the same key), not from status.json; Haiku sorts each one: "now" is typed
@@ -681,14 +784,15 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   var CHECK = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3.2 3.2L13 4.8" fill="none" stroke="currentColor" ' +
     'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   var MARK = { sorting: "s-spin", sending: "s-spin", held: "s-spin held", delivered: "s-spin", noted: "s-check", error: "s-err" };
-  function api(path, body) {
+  function qapi(id, verb, body) { return api("/" + id + "/" + verb, body, BASE + "api/questions"); }   // D-300
+  function api(path, body, base) {
     var opt = { cache: "no-store", credentials: "same-origin", redirect: "manual" };
     if (body !== undefined) {
       opt.method = "POST";
       opt.headers = { "Content-Type": "application/json" };
       opt.body = JSON.stringify(body);
     }
-    return fetch(API + (path || ""), opt).then(function (r) {
+    return fetch((base || API) + (path || ""), opt).then(function (r) {
       if (r.type === "opaqueredirect" || r.status === 0) throw new Error("Login expired. Reload the page to sign in again.");
       return r.json().catch(function () { return {}; }).then(function (j) {
         if (!r.ok) throw new Error((j && j.error) || "HTTP " + r.status);
@@ -747,8 +851,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       if (gen !== msgGen) return null;
       $("msg-text").maxLength = box.max_chars || 4000;
       renderMessages(box);
-      setThreads(box.threads || [], box.notices || [], "");
-      return box.busy ? 30000 : (box.messages || []).length ? 300000 : 0;
+      setThreads(box.threads || [], box.notices || [], box.questions || [], "");
+      return box.busy ? 30000 : (box.messages || []).length || (box.questions || []).length ? 300000 : 0;
     }).catch(function (e) {
       if (gen !== msgGen) return null;
       msgShown = null;
@@ -756,7 +860,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var why = "Message box unavailable: " + e.message;
       $("msg-log").innerHTML = '<div class="m-err"><span class="t">' + esc(why) + '</span><span class="st s-err" tabindex="0" ' +
         'role="img" aria-label="' + esc(why) + '" data-tip="' + esc(why) + '"></span></div>';
-      setThreads([], [], why);
+      setThreads([], [], [], why);
       return 0;
     });
   }

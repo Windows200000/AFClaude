@@ -519,7 +519,7 @@ class Autonomous(Base):
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
-                  "question.decide",                                           # phase 4b Q3: the owner's answer
+                  "question.decide", "question.answer",                        # phase 4b Q3: the owner's answer
                   # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
                   # message naming the id (phase 4b Q2, owner_words.py), D-104/D-285
                   "install.stamp", "install.restored"}                           # phase 5c: backup.py
@@ -1167,8 +1167,10 @@ class EveryAction(Base):
             ("auth.session_revoke", {"user_id": 7}),
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
-        # are in test_decisions_seed; question.decide writes the entry's rows too (test_questions)
-        self.assertEqual({n for n, _ in script}, set(actions.ACTIONS) - {"decision.seed", "question.decide"})
+        # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
+        # (both in test_questions)
+        self.assertEqual({n for n, _ in script},
+                         set(actions.ACTIONS) - {"decision.seed", "question.decide", "question.answer"})
         for i, (name, params) in enumerate(script, 1):
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")

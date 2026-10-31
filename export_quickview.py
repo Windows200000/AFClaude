@@ -392,24 +392,34 @@ _MD_FILE_RE = re.compile(r"\b[\w./-]*\.md\b")
 _MD_POINTER_WORDS_RE = re.compile(r"\b(see|cf\.?|details?( in)?|refer to|in)\b", re.IGNORECASE)
 
 
-def _split_open_questions(oq_md):
-    """Top-level '- ' items of OPEN_QUESTIONS.md, each as its list of raw lines (the first line
-    with the leading '- ' stripped). A line is part of the current item unless it starts a new
-    top-level item (a '-' with no leading indentation); indented continuation lines and nested
-    numbered/bulleted sub-items (D-279: a multi-line item must not collapse to its first line)
-    stay with it."""
-    items, cur = [], None
+def parse_open_questions(oq_md):
+    """The items of OPEN_QUESTIONS.md as (style, lines): style "-" for a top-level '- ' item, "##" for a
+    '## ' section (today's format; the heading is the first line). `lines` is the list of raw lines, the first
+    with its '- ' / '## ' stripped. A line is part of the current item unless it starts a new one: a '-'
+    with no leading indentation (not inside a '## ' section, whose own '- ' lines are its body) or a '## '
+    heading. Indented continuation lines and nested numbered/bulleted sub-items (D-279: a multi-line item
+    must not collapse to its first line) stay with the item. Text before the first item (title, blank,
+    comments) is no question."""
+    items, cur, style = [], None, None
     for line in oq_md.splitlines():
-        if re.match(r"^-\s+\S", line):
+        if re.match(r"^##\s+\S", line):
             if cur is not None:
-                items.append(cur)
-            cur = [re.sub(r"^-\s+", "", line).rstrip()]
+                items.append((style, cur))
+            cur, style = [re.sub(r"^##\s+", "", line).rstrip()], "##"
+        elif style != "##" and re.match(r"^-\s+\S", line):
+            if cur is not None:
+                items.append((style, cur))
+            cur, style = [re.sub(r"^-\s+", "", line).rstrip()], "-"
         elif cur is not None:
             cur.append(line.rstrip())
-        # lines before the first top-level item (title, blank, comments) aren't an item
     if cur is not None:
-        items.append(cur)
+        items.append((style, cur))
     return items
+
+
+def _split_open_questions(oq_md):
+    """parse_open_questions' items as their lists of raw lines."""
+    return [lines for _style, lines in parse_open_questions(oq_md)]
 
 
 def _open_question_text(lines):
@@ -443,31 +453,46 @@ def _open_question_warning(lines):
     return None
 
 
-def _open_question_md(lines):
-    """One open question as one markdown string (D-279: in full); a warning goes into the text."""
-    text = _open_question_text(lines)
+def _open_question_md(lines, style="-"):
+    """One open question as one markdown string (D-279: in full); a warning goes into the text. A '## '
+    section's heading is bold (a '- ' item's first line is the item's own text)."""
+    text = _open_question_text(["**" + lines[0] + "**"] + lines[1:] if style == "##" else lines)
+
     warning = _open_question_warning(lines)
     return text + "\n\n**⚠ " + warning + "**" if warning else text
 
 
+QUESTIONS_SOURCES = ("file", "db")
+
+
 def needs_input():
-    oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
-    open_questions = [_open_question_md(lines) for lines in _split_open_questions(oq_md)]
+    """What waits for the owner. Questions: while meta questions_source is "file" (until Q3's import) the
+    items of OPEN_QUESTIONS.md, both formats; the DB's open questions (decision questions, asked ones) are
+    shown by the page live from the inbox API, with their answer controls (D-300), in both states. Blocked
+    tasks (kind task) as before; a blocked question is not one of them. A DB error or an unknown source
+    is shown in `error`, and the file's items stay."""
+    source, err = "file", None
     try:
         conn = store.connect()
-        import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
-        stalled.scan(conn)
-        inbox = store.pending_user_input(conn)
+        try:
+            source = store.get_meta(conn, "questions_source", "file")
+            if source not in QUESTIONS_SOURCES:
+                err, source = "questions_source is %r (want file|db)" % source, "file"
+            import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
+            stalled.scan(conn)
+            inbox = store.pending_user_input(conn)
+        finally:
+            conn.close()
         blocked = [{"id": t.get("id"), "title": t.get("title"), "project": t.get("project_name"),
-                    "question": t.get("blocked_question")} for t in inbox["blocked_tasks"]]
-        undecided = [{"session_id": s.get("session_id"), "title": s.get("title"),
-                      "cwd": s.get("cwd"), "kind": s.get("kind"),
-                      "reset_at_berlin": bstr(ka.parse_ts(s.get("reset_at"))) if s.get("reset_at") else None}
-                     for s in inbox["undecided_sessions"]]
-        err = None
+                    "question": t.get("blocked_question")}
+                   for t in inbox["blocked_tasks"] if t.get("kind") != "question"]
     except Exception as e:  # noqa: BLE001 - never let a DB hiccup break the export
-        blocked, undecided, err = [], [], str(e)[:300]
-    return {"open_questions": open_questions, "blocked_tasks": blocked,
+        blocked, err = [], str(e)[:300]
+    open_questions = []
+    if source == "file":
+        oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
+        open_questions = [_open_question_md(lines, style) for style, lines in parse_open_questions(oq_md)]
+    return {"open_questions": open_questions, "blocked_tasks": blocked, "source": source,
             "error": err,
             # user rule 29.09.: only real questions + blocked tasks; stalled sessions are not shown here
             "count": len(open_questions) + len(blocked)}

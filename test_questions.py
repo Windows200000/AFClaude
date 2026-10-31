@@ -49,6 +49,13 @@ class Env(unittest.TestCase):
     def dash(self, name, **params):
         return self.do(name, actor="owner", via="dashboard", **params)
 
+    def manager(self, name="Mgr", sid="00000000-0000-4000-8000-0000000000b1"):
+        """A project with a task-manager session: what an answer's inbox message goes to."""
+        store.add_project(self.conn, name)
+        store.update_project(self.conn, name, manager_session=sid)
+        self.conn.commit()
+        return sid
+
     def owner_entry(self, title="Short titles", **kw):
         return self.do("decision.add", title=title, topics=["lists"], author="owner", words=OWNER_WORDS,
                        summary=kw.pop("summary", "Titles stay short."), **kw)
@@ -104,6 +111,7 @@ class Decide(Env):
         self.assertEqual((self.entry(p["id"])["state"], self.task(q["id"])["status"]), ("proposed", "blocked"))
 
     def test_edit_replaces_the_summary_then_confirms(self):
+        self.manager()
         p = self.proposal(title="Old title")
         q = self.question_of(p["id"])
         r = self.dash("question.decide", task_id=q["id"], choice="edit", text="The owner's own wording.",
@@ -121,6 +129,7 @@ class Decide(Env):
                       decision_version=p2["version"])
 
     def test_reject_deletes_the_proposal_and_keeps_the_originals(self):
+        self.manager()
         a = self.owner_entry("First")
         p = self.proposal(supersedes=[a["id"]])
         q = self.question_of(p["id"])

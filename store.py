@@ -3623,12 +3623,20 @@ def inbox_row(conn: sqlite3.Connection, msg_id: object) -> Row:
     return m
 
 
-def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str) -> Row:
+def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str,
+              question_id: int | None = None, noted: str | None = None) -> Row:
+    """A new message. question_id: the question the text answers (the delivery names it). noted: the reason of a
+    verdict "note" given at once, without a triage (a decision answer's note: the change is already
+    applied); the message is then noted, not pending."""
     clean = inbox_text(text)
     sid = _session_id(session_id)
     with transaction(conn):
-        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text) VALUES (?, ?, ?, ?)",
-                           (now_iso(), created_by, sid, clean))
+        ts = now_iso()
+        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, question_id) "
+                           "VALUES (?, ?, ?, ?, ?)", (ts, created_by, sid, clean, question_id))
+        if noted is not None:
+            conn.execute("UPDATE inbox_messages SET status='noted', verdict='note', verdict_reason=?, triaged_at=? "
+                         "WHERE id=?", (noted, ts, _rowid(cur)))
         m = get_inbox(conn, _rowid(cur))
     assert m is not None
     return m
