@@ -55,6 +55,9 @@ imports it, and builds what the task-manager reads:
     in the DB itself (origin 'db'), their text rendered here (render_body) from the fields; an
     owner's words are active at once, the task-manager's own entries 'proposed' (not in the TLDR)
     until the owner confirms (D-285). The import above leaves them alone.
+  - decision questions (phase 4b Q3): an open proposal and an unconfirmed task-manager entry each have one
+    question for the owner (actions.ask_decision_question); question_kind / question_text say which kind it
+    is and render it in plain words and in full (D-263, D-279); confirmed entries are protected (D-104).
 
     python3 decisions.py tldr | import [--file PATH] | seed ... | hook --part N --of M
 (the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords|import`)
@@ -316,6 +319,64 @@ def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str
             lines.append(f"- **{name}:** {value}")
     return "\n".join(lines)
 
+
+
+# ---------------------------------------------------------------- decision questions (Q3)
+
+PROPOSAL_CHOICES = ("approve", "edit", "reject")      # a proposed entry
+CONFIRM_CHOICES = ("confirm", "drop")                 # an active, unconfirmed task-manager entry
+QUESTION_TITLE_MAX = 120
+
+
+def question_kind(d: dict[str, Any]) -> Optional[str]:
+    """What the owner is asked about entry `d`: "proposal" (state proposed), "confirm" (an active
+    task-manager entry nobody confirmed), None (nothing: an owner's entry, a confirmed one, any other
+    state). An entry that mirrors the file (origin 'file') is never asked."""
+    if d.get("origin") != "db":
+        return None
+    if d["state"] == "proposed":
+        return "proposal"
+    if d["state"] == "active" and d["author"] == "task-manager" and not d.get("confirmed_at"):
+        return "confirm"
+    return None
+
+
+def question_choices(kind: str) -> tuple[str, ...]:
+    return PROPOSAL_CHOICES if kind == "proposal" else CONFIRM_CHOICES
+
+
+def _entry_lines(d: dict[str, Any]) -> list[str]:
+    """One entry in plain words: id, title and date, its summary, the owner's words and the source."""
+    out = [f"{d['id']}: {d['title']}" + (f" ({d['date']})" if d.get("date") else "")]
+    if d.get("summary"):
+        out.append(d["summary"])
+    if d.get("words"):
+        out.append(f"The owner's words: \"{d['words']}\"")
+    if d.get("source"):
+        out.append(f"Source: {d['source']}")
+    return out
+
+
+def question_text(d: dict[str, Any], kind: str, replaced: list[dict[str, Any]]) -> tuple[str, str]:
+    """(title, text) of the question about entry `d` (plain words, nothing cut: D-263, D-279). `replaced`:
+    the entries a proposal replaces, each with its own title, date and the owner's words."""
+    head = d["title"] if len(d["title"]) <= QUESTION_TITLE_MAX else d["title"][:QUESTION_TITLE_MAX - 1] + "…"
+    if kind == "proposal":
+        title = f"Approve {d['id']}: {head}"
+        lines = ["Approve this decision the task-manager proposes?", "", *_entry_lines(d)]
+        if replaced:
+            lines += ["", "It replaces these entries, which are deleted when you approve it:"]
+            for o in replaced:
+                lines += [""] + _entry_lines(o)
+        lines += ["", "approve: it becomes your decision" + (" and the entries above are deleted" if replaced else "")
+                  + ". edit: you rewrite its summary, then it is approved. reject: it is deleted and "
+                  + ("the entries above stay." if replaced else "nothing else changes.")]
+    else:
+        title = f"Confirm {d['id']}: {head}"
+        lines = ["Confirm this decision the task-manager recorded on its own?", "", *_entry_lines(d), "",
+                 "confirm: it becomes yours and the task-manager can no longer change or delete it. "
+                 "drop: it is deleted."]
+    return title, "\n".join(lines)
 
 
 # ---------------------------------------------------------------- the seeding (Q2)

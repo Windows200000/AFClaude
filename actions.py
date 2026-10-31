@@ -325,15 +325,18 @@ def task_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, description: Any = 
 
 @action("task.ask", "task")
 def task_ask(conn: sqlite3.Connection, ctx: Ctx, question: Any, project: Any = None, created_by_session: Any = None,
-             title: Any = None) -> Result:
-    """A manager question: a task of kind 'question', born blocked (§4.6)."""
-    t = store.ask_question(conn, question, project, created_by_session or ctx.session, title)
+             title: Any = None, options: Any = None) -> Result:
+    """A manager question: a task of kind 'question', born blocked (§4.6). options: short answer choices
+    (a list of strings, optional; the owner may always type an answer of their own)."""
+    t = store.ask_question(conn, question, project, created_by_session or ctx.session, title, options)
     return Result(t, t["id"], None, t)
 
 
 @action("task.edit", "task", extra=store.TASK_EDITABLE)
 def task_edit(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, version: Any = None, **fields: Any) -> Result:
     """title / description / project (None = no project) / priority / kind."""
+    if "kind" in fields and _task(conn, task_id).get("decision_id"):
+        raise ValueError(f"task #{task_id} is a decision question: its kind doesn't change")
     return _task_change(conn, task_id, version, lambda: store.update_task(conn, task_id, **fields))
 
 
@@ -355,8 +358,13 @@ def task_block(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, question: Any, 
 @action("task.answer", "task")
 def task_answer(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, answer: Any, version: Any = None) -> Result:
     """blocked -> pending (a question: -> done). From the dashboard, the same answer
-    again right after it was given is a no-op success (a double submit), not an error."""
+    again right after it was given is a no-op success (a double submit), not an error. A decision question
+    (it asks about a decision entry) is refused: the owner decides it (question.decide), a typed answer
+    would leave the entry unchanged."""
     t = _task(conn, task_id)
+    if t.get("decision_id"):
+        raise ValueError(f"task #{task_id} asks about decision {t['decision_id']}: the owner decides it "
+                         "(approve / edit / reject, or confirm / drop, on the dashboard), it has no typed answer")
     if (ctx.via == "dashboard" and t["status"] != "blocked" and t["answer"] is not None
             and isinstance(answer, str) and answer.strip() == t["answer"]
             and store.task_events(conn, task_id)[-1]["event"] == "answered"):
@@ -376,11 +384,15 @@ def task_finish(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, summary: Any =
 
 @action("task.cancel", "task")
 def task_cancel(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = None, version: Any = None) -> Result:
+    _check_question_closable(conn, _task(conn, task_id))
     return _task_change(conn, task_id, version, lambda: store.cancel_task(conn, task_id, reason))
 
 
 @action("task.reopen", "task")
 def task_reopen(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = None, version: Any = None) -> Result:
+    if _task(conn, task_id).get("decision_id"):
+        raise store.InvalidTransition(f"task #{task_id} is a decision question: it isn't reopened (an entry "
+                                      "that still needs the owner has its open question already)")
     return _task_change(conn, task_id, version, lambda: store.reopen_task(conn, task_id, reason))
 
 
@@ -401,6 +413,8 @@ def task_update(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, fields: Any = 
             store.move_stage(conn, task_id, stage)
         if status is not None:
             cur = store._task_row(conn, task_id)
+            if status == "cancelled":
+                _check_question_closable(conn, cur)
             if status == "done":
                 store.finish_task(conn, task_id, note)
             elif status == "cancelled":
@@ -2339,6 +2353,7 @@ def _decision_view(d: Mapping[str, Any]) -> dict[str, Any]:
             "scope": d["scope"], "interpretation": d["interpretation"], "supersedes": d["supersedes"],
             "keywords": d["effective_keywords"],
             "topics": d["topics"], "links": [store.link_text(x) for x in d["links"]], "body": d["body"],
+            "confirmed_at": d.get("confirmed_at"), "confirmed_by": d.get("confirmed_by"),
             "version": d["version"]}
 
 
@@ -2352,10 +2367,91 @@ def _decision_row(conn: sqlite3.Connection, decision: Any, native: bool = False)
     return cur
 
 
+def _protected(cur: Mapping[str, Any]) -> bool:
+    """An owner's entry, or a task-manager entry the owner confirmed (Q3): changed only through the owner."""
+    return bool(cur["author"] == "owner" or cur.get("confirmed_at"))
+
+
 def _decision_owner_guard(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any], what: str) -> None:
-    if cur["author"] == "owner" and decision_autonomous(conn, ctx):
-        raise Forbidden(f"decision.{what} of an owner's decision {cur['id']} is not allowed for an autonomous AFClaude "
+    if _protected(cur) and decision_autonomous(conn, ctx):
+        whose = "an owner's" if cur["author"] == "owner" else "an owner-confirmed"
+        raise Forbidden(f"decision.{what} of {whose} decision {cur['id']} is not allowed for an autonomous AFClaude "
                         "session (only the owner changes one, D-104): propose a replacement instead")
+
+
+# ---- the decision questions (phase 4b Q3, §3.4): every open proposal and every unconfirmed task-manager
+# entry has one open question for the owner (a task of kind question with decision_id); the decision actions
+# below keep it in step in their own transaction, so nothing the owner is asked about is out of date. The
+# question's own creation, rewording and closing are in the task's history (task_events) and in the id the
+# decision action's result and audit row carry ("question"), not in audit rows of their own.
+
+def _audit_row(conn: sqlite3.Connection, ctx: Ctx, name: str, target_type: str, target: object, before: Any,
+               after: Any) -> None:
+    """An audit row for a change an action makes besides its own (question.decide's entry changes)."""
+    store.add_audit(conn, ctx.actor, ctx.via, name, target_type, target, before, after)
+
+
+def _decision_replaced(conn: sqlite3.Connection, d: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The entries a proposal replaces that still exist."""
+    return [e for e in (store.get_decision_entry(conn, i) for i in decisions.supersedes_ids(d["supersedes"]))
+            if e is not None]
+
+
+def _question_project(conn: sqlite3.Connection, d: Mapping[str, Any]) -> str | None:
+    """The project a decision's question belongs to: the entry's, else this checkout's if it is one."""
+    p = store.get_project(conn, d["project_id"]) if d["project_id"] is not None \
+        else store.get_project(conn, HERE, nearest=False)
+    return p["name"] if p else None
+
+
+def ask_decision_question(conn: sqlite3.Connection, ctx: Ctx, d: Mapping[str, Any]) -> store.Row:
+    """Ask the owner about entry `d`: a proposal (approve / edit / reject) or an unconfirmed task-manager
+    entry (confirm / drop). The caller's transaction; ValueError if the entry needs nothing from the owner,
+    InvalidTransition if it already has an open question. The text is rendered from the entry (plain words,
+    in full, D-263, D-279). -> the question (a task row)."""
+    kind = decisions.question_kind(dict(d))
+    if kind is None:
+        raise ValueError(f"{d['id']} needs nothing from the owner (a proposal or an unconfirmed task-manager entry "
+                         "does)")
+    title, text = decisions.question_text(dict(d), kind, _decision_replaced(conn, d))
+    t = store.ask_question(conn, text, _question_project(conn, d), ctx.session, title,
+                           list(decisions.question_choices(kind)), d["id"])
+    return t
+
+
+def _reword_decision_question(conn: sqlite3.Connection, d: Mapping[str, Any]) -> int | None:
+    """The open question about `d` (if any) is rendered again from the entry (decision.edit). -> its id."""
+    q = store.open_decision_question(conn, d["id"])
+    kind = decisions.question_kind(dict(d))
+    if q is None or kind is None:
+        return None
+    title, text = decisions.question_text(dict(d), kind, _decision_replaced(conn, d))
+    if (title, text) != (q["title"], q["blocked_question"]):
+        store.reword_question(conn, q["id"], title, text)
+    return int(q["id"])
+
+
+def _close_decision_question(conn: sqlite3.Connection, did: str, why: str) -> int | None:
+    """The entry was confirmed, deleted or expired another way: its open question (if any) is closed
+    (cancelled) with the reason. -> its id."""
+    q = store.open_decision_question(conn, did)
+    if q is None:
+        return None
+    store.cancel_task(conn, q["id"], f"{did} {why}")
+    return int(q["id"])
+
+
+def _check_question_closable(conn: sqlite3.Connection, t: Mapping[str, Any]) -> None:
+    """A question about a decision entry that still waits for the owner isn't closed by hand: it closes
+    with the entry (confirm, delete). One whose entry is gone, or no longer needs the owner (an older
+    code version confirmed it), may be."""
+    did = t.get("decision_id")
+    if did is None:
+        return
+    cur = store.get_decision_entry(conn, did)
+    if cur is not None and decisions.question_kind(cur) is not None:
+        raise Forbidden(f"task #{t['id']} asks the owner about {did}, which still waits for the owner: it closes "
+                        f"when {did} is confirmed or deleted (decision.confirm / decision.delete), not by hand")
 
 
 def _topics(value: Any, required: bool) -> list[str]:
@@ -2419,7 +2515,8 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
     session (owner_words.find: an inbox message or a transcript prompt; `ref` = inbox:N | chat:S:UUID
     picks one when several match): the entry's date is that message's time and its source names it (D-104,
     D-285, D-198). author task-manager: its own entry, proposed until the owner confirms it
-    (decision.confirm); `supersedes` (ids of native entries) are deleted when it is confirmed. `author` is
+    (decision.confirm) and asks the owner a question about it (Q3); `supersedes` (ids of native entries) are
+    deleted when it is confirmed. `author` is
     always given (no default). At least one topic (D-284). The id is the next D-NNN from the DB alone (no
     id parameter, never the file's numbers); the slug (default: from the title) is unique per project;
     project None = install-wide."""
@@ -2473,6 +2570,8 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
         "interpretation": f["interpretation"], "body": body, "slug": sl, "project_id": pid, "keywords": kws,
         "topics": tops, "supersedes": sup_text}, ctx.actor)
     view = _decision_view(row)
+    if state == "proposed":                           # the owner is asked, in this transaction (Q3)
+        view["question"] = ask_decision_question(conn, ctx, row)["id"]
     if ev is not None:
         return Result(dict(view, **_topic_note(conn, tops), evidence=ev.ref), did, None, dict(view, evidence=ev.ref))
     return Result(dict(view, **_topic_note(conn, tops)), did, None, view)
@@ -2512,24 +2611,30 @@ def decision_edit(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: An
             changes[k] = store.check_decision_slug(conn, v, cur["project_id"], cur["id"]) if v is not None else None
         else:
             changes[k] = store._text(v, k, required=k == "title")
-    if cur["author"] == "owner" and ("words" in changes or "summary" in changes):
-        raise ValueError(f"{cur['id']} is the owner's: its words and summary are not edited, by anyone (D-104, "
-                         "D-285). A rewording is the task-manager's proposal: add it as its own entry "
-                         "(author task-manager) and link it; the owner's own correction is a delete + add")
+    if _protected(cur) and ("words" in changes or "summary" in changes):
+        raise ValueError(f"{cur['id']} is the owner's or confirmed by the owner: its words and summary are not "
+                         "edited, by anyone (D-104, D-285). A rewording is the task-manager's proposal: add it as "
+                         "its own entry (author task-manager) and link it; the owner's own correction is a "
+                         "delete + add")
     new = _decision_rerender(cur, **{k: v for k, v in changes.items() if k in DECISION_EDIT_FIELDS})
     new.update({k: v for k, v in changes.items() if k == "slug"})
     if all(cur[k] == new[k] for k in changes):
         return Result(_decision_view(cur), cur["id"], None, None, changed=False)
     after = store.update_decision_entry(conn, cur["id"], new, ctx.actor)
-    return Result(_decision_view(after), cur["id"], _decision_view(cur), _decision_view(after))
+    qid = _reword_decision_question(conn, after)
+    extra = {"question": qid} if qid is not None else {}
+    return Result(dict(_decision_view(after), **extra), cur["id"], _decision_view(cur),
+                  dict(_decision_view(after), **extra))
 
 
 def _decision_remove(conn: sqlite3.Connection, cur: Mapping[str, Any], version: Any, reason: str) -> Result:
     """Delete `cur` with its topics and links; the audit row holds the whole old entry and the reason."""
     _check_version(cur, version, f"decision {cur['id']}")
     store.delete_decision_entry(conn, cur["id"])
-    return Result({"id": cur["id"], "deleted": True, "reason": reason}, cur["id"], _decision_view(cur),
-                  {"deleted": True, "reason": reason})
+    qid = _close_decision_question(conn, cur["id"], "was deleted" + (f" ({reason})" if reason else ""))
+    extra = {"question": qid} if qid is not None else {}
+    return Result({"id": cur["id"], "deleted": True, "reason": reason, **extra}, cur["id"],
+                  _decision_view(cur), {"deleted": True, "reason": reason, **extra})
 
 
 @action("decision.delete", "decision")
@@ -2549,7 +2654,7 @@ def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
     (plus `reason`) in the audit row. An autonomous session may do this only to an entry whose Status says
     "active until <date>" with that date past (D-278); any other owner's entry is the owner's to remove."""
     cur = _decision_row(conn, decision, native=True)
-    if cur["author"] == "owner" and decision_autonomous(conn, ctx):
+    if _protected(cur) and decision_autonomous(conn, ctx):
         until = decisions.until_of(cur["status"] or "")
         if until is None or datetime.now(decisions.BERLIN) < until:
             raise Forbidden(f"decision.expire of {cur['id']} is not allowed for an autonomous AFClaude session: "
@@ -2561,45 +2666,61 @@ def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
 @action("decision.confirm", "decision")
 def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: Any = None, ref: Any = None,
                      session: Any = None) -> Result:
-    """The owner confirms a proposal: it becomes active (D-285). An autonomous AFClaude session (the
-    task-manager the owner chats with) confirms only against an owner message of its own session that
-    names the id (owner_words.find; `ref` picks one when several do; D-104, D-198). The entries a
-    proposal `supersedes` are deleted in the same transaction, each audited "replaced by D-NNN"; the
-    confirm is refused (nothing written) if one of them no longer exists. Confirming an entry that is
-    already active is a no-op."""
+    """The owner confirms a proposal: it becomes active (D-285), or an active task-manager entry nobody
+    confirmed yet (Q3). Either way it is stored as confirmed (confirmed_at / confirmed_by): from then on it
+    is protected like an owner's entry (D-104), and its open question is closed. An autonomous AFClaude
+    session (the task-manager the owner chats with) confirms only against an owner message of its own session
+    that names the id (owner_words.find; `ref` picks one when several do; D-104, D-198). The entries a
+    proposal `supersedes` are deleted in the same transaction, each audited "replaced by D-NNN"; the confirm
+    is refused (nothing written) if one of them no longer exists. Confirming an entry that is already
+    active and owner's or confirmed is a no-op."""
     cur = _decision_row(conn, decision, native=True)
     autonomous = decision_autonomous(conn, ctx)
     if ref is not None and not autonomous:
         raise ValueError("from (ref) names the owner's message an autonomous session confirms against; "
                          "the owner confirms without it")
     _check_version(cur, version, f"decision {cur['id']}")
-    if cur["state"] == "active":
-        return Result(_decision_view(cur), cur["id"], None, None, changed=False)
-    if cur["state"] != "proposed":
+    if decisions.question_kind(cur) is None:
+        if cur["state"] == "active":
+            return Result(_decision_view(cur), cur["id"], None, None, changed=False)
         raise store.InvalidTransition(f"{cur['id']} is {cur['state']}, not proposed")
     ev: owner_words.Evidence | None = None
     if autonomous:
         ev = _owner_evidence(conn, ctx, f"decision.confirm of {cur['id']}", [cur["id"]], session, ref, word=True,
                              since=max(filter(None, (store.parse_iso(cur["imported_at"]),
                                                     store.parse_iso(cur["updated_at"])))))
+    return _apply_confirm(conn, ctx, cur, ev)
+
+
+def _apply_confirm(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any],
+                   ev: owner_words.Evidence | None) -> Result:
+    """decision.confirm's write (also question.decide's approve / edit / confirm): `cur` is a proposal or an
+    unconfirmed task-manager entry. The caller has checked who may."""
     olds = []
-    for i in decisions.supersedes_ids(cur["supersedes"]):
+    for i in decisions.supersedes_ids(cur["supersedes"]) if cur["state"] == "proposed" else []:
         old = store.get_decision_entry(conn, i)
         if old is None:
             raise store.NotFound(f"{cur['id']} replaces {i}, which no longer exists: nothing was confirmed; edit "
                                  f"the proposal's replaced list or propose it again (decision.delete {cur['id']})")
         olds.append(_decision_row(conn, i, native=True))
-    status = "active" if cur["status"] == decisions.PROPOSED_STATUS else cur["status"]
-    body = decisions.render_body(cur["id"], cur["title"], type=cur["type"], date=cur["date"], status=status,
-                                 summary=cur["summary"], words=cur["words"], source=cur["source"],
-                                 scope=cur["scope"], interpretation=cur["interpretation"],
-                                 supersedes=cur["supersedes"])
-    after = store.set_decision_state(conn, cur["id"], "active", status, body, ctx.actor)
+    if cur["state"] == "proposed":
+        status = "active" if cur["status"] == decisions.PROPOSED_STATUS else cur["status"]
+        body = decisions.render_body(cur["id"], cur["title"], type=cur["type"], date=cur["date"], status=status,
+                                     summary=cur["summary"], words=cur["words"], source=cur["source"],
+                                     scope=cur["scope"], interpretation=cur["interpretation"],
+                                     supersedes=cur["supersedes"])
+        after = store.set_decision_state(conn, cur["id"], "active", status, body, ctx.actor)
+    else:
+        after = store.set_decision_confirmed(conn, cur["id"], ctx.actor)
     for old in olds:
         store.delete_decision_entry(conn, old["id"])
         store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", old["id"], _decision_view(old),
                         {"deleted": True, "reason": f"replaced by {cur['id']}"})
+        _close_decision_question(conn, old["id"], f"was replaced by {cur['id']}")
     extra: dict[str, Any] = {}
+    qid = _close_decision_question(conn, cur["id"], "was confirmed")
+    if qid is not None:
+        extra["question"] = qid
     if olds:
         extra["replaced"] = [o["id"] for o in olds]
     if ev is not None:
@@ -2653,6 +2774,81 @@ def decision_link(conn: sqlite3.Connection, ctx: Ctx, decision: Any, to: Any, ki
     after = _decision_row(conn, a["id"])
     links = [store.link_text(x) for x in after["links"]]
     return Result({"id": a["id"], "links": links}, a["id"], {"links": before}, {"links": links})
+
+
+# ---- questions (phase 4b Q3, §3.4): the owner answers a decision question with one of its choices
+
+@action("question.decide", "task", owner_only=True)
+def question_decide(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, choice: Any, decision_version: Any,
+                    text: Any = None, note: Any = None, title: Any = None) -> Result:
+    """The owner decides a decision question (one that asks about an entry). A proposal: approve (confirm; the
+    entries it replaces are deleted), edit (`text` replaces its summary, `title` its title, then confirm) or
+    reject (deleted; the originals stay). An unconfirmed task-manager entry: confirm (stored as the owner's:
+    protected, D-104) or drop (deleted). `note` is the owner's reason. `decision_version`: the entry's version
+    the owner saw (a stale one is refused, nothing written). The question is closed with the choice as its
+    answer; the entry's change (decision.edit, decision.confirm | decision.delete, on the entry) and the
+    question.decide row (on the question) are audited, in this transaction.
+    Owner-only: the dashboard and the owner's own CLI, never MCP or an autonomous session (D-104)."""
+    if ctx.via not in ("dashboard", "cli") or decision_autonomous(conn, ctx):
+        raise Forbidden("question.decide is the owner's: not for MCP or an autonomous AFClaude session (D-104)")
+    t = _task(conn, task_id)
+    did = t.get("decision_id")
+    if t["kind"] != store.QUESTION_KIND or not did:
+        raise ValueError(f"task #{task_id} isn't a decision question: answer it with task.answer")
+    if t["status"] != "blocked":
+        raise store.InvalidTransition(f"question #{task_id} is {t['status']}: it was answered or closed already")
+    cur = store.get_decision_entry(conn, did)
+    if cur is None:
+        raise store.NotFound(f"{did} no longer exists: close question #{task_id} (question.close)")
+    kind = decisions.question_kind(cur)
+    if kind is None:
+        raise store.InvalidTransition(f"{did} is {cur['state']}" + (", confirmed" if cur.get("confirmed_at") else "")
+                                      + f": it needs no decision any more, close question #{task_id} "
+                                      "(question.close)")
+    state_before = cur["state"]
+    store._enum(choice, decisions.question_choices(kind), "choice")
+    if isinstance(decision_version, bool) or not isinstance(decision_version, int):
+        raise ValueError("decision_version: the version of the entry the owner saw (an integer)")
+    _check_version(cur, decision_version, f"decision {did}")
+    body = store._text(text, "text")
+    new_title = store._text(title, "title")
+    reason_note = store._text(note, "note")
+    if choice == "edit" and not body:
+        raise ValueError("edit needs the new summary (text)")
+    if choice != "edit" and (body or new_title):
+        raise ValueError("text and title belong to an edit")
+    store.answer_task(conn, task_id, choice)          # first: the entry's own actions then find no open question
+    if choice == "edit":
+        new = _decision_rerender(cur, summary=body, **({"title": new_title} if new_title else {}))
+        edited = store.update_decision_entry(conn, did, new, ctx.actor)
+        _audit_row(conn, ctx, "decision.edit", "decision", did, _decision_view(cur), _decision_view(edited))
+        cur = edited
+    if choice in ("reject", "drop"):
+        res = _decision_remove(conn, cur, None, ("rejected" if choice == "reject" else "dropped")
+                               + " by the owner" + (f": {reason_note}" if reason_note else ""))
+        _audit_row(conn, ctx, "decision.delete", "decision", did, res.before, res.after)
+    else:
+        res = _apply_confirm(conn, ctx, cur, None)
+        _audit_row(conn, ctx, "decision.confirm", "decision", did, *res.audit_pair())
+    after_state = "deleted" if choice in ("reject", "drop") else "active"
+    return Result({"question": task_id, "decision_id": did, "choice": choice, "decision": res.result}, task_id,
+                  {"status": "blocked", "decision_state": state_before},
+                  {"status": "done", "answer": choice, "decision_state": after_state, "note": reason_note})
+
+
+@action("question.close", "task")
+def question_close(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any, version: Any = None) -> Result:
+    """The task-manager closes a question that no longer needs the owner (D-102, D-105): cancelled with the
+    reason, audited. Only open questions. One about a decision entry that still waits for the owner is
+    refused (it closes when the entry is confirmed or deleted)."""
+    t = _task(conn, task_id)
+    if t["kind"] != store.QUESTION_KIND:
+        raise ValueError(f"task #{task_id} isn't a question (task.cancel closes a task)")
+    if t["status"] != "blocked":
+        raise store.InvalidTransition(f"question #{task_id} is {t['status']}: only an open one is closed")
+    _check_question_closable(conn, t)
+    r = store._text(reason, "reason", required=True)
+    return _task_change(conn, task_id, version, lambda: store.cancel_task(conn, task_id, r))
 
 
 # ---- the seeding (phase 4b Q2, §3.3): the DB becomes the only decision source; decisions.py checks and

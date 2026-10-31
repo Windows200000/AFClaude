@@ -132,6 +132,21 @@ class Tasks(Env):
         t = run(ms.afclaude_add_task("from env"))
         self.assertEqual((t["project"], t["project_source"]), ("Proj", "env"))
 
+    def test_ask_with_options_and_a_decision_question_is_not_answered_here(self):
+        t = run(ms.afclaude_ask("Which port?", project="A", options=["80", "8080"]))
+        self.assertEqual((t["kind"], t["options"]), ("question", ["80", "8080"]))
+        self.assertEqual(run(ms.afclaude_get_task(t["id"]))["options"], ["80", "8080"])
+        with self.assertRaisesRegex(ToolError, "at most 8 different choices"):
+            asyncio.run(ms.afclaude_ask("Which?", project="A", options=["x", "x"]))
+        c = store.connect(self.db)
+        try:
+            p = actions.perform(c, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager"},
+                                actor="cli", via="cli")
+        finally:
+            c.close()
+        with self.assertRaisesRegex(ToolError, f"asks about decision {p['id']}"):
+            asyncio.run(ms.afclaude_answer_task(p["question"], "yes"))
+
     def test_list_get_update_answer(self):
         a = run(ms.afclaude_add_task("A1", project="A"))
         b = run(ms.afclaude_add_task("B1", project="B"))
