@@ -84,6 +84,13 @@ PROPOSED_STATUS = "proposed (the task-manager's own entry, waiting for the owner
 BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active until" date is Berlin time
 
 
+SOURCE_META = "decisions_source"                     # 'db' once the seeding ran (Q2); absent = the file
+SEED_SHA_META = "decisions_seed_sha"                 # the file's sha256 at the seeding
+SEEDED_META = "decisions_seeded"                     # JSON: what the seeding turned into db rows (for --undo)
+CHANGED_MARK = "decisions_file_changed_alerted"      # meta: the file-changed alert's episode (the file's sha)
+TOPICS_MAX = 3                                       # a seeded entry's topics: 1-3 (D-284: a low number)
+
+
 class SourceError(ValueError):
     """DECISIONS.md can't be imported as it is (no entries, a duplicate id, a mass removal)."""
 
@@ -294,13 +301,302 @@ def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str
     return "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------- the seeding (Q2)
+
+class SeedRefused(ValueError):
+    """The seeding's preconditions aren't met (every problem listed): nothing was written."""
+
+
+DRIFT_RE = re.compile(r"^### (DR-\d+)\b[ \t]*(.*?)\s*$")
+PREAMBLE = "(before the first heading)"
+# a done entry whose Status still names a part that stays in force ("done (the guard stays active)"); an
+# "active until <date>" one-off is not that
+ACTIVE_PART_RE = re.compile(r"\b(active|stays?|remains?|still|continues?|later)\b", re.IGNORECASE)
+ACTIVE_UNTIL_RE = re.compile(r"active until \d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2})?", re.IGNORECASE)
+
+
+@dataclass
+class Block:
+    """A part of DECISIONS.md that is not a D-/M- entry: a DR-NN drift entry, or a section (a "##" heading or
+    another "###" with its text; the text before the first heading)."""
+    kind: str                                # drift | section
+    id: str                                  # DR-NN, or the heading
+    text: str                                # heading line included
+    empty: bool                              # nothing but the heading (the structure the entries' section keeps)
+
+
+def split_blocks(text: str) -> list[Block]:
+    """Everything of the source that parse() does not return as an entry, in file order: each "##" heading,
+    each "###" that is no D-/M- entry, and the text before the first heading, with the text up to the next
+    heading. A trailing "---" rule is not part of it."""
+    out: list[Block] = []
+    cur: Optional[tuple[str, str, list[str]]] = ("section", PREAMBLE, [])
+
+    def close() -> None:
+        if cur is None:
+            return
+        kind, bid, lines = cur
+        while lines and lines[-1].strip() in ("", "---"):
+            lines.pop()
+        if lines:
+            out.append(Block(kind, bid, "\n".join(lines), empty=bid != PREAMBLE and len(lines) == 1))
+
+    for line in text.split("\n"):
+        h = HEADING_RE.match(line)
+        if h:
+            close()
+            if h.group(1) == "###" and ENTRY_RE.match(line):
+                cur = None
+                continue
+            d = DRIFT_RE.match(line)
+            cur = ("drift", d.group(1), [line.rstrip()]) if d else ("section", h.group(2), [line.rstrip()])
+            continue
+        if cur is not None:
+            cur[2].append(line.rstrip())
+    close()
+    return out
+
+
+@dataclass
+class Merge:
+    """A merge of the seeding: the task-manager's rewording of several entries, a proposal the owner
+    confirms (D-285); confirming it deletes the originals (`supersedes`)."""
+    title: str
+    summary: str
+    topics: list[str]
+    supersedes: list[str]
+    words: Optional[str]                     # the originals' owner words, verbatim, with id and date
+    scope: Optional[str] = None
+    interpretation: Optional[str] = None
+
+
+@dataclass
+class SeedPlan:
+    file: str
+    sha: str
+    entries: list[Entry]
+    classes: dict[str, str]                  # entry id -> active | partial | done | expired | superseded
+    survive: list[str]                       # become db rows, in file order
+    delete: list[str]                        # deleted with their full text in the audit log
+    keep: list[str]
+    topics: dict[str, list[str]]             # every surviving entry's topics
+    merges: list[Merge]
+    blocks: list[Block]
+    floor: int                               # the file's highest D-number
+
+    def counts(self) -> dict[str, Any]:
+        """The classes against the file's own numbers; balanced = every entry is accounted for once."""
+        by = {c: sum(1 for v in self.classes.values() if v == c)
+              for c in ("active", "partial", "done", "expired", "superseded")}
+        merged = {i for m in self.merges for i in m.supersedes}
+        return {"file": {"entries": len(self.entries), "drift_entries": sum(b.kind == "drift" for b in self.blocks),
+                         "sections": sum(b.kind == "section" and not b.empty for b in self.blocks),
+                         "headings_only": sum(b.empty for b in self.blocks)},
+                "classes": by,
+                "become_db_rows": len(self.survive),
+                "of_which_kept": len(self.keep), "of_which_merge_originals": len(merged),
+                "deleted": len(self.delete), "proposals": len(self.merges),
+                "audit_only": sum(not b.empty for b in self.blocks),
+                "balanced": len(self.survive) + len(self.delete) == len(self.entries)}
+
+
+def expired_status(status: Optional[str]) -> bool:
+    """A one-off whose moment passed: "expired ..." or an "active until <date>" that is past (D-278)."""
+    s = (status or "").strip().lower()
+    return s.startswith("expired") or until_of(s) is not None
+
+
+def merge_words(originals: list[Entry]) -> Optional[str]:
+    """The originals' owner words as written, each with its id and date: what a merge's proposal carries."""
+    parts = [f"{e.id} ({e.date or 'undated'}): {e.words}" for e in originals if e.words]
+    return " | ".join(parts) or None
+
+
+def load_seed_files(topics_path: str, merges_path: str) -> tuple[Any, list[Any], Any]:
+    """The two JSON files of the seeding: topics {"D-001": ["topic", ...], ...} and merges
+    {"merges": [{"title", "summary", "topics", "supersedes", "scope"?, "interpretation"?}, ...],
+    "keep": ["D-094", ...]} -> (topics, merges, keep)."""
+    def load(path: str, what: str) -> Any:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError) as e:
+            raise SeedRefused(f"can't read the {what} file {path}: {e}") from e
+    topics = load(topics_path, "topics")
+    merges = load(merges_path, "merges")
+    if not isinstance(merges, dict) or set(merges) - {"merges", "keep"}:
+        raise SeedRefused(f"the merges file {merges_path} must be a JSON object with only 'merges' and 'keep'")
+    ms = merges.get("merges", [])
+    if not isinstance(ms, list):
+        raise SeedRefused(f"the merges file {merges_path}: 'merges' must be a list")
+    return topics, ms, merges.get("keep", [])
+
+
+def _topic_list(value: Any, who: str, problems: list[str]) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+        problems.append(f"{who}: topics must be a list of 1-{TOPICS_MAX} strings")
+        return []
+    try:
+        out = list(dict.fromkeys(store.decision_topic(t) for t in value))
+    except ValueError as e:
+        problems.append(f"{who}: {e}")
+        return []
+    if not 1 <= len(out) <= TOPICS_MAX:
+        problems.append(f"{who}: {len(out)} topics, needs 1-{TOPICS_MAX} (D-284)")
+        return []
+    return out
+
+
+def seed_plan(conn: sqlite3.Connection, path: str, topics: Any, merges: list[Any], keep: Any) -> SeedPlan:
+    """Check every precondition of the seeding and work out what it does; reads only. Refused
+    (SeedRefused, all problems listed) when: the DB doesn't mirror the file (run the import first); a
+    surviving entry has no topics or more than TOPICS_MAX; a done entry whose Status names a part that
+    stays in force is in no merge and not in `keep`; a merge or keep names an id that isn't there, is
+    superseded, or is used twice."""
+    try:
+        text, sha = read_source(path)
+    except (OSError, UnicodeDecodeError) as err:
+        raise SeedRefused(f"can't read {path}: {err}") from err
+    entries = parse(text)
+    check_entries(entries, path)
+    by_id = {e.id: e for e in entries}
+    rows = {r["id"]: r for r in store.list_decision_entries(conn) if r["origin"] == "file"}
+    clash = sorted(r[0] for r in conn.execute("SELECT id FROM decisions WHERE origin = 'db'") if r[0] in by_id)
+    if clash:
+        raise IdCollision(f"{path}: {', '.join(clash)} is in the file and is also a native entry")
+    new = [i for i in by_id if i not in rows]
+    gone = [i for i in rows if i not in by_id]
+    stale = [i for i, e in by_id.items() if i in rows and (
+        rows[i]["body_sha256"] != store.sha256_text(e.body) or rows[i]["state"] != e.row()["state"]
+        or rows[i]["keywords"] != e.keywords)]
+    if new or gone or stale:
+        raise SeedRefused("the DB does not mirror the file: run `python3 tasks.py decision import` first "
+                          f"(in the file only: {', '.join(new[:10]) or '-'}; in the DB only: "
+                          f"{', '.join(gone[:10]) or '-'}; differing: {', '.join(stale[:10]) or '-'})")
+    problems: list[str] = []
+    classes: dict[str, str] = {}
+    for e in entries:
+        st = e.row()["state"]
+        classes[e.id] = ("expired" if expired_status(e.status) else "done") if st == "done" else st
+    used: set[str] = set()
+    ms: list[Merge] = []
+    allowed = {"title", "summary", "topics", "supersedes", "scope", "interpretation"}
+    for n, m in enumerate(merges, 1):
+        who = f"merge {n}"
+        if not isinstance(m, dict) or set(m) - allowed or not {"title", "summary", "topics", "supersedes"} <= set(m):
+            problems.append(f"{who}: an object with title, summary, topics, supersedes (and scope, "
+                            "interpretation at most)")
+            continue
+        who = f"merge {n} ({str(m['title'])[:40]})"
+        sup = m["supersedes"]
+        if not isinstance(sup, list) or not sup or not all(isinstance(i, str) for i in sup):
+            problems.append(f"{who}: supersedes must be a list of entry ids")
+            continue
+        for i in sup:
+            if i not in by_id:
+                problems.append(f"{who}: {i} is not in the file")
+            elif classes[i] == "superseded":
+                problems.append(f"{who}: {i} is superseded already")
+            elif i in used:
+                problems.append(f"{who}: {i} is in another merge")
+        used.update(sup)
+        try:
+            title = store._text(m["title"], "title", required=True)
+            summary = store._text(m["summary"], "summary", required=True)
+            scope = store._text(m.get("scope"), "scope")
+            interp = store._text(m.get("interpretation"), "interpretation")
+        except ValueError as err:
+            problems.append(f"{who}: {err}")
+            continue
+        tops = _topic_list(m["topics"], who, problems)
+        ms.append(Merge(title, summary, tops, [i for i in sup if i in by_id],
+                        merge_words([by_id[i] for i in sup if i in by_id]), scope, interp))
+    kept: list[str] = []
+    if not isinstance(keep, list) or not all(isinstance(i, str) for i in keep):
+        problems.append("keep: a list of entry ids")
+    else:
+        for i in dict.fromkeys(keep):
+            if i not in by_id:
+                problems.append(f"keep {i}: not in the file")
+            elif classes[i] in ("active", "partial"):
+                problems.append(f"keep {i}: it is {classes[i]}, it stays anyway")
+            elif i in used:
+                problems.append(f"keep {i}: it is in a merge")
+            else:
+                kept.append(i)
+    covered = used | set(kept)
+    for e in entries:
+        if classes[e.id] == "done" and e.id not in covered and ACTIVE_PART_RE.search(
+                ACTIVE_UNTIL_RE.sub("", e.status or "")):
+            problems.append(f"{e.id} is done but its Status names a part that stays ({e.status!r}): cover it "
+                            "with a merge or list it under keep")
+    survive = [e.id for e in entries if classes[e.id] in ("active", "partial") or e.id in covered]
+    if not isinstance(topics, dict):
+        problems.append("topics: an object {id: [topics]}")
+        topics = {}
+    tmap: dict[str, list[str]] = {}
+    for i in survive:
+        if i not in topics:
+            problems.append(f"{i} has no topics (D-284: 1-{TOPICS_MAX} per surviving entry)")
+        else:
+            tmap[i] = _topic_list(topics[i], i, problems)
+    for i in topics:
+        if i not in survive:
+            problems.append(f"topics for {i}, which does not survive the seeding")
+    if problems:
+        raise SeedRefused(f"the seeding is refused, nothing was written ({len(problems)} problems):\n  - "
+                          + "\n  - ".join(problems))
+    top = max((int(e.id[2:]) for e in entries if e.id.startswith("D-")), default=0)
+    return SeedPlan(path, sha, entries, classes, survive, [e.id for e in entries if e.id not in survive],
+                    kept, tmap, ms, split_blocks(text), top)
+
+
+def source_of(conn: sqlite3.Connection) -> str:
+    """'db' once the seeding ran (the DB is the only source, the file is no longer imported), else 'file'."""
+    return "db" if store.get_meta(conn, SOURCE_META) == "db" else "file"
+
+
+def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Optional[str] = None,
+         path: Optional[str] = None, dry_run: bool = False, undo: bool = False) -> dict[str, Any]:
+    """The seeding (action decision.seed, CLI only): checks everything first (a dry run of the action), then
+    backs the database up (<db>.preseed-<utc>.bak, store._backup_copy) and runs it in one transaction.
+    undo: restores (decision.seed with undo). -> the action's result (counts per class against the file's)."""
+    import actions
+    params: dict[str, Any] = {"dry_run": True}
+    if undo:
+        params["undo"] = True
+    else:
+        if not topics_path or not merges_path:
+            raise SeedRefused("seed needs --topics FILE and --merges FILE")
+        topics, merges, keep = load_seed_files(topics_path, merges_path)
+        params.update(path=os.path.abspath(path or DEFAULT_SOURCE), topics=topics, merges=merges, keep=keep)
+    conn = store.connect(db_path)
+    try:
+        report: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
+        if dry_run:
+            return report
+        params["dry_run"] = False
+        if not undo:
+            db_file = store._db_file(conn)
+            if db_file is None:
+                raise SeedRefused("the database is not a file: no backup can be made")
+            params["backup"] = store._backup_copy(conn, db_file, "preseed")
+        result: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
+        return result
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- import
 
 def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor: str = IMPORT_ACTOR,
-                via: str = "runner", force: bool = False, conn: Optional[sqlite3.Connection] = None
-                ) -> dict[str, Any]:
+                via: str = "runner", force: bool = False, conn: Optional[sqlite3.Connection] = None,
+                alert: Optional[Callable[[str, str], None]] = None) -> dict[str, Any]:
     """Mirror the source file into the decisions table (actions.decision_import, audited).
-    -> {"file", "sha256", "entries", "added", "changed", "removed", "unchanged"}."""
+    -> {"file", "sha256", "entries", "added", "changed", "removed", "unchanged"}. After the seeding (Q2) it
+    imports nothing: -> {"retired": True, "file", "sha256", "seed_sha256", "differs"}, and a file that is not the
+    one the DB was seeded from alerts the owner once per episode (_file_changed)."""
     import actions
     own = conn is None
     c = conn if conn is not None else store.connect(db_path)
@@ -308,10 +604,31 @@ def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor
         r: dict[str, Any] = actions.perform(c, "decision.import",
                                             {"path": os.path.abspath(path or DEFAULT_SOURCE), "force": force},
                                             actor=actor, via=via)
+        if r.get("retired"):
+            _file_changed(c, r, alert)
         return r
     finally:
         if own:
             c.close()
+
+
+def _file_changed(conn: sqlite3.Connection, r: dict[str, Any], alert: Optional[Callable[[str, str], None]]) -> None:
+    """After the cut-over the file is not read any more; one whose sha differs from the seeding's means
+    somebody wrote a decision into it. Alert once per episode (CHANGED_MARK; it ends when the file is the
+    seeded one again): the DB has the decisions, record it with `tasks.py decision add`."""
+    mark = store.get_meta(conn, CHANGED_MARK)
+    if not r["differs"]:
+        if mark:
+            with store.transaction(conn):
+                store.set_meta(conn, CHANGED_MARK, "")
+        return
+    if not mark:
+        (alert or _alert)("DECISIONS.md changed after the cut-over",
+                          f"{r['file']} is not the file the decision store was seeded from (the DB is the only "
+                          "source now, the file is not imported any more). DECISIONS.md changed after the "
+                          "cut-over; record it with `python3 tasks.py decision add`.")
+        with store.transaction(conn):
+            store.set_meta(conn, CHANGED_MARK, r["sha256"])
 
 
 # ---------------------------------------------------------------- output
@@ -388,6 +705,8 @@ def _hook_import(conn: sqlite3.Connection, source_path: Optional[str], db_path: 
     it is built from what the DB holds, read-only, and the returned note (shown at the top of part 1)
     says what is stale. A collision also alerts the owner (once per episode, as the 10-min import).
     Any other failure raises: the hook then says it could not build the TLDR."""
+    if source_of(conn) == "db":
+        return None                                  # after the seeding the DB is the only source (Q2)
     problem = store.schema_problem(conn)
     if problem is not None:
         return (f"[NOTE: DECISIONS.md was not imported, the database's schema doesn't fit this code "
@@ -425,11 +744,28 @@ def hook_output(part: int, of: int, hook_input: dict[str, Any], source_path: Opt
     except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
         if part != 1:
             return None          # part 1 reports it (once, not per part)
-        text = (f"[AFClaude decisions TLDR (D-242): could NOT be built ({type(e).__name__}: {e}). Tell the "
-                f"owner. Until it is fixed, read {source_path or DEFAULT_SOURCE} directly before design or "
-                "planning work.]")
+        what = f"[AFClaude decisions TLDR (D-242): could NOT be built ({type(e).__name__}: {e}). Tell the owner. "
+        if _source_kind(db_path) == "file":
+            text = what + (f"Until it is fixed, read {source_path or DEFAULT_SOURCE} directly before design or "
+                           "planning work.]")
+        else:        # the DB is the only source (after the seeding; or it can't even be read): no file to read
+            text = what + ("Until it is fixed, look decisions up with `python3 tasks.py decision find "
+                           "KEYWORD...` before design or planning work (the DB holds them; DECISIONS.md is not "
+                           "read any more).]")
         sys.stderr.write(f"decisions hook: {type(e).__name__}: {e}\n")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
+
+
+def _source_kind(db_path: Optional[str]) -> Optional[str]:
+    """The decision source ('file' | 'db'), or None when the DB can't be read (the hook's failure text)."""
+    try:
+        conn = store.connect(db_path)
+        try:
+            return source_of(conn)
+        finally:
+            conn.close()
+    except (store.DBError, sqlite3.Error, OSError):
+        return None
 
 
 def print_hook(part: int, of: int, source_path: Optional[str] = None) -> int:
@@ -468,7 +804,7 @@ def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
             conn.close()
         if problem is not None:
             raise problem
-        r = import_file(path, db_path)
+        r = import_file(path, db_path, alert=alert)
         err = None
     except (OSError, ValueError, LookupError, store.DBError, sqlite3.Error) as e:
         r, err, mismatch = {}, f"{type(e).__name__}: {e}", isinstance(e, store.SchemaMismatch)
@@ -533,12 +869,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     h.add_argument("--of", type=int, required=True)
     h.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     sub.add_parser("tldr", help="the TLDR as the hook shows it (no import)")
+    sd = sub.add_parser("seed", help="the one-time cut-over: the DB becomes the only source (Q2); see docs/phase4_plan.md")
+    sd.add_argument("--topics", default=None, help="JSON file: {\"D-001\": [\"topic\", ...], ...} for every surviving entry")
+    sd.add_argument("--merges", default=None, help="JSON file: {\"merges\": [...], \"keep\": [...]}")
+    sd.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
+    sd.add_argument("--dry-run", action="store_true", help="check and count, write nothing")
+    sd.add_argument("--undo", action="store_true", help="restore the file as the source (refused after an edit)")
     args = ap.parse_args(argv)
     if args.cmd == "hook":
         if not 1 <= args.part <= args.of:
             ap.error("--part must be 1..--of")
         return print_hook(args.part, args.of, args.file)
     try:
+        if args.cmd == "seed":
+            print(json.dumps(seed(args.topics, args.merges, db_path=args.db, path=args.file,
+                                  dry_run=args.dry_run, undo=args.undo), indent=1, ensure_ascii=False))
+            return 0
         if args.cmd == "import":
             print(json.dumps(import_file(args.file, args.db, actor="cli", via="cli", force=args.force),
                              indent=1, ensure_ascii=False))

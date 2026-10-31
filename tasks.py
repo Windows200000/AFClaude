@@ -453,6 +453,11 @@ def run_decision(conn, args):
         r = decisions.import_file(args.file, actor="cli", via="cli", force=args.force, conn=conn)
         if args.json:
             return dump(r)
+        if r.get("retired"):
+            print("nothing imported: the DB is the only decision source since the cut-over (the file is not read). "
+                  + ("The file differs from the seeded one: record what it holds with `tasks.py decision add`."
+                     if r["differs"] else "The file is the seeded one."))
+            return None
         parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r[k]]
         print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
               + (f" ({r['moved']} moved)" if r["moved"] else ""))
