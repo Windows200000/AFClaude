@@ -725,7 +725,8 @@ class Stdio(unittest.TestCase):
         size = sum(len(json.dumps(t.model_dump(by_alias=True, exclude_none=True))) for t in tools)
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
-        # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535)
+        # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
+        # then afclaude_ask's options (phase 4b Q3 W1: 17800)
         self.assertLess(size, 18000, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)

@@ -335,8 +335,6 @@ def task_ask(conn: sqlite3.Connection, ctx: Ctx, question: Any, project: Any = N
 @action("task.edit", "task", extra=store.TASK_EDITABLE)
 def task_edit(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, version: Any = None, **fields: Any) -> Result:
     """title / description / project (None = no project) / priority / kind."""
-    if "kind" in fields and _task(conn, task_id).get("decision_id"):
-        raise ValueError(f"task #{task_id} is a decision question: its kind doesn't change")
     return _task_change(conn, task_id, version, lambda: store.update_task(conn, task_id, **fields))
 
 
@@ -390,9 +388,6 @@ def task_cancel(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = 
 
 @action("task.reopen", "task")
 def task_reopen(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any = None, version: Any = None) -> Result:
-    if _task(conn, task_id).get("decision_id"):
-        raise store.InvalidTransition(f"task #{task_id} is a decision question: it isn't reopened (an entry "
-                                      "that still needs the owner has its open question already)")
     return _task_change(conn, task_id, version, lambda: store.reopen_task(conn, task_id, reason))
 
 
@@ -2426,8 +2421,9 @@ def _reword_decision_question(conn: sqlite3.Connection, d: Mapping[str, Any]) ->
     if q is None or kind is None:
         return None
     title, text = decisions.question_text(dict(d), kind, _decision_replaced(conn, d))
-    if (title, text) != (q["title"], q["blocked_question"]):
-        store.reword_question(conn, q["id"], title, text)
+    choices = list(decisions.question_choices(kind))
+    if (title, text, choices) != (q["title"], q["blocked_question"], list(q.get("options") or [])):
+        store.reword_question(conn, q["id"], title, text, choices)
     return int(q["id"])
 
 
@@ -2443,13 +2439,15 @@ def _close_decision_question(conn: sqlite3.Connection, did: str, why: str) -> in
 
 def _check_question_closable(conn: sqlite3.Connection, t: Mapping[str, Any]) -> None:
     """A question about a decision entry that still waits for the owner isn't closed by hand: it closes
-    with the entry (confirm, delete). One whose entry is gone, or no longer needs the owner (an older
-    code version confirmed it), may be."""
+    with the entry (confirm, delete). One whose entry is gone, no longer needs the owner, or is asked
+    something else now (an older code version confirmed the proposal: it is an unconfirmed entry whose
+    question still offers approve / edit / reject) may be."""
     did = t.get("decision_id")
     if did is None:
         return
     cur = store.get_decision_entry(conn, did)
-    if cur is not None and decisions.question_kind(cur) is not None:
+    kind = decisions.question_kind(cur) if cur is not None else None
+    if kind is not None and list(t.get("options") or []) == list(decisions.question_choices(kind)):
         raise Forbidden(f"task #{t['id']} asks the owner about {did}, which still waits for the owner: it closes "
                         f"when {did} is confirmed or deleted (decision.confirm / decision.delete), not by hand")
 
@@ -2969,10 +2967,12 @@ def _seed_undo(conn: sqlite3.Connection, ctx: Ctx, dry_run: bool) -> Result:
         return Result(report, "seed", changed=False)
     for did in rows:
         conn.execute("UPDATE decisions SET origin = 'file' WHERE id = ?", (did,))
+        _close_decision_question(conn, did, "seeding undone")
     for did in props:
         row = store.delete_decision_entry(conn, did)
         store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", did, _decision_view(row),
                         {"deleted": True, "reason": "seeding undone"})
+        _close_decision_question(conn, did, "seeding undone")
     store.set_meta(conn, decisions.SOURCE_META, "file")
     for k in (decisions.SEED_SHA_META, decisions.SEEDED_META, decisions.CHANGED_MARK):
         store.set_meta(conn, k, "")

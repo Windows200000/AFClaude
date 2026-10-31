@@ -2290,11 +2290,16 @@ def _update(conn: sqlite3.Connection, task_id: int, event: str, fields: Mapping[
 def update_task(conn: sqlite3.Connection, task_id: int, **fields: object) -> Row:
     """Change title/description/project/priority/kind/estimated_sessions. Logs one 'updated'
     event with {field: [old, new]} (nothing is logged if nothing changed).
-    A new project appends the task as that project's last stage."""
+    A new project appends the task as that project's last stage. A decision question's kind, title and
+    description follow its entry (reword_question), nobody edits them."""
     bad = set(fields) - set(TASK_EDITABLE)
     if bad:
         raise ValueError(f"not editable: {sorted(bad)} (editable: {', '.join(TASK_EDITABLE)}; "
                          "status changes go through block/answer/start/finish/cancel/reopen)")
+    fixed = sorted(set(fields) & {"kind", "title", "description"})
+    if fixed and _task_row(conn, task_id).get("decision_id"):
+        raise ValueError(f"task #{task_id} is a decision question: its {', '.join(fixed)} doesn't change "
+                         "(it is rendered from the entry)")
     return _update(conn, task_id, "updated", fields)
 
 
@@ -2425,14 +2430,16 @@ def open_decision_question(conn: sqlite3.Connection, decision: str) -> Row | Non
     return _task_dict(r) if r else None
 
 
-def reword_question(conn: sqlite3.Connection, task_id: int, title: str, question: str) -> Row:
-    """A decision question's text and title follow its entry (decision.edit): the blocked question is
-    overwritten, the old text goes into the history."""
+def reword_question(conn: sqlite3.Connection, task_id: int, title: str, question: str,
+                    options: Sequence[str] | None = None) -> Row:
+    """A decision question's text, title and choices follow its entry (decision.edit): the blocked question
+    is overwritten, the old text goes into the history."""
     with transaction(conn):
         t = _task_row(conn, task_id)
         ts = now_iso()
-        conn.execute("UPDATE tasks SET title = ?, blocked_question = ?, updated_at = ? WHERE id = ?",
-                     (title, question, ts, task_id))
+        conn.execute("UPDATE tasks SET title = ?, blocked_question = ?, options = ?, updated_at = ? WHERE id = ?",
+                     (title, question, json.dumps(list(options), ensure_ascii=False) if options else None, ts,
+                      task_id))
         _event(conn, task_id, ts, "reworded", {"was": t["blocked_question"]})
         return _task_row(conn, task_id)
 
@@ -2468,6 +2475,9 @@ def reopen_task(conn: sqlite3.Connection, task_id: int, reason: object = None) -
     question goes back to blocked (asked again, the old answer cleared)."""
     r = _text(reason, "reason")
     with transaction(conn):
+        if _task_row(conn, task_id).get("decision_id"):
+            raise InvalidTransition(f"task #{task_id} is a decision question: it isn't reopened (an entry "
+                                    "that still needs the owner has its open question already)")
         if _task_row(conn, task_id)["kind"] == QUESTION_KIND:
             return _transition(conn, task_id, ("done", "cancelled"), "blocked", "reopened",
                                {"reason": r} if r else None, done_at=None, answer=None, answered_at=None,

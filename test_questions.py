@@ -290,6 +290,51 @@ class Invariant(Env):
             self.do("task.edit", task_id=q["id"], kind="task")
         self.assertEqual(self.task(q["id"])["status"], "blocked")
 
+    def test_task_update_and_task_edit_cant_reopen_or_rewrite_a_decision_question(self):
+        """F1/F2: every path to store.reopen_task / store.update_task meets the same refusal."""
+        p = self.proposal()
+        q = self.question_of(p["id"])
+        self.dash("question.decide", task_id=q["id"], choice="reject", decision_version=p["version"])   # done
+        p2 = self.proposal(title="Second")                                  # another open question exists
+        self.assertIsNotNone(self.question_of(p2["id"]))
+        with self.assertRaisesRegex(store.InvalidTransition, "isn't reopened"):
+            self.do("task.update", task_id=q["id"], status="pending")
+        self.assertEqual(self.task(q["id"])["status"], "done")
+        q2 = self.question_of(p2["id"])
+        for params in ({"kind": "task"}, {"title": "anything"}, {"description": "x"}):
+            with self.assertRaisesRegex(ValueError, "is a decision question"):
+                self.do("task.edit", task_id=q2["id"], **params)
+            with self.assertRaisesRegex(ValueError, "is a decision question"):
+                self.do("task.update", task_id=q2["id"], fields=params)
+        self.do("task.edit", task_id=q2["id"], priority="low")             # other fields stay editable
+        self.assertEqual(self.task(q2["id"])["priority"], "low")
+
+    def test_a_question_whose_proposal_an_older_code_confirmed_is_not_stuck(self):
+        """F3: the entry is active and unconfirmed now (kind confirm), the question still offers approve."""
+        p = self.proposal()
+        q = self.question_of(p["id"])
+        body = self.entry(p["id"])["body"]
+        self.conn.execute("UPDATE decisions SET state = 'active', status = 'active' WHERE id = ?", (p["id"],))
+        self.conn.commit()                                                   # what older code's confirm wrote
+        e = self.entry(p["id"])
+        with self.assertRaisesRegex(ValueError, "choice must be one of confirm\\|drop"):
+            self.dash("question.decide", task_id=q["id"], choice="approve", decision_version=e["version"])
+        self.do("question.close", task_id=q["id"], reason="confirmed by older code")
+        self.assertEqual(self.task(q["id"])["status"], "cancelled")
+        self.assertIn(p["id"], body)
+
+    def test_an_edit_refreshes_the_choices_of_a_stale_question(self):
+        p = self.proposal()
+        q = self.question_of(p["id"])
+        self.conn.execute("UPDATE decisions SET state = 'active', status = 'active' WHERE id = ?", (p["id"],))
+        self.conn.commit()
+        self.do("decision.edit", decision=p["id"], title="Retitled")
+        q2 = self.task(q["id"])
+        self.assertEqual(q2["options"], ["confirm", "drop"])
+        self.assertIn("recorded on its own", q2["blocked_question"])
+        self.dash("question.decide", task_id=q["id"], choice="confirm", decision_version=self.entry(p["id"])["version"])
+        self.assertIsNotNone(self.entry(p["id"])["confirmed_at"])
+
     def test_a_dangling_question_can_be_closed(self):
         p = self.proposal()
         q = self.question_of(p["id"])

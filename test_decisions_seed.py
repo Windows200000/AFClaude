@@ -286,6 +286,26 @@ class Undo(Seed):
         self.seed()                                                      # and it can run again
         self.assertEqual(self.meta(dec.SOURCE_META), "db")
 
+    def test_undo_closes_the_questions_of_what_it_deletes_or_resets(self):
+        """F5 (phase 4b Q3): a question about a seeded proposal (or entry) is closed with the seeding."""
+        r = self.seed(merges={"merges": [self.MERGE], "keep": ["D-005"]})
+        pid = r["proposal_ids"][0]
+        c = self.conn()
+        try:
+            with store.transaction(c):
+                q = actions.ask_decision_question(c, actions.Ctx("cli", "cli"), store.get_decision_entry(c, pid))
+        finally:
+            c.close()
+        self.undo()
+        c = self.conn()
+        try:
+            t = store.get_task(c, q["id"])
+            self.assertEqual(t["status"], "cancelled")
+            self.assertIn("seeding undone", store.task_events(c, q["id"])[-1]["detail"]["reason"])
+            self.assertIsNone(store.open_decision_question(c, pid))
+        finally:
+            c.close()
+
     def all_rows(self):
         c = self.conn()
         try:
