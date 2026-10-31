@@ -86,6 +86,9 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                setup_codes (phase 6a W7, additive the same way, SETUP_SCHEMA): the one-time setup
                code (first owner) and admin reset-auth codes (dashboard/setup.py; actions.py's
                setup.mint_code / setup.claim_code write it; only a code's hash is ever stored).
+               typed_messages (goal 12 S2, additive the same way, TYPED_SCHEMA): every message
+               AFClaude typed or launched with (keepalive.fire; actions.py's typed.record), its driver
+               and the hash of its text, for the usage split's "who drove a turn".
 
 Schema guard (docs/dashboard_design/07_data_model.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -834,6 +837,29 @@ CREATE TABLE IF NOT EXISTS setup_codes (
 CREATE INDEX IF NOT EXISTS setup_codes_open ON setup_codes(kind, user_id, used_at);
 """
 
+# ---- typed messages (goal 12 usage split S2, docs/usage_split_plan.md §3.1, D-138): one row per message
+# AFClaude typed into a session or launched it with (keepalive.fire, the one send path), written BEFORE
+# the send through actions.py's typed.record (audited); a failed write aborts the send (D-235). driver:
+# auto (AFClaude's own text) | owner (the owner's inbox message it delivered). category: the launch's
+# Remote Control category (remote_control.CATEGORIES); prompt: the sender's name for the text (window-
+# start, compact, inbox, ...). Only the sha256 of the whitespace-normalised text is kept
+# (usage_split.text_hash): the sampler matches a transcript prompt against it (same session, sent at
+# most usage_split.MATCH_WINDOW before the prompt) to learn who drove the turn. Append-only, additive,
+# no schema_version bump.
+TYPED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS typed_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    sent_at     TEXT NOT NULL,           -- iso_ms, written just before the send
+    driver      TEXT NOT NULL CHECK (driver IN ('auto', 'owner')),
+    category    TEXT NOT NULL,           -- remote_control category of the launch
+    prompt      TEXT NOT NULL,           -- the sender's name for the text
+    text_sha256 TEXT NOT NULL,           -- usage_split.text_hash(text)
+    actor       TEXT NOT NULL            -- the component that sent it
+);
+CREATE INDEX IF NOT EXISTS typed_messages_session ON typed_messages(session_id, sent_at);
+"""
+
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
 # owner / task-manager decision. Until the seeding step (Q2) it is still mirrored from DECISIONS.md
 # (origin 'file': actions.decision_import, audited) with the full entry text and its fields; from Q1
@@ -1212,6 +1238,7 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     conn.executescript(DECISIONS_SCHEMA)
     conn.executescript(AUTH_SCHEMA)
     conn.executescript(SETUP_SCHEMA)
+    conn.executescript(TYPED_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         _init_decisions_fts(conn)
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
@@ -3699,6 +3726,37 @@ def update_inbox(conn: sqlite3.Connection, msg_id: int, allowed_from: Sequence[s
     assert out is not None
     return out
 
+
+
+# ---------------------------------------------------------------- typed messages (goal 12 S2)
+
+TYPED_DRIVERS = ("auto", "owner")
+
+
+def add_typed_message(conn: sqlite3.Connection, session_id: str, driver: str, category: str, prompt: str,
+                      text_sha256: str, actor: str) -> Row:
+    """One typed_messages row (actions.typed.record validates the values), sent_at = now. -> the row."""
+    if driver not in TYPED_DRIVERS:
+        raise ValueError(f"unknown driver {driver!r}")
+    cur = conn.execute("INSERT INTO typed_messages(session_id, sent_at, driver, category, prompt, text_sha256, actor) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (session_id, now_iso(), driver, category, prompt, text_sha256, actor))
+    r = conn.execute("SELECT * FROM typed_messages WHERE id=?", (_rowid(cur),)).fetchone()
+    return dict(r)
+
+
+def typed_messages(conn: sqlite3.Connection, session_id: str, since: datetime | str) -> list[Row]:
+    """The session's typed_messages rows sent at or after `since`, oldest first (the sampler's matcher)."""
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM typed_messages WHERE session_id=? AND sent_at>=? ORDER BY sent_at, id",
+        (session_id, iso_ms(since) if isinstance(since, datetime) else since))]
+
+
+def typed_since(conn: sqlite3.Connection) -> str | None:
+    """When the typed-message record started (its oldest row), None while it is empty: prompts before
+    it are matched by the prefix list (usage_split.driver_of_prefix, source "prefix")."""
+    r = conn.execute("SELECT MIN(sent_at) FROM typed_messages").fetchone()
+    return str(r[0]) if r and r[0] is not None else None
 
 
 # ---------------------------------------------------------------- notices (D-306)

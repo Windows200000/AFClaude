@@ -1159,6 +1159,8 @@ class EveryAction(Base):
             ("install.stamp", {}),
             ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
             ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
+            ("typed.record", {"session_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "driver": "auto",
+                              "category": "task_manager", "prompt": "continue", "text_sha256": "7" * 64}),
             ("auth.session_login", {"user_id": 7, "id_sha256": "1" * 64, "csrf_sha256": "2" * 64,
                                     "factors": ["passkey_hw"]}),
             ("auth.session_rotate", {"id_sha256": "1" * 64, "new_id_sha256": "3" * 64, "new_csrf_sha256": "4" * 64,

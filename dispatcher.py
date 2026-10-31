@@ -456,7 +456,8 @@ class Pass:
             return "dry-run", tmux
         try:
             rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model,
-                                   category=ka.remote_control.CONTINUE)   # D-269
+                                   category=ka.remote_control.CONTINUE,   # D-269
+                                   driver="auto", prompt="continue" if af else "continue_foreign", actor="dispatcher")
         except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "result": "launch-error",
                                        "error": f"{type(e).__name__}: {e}"[:300]}

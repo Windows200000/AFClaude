@@ -117,32 +117,32 @@ class Fire(Base):
     def test_default_launch(self):
         """The stored tmux name goes along; no --name (ka_resume.sh: the Remote Control name is the
         tmux name, 3b S2)."""
-        ka.fire(SID, "/tmp", "go", "resume")
+        ka.fire(SID, "/tmp", "go", "resume", driver="auto", prompt="test")
         self.assertEqual(self.flags(), {"model": "claude-opus-5-5", "effort": "high", "tmux": "afc-p-task-manager"})
 
     def test_no_stored_name_aborts_before_any_host_call(self):
         """3b S2 (D-235): a session without its driven_sessions row is an error, never a ka- guess."""
         third = "abcdef03-0000-4000-8000-000000000003"
         with self.assertRaisesRegex(ka.NoTmuxName, "abcdef03 has no driven_sessions row"):
-            ka.fire(third, "/tmp", "go", "take-over:42")
+            ka.fire(third, "/tmp", "go", "take-over:42", driver="auto", prompt="test")
         self.assertEqual(self.runs, [])
 
     def test_project_launch_wins(self):
         self.project("P", model="claude-sonnet-5-5", effort="xhigh")
-        ka.fire(SID, "/tmp", "go", "resume", name="mgr", model="claude-opus-5")   # e.g. the dispatcher's
+        ka.fire(SID, "/tmp", "go", "resume", name="mgr", model="claude-opus-5", driver="auto", prompt="test")   # e.g. the dispatcher's
         self.assertEqual(self.flags(), {"model": "claude-sonnet-5-5", "effort": "xhigh", "name": "mgr",
                                         "tmux": "afc-p-task-manager"})
-        ka.fire(OTHER, "/tmp", "go", "resume", model="claude-opus-5")             # not a task-manager
+        ka.fire(OTHER, "/tmp", "go", "resume", model="claude-opus-5", driver="auto", prompt="test")             # not a task-manager
         self.assertEqual(self.flags()["model"], "claude-opus-5")
         self.do("project.manager_launch", project="P", model="default")           # back to LAUNCH's model
-        ka.fire(SID, "/tmp", "go", "send-keys")
+        ka.fire(SID, "/tmp", "go", "send-keys", driver="auto", prompt="test")
         self.assertEqual((self.flags()["model"], self.flags()["effort"]), ("claude-opus-5-5", "xhigh"))
 
     def test_invalid_launch_aborts_before_any_host_call(self):
         self.project("P")
         self.poke("P", manager_effort="turbo")
         with self.assertRaisesRegex(ml.LaunchError, "effort must be one of"):
-            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume")
+            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume", driver="auto", prompt="test")
         self.assertEqual(self.runs, [])                                 # no `claude stop`, no resume
 
 

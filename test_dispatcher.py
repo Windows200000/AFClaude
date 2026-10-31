@@ -16,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import dispatcher as dp  # noqa: E402
+import usage_split  # noqa: E402
 import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
@@ -230,6 +231,11 @@ class Stalled(Base):
         self.assertIn("Guard hooks", msg)
         self.assertNotIn("TASK-MANAGER", msg)                     # neutral: no manager rules
         self.assertEqual(call[call.index("--model") + 1], "claude-sonnet-test")   # its own model
+        typed = self.conn.execute("SELECT driver, prompt, category, actor, text_sha256 FROM typed_messages "
+                                  "WHERE session_id=?", (sid(1),)).fetchall()                # usage split S2
+        self.assertEqual([tuple(r)[:4] for r in typed], [("auto", "continue_foreign", "continue", "dispatcher")])
+        sent = " ".join(call[call.index("--message") + 1:call.index("--cwd")])   # (the fake log splits on spaces)
+        self.assertEqual(typed[0][4], usage_split.text_hash(sent))
         skips = "\n".join(rep["skip"])
         self.assertIn(f"{sid(2)[:8]}: undecided", skips)
         self.assertIn(f"{sid(3)[:8]}: ignored", skips)

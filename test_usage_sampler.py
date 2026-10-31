@@ -254,6 +254,31 @@ class Main(unittest.TestCase):
         self.assertTrue(os.path.exists(us.STATE))                         # no double count next run
         self.assertEqual(self.alerts, ["AFClaude STOPPED: run metrics update failed"])
 
+    def test_a_missed_typed_message_is_an_error_after_the_row(self):
+        """Usage split S2 (D-235): a keep-alive-prefixed prompt with no typed_messages row (a send around
+        keepalive.fire) is reported after the sample row; the state is saved, so it isn't reported twice."""
+        import json
+        import os
+        import store
+        testenv.fresh_db(self)                       # its own DB: the typed row stays out of the shared one
+        conn = store.connect()
+        try:          # the record has started (an older row), but nothing matches the prompt below
+            with store.transaction(conn):
+                store.add_typed_message(conn, "cccccccc-3333-4333-8333-cccccccccccc", "auto", "task_manager",
+                                        "continue", "0" * 64, "keepalive")
+        finally:
+            conn.close()
+        proj = os.path.join(self.d, "projects", "-p")
+        os.makedirs(proj)
+        sid = "dddddddd-4444-4444-8444-dddddddddddd"
+        with open(os.path.join(proj, sid + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "uuid": "k1", "timestamp": store.now_iso(), "origin": {"kind": "human"},
+                                 "message": {"role": "user", "content": "[keep-alive] sent around fire"}}) + "\n")
+        self.assertEqual(us.main(["--no-haiku"]), 1)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertTrue(os.path.exists(us.STATE))
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: an AFClaude-prefixed prompt has no typed_messages row"])
+
     def test_agents_snapshot_failure_aborts(self):
         def roh(*a, **k):
             import subprocess

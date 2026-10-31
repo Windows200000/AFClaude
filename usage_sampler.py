@@ -65,6 +65,7 @@ import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual
 import runner_state  # noqa: E402  (phase 2d: the sampler state and log lines too)
 import failstop  # noqa: E402  (D-234/D-235: every failure is an error the owner sees)
 import prompts as prompt_registry  # noqa: E402  (phase 4a; "prompts" is a local name here)
+import usage_split  # noqa: E402  (goal 12: who drove a turn, the typed-message matcher)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -77,6 +78,7 @@ OWN_LIST = os.path.join(DATA, "own_sessions.txt")   # names the own-session list
 PROJECTS = os.path.expanduser("~/.claude/projects")
 
 HAIKU_EVERY = timedelta(minutes=55)
+DRIVER_KEEP = timedelta(hours=24)    # per-session driver changes kept in the state (usage split §3.1)
 RECENT = timedelta(hours=6)          # sessions shown to Haiku
 OWN_CWD_MARKERS = ("/work/AFClaude", "AFClaude")
 # session names of AFClaude's launches: the tmux / Remote Control names (ka-<id8>; afc-..., 3b S2) and older ones
@@ -189,13 +191,138 @@ def algo_load(weighted):
     return "heavy"
 
 
-def scan(st, baseline):
-    """Read only bytes appended since the last run."""
+# ------------------------------------------------------------------ who drove a turn (usage split S2)
+
+def _ts(v):
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=UTC)
+
+
+class _Typed:
+    """The typed_messages rows the driver matcher needs, read once per scan (store.typed_messages;
+    the DB connection opened on first use). A DB failure raises (D-235: no match guessed)."""
+    def __init__(self):
+        self.conn = None
+        self.since = None
+
+    def _connect(self):
+        if self.conn is None:
+            import store
+            self.conn = store.connect()
+            self.since = store.typed_since(self.conn)
+        return self.conn
+
+    def record_since(self):
+        self._connect()
+        return self.since
+
+    def rows(self, sid, since):
+        import store
+        return [usage_split.TypedRow(r["session_id"], _ts(r["sent_at"]), r["driver"], r["text_sha256"])
+                for r in store.typed_messages(self._connect(), sid, since)]
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+
+
+def track_driver(sid, meta, entries, typed, now, problems):
+    """Update the session's driver state from this chunk of its main transcript (docs/usage_split_plan.md
+    §3.1): each real prompt matched against typed_messages (usage_split.classify; prompts from before the
+    record started go through the prefix matcher, labelled source "prefix", never mixed silently with
+    "typed"). State: meta["driver"] (in force now), meta["drivers"] (changes of the last DRIVER_KEEP:
+    at, driver, via, source) and meta["driver_before"] / ["driver_before_source"] (in force before the
+    oldest kept one). A classification error (usage_split.SplitError: an unknown origin kind, an entry
+    without a time, out of order) or an AFClaude-prefixed prompt without a typed row (a send the record
+    lacks) goes into `problems` (the sampler reports them after the row, D-235); after an error the
+    driver is unknown (a None change) until the next prompt. -> the uuids of the chunk's prompts that
+    AFClaude typed (driver auto), which Haiku leaves out (D-131)."""
+    since = typed.record_since()
+    cut = _ts(since) if since else None
+    if cut is None:                             # nothing recorded yet: the whole chunk is history
+        old, new = entries, []
+    else:
+        old, new = [], []
+        for e in entries:
+            t = _ts(e.get("timestamp")) if e.get("timestamp") else None
+            (old if t is not None and t < cut else new).append(e)
+    auto = set()
+    rows = meta.setdefault("drivers", [])
+    cur = meta.get("driver")
+    try:
+        verdicts = []
+        for part, source in ((old, usage_split.SOURCE_PREFIX), (new, usage_split.SOURCE_TYPED)):
+            if not any(usage_split.real_prompt(e) is not None for e in part):
+                continue
+            typed_rows = []
+            times = [t for t in (_ts(e.get("timestamp")) for e in part
+                                 if e.get("timestamp") and usage_split.real_prompt(e) is not None) if t]
+            if source == usage_split.SOURCE_TYPED and times:   # (a prompt without a time: classify raises)
+                typed_rows = typed.rows(sid, min(times) - usage_split.MATCH_WINDOW)
+            track, prompts = usage_split.classify(sid, part, typed_rows, cur, source)
+            for c in track.changes:
+                rows.append({"at": c.at.isoformat(), "driver": c.driver, "via": c.via, "source": source})
+                cur = c.driver
+            verdicts += prompts
+        for v in verdicts:
+            if v.driver == "auto":
+                auto.add(v.uuid)
+            if v.missed:
+                problems.append(("an AFClaude-prefixed prompt has no typed_messages row",
+                                 f"session {sid[:8]}, entry {v.uuid} at {v.at.isoformat()}: sent around "
+                                 "keepalive.fire (every send must be recorded), or the owner typed such a text"))
+    except usage_split.SplitError as e:
+        times = [t for t in (_ts(x.get("timestamp")) for x in entries if x.get("timestamp")) if t]
+        rows.append({"at": (min(times) if times else now).isoformat(), "driver": None, "via": "error",
+                     "source": None})
+        cur = None
+        problems.append(("usage split: the driver of a session could not be classified",
+                         f"session {sid[:8]}: {e}"))
+    meta["driver"] = cur
+    keep = now - DRIVER_KEEP
+    while rows and _ts(rows[0]["at"]) < keep:
+        r = rows.pop(0)
+        meta["driver_before"], meta["driver_before_source"] = r["driver"], r["source"]
+    return auto
+
+
+def driver_at(meta, ts):
+    """The driver of a session at `ts` and its source (typed | prefix): what a subagent request (its
+    own transcript, parent = this session) takes (§3.1). Unknown (no prompt seen before `ts`, or the
+    classification failed and no prompt came since) -> usage_split.SplitError (D-235: never guessed)."""
+    driver, source = meta.get("driver_before"), meta.get("driver_before_source")
+    for r in meta.get("drivers") or []:
+        if _ts(r["at"]) > ts:
+            break
+        driver, source = r["driver"], r["source"]
+    if driver is None:
+        raise usage_split.SplitError(f"no driver known at {ts.isoformat()}")
+    return driver, source
+
+
+def scan(st, baseline, problems=None):
+    """Read only bytes appended since the last run. Main transcripts first, so a session's driver
+    (track_driver) is current before its subagents' requests are read. `problems`: where the driver
+    tracking's errors go (the caller reports them after the row; None = a throwaway list)."""
+    problems = [] if problems is None else problems
     offsets = st.setdefault("offsets", {})
-    sessions = st.setdefault("sessions", {})   # uuid -> {title, cwd, last_activity, own}
+    sessions = st.setdefault("sessions", {})   # uuid -> {title, cwd, last_activity, own, driver...}
     agg = {}
     seen_ids = set()
-    for path in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+    typed = _Typed()
+    try:
+        return _scan(st, baseline, problems, offsets, sessions, agg, seen_ids, typed)
+    finally:
+        typed.close()
+
+
+def _scan(st, baseline, problems, offsets, sessions, agg, seen_ids, typed):
+    now = now_utc()
+    paths = glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True)
+    for path in sorted(paths, key=lambda p: (session_of(p)[1], p)):
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -217,11 +344,16 @@ def scan(st, baseline):
         offsets[path] = off + last_nl + 1
         a = agg.setdefault(sid, {"tokens": {}, "assistant_turns": 0, "human_prompts": 0,
                                  "limit_hits": 0, "subagent_turns": 0, "last_ts": None})
+        entries = []
         for line in chunk[:last_nl].splitlines():
             try:
                 e = json.loads(line)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
+            if isinstance(e, dict):
+                entries.append(e)
+        typed_auto = set() if is_sub else track_driver(sid, meta, entries, typed, now, problems)
+        for e in entries:
             t = e.get("type")
             if t == "custom-title":
                 meta["title"] = e.get("customTitle")
@@ -256,6 +388,8 @@ def scan(st, baseline):
                 if txt and not txt.lstrip().startswith(("<local-command", "<command-", "<system-reminder", "<task-notification")) \
                         and not (isinstance(c, list) and any(x.get("type") == "tool_result" for x in c if isinstance(x, dict))):
                     a["human_prompts"] += 1
+                    if e.get("uuid") and e["uuid"] in typed_auto:
+                        continue        # AFClaude typed it: not one of the owner's prompts for Haiku (D-131, §3.1)
                     prompts = meta.setdefault("prompts", [])
                     gaps = meta.setdefault("gaps", [])
                     if prompts:
@@ -601,7 +735,8 @@ def sample(args, t):
     st = runner_state.load("sampler", STATE)   # the DB (D-161)
     baseline = not st.get("offsets")
     usage = usage_now(t)
-    agg = scan(st, baseline)
+    split_problems = []
+    agg = scan(st, baseline, split_problems)
     row = {"at": t.isoformat(), **local_fields(t), "tag": args.tag, "baseline": baseline,
            "since": st.get("last_sample_at"), "usage": usage,
            "activity": summarize(agg, st["sessions"]) if agg is not None else None,
@@ -620,7 +755,7 @@ def sample(args, t):
     append(SAMPLES, row)
     append(SERIES, series_line(row))
     # -- the row is stored: from here on the state must be saved; failures are reported after it
-    errors = []
+    errors = list(split_problems)        # usage split S2: driver tracking (nothing decides on it yet)
     try:
         why = track_cycle(usage, t, args.tag)
         if why:

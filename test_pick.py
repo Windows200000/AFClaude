@@ -319,6 +319,7 @@ class FirstStart(Base):
             self.addCleanup(p.stop)
 
     def fake_fire(self, sid, cwd, message, plan, new=False, **kw):
+        self.fire_kw = kw                                  # usage split S2: driver / prompt / actor
         self.launches.append((sid, cwd, message, plan, new, ka.tmux_name(sid)))
         return self.rc, "", "boom" if self.rc else ""
 
@@ -333,6 +334,7 @@ class FirstStart(Base):
                                                   "afc-gamma-task-manager"))
         self.assertEqual(self.gamma()["manager_session"], sid)
         self.assertIn("task-manager of the project gamma", msg)
+        self.assertEqual((self.fire_kw["driver"], self.fire_kw["prompt"]), ("auto", "manager_first_start"))
         self.assertIn("the gamma project", msg)                    # the description: the kickstart (D-301)
         self.assertIn("PACE", msg)
         self.assertNotIn("AFClaude-repo rules", msg)

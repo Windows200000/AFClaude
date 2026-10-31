@@ -396,7 +396,8 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
     tmux = ka.claim_tmux(sid, "review", actor="runner:usage_review")   # its readable name, stored first (3b S2)
     rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude {which} review (one-off) {d}",
-                           category=ka.remote_control.REVIEW)   # D-269
+                           category=ka.remote_control.REVIEW,   # D-269
+                           driver="auto", prompt=ONLY_BUNDLES[which], actor=ACTOR)
     ok = rc == 0 and out.strip().startswith("started")
     st.setdefault("one_off_runs", []).append(
         {"at": now.isoformat(), "only": which, "session": sid, "rc": rc, "out": out.strip(), "err": err.strip()[-300:]})
