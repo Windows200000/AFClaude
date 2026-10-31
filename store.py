@@ -1369,7 +1369,8 @@ def check_writable(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> None
     problem = schema_problem(conn)
     if problem is None:
         if isinstance(conn, TimedConnection) and conn._gap:
-            conn.set_authorizer(None)
+            # set_authorizer(None) only works on Python 3.11+; on 3.9 it installs a callback that denies everything
+            conn.set_authorizer(_gap_authorizer(frozenset()))
             conn._gap = False
         return
     if (isinstance(problem, MigrationNeeded) and _in_gap(problem.db_version)
