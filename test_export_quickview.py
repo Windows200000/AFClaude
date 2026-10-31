@@ -187,6 +187,121 @@ class OpenQuestions(unittest.TestCase):
         self.assertNotIn(".text", body)
 
 
+class QuestionsSource(unittest.TestCase):
+    """Phase 4b Q3 W2: both file formats parse; the file's items show only while meta questions_source is
+    "file"; the DB's questions are the page's own live list (so a blocked question is not a blocked task)."""
+    FILE = ("# Open questions\n\nsome text before the first item is no question\n\n"
+            "## Q-1: First, in the section format\n"
+            "Plain text of the first.\n"
+            "- option a\n- option b\n\n"
+            "## Q-2: Second\nOnly a body line.\n")
+
+    def setUp(self):
+        testenv.fresh_db(self)
+        projects = tempfile.TemporaryDirectory()
+        self.addCleanup(projects.cleanup)
+        patcher = mock.patch.object(qv.ka, "PROJECTS_DIR", projects.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = mock.patch.object(qv, "HERE", self.dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, text):
+        with open(os.path.join(self.dir.name, "OPEN_QUESTIONS.md"), "w") as fh:
+            fh.write(text)
+
+    def source(self, value):
+        conn = store.connect()
+        try:
+            store.set_meta(conn, "questions_source", value)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_both_formats_parse_whole(self):
+        items = qv.parse_open_questions(self.FILE)
+        self.assertEqual([s for s, _ in items], ["##", "##"])
+        self.assertEqual(items[0][1][0], "Q-1: First, in the section format")
+        self.assertIn("- option b", items[0][1])                 # a section's own '- ' lines are its body
+        mixed = "- a dash item\n  with a continuation\n## Q-3: then a section\nbody\n"
+        self.assertEqual([(s, l[0]) for s, l in qv.parse_open_questions(mixed)],
+                         [("-", "a dash item"), ("##", "Q-3: then a section")])
+        self.assertEqual(qv.parse_open_questions("# Title only\n\nno item here\n"), [])
+        self.assertEqual(qv._split_open_questions(mixed)[0], ["a dash item", "  with a continuation"])
+
+    def test_section_items_show_whole_with_a_bold_heading(self):
+        self.write(self.FILE)
+        out = qv.needs_input()
+        self.assertEqual(out["source"], "file")
+        self.assertEqual(len(out["open_questions"]), 2)
+        q1 = out["open_questions"][0]
+        self.assertTrue(q1.startswith("**Q-1: First, in the section format**"))
+        for part in ("Plain text of the first.", "- option a", "- option b"):
+            self.assertIn(part, q1)
+        self.assertNotIn("some text before", " ".join(out["open_questions"]))
+        self.assertEqual(out["count"], 2)
+
+    def test_the_file_is_not_shown_once_the_source_is_db(self):
+        self.write(self.FILE)
+        self.source("db")
+        out = qv.needs_input()
+        self.assertEqual((out["source"], out["open_questions"], out["count"], out["error"]), ("db", [], 0, None))
+
+    def test_an_unknown_source_or_a_db_error_shows_the_error_and_no_file_items(self):
+        self.write(self.FILE)
+        self.source("both")
+        out = qv.needs_input()
+        self.assertIn("questions_source", out["error"])
+        self.assertEqual((out["source"], out["open_questions"]), (None, []))
+        with mock.patch.object(qv.store, "connect", side_effect=RuntimeError("db is gone")):
+            out = qv.needs_input()
+        self.assertEqual((out["source"], out["open_questions"], out["error"]), (None, [], "db is gone"))
+
+    def test_fenced_code_starts_no_item(self):
+        md = ("## Q-1: With a code block\n"
+              "Run this:\n"
+              "```\n## not a heading\n- not an item\n```\n"
+              "and then\n"
+              "~~~sh\n- nor this\n## nor this\n~~~\n"
+              "- inside the section's body\n"
+              "- A dash item after fences\n")
+        items = qv.parse_open_questions(md)
+        self.assertEqual([s for s, _ in items], ["##"])
+        self.assertIn("## not a heading", items[0][1])
+        self.assertIn("- nor this", items[0][1])
+        self.assertIn("- A dash item after fences", items[0][1])         # in a ## section a '- ' line is body
+        dash = qv.parse_open_questions("- First\n```\n- fenced\n## fenced\n```\n- Second\n")
+        self.assertEqual([(s, l[0]) for s, l in dash], [("-", "First"), ("-", "Second")])
+        self.assertEqual(dash[0][1][1:], ["```", "- fenced", "## fenced", "```"])
+        unclosed = qv.parse_open_questions("- One\n```\n- never closed\n- Two\n")
+        self.assertEqual(len(unclosed), 1)                              # an unclosed fence runs to the end
+
+    def test_blocked_tasks_stay_but_a_question_is_not_one(self):
+        conn = store.connect()
+        try:
+            t = store.add_task(conn, "A blocked task", None, None, "medium", "task", None)
+            store.block_task(conn, t["id"], "which way?")
+            store.ask_question(conn, "A question for the owner?", None, None, "Asked", ["yes", "no"])
+            conn.commit()
+        finally:
+            conn.close()
+        for src in ("file", "db"):
+            self.source(src)
+            out = qv.needs_input()
+            self.assertEqual([(b["title"], b["question"]) for b in out["blocked_tasks"]],
+                             [("A blocked task", "which way?")])
+
+    def test_page_has_the_question_controls_on_the_new_endpoints(self):
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        for part in ('BASE + "api/questions"', 'data-qact="answer"', 'data-qact="option"', "Decisions waiting for you",
+                     "box.questions", 'version: q.decision.version', 'path = "decide"', 'path = "answer"'):
+            self.assertIn(part, page)
+
+
 class DocsFromTheDb(unittest.TestCase):
     """PROGRESS/GOALS/ALERTS/EXCEPTIONS come from the project docs in the DB (design §7.7: the
     runners' notes and the alerts are only there); the file only when the DB has no such doc."""

@@ -171,10 +171,14 @@ def transcript_messages(session: str) -> list[Evidence]:
 
 
 def inbox_messages(conn: sqlite3.Connection, session: str) -> list[Evidence]:
-    """The owner's inbox messages for the session, oldest first (every status: the owner wrote them)."""
+    """The owner's inbox messages for the session, oldest first (every status: the owner wrote them). Only
+    rows the owner typed: an option button's text and an edit of the task-manager's summary are not the
+    owner's words (D-285); a database without the `origin` column has only typed rows."""
+    typed = ("AND origin = 'typed' " if any(c["name"] == "origin" for c in conn.execute(
+        "PRAGMA table_info(inbox_messages)")) else "")
     out: list[Evidence] = []
     for r in conn.execute("SELECT id, created_at, text FROM inbox_messages WHERE session_id = ? "
-                          "AND created_by = 'owner' ORDER BY id", (session,)):
+                          f"AND created_by = 'owner' {typed}ORDER BY id", (session,)):
         at = store.parse_iso(r["created_at"])
         if at is not None:
             out.append(Evidence(f"inbox:{r['id']}", at, r["text"]))

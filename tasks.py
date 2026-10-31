@@ -32,6 +32,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            ask the owner (plain words, the whole question in the text;
                                            D-279); --option: a short answer choice, repeatable
     tasks.py question list [--answered]    the open questions (--answered: the recent answered or closed ones)
+    tasks.py question answer ID "text"     the owner's answer to a plain question (question.answer: stored on it
+                                           and as an owner message to the task-manager; refused for an autonomous
+                                           session and for a decision question)
     tasks.py question close ID --reason R  a question that no longer needs the owner (D-102); one about a
                                            decision entry closes with the entry
     tasks.py inbox                         everything that needs the user's input
@@ -882,7 +885,7 @@ def print_question(q):
 
 
 def run_question(conn, args):
-    """Phase 4b Q3: questions for the owner (ask, list, close). The owner answers on the dashboard."""
+    """Phase 4b Q3: questions for the owner (ask, list, answer, close). The owner answers on the dashboard, or here."""
     qc = args.question_cmd
     if qc == "list":
         rows = store.list_tasks(conn, kind=store.QUESTION_KIND,
@@ -903,6 +906,8 @@ def run_question(conn, args):
             project = p["name"] if p else None
         q = act(conn, "task.ask", question=args.text, title=args.title, options=args.option, project=project,
                 created_by_session=os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    elif qc == "answer":
+        q = act(conn, "question.answer", task_id=args.id, answer=args.text)
     else:   # close
         q = act(conn, "question.close", task_id=args.id, reason=args.reason)
     return dump(q) if args.json else print(f"question #{q['id']}: {q['status']}")
@@ -1169,7 +1174,7 @@ def parser():
                                                     "each compaction; the file is not changed)")
     q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")
     q.add_argument("--force", action="store_true", help="allow removing more than half of the decisions")
-    p = sub.add_parser("question", help="questions for the owner (phase 4b Q3): ask | list | close")
+    p = sub.add_parser("question", help="questions for the owner (phase 4b Q3): ask | list | answer | close")
     qs = p.add_subparsers(dest="question_cmd", required=True)
     q = qs.add_parser("ask", parents=[js], help="ask the owner: plain words, the whole question in the text")
     q.add_argument("text")
@@ -1180,6 +1185,10 @@ def parser():
     q = qs.add_parser("list", parents=[js], help="the open questions")
     q.add_argument("--answered", action="store_true", help="the recent answered or closed ones instead")
     q.add_argument("--limit", type=int, default=30, help="with --answered: how many (default 30)")
+    q = qs.add_parser("answer", parents=[js], help="the owner's answer to a plain question (not for an autonomous "
+                                                   "session; a decision question is decided on the dashboard)")
+    q.add_argument("id", type=int)
+    q.add_argument("text")
     q = qs.add_parser("close", parents=[js], help="a question that no longer needs the owner (cancelled, audited)")
     q.add_argument("id", type=int)
     q.add_argument("--reason", required=True)

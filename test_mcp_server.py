@@ -146,6 +146,9 @@ class Tasks(Env):
             c.close()
         with self.assertRaisesRegex(ToolError, f"asks about decision {p['id']}"):
             asyncio.run(ms.afclaude_answer_task(p["question"], "yes"))
+        with self.assertRaisesRegex(ToolError, "question for the owner.*question.answer"):   # any question: the owner's
+            asyncio.run(ms.afclaude_answer_task(t["id"], "80"))
+        self.assertEqual(run(ms.afclaude_get_task(t["id"]))["status"], "blocked")
 
     def test_list_get_update_answer(self):
         a = run(ms.afclaude_add_task("A1", project="A"))

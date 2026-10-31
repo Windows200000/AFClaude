@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import decisions  # noqa: E402
 import prompts  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
@@ -137,11 +138,36 @@ def parse_triage(returncode: int, stdout: str, stderr: str = "") -> dict[str, An
 
 # ---------------------------------------------------------------- messages into the session
 
-def _note_item(m: dict[str, Any]) -> str:
+def question_about(conn: sqlite3.Connection, m: dict[str, Any]) -> str | None:
+    """The delivery header of a message that answers a question (phase 4b Q3): "answer to your question #N
+    <title>", and what the owner chose: for a decision question its choice (on the question, not in the
+    message's text), for an option button the option's number. None for any other message."""
+    qid = m.get("question_id")
+    if qid is None:
+        return None
+    q = store.get_task(conn, qid)
+    if q is None:
+        return f"answer to your question #{qid}"
+    about = f"answer to your question #{qid} {one_line(q['title'])}"
+    if q.get("decision_id") and q.get("answer"):
+        about += f" (the owner chose: {q['answer']})"
+    elif m.get("origin") == "option":       # the text is one of the question's own options: say so
+        opts = list(q.get("options") or [])
+        n = opts.index(m["text"]) + 1 if m["text"] in opts else None
+        about += f" (the owner chose option {n}: {one_line(m['text'])})" if n else " (the owner chose an option)"
+    return about
+
+
+def _stamp(m: dict[str, Any], about: str | None) -> str:
+    """"21.10. 10:00" (+ ", answer to your question #N <title>") for the parentheses after a message's id."""
+    return f"{berlin(m['created_at'])}" + (f", {about}" if about else "")
+
+
+def _note_item(m: dict[str, Any], about: str | None = None) -> str:
     text = one_line(m["text"])
     if len(text) > NOTE_ITEM_MAX:
         text = text[:NOTE_ITEM_MAX] + f"... (cut; the full text: python3 tasks.py inbox show {m['id']})"
-    return f"#{m['id']} ({berlin(m['created_at'])}): \"{text}\""
+    return f"#{m['id']} ({_stamp(m, about)}): \"{text}\""
 
 
 def notes_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, list[int]]:
@@ -152,7 +178,7 @@ def notes_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None,
     ids: list[int] = []
     size = 0
     for m in reversed(store.list_inbox(conn, "noted", session_id, limit=200)):
-        item = _note_item(m)
+        item = _note_item(m, question_about(conn, m))
         if items and size + len(item) > NOTES_MAX:
             break
         items.append(item)
@@ -181,9 +207,10 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
         text = one_line(m["text"])
         if len(text) > NOTE_ITEM_MAX:
             text = text[:NOTE_ITEM_MAX] + f"... (cut; the full text: python3 tasks.py inbox show {m['id']})"
-        item = f"{marker(m['id'])} ({berlin(m['created_at'])}): \"{text}\""
+        stamp = _stamp(m, question_about(conn, m))
+        item = f"{marker(m['id'])} ({stamp}): \"{text}\""
         if size + len(item) > HELD_MAX:
-            item = f"{marker(m['id'])} ({berlin(m['created_at'])}): (its text: python3 tasks.py inbox show {m['id']})"
+            item = f"{marker(m['id'])} ({stamp}): (its text: python3 tasks.py inbox show {m['id']})"
         items.append(item)
         ids.append(m["id"])
         size += len(item)
@@ -233,14 +260,15 @@ def seen(path: str, offset: int, mark: str) -> bool:
         return False
 
 
-def now_fields(m: dict[str, Any], notes: str | None) -> dict[str, Any]:
-    """The placeholders of inbox_now.md for message m (+ the noted ones going along)."""
-    return {"id": m["id"], "at": berlin(m["created_at"]), "text": one_line(m["text"]), "notes": notes or ""}
+def now_fields(m: dict[str, Any], notes: str | None, about: str | None = None) -> dict[str, Any]:
+    """The placeholders of inbox_now.md for message m (+ the noted ones going along). `about`
+    (question_about): the question the message answers, named after the time."""
+    return {"id": m["id"], "at": _stamp(m, about), "text": one_line(m["text"]), "notes": notes or ""}
 
 
-def now_message(m: dict[str, Any], notes: str | None) -> str:
+def now_message(m: dict[str, Any], notes: str | None, about: str | None = None) -> str:
     """The "now" message as typed into a live session: inbox_now.md on one line."""
-    return " ".join(prompt("inbox_now").format(**now_fields(m, notes)).split())
+    return " ".join(prompt("inbox_now").format(**now_fields(m, notes, about)).split())
 
 
 def fits(message: str) -> bool:
@@ -339,6 +367,36 @@ def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[
             "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
 
 
+def question_view(conn: sqlite3.Connection, t: dict[str, Any]) -> dict[str, Any]:
+    """An open question as the questions section shows it (D-279: the whole text, D-300: what the owner can
+    answer with): `options` (a plain question's answer buttons, free text always allowed), or `decision`
+    for a question about an entry: its id, `kind` (proposal | confirm; None: it needs no decision any more,
+    only the task-manager can close it), the `choices`, the entry's `version` the answer must carry and its
+    `summary`."""
+    out: dict[str, Any] = {"id": t["id"], "title": t["title"], "text": t["blocked_question"],
+                           "project": t["project_name"], "asked_berlin": berlin(t["created_at"], VIEW_FMT),
+                           "options": [], "decision": None}
+    did = t.get("decision_id")
+    if not did:
+        out["options"] = list(t.get("options") or [])
+        return out
+    e = store.get_decision_entry(conn, did)
+    kind = decisions.question_kind(e) if e is not None else None
+    out["decision"] = {"id": did, "kind": kind, "choices": list(decisions.question_choices(kind)) if kind else [],
+                       "version": e["version"] if e is not None else None,
+                       "summary": e["summary"] if e is not None else None}   # the edit box starts from it
+    return out
+
+
+def thread_view(conn: sqlite3.Connection, m: dict[str, Any]) -> dict[str, Any]:
+    """An answered message for the questions section (D-304); one that answers a question carries the
+    question (id, title, text) so the thread shows question, answer and reply."""
+    out = message_view(m)
+    q = store.get_task(conn, m["question_id"]) if m.get("question_id") is not None else None
+    out["question"] = ({"id": q["id"], "title": q["title"], "text": q["blocked_question"]} if q is not None else None)
+    return out
+
+
 def notice_view(n: dict[str, Any]) -> dict[str, Any]:
     """A notice for the owner (D-306) as the questions section shows it."""
     return {"id": n["id"], "title": n["title"], "text": n["text"], "project": n["project_name"],
@@ -352,12 +410,15 @@ def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any
     stays until then, whatever the chat's reset). `chat`: an answer is in view (the box shows it
     as a chat); `busy`: a message is still on its way (the page polls faster). `threads`: every
     answered message the owner has not dismissed, whatever its age, for the questions section (D-304);
-    `notices`: every notice the owner has not dismissed, oldest first, for the same section (D-306)."""
+    `notices`: every notice the owner has not dismissed, oldest first, for the same section (D-306);
+    `questions`: every open question in full, oldest first, with its options or decision choices (D-300)."""
     ms = sorted(thread(conn, now) + store.list_inbox(conn, "noted", limit=200), key=lambda m: m["id"])
     cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
     out = [message_view(m, cfg) for m in ms]
-    return {"messages": out, "threads": [message_view(m) for m in store.inbox_threads(conn)],
+    questions = sorted(store.list_tasks(conn, status="blocked", kind=store.QUESTION_KIND), key=lambda t: t["id"])
+    return {"messages": out, "threads": [thread_view(conn, m) for m in store.inbox_threads(conn)],
             "notices": [notice_view(n) for n in store.list_notices(conn)],
+            "questions": [question_view(conn, t) for t in questions],
             "chat": any(m["answer"] for m in ms),
             "busy": any(m["state"] in BUSY_STATES for m in out),
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}

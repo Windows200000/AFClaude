@@ -11,13 +11,23 @@ nothing new is published and the request has passed nginx's X-AFClaude-Key check
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200
   POST /afclaude/api/inbox/<id>/dismiss  an answered thread leaves the questions section (D-304) -> 200
   POST /afclaude/api/inbox/notice/<id>/dismiss   a notice leaves the questions section (D-306) -> 200
+  POST /afclaude/api/questions/<id>/answer   {"answer": "..."} or {"option": i} (the 0-based index of one of
+                                         its options; the server stores the option's text) -> 200: a plain
+                                         question is answered
+                                         (question.answer: stored on it and as an inbox message from the
+                                         owner, triaged and delivered like any other; Q3 W2, D-300)
+  POST /afclaude/api/questions/<id>/decide   {"choice": "...", "text"?, "note"?, "version": N} -> 200: a
+                                         question about a decision entry is decided (question.decide:
+                                         approve / edit / reject or confirm / drop); `version` is the entry's
+                                         the owner saw, a stale one is a 409 and the page reloads
 
 Owner-only (the text ends up in the task-manager's session): every request needs the same
 X-AFClaude-Key here too (compared with the key file, read on every request, so a rotated key
 needs no restart; no key file: every request is refused, 503), a POST must be JSON
 (application/json, so a cross-site form can't send one), at most BODY_MAX bytes, and at most
-inbox.RATE_MAX messages an hour. Writes go through actions.py (inbox.post / retry / dismiss and
-notice.dismiss, actor owner, via dashboard: audited).
+inbox.RATE_MAX messages an hour (an answer or a decision's note is a message too: both count). Writes
+go through actions.py (inbox.post / retry / dismiss, notice.dismiss, question.answer / decide, actor
+owner, via dashboard: audited).
 
 Phase 3a S7 (docs/phase3a_plan.md §5 S7): this process only serves HTTP; a post or a retry wakes
 the resident runner (runner.wake), whose own `inbox` / `inbox_verify` jobs do the triage, delivery
@@ -56,6 +66,8 @@ KEY_HEADER = "X-AFClaude-Key"
 PREFIX = "/afclaude/api/inbox"
 MSG_RE = re.compile(r"^/afclaude/api/inbox/(\d{1,9})/(retry|dismiss)$")
 NOTICE_RE = re.compile(r"^/afclaude/api/inbox/notice/(\d{1,9})/dismiss$")
+QUESTION_RE = re.compile(r"^/afclaude/api/questions/(\d{1,9})/(answer|decide)$")
+QUESTION_FIELDS = {"answer": {"answer", "option"}, "decide": {"choice", "text", "note", "version"}}
 BODY_MAX = 16 * 1024
 ACTOR, VIA = "owner", "dashboard"
 
@@ -178,6 +190,11 @@ class Handler(BaseHTTPRequestHandler):
             log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)")
             self.server.wake.set()
             return 201, inbox.message_view(m)
+        question = QUESTION_RE.match(path)
+        if question:
+            if method != "POST":
+                raise HTTPError(405, "method not allowed")
+            return self.question(conn, int(question.group(1)), question.group(2))
         notice = NOTICE_RE.match(path)
         if notice:
             if method != "POST":
@@ -196,6 +213,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.wake.set()
             return 200, inbox.message_view(m)
         raise HTTPError(404 if not hit else 405, "not found" if not hit else "method not allowed")
+
+    def question(self, conn: Any, qid: int, verb: str) -> tuple[int, object]:
+        """The owner answers question `qid` (D-300): "answer" a plain one, "decide" one about a decision
+        entry. Same JSON, size and rate rules as the box; a message the answer writes counts as one."""
+        body = self.json_body()
+        extra = set(body) - QUESTION_FIELDS[verb]
+        if extra:
+            raise HTTPError(400, f"unknown field(s) {sorted(extra)}")
+        typed = any(isinstance(body.get(k), str) and body[k].strip() for k in ("text", "note"))
+        if (verb == "answer" or typed) and not inbox.rate_ok(conn):
+            raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
+        if verb == "answer":
+            r = actions.perform(conn, "question.answer",
+                                {"task_id": qid, **{k: body[k] for k in ("answer", "option") if k in body}},
+                                actor=ACTOR, via=VIA)
+        else:
+            r = actions.perform(conn, "question.decide",
+                                {"task_id": qid, "choice": body.get("choice"), "decision_version": body.get("version"),
+                                 **{k: body[k] for k in ("text", "note") if k in body}}, actor=ACTOR, via=VIA)
+        mid = r.get("inbox")
+        log(f"question #{qid}: {'answered' if verb == 'answer' else 'decided'} by the owner" + (f", inbox #{mid}" if mid else ""))
+        if verb == "answer" and mid:
+            self.server.wake.set()
+        return 200, {"question": qid, "status": "done", "inbox": mid}
 
     def do_GET(self) -> None:
         self.handle_api("GET")

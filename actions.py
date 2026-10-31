@@ -355,14 +355,16 @@ def task_block(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, question: Any, 
 
 @action("task.answer", "task")
 def task_answer(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, answer: Any, version: Any = None) -> Result:
-    """blocked -> pending (a question: -> done). From the dashboard, the same answer
-    again right after it was given is a no-op success (a double submit), not an error. A decision question
-    (it asks about a decision entry) is refused: the owner decides it (question.decide), a typed answer
-    would leave the entry unchanged."""
+    """blocked -> pending. From the dashboard, the same answer again right after it was given is a no-op
+    success (a double submit), not an error. A question (kind question, plain or about a decision entry) is
+    refused: only the owner answers it (question.answer, or question.decide for a decision), and the
+    task-manager closes one that needs no answer (question.close)."""
     t = _task(conn, task_id)
-    if t.get("decision_id"):
-        raise ValueError(f"task #{task_id} asks about decision {t['decision_id']}: the owner decides it "
-                         "(approve / edit / reject, or confirm / drop, on the dashboard), it has no typed answer")
+    if t["kind"] == store.QUESTION_KIND:
+        about = f"asks about decision {t['decision_id']} and " if t.get("decision_id") else ""
+        raise ValueError(f"task #{task_id} {about}is a question for the owner: the owner answers it on the dashboard "
+                         "(question.answer; question.decide for a decision), or `tasks.py question answer`; "
+                         "close one that needs no answer with question.close (`tasks.py question close`)")
     if (ctx.via == "dashboard" and t["status"] != "blocked" and t["answer"] is not None
             and isinstance(answer, str) and answer.strip() == t["answer"]
             and store.task_events(conn, task_id)[-1]["event"] == "answered"):
@@ -1746,6 +1748,22 @@ def _short(value: Any, what: str, limit: int, required: bool = True) -> str | No
     return t
 
 
+def _inbox_session(conn: sqlite3.Connection, project: Any = None) -> str:
+    """The task-manager session a message for `project` (a name, id or directory; None: the first project's
+    task-manager, rank order, D-064) goes to. None exists: ValueError (D-235), never a guess."""
+    if project is not None:
+        p = store.get_project(conn, project)
+        if p is None:
+            raise ValueError(f"unknown project {project!r}")
+        if not p.get("manager_session"):
+            raise ValueError(f"project {p['name']!r} has no task-manager session yet (created at its first start)")
+        return str(p["manager_session"])
+    tms = store.manager_sessions(conn)
+    if not tms:
+        raise ValueError("no project has a task-manager session: nowhere to post to")
+    return str(tms[0]["session"])
+
+
 @action("inbox.post", "inbox", owner_only=True)
 def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None, project: Any = None) -> Result:
     """A message from the owner to a task-manager, pending until the triage sorts it. The target is a
@@ -1754,20 +1772,7 @@ def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = 
     yet, or no task-manager at all, is an error (D-235), not a guess."""
     if session_id is not None and project is not None:
         raise ValueError("name a project or a session, not both")
-    if session_id is not None:
-        sid = session_id
-    elif project is not None:
-        p = store.get_project(conn, project)
-        if p is None:
-            raise ValueError(f"unknown project {project!r}")
-        if not p.get("manager_session"):
-            raise ValueError(f"project {p['name']!r} has no task-manager session yet (created at its first start)")
-        sid = p["manager_session"]
-    else:
-        tms = store.manager_sessions(conn)
-        if not tms:
-            raise ValueError("no project has a task-manager session: nowhere to post to")
-        sid = tms[0]["session"]
+    sid = session_id if session_id is not None else _inbox_session(conn, project)
     m = store.add_inbox(conn, text, sid, ctx.actor)
     return Result(m, m["id"], None, _inbox_audit(m))
 
@@ -2776,6 +2781,63 @@ def decision_link(conn: sqlite3.Connection, ctx: Ctx, decision: Any, to: Any, ki
 
 # ---- questions (phase 4b Q3, §3.4): the owner answers a decision question with one of its choices
 
+DECISION_NOTE_REASON = "a decision answer: the change is already applied, so no triage"
+
+
+def _owner_answer_only(ctx: Ctx, conn: sqlite3.Connection, name: str) -> None:
+    if ctx.via not in ("dashboard", "cli") or decision_autonomous(conn, ctx):
+        raise Forbidden(f"{name} is the owner's: not for MCP or an autonomous AFClaude session (D-104)")
+
+
+def _answer_message(conn: sqlite3.Connection, ctx: Ctx, t: Mapping[str, Any], text: str, origin: str = "typed",
+                    noted: str | None = None) -> store.Row:
+    """What the owner answered on question `t` becomes an inbox message from the owner (verbatim, with
+    question_id) for the question's task-manager: the one way an answer reaches it (§0). `origin`: typed, or
+    option / edit when the text is the task-manager's wording (never counted as the owner's words, D-285).
+    `noted`: a verdict note given at once (a decision answer). Audited as inbox.post."""
+    sid = _inbox_session(conn, t["project_id"])
+    m = store.add_inbox(conn, text, sid, ctx.actor, question_id=t["id"], noted=noted, origin=origin)
+    _audit_row(conn, ctx, "inbox.post", "inbox", m["id"], None, _inbox_audit(m))
+    return m
+
+
+@action("question.answer", "task", owner_only=True)
+def question_answer(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, answer: Any = None, option: Any = None) -> Result:
+    """The owner answers a plain question (no decision behind it; the dashboard's answer box or an option
+    button, D-300): the answer is stored on the question (it is done) and as an inbox message from the owner
+    with question_id, in the same transaction, so it is triaged and delivered like any other (the delivery
+    names the question) and nothing is stored without its delivery path. `answer`: what the owner typed
+    (origin typed). `option`: the 0-based index of one of the question's options: the server stores that
+    option's text, as an `option` row that owner_words never counts as the owner's words (it is the
+    task-manager's wording, D-285). One of the two. The same answer again right after it was given is a no-op
+    success (a double submit). A decision question is refused: question.decide. Owner-only: the dashboard
+    and the owner's own CLI, never MCP."""
+    _owner_answer_only(ctx, conn, "question.answer")
+    t = _task(conn, task_id)
+    if t["kind"] != store.QUESTION_KIND:
+        raise ValueError(f"task #{task_id} isn't a question (task.answer answers a blocked task)")
+    if t.get("decision_id"):
+        raise ValueError(f"question #{task_id} asks about decision {t['decision_id']}: decide it with "
+                         "question.decide (approve / edit / reject, or confirm / drop)")
+    if (answer is None) == (option is None):
+        raise ValueError("give the answer (typed text) or the option (its index), not both and not neither")
+    origin = "typed"
+    if option is not None:
+        opts = list(t.get("options") or [])
+        if isinstance(option, bool) or not isinstance(option, int) or not 0 <= option < len(opts):
+            raise ValueError(f"option must be the index (0..{len(opts) - 1}) of one of the question's options"
+                             if opts else f"question #{task_id} has no options")
+        answer, origin = opts[option], "option"
+    if (t["status"] != "blocked" and t["answer"] is not None and isinstance(answer, str)
+            and answer.strip() == t["answer"] and store.task_events(conn, task_id)[-1]["event"] == "answered"):
+        return Result(t, task_id, t, t, changed=False)
+    if t["status"] != "blocked":
+        raise store.InvalidTransition(f"question #{task_id} is {t['status']}: it was answered or closed already")
+    after = store.answer_task(conn, task_id, answer)
+    m = _answer_message(conn, ctx, t, answer, origin)
+    return Result({**after, "inbox": m["id"]}, task_id, t, after)
+
+
 @action("question.decide", "task", owner_only=True)
 def question_decide(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, choice: Any, decision_version: Any,
                     text: Any = None, note: Any = None, title: Any = None) -> Result:
@@ -2787,8 +2849,7 @@ def question_decide(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, choice: An
     answer; the entry's change (decision.edit, decision.confirm | decision.delete, on the entry) and the
     question.decide row (on the question) are audited, in this transaction.
     Owner-only: the dashboard and the owner's own CLI, never MCP or an autonomous session (D-104)."""
-    if ctx.via not in ("dashboard", "cli") or decision_autonomous(conn, ctx):
-        raise Forbidden("question.decide is the owner's: not for MCP or an autonomous AFClaude session (D-104)")
+    _owner_answer_only(ctx, conn, "question.decide")
     t = _task(conn, task_id)
     did = t.get("decision_id")
     if t["kind"] != store.QUESTION_KIND or not did:
@@ -2813,6 +2874,8 @@ def question_decide(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, choice: An
     reason_note = store._text(note, "note")
     if choice == "edit" and not body:
         raise ValueError("edit needs the new summary (text)")
+    if choice == "edit" and " ".join((body or "").split()) == " ".join((cur["summary"] or "").split()):
+        raise ValueError(f"the edit text equals the current summary of {did}: approve it instead")
     if choice != "edit" and (body or new_title):
         raise ValueError("text and title belong to an edit")
     store.answer_task(conn, task_id, choice)          # first: the entry's own actions then find no open question
@@ -2829,7 +2892,14 @@ def question_decide(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, choice: An
         res = _apply_confirm(conn, ctx, cur, None)
         _audit_row(conn, ctx, "decision.confirm", "decision", did, *res.audit_pair())
     after_state = "deleted" if choice in ("reject", "drop") else "active"
-    return Result({"question": task_id, "decision_id": did, "choice": choice, "decision": res.result}, task_id,
+    out: dict[str, Any] = {"question": task_id, "decision_id": did, "choice": choice, "decision": res.result}
+    # what the owner wrote reaches the task-manager, each part as its own row: the edit text is the owner's
+    # rewrite of the task-manager's summary (origin edit: not counted as the owner's words), the note is typed
+    rows = [(x, o) for x, o in ((body, "edit"), (reason_note, "typed")) if x]
+    ids = [_answer_message(conn, ctx, t, x, o, noted=DECISION_NOTE_REASON)["id"] for x, o in rows]
+    if ids:
+        out["inbox"], out["inbox_ids"] = ids[0], ids
+    return Result(out, task_id,
                   {"status": "blocked", "decision_state": state_before},
                   {"status": "done", "answer": choice, "decision_state": after_state, "note": reason_note})
 
