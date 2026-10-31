@@ -2569,7 +2569,8 @@ def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version:
     ev: owner_words.Evidence | None = None
     if autonomous:
         ev = _owner_evidence(conn, ctx, f"decision.confirm of {cur['id']}", [cur["id"]], session, ref, word=True,
-                             since=store.parse_iso(cur["imported_at"]))
+                             since=max(filter(None, (store.parse_iso(cur["imported_at"]),
+                                                    store.parse_iso(cur["updated_at"])))))
     olds = []
     for i in decisions.supersedes_ids(cur["supersedes"]):
         old = store.get_decision_entry(conn, i)

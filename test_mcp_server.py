@@ -561,7 +561,7 @@ class Decisions(Env):
             conn.close()
         with mock.patch.dict(os.environ, {"CLAUDE_GUARD_DISABLE": "1", "CLAUDE_CODE_SESSION_ID": sid}):
             with self.assertRaisesRegex(ToolError, "none of the owner's messages"):
-                asyncio.run(ms.afclaude_decisions("record", title="T", topics=["x"], words="not said"))
+                asyncio.run(ms.afclaude_decisions("record", title="T", topics=["x"], words="was never said"))
             with self.assertRaisesRegex(ToolError, "record needs title and words"):
                 asyncio.run(ms.afclaude_decisions("record", title="T", topics=["x"]))
             r = run(ms.afclaude_decisions("record", title="Said", topics=["x"], words="a verbatim quote"))

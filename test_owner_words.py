@@ -2,7 +2,7 @@
 """Tests for the owner's words as evidence (phase 4b Q2 W1; D-104, D-198, D-235, D-285): owner_words.find over
 the inbox and a transcript, decision.add by an autonomous session (actions, CLI), decision.confirm against an
 owner message that names the id, a proposal's `supersedes`, and that every text AFClaude types into tmux starts
-with a keep-alive prefix (so it never passes for the owner's). Synthetic data only.
+with a keep-alive prefix (so it never passes for the owner's). Synthetic data onlyonceonly.
 
     python3 -m unittest test_owner_words
 """
@@ -34,6 +34,18 @@ def entry(text, *, kind="human", uuid="u1", ts=AT, side=False, meta=False, conte
          "message": {"role": "user", "content": content if content is not None else text}}
     if kind is not None:
         e["origin"] = {"kind": kind}
+    return e
+
+
+def pasted(text, pid="ab12"):
+    """What Claude Code stores for a long text typed with `tmux send-keys -l` (the shape of a real entry,
+    text synthetic): a bracketed paste, origin human, promptSource typed, isMeta unset."""
+    return f'\n\n<pasted_content id="{pid}">\n{text}\n</pasted_content id="{pid}">\n'
+
+
+def typed_entry(text, **kw):
+    e = entry(pasted(text), **kw)
+    e.update({"promptSource": "typed", "turnOrigin": "human", "userType": "external", "entrypoint": "cli"})
     return e
 
 
@@ -75,7 +87,7 @@ class Lookup(Env):
         ev = self.find("keep the titles, and add topics")                      # whitespace is normalised
         self.assertEqual(ev.ref, f"inbox:{n}")
         self.assertEqual(ev.label[:9], f"inbox #{n} ")
-        for bad in ("Keep the titles", "keep the titels", "never said"):       # case and typos must match exactly
+        for bad in ("Keep the titles", "keep the titels", "never ever said"):       # case and typos must match exactly
             with self.assertRaisesRegex(owner_words.OwnerWordsError, "none of the owner's messages"):
                 self.find(bad)
 
@@ -92,10 +104,10 @@ class Lookup(Env):
         self.assertEqual(ev.ref, f"chat:{SID}:abc")
         self.assertEqual(ev.at, datetime(2026, 10, 23, 14, 19, tzinfo=timezone.utc))   # the message's time
         self.assertEqual(ev.label, f"chat {SID} 23.10. 16:19")
-        self.assertEqual(self.find("questions", ref=f"chat:{SID}:abc").ref, ev.ref)
+        self.assertEqual(self.find("Recording questions", ref=f"chat:{SID}:abc").ref, ev.ref)
 
     def test_what_is_not_an_owner_prompt_is_refused(self):
-        words = "the words that are quoted"
+        words = "the exact words that are quoted"
         self.transcript(
             entry("[keep-alive] A new run starts: " + words, uuid="a"),                    # AFClaude's own texts
             entry("[AFClaude inbox #3] The owner wrote this: " + words, uuid="b"),         # an inbox delivery
@@ -113,9 +125,38 @@ class Lookup(Env):
         self.transcript(entry("really: " + words, uuid="z"))                               # the owner's own
         self.assertEqual(self.find(words).ref, f"chat:{SID}:z")
 
+    def test_a_pasted_afclaude_text_is_not_an_owner_prompt(self):
+        """A long text AFClaude typed arrives as a <pasted_content> block (origin human): unwrapped first."""
+        words = "the exact words that are quoted"
+        self.transcript(
+            typed_entry("[keep-alive] A new run starts: " + words, uuid="a"),
+            typed_entry("[keep-alive] This session was compacted (D-144): " + words, uuid="b"),
+            typed_entry("[AFClaude inbox #3] The owner wrote this: " + words, uuid="c"),
+            typed_entry("This session was compacted: " + words, uuid="d"),
+            typed_entry("[AFClaude] your usage limit has reset: " + words, uuid="e"),
+            # a leading AFClaude block makes the whole prompt AFClaude's, whatever follows it
+            entry(pasted("[keep-alive] Go on.") + "also, " + words, uuid="f"))
+        with self.assertRaisesRegex(owner_words.OwnerWordsError, "none of the owner's messages"):
+            self.find(words)
+        kinds = [owner_words.prompt_kind(typed_entry(t), pasted(t)) for t in
+                 ("[keep-alive] x", "[AFClaude inbox #3] x", "[AFClaude] x", "x")]
+        self.assertEqual(kinds, ["keepalive", "inbox", "keepalive", "owner"])
+
+    def test_a_pasted_text_without_a_prefix_stays_the_owners(self):
+        words = "the exact words that are quoted"
+        self.transcript(typed_entry("my own notes, pasted: " + words, uuid="p"),
+                        entry(words + " first, then " + pasted("[keep-alive] AFClaude text"), uuid="q"))
+        self.assertEqual(owner_words.owner_prompt(typed_entry("my notes: " + words)), "my notes: " + words)
+        with self.assertRaisesRegex(owner_words.OwnerWordsError, "2 owner messages"):    # p and q: both the owner's
+            self.find(words)
+        self.assertEqual(self.find(words, ref=f"chat:{SID}:p").ref, f"chat:{SID}:p")
+        self.assertEqual(owner_words.unwrap_paste(pasted("x y")), "x y")
+        self.assertEqual(owner_words.unwrap_paste("no block here"), "no block here")
+
     def test_every_keepalive_prefix_is_what_the_rule_refuses(self):
         for p in owner_words.KEEPALIVE_PREFIXES:
             self.assertIsNone(owner_words.owner_prompt(entry(p + " owner words here")), p)
+            self.assertIsNone(owner_words.owner_prompt(typed_entry(p + " owner words here")), p)
         self.assertEqual(owner_words.owner_prompt(entry("owner words here")), "owner words here")
 
     def test_several_matches_need_from(self):
@@ -130,28 +171,41 @@ class Lookup(Env):
         self.assertEqual(self.find("use the quick path", ref=f"chat:{SID}:u2").ref, f"chat:{SID}:u2")
 
     def test_a_bad_from_is_refused(self):
-        self.inbox("some words")
+        self.inbox("some more words")
         for ref, msg in (("garbage", "write inbox"), (f"chat:{OTHER}:u", "another session"),
                          ("inbox:999", "no such owner message"), (f"chat:{SID}:nope", "no such owner message")):
             with self.assertRaisesRegex(owner_words.OwnerWordsError, msg):
-                self.find("some words", ref=ref)
+                self.find("some more words", ref=ref)
 
     def test_several_quotes_all_come_from_one_message(self):
-        n = self.inbox("alpha beta gamma delta")
-        self.inbox("alpha only")
-        self.assertEqual(self.find(["alpha", "delta"]).ref, f"inbox:{n}")
+        n = self.inbox("alphabetical betaversions gammaradiate deltaairlines")
+        self.inbox("alphabetical onlyonceonly")
+        self.assertEqual(self.find(["alphabetical", "deltaairlines"]).ref, f"inbox:{n}")
         with self.assertRaises(owner_words.OwnerWordsError):
-            self.find(["alpha", "only", "delta"])
+            self.find(["alphabetical", "onlyonceonly", "deltaairlines"])
 
     def test_empty_quote_no_session_and_unreadable_transcript(self):
         for q in ("", "  ", []):
             with self.assertRaisesRegex(owner_words.OwnerWordsError, "quote of the owner's words"):
                 self.find(q)
         with self.assertRaisesRegex(owner_words.OwnerWordsError, "no session id"):
-            owner_words.find(self.conn, "x", None)
+            owner_words.find(self.conn, "x y z", None)
         os.makedirs(os.path.join(self.proj, "p", f"{OTHER}.jsonl"))                         # exists, can't be read
         with self.assertRaisesRegex(owner_words.OwnerWordsError, "can't read the transcript"):
-            self.find("x", session=OTHER)
+            self.find("x y z", session=OTHER)
+
+    def test_a_quote_is_matched_on_word_boundaries_and_needs_a_minimum(self):
+        self.inbox("we decided: keeping the titles unchanged, thanks")
+        self.find("keeping the titles")                                                  # 3 words
+        self.find("unchanged, thanks")                                                   # 17 characters
+        for short in ("titles", "the titles", "yes", "keeping"):
+            with self.assertRaisesRegex(owner_words.OwnerWordsError, "too short"):
+                self.find(short)
+        with self.assertRaisesRegex(owner_words.OwnerWordsError, "too short"):
+            self.find(["keeping the titles", "titles"])                                  # every quote counts
+        for inside in ("keeping the tit", "eping the titles", "decided: keeping the titles un"):
+            with self.assertRaisesRegex(owner_words.OwnerWordsError, "none of the owner's messages"):
+                self.find(inside)                                                        # not on word boundaries
 
     def test_word_and_since(self):
         self.inbox("please confirm D-123 now")
@@ -166,7 +220,7 @@ class Write(Env):
     def do(self, name, *, actor="cli", via="cli", autonomous=False, **params):
         return actions.perform(self.conn, name, params, actor=actor, via=via, autonomous=autonomous)
 
-    def record(self, quotes="the words", **kw):
+    def record(self, quotes="the exact words", **kw):
         kw.setdefault("session", SID)
         return self.do("decision.add", title="Said in chat", topics=["chat"], author="owner", words=quotes,
                        autonomous=True, **kw)
@@ -178,34 +232,34 @@ class Write(Env):
         return self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
 
     def test_an_autonomous_session_records_against_an_inbox_message(self):
-        n = self.inbox("the owner says: the words, verbatim")
-        r = self.record("the words,   verbatim")
+        n = self.inbox("the owner says: the exact words, verbatim")
+        r = self.record("the exact words,   verbatim")
         d = store.get_decision_entry(self.conn, r["id"])
-        self.assertEqual((d["state"], d["author"], d["words"]), ("active", "owner", "the words, verbatim"))
+        self.assertEqual((d["state"], d["author"], d["words"]), ("active", "owner", "the exact words, verbatim"))
         self.assertEqual(d["date"], datetime.now(owner_words.BERLIN).strftime("%Y-%m-%d %H:%M"))   # the message's time
         self.assertTrue(d["source"].startswith(f"inbox #{n} "), d["source"])
         a = [x for x in store.audit_log(self.conn, 10, target_type="decision") if x["action"] == "decision.add"][0]
         self.assertEqual(a["after"]["evidence"], f"inbox:{n}")
 
     def test_the_date_and_source_come_from_a_transcript_message(self):
-        self.transcript(entry("we decided: the words", uuid="m1"))
-        r = self.record("the words", source="a note")
+        self.transcript(entry("we decided: the exact words", uuid="m1"))
+        r = self.record("the exact words", source="a note")
         self.assertEqual((r["date"], r["source"]), ("2026-10-23 16:19", f"chat {SID} 23.10. 16:19; a note"))
         self.assertEqual(r["evidence"], f"chat:{SID}:m1")
         self.assertIn("**Date:** 2026-10-23 16:19", store.get_decision_entry(self.conn, r["id"])["body"])
 
     def test_the_mcp_actor_s_session_is_the_one_searched(self):
-        self.inbox("the words")
-        r = self.do("decision.add", title="T", topics=["t"], author="owner", words="the words", actor=f"mcp:{SID}",
+        self.inbox("the exact words")
+        r = self.do("decision.add", title="T", topics=["t"], author="owner", words="the exact words", actor=f"mcp:{SID}",
                     via="mcp", autonomous=True)                                          # no `session` parameter
         self.assertEqual(r["evidence"].split(":")[0], "inbox")
         with self.assertRaisesRegex(actions.Forbidden, "no stored|none of the owner's messages"):
-            self.do("decision.add", title="T", topics=["t"], author="owner", words="the words",
+            self.do("decision.add", title="T", topics=["t"], author="owner", words="the exact words",
                     actor=f"mcp:{OTHER}", via="mcp", autonomous=True)
 
     def test_an_autonomous_session_without_evidence_is_refused_and_nothing_is_written(self):
         self.inbox("something else entirely")
-        for kw, msg in (({"quotes": "never said"}, "none of the owner's messages"),
+        for kw, msg in (({"quotes": "never ever said"}, "none of the owner's messages"),
                         ({"session": None}, "no session id"),
                         ({"quotes": "  "}, "quote of the owner's words"),
                         ({"quotes": None}, "quote of the owner's words")):
@@ -214,21 +268,21 @@ class Write(Env):
         self.assertEqual(self.count(), 0)
 
     def test_several_matches_need_from_and_the_date_is_not_passed(self):
-        a = self.inbox("the words, once")
-        b = self.inbox("the words, twice")
+        a = self.inbox("the exact words, once")
+        b = self.inbox("the exact words, twice")
         with self.assertRaisesRegex(actions.Forbidden, "2 owner messages"):
-            self.record("the words")
-        self.assertEqual(self.record("the words", ref=f"inbox:{b}")["evidence"], f"inbox:{b}")
+            self.record("the exact words")
+        self.assertEqual(self.record("the exact words", ref=f"inbox:{b}")["evidence"], f"inbox:{b}")
         with self.assertRaisesRegex(ValueError, "takes its date from the owner's message"):
-            self.record("the words", ref=f"inbox:{a}", date="2020-01-01")
+            self.record("the exact words", ref=f"inbox:{a}", date="2020-01-01")
 
     def test_repeated_quotes_all_from_one_message(self):
-        self.inbox("alpha and beta, said once")
-        self.inbox("gamma, said elsewhere")
-        r = self.record(["alpha", "beta"])
-        self.assertEqual(store.get_decision_entry(self.conn, r["id"])["words"], 'alpha" ... "beta')
+        self.inbox("alphabetical and betaversions, said once")
+        self.inbox("gammaradiate, said elsewhere")
+        r = self.record(["alphabetical", "betaversions"])
+        self.assertEqual(store.get_decision_entry(self.conn, r["id"])["words"], 'alphabetical" ... "betaversions')
         with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):
-            self.record(["alpha", "gamma"])
+            self.record(["alphabetical", "gammaradiate"])
 
     def test_the_owners_own_calls_are_unchanged(self):
         r = self.do("decision.add", title="Own", topics=["t"], author="owner", words="anything at all")
@@ -259,6 +313,18 @@ class Write(Env):
         self.assertEqual(p, "D-001")
         with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):
             self.do("decision.confirm", decision=p, actor=f"mcp:{SID}", via="mcp", autonomous=True)
+
+    def test_a_message_older_than_the_last_edit_does_not_confirm_the_proposal(self):
+        p = self.propose()["id"]
+        n = self.inbox(f"{p} sounds good")
+        self.conn.execute("UPDATE decisions SET updated_at = ? WHERE id = ?", ("2999-01-01T00:00:00.000Z", p))
+        self.conn.commit()                                     # edited after the owner's message (as decision.edit does)
+        with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):
+            self.do("decision.confirm", decision=p, actor=f"mcp:{SID}", via="mcp", autonomous=True)
+        self.conn.execute("UPDATE inbox_messages SET created_at = ? WHERE id = ?", ("2999-06-01T00:00:00.000Z", n))
+        self.conn.commit()                                     # the owner says it again, after the edit
+        self.assertEqual(self.do("decision.confirm", decision=p, actor=f"mcp:{SID}", via="mcp",
+                                 autonomous=True)["evidence"], f"inbox:{n}")
 
     def test_several_messages_naming_the_id_need_from(self):
         p = self.propose()["id"]
@@ -331,21 +397,21 @@ class Cli(Env):
     UNATTENDED = {"CLAUDE_GUARD_DISABLE": "1"}
 
     def test_an_unattended_cli_records_against_an_owner_message(self):
-        n = self.inbox("alpha beta gamma")
+        n = self.inbox("alphabetical betaversions gammaradiate")
         add = ["add", "--title", "Said", "--topic", "t", "--author", "owner"]
-        code, _, err = self.cli(*add, "--words", "never said", env=self.UNATTENDED)
+        code, _, err = self.cli(*add, "--words", "never ever said", env=self.UNATTENDED)
         self.assertEqual(code, 1)
         self.assertIn("none of the owner's messages", err)
-        code, out, _ = self.cli(*add, "--words", "alpha", "--words", "gamma", env=self.UNATTENDED)
+        code, out, _ = self.cli(*add, "--words", "alphabetical", "--words", "gammaradiate", env=self.UNATTENDED)
         self.assertEqual(code, 0)
         self.assertIn(f"recorded against the owner's message inbox:{n}", out)
         d = store.get_decision_entry(store.connect(self.db), "D-001")
-        self.assertEqual((d["words"], d["state"]), ('alpha" ... "gamma', "active"))
-        self.inbox("alpha beta gamma, again")
-        code, _, err = self.cli(*add, "--words", "alpha", env=self.UNATTENDED)
+        self.assertEqual((d["words"], d["state"]), ('alphabetical" ... "gammaradiate', "active"))
+        self.inbox("alphabetical betaversions gammaradiate, again")
+        code, _, err = self.cli(*add, "--words", "alphabetical", env=self.UNATTENDED)
         self.assertEqual(code, 1)
         self.assertIn("--from", err)
-        code, _, _ = self.cli(*add, "--words", "alpha", "--from", f"inbox:{n}", env=self.UNATTENDED)
+        code, _, _ = self.cli(*add, "--words", "alphabetical", "--from", f"inbox:{n}", env=self.UNATTENDED)
         self.assertEqual(code, 0)
 
     def test_the_owners_own_cli_needs_no_message(self):
@@ -380,6 +446,7 @@ class Typed(unittest.TestCase):
                 text = prompts.bundle(kind, insert="an insert", **system)
             self.assertTrue(text.lstrip().startswith(owner_words.KEEPALIVE_PREFIXES), f"{kind}: {text[:60]!r}")
             self.assertIsNone(owner_words.owner_prompt(entry(text)), kind)
+            self.assertIsNone(owner_words.owner_prompt(typed_entry(text)), kind)   # as a stored bracketed paste
             checked.append(kind)
         self.assertIn("continue", checked)
         self.assertIn("inbox_now", checked)

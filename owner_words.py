@@ -10,10 +10,13 @@ occurs in one stored owner message, found here:
   - an owner prompt in that session's transcript (keepalive.transcript_path's lookup, read-only),
     cited as `chat:<session>:<uuid>`: a non-sidechain user entry with origin kind "human" that is
     not meta, not a tool result and not a keep-alive message (KEEPALIVE_PREFIXES: AFClaude's own
-    texts are typed into tmux too, so they must never pass for the owner's). An inbox delivery
+    texts are typed into tmux too, so they must never pass for the owner's; a long one is stored as a
+    `<pasted_content>` block, which is unwrapped before the prefix is looked at: a prompt whose leading
+    block carries an AFClaude prefix is AFClaude's, a paste without one stays the owner's). An inbox delivery
     arrives in the transcript behind the "[AFClaude inbox #N]" prefix: it is cited by its inbox id,
     not found twice.
-Quotes are matched after whitespace normalisation; case and typos must match exactly. No match, or
+Quotes are matched after whitespace normalisation, on word boundaries, and must be at least
+MIN_QUOTE_WORDS words or MIN_QUOTE_CHARS characters long; case and typos must match exactly. No match, or
 several messages that match, is an OwnerWordsError (D-235): the caller names one with `ref`.
 
 The prefix list and the owner-prompt rule are compact_timing's (D-237: an owner prompt is what a
@@ -41,6 +44,12 @@ INBOX_PREFIX = "[AFClaude inbox #"           # the owner's dashboard message del
 KEEPALIVE_PREFIXES = ("[keep-alive]", "This session was compacted", "You are the long-running", "[AFClaude",
                       "/compact", "<command-name>/compact")
 INTERRUPT_PREFIX = "[Request interrupted"
+# Claude Code stores a long text typed with `tmux send-keys -l` as a bracketed paste: the prompt text is
+# "\n\n<pasted_content id=\"..\">\n<text>\n</pasted_content id=\"..\">\n", origin human, promptSource "typed".
+PASTE_OPEN = re.compile(r"\s*<pasted_content\b[^>]*>\s*")
+PASTE_CLOSE = re.compile(r"\s*</pasted_content\b[^>]*>\s*")
+MIN_QUOTE_WORDS = 3                          # a quote of an owner message: at least this many words ...
+MIN_QUOTE_CHARS = 12                         # ... or this many characters (a decision id alone is exempt: word=True)
 EXCERPT = 90                                 # characters of a candidate message shown when several match
 SHOWN = 5                                    # candidates listed in that refusal
 
@@ -82,10 +91,20 @@ def prompt_text(e: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def unwrap_paste(text: str) -> str:
+    """The prompt text without the `<pasted_content ...>` tags Claude Code puts around a pasted (or
+    tmux-typed) long text: the leading open tag and the first closing tag, whitespace trimmed around them."""
+    m = PASTE_OPEN.match(text)
+    if m is None:
+        return text
+    return PASTE_CLOSE.sub("\n", text[m.end():], count=1).strip()
+
+
 def prompt_kind(e: Mapping[str, Any], text: str) -> str:
     """owner | inbox (the owner's dashboard message, delivered) | keepalive | summary | other."""
     if e.get("isCompactSummary"):
         return "summary"
+    text = unwrap_paste(text)
     if text.lstrip().startswith(INBOX_PREFIX):
         return "inbox"
     if text.lstrip().startswith(KEEPALIVE_PREFIXES):
@@ -105,7 +124,7 @@ def owner_prompt(e: Mapping[str, Any]) -> Optional[str]:
     text = prompt_text(e)
     if text is None or text.startswith(INTERRUPT_PREFIX):
         return None
-    return text if prompt_kind(e, text) == "owner" else None
+    return unwrap_paste(text) if prompt_kind(e, text) == "owner" else None
 
 
 def _entries(path: str) -> Iterator[dict[str, Any]]:
@@ -169,9 +188,8 @@ def normalise(text: str) -> str:
     return " ".join(text.split())
 
 
-def _has(message: str, quote: str, word: bool) -> bool:
-    if not word:
-        return quote in message
+def _has(message: str, quote: str) -> bool:
+    """The quote occurs in the message on word boundaries (a decision id `D-12` is not in `D-123`)."""
     return re.search(r"(?<![A-Za-z0-9-])" + re.escape(quote) + r"(?![A-Za-z0-9])", message) is not None
 
 
@@ -197,12 +215,17 @@ def check_ref(ref: str, session: str) -> None:
 def find(conn: sqlite3.Connection, quotes: Sequence[str] | str, session: Optional[str], ref: Optional[str] = None,
          *, word: bool = False, since: Optional[datetime] = None) -> Evidence:
     """The one stored owner message of `session` (inbox rows, then its transcript) that contains every quote.
-    ref picks one when several match. word: a quote must stand alone (a decision id: `D-12` is not in
-    `D-123`). since: a message before this time doesn't count (an entry can't be confirmed before it
-    existed). -> Evidence(ref, at, text); an OwnerWordsError when there is none or it is ambiguous."""
+    ref picks one when several match. word: the quote is a decision id (exempt from the minimum length;
+    matching is always on word boundaries: `D-12` is not in `D-123`). since: a message before this time
+    doesn't count (an entry can't be confirmed before it existed). -> Evidence(ref, at, text); an OwnerWordsError when there is none or it is ambiguous."""
     qs = [normalise(q) for q in ([quotes] if isinstance(quotes, str) else quotes)]
     if not qs or any(not q for q in qs):
         raise OwnerWordsError("a quote of the owner's words is needed (the exact words, as the owner wrote them)")
+    if not word:
+        short = [q for q in qs if len(q.split()) < MIN_QUOTE_WORDS and len(q) < MIN_QUOTE_CHARS]
+        if short:
+            raise OwnerWordsError(f"the quote {short[0]!r} is too short to prove anything: quote at least "
+                                  f"{MIN_QUOTE_WORDS} words or {MIN_QUOTE_CHARS} characters of the owner's words")
     if not session:
         raise OwnerWordsError("no session id to look for the owner's message in (CLAUDE_CODE_SESSION_ID is "
                               "unset): an autonomous session records what the owner said only against a "
@@ -217,7 +240,7 @@ def find(conn: sqlite3.Connection, quotes: Sequence[str] | str, session: Optiona
         if not pool:
             raise OwnerWordsError(f"--from {ref}: no such owner message in session {session} (an inbox message "
                                   "must be the owner's, a chat message an owner prompt, not a keep-alive text)")
-    hits = [m for m in pool if all(_has(normalise(m.text), q, word) for q in qs)]
+    hits = [m for m in pool if all(_has(normalise(m.text), q) for q in qs)]
     shown = " / ".join(f'"{q}"' for q in qs)
     if not hits:
         raise OwnerWordsError(f"{shown} is in none of the owner's messages of session {session} "

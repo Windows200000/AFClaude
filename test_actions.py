@@ -793,7 +793,7 @@ class WindowActions(Base):
 
 class PromptActions(Base):
     def test_set_validate_reset(self):
-        body = "Go on ({reason}); {progress}. {{literal}}"
+        body = "[keep-alive] Go on ({reason}); {progress}. {{literal}}"
         r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         self.assertEqual((r["body"], r["version"], r["updated_by"]), (body, 1, "owner"))
         with open(os.path.join(actions.PROMPTS_DIR, "continue.md"), "rb") as fh:
@@ -942,7 +942,7 @@ class PromptDefaultsSync(Base):
     def test_marks_an_override_s_base_outdated_against_the_current_default(self):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
         self.do("prompt.set", actor="owner", via="dashboard", name="continue.md",
-                body="Go on ({reason}); {progress}.")
+                body="[keep-alive] Go on ({reason}); {progress}.")
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)   # made against the current one
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")  # default unchanged: still matches
         self.assertEqual(store.get_prompt_override(self.conn, "continue.md")["base_outdated"], 0)
@@ -953,7 +953,7 @@ class PromptDefaultsSync(Base):
 
     def test_setting_the_same_body_again_reconfirms_it_against_the_new_default(self):
         self.do("prompt.defaults_sync", actor="runner:deploy", via="runner")
-        body = "Go on ({reason}); {progress}."
+        body = "[keep-alive] Go on ({reason}); {progress}."
         r = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         again = self.do("prompt.set", actor="owner", via="dashboard", name="continue.md", body=body)
         self.assertEqual(again["version"], r["version"])              # nothing moved: still a no-op
