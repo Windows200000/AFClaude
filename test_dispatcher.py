@@ -850,7 +850,7 @@ class Prompts(Base):
         finally:
             conn.close()
         m = ka.session_message("continue", reason="r", progress="P.md")
-        for part in ("TASK-MANAGER", "usage_report.py", "OPEN_QUESTIONS.md", "PUBLIC", "worktree"):
+        for part in ("TASK-MANAGER", "usage_report.py", "tasks.py question ask", "PUBLIC", "worktree"):
             self.assertIn(part, m)
 
 

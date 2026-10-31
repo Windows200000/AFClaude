@@ -1492,7 +1492,9 @@ def prompt_var_reset(conn: sqlite3.Connection, ctx: Ctx, project: Any, name: Any
 def prompt_var_migrate(conn: sqlite3.Connection, ctx: Ctx) -> Result:
     """The migrate step (prompts.py migrate): the seeds of the project at this checkout
     (prompts.CHECKOUT_SEED), each only where that project never had a row for it, so a value
-    someone set or reset stays. Idempotent: a second run writes nothing (no audit row)."""
+    someone set or reset stays; a row that still equals the previous seed (prompts.OLD_CHECKOUT_SEED,
+    never changed by anyone) moves to the new one (the old value is in the audit row, "was").
+    Idempotent: a second run writes nothing (no audit row)."""
     plan = prompts.migrate_plan(conn)
     for w in plan:
         prompts.check_var(w["name"], w["value"])
