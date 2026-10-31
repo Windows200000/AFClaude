@@ -67,8 +67,9 @@ here asks failstop.paused(session=sid), the install-wide pause OR the pause of t
 the task-manager of. (--work-on and --window-start --now are retired, 3b S5: `tasks.py run-now`.)
 
 Default is DRY-RUN (decides and logs "WOULD FIRE", never resumes anything).
-Pass --arm to actually fire. Create a file named STOP next to this script to
-make a running watcher exit.
+Pass --arm to actually fire. The watcher loop (run(), started by docker/start_watcher.sh with its
+STOP / PAUSED files) is gone since phase 3a S9: the resident runner runs its passes as jobs
+(runner_pass below), held by automation_paused like everything else.
 
 All log times are Europe/Berlin.
 """
@@ -108,7 +109,6 @@ CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR", HERE)
 STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")   # names the state; the DB holds it (D-161)
 LOCK_FILE = os.path.join(STATE_DIR, "keepalive.lock")
-STOP_FILE = os.path.join(STATE_DIR, "STOP")
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
@@ -869,7 +869,7 @@ def rename_tmux(old, new, actor="cli", via="cli"):
     import store
     for n in (old, new):
         if not names.TMUX_RE.match(n or ""):
-            raise ValueError(f"{n!r} is not a tmux name (ka-<8 hex> or afc-<[a-z0-9-], at most 36>)")
+            raise ValueError(f"{n!r} is not a tmux name (afc-<[a-z0-9-], at most 36>)")
     if old == new:
         raise ValueError("the new name is the old one")
     conn = store.connect()
@@ -1428,26 +1428,13 @@ def watch_pass(sid, now, st):
 
 
 WAKE_SLACK = timedelta(seconds=1)     # wake this long after a due time (resets_at jitters by ms)
-MIN_SLEEP = 0.5                       # seconds; never a busy loop
-LM_BOUNDARY_EVERY = timedelta(minutes=5)   # re-read the next last-stretch slot start this often
 
 
 def _now():
     return datetime.now(UTC)
 
 
-_sleep = time.sleep   # run()'s clock and sleep: tests replace both
-
-
-def sleep_seconds(now, *due):
-    """The watcher's sleep: POLL_SECONDS, or less to wake at the earliest due time after `now`
-    (a planned fill-up start, a last-stretch slot start, a postponed window start's recheck),
-    so a start fires at its time, not up to a poll / fill-up interval late."""
-    s = float(POLL_SECONDS)
-    for d in due:
-        if d is not None and d > now:
-            s = min(s, (d - now).total_seconds())
-    return max(s, MIN_SLEEP)
+_sleep = time.sleep   # tests replace it
 
 
 def last_mile_next_start(now, usage=None):
@@ -1464,89 +1451,6 @@ def last_mile_next_start(now, usage=None):
     cands = [reset - lm] + [reset - k * sl for k in range(1, int(lm / sl) + 1) if k * sl < lm]
     future = [c for c in cands if c > now]
     return min(future) if future else None
-
-
-def runner_refusal():
-    """Why this watcher must not start (runner.runner_conflict: AFCLAUDE_SCHEDULER=on or a live
-    resident runner, which runs the watcher's passes since phase 3a S6), or None."""
-    import runner
-    import store
-    conn = store.connect()
-    try:
-        return runner.runner_conflict(conn)
-    finally:
-        conn.close()
-
-
-def run(args):
-    why = runner_refusal()
-    if why:
-        sys.exit(f"keepalive.py: not starting the watcher: {why}")
-    lock = open(LOCK_FILE, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.exit("another keepalive.py instance holds the lock; exiting")
-    sid = args.session
-    mode = "ARMED" if args.arm else "DRY-RUN"
-    log(f"keepalive start ({mode}) target={sid} windows {schedule.describe()} pid={os.getpid()}")
-    st = load_state()
-    global _WATCH_LINE
-    _WATCH_LINE = None
-    next_eval = next_reading = next_fillup = next_compact = lm_checked = datetime.min.replace(tzinfo=UTC)
-    lm_start = None
-    while True:
-        if os.path.exists(STOP_FILE):
-            log("STOP file present, exiting")
-            return
-        now = _now()
-        if now >= lm_checked + LM_BOUNDARY_EVERY or (lm_start is not None and now >= lm_start):
-            lm_checked = now
-            try:     # wake at the next last-stretch slot start, not up to a poll (or a HOLD recheck) late
-                lm_start = last_mile_next_start(now)
-            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
-                lm_start = None
-                fail_stop("last-stretch slot time failed", f"{type(e).__name__}: {e}")
-        if now >= next_eval:
-            next_eval = now + timedelta(seconds=POLL_SECONDS)
-            try:
-                watch_pass(sid, now, st)
-                # a last-stretch slot start decides by its own check, stalled or not (D-204)
-                next_lm = last_mile_pass(sid, now, st, args)
-                if next_lm:
-                    next_eval = max(next_eval, next_lm)
-            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
-                fail_stop(f"watcher pass failed: {type(e).__name__}", str(e)[:500])
-        if lm_start is not None and lm_start + WAKE_SLACK < next_eval:
-            next_eval = lm_start + WAKE_SLACK      # a new slot's start is not held by the last one's HOLD
-        # a postponed session-window start (D-018/D-202), also when the previous run ended at a
-        # limit (D-204: "limit hit before 4am and the next run starts at 4am")
-        try:
-            deferred_due = deferred_window_start_pass(sid, now, st, args)
-        except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
-            deferred_due = None
-            fail_stop(f"postponed window-start pass failed: {type(e).__name__}", str(e)[:500])
-        if now >= next_fillup:    # the fill-up run of an AFClaude session window (D-212)
-            next_fillup = now + FILLUP_EVERY
-            try:
-                due = fillup_pass(sid, now, args)
-                if isinstance(due, datetime):     # its planned start (or recheck): wake right then
-                    next_fillup = max(min(next_fillup, due + WAKE_SLACK), now + timedelta(seconds=MIN_SLEEP))
-            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
-                fail_stop("fill-up pass failed", f"{type(e).__name__}: {e}")
-        if now >= next_reading:   # the fill-time measurement's extra readings (D-207)
-            next_reading = now + RUN_READING_EVERY
-            watch_run_usage(sid, now)
-        if now >= next_compact:   # compact at a run end or after 50 min idle (D-238)
-            next_compact = now + COMPACT_CHECK_EVERY
-            try:
-                compaction_pass(sid, _now(), args)
-            except Exception as e:   # noqa: BLE001 - an error (D-234/D-235); the watcher goes on
-                fail_stop(f"compaction pass failed: {type(e).__name__}", str(e)[:500])
-        if args.once:
-            return
-        _sleep(sleep_seconds(_now(), next_eval, next_fillup, next_reading, next_compact,
-                             deferred_due + WAKE_SLACK if isinstance(deferred_due, datetime) else None))
 
 
 LAST_MILE_RECHECK = timedelta(minutes=15)
@@ -1761,12 +1665,11 @@ def window_start_pass(sid, now, args):
 # ---------------------------------------------------------------- --window-start: who starts it, once per start
 # Phase 3a S5 (docs/phase3a_plan.md): the resident runner's window_start job starts --window-start
 # at the session-window start itself (`--start-key`: the start it planned, which must still be the
-# current one; the runner keeps the timing and the 30-min catch-up, runner_start_catchup). In the
-# legacy mode (AFCLAUDE_SCHEDULER=legacy) cron starts it every 30 min and it acts only when a start
+# current one; the runner keeps the timing and the 30-min catch-up, runner_start_catchup). Without
+# --start-key (by hand; the legacy mode's */30 cron line until phase 3a S9) it acts only when a start
 # is due (schedule.due_session_start). Either way a start is decided once: the first caller claims
 # its key in the keepalive state's "window_starts" before window_start_pass, and a later caller
-# for the same start (cron after the runner across a switch to legacy) only logs it. The runner
-# reads the same claims (runner._settled), so a start cron decided is no "missed start" for it.
+# for the same start only logs it. The runner reads the same claims (runner._settled).
 
 WINDOW_STARTS_KEPT = 60                  # st["window_starts"]: about a month of nights
 
@@ -2855,7 +2758,6 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
 
 FILLUP_FILE = os.path.join(STATE_DIR, "keepalive_fillup.json")   # {"plans": {session: its current plan},
                                                                   #  "test": a --plan-fillup-test entry}
-FILLUP_EVERY = timedelta(seconds=60)
 FILLUP_PREFETCH = timedelta(minutes=2)   # refresh the usage this long before a planned start ...
 FILLUP_FRESH = timedelta(minutes=3)      # ... so the start fires at once on numbers at most this old
 _FILLUP_LINE = None
@@ -3133,7 +3035,6 @@ COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this l
 COMPACT_POLL = 10                           # seconds
 SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt, then: error
 TASKS_PY = os.path.join(HERE, "tasks.py")
-COMPACT_CHECK_EVERY = timedelta(seconds=60)   # compaction_pass in the watcher
 COMPACT_GUARD = timedelta(minutes=40)       # no compaction this close before a start that types into the session
 COMPACT_LOCK_WAIT = timedelta(minutes=40)   # a start waits this long for a running compaction, then: error
 COMPACT_SESSION_RESERVE = 3.0               # session % a compaction needs (~2 %, D-238)
@@ -4100,8 +4001,8 @@ def _compact_now(sid, path, d, rec, head):
 
 
 # ---------------------------------------------------------------- the passes as runner jobs (phase 3a S6)
-# docs/phase3a_plan.md §5 S6. The watcher (run(), the legacy mode) calls each pass's plan and act step in
-# its loop (watch_pass, last_mile_pass, deferred_window_start_pass, fillup_pass, watch_run_usage,
+# docs/phase3a_plan.md §5 S6. The watcher (run(), the legacy mode until S9 removed both) called each pass's
+# plan and act step in its loop (watch_pass, last_mile_pass, deferred_window_start_pass, fillup_pass, watch_run_usage,
 # compaction_pass). The resident runner calls the same steps as jobs (`runner_jobs.py <job> [--key K]` ->
 # runner_pass). Its ticks only read and plan, so a rerun is safe: `watch` (every 60 s: the detection and
 # the plan steps of the last stretch, the postponed / planned starts and the fill-up), `compaction_check`
@@ -4116,23 +4017,21 @@ def _compact_now(sid, path, d, rec, head):
 # restart is never rerun (D-257: its run key is settled). The watcher's in-memory timing is stored
 # instead: a HOLD's recheck, the owner-busy retry and a planned start are the act's `at`; the next
 # last-stretch slot start and the fill-up's usage refresh ahead of its start are the watch tick's
-# next_due. Its log-once memory (MEMO) is kept in the same state between the runs. The watcher's STOP
-# and PAUSED files hold the runner's passes too (until S9 retires them, D-235's automation_paused stays
-# the switch for everything else).
+# next_due. Its log-once memory (MEMO) is kept in the same state between the runs. Since S9 the watcher's
+# STOP and PAUSED files hold nothing: automation_paused (D-235) is the one switch (the jobs' paused
+# policy, runner.JOBS, and the passes' own pause checks).
 
 WATCH_FILE = None        # the runner state 'keepalive.watch' lives in the DB only (never a file)
-PAUSED_FILE = os.path.join(HERE, "PAUSED")   # start_watcher.sh: keeps the watcher stopped
 ACT_JOBS = ("last_stretch", "deferred_start", "fillup", "compaction")
 RUN_KEY_RE = re.compile(r"[^A-Za-z0-9_.:+-]")
 RUN_KEY_MAX = 128
 SESSION_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-_STOP_LINE = None        # runner_pass: why the passes are held (STOP / PAUSED), logged when it changes
 # The log-once lines of the three passes are per task-manager (phase 3b S3): _LINES = {session: {name:
 # line}}, swapped into the module's _WATCH_LINE / _FILLUP_LINE / _COMPACT_LINE around each session's step
 # (lines_of), so two sessions' alternating lines don't log themselves every minute.
 LINE_NAMES = ("_WATCH_LINE", "_FILLUP_LINE", "_COMPACT_LINE")
 _LINES = {}
-MEMO = ("_LINES", "_PAUSE_LOGGED", "_FILLUP_BUSY", "_STOP_LINE")
+MEMO = ("_LINES", "_PAUSE_LOGGED", "_FILLUP_BUSY")
 
 
 def load_watch():
@@ -4278,14 +4177,6 @@ def memo_save(doc, before):
     if changed:
         doc.setdefault("memo", {}).update(changed)
         save_watch(doc)
-
-
-def watcher_stopped():
-    """Why the watcher's passes are held (the STOP or PAUSED file, as for the watcher), else None."""
-    for path, what in ((STOP_FILE, "STOP"), (PAUSED_FILE, "PAUSED")):
-        if os.path.exists(path):
-            return f"the watcher's {what} file is present ({path})"
-    return None
 
 
 def plan_deferred_act(sid, now, st=None):
@@ -4601,7 +4492,7 @@ def start_session():
 
 
 def _pass_args(sid):
-    return argparse.Namespace(session=sid, arm=True, now=False, once=True, take_over_idle=False, start_key=None)
+    return argparse.Namespace(session=sid, arm=True, now=False, take_over_idle=False, start_key=None)
 
 
 def lines_of(sid, fn, *a):
@@ -4640,7 +4531,6 @@ def runner_pass(job, key=None):
     """runner_jobs.py's entry for the watcher's passes (the section comment): the tick `job` over every
     task-manager of the registry, or the act `job` under its run key `key` on the task-manager whose
     plan it is, armed (as the watcher ran). -> {status ok|skipped, note, next_due}. A missing key raises."""
-    global _STOP_LINE
     if job not in TICKS and job not in ACTS:
         raise RuntimeError(f"unknown keep-alive pass {job!r}")
     if job in ACTS and not key:
@@ -4655,17 +4545,6 @@ def runner_pass(job, key=None):
         if job in ACTS:
             owner = next((t["session"] for t in tms
                           if ((doc.get("acts") or {}).get(act_name(job, t["session"])) or {}).get("run") == key), None)
-        why = watcher_stopped()
-        if why:
-            if why != _STOP_LINE:
-                log(f"keep-alive passes held: {why}")
-                _STOP_LINE = why
-            if owner:     # not started: dropped, so a plan once the file is gone plans it anew (a new run key)
-                _act_done(job, owner, None, key, None, _now())
-            return {"status": "skipped", "note": why}
-        if _STOP_LINE is not None:
-            log("keep-alive passes run again: the watcher's STOP / PAUSED file is gone")
-            _STOP_LINE = None
         now = _now()
         if job in TICKS:
             return run_tick(job, tms, now)
@@ -4687,14 +4566,12 @@ def main():
     ap.add_argument("--session", default=os.environ.get("KEEPALIVE_SESSION"),
                     help="FULL session UUID to keep alive")
     ap.add_argument("--arm", action="store_true", help="actually fire resumes (default: dry-run)")
-    ap.add_argument("--once", action="store_true", help="single evaluation pass, then exit")
     ap.add_argument("--decide", action="store_true",
                     help="print the window + budget decision for right now and exit")
     ap.add_argument("--last-mile", action="store_true",
                     help="one-shot: continue the session if the last-mile period before the weekly reset is open")
     ap.add_argument("--window-start", action="store_true",
-                    help="one-shot (the runner at each session-window start with --start-key; cron every 30 min in "
-                         "the legacy mode): at a due session-window start (23:00, 04:00 by default; D-202), "
+                    help="one-shot (the runner at each session-window start with --start-key): at a due session-window start (23:00, 04:00 by default; D-202), "
                          "continue the session if the budget rule allows")
     ap.add_argument("--start-key", metavar="KEY",
                     help="with --window-start: the session-window start the resident runner starts this for "
@@ -4800,13 +4677,13 @@ def main():
         if args.session:
             print(stall_status(args.session, now)[:2])
         return
-    if not args.session or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", args.session):
-        sys.exit("--session must be the FULL session UUID (a short id or a prefix makes resume fork)")
-    run(args)
+    ap.print_usage(sys.stderr)
+    sys.exit("keepalive.py: no action given (the watcher loop is retired, phase 3a S9: the resident runner "
+             "runs its passes as jobs)")
 
 
 def check_registry(session):
-    """A `--session` (cron's window start, the watcher, and the runner's window_start child, whose
+    """A `--session` (the runner's window_start child, whose
     {session} comes from the registry: store.start_manager) must be a task-manager of the registry
     (phase 3b S3, docs/phase3b_plan.md §3.3): else a fail-stop (alert + pause) and exit
     runner_jobs.EXIT_REPORTED (3: the failure is reported, the runner does not alert again)."""

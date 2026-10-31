@@ -270,7 +270,7 @@ class ContinueAndReview(Base):
         self.assertIn("rc thread work-a1", tasks.request_line(dict(row)))     # what `tasks.py run-now` shows
         r2 = store.add_request(self.conn, "cli", "review_now", None)
         self.conn.commit()
-        for kw in ({}, {"tmux": "ka-00000000", "note": "x"}):                 # exactly one of tmux, note
+        for kw in ({}, {"tmux": "afc-00000000", "note": "x"}):                 # exactly one of tmux, note
             with self.subTest(kw=kw), self.assertRaises(ValueError):
                 actions.perform(self.conn, "request.start", {"request_id": r2["id"], **kw},
                                 actor="runner:request", via="runner")

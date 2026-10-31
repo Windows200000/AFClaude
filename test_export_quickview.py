@@ -473,13 +473,6 @@ class ScheduleSection(unittest.TestCase):
         self.assertEqual(mine["at"]["schedule_utc"], "each at-job's minute")      # S4
         self.assertFalse(any("at-shim" in e["what"] for e in cron))
 
-    def test_legacy_mode_lists_the_legacy_crontab_only(self):
-        out = self.entries("legacy", "crontab.legacy")
-        self.assertEqual({e["owner"] for e in out}, {"cron"})
-        whats = " ".join(e["what"] for e in out)
-        for tag in ("usage sampler", "dispatcher", "quickview export", "docs import", "log retention",
-                    "usage-model review", "window-start", "at-shim"):
-            self.assertIn(tag, whats)
 
     def test_a_runner_read_that_fails_is_shown(self):
         from unittest import mock

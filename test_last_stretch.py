@@ -18,7 +18,7 @@ import keepalive as ka  # noqa: E402
 import pacing  # noqa: E402
 from test_compaction import NIGHT, SID, Armed, Env  # noqa: E402
 
-TYPING = "a draft in ka-abcdef01's input box (5 characters)"
+TYPING = "a draft in afc-abcdef01's input box (5 characters)"
 HELD = f"{ka.RC_HELD} thread (pid [7]); a take-over would fork the user's Remote Control thread"
 
 
@@ -91,7 +91,7 @@ class OwnerCheck(Env):
     def test_unreadable_pane_aborts_the_start(self):
         """owner_typing failing (tmux, an unknown screen) is an error, not a go (D-235)."""
         def boom(sid, now):
-            raise RuntimeError("can't read ka-abcdef01's pane")
+            raise RuntimeError("can't read afc-abcdef01's pane")
         ka.owner_typing = boom
         r, rec = self.start()
         self.assertEqual((r, rec["result"], self.sent), ("failed", "start-failed", []))

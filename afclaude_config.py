@@ -8,10 +8,9 @@ re-reads per loop (schedule.py reads the window settings on every call). If the 
 and returns the code default (the full DB error path is phase 2a step 3, §7.8 / D-171).
 
 Machine identity stays in the local file data/afclaude.json (gitignored; or $AFCLAUDE_CONFIG;
-template afclaude.example.json): manager_session, trust_root, the dashboard block. manager_session
-has no code default (D-235): a missing one raises ConfigError, which callers that run under cron
-(dispatcher, keepalive, usage_report, export_quickview) turn into an alert/pause (or, for a display
-path like quickview, D-239: show the error) instead of crashing silently on every run.
+template afclaude.example.json): trust_root, the dashboard block. The task-managers' sessions are
+not machine identity: they are the registry in the DB (projects.manager_session, phase 3b; the
+local file's manager_session setting is retired since 3b S6, and nothing reads it).
 
 One-time import (phase 2a): tunables still found in data/afclaude.json, data/dispatcher.json
 or (the pacing keys) the user model are imported into the DB on first use through
@@ -239,9 +238,7 @@ def pacing_params() -> dict[str, Any]:
 
 # ---- machine identity (dashboard design §7.3), the local file. Committed template with
 # placeholders: afclaude.example.json. LEGACY_TRUST_ROOT is what the code had hardcoded before;
-# it applies only while the local file does not set trust_root. manager_session has no such
-# fallback any more (D-235): a host-specific session id does not belong in this public file, so a
-# missing manager_session is a config error, not a silently-used default.
+# it applies only while the local file does not set trust_root.
 EXAMPLE_FILE = os.path.join(HERE, "afclaude.example.json")
 LEGACY_TRUST_ROOT = "/mnt/BlockVolume/Claude"
 
@@ -274,19 +271,6 @@ def identity(key: str, default: Any = None) -> Any:
 def _text(key: str, legacy: str) -> str:
     v = identity(key)
     return v.strip() if isinstance(v, str) and v.strip() else legacy
-
-
-def manager_session() -> str:
-    """Session id of the AFClaude manager (legacy: phase 3b S3 moved every reader to the task-manager
-    registry, projects.manager_session; only a boot check compares this setting with the registry
-    until 3b S6 removes it).
-    Raises ConfigError if the local file (CONFIG_FILE, or $AFCLAUDE_CONFIG) has no manager_session
-    (D-235: no baked-in fallback for host-specific data)."""
-    v = identity("manager_session")
-    if isinstance(v, str) and v.strip():
-        return v.strip()
-    raise ConfigError(f"manager_session is not set in {CONFIG_FILE} (see afclaude.example.json); "
-                      "set it to this machine's AFClaude manager session id")
 
 
 def trust_root() -> str:

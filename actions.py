@@ -1593,15 +1593,15 @@ def request_finish(conn: sqlite3.Connection, ctx: Ctx, request_id: Any, status: 
 # sessions (kind 'own') keep their own writer, own_session_add.
 
 DRIVEN_KINDS = names.KINDS
-# today's ka-<id8> names (until S6) and the readable afc-... ones (§3.2: [a-z0-9-], at most 40
-# characters): names.py's, the same the bridge accepts (\Z: no trailing newline)
+# the readable afc-... names (§3.2: [a-z0-9-], at most 40 characters; 3b S6 retired the ka-<id8> ones):
+# names.py's, the same the bridge accepts (\Z: no trailing newline)
 TMUX_RE = names.TMUX_RE
 
 
 def _tmux_name(value: Any) -> str:
     name = store._text(value, "tmux", required=True)
     if not TMUX_RE.match(name):
-        raise ValueError(f"tmux must be ka-<8 hex> or afc-<a-z 0-9 -, at most 36>, got {name!r}")
+        raise ValueError(f"tmux must be afc-<a-z 0-9 -, at most 36>, got {name!r}")
     return name
 
 

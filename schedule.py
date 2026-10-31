@@ -20,8 +20,8 @@ runs at each of them and never in between (D-202/D-203); AFClaude runs begin onl
 the last-stretch slot starts, D-205). A start postponed at a session-window start must begin
 before the next session-window start of the same window; at the last one it skips to the next
 window (postpone_deadline). The resident runner starts `keepalive.py --window-start` at each
-session-window start (next_session_start, key start_key; phase 3a S5); in the legacy mode cron runs
-it every 30 minutes (docker/crontab.legacy) and it acts only when a session-window start is due
+session-window start (next_session_start, key start_key; phase 3a S5); a call without a start key
+(by hand; the legacy mode's */30 cron line until 3a S9) acts only when a session-window start is due
 (due_session_start: within CRON_STEP after it); either way once per start (start_key).
 
 On a spring-forward night two back-to-back windows (Mon 23:00 x 2, Tue 09:00) would overlap by
@@ -43,7 +43,7 @@ DEFAULT_TZ = "Europe/Berlin"
 DEFAULT_SESSION_HOURS = 5.0
 DEFAULT_START, DEFAULT_N = "23:00", 2          # every night 23:00 x 2 (D-033)
 GRID_MINUTES = 30                              # window starts are on the 30-min grid
-CRON_STEP = timedelta(minutes=30)              # docker/crontab.legacy: --window-start every 30 min
+CRON_STEP = timedelta(minutes=30)              # a start is "due" this long after it (the old */30 cron step)
 WEEK_MIN = 7 * 24 * 60
 LOOKAHEAD = timedelta(days=8)                  # more than a week: every weekday's window once
 

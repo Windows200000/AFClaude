@@ -20,7 +20,7 @@ The DB is the source (the §7.7 switch, built): the writers go through actions.p
   - the runners' notes: notify.py's alerts (alerts + a progress line) and keepalive.py's progress
     notes call append_note() below (doc.append, actor runner:*); they no longer write the files.
 Hand edits of PROGRESS.md / GOALS.md / EXCEPTIONS.md stay possible (the owner and the task-manager
-edit them directly): the importer takes them in, on a schedule (docker/crontab, every 10 min,
+edit them directly): the importer takes them in, on a schedule (the runner's docs_import job, every 10 min,
 `import --cron`) and as the first step of every export:
     python3 project_docs.py import [--cron]     (= python3 store.py import-docs; idempotent, files untouched)
 (--cron also imports the repo's DECISIONS.md into the decision store first: decisions.cron_import, D-242.)
@@ -217,7 +217,7 @@ def doc_text(name: str, repo: Optional[str] = None, db_path: Optional[str] = Non
 
 def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
                 reviews_dir: Optional[str] = None, project: Optional[str] = None) -> tuple[int, str]:
-    """The scheduled import (docker/crontab): import_all, then a one-line summary (only when
+    """The scheduled import (the runner's docs_import job): import_all, then a one-line summary (only when
     something happened; an all-quiet run prints nothing, so the log stays small). A conflict
     alerts the owner once per episode per doc (notify.py; the episode ends when the doc imports
     cleanly again). -> (exit code, the line or "")."""

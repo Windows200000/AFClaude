@@ -68,9 +68,9 @@ class Names(unittest.TestCase):
             names.tmux_name("review", taken={"afc-review"} | {f"afc-review-{i}" for i in range(2, 100)})
 
     def test_the_whitelist_regex(self):
-        for ok in ("ka-0123abcd", "afc-review", "afc-" + "a" * 36, "afc-a-b-1"):
+        for ok in ("afc-0123abcd", "afc-review", "afc-" + "a" * 36, "afc-a-b-1"):
             self.assertTrue(names.TMUX_RE.match(ok), ok)
-        for bad in ("ka-0123abc", "ka-0123ABCD", "afc-", "afc-" + "a" * 37, "afc-a b", "afc-a;b", "afc-A",
+        for bad in ("ka-0123abcd", "ka-0123abc", "ka-0123ABCD", "afc-", "afc-" + "a" * 37, "afc-a b", "afc-a;b", "afc-A",
                     "afc-a\n", "afc-a.b", "afc-a:b", "../afc-a", "Claude", ""):
             self.assertFalse(names.TMUX_RE.match(bad), repr(bad))
 
@@ -165,7 +165,7 @@ class Lookup(Base):
         with self.assertRaisesRegex(ka.NoTmuxName, "abcdef01 has no driven_sessions row"):
             ka.tmux_name(SID)
         self.assertEqual(ka.tmux_label(SID), "no stored tmux name")
-        ka.host.run_on_host = FakeTmux(alive={"ka-abcdef01"})
+        ka.host.run_on_host = FakeTmux(alive={"afc-abcdef01"})
         ok, problems, plan = ka.preflight(SID)
         self.assertEqual((ok, plan), (False, None))
         self.assertIn("no driven_sessions row", problems[0])
@@ -214,43 +214,43 @@ class Rename(Base):
         super().setUp()
         self.old = ka.host.run_on_host
         self.addCleanup(setattr, ka.host, "run_on_host", self.old)
-        self.tmux = ka.host.run_on_host = FakeTmux(alive={"ka-abcdef01"})
+        self.tmux = ka.host.run_on_host = FakeTmux(alive={"afc-abcdef01"})
         testenv.tmux_row(SID, project_id=self.project("AFClaude"))
 
     def test_rename_and_back(self):
-        self.assertEqual(ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager"), SID)
+        self.assertEqual(ka.rename_tmux("afc-abcdef01", "afc-afclaude-task-manager"), SID)
         self.assertEqual(self.tmux.alive, {"afc-afclaude-task-manager"})
         self.assertEqual(ka.tmux_name(SID), "afc-afclaude-task-manager")
         audit = self.conn.execute("SELECT actor, action, before, after FROM audit_log WHERE target_id=?",
                                   (SID,)).fetchall()
         self.assertEqual([(a[0], a[1]) for a in audit], [("cli", "driven.set")])
-        self.assertIn("ka-abcdef01", audit[0][2])
-        ka.rename_tmux("afc-afclaude-task-manager", "ka-abcdef01")        # the rollback before reverting S2
-        self.assertEqual((self.tmux.alive, ka.tmux_name(SID)), ({"ka-abcdef01"}, "ka-abcdef01"))
+        self.assertIn("afc-abcdef01", audit[0][2])
+        ka.rename_tmux("afc-afclaude-task-manager", "afc-abcdef01")        # the rollback before reverting S2
+        self.assertEqual((self.tmux.alive, ka.tmux_name(SID)), ({"afc-abcdef01"}, "afc-abcdef01"))
 
     def test_refusals_change_nothing(self):
         testenv.tmux_row(SID2, "afc-taken", kind="stall")
-        for (old, new), err in ((("ka-abcdef01", "afc-Bad"), "not a tmux name"),
-                                (("ka-abcdef01", "ka-abcdef01"), "the new name is the old one"),
+        for (old, new), err in ((("afc-abcdef01", "afc-Bad"), "not a tmux name"),
+                                (("afc-abcdef01", "afc-abcdef01"), "the new name is the old one"),
                                 (("afc-nobody", "afc-x"), "0 live driven_sessions rows"),
-                                (("ka-abcdef01", "afc-taken"), "live name of abcdef02")):
+                                (("afc-abcdef01", "afc-taken"), "live name of abcdef02")):
             with self.assertRaisesRegex(ValueError, err):
                 ka.rename_tmux(old, new)
         self.tmux.alive.add("afc-x")
         with self.assertRaisesRegex(ValueError, "afc-x already runs"):
-            ka.rename_tmux("ka-abcdef01", "afc-x")
-        self.tmux.clients.add("ka-abcdef01")
+            ka.rename_tmux("afc-abcdef01", "afc-x")
+        self.tmux.clients.add("afc-abcdef01")
         with self.assertRaisesRegex(ValueError, "a terminal is attached"):
-            ka.rename_tmux("ka-abcdef01", "afc-y")
+            ka.rename_tmux("afc-abcdef01", "afc-y")
         self.tmux.clients.clear()
         lock = ka.session_lock(SID)
         try:
             with self.assertRaisesRegex(ValueError, "holds its lock"):
-                ka.rename_tmux("ka-abcdef01", "afc-y")
+                ka.rename_tmux("afc-abcdef01", "afc-y")
         finally:
             ka.release_lock(lock)
         self.assertNotIn("rename-session", [c[1] for c in self.tmux.calls])
-        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+        self.assertEqual(ka.tmux_name(SID), "afc-abcdef01")
 
     def test_a_failed_row_update_renames_back(self):
         old = actions.perform
@@ -261,28 +261,28 @@ class Rename(Base):
             return old(conn, name, params, **k)
         actions.perform = boom
         self.addCleanup(setattr, actions, "perform", old)
-        with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to ka-abcdef01: rc=0"):
-            ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
-        self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
-        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+        with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to afc-abcdef01: rc=0"):
+            ka.rename_tmux("afc-abcdef01", "afc-afclaude-task-manager")
+        self.assertEqual(self.tmux.alive, {"afc-abcdef01"})
+        self.assertEqual(ka.tmux_name(SID), "afc-abcdef01")
 
     def test_rc1_no_current_client_but_renamed_is_success(self):
         """D-281 incident 2026-10-22 05:16: tmux renamed the session but exited 1 with "no
         current client" (no attached terminal). Success must be decided from tmux state."""
-        self.tmux.noisy.add("ka-abcdef01")
-        self.assertEqual(ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager"), SID)
+        self.tmux.noisy.add("afc-abcdef01")
+        self.assertEqual(ka.rename_tmux("afc-abcdef01", "afc-afclaude-task-manager"), SID)
         self.assertEqual(self.tmux.alive, {"afc-afclaude-task-manager"})
         self.assertEqual(ka.tmux_name(SID), "afc-afclaude-task-manager")
 
     def test_rc1_no_current_client_and_not_renamed_is_a_failure(self):
         """Same rc and stderr text, but tmux's state shows nothing moved: a real failure, and
         the row must not be touched (the bug this fixes: rc/message alone can't tell these apart)."""
-        self.tmux.broken.add("ka-abcdef01")
+        self.tmux.broken.add("afc-abcdef01")
         with self.assertRaisesRegex(RuntimeError,
-                                    "tmux rename-session ka-abcdef01 afc-afclaude-task-manager failed rc=1"):
-            ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
-        self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
-        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+                                    "tmux rename-session afc-abcdef01 afc-afclaude-task-manager failed rc=1"):
+            ka.rename_tmux("afc-abcdef01", "afc-afclaude-task-manager")
+        self.assertEqual(self.tmux.alive, {"afc-abcdef01"})
+        self.assertEqual(ka.tmux_name(SID), "afc-abcdef01")
 
     def test_rollback_rc1_no_current_client_is_reported_accurately(self):
         """The rollback rename (after a failed row update) can hit the same noisy rc=1; it must
@@ -296,10 +296,10 @@ class Rename(Base):
         actions.perform = boom
         self.addCleanup(setattr, actions, "perform", old)
         self.tmux.noisy.add("afc-afclaude-task-manager")       # the rollback renames new -> old
-        with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to ka-abcdef01: rc=1"):
-            ka.rename_tmux("ka-abcdef01", "afc-afclaude-task-manager")
-        self.assertEqual(self.tmux.alive, {"ka-abcdef01"})
-        self.assertEqual(ka.tmux_name(SID), "ka-abcdef01")
+        with self.assertRaisesRegex(RuntimeError, "not renamed .*renamed back to afc-abcdef01: rc=1"):
+            ka.rename_tmux("afc-abcdef01", "afc-afclaude-task-manager")
+        self.assertEqual(self.tmux.alive, {"afc-abcdef01"})
+        self.assertEqual(ka.tmux_name(SID), "afc-abcdef01")
 
 
 if __name__ == "__main__":

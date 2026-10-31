@@ -11,7 +11,7 @@ store the chosen one in driven_sessions; nothing computes a session's name from 
 
 Charset [a-z0-9-], at most 40 characters; the slug is cut to fit. A suffix (-2, -3, ...) only
 when the name is taken. TMUX_RE is every name the host bridge accepts (docker/host_exec.py,
-host.py, ka_resume.sh): today's ka-<id8> names, until no live session uses one (3b S6), and these.
+host.py, ka_resume.sh): these only (3b S6 retired the old ka-<id8> names: no live session used one).
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from typing import Collection, Optional
 
 PREFIX = "afc-"
 MAX_LEN = 40
-TMUX_RE = re.compile(r"^(ka-[0-9a-f]{8}|afc-[a-z0-9-]{1,36})\Z")   # \Z: no trailing newline
+TMUX_RE = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # \Z: no trailing newline
 KINDS = ("task-manager", "review", "stall", "request")
 MAX_SUFFIX = 99
 # letters NFKD doesn't split into a base letter + accent

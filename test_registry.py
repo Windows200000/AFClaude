@@ -251,16 +251,6 @@ class Legacy(Base):
             code, _, _ = self.run_main("--run-stopped")
         self.assertIn("--run-stopped needs the session", str(code))
 
-    def test_the_runner_checks_the_setting_at_boot(self):
-        r = runner.Runner(self.conn, owns=frozenset(), fail=lambda *a, **kw: fails.append((a, kw)),
-                          log_fn=lambda s: None, sock=os.path.join(testenv.DIR, "r.sock"))
-        fails = []
-        self.assertTrue(r.check_registry(SID_A))
-        self.assertTrue(r.check_registry(""))              # no setting any more: nothing to check
-        self.assertEqual(fails, [])
-        self.assertFalse(r.check_registry("cccccccc-0000-4000-8000-000000000003"))
-        self.assertEqual(fails[0][0][1], "the manager_session setting disagrees with the task-manager registry")
-
 
 class SeveralManagers(Base):
     """Since S4 (project selection at the start) several projects may have a task-manager session:

@@ -537,7 +537,7 @@ class Delivery(tc.Env):
         self.assertIsNone(self.row(m)["hold"])
 
     def test_held_while_the_owner_types(self):
-        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (5 characters)"
         m = self.now_msg()
         self.assertEqual(self.deliver(m), "held")
         self.assertIn("a draft", self.row(m)["hold"])
@@ -572,7 +572,7 @@ class Delivery(tc.Env):
         old_utcnow = store._utcnow
         store._utcnow = lambda: since
         self.addCleanup(setattr, store, "_utcnow", old_utcnow)
-        self.typing = "the owner typed in a terminal attached to ka-abcdef01 1 min ago"
+        self.typing = "the owner typed in a terminal attached to afc-abcdef01 1 min ago"
         m = self.now_msg()
         self.assertEqual(self.deliver(m, since), "held")
         self.assertEqual(store.parse_iso(self.row(m)["hold_since"]), since)
@@ -600,7 +600,7 @@ class Delivery(tc.Env):
         self.assertTrue(inbox.message_view(r)["tip"].startswith("Failed "), inbox.message_view(r)["tip"])
 
     def test_a_hold_without_any_window_start_is_an_error(self):
-        self.typing = "a draft in ka-abcdef01's input box (5 characters)"
+        self.typing = "a draft in afc-abcdef01's input box (5 characters)"
         testenv.set_setting("window_days", {d: None for d in schedule.DAYS})
         m = self.now_msg()
         self.assertEqual(self.deliver(m), "failed")
@@ -620,11 +620,11 @@ class Delivery(tc.Env):
         """A refused preflight (not the owner), an unreadable pane, a failed send: an error on the
         message and an alert; nothing (more) is sent."""
         def unreadable(sid, now):
-            raise RuntimeError("can't read ka-abcdef01's pane")
+            raise RuntimeError("can't read afc-abcdef01's pane")
         cases = [("preflight", lambda: setattr(ka, "preflight", lambda sid: (False, ["host process info unavailable"], None)),
                   "preflight refused"),
                  ("pane", lambda: setattr(ka, "owner_typing", unreadable), "can't read"),
-                 ("send", lambda: setattr(ka, "fire", lambda *a, **kw: (1, "", "send-keys to ka-abcdef01 failed")),
+                 ("send", lambda: setattr(ka, "fire", lambda *a, **kw: (1, "", "send-keys to afc-abcdef01 failed")),
                   "rc=1")]
         for what, arrange, want in cases:
             with self.subTest(what):
@@ -645,7 +645,7 @@ class Delivery(tc.Env):
 
     def test_not_in_the_transcript_is_an_error(self):
         m = self.now_msg()
-        ka.fire = lambda *a, **kw: (0, "sent-keys ka-abcdef01", "")          # typed, but nothing arrives
+        ka.fire = lambda *a, **kw: (0, "sent-keys afc-abcdef01", "")          # typed, but nothing arrives
         now = datetime.now(UTC)
         self.assertEqual(iw.deliver(self.conn, self.row(m), now,
                                     verify=lambda mid, path, off, t: iw.store_verify(mid, path, off, t, timedelta(0))),
@@ -694,7 +694,7 @@ class Delivery(tc.Env):
         self.assertTrue(len(msg) > len(inbox.now_message(self.row(m), None)))   # + the standing rules / pointer
 
     def test_a_held_message_is_tried_again_by_the_next_pass(self):
-        self.typing = "a dialog or menu is open on ka-abcdef01's pane"
+        self.typing = "a dialog or menu is open on afc-abcdef01's pane"
         m = self.now_msg()
         self.assertEqual(iw.process(self.conn, verify=lambda *a: None), {"held": 1})
         self.typing = None
@@ -841,7 +841,7 @@ class HeldInStarts(tc.Env):
         def fire(sid, cwd, message, plan, new=False, **kw):                 # a reply, but the message never shows
             self.sent.append((plan, message))
             self.write([tc.assistant(datetime.now(UTC))], "a")
-            return 0, "sent-keys ka-abcdef01", ""
+            return 0, "sent-keys afc-abcdef01", ""
         ka.fire = fire
         self.start()
         r = self.row(self.held)
@@ -863,7 +863,7 @@ class HeldInStarts(tc.Env):
         def fire(sid, cwd, message, plan, new=False, **kw):
             self.sent.append((plan, message))
             self.write([tc.assistant(datetime.now(UTC))], "a")
-            return 0, "sent-keys ka-abcdef01", ""
+            return 0, "sent-keys afc-abcdef01", ""
         ka.fire = fire
         self.start()
         self.assertEqual(self.row(self.held)["status"], "error")

@@ -28,7 +28,7 @@
 
 ### 5.3 Readable tmux names (D-147)
 - `afc-<project-slug>-<role>`: `afc-afclaude-task-manager`, `afc-stall-<title-slug>-<id4>`, `afc-review` (no per-task sessions, D-205). Charset `[a-z0-9-]`, ≤ 40 chars, a short suffix only on collision. The same string is the RC `--name`.
-- Runners find their sessions through `driven_sessions` (tmux name ↔ session id), never by a name regex (today `ka-[0-9a-f]{8}`).
+- Runners find their sessions through `driven_sessions` (tmux name ↔ session id), never by a name regex (the old `ka-<id8>` names are retired, phase 3b S6).
 
 ### 5.4 Run now (D-153, D-036, D-173)
 - Kinds: `continue_now` (one stalled session), `work_on_now` (a project: its task-manager, with its next ready stage), `review_now`; a waking `task_manager_message` (F14) is delivered the same way.

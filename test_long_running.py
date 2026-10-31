@@ -96,7 +96,7 @@ class Detector(unittest.TestCase):
         conn = store.connect()
         try:
             with store.transaction(conn):
-                store.upsert_driven_session(conn, sid, kind=kind, tmux="ka-" + sid[:8], task_id=task_id,
+                store.upsert_driven_session(conn, sid, kind=kind, tmux="afc-" + sid[:8], task_id=task_id,
                                             started_at=store.now_iso(), ended_at=ended)
         finally:
             conn.close()
@@ -104,7 +104,7 @@ class Detector(unittest.TestCase):
             with open(os.path.join(self.tmp.name, "proj", sid + ".jsonl"), "w") as fh:
                 fh.write(json.dumps(entry("user", first)) + "\n" + json.dumps(entry("assistant", NOW)) + "\n")
         if live:
-            self.live.add("ka-" + sid[:8])
+            self.live.add("afc-" + sid[:8])
 
     def driven(self, sid):
         conn = store.connect()
@@ -140,7 +140,7 @@ class Detector(unittest.TestCase):
         self.assertEqual(ka.long_running_check(NOW, True), [])                    # the next tick: nothing
         self.assertEqual(ka.long_running_check(NOW + timedelta(hours=3), True), [])
         self.assertEqual((len(self.alerts), len(self.rows())), (1, 1))
-        self.assertEqual(self.tmux_calls, ["ka-" + REV[:8]])                       # reported: no tmux check again
+        self.assertEqual(self.tmux_calls, ["afc-" + REV[:8]])                       # reported: no tmux check again
 
     def test_a_request_session_counts_too(self):
         self.row(REQ, kind="request")
@@ -169,7 +169,7 @@ class Detector(unittest.TestCase):
         self.assertIsNotNone(self.driven(REQ)["ended_at"])
         self.assertEqual(self.audits(REQ), 1)                                      # through driven.set, audited
         self.assertEqual(ka.long_running_check(NOW, True), [])
-        self.assertEqual(self.tmux_calls, ["ka-" + REQ[:8]])
+        self.assertEqual(self.tmux_calls, ["afc-" + REQ[:8]])
         self.assertEqual((self.alerts, self.rows(), self.audits(REQ)), ([], [], 1))
 
     def test_a_dry_run_ends_no_row(self):
@@ -241,10 +241,10 @@ class Detector(unittest.TestCase):
         self.row(REV, live=False, first=START - timedelta(hours=2))
         self.row(REQ, kind="request", first=START - timedelta(hours=1))
         self.assertEqual(ka.long_running_check(NOW, True), [])                    # the oldest: ended
-        self.assertEqual(self.tmux_calls, ["ka-" + REV[:8]])
+        self.assertEqual(self.tmux_calls, ["afc-" + REV[:8]])
         self.assertEqual(ka.long_running_check(NOW, True), [REQ[:8]])             # then the next
         self.assertEqual(ka.long_running_check(NOW, True), [])
-        self.assertEqual(self.tmux_calls, ["ka-" + REV[:8], "ka-" + REQ[:8]])
+        self.assertEqual(self.tmux_calls, ["afc-" + REV[:8], "afc-" + REQ[:8]])
         self.assertEqual((len(self.alerts), self.stops), (1, []))
 
     def test_once_per_tick_over_several_task_managers(self):

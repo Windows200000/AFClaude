@@ -301,12 +301,6 @@ class ExactTiming(unittest.TestCase):
             session, arm, once, now = self.SID, True, False, False
         ka.run(A())
 
-    def test_sleep_seconds(self):
-        now = RESET
-        self.assertEqual(ka.sleep_seconds(now), ka.POLL_SECONDS)
-        self.assertEqual(ka.sleep_seconds(now, now + timedelta(seconds=7), None, now + timedelta(minutes=5)), 7)
-        self.assertEqual(ka.sleep_seconds(now, now - timedelta(seconds=7)), ka.POLL_SECONDS)   # past: ignored
-        self.assertEqual(ka.sleep_seconds(now, now + timedelta(milliseconds=10)), ka.MIN_SLEEP)
 
     def test_fillup_pass_returns_the_planned_start(self):
         start = RESET - timedelta(minutes=5.5)          # 5% at 60 %/h x 1.1

@@ -86,14 +86,14 @@ class BridgeArgv(unittest.TestCase):
                          ["ka_resume.sh", "--session", "u", "--message", "hi there"])
 
     def test_tmux_shapes(self):
-        self.assertEqual(host.bridge_argv(["tmux", "has-session", "-t", "=ka-0123abcd"]), ["tmux-has", "ka-0123abcd"])
-        self.assertEqual(host.bridge_argv(["tmux", "kill-session", "-t", "=ka-0123abcd"]), ["tmux-kill", "ka-0123abcd"])
-        self.assertEqual(host.bridge_argv(["tmux", "list-panes", "-s", "-t", "=ka-0123abcd", "-F", "#{pane_pid}"]),
-                         ["tmux-panes", "ka-0123abcd"])
-        self.assertEqual(host.bridge_argv(["tmux", "list-clients", "-t", "=ka-0123abcd", "-F", "#{client_activity}"]),
-                         ["tmux-clients", "ka-0123abcd"])
-        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=ka-0123abcd:"]),
-                         ["tmux-capture", "ka-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "has-session", "-t", "=afc-0123abcd"]), ["tmux-has", "afc-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "kill-session", "-t", "=afc-0123abcd"]), ["tmux-kill", "afc-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "list-panes", "-s", "-t", "=afc-0123abcd", "-F", "#{pane_pid}"]),
+                         ["tmux-panes", "afc-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "list-clients", "-t", "=afc-0123abcd", "-F", "#{client_activity}"]),
+                         ["tmux-clients", "afc-0123abcd"])
+        self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=afc-0123abcd:"]),
+                         ["tmux-capture", "afc-0123abcd"])
         with self.assertRaises(ValueError):
             host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", "=Claude:"])
 
@@ -104,18 +104,18 @@ class BridgeArgv(unittest.TestCase):
         self.assertEqual(host.bridge_argv(["tmux", "capture-pane", "-e", "-p", "-t", f"={n}:"]), ["tmux-capture", n])
         self.assertEqual(host.bridge_argv(["tmux", "list-panes", "-s", "-t", "=afc-review-2", "-F", "#{pane_pid}"]),
                          ["tmux-panes", "afc-review-2"])
-        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=ka-0123abcd", n]),
-                         ["tmux-rename", "ka-0123abcd", n])
-        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=" + n, "ka-0123abcd"]),
-                         ["tmux-rename", n, "ka-0123abcd"])           # the rollback (plan §3.4)
+        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=afc-0123abcd", n]),
+                         ["tmux-rename", "afc-0123abcd", n])
+        self.assertEqual(host.bridge_argv(["tmux", "rename-session", "-t", "=" + n, "afc-0123abcd"]),
+                         ["tmux-rename", n, "afc-0123abcd"])           # the rollback (plan §3.4)
         for bad in ("=afc-a;b", "=afc-a b", "=afc-Upper", "=afc-" + "x" * 37, "=afc-", "=afc-x\n", "=afc-x:"):
             with self.assertRaises(ValueError, msg=bad):
                 host.bridge_argv(["tmux", "has-session", "-t", bad])
-        for argv in (["tmux", "rename-session", "-t", "ka-0123abcd", n],          # no exact-match "="
-                     ["tmux", "rename-session", "-t", "=ka-0123abcd", "=" + n],
-                     ["tmux", "rename-session", "-t", "=ka-0123abcd", "Claude"],
+        for argv in (["tmux", "rename-session", "-t", "afc-0123abcd", n],          # no exact-match "="
+                     ["tmux", "rename-session", "-t", "=afc-0123abcd", "=" + n],
+                     ["tmux", "rename-session", "-t", "=afc-0123abcd", "Claude"],
                      ["tmux", "rename-session", "-t", "=Claude", n],
-                     ["tmux", "rename-session", "-t", "=ka-0123abcd", n, "x"]):
+                     ["tmux", "rename-session", "-t", "=afc-0123abcd", n, "x"]):
             with self.assertRaises(ValueError, msg=argv):
                 host.bridge_argv(argv)
 
@@ -126,7 +126,7 @@ class BridgeArgv(unittest.TestCase):
 
     def test_refused(self):
         for argv in (["cat", "/etc/passwd"], ["tmux", "kill-server"], ["tmux", "has-session", "-t", "=Claude"],
-                     ["tmux", "kill-session", "-t", "=ka-0123abcd", "-a"], ["tmux", "send-keys", "-t", "ka-0123abcd", "x"],
+                     ["tmux", "kill-session", "-t", "=afc-0123abcd", "-a"], ["tmux", "send-keys", "-t", "afc-0123abcd", "x"],
                      ["kill-claude", "1; rm"], ["append-note", "README.md"], ["proc-snapshot", "1"], [], ["sh", "-c", "id"]):
             with self.assertRaises(ValueError, msg=argv):
                 host.bridge_argv(argv)
@@ -168,9 +168,9 @@ class RunOnHost(unittest.TestCase):
 
     def test_container_mode_goes_over_ssh(self):
         with Env(AFCLAUDE_IN_CONTAINER="1", PATH=self.d + os.pathsep + os.environ["PATH"]):
-            r = host.run_on_host(["tmux", "has-session", "-t", "=ka-0123abcd"], cwd="/nonexistent", timeout=10)
+            r = host.run_on_host(["tmux", "has-session", "-t", "=afc-0123abcd"], cwd="/nonexistent", timeout=10)
             self.assertEqual((r.returncode, r.stdout.strip()), (3, "remote-out"))
-            self.assertEqual(json.load(open(self.rec)), {"cmd": "tmux-has ka-0123abcd", "stdin": ""})
+            self.assertEqual(json.load(open(self.rec)), {"cmd": "tmux-has afc-0123abcd", "stdin": ""})
             host.run_on_host(["claude", "-p", "--model", "haiku"], input="the prompt", timeout=10)
             self.assertEqual(json.load(open(self.rec)), {"cmd": "claude -p --model haiku", "stdin": "the prompt"})
             with self.assertRaises(ValueError):
@@ -206,7 +206,7 @@ class Whitelist(unittest.TestCase):
         """3b S2: every tmux verb takes ka-<8 hex> or afc-<[a-z0-9-], at most 36>, and nothing else;
         tmux-rename takes two such names. (Accepted names here are ones no tmux session has: tmux
         just exits 1.)"""
-        ok = ("ka-00000000", "afc-s2-whitelist-test-none", "afc-" + "x" * 36)
+        ok = ("afc-00000000", "afc-s2-whitelist-test-none", "afc-" + "x" * 36)
         for verb in ("tmux-has", "tmux-panes", "tmux-clients", "tmux-capture", "tmux-kill"):
             for name in ok:
                 r = run_host_exec(f"{verb} {name}")
@@ -228,7 +228,7 @@ class Whitelist(unittest.TestCase):
         with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
             spec.loader.exec_module(he)
             sid = "abcdef01-0000-4000-8000-000000000001"
-            for name in ("ka-abcdef01", "afc-afclaude-task-manager"):
+            for name in ("afc-abcdef01", "afc-afclaude-task-manager"):
                 he.check_ka_resume(["--session", sid, "--tmux", name, "--message", "go", "--new"])   # no exit
             for bad in ([], ["--tmux", "../x"], ["--tmux", "afc-A"], ["--tmux", "afc-x\n"], ["--tmux"],
                         ["--tmux", "afc-" + "x" * 37]):
@@ -356,9 +356,9 @@ class Whitelist(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         log = os.path.join(d, "host_exec.log")
-        r = run_host_exec("tmux-has ka-00000000", log=log)
+        r = run_host_exec("tmux-has afc-00000000", log=log)
         self.assertNotEqual(r.returncode, 126)
-        r = run_host_exec("tmux-panes ka-00000000", log=log)
+        r = run_host_exec("tmux-panes afc-00000000", log=log)
         self.assertNotEqual(r.returncode, 126)
         r = run_host_exec("proc-snapshot", log=log)
         self.assertEqual(r.returncode, 0)
@@ -376,11 +376,11 @@ class Whitelist(unittest.TestCase):
         """The shapes host.py emits, run through host_exec.py's parser without executing:
         only the head/arity checks matter, so use targets that do nothing harmful."""
         for argv, ok_codes in (
-                (["tmux", "has-session", "-t", "=ka-00000000"], None),
-                (["tmux", "list-panes", "-s", "-t", "=ka-00000000", "-F", "#{pane_pid}"], None),
-                (["tmux", "list-clients", "-t", "=ka-00000000", "-F", "#{client_activity}"], None),
-                (["tmux", "capture-pane", "-e", "-p", "-t", "=ka-00000000:"], None),
-                (["tmux", "kill-session", "-t", "=ka-00000000"], None),   # no such session: tmux exits 1
+                (["tmux", "has-session", "-t", "=afc-00000000"], None),
+                (["tmux", "list-panes", "-s", "-t", "=afc-00000000", "-F", "#{pane_pid}"], None),
+                (["tmux", "list-clients", "-t", "=afc-00000000", "-F", "#{client_activity}"], None),
+                (["tmux", "capture-pane", "-e", "-p", "-t", "=afc-00000000:"], None),
+                (["tmux", "kill-session", "-t", "=afc-00000000"], None),   # no such session: tmux exits 1
                 (["tmux", "has-session", "-t", "=afc-s2-whitelist-test-none"], None),
                 (["tmux", "capture-pane", "-e", "-p", "-t", "=afc-s2-whitelist-test-none:"], None),
                 (["tmux", "rename-session", "-t", "=afc-s2-whitelist-test-none", "afc-s2-whitelist-test-x"], None)):

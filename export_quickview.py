@@ -36,7 +36,7 @@ Never exports the usage samples or the Haiku judgements (raw usage/message
 details); only small aggregates. Never calls /usage: usage comes from the
 ~/.claude.json cache that the sampler keeps fresh. All times Europe/Berlin.
 Also publishes the page itself (quickview/AFClaude.html -> AFClaude.html, D-253).
-Run every 3 min (the runner's quickview job, or cron in the legacy mode; via flock); each
+Run every 3 min (the runner's quickview job); each
 file is replaced atomically.
 """
 import glob
@@ -44,7 +44,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -88,7 +87,7 @@ def registry_self_session(project):
 
 
 try:
-    SELF_SESSION = os.environ.get("QUICKVIEW_SELF_SESSION") or registry_self_session(STAGES_PROJECT)
+    SELF_SESSION = registry_self_session(STAGES_PROJECT)
     SELF_SESSION_ERROR = None
 except Exception as e:   # noqa: BLE001 - a display path: shown, never raised (D-239)
     SELF_SESSION = None
@@ -661,31 +660,24 @@ WATCH_STALE = timedelta(minutes=5)   # the runner's watch pass (S6) last ran ok 
 
 
 def watcher_running(conn=None, now=None):
-    """The keep-alive watcher: its process (pgrep), or while the resident runner runs its passes
-    (AFCLAUDE_SCHEDULER on/runner, phase 3a S6) the runner's `watch` job: running = its last ok run
-    is younger than WATCH_STALE ({"running", "pids": [], "by": "runner", "last_ok_berlin"}). A
-    read that fails is running None (unknown), never raised."""
-    if os.environ.get("AFCLAUDE_SCHEDULER", "off") in RUNNER_MODES:
-        now = now or datetime.now(UTC)
-        try:
-            own = conn is None
-            conn = conn or store.connect()
-            try:
-                row = store.get_runner_job(conn, "watch") or {}
-            finally:
-                if own:
-                    conn.close()
-        except Exception:   # noqa: BLE001 - a display path: unknown
-            return {"running": None, "pids": [], "by": "runner"}
-        ok = store.parse_iso(row.get("last_ok_at")) if row.get("last_ok_at") else None
-        return {"running": bool(ok and now - ok <= WATCH_STALE), "pids": [], "by": "runner",
-                "last_ok_berlin": bstr(ok) if ok else None}
+    """The keep-alive passes (the watcher's, run by the resident runner since phase 3a S6; the watcher
+    process is gone since S9): the runner's `watch` job, running = its last ok run is younger than
+    WATCH_STALE ({"running", "pids": [], "by": "runner", "last_ok_berlin"}). A read that fails is
+    running None (unknown), never raised."""
+    now = now or datetime.now(UTC)
     try:
-        r = subprocess.run(["pgrep", "-f", "keepalive.py --session"], capture_output=True, text=True, timeout=10)
-        pids = [p for p in r.stdout.split() if p.strip()]
-        return {"running": bool(pids), "pids": pids}
-    except OSError:
-        return {"running": None, "pids": []}
+        own = conn is None
+        conn = conn or store.connect()
+        try:
+            row = store.get_runner_job(conn, "watch") or {}
+        finally:
+            if own:
+                conn.close()
+    except Exception:   # noqa: BLE001 - a display path: unknown
+        return {"running": None, "pids": [], "by": "runner"}
+    ok = store.parse_iso(row.get("last_ok_at")) if row.get("last_ok_at") else None
+    return {"running": bool(ok and now - ok <= WATCH_STALE), "pids": [], "by": "runner",
+            "last_ok_berlin": bstr(ok) if ok else None}
 
 
 def tail_last_json(path, chunk=65536):
@@ -1068,18 +1060,16 @@ def next_review_block():
     return {"at_berlin": win["at_berlin"], "which": win["kind"], "label": win["label"], "secondary": secondary}
 
 
-RUNNER_MODES = ("on", "runner")     # AFCLAUDE_SCHEDULER values with the resident runner (phase 3a §4)
+RUNNER_MODES = ("runner",)     # AFCLAUDE_SCHEDULER values with the resident runner (phase 3a §4)
 
 
 def cron_entries():
-    """What is scheduled: the crontab lines tagged AFClaude (owner "cron") and, while the resident
-    runner runs (AFCLAUDE_SCHEDULER on/runner; not in legacy, where cron runs everything), its own
-    jobs from runner_jobs (owner "runner", phase 3a S3). A display path: a runner read that fails
-    is shown as an entry with its error, never raised (D-239.3)."""
-    out = crontab_entries()
+    """What is scheduled: while the resident runner runs (AFCLAUDE_SCHEDULER=runner), its jobs from
+    runner_jobs (owner "runner", phase 3a S3); nothing else (S9 removed the crontabs). A display
+    path: a runner read that fails is shown as an entry with its error, never raised (D-239.3)."""
     if os.environ.get("AFCLAUDE_SCHEDULER", "off") in RUNNER_MODES:
-        out += runner_entries()
-    return out
+        return runner_entries()
+    return []
 
 
 def runner_schedule(job):
@@ -1129,44 +1119,10 @@ def runner_entries(conn=None, now=None):
         job, r = runner.JOBS[name], rows.get(name) or {}
         utc, berlin = runner_schedule(job)
         out.append({"owner": "runner", "job": name, "schedule_utc": utc, "schedule_berlin": berlin,
-                    "what": job.what or job.cron_tag or name, "next_due_berlin": when(r.get("next_due")),
+                    "what": job.what or name, "next_due_berlin": when(r.get("next_due")),
                     "last_status": r.get("last_status"), "last_ok_berlin": when(r.get("last_ok_at")),
                     "consecutive_failures": r.get("consecutive_failures") or 0})
     return out
-
-
-def crontab_entries():
-    # In the manager container supercronic runs a crontab FILE (AFCLAUDE_CRONTAB);
-    # there is no `crontab -l` there.
-    if os.environ.get("AFCLAUDE_CRONTAB"):
-        text = read(os.environ["AFCLAUDE_CRONTAB"]) or ""
-    else:
-        try:
-            text = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10).stdout
-        except OSError:
-            return []
-    out = []
-    for line in text.splitlines():
-        if "AFClaude" not in line or line.lstrip().startswith("#"):
-            continue
-        comment = line.split(" # ", 1)[1].strip() if " # " in line else ""
-        if line.startswith("@"):
-            sched = line.split()[0]
-        else:
-            sched = " ".join(line.split()[:5])
-        out.append({"owner": "cron", "schedule_utc": sched, "schedule_berlin": cron_berlin(sched),
-                    "what": comment or line[len(sched):].strip()[:120]})
-    return out
-
-
-def cron_berlin(sched):
-    """Cron runs on the host clock (UTC); show the hours in Berlin time (current offset)."""
-    f = sched.split()
-    if len(f) != 5 or not re.fullmatch(r"[\d,]+", f[1]):
-        return sched  # @reboot or an hour-independent schedule: same in any time zone
-    off = int(datetime.now(ka.BERLIN).utcoffset().total_seconds() // 3600)
-    hours = ",".join(str((int(h) + off) % 24) for h in f[1].split(","))
-    return " ".join([f[0], hours] + f[2:]) + f" (Berlin, UTC+{off})"
 
 
 def main():

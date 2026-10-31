@@ -121,7 +121,6 @@ class Import(FileCase):
         self.assertEqual(self.user_model(), {"schema": "afclaude.user_model/1",
                                              "envelope_weekly_pct_by_hours": {"1": 9}})
         self.assertEqual(self.read(ac.USER_MODEL_FILE)["idle_min"], 45)    # the legacy file: frozen, never written
-        self.assertEqual(ac.manager_session(), SID)
         # one audit row per file, by the runner (D-154), nothing lost: notes and defaults too
         rows = self.imports()
         self.assertEqual([(r["actor"], r["via"], r["target_id"]) for r in rows],

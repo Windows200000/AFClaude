@@ -608,33 +608,6 @@ class Writes(Base):
         self.assertEqual(r["status"], rs.RETIRED)
         self.assertEqual(store.get_job(self.conn, later)["status"], "pending")
 
-    def test_at_shim_adopts_a_legacy_spool_file(self):
-        shim = self._shim()
-        self.fill()
-        rs.import_all()                                              # the two spooled jobs: in the DB
-        old = {"id": "0123456789ab", "at": "2020-01-01T00:00:00+00:00", "cmd": "true\n", "cwd": "/"}
-        write(os.path.join(shim.SPOOL, "0123456789ab.json"), json.dumps(old))   # an older shim copy's job
-        files = snapshot(shim.SPOOL)
-        shim.run_due()
-        self.assertEqual(store.get_job(self.conn, "0123456789ab")["status"], "started")
-        self.assertEqual(snapshot(shim.SPOOL), files)                 # read-only: nothing deleted
-        self.assertEqual({j["id"]: j["status"] for j in store.list_jobs(self.conn)},
-                         {"0123456789ab": "started", "4d6dda0d5724": "pending", "a4a2cedcd99a": "pending"})
-
-    def test_at_shim_db_failure(self):
-        shim = self._shim()
-        self.conn.close()
-        os.remove(store.DB_PATH)
-        with mock.patch.object(sys, "stdin", io.StringIO("true\n")), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(shim.main(["-t", "209901010000"]), 1)
-        failed = [e for e in store.fallback_events(store.fallback_path()) if e.get("event") == "failed"]
-        self.assertEqual(failed[0]["action"], "job.put")
-        self.assertEqual(failed[0]["params"]["job"]["cmd"], "true\n")   # kept for a replay
-        fails = []
-        shim.fail = lambda subject, detail="": fails.append(subject)
-        self.assertEqual(shim.run_due(), 1)
-        self.assertEqual(fails, ["scheduled jobs unreadable: no job started"])   # D-234/D-235: an error
-        self.conn = store.connect(os.path.join(self.dir, "other.db"), create=True)
 
     def _locked_shim(self, fail_times, kind="locked", target="jobs"):
         """A shim whose runner_state.<target> raises a DBError of `kind` the first `fail_times` calls."""
@@ -655,47 +628,6 @@ class Writes(Base):
         p.start()
         self.addCleanup(p.stop)
         return shim
-
-    def test_at_shim_waits_once_more_for_a_locked_db(self):
-        shim = self._locked_shim(1)
-        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
-        self.assertEqual(shim.run_due(), 0)                          # the second try read the jobs
-        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
-        self.assertEqual((self.sleeps, self.fails), ([shim.LOCK_RETRY_WAIT], []))
-        self.assertTrue(self.shim_log[0].startswith("WARN: reading the scheduled jobs: database locked"))
-
-    def test_at_shim_claim_waits_once_more_too(self):
-        shim = self._locked_shim(1, target="job_claim")
-        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
-        self.assertEqual(shim.run_due(), 0)
-        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")
-        self.assertEqual((self.sleeps, self.fails), ([shim.LOCK_RETRY_WAIT], []))
-        self.assertIn(f"claiming job {jid}", self.shim_log[0])
-
-    def test_at_shim_locked_twice_is_still_a_failure(self):
-        shim = self._locked_shim(2)                                  # D-235: no endless waiting
-        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
-        self.assertEqual(shim.run_due(), 1)
-        self.assertEqual(self.sleeps, [shim.LOCK_RETRY_WAIT])
-        self.assertEqual(self.fails, ["scheduled jobs unreadable: no job started"])
-        self.assertEqual(store.get_job(self.conn, jid)["status"], "pending")
-
-    def test_at_shim_other_db_errors_fail_at_once(self):
-        shim = self._locked_shim(1, kind="corrupt")
-        self.assertEqual(shim.run_due(), 1)
-        self.assertEqual((self.sleeps, self.shim_log), ([], []))
-        self.assertEqual(self.fails, ["scheduled jobs unreadable: no job started"])
-
-    def test_at_shim_job_that_cannot_start_is_an_error(self):
-        shim = self._shim()
-        jid = shim.spool(datetime(2020, 1, 1, tzinfo=timezone.utc), "true\n")
-        fails = []
-        shim.fail = lambda subject, detail="": fails.append((subject, detail))
-        with mock.patch.object(shim.subprocess, "Popen", side_effect=OSError("no /bin/sh")):
-            self.assertEqual(shim.run_due(), 1)
-        self.assertEqual(fails[0][0], "a claimed job could not be started")
-        self.assertIn("no /bin/sh", fails[0][1])
-        self.assertEqual(store.get_job(self.conn, jid)["status"], "started")   # claimed: never run twice
 
 
 if __name__ == "__main__":

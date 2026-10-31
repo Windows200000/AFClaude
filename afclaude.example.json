@@ -1,7 +1,6 @@
 {
-  "_comment": "Template for data/afclaude.json (local, gitignored; or $AFCLAUDE_CONFIG). Copy it, fill in the values, delete what you don't need: most keys are optional and fall back to the code default (afclaude_config.py). manager_session has no fallback: leaving it unset makes afclaude_config.manager_session() raise ConfigError (D-235). Keys starting with _ are ignored.",
+  "_comment": "Template for data/afclaude.json (local, gitignored; or $AFCLAUDE_CONFIG). Copy it, fill in the values, delete what you don't need: most keys are optional and fall back to the code default (afclaude_config.py). The task-managers' sessions are not set here: they are the registry in the DB (projects.manager_session). Keys starting with _ are ignored.",
 
-  "manager_session": "<manager-session-uuid>",
   "trust_root": "/path/to/your/workspace",
 
   "_settings_comment": "This file holds only machine identity (D-146). Every tunable (window, budget, pacing, dispatcher timings) is a setting in the DB settings table (actions.SETTINGS: code defaults, set with actions.py / the dashboard; `python3 afclaude_config.py` lists them). Tunables still found here are imported into the DB once and removed from this file.",
