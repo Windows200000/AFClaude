@@ -383,10 +383,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             dcode, dline = decisions.cron_import(args.db, args.repo)
             if dline:
                 print(dline)
+            import questions          # after the cut-over OPEN_QUESTIONS.md must be the imported file (Q3)
+            qcode, qline = questions.cron_check(args.db, args.repo)
+            if qline:
+                print(qline)
             code, line = cron_import(args.db, args.repo, args.reviews_dir, args.project)
             if line:
                 print(line)
-            return max(code, dcode)
+            return max(code, dcode, qcode)
         if args.cmd == "import":
             r = import_all(args.db, args.repo, args.reviews_dir, args.project, force=args.force)
             print(json.dumps(r, indent=1, ensure_ascii=False))

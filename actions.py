@@ -76,6 +76,7 @@ import names  # noqa: E402  (pure: the tmux names, phase 3b S2)
 import prompts  # noqa: E402
 import decisions  # noqa: E402  (pure: the parser and the entry text, phase 4b)
 import owner_words  # noqa: E402  (the owner's stored messages as evidence, phase 4b Q2)
+import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -2442,6 +2443,25 @@ def _close_decision_question(conn: sqlite3.Connection, did: str, why: str) -> in
     return int(q["id"])
 
 
+def pending_decision_questions(conn: sqlite3.Connection) -> list[tuple[store.Row, str]]:
+    """Every entry the owner should be asked about that has no open question: (entry, kind), kind
+    "proposal" or "confirm" (decisions.question_kind), in the store's order."""
+    return [(d, kind) for d in store.list_decision_entries(conn, ("proposed", "active"))
+            if (kind := decisions.question_kind(dict(d))) is not None
+            and store.open_decision_question(conn, d["id"]) is None]
+
+
+def ensure_decision_questions(conn: sqlite3.Connection, ctx: Ctx) -> list[dict[str, Any]]:
+    """The invariant's catch-up (phase 4b Q3): every proposed entry and every active, unconfirmed
+    task-manager entry without an open question gets its decision question, asked the way decision.add asks
+    one (ask_decision_question). Idempotent: an entry with an open question is left alone (the unique partial
+    index allows one per decision). The caller's transaction. -> [{decision, kind, question}] of the new ones."""
+    out: list[dict[str, Any]] = []
+    for d, kind in pending_decision_questions(conn):
+        out.append({"decision": d["id"], "kind": kind, "question": ask_decision_question(conn, ctx, d)["id"]})
+    return out
+
+
 def _check_question_closable(conn: sqlite3.Connection, t: Mapping[str, Any]) -> None:
     """A question about a decision entry that still waits for the owner isn't closed by hand: it closes
     with the entry (confirm, delete). One whose entry is gone, no longer needs the owner, or is asked
@@ -2917,6 +2937,90 @@ def question_close(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any
     _check_question_closable(conn, t)
     r = store._text(reason, "reason", required=True)
     return _task_change(conn, task_id, version, lambda: store.cancel_task(conn, task_id, r))
+
+
+# ---- the question import (phase 4b Q3 W3, docs/phase4_plan.md): the DB becomes the only question list;
+# questions.py parses and checks (plan_import), this applies it in the one transaction perform() gives it
+
+@action("question.import", "task")
+def question_import(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, project: Any = None,
+                    dry_run: Any = False, undo: Any = False, backup: Any = None) -> Result:
+    """The one-time cut-over (CLI only: refused for MCP and the dashboard). Each item of OPEN_QUESTIONS.md
+    becomes a question for the project (title = the heading without its Q-...: label, D-263; text = the
+    item verbatim, D-279), asked the way task.ask asks one; then every proposal and every unconfirmed
+    task-manager entry without an open question gets its decision question (ensure_decision_questions).
+    Meta questions_source=db, questions_file_sha and questions_imported (every question id the import made,
+    for undo). dry_run: the checks and the counts, nothing written. undo: refused, every reason listed, if an
+    imported question was answered, decided or closed; else the imported questions (the decision questions
+    too) are cancelled ("import undone") and the source is the file again. The preconditions are in
+    questions.plan_import; any failure writes nothing."""
+    if ctx.via != questions.IMPORT_VIA:
+        raise Forbidden(f"question.import is for the CLI only (questions.py import), not {ctx.via}")
+    for k, v in (("dry_run", dry_run), ("undo", undo)):
+        if not isinstance(v, bool):
+            raise ValueError(f"{k} must be true or false")
+    if undo:
+        return _question_import_undo(conn, dry_run)
+    plan = questions.plan_import(conn, os.path.abspath(store._text(path, "path", required=True)),
+                                 store._text(project, "project"))
+    pending = pending_decision_questions(conn)
+    kinds = [kind for _d, kind in pending]
+    report: dict[str, Any] = {
+        "file": plan.file, "sha256": plan.sha, "project": plan.project,
+        "items": [{"title": it.title, "chars": it.chars, "style": it.style} for it in plan.items],
+        "counts": {"items": len(plan.items), "proposals": kinds.count("proposal"),
+                   "unconfirmed_entries": kinds.count("confirm"), "questions": len(plan.items) + len(pending)}}
+    if dry_run:
+        return Result(dict(report, dry_run=True), "import", changed=False)
+    ids = [int(store.ask_question(conn, it.text, plan.project, ctx.session, it.title)["id"]) for it in plan.items]
+    asked = ensure_decision_questions(conn, ctx)
+    if len(asked) != len(pending) or len(ids) != len(plan.items):
+        raise RuntimeError(f"question.import: the counts do not add up ({len(ids)} of {len(plan.items)} items, "
+                           f"{len(asked)} of {len(pending)} decision questions): nothing was written")
+    every = ids + [int(a["question"]) for a in asked]
+    store.set_meta(conn, questions.SOURCE_META, "db")
+    store.set_meta(conn, questions.FILE_SHA_META, plan.sha)
+    store.set_meta(conn, questions.CHANGED_MARK, "")
+    store.set_meta(conn, questions.IMPORTED_META, json.dumps(
+        {"at": store.now_iso(), "backup": backup, "sha256": plan.sha, "items": ids,
+         "decisions": {a["decision"]: a["question"] for a in asked}}, ensure_ascii=False))
+    out = dict(report, dry_run=False, backup=backup, question_ids=every)
+    return Result(out, "import", {"source": "file"},
+                  {"source": "db", "sha256": plan.sha, "counts": report["counts"], "backup": backup,
+                   "questions": every})
+
+
+def _question_import_undo(conn: sqlite3.Connection, dry_run: bool) -> Result:
+    """question.import with undo: see the action."""
+    if questions.source_of(conn) != "db":
+        raise questions.ImportRefused("nothing to undo: the questions are not imported (questions_source is not db)")
+    try:
+        rec = json.loads(store.get_meta(conn, questions.IMPORTED_META) or "")
+        ids = [int(i) for i in rec["items"]] + [int(i) for i in rec["decisions"].values()]
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise questions.ImportRefused(f"the import's record (meta questions_imported) is unreadable: {e}") from e
+    problems: list[str] = []
+    for qid in ids:
+        t = store.get_task(conn, qid)
+        if t is None:
+            problems.append(f"question #{qid} is gone")
+        elif t["status"] != "blocked":
+            what = "answered or decided" if t["status"] == "done" else t["status"]
+            problems.append(f"question #{qid} ({t['title'][:50]}) was {what}: it is not open any more")
+    if problems:
+        raise questions.ImportRefused("the undo is refused, nothing was changed (stay on the DB and fix forward; "
+                                      "restoring the preqimport backup loses every write since and needs the "
+                                      "owner's OK):\n  - " + "\n  - ".join(problems))
+    report = {"undo": True, "cancelled": ids, "dry_run": dry_run}
+    if dry_run:
+        return Result(report, "import", changed=False)
+    for qid in ids:
+        store.cancel_task(conn, qid, "import undone")
+    store.set_meta(conn, questions.SOURCE_META, "file")
+    for k in (questions.FILE_SHA_META, questions.IMPORTED_META, questions.CHANGED_MARK):
+        store.set_meta(conn, k, "")
+    return Result(report, "import", {"source": "db"},
+                  {"source": "file", "cancelled": ids, "reason": "import undone"})
 
 
 # ---- the seeding (phase 4b Q2, §3.3): the DB becomes the only decision source; decisions.py checks and
