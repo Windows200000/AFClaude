@@ -4354,14 +4354,16 @@ def set_decision_state(conn: sqlite3.Connection, decision: object, state: str, s
     return _decision_refresh(conn, cur["id"])
 
 
-def set_decision_confirmed(conn: sqlite3.Connection, decision: object, by: str) -> Row:
-    """An active task-manager entry the owner confirms: confirmed_at / confirmed_by, nothing else."""
+def set_decision_active(conn: sqlite3.Connection, decision: object, status: str | None, body: str,
+                        by: str) -> Row:
+    """A task-manager entry that waited as a proposal becomes active without the owner's confirmation (D-322:
+    no confirmed_at, so the task-manager may still change or delete it), with its Status line and the
+    re-rendered body."""
     cur = get_decision_entry(conn, decision)
     if cur is None:
         raise NotFound(f"no decision {decision}")
-    now = now_iso()
-    conn.execute("UPDATE decisions SET confirmed_at = ?, confirmed_by = ?, updated_at = ?, updated_by = ? "
-                 "WHERE id = ?", (now, by, now, by, cur["id"]))
+    conn.execute("UPDATE decisions SET state = 'active', status = ?, body = ?, body_sha256 = ?, updated_at = ?, "
+                 "updated_by = ? WHERE id = ?", (status, body, sha256_text(body), now_iso(), by, cur["id"]))
     return _decision_refresh(conn, cur["id"])
 
 

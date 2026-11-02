@@ -226,6 +226,10 @@ class Write(Env):
                        autonomous=True, **kw)
 
     def propose(self, title="Reworded", **kw):
+        """A task-manager entry that changes an owner's one (D-322: only that waits as a proposal)."""
+        if "supersedes" not in kw:
+            kw["supersedes"] = [self.do("decision.add", title=f"Base of {title}", topics=["t"], author="owner",
+                                        words="anything at all")["id"]]
         return self.do("decision.add", title=title, topics=["t"], author="task-manager", **kw)
 
     def count(self):
@@ -240,6 +244,44 @@ class Write(Env):
         self.assertTrue(d["source"].startswith(f"inbox #{n} "), d["source"])
         a = [x for x in store.audit_log(self.conn, 10, target_type="decision") if x["action"] == "decision.add"][0]
         self.assertEqual(a["after"]["evidence"], f"inbox:{n}")
+
+    def option_row(self, text="Forecast design chats again", session=SID, origin="option"):
+        q = store.ask_question(self.conn, "Which way?", None, session, "Which way", [text, "Leave it"])
+        m = store.add_inbox(self.conn, text, session, "owner", question_id=q["id"], origin=origin)
+        self.conn.commit()
+        return q["id"], m["id"]
+
+    def test_the_owners_click_on_an_answer_button_is_recorded_with_its_exact_text(self):
+        qid, n = self.option_row()
+        r = self.record("Forecast design chats   again", ref=f"inbox:{n}")
+        d = store.get_decision_entry(self.conn, r["id"])
+        self.assertEqual((d["state"], d["author"], d["words"]), ("active", "owner", "Forecast design chats again"))
+        self.assertEqual(d["source"], f'option "Forecast design chats again" of question #{qid} (inbox #{n})')
+        a = [x for x in store.audit_log(self.conn, 10, target_type="decision") if x["action"] == "decision.add"][0]
+        self.assertEqual(a["after"]["evidence"], f"inbox:{n}")
+
+    def test_a_click_is_not_free_speech(self):
+        qid, n = self.option_row()
+        for words in ("Forecast design chats", "design chats again", "Leave it", "Forecast design chats again, please",
+                      ["Forecast design chats again", "and more"]):
+            with self.assertRaisesRegex(actions.Forbidden, f"click on an answer button of question #{qid}"):
+                self.record(words, ref=f"inbox:{n}")
+        with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):        # no --from: no match
+            self.record("Forecast design chats again")
+        with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):        # not even a part of it
+            self.record("design chats", ref=None)
+        self.assertEqual(self.count(), 0)
+
+    def test_only_a_real_option_answer_of_this_session_counts(self):
+        _, edit = self.option_row("The summary the owner rewrote", origin="edit")
+        with self.assertRaisesRegex(actions.Forbidden, "no such owner message"):
+            self.record("The summary the owner rewrote", ref=f"inbox:{edit}")
+        _, other = self.option_row("An option of another session", session="00000000-0000-4000-8000-0000000000f9")
+        with self.assertRaisesRegex(actions.Forbidden, "no such owner message"):
+            self.record("An option of another session", ref=f"inbox:{other}")
+        n = self.inbox("typed: the exact words of the owner")                                     # typed rows as before
+        self.assertEqual(self.record("the exact words of the owner", ref=f"inbox:{n}")["state"], "active")
+        self.assertEqual(self.count(), 1)
 
     def test_the_date_and_source_come_from_a_transcript_message(self):
         self.transcript(entry("we decided: the exact words", uuid="m1"))
@@ -308,9 +350,9 @@ class Write(Env):
         self.assertEqual(a["after"]["evidence"], f"inbox:{n}")
 
     def test_a_message_older_than_the_proposal_does_not_confirm_it(self):
-        self.inbox("D-001 sounds good", at="2020-01-01T00:00:00.000Z")
+        self.inbox("D-002 sounds good", at="2020-01-01T00:00:00.000Z")
         p = self.propose()["id"]
-        self.assertEqual(p, "D-001")
+        self.assertEqual(p, "D-002")                                                  # D-001: the owner's it changes
         with self.assertRaisesRegex(actions.Forbidden, "none of the owner's messages"):
             self.do("decision.confirm", decision=p, actor=f"mcp:{SID}", via="mcp", autonomous=True)
 

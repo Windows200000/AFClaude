@@ -186,7 +186,7 @@ class Migration(V4Env):
             # writable now, and the new state is allowed
             r = actions.perform(conn, "decision.add", {"title": "T", "topics": ["a"], "author": "task-manager"},
                                 actor="cli", via="cli")
-            self.assertEqual(r["state"], "proposed")
+            self.assertEqual(r["state"], "active")
             before = conn.execute("SELECT version FROM decisions WHERE id = 'D-001'").fetchone()[0]
             actions.perform(conn, "decision.keywords", {"decision": "D-001", "op": "add", "keywords": ["y"]},
                             actor="cli", via="cli")
@@ -443,10 +443,36 @@ class Add(Env):
         self.assertEqual((a["target_id"], a["before"], a["after"]["state"], a["after"]["topics"]),
                          ("D-001", None, "active", ["lists", "decision list"]))
 
-    def test_task_manager_entry_is_proposed(self):
+    def test_task_manager_entry_is_active_at_once(self):
+        """D-322: its own entry needs no confirmation: active, no question, its author may change it."""
         r = self.do("decision.add", title="Rename X", topics=["naming"], author="task-manager")
-        self.assertEqual((r["state"], r["status"].startswith("proposed")), ("proposed", True))
+        self.assertEqual((r["state"], r["status"], r["type"], r["confirmed_at"]), ("active", "active", "task-manager",
+                                                                                 None))
+        self.assertNotIn("question", r)
+        self.assertIn("**Status:** active", store.get_decision_entry(self.conn, r["id"])["body"])
+        self.assertIsNone(store.open_decision_question(self.conn, r["id"]))
+        self.do("decision.edit", decision=r["id"], summary="Changed.", actor="mcp:abc", via="mcp", autonomous=True)
+        self.do("decision.delete", decision=r["id"], reason="no longer", actor="mcp:abc", via="mcp", autonomous=True)
+
+    def test_task_manager_entry_changing_an_owners_waits_for_the_owner(self):
+        """D-322: supersedes names an owner's entry (a replacement, rewording or merge): proposed + question."""
+        o = self.add()
+        r = self.do("decision.add", title="Rename X", topics=["naming"], author="task-manager", supersedes=[o["id"]])
+        self.assertEqual((r["state"], r["supersedes"]), ("proposed", o["id"]))
+        self.assertTrue(r["status"].startswith("proposed"))
         self.assertIn("**Status:** proposed", store.get_decision_entry(self.conn, r["id"])["body"])
+        self.assertEqual(store.open_decision_question(self.conn, r["id"])["id"], r["question"])
+        # an owner-confirmed task-manager entry is the owner's now: changing it waits too
+        r2 = self.do("decision.confirm", decision=r["id"])
+        r3 = self.do("decision.add", title="Again", topics=["naming"], author="task-manager", supersedes=[r["id"]])
+        self.assertEqual((r2["state"], r3["state"]), ("active", "proposed"))
+
+    def test_supersedes_only_the_task_managers_own_unconfirmed_entries_is_refused(self):
+        mine = self.do("decision.add", title="Mine", topics=["naming"], author="task-manager")
+        with self.assertRaisesRegex(ValueError, "yours to change"):
+            self.do("decision.add", title="Better", topics=["naming"], author="task-manager",
+                    supersedes=[mine["id"]])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 1)
 
     def test_refusals(self):
         for kw, msg in (({"words": None}, "exact words"), ({"topics": []}, "at least one"),
@@ -462,7 +488,7 @@ class Add(Env):
             self.add(actor="mcp:abc", via="mcp", autonomous=True)
         r = self.do("decision.add", title="Mine", topics=["x"], author="task-manager", actor="mcp:abc", via="mcp",
                     autonomous=True)
-        self.assertEqual(r["state"], "proposed")
+        self.assertEqual(r["state"], "active")
 
     def test_ids_slugs_and_projects(self):
         self.floor(299)
@@ -599,8 +625,13 @@ class Remove(Env):
 
 
 class Confirm(Env):
+    def prop(self, title="Prop", **kw):
+        """A task-manager entry that changes an owner's one: the only kind that waits (D-322)."""
+        o = self.add(title=f"Base of {title}")
+        return self.do("decision.add", title=title, topics=["x"], author="task-manager", supersedes=[o["id"]], **kw)
+
     def test_the_owner_confirms_a_proposal(self):
-        p = self.do("decision.add", title="Prop", topics=["x"], author="task-manager", words="reworded")
+        p = self.prop(words="reworded")
         r = self.do("decision.confirm", decision=p["id"])
         self.assertEqual((r["state"], r["status"], r["version"]), ("active", "active", p["version"] + 1))
         self.assertIn("- **Status:** active", store.get_decision_entry(self.conn, p["id"])["body"])
@@ -610,13 +641,13 @@ class Confirm(Env):
         self.assertEqual(len(self.audit("decision.confirm")), 1)
 
     def test_an_autonomous_session_cannot_confirm(self):
-        p = self.do("decision.add", title="Prop", topics=["x"], author="task-manager")
+        p = self.prop()
         with self.assertRaises(actions.Forbidden):
             self.do("decision.confirm", decision=p["id"], actor="mcp:abc", via="mcp", autonomous=True)
         self.assertEqual(store.get_decision_entry(self.conn, p["id"])["state"], "proposed")
 
     def test_a_custom_status_survives_the_confirmation(self):
-        p = self.do("decision.add", title="Prop", topics=["x"], author="task-manager", status="active until 2999-01-01")
+        p = self.prop(status="active until 2999-01-01")
         self.assertEqual(self.do("decision.confirm", decision=p["id"])["status"], "active until 2999-01-01")
 
 
@@ -783,7 +814,8 @@ class Tldr(Env):
         for n in range(1, 241):             # about the size of the live store
             self.do("decision.add", title=f"Decision number {n} about some topic of the project", topics=["t"],
                     words="w", author="owner")
-        self.do("decision.add", title="Waiting for the owner", topics=["t"], author="task-manager")
+        self.do("decision.add", title="Waiting for the owner", topics=["t"], author="task-manager",
+                supersedes=["D-001"])
         lines = dec.tldr_lines(self.conn)
         self.assertEqual(len(lines), 240)
         self.assertEqual(lines[0], "D-001 Decision number 1 about some topic of the project")   # id + title, no topics
@@ -823,7 +855,8 @@ class Cli(CliEnv):
         code, _, err = self.cli("add", "--title", "No words", "--topic", "x", "--author", "owner")
         self.assertEqual(code, 1)
         self.assertIn("exact words", err)
-        code, out, _ = self.cli("add", "--title", "Mine", "--topic", "lists", "--topic", "naming", "--author", "task-manager")
+        code, out, _ = self.cli("add", "--title", "Mine", "--topic", "lists", "--topic", "naming", "--author",
+                                "task-manager", "--supersedes", "D-001")
         self.assertIn("proposed", store.get_decision_entry(self.conn, "D-002")["state"])
         self.assertNotIn("new topics: lists", out)
         out = self.cli("show", "D-002")[1]
@@ -847,9 +880,11 @@ class Cli(CliEnv):
         self.assertEqual(store.get_decision_entry(self.conn, "D-002")["state"], "active")
         code, out, _ = self.cli("expire", "D-002", "--reason", "carried out")
         self.assertIn("removed (expired: carried out)", out)
-        self.assertEqual(self.cli("tldr")[1].count("\nD-"), 1)
-        self.assertEqual(self.cli("delete", "D-001", "--reason", "gone")[0], 0)
-        self.assertEqual(self.cli("delete", "D-001", "--reason", "again")[0], 1)
+        self.assertEqual(self.cli("tldr")[1].count("\nD-"), 0)                  # D-001 was replaced by D-002
+        self.assertEqual(self.cli("delete", "D-001", "--reason", "gone")[0], 1)
+        self.assertEqual(self.cli("add", "--title", "Own", "--topic", "t", "--author", "task-manager")[0], 0)
+        self.assertEqual(self.cli("delete", "D-003", "--reason", "gone")[0], 0)
+        self.assertEqual(self.cli("delete", "D-003", "--reason", "again")[0], 1)
 
 
 class CliAuthority(CliEnv):
@@ -857,7 +892,9 @@ class CliAuthority(CliEnv):
     def setUp(self):
         super().setUp()
         self.owner = self.add(title="Owner's", words="exact")["id"]                      # D-001, active
-        self.tm = self.do("decision.add", title="Mine", topics=["t"], author="task-manager")["id"]
+        base = self.add(title="Base", words="exact")["id"]                               # D-002, the one D-003 changes
+        self.tm = self.do("decision.add", title="Mine", topics=["t"], author="task-manager",
+                          supersedes=[base])["id"]
         self.oneoff = self.add(title="Lapsed", status="active until 2001-01-01 19:00 (one-off, D-278)")["id"]
         self.future = self.add(title="Future", status="active until 2999-01-01 19:00")["id"]
         env = mock.patch.dict(os.environ, {"CLAUDE_GUARD_DISABLE": "1"})
@@ -878,11 +915,11 @@ class CliAuthority(CliEnv):
         self.refused("expire", self.future)                                           # its date isn't past
         self.assertEqual(store.get_decision_entry(self.conn, self.tm)["state"], "proposed")
         self.assertEqual(store.get_decision_entry(self.conn, self.owner)["title"], "Owner's")
-        self.assertEqual(store.get_decision_entry(self.conn, "D-005"), None)
+        self.assertEqual(store.get_decision_entry(self.conn, "D-006"), None)
 
     def test_what_it_may_do(self):
         code, out, _ = self.cli("add", "--title", "Its own", "--topic", "t", "--author", "task-manager")
-        self.assertEqual((code, out.splitlines()[0]), (0, "D-005 (state: proposed; topics: t)"))
+        self.assertEqual((code, out.splitlines()[0]), (0, "D-006 (state: active; topics: t)"))
         self.assertEqual(self.cli("edit", self.tm, "--title", "Reworded")[0], 0)           # its own entry
         self.assertEqual(self.cli("topics", self.owner, "add", "more")[0], 0)              # topics and keywords
         self.assertEqual(self.cli("keywords", self.owner, "add", "kw")[0], 0)

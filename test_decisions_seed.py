@@ -320,7 +320,7 @@ class Undo(Seed):
         self.undo()
         self.assertEqual(self.row("D-007")["origin"], "db")
         self.imp()
-        self.assertEqual(self.row("D-007")["state"], "proposed")
+        self.assertEqual(self.row("D-007")["state"], "active")                  # its own entry, D-322
 
     def test_refused_after_an_edit(self):
         self.seed()

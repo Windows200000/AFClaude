@@ -92,6 +92,9 @@ class Base(unittest.TestCase):
         return self.do("task.ask", question=text, project="Mgr", **kw)
 
     def proposal(self, title="Reworded titles", supersedes=None):
+        """A task-manager entry that changes an owner's one (D-322: only that waits as a proposal)."""
+        if supersedes is None:
+            supersedes = [self.owner_entry(f"Base of {title}")["id"]]
         return self.do("decision.add", title=title, topics=["lists"], author="task-manager", summary="A rewording.",
                        supersedes=supersedes)
 
@@ -371,30 +374,17 @@ class Decisions(Base):
         self.assertEqual((self.entry(p["id"])["state"], store.get_task(self.conn, q["id"])["status"], self.messages()),
                          ("proposed", "blocked", []))
 
-    def test_confirm_and_drop_an_unconfirmed_task_manager_entry_through_the_endpoint(self):
-        ids = []
-        for title in ("Mine", "Other"):
-            p = self.proposal(title=title)
-            self.do("decision.confirm", decision=p["id"])
-            # active but unconfirmed: what the seeding left (written as the old code would have)
-            self.conn.execute("UPDATE decisions SET confirmed_at = NULL, confirmed_by = NULL WHERE id = ?", (p["id"],))
-            self.conn.commit()
-            with self.conn:
-                ids.append(actions.ask_decision_question(self.conn, actions.Ctx("cli", "cli"), self.entry(p["id"])))
-        (qa, qb) = ids
-        (va,) = [x for x in inbox.view(self.conn)["questions"] if x["id"] == qa["id"]]
-        self.assertEqual((va["decision"]["kind"], va["decision"]["choices"]), ("confirm", ["confirm", "drop"]))
-        did_a, did_b = qa["decision_id"], qb["decision_id"]
-        st, r = self.post(qa["id"], "decide", {"choice": "confirm", "version": va["decision"]["version"]})
-        self.assertEqual((st, r["inbox"]), (200, None))
-        self.assertEqual((self.entry(did_a)["confirmed_by"], self.messages()), ("owner", []))
-        st, r = self.post(qb["id"], "decide", {"choice": "drop", "version": self.entry(did_b)["version"],
-                                              "note": "obsolete"})
-        self.assertEqual(st, 200)
-        self.assertIsNone(self.entry(did_b))
-        (m,) = self.messages()
-        self.assertEqual((m["text"], m["status"], m["verdict"]), ("obsolete", "noted", "note"))
-        self.assertEqual(inbox.view(self.conn)["questions"], [])
+    def test_an_active_task_manager_entry_has_no_question_and_decide_refuses_an_old_one(self):
+        """D-322: no confirm / drop question for the task-manager's own entry; an older one is refused."""
+        p = self.do("decision.add", title="Mine", topics=["lists"], author="task-manager", summary="Mine.")
+        self.assertEqual((p["state"], self.question_of(p["id"])), ("active", None))
+        old = store.ask_question(self.conn, "Confirm this?", None, None, "Confirm", ["confirm", "drop"], p["id"])
+        self.conn.commit()
+        (v,) = [x for x in inbox.view(self.conn)["questions"] if x["id"] == old["id"]]
+        self.assertEqual((v["decision"]["kind"], v["decision"]["choices"]), (None, []))
+        st, r = self.post(old["id"], "decide", {"choice": "confirm", "version": p["version"]})
+        self.assertEqual(st, 409)
+        self.assertEqual(self.entry(p["id"])["confirmed_at"], None)
 
     def test_the_rate_rule_covers_an_answer_and_a_decision_that_writes_a_message(self):
         for i in range(inbox.RATE_MAX):

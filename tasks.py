@@ -85,8 +85,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py decision add --title T --topic T... --author owner|task-manager [--words W ...]
                           [--from inbox:N|chat:S:UUID] [--supersedes ID ...]   write a decision into the DB
                                            (owner: active at once, exact --words required, D-285; task-manager:
-                                           proposed until the owner confirms; --supersedes: native entries the
-                                           proposal replaces, deleted on its confirm). A session AFClaude
+                                           active at once, D-322; --supersedes: owner's entries it replaces,
+                                           then it waits as a proposal for the owner's confirmation and they
+                                           are deleted on it). A session AFClaude
                                            launched (CLAUDE_GUARD_DISABLE=1) records author owner only
                                            against an owner message of its own session that contains every
                                            --words quote (--from when several do; the date and source come
@@ -1141,14 +1142,17 @@ def parser():
     q.add_argument("--topic", action="append", required=True, help="a topic (repeat; at least one, D-284)")
     q.add_argument("--author", choices=store.DECISION_AUTHORS, required=True,
                    help="owner: the owner's words, active at once (not for an autonomous session); "
-                        "task-manager: proposed until the owner confirms")
+                        "task-manager: your own, active at once; with --supersedes (an owner's entry) it is "
+                        "proposed until the owner confirms (D-322)")
     q.add_argument("--words", action="append", help="the owner's exact words (required for author owner; repeat "
                    "for several quotes, all from one message; an autonomous session's must occur in a message "
                    "of the owner in its own session: inbox or chat)")
     q.add_argument("--from", dest="ref", metavar="inbox:N|chat:SESSION:UUID",
-                   help="which owner message the words are from, when several contain them (autonomous session)")
+                   help="which owner message the words are from, when several contain them (autonomous session); "
+                        "inbox:N may be the owner's click on an answer button (words = its exact text)")
     q.add_argument("--supersedes", action="append", metavar="ID",
-                   help="a native decision this proposal replaces (repeat): deleted when it is confirmed")
+                   help="an owner's decision this entry replaces, rewords or merges (repeat): the entry waits for the "
+                        "owner's confirmation (D-322); the original is deleted when it is confirmed")
     for f in ("summary", "scope", "source", "interpretation", "date", "status", "slug"):
         q.add_argument(f"--{f}")
     q.add_argument("--keyword", action="append", help="a keyword (repeat)")

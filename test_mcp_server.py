@@ -140,8 +140,10 @@ class Tasks(Env):
             asyncio.run(ms.afclaude_ask("Which?", project="A", options=["x", "x"]))
         c = store.connect(self.db)
         try:
-            p = actions.perform(c, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager"},
-                                actor="cli", via="cli")
+            o = actions.perform(c, "decision.add", {"title": "Said", "topics": ["x"], "author": "owner",
+                                                    "words": "the owner's own words"}, actor="cli", via="cli")
+            p = actions.perform(c, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager",
+                                                    "supersedes": [o["id"]]}, actor="cli", via="cli")
         finally:
             c.close()
         with self.assertRaisesRegex(ToolError, f"asks about decision {p['id']}"):
@@ -539,12 +541,13 @@ class Decisions(Env):
             asyncio.run(ms.afclaude_decisions("find"))
 
     def test_propose_writes_a_proposal_and_find_shows_topics_and_links(self):
-        """propose (Q1): the task-manager's own entry, proposed; find matches its topics once confirmed."""
+        """propose (Q1): the task-manager's own entry, active at once (D-322); one that supersedes an owner's entry
+        is proposed and waits."""
         r = run(ms.afclaude_decisions("propose", title="Show titles", topics=["lists", "tldr"], words="as said",
                                       interpretation="my reading"))
-        self.assertEqual((r["id"], r["state"], r["topics"], r["new_topics"]), ("D-001", "proposed", ["lists", "tldr"],
-                                                                                 ["lists", "tldr"]))
-        self.assertIn("waits for the owner", r["note"])
+        self.assertEqual((r["id"], r["state"], r["topics"], r["new_topics"]), ("D-001", "active", ["lists", "tldr"],
+                                                                                ["lists", "tldr"]))
+        self.assertIn("active at once", r["note"])
         conn = store.connect(self.db)
         try:
             self.assertEqual(store.get_decision_entry(conn, "D-001")["author"], "task-manager")
@@ -563,6 +566,9 @@ class Decisions(Env):
                            "links": ["refined by D-002"]},
                           {"id": "D-002", "title": "Other", "state": "active", "topics": ["x"],
                            "links": ["refines D-001"]}])
+        r = run(ms.afclaude_decisions("propose", title="Reworded other", topics=["x"], supersedes=["D-002"]))
+        self.assertEqual((r["state"], r["supersedes"]), ("proposed", "D-002"))
+        self.assertIn("waits for the owner", r["note"])
         with self.assertRaisesRegex(ToolError, "propose needs title"):
             asyncio.run(ms.afclaude_decisions("propose", topics=["a"]))
         with self.assertRaisesRegex(ToolError, "at least one"):
