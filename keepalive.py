@@ -3231,6 +3231,9 @@ def compaction_busy(sid, what, wait=None):
 
 def compact_session(sid, cwd, path):
     """Send /compact into our live tmux session and wait until the transcript shows it finished.
+    A compacted result carries the marker's time (done_at) and, from the compact_boundary's
+    compactMetadata, the context before and after it (pre_tokens / post_tokens; None when only the
+    summary entry was found): compact_resume_text names them.
     -> dict status: compacted | timeout (no marker within COMPACT_TIMEOUT) | busy (still mid-turn
     after COMPACT_TURN_WAIT: a turn that started after the save, e.g. a task notification, D-307) |
     send-failed. Only "compacted" lets the start go on (compact_with_handoff)."""
@@ -3246,8 +3249,11 @@ def compact_session(sid, cwd, path):
     while True:
         hit = compacted_since(path, since)
         if hit:
-            log(f"compaction: {sid[:8]} compacted ({hit.get('subtype') or 'summary'} at {hit.get('timestamp')})")
-            return {"status": "compacted", "sent_at": since, "done_at": hit.get("timestamp")}
+            meta = hit.get("compactMetadata") or {}
+            log(f"compaction: {sid[:8]} compacted ({hit.get('subtype') or 'summary'} at {hit.get('timestamp')}"
+                + (f", {meta['preTokens']} -> {meta['postTokens']} tokens" if meta.get("postTokens") else "") + ")")
+            return {"status": "compacted", "sent_at": since, "done_at": hit.get("timestamp"),
+                    "pre_tokens": meta.get("preTokens"), "post_tokens": meta.get("postTokens")}
         if time.time() >= deadline:
             log(f"compaction: no compaction marker in {sid[:8]}'s transcript after {COMPACT_TIMEOUT}")
             return {"status": "timeout", "sent_at": since}
@@ -3459,11 +3465,26 @@ def refresh_stale_handoff(sid, cwd, path, save):
         save.update(handoff_id=res["handoff_id"], saved_at=res["saved_at"])
 
 
-def compact_resume_text(sid, save, trigger="run-end", progress=None):
+def compaction_text(comp):
+    """compact_resume.md's {compaction}: the one compaction that ran (compact_session's result: its
+    time and the context before and after it). Claude Code shows the /compact line twice, before its
+    summary and again under it, and the summary opens with "ran out of context": owners read that as
+    a second compaction (inbox #46, 02.11.), so the message the session view shows right below
+    says it was one."""
+    comp = comp or {}
+    done = _entry_ts(comp, "done_at")
+    parts = ([f"done at {_hm(done)}"] if done else []) + (
+        [f"context {comp['pre_tokens'] / 1000:.0f}k to {comp['post_tokens'] / 1000:.0f}k tokens"]
+        if comp.get("pre_tokens") and comp.get("post_tokens") else [])
+    return "one compaction" + (f" ({', '.join(parts)})" if parts else "")
+
+
+def compact_resume_text(sid, save, trigger="run-end", progress=None, comp=None):
     """The text that gives the session its hand-off back after a compaction -> (text, hand-off row):
     the session's latest unconsumed hand-off, which must be the one the save right before this
     compaction wrote (`save`: save_before_compaction's result, status "saved"; compact_resume.md),
-    pointing at `progress` (default: the session's project's PROGRESS.md, session_progress).
+    pointing at `progress` (default: the session's project's PROGRESS.md, session_progress), and
+    naming the compaction `comp` (compact_session's result: compaction_text).
     Anything else raises failstop.Failed (D-234): no save, the saved hand-off not found (e.g.
     consumed or gone meanwhile), no project, or the DB could not be read."""
     import failstop
@@ -3485,7 +3506,7 @@ def compact_resume_text(sid, save, trigger="run-end", progress=None):
                               f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
                               + (f"#{h['id']}" if h else "none"))
     return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress,
-                                                when=TRIGGER_TEXT[trigger][1]), h
+                                                when=TRIGGER_TEXT[trigger][1], compaction=compaction_text(comp)), h
 
 
 def _jsonable(d):
@@ -3541,7 +3562,7 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
         raise failstop.Failed(f"compaction not done: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
     try:
-        insert, h = compact_resume_text(sid, save, trigger, progress)
+        insert, h = compact_resume_text(sid, save, trigger, progress, comp)
     except failstop.Failed as e:
         raise failstop.Failed(e.why, e.detail, rec) from None
     rec["handoff_id"] = h["id"]

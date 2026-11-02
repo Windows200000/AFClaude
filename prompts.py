@@ -112,7 +112,7 @@ PROMPTS: dict[str, Prompt] = {
                                        used_by="keepalive: the hand-off asked for again when new input reached the "
                                                "session after it, before /compact (D-307)"),
     "compact": Prompt(used_by="keepalive /compact instruction"),
-    "compact_resume": Prompt(("handoff", "progress", "when"), used_by="keepalive, inside compact_after"),
+    "compact_resume": Prompt(("compaction", "handoff", "progress", "when"), used_by="keepalive, inside compact_after"),
     "compact_after": Prompt(("resume",), used_by="keepalive message after a compaction"),
     "compact_after_run": Prompt(("budget", "pace", "reason", "resume", "started", "threshold"),
                                 used_by="keepalive message after a mid-run compaction (D-307): the run goes on"),
