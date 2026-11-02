@@ -229,7 +229,8 @@ class Endpoints(Base):
                 autonomous=True)
         v = inbox.view(self.conn)
         (th,) = v["threads"]
-        self.assertEqual((th["id"], th["text"], th["answer"]), (m["id"], "Daily", "Done: daily."))
+        (row,) = th["rows"]                                        # D-324: a thread card holds its messages as rows
+        self.assertEqual((th["id"], row["text"], row["answer"]), (m["id"], "Daily", "Done: daily."))
         self.assertEqual(th["question"], {"id": q["id"], "title": "Nightly run", "text": "Which way?"})
         self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{m['id']}/dismiss", {})[0], 200)
         self.assertEqual(inbox.view(self.conn)["threads"], [])
