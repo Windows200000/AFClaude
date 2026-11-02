@@ -58,8 +58,8 @@ class Base(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def do(self, _action, /, actor="cli", via="cli", **params):
-        return actions.perform(self.conn, _action, params, actor=actor, via=via)
+    def do(self, _action, /, actor="cli", via="cli", autonomous=False, **params):
+        return actions.perform(self.conn, _action, params, actor=actor, via=via, autonomous=autonomous)
 
     def notify(self, subject, body):
         self.alerts.append(subject)
@@ -80,14 +80,14 @@ class Base(unittest.TestCase):
     def owner(self, uid):
         return self.do("grant.set", user_id=uid, scope="owner")
 
-    def register(self, hostname="host-a", user_id=None, code=None):
+    def register(self, hostname="host-a", user_id=None, code=None, label=None):
         """-> the raw token of a freshly registered (or re-issued) machine."""
         code = code or roles.new_registration_code()
         params = {"code_sha256": roles.code_sha256(code)}
         if user_id is not None:
             params["user_id"] = user_id
         self.do("machine.code", **params)
-        return actions.register_machine(self.conn, code, hostname, actor="cli", via="cli")
+        return actions.register_machine(self.conn, code, hostname, actor="cli", via="cli", label=label)
 
     def dump_all(self):
         return "\n".join(self.conn.iterdump())
@@ -162,7 +162,8 @@ class Grants(Base):
         r = self.owner(uid)
         self.assertEqual((r["scope"], r["level"], r["source"]), ("owner", None, "manual"))
         self.assertEqual(len(r["alerts"]), 1)
-        self.assertIn("ann", r["alerts"][0]["subject"])
+        self.assertNotIn("ann", r["alerts"][0]["subject"])
+        self.assertIn("ann", r["alerts"][0]["body"])
         row = self.audit("grant.set")[-1]
         self.assertEqual((row["actor"], row["target_type"]), ("cli", "grant"))
         self.assertNotIn("alerts", json.dumps(row["after"]))
@@ -510,7 +511,7 @@ class Registration(Base):
 
     def test_code_input_checks(self):
         for kw in ({"code_sha256": "short"}, {"code_sha256": "e" * 64, "ttl_minutes": 0},
-                   {"code_sha256": "e" * 64, "ttl_minutes": 1441}, {"code_sha256": "e" * 64, "ttl_minutes": "15"}):
+                   {"code_sha256": "e" * 64, "ttl_minutes": 61}, {"code_sha256": "e" * 64, "ttl_minutes": "15"}):
             with self.assertRaises(ValueError, msg=kw):
                 self.do("machine.code", **kw)
         for host in ("", "a b", "x" * 129):
@@ -540,6 +541,71 @@ class Registration(Base):
         self.assertNotIn(code, text)
         self.assertNotIn(roles.parse_token(r["token"])[1], text)
         self.assertEqual([x["action"] for x in self.audit()][:3], ["machine.code", "machine.register", "machine.register_failed"])
+
+
+class Alerts(Base):
+    """The subject of an alert reaches the progress doc and the public PROGRESS.md: ids only."""
+    def test_no_label_or_hostname_in_any_subject(self):
+        r = self.register("secret-host.example", label="secret-label")
+        out = self.owner(r["user_id"])
+        sync_user = self.person("secret-person")
+        sync = self.do("grant.sync_groups", user_id=sync_user, groups=["a"], provider="idp",
+                       group_map=[{"group": "a", "grant": "owner"}])
+        tok = actions.authenticate_machine(self.conn, r["token"], "secret-host.example", "stdio", notify=self.notify)
+        self.assertIsNotNone(tok)
+        actions.authenticate_machine(self.conn, r["token"], "other-secret-host", "stdio", notify=self.notify)
+        self.assertEqual(len(self.alerts), 1)                                   # the clone alert
+        seen = self.alerts + [a["subject"] for a in out["alerts"] + sync["alerts"]]
+        self.assertEqual(len(seen), 3)
+        for subject in seen:
+            for secret in ("secret", "example", "other-secret"):
+                self.assertNotIn(secret, subject)
+        bodies = [a["body"] for a in out["alerts"]]
+        self.assertIn("secret-label", bodies[0])                                # the body (alerts doc) keeps them
+
+    def test_clone_alert_body_names_the_hosts(self):
+        r = self.register("box-1")
+        got = []
+        actions.authenticate_machine(self.conn, r["token"], "box-2", "stdio", notify=lambda s, b: got.append(b))
+        self.assertIn("box-1", got[0])
+        self.assertIn("box-2", got[0])
+
+
+class Autonomous(Base):
+    """A session AFClaude launched may not hand out roles or machine credentials, through the CLI either."""
+    def test_refused_for_an_autonomous_caller_on_every_path(self):
+        uid = self.person()
+        m = self.register()["user_id"]
+        self.owner(self.person("boss"))
+        for name, params in (("grant.set", {"user_id": uid, "scope": "owner"}),
+                             ("grant.remove", {"user_id": uid, "scope": "owner"}),
+                             ("grant.sync_groups", {"user_id": uid, "groups": [], "provider": "i", "group_map": []}),
+                             ("machine.code", {"code_sha256": "a" * 64}),
+                             ("machine.revoke", {"user_id": m}), ("user.revoke", {"user_id": m})):
+            for via in ("cli", "mcp", "dashboard"):
+                with self.assertRaises(actions.Forbidden, msg=(name, via)):
+                    self.do(name, via=via, autonomous=True, **params)
+        self.assertEqual(store.list_grants(self.conn, uid), [])
+        self.assertIsNone(store.get_user(self.conn, m)["revoked_at"])
+        self.assertEqual(store.count_audit_since(self.conn, "machine.code", "0"), 1)       # only the setup's own
+        self.owner(uid)                                                                      # the owner still can
+
+    def test_the_cli_passes_the_guard_flag(self):
+        old = os.environ.get("CLAUDE_GUARD_DISABLE")
+        os.environ["CLAUDE_GUARD_DISABLE"] = "1"
+        try:
+            self.conn.close()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = tasks.main(["--db", self.db, "machine", "code"])
+            self.assertEqual(rc, 1)
+            self.assertIn("autonomous", err.getvalue())
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_GUARD_DISABLE")
+            else:
+                os.environ["CLAUDE_GUARD_DISABLE"] = old
+            self.conn = store.connect(self.db)
 
 
 class Authenticate(Base):
@@ -644,7 +710,7 @@ class CLI(Base):
             return json.load(fh)
 
     def test_register_writes_the_token_file_with_mode_0600(self):
-        out, _ = self.run_cli("machine", "register", self.code(), "--hostname", "box", "--file", self.file)
+        out, _ = self.run_cli("machine", "register", self.code(), "--label", "box", "--file", self.file)
         self.assertIn("no access until an owner grants", out)
         self.assertEqual(stat.S_IMODE(os.stat(self.file).st_mode), 0o600)
         rec = self.read_file()
@@ -669,7 +735,7 @@ class CLI(Base):
         self.assertIn("token", self.read_file())
 
     def test_print_shows_the_token_once_and_writes_no_file(self):
-        out, _ = self.run_cli("machine", "register", self.code(), "--print", "--hostname", "box")
+        out, _ = self.run_cli("machine", "register", self.code(), "--print", "--label", "box")
         self.assertIn("afcm_", out)
         self.assertFalse(os.path.exists(self.file))
 
@@ -679,7 +745,7 @@ class CLI(Base):
         self.assertFalse(os.path.exists(self.file))
 
     def test_machine_list_rename_revoke_and_grants(self):
-        self.run_cli("machine", "register", self.code(), "--hostname", "box", "--file", self.file)
+        self.run_cli("machine", "register", self.code(), "--label", "box", "--file", self.file)
         self.run_cli("grant", "set", "1", "--owner")
         out, _ = self.run_cli("machine", "list")
         self.assertIn("box", out)
@@ -697,15 +763,46 @@ class CLI(Base):
 
     def test_project_grants(self):
         self.run_cli("project", "add", "P")
-        self.run_cli("machine", "register", self.code(), "--hostname", "box", "--file", self.file)
+        self.run_cli("machine", "register", self.code(), "--label", "box", "--file", self.file)
         self.run_cli("grant", "set", "1", "--project", "P", "--level", "editor")
         self.assertIn("editor of P", self.run_cli("grant", "list", "--user", "1")[0])
         _, err = self.run_cli("grant", "set", "1", "--project", "P", expect=1)
         self.assertIn("level", err)
         self.run_cli("grant", "remove", "1", "--project", "P")
 
+    def test_a_label_is_not_the_hostname_and_causes_no_clone_alert(self):
+        import socket
+        self.run_cli("machine", "register", self.code(), "--label", "build box", "--file", self.file)
+        rec = self.read_file()
+        self.assertEqual(rec["label"], "build box")
+        conn = store.connect(self.db)
+        try:
+            self.assertEqual(store.get_machine_token(conn, rec["token_id"])["hostname_at_issue"], socket.gethostname())
+            actions.authenticate_machine(conn, rec["token"], socket.gethostname(), "stdio", notify=self.notify)
+        finally:
+            conn.close()
+        self.assertEqual(self.alerts, [])
+
+    def test_a_failed_file_write_shows_the_token_once_in_the_error(self):
+        saved = tasks.write_machine_file
+
+        def broken(path, rec):
+            raise OSError("disk full")
+        tasks.write_machine_file = broken
+        try:
+            _, err = self.run_cli("machine", "register", self.code(), "--file", self.file, expect=1)
+        finally:
+            tasks.write_machine_file = saved
+        self.assertIn("disk full", err)
+        self.assertRegex(err, r"afcm_\d+_[0-9a-f]{64}")
+
+    def test_the_ttl_is_capped_at_60_minutes(self):
+        _, err = self.run_cli("machine", "code", "--ttl", "61", expect=1)
+        self.assertIn("60", err)
+        self.run_cli("machine", "code", "--ttl", "60")
+
     def test_the_reissue_flow(self):
-        self.run_cli("machine", "register", self.code(), "--hostname", "box", "--file", self.file)
+        self.run_cli("machine", "register", self.code(), "--label", "box", "--file", self.file)
         old = self.read_file()["token"]
         out, _ = self.run_cli("machine", "code", "--user", "1")
         self.assertIn("re-issues machine 1", out)

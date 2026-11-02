@@ -3543,6 +3543,7 @@ REGISTER_WINDOW = timedelta(minutes=15)
 CLONE_WINDOW = timedelta(hours=24)              # a token seen from two hostnames within this alerts (D-198)
 LABEL_MAX = 100
 HOSTNAME_MAX = 128
+CODE_TTL_MAX_MINUTES = 60                       # a code is for typing in now; the default is roles.CODE_TTL_MINUTES (15)
 
 
 class RegistrationRefused(ValueError):
@@ -3613,6 +3614,15 @@ def _check_grantor(conn: sqlite3.Connection, ctx: Ctx, scope: str, project_id: i
         raise Forbidden(str(e)) from None
 
 
+def _refuse_autonomous(conn: sqlite3.Connection, ctx: Ctx, what: str) -> None:
+    """Grants and machine credentials are a person's to hand out: an autonomous AFClaude session is refused
+    through the CLI as well as MCP (is_autonomous checks MCP only), as decision_autonomous does for decisions;
+    otherwise a launched session could mint itself an owner credential (machine code, register, grant)."""
+    if decision_autonomous(conn, ctx):
+        raise Forbidden(f"{what} is not allowed for an autonomous AFClaude session (the owner hands out roles and "
+                        "machine credentials)")
+
+
 def _grant_target(conn: sqlite3.Connection, scope: Any, project: Any, level: Any,
                   ) -> tuple[str, store.Row | None, str | None]:
     sc = store._enum(scope, roles.SCOPES, "scope")
@@ -3630,8 +3640,10 @@ def _grant_text(conn: sqlite3.Connection, g: Mapping[str, Any]) -> str:
 
 
 def _owner_alert(conn: sqlite3.Connection, ctx: Ctx, user: Mapping[str, Any], how: str) -> dict[str, str]:
-    return {"subject": f"owner role given to {user['kind']} user {user['id']} ({user['label']})",
-            "body": f"{ctx.actor} {how}. An owner can do everything, including granting it on (D-172)."}
+    # the subject reaches the progress doc and so the exported PROGRESS.md: the id only, never the label
+    return {"subject": f"owner role given to {user['kind']} user {user['id']}",
+            "body": f"{ctx.actor} {how} to {user['kind']} user {user['id']} ({user['label']}). "
+                    "An owner can do everything, including granting it on (D-172)."}
 
 
 @action("grant.set", "grant", owner_only=True)
@@ -3641,6 +3653,7 @@ def grant_set(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, scope: Any, proj
     editor | manager), manually; an existing manual grant for the same thing changes its level. Owners
     grant anything; a project's managers grant editor and viewer on it (roles.check_grant_change).
     Making an owner returns an alert (result["alerts"])."""
+    _refuse_autonomous(conn, ctx, "grant.set")
     user = _user(conn, user_id, active=True)
     sc, proj, lv = _grant_target(conn, scope, project, level)
     pid = None if proj is None else int(proj["id"])
@@ -3666,6 +3679,7 @@ def grant_remove(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, scope: Any, p
     """Take a manual grant away (the owner role, or the user's grant on one project). A grant that
     comes from an OIDC group isn't removed here: it follows the group map at the next login. Refused when
     it would leave no manual person owner (D-183). Managers revoke editor and viewer on their project only."""
+    _refuse_autonomous(conn, ctx, "grant.remove")
     user = _user(conn, user_id)
     sc, proj, _ = _grant_target(conn, scope, project, None if scope == "owner" else "viewer")
     pid = None if proj is None else int(proj["id"])
@@ -3692,6 +3706,7 @@ def grant_sync_groups(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, groups: 
     dashboard.auth.oidc_groups.parse_group_map checks it); a project it names that doesn't exist is an
     error, nothing applied (D-235). Group-derived owners don't count for the last-owner guard (D-183), so
     none is needed here. An owner newly granted returns an alert (result["alerts"])."""
+    _refuse_autonomous(conn, ctx, "grant.sync_groups")
     from dashboard.auth import oidc_groups as og
     user = _user(conn, user_id, kind="person", active=True)
     prov = store._text(provider, "provider", required=True)
@@ -3755,6 +3770,7 @@ def user_rename(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, label: Any, ve
 
 @action("user.revoke", "user", owner_only=True)
 def user_revoke(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, version: Any = None) -> Result:
+    _refuse_autonomous(conn, ctx, "user.revoke")
     return _revoke(conn, _user(conn, user_id), version)
 
 
@@ -3765,6 +3781,7 @@ def machine_rename(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, label: Any,
 
 @action("machine.revoke", "user", owner_only=True)
 def machine_revoke(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, version: Any = None) -> Result:
+    _refuse_autonomous(conn, ctx, "machine.revoke")
     return _revoke(conn, _user(conn, user_id, kind="machine"), version)
 
 
@@ -3775,9 +3792,10 @@ def machine_code(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, user_id: 
     the caller shows it once; the raw code never reaches the audit log or an idempotency record). Valid
     for ttl_minutes (15), single use. user_id: a re-issue for that machine (its other open codes are
     superseded); none: a new machine. -> {id, user_id, expires_at}."""
+    _refuse_autonomous(conn, ctx, "machine.code")
     h = _sha256_hex(code_sha256, "code_sha256")
-    if isinstance(ttl_minutes, bool) or not isinstance(ttl_minutes, int) or not 1 <= ttl_minutes <= 24 * 60:
-        raise ValueError("ttl_minutes must be a whole number from 1 to 1440")
+    if isinstance(ttl_minutes, bool) or not isinstance(ttl_minutes, int) or not 1 <= ttl_minutes <= CODE_TTL_MAX_MINUTES:
+        raise ValueError(f"ttl_minutes must be a whole number from 1 to {CODE_TTL_MAX_MINUTES}")
     uid = None if user_id is None else int(_user(conn, user_id, kind="machine", active=True)["id"])
     now = store._utcnow()
     if uid is not None:
@@ -3791,10 +3809,10 @@ def machine_code(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, user_id: 
 
 @action("machine.register", "user")
 def machine_register(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, token_sha256: Any,
-                     hostname: Any) -> Result:
+                     hostname: Any, label: Any = None) -> Result:
     """Spend a registration code and issue a machine token: no principal, the code is the credential (use
     register_machine(), which makes the token and records a refusal for the rate limit). A new machine
-    gets a user (label = hostname) with no grants (D-195); a re-issue (the code was minted for a machine)
+    gets a user (label: the given one, else the hostname) with no grants (D-195); a re-issue (the code was minted for a machine)
     revokes that machine's old tokens in the same transaction. Only the sha256 of the token's random part
     arrives here and is stored. Refused unseen after REGISTER_MAX_FAILURES refusals in REGISTER_WINDOW.
     -> {user_id, token_id, label, reissued, revoked_tokens}: the caller joins token_id and its secret
@@ -3809,7 +3827,7 @@ def machine_register(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, token
         raise RegistrationRefused("the registration code is not valid (unknown, already used or expired)")
     revoked: list[int] = []
     if reg["user_id"] is None:
-        user = store.add_user(conn, "machine", host, reg["created_by"])
+        user = store.add_user(conn, "machine", host if label is None else _label(label), reg["created_by"])
     else:
         user = _user(conn, reg["user_id"], kind="machine", active=True)
         revoked = store.revoke_machine_tokens(conn, user["id"])
@@ -3819,14 +3837,16 @@ def machine_register(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, token
     return Result(out, user["id"], None, {**out, "hostname": host, "registration": reg["id"]})
 
 
-def register_machine(conn: sqlite3.Connection, code: str, hostname: str, *, actor: str, via: str) -> dict[str, Any]:
+def register_machine(conn: sqlite3.Connection, code: str, hostname: str, *, actor: str, via: str,
+                     label: str | None = None) -> dict[str, Any]:
     """The registration as callers use it: makes the token's secret, performs machine.register and returns
     its result plus the raw `token` (shown once by the caller, never stored). A refused code is recorded
     (machine.register_failed, no code in it) for the rate limit; a rate-limited attempt is not."""
     secret = roles.new_token_secret()
     try:
         r = perform(conn, "machine.register", {"code_sha256": roles.code_sha256(code),
-                                               "token_sha256": roles.secret_sha256(secret), "hostname": hostname},
+                                               "token_sha256": roles.secret_sha256(secret), "hostname": hostname,
+                                               **({} if label is None else {"label": label})},
                     actor=actor, via=via)
     except RegistrationRefused:
         def record() -> None:
@@ -3859,8 +3879,8 @@ def machine_seen(conn: sqlite3.Connection, ctx: Ctx, token_id: Any, hostname: An
     if not clone:
         return Result({"alerts": []}, row["id"], None, None, changed=False)
     user = store._user_row(conn, row["user_id"])
-    alert = {"subject": f"machine token of {user['label']} (user {user['id']}) seen from a second host",
-             "body": f"Token #{row['id']} was issued for {row['hostname_at_issue']}, last seen from {base_host}, "
+    alert = {"subject": f"machine token of user {user['id']} seen from a second host",   # no label: see _owner_alert
+             "body": f"Machine {user['label']}: token #{row['id']} was issued for {row['hostname_at_issue']}, last seen from {base_host}, "
                      f"now from {host} within 24 hours: a cloned machine shares its token until re-issued "
                      f"(afclaude machine register with a new code). Revoke it with: tasks.py machine revoke {user['id']}."}
     return Result({"alerts": [alert]}, row["id"], {"last_hostname": base_host}, {"last_hostname": host, "alert": True},

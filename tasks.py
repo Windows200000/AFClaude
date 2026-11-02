@@ -108,9 +108,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py notice list [--all]           the notices still shown (--all: the dismissed ones too)
     tasks.py notice dismiss ID             dismiss one (the owner; the dashboard's Dismiss button)
     tasks.py machine code [--user ID] [--ttl MINUTES]   a one-time registration code for a machine user
-                                           (phase 5a, D-195): shown once, valid 15 minutes, single use;
+                                           (phase 5a, D-195): shown once, valid 15 minutes (--ttl up to 60), single use;
                                            --user: re-issue the token of that machine
-    tasks.py machine register CODE [--hostname H] [--file F | --print]   spend a code: a machine user (label =
+    tasks.py machine register CODE [--label L] [--file F | --print]   spend a code: a machine user (label = L or the
                                            hostname, no access until granted) and its token, written to the
                                            token file (mode 0600; --file F: elsewhere, --print: show it once
                                            instead; an existing file is kept unless --force)
@@ -385,17 +385,21 @@ def run_machine(conn, args):
                      "on the machine:  python3 tasks.py machine register <code>")
     if mc == "register":
         import socket
-        host = args.hostname or socket.gethostname()
+        host = socket.gethostname()          # always the real one: the clone check compares against it
         path = args.file or MACHINE_FILE
         if not args.print:
             machine_file_free(path, args.force)
-        r = actions.register_machine(conn, args.code, host, actor="cli", via="cli")
+        r = actions.register_machine(conn, args.code, host, actor="cli", via="cli", label=args.label)
         out = {k: v for k, v in r.items() if k != "token"}
         if args.print:
             out["token"] = r["token"]
         else:
-            write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
-                                      "token_id": r["token_id"], "hostname": host})
+            try:
+                write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
+                                          "token_id": r["token_id"], "hostname": host})
+            except OSError as e:     # the code is spent: the token must not be lost with the error
+                raise ValueError(f"the token file could not be written ({e}); the token, shown once: "
+                                 f"{r['token']}") from e
             out["file"] = path
         if args.json:
             return dump(out)
@@ -1388,10 +1392,10 @@ def parser():
     ms = p.add_subparsers(dest="machine_cmd", required=True)
     q = ms.add_parser("code", parents=[js], help="a one-time registration code (shown once, 15 minutes)")
     q.add_argument("--user", type=int, help="re-issue the token of this machine user")
-    q.add_argument("--ttl", type=int, default=15, help="minutes it stays valid (default 15)")
+    q.add_argument("--ttl", type=int, default=15, help="minutes it stays valid (default 15, at most 60)")
     q = ms.add_parser("register", parents=[js], help="spend a code: a machine user and its token")
     q.add_argument("code")
-    q.add_argument("--hostname", help="the machine's label (default: this host's name)")
+    q.add_argument("--label", help="the machine user's name (default: this host's name)")
     where = q.add_mutually_exclusive_group()
     where.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
     where.add_argument("--print", action="store_true", help="show the token once instead of writing a file")
