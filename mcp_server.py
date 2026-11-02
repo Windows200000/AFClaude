@@ -444,6 +444,18 @@ async def afclaude_inbox() -> str:
     return out(res)
 
 
+@tool("Answer a message from the owner's dashboard box (id from the message sent to you): it becomes a thread "
+      "card. needs_input: true only when the answer asks the owner something or waits for their decision "
+      "(it then shows under Needs your input).")
+async def afclaude_reply(id: int, answer: str, needs_input: bool = False) -> str:
+    conn = db()
+    try:
+        m = act(conn, "inbox.reply", message_id=id, answer=answer, needs_input=needs_input)
+    finally:
+        conn.close()
+    return out({"id": m["id"], "status": m["status"], "needs_input": bool(m["needs_input"])})
+
+
 @tool("Decide a stalled Claude Code session (id or unique prefix): continue (resume it in the nightly window), "
       "ignore, or clear the decision. Applies to its current stall only; use afclaude_rule for standing rules.")
 async def afclaude_decide_session(session: str, decision: Literal["continue", "ignore", "clear"],

@@ -40,7 +40,7 @@ CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
                   "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions",
-                  "afclaude_notice", "afclaude_request", "afclaude_prompts"}
+                  "afclaude_notice", "afclaude_request", "afclaude_prompts", "afclaude_reply"}
 
 
 def run(coro):
@@ -482,6 +482,36 @@ class Docs(Env):
 
 
 class Notices(Env):
+    def test_reply_tool(self):
+        """afclaude_reply (phase 4b Q4, D-324): a task-manager answers a quickview message through MCP; the answer
+        is a thread card, needs_input sends it to "Needs your input", a follow-up and its reply stay in the thread."""
+        import inbox
+        c = self.conn()
+        try:
+            store.add_project(c, "Proj", None, self.work)
+            m = store.add_inbox(c, "Is the build green?", SID, "owner")
+            c.commit()
+            r = run(ms.afclaude_reply(m["id"], "Yes, green."))
+            self.assertEqual(r, {"id": m["id"], "status": "answered", "needs_input": False})
+            v = inbox.view(self.conn())
+            self.assertEqual([(t["id"], t["needs_input"]) for t in v["threads"]], [(m["id"], False)])
+            f = actions.perform(c, "inbox.post", {"text": "And the docs?", "parent": m["id"]}, actor="owner",
+                                via="dashboard")
+            c.commit()
+            r = run(ms.afclaude_reply(f["id"], "Which docs?", needs_input=True))
+            self.assertEqual((r["id"], r["needs_input"]), (f["id"], True))
+            v = inbox.view(self.conn())
+            self.assertEqual([(t["id"], len(t["rows"]), t["needs_input"]) for t in v["threads"]],
+                             [(m["id"], 2, True)])
+            audit = store.audit_log(c, 5, "inbox")
+            self.assertEqual(audit[0]["actor"], f"mcp:{CALLER}")
+            with self.assertRaisesRegex(ToolError, "no inbox message #999"):
+                asyncio.run(ms.afclaude_reply(999, "x"))
+            with self.assertRaisesRegex(ToolError, "answer must not be empty"):
+                asyncio.run(ms.afclaude_reply(m["id"], "  "))
+        finally:
+            c.close()
+
     def test_notice_tool(self):
         """afclaude_notice (D-306): post (audited as the calling session) and list the owner's notices."""
         c = self.conn()
@@ -747,8 +777,9 @@ class Stdio(unittest.TestCase):
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
         # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
-        # then afclaude_ask's options (phase 4b Q3 W1: 17800), 18500 for the hand-off's drop_working_notes (was 17987)
-        self.assertLess(size, 18500, f"tool list is {size} bytes")
+        # then afclaude_ask's options (phase 4b Q3 W1: 17800), 18500 for the hand-off's drop_working_notes (was 17987),
+        # 19000 for afclaude_reply (phase 4b Q4: about 400 bytes)
+        self.assertLess(size, 19000, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))
