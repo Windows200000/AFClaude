@@ -504,7 +504,7 @@ def poke_auth(cwd=HERE, now=None, verdict=None):
         auth_expired("token-refresh request", found, now)
         if verdict is not None:
             verdict["found"] = found
-    elif r.returncode == 0:
+    elif claude_auth.succeeded(r.returncode, r.stdout or ""):
         auth_ok("token-refresh request", now)
     return f"rc={r.returncode} {res}"
 
@@ -546,7 +546,7 @@ def refresh_usage_checked(cwd=HERE, now=None):
         rc, out = refresh_usage(cwd)
         u = read_usage_cache()
         res.update(rc=rc, out=out, usage=u, ok=_refreshed(u, before, max(now, datetime.now(UTC))))
-        res["auth"] = found or claude_auth.detect(rc, out, local=True) or res["auth"]
+        res["auth"] = found or claude_auth.detect(rc, out, local=True)   # the latest verdicts only
     if res["ok"]:
         res["auth"] = None
         auth_ok("/usage", now)

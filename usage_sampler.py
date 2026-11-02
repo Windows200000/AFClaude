@@ -413,16 +413,20 @@ def haiku_judgement(st, t):
                 row["error"], row["auth"] = f"{claude_auth.SHORT}: {found}", found
             else:
                 out = json.loads(r.stdout)
-                if r.returncode != 0 or out.get("is_error"):   # D-235: a failed call is no answer
-                    raise ValueError(f"claude -p failed (rc={r.returncode}): {str(out.get('result') or r.stderr)[:200]}")
-                ka.auth_ok("Haiku usage judgement", t)
-                row["cost_usd"] = out.get("total_cost_usd")
-                row["usage"] = out.get("usage")
                 res = out.get("result", "")
-                m = re.search(r"\{.*\}", res, re.S)
-                row["answer"] = json.loads(m.group(0)) if m else None
-                if not m:
-                    row["raw"] = res[:500]
+                failed = r.returncode != 0 or bool(out.get("is_error"))
+                limit = next((x for x in (res, r.stderr) if failed and isinstance(x, str) and ka.LIMIT_TEXT_RE.search(x)), None)
+                if claude_auth.succeeded(r.returncode, r.stdout):
+                    ka.auth_ok("Haiku usage judgement", t)
+                if limit:   # refused at the usage limit (as the triage reads it): nothing to judge now, no error
+                    row["skipped"] = f"usage limit: {limit.strip()[:200]}"
+                else:       # (any other failed call keeps its old shape: a raw row, no error)
+                    row["cost_usd"] = out.get("total_cost_usd")
+                    row["usage"] = out.get("usage")
+                    m = re.search(r"\{.*\}", res, re.S)
+                    row["answer"] = json.loads(m.group(0)) if m else None
+                    if not m:
+                        row["raw"] = res[:500]
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as e:
             row["error"] = f"{type(e).__name__}: {e}"[:300]     # kept in the row; main raises it
         meta["last_haiku_at"] = t.isoformat()

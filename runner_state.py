@@ -145,9 +145,12 @@ class StateDoc(dict[str, Any]):
 _LOAD_FAILED: dict[str, str] = {}   # component -> why its last load() couldn't read the DB (this process)
 
 
-def load_failed() -> Optional[str]:
+def load_failed(component: Optional[str] = None) -> Optional[str]:
     """Why the last state load of this process couldn't read the DB (until a load reads it
-    again), None if it could: the runners treat it like a broken DB (no autonomous start)."""
+    again), None if it could: the runners treat it like a broken DB (no autonomous start).
+    With `component`: only that component's failure."""
+    if component is not None:
+        return _LOAD_FAILED.get(component)
     return next(iter(_LOAD_FAILED.values()), None)
 
 

@@ -188,7 +188,7 @@ def triage_call(text: str) -> dict[str, Any]:
     except inbox.TriageLoginExpired as e:
         ka.auth_expired("inbox triage", e.found)   # D-320: the dashboard shows it
         raise
-    ka.auth_ok("inbox triage")   # the call authenticated (even if its verdict was unusable): clears the state
+    ka.auth_ok("inbox triage")   # parse_triage took the answer: the call worked, so the login state is cleared
     return t
 
 

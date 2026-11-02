@@ -84,6 +84,24 @@ class Detect(unittest.TestCase):
         self.assertIsNone(claude_auth.detect(1, "", ""))
         self.assertIsNone(claude_auth.detect(1, "not json at all", "boom"))
 
+    def test_unrelated_authentication_and_session_failures_are_not_the_login(self):
+        # an MCP server's own auth problem (the call timed out, rc=124), a Remote Control session, a stray /login
+        for text in ("MCP server foo: Authentication required", "Remote Control session expired",
+                     "MCP server foo: authentication failed", "Not logged in to the registry"):
+            self.assertIsNone(claude_auth.detect(124, "", text), text)
+            self.assertIsNone(claude_auth.detect(1, result_json(text), ""), text)
+        # stderr is searched only when there is no JSON result at all
+        self.assertIsNone(claude_auth.detect(1, result_json("API Error: 529 overloaded_error"), INVALID_KEY))
+        self.assertIsNone(claude_auth.detect(1, OK_JSON, NOT_LOGGED_IN))
+
+    def test_succeeded_needs_a_clean_result_and_exit_zero(self):
+        self.assertTrue(claude_auth.succeeded(0, OK_JSON))
+        self.assertFalse(claude_auth.succeeded(1, OK_JSON))
+        self.assertFalse(claude_auth.succeeded(0, EXPIRED_JSON))
+        self.assertFalse(claude_auth.succeeded(0, result_json("API Error: 529 overloaded_error")))
+        self.assertFalse(claude_auth.succeeded(0, "not json"))
+        self.assertFalse(claude_auth.succeeded(0, ""))
+
     def test_a_successful_answer_is_never_searched(self):
         talk = json.dumps({"type": "result", "is_error": False, "result": "If it says Not logged in, please run /login."})
         self.assertIsNone(claude_auth.detect(0, talk, ""))
@@ -248,6 +266,21 @@ class UsageRead(StateBase):
         r = ka.refresh_usage_checked(now=self.now)
         self.assertEqual(r["auth"], NOT_LOGGED_IN)
 
+    def test_an_old_verdict_does_not_outlive_a_poke_that_worked(self):
+        outs = iter([(1, NOT_LOGGED_IN), (0, "Total cost:            $0.0000")])   # /usage 1 names the login, /usage 2 does not
+        self.p(ka, "refresh_usage", lambda cwd=ka.HERE: next(outs))
+        self.p(host, "run_on_host", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=OK_JSON, stderr=""))
+        r = ka.refresh_usage_checked(now=self.now)
+        self.assertFalse(r["ok"])
+        self.assertIsNone(r["auth"])                                   # generic failure, not "login expired"
+        self.assertEqual(ka.usage_failure_subject(r), ka.USAGE_FAILED)
+
+    def test_a_throttled_poke_after_the_state_was_cleared_is_generic(self):
+        ka._save_usage_state({"poke_at": self.now.isoformat()})        # a poke just ran; the state is not expired
+        r = ka.refresh_usage_checked(now=self.now + timedelta(minutes=1))
+        self.assertIn("skipped", r["poke"])
+        self.assertIsNone(r["auth"])
+
     def test_the_refresh_keeps_stderr(self):
         self.p(host, "run_on_host", lambda argv, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=NOT_LOGGED_IN))
         self.p(ka, "refresh_usage", type(self).real_refresh)
@@ -278,6 +311,7 @@ class HaikuJudgement(StateBase):
 
     def run_with(self, result):
         self.p(host, "run_on_host", lambda argv, **k: result)
+        self.st["sessions"]["abc"].pop("last_haiku_at", None)      # judge again
         return us.haiku_judgement(self.st, self.t)
 
     def test_an_expired_login_is_an_error_row_not_a_raw_answer(self):
@@ -289,16 +323,33 @@ class HaikuJudgement(StateBase):
 
     def test_a_good_answer_clears_the_state(self):
         claude_auth.record_expired("usage read", "old", ka.USAGE_STATE_FILE)
-        out = json.dumps({"is_error": False, "result": '{"load": "low"}', "total_cost_usd": 0.001, "usage": {}})
+        out = json.dumps({"type": "result", "is_error": False, "result": '{"load": "low"}',
+                          "total_cost_usd": 0.001, "usage": {}})
         rows = self.run_with(types.SimpleNamespace(returncode=0, stdout=out, stderr=""))
         self.assertNotIn("error", rows[0])
         self.assertEqual(rows[0]["answer"], {"load": "low"})
         self.assertFalse(claude_auth.is_expired(ka.USAGE_STATE_FILE))
 
-    def test_another_failed_call_is_an_error_row_too(self):
-        rows = self.run_with(types.SimpleNamespace(returncode=1, stdout=result_json(NOT_AUTH[3]), stderr=""))
-        self.assertIn("claude -p failed", rows[0]["error"])
-        self.assertNotIn("auth", rows[0])
+    def no_pause(self, rows, key=None):
+        """Nothing the sampler would fail-stop on: no row carries an error; the login state is untouched."""
+        self.assertEqual([r for r in rows if r.get("error")], [])
+        self.assertFalse(claude_auth.is_expired(ka.USAGE_STATE_FILE))
+
+    def test_a_usage_limit_refusal_is_a_skipped_row(self):
+        result = "You've hit your session limit \u00b7 resets 6pm (Europe/Berlin)"
+        for rc, out, err in ((1, result_json(result), ""), (1, "{}", result)):
+            claude_auth.record_ok("x", ka.USAGE_STATE_FILE)
+            rows = self.run_with(types.SimpleNamespace(returncode=rc, stdout=out, stderr=err))
+            self.no_pause(rows)
+            self.assertIn("usage limit", rows[0]["skipped"])
+            self.assertNotIn("answer", rows[0])
+
+    def test_a_transient_api_error_keeps_the_old_raw_row(self):
+        for text in ("API Error: 529 overloaded_error", NOT_AUTH[0]):   # overloaded; "another process is refreshing it"
+            rows = self.run_with(types.SimpleNamespace(returncode=1, stdout=result_json(text), stderr=""))
+            self.no_pause(rows)
+            self.assertEqual(rows[0]["raw"], text[:500])
+            self.assertNotIn("auth", rows[0])
 
 
 class Triage(unittest.TestCase):
@@ -365,6 +416,20 @@ class QuickviewBlock(StateBase):
         self.assertIn("14:15", b["since_berlin"])                     # shown in Berlin time
         claude_auth.record_ok("usage read", ka.USAGE_STATE_FILE)
         self.assertFalse(qv.auth_block()["expired"])
+
+    def test_unknown_only_for_the_auth_state_own_failed_load(self):
+        import runner_state
+
+        def failing(component):
+            def state(path=None):
+                runner_state._LOAD_FAILED[component] = "boom"
+                return {}
+            return state
+        self.addCleanup(runner_state._LOAD_FAILED.clear)
+        self.p(claude_auth, "state", failing("sampler"))             # another component's failed load
+        self.assertIsNone(qv.auth_block()["error"])
+        self.p(claude_auth, "state", failing(claude_auth.COMPONENT))
+        self.assertIn("boom", qv.auth_block()["error"])
 
     def test_the_page_renders_it_first(self):
         with open(os.path.join(HERE, "quickview", "AFClaude.html"), encoding="utf-8") as fh:

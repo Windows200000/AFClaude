@@ -45,7 +45,7 @@ def push(text):
     if found:   # D-320: the alert itself still goes to the alerts doc; the dashboard shows the login state
         claude_auth.record_expired("push notification", found)
         return f"push failed: {claude_auth.SHORT} ({found[:120]})"
-    if r.returncode == 0:
+    if claude_auth.succeeded(r.returncode, r.stdout or ""):
         claude_auth.record_ok("push notification")
     for line in r.stdout.splitlines():
         try:

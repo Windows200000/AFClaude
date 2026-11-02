@@ -616,7 +616,7 @@ def auth_block():
     import claude_auth
     import runner_state
     st = claude_auth.state(ka.USAGE_STATE_FILE)
-    err = runner_state.load_failed()
+    err = runner_state.load_failed(claude_auth.COMPONENT)   # this state's own failed load, not another component's
     return {"expired": bool(st.get("expired")), "since_berlin": bstr(ka.parse_ts(st["since"])) if st.get("since") else None,
             "last_berlin": bstr(ka.parse_ts(st["last"])) if st.get("last") else None,
             "source": st.get("source"), "found": st.get("found"), "fix": claude_auth.FIX,

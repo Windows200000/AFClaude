@@ -48,10 +48,12 @@ COMPONENT = "keepalive.usage_refresh"   # the runner state the "auth" key lives 
 KEY = "auth"
 FOUND_MAX = 300
 
+# Anchored to the CLI's own sentences: a bare "Authentication required" (an MCP server's), "session expired" (a
+# Remote Control session's) or "not logged in" (another tool's) is no login problem of the Claude account.
 _AUTH = re.compile(
-    r"please run /login|not logged in|failed to authenticate|authentication[_ ](?:failed|required)"
-    r"|oauth (?:session|(?:access )?token) (?:has )?(?:expired|revoked)|invalid api key"
-    r"|api error: 401|session (?:has )?expired", re.I)
+    r"please run /login|not logged in \u00b7|^\s*failed to authenticate: |^\s*authentication required \u00b7 sign in"
+    r"|\bauthentication_failed\b|oauth session expired|oauth (?:access )?token (?:has )?(?:expired|revoked)"
+    r"|invalid api key|api error: 401", re.I)
 
 
 def _events(stdout: str) -> list[dict[str, Any]]:
@@ -89,9 +91,10 @@ def _message_text(ev: dict[str, Any]) -> str:
 def detect(returncode: int, stdout: str = "", stderr: str = "", local: bool = False) -> Optional[str]:
     """The Claude CLI's own words when this `claude -p` call failed to authenticate (an expired or invalid
     login), else None. Looks only where an error is: an error result (is_error), an assistant/result event
-    whose error is "authentication_failed", or, for a failed call (exit code != 0), stderr and stdout.
-    A successful call's model answer is never searched (it may mention /login). local=True: the call is a
-    local command with no model reply (`-p /usage`), so its whole output counts, whatever the exit code."""
+    whose error is "authentication_failed"; stderr and stdout are searched only when the call printed no
+    JSON result at all (a failed call, exit code != 0). A successful call's model answer is never searched
+    (it may mention /login). local=True: the call is a local command with no model reply (`-p /usage`),
+    so its whole output counts, whatever the exit code."""
     texts: list[str] = []
     failed = returncode != 0
     events = _events(stdout)
@@ -102,15 +105,21 @@ def detect(returncode: int, stdout: str = "", stderr: str = "", local: bool = Fa
             texts.append(str(ev.get("result") or "") + " " + _message_text(ev))
             if is_auth_event:
                 texts.append("authentication_failed")   # the event's error code, when its text names nothing
-    if failed or local:
-        texts.append(stderr or "")
-        if not events or local:
-            texts.append(stdout or "")
+    if local or (failed and not events):
+        texts += [stderr or "", stdout or ""]
     for t in texts:
         m = _AUTH.search(t)
         if m:
             return " ".join(t.split())[:FOUND_MAX]
     return None
+
+
+def succeeded(returncode: int, stdout: str) -> bool:
+    """The call printed a JSON result that is no error and exited 0: it really authenticated and ran
+    (what clears the "login expired" state). Unparseable output proves nothing."""
+    events = _events(stdout)
+    return (returncode == 0 and any(e.get("type") == "result" for e in events)
+            and not any(e.get("is_error") for e in events))
 
 
 def failure_detail(found: str) -> str:
