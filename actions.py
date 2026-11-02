@@ -77,6 +77,7 @@ import prompts  # noqa: E402
 import decisions  # noqa: E402  (pure: the parser and the entry text, phase 4b)
 import owner_words  # noqa: E402  (the owner's stored messages as evidence, phase 4b Q2)
 import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
+import roles  # noqa: E402  (pure: grants, effective roles, the last owner, credentials, phase 5a A1)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -3525,6 +3526,386 @@ def setup_claim_code(conn: sqlite3.Connection, ctx: Ctx, id: Any, kind: Any, use
     if not store.claim_setup_code(conn, cid, now):
         raise store.InvalidTransition("this code has already been used")   # lost the race
     return Result({"id": cid, "kind": k, "user_id": uid}, cid, {"used_at": None}, {"used_at": now})
+
+
+# ---------------------------------------------------------------- users, grants, machine users (phase 5a A1)
+#
+# docs/phase5a_plan.md §3.2, §3.5, §3.6; roles.py holds the rules (pure), store.py the rows. D-149/D-172: owner
+# is a grant, several allowed; D-192: a project's managers grant editor and viewer on it; D-183: the last
+# manual person owner stays; D-195/D-198: a machine user per machine, no access until granted, any role.
+# Nothing here is the permission matrix (A3): the host's own writers (cli, runner, ...) are unrestricted, a
+# `user:<id>` / `machine:<id>` actor is held to roles.check_grant_change. An action that may raise an alert
+# returns it in result["alerts"]: notify.py pushes and writes the alerts doc over another connection and
+# can take minutes, so the caller delivers it after the transaction (deliver_alerts), never inside it.
+
+REGISTER_MAX_FAILURES = 5                       # refused registrations per window before the next one is refused unseen
+REGISTER_WINDOW = timedelta(minutes=15)
+CLONE_WINDOW = timedelta(hours=24)              # a token seen from two hostnames within this alerts (D-198)
+LABEL_MAX = 100
+HOSTNAME_MAX = 128
+
+
+class RegistrationRefused(ValueError):
+    """The registration code is unknown, used or expired (one message for all three: no oracle)."""
+
+
+class RateLimited(ValueError):
+    """Too many refused registrations lately."""
+
+
+def _label(v: Any) -> str:
+    t = store._text(v, "label", required=True)
+    if not t or len(t) > LABEL_MAX or any(ord(c) < 32 for c in t):
+        raise ValueError(f"label must be 1-{LABEL_MAX} printable characters")
+    return t
+
+
+def _hostname(v: Any) -> str:
+    t = store._text(v, "hostname", required=True)
+    if not t or len(t) > HOSTNAME_MAX or any(ord(c) < 33 or ord(c) == 127 for c in t):
+        raise ValueError(f"hostname must be 1-{HOSTNAME_MAX} characters without spaces or control characters")
+    return t
+
+
+def _user(conn: sqlite3.Connection, user_id: Any, kind: str | None = None, active: bool = False) -> store.Row:
+    row = store.get_user(conn, _user_id(user_id))
+    if row is None:
+        raise store.NotFound(f"no user {user_id}")
+    if kind is not None and row["kind"] != kind:
+        raise ValueError(f"user {row['id']} is a {row['kind']} user, not a {kind} user")
+    if active and row["revoked_at"] is not None:
+        raise store.InvalidTransition(f"user {row['id']} is revoked")
+    return row
+
+
+def _grant_rows(rows: Iterable[Mapping[str, Any]]) -> list[roles.GrantRow]:
+    return [roles.GrantRow(r["user_id"], r["scope"], r["project_id"], r["level"], r["source"]) for r in rows]
+
+
+def _owner_state(conn: sqlite3.Connection) -> frozenset[int]:
+    """The manual person owners now (what D-183 protects)."""
+    users = [roles.UserRow(u["id"], u["kind"], u["revoked_at"] is not None) for u in store.list_users(conn)]
+    return roles.manual_person_owner_ids(users, _grant_rows(store.list_grants(conn)))
+
+
+def _guard_last_owner(conn: sqlite3.Connection, before: frozenset[int]) -> None:
+    """Call after the change, inside the transaction: a refusal rolls it back."""
+    try:
+        roles.check_last_owner(before, _owner_state(conn))
+    except roles.Denied as e:
+        raise Forbidden(str(e)) from None
+
+
+def _check_grantor(conn: sqlite3.Connection, ctx: Ctx, scope: str, project_id: int | None,
+                   new_level: str | None, old_level: str | None) -> None:
+    """A `user:<id>` / `machine:<id>` actor must be allowed to make this change (D-192); the host's own
+    writers (cli, owner, runner, ...) are not held to it, as before the matrix (A3)."""
+    who = roles.parse_actor(ctx.actor)
+    if who.user_id is None:
+        return
+    u = store.get_user(conn, who.user_id)
+    if u is None or u["revoked_at"] is not None:
+        raise Forbidden(f"{ctx.actor} is not an active user")
+    try:
+        roles.check_grant_change(_grant_rows(store.list_grants(conn, who.user_id)), scope, project_id,
+                                 new_level, old_level)
+    except roles.Denied as e:
+        raise Forbidden(str(e)) from None
+
+
+def _grant_target(conn: sqlite3.Connection, scope: Any, project: Any, level: Any,
+                  ) -> tuple[str, store.Row | None, str | None]:
+    sc = store._enum(scope, roles.SCOPES, "scope")
+    proj = _project(conn, project) if project is not None else None
+    lv = None if level is None else store._enum(level, roles.LEVELS, "level")
+    roles.check_grant_shape(sc, None if proj is None else proj["id"], lv, roles.MANUAL)
+    return sc, proj, lv
+
+
+def _grant_text(conn: sqlite3.Connection, g: Mapping[str, Any]) -> str:
+    if g["scope"] == "owner":
+        return "owner"
+    p = store.get_project(conn, g["project_id"])
+    return f"{g['level']} of {p['name'] if p else g['project_id']}"
+
+
+def _owner_alert(conn: sqlite3.Connection, ctx: Ctx, user: Mapping[str, Any], how: str) -> dict[str, str]:
+    return {"subject": f"owner role given to {user['kind']} user {user['id']} ({user['label']})",
+            "body": f"{ctx.actor} {how}. An owner can do everything, including granting it on (D-172)."}
+
+
+@action("grant.set", "grant", owner_only=True)
+def grant_set(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, scope: Any, project: Any = None, level: Any = None,
+              version: Any = None) -> Result:
+    """Give a user the owner role (`scope` owner: no project, no level) or a level on one project (viewer |
+    editor | manager), manually; an existing manual grant for the same thing changes its level. Owners
+    grant anything; a project's managers grant editor and viewer on it (roles.check_grant_change).
+    Making an owner returns an alert (result["alerts"])."""
+    user = _user(conn, user_id, active=True)
+    sc, proj, lv = _grant_target(conn, scope, project, level)
+    pid = None if proj is None else int(proj["id"])
+    old = store.get_grant(conn, user["id"], sc, pid, roles.MANUAL)
+    if old is not None:
+        _check_version(old, version, f"grant #{old['id']}")
+    _check_grantor(conn, ctx, sc, pid, lv, None if old is None else old["level"])
+    if old is None:
+        row = store.add_grant(conn, user["id"], sc, pid, lv, roles.MANUAL, ctx.actor)
+    elif old["level"] == lv:
+        return Result({**old, "unchanged": True}, old["id"], dict(old), dict(old), changed=False)
+    else:
+        row = store.set_grant_level(conn, old["id"], str(lv))
+    alerts = [_owner_alert(conn, ctx, user, "granted it")] if sc == "owner" and old is None else []
+    out = {**row, "alerts": alerts}
+    return Result(out, row["id"], None if old is None else dict(old),
+                  {**row, "user": user["label"], "grant": _grant_text(conn, row)})
+
+
+@action("grant.remove", "grant", owner_only=True)
+def grant_remove(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, scope: Any, project: Any = None,
+                 version: Any = None) -> Result:
+    """Take a manual grant away (the owner role, or the user's grant on one project). A grant that
+    comes from an OIDC group isn't removed here: it follows the group map at the next login. Refused when
+    it would leave no manual person owner (D-183). Managers revoke editor and viewer on their project only."""
+    user = _user(conn, user_id)
+    sc, proj, _ = _grant_target(conn, scope, project, None if scope == "owner" else "viewer")
+    pid = None if proj is None else int(proj["id"])
+    old = store.get_grant(conn, user["id"], sc, pid, roles.MANUAL)
+    if old is None:
+        others = [g for g in store.list_grants(conn, user["id"])
+                  if g["scope"] == sc and g["project_id"] == pid]
+        hint = f" (it comes from {others[0]['source']}: change the group map)" if others else ""
+        raise store.NotFound(f"user {user['id']} has no manual {sc} grant there{hint}")
+    _check_version(old, version, f"grant #{old['id']}")
+    _check_grantor(conn, ctx, sc, pid, None, old["level"])
+    before_owners = _owner_state(conn)
+    store.delete_grant(conn, old["id"])
+    _guard_last_owner(conn, before_owners)
+    return Result({**old, "removed": True}, old["id"], dict(old), {"removed": True})
+
+
+@action("grant.sync_groups", "grant", owner_only=True)
+def grant_sync_groups(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, groups: Any, provider: Any,
+                      group_map: Any) -> Result:
+    """The OIDC login's group claims -> the user's `oidc:<group>` grants (6b calls this at every login):
+    adds the grants the map gives the groups, removes the user's `oidc:` grants it no longer gives, never
+    touches a manual one. `group_map` is the auth_oidc_group_map setting's value (6b adds the setting;
+    dashboard.auth.oidc_groups.parse_group_map checks it); a project it names that doesn't exist is an
+    error, nothing applied (D-235). Group-derived owners don't count for the last-owner guard (D-183), so
+    none is needed here. An owner newly granted returns an alert (result["alerts"])."""
+    from dashboard.auth import oidc_groups as og
+    user = _user(conn, user_id, kind="person", active=True)
+    prov = store._text(provider, "provider", required=True)
+    if not isinstance(groups, list) or not all(isinstance(g, str) for g in groups):
+        raise ValueError("groups must be a list of strings")
+    entries = og.parse_group_map(group_map)
+    names_to_ids: dict[str, int] = {}
+    for e in entries:
+        if e.project is not None and e.project not in names_to_ids:
+            names_to_ids[e.project] = int(_project(conn, e.project)["id"])   # NotFound names the project
+    row_of: dict[og.Grant, store.Row] = {}
+    for stored in store.list_grants(conn, user["id"]):
+        if stored["source"].startswith(roles.OIDC_PREFIX):
+            name = None if stored["project_id"] is None else store._project_row(conn, stored["project_id"])["name"]
+            row_of[og.Grant(stored["scope"], name, stored["level"], stored["source"])] = stored
+    plan = roles.plan_group_sync(list(row_of), groups, entries)
+    for gone in plan.remove:                     # first: a level change is a remove and an add of one key
+        store.delete_grant(conn, row_of[gone]["id"])
+    for new in plan.add:
+        store.add_grant(conn, user["id"], new.scope, None if new.project is None else names_to_ids[new.project],
+                        new.level, new.source, ctx.actor)
+    def fmt(g: og.Grant) -> dict[str, Any]:
+        return {"scope": g.scope, "project": g.project, "level": g.level, "source": g.source}
+    added, removed = sorted((fmt(g) for g in plan.add), key=str), sorted((fmt(g) for g in plan.remove), key=str)
+    alerts = [_owner_alert(conn, ctx, user, f"derived it from the {prov} group claim")] if plan.owner_granted else []
+    return Result({"user_id": user["id"], "added": added, "removed": removed, "alerts": alerts}, user["id"],
+                  {"removed": removed}, {"added": added, "provider": prov},
+                  changed=bool(added or removed))
+
+
+def _rename(conn: sqlite3.Connection, user: store.Row, label: Any, version: Any) -> Result:
+    new = _label(label)
+    _check_version(user, version, f"user {user['id']}")
+    after = store.rename_user(conn, user["id"], new)
+    return Result(after, user["id"], user, after)
+
+
+def _revoke(conn: sqlite3.Connection, user: store.Row, version: Any) -> Result:
+    """Revoke a user: no access any more (its grants stay as history, effective roles ignore a revoked user),
+    every token of a machine user revoked, every open browser session of a person ended. Refused when it
+    would leave no manual person owner (D-183). Revoking a revoked user changes nothing."""
+    _check_version(user, version, f"user {user['id']}")
+    if user["revoked_at"] is not None:
+        return Result({**user, "unchanged": True}, user["id"], user, user, changed=False)
+    before_owners = _owner_state(conn)
+    store.revoke_user_row(conn, user["id"])
+    tokens = store.revoke_machine_tokens(conn, user["id"]) if user["kind"] == "machine" else []
+    ended = [r["id"] for r in store.open_auth_sessions(conn, user["id"])]
+    for sid in ended:
+        store.end_auth_session(conn, sid, "revoked")
+    _guard_last_owner(conn, before_owners)
+    after = store._user_row(conn, user["id"])
+    return Result({**after, "revoked_tokens": tokens, "ended_sessions": ended}, user["id"], user,
+                  {**after, "revoked_tokens": tokens, "ended_sessions": ended})
+
+
+@action("user.rename", "user", owner_only=True)
+def user_rename(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, label: Any, version: Any = None) -> Result:
+    return _rename(conn, _user(conn, user_id), label, version)
+
+
+@action("user.revoke", "user", owner_only=True)
+def user_revoke(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, version: Any = None) -> Result:
+    return _revoke(conn, _user(conn, user_id), version)
+
+
+@action("machine.rename", "user", owner_only=True)
+def machine_rename(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, label: Any, version: Any = None) -> Result:
+    return _rename(conn, _user(conn, user_id, kind="machine"), label, version)
+
+
+@action("machine.revoke", "user", owner_only=True)
+def machine_revoke(conn: sqlite3.Connection, ctx: Ctx, user_id: Any, version: Any = None) -> Result:
+    return _revoke(conn, _user(conn, user_id, kind="machine"), version)
+
+
+@action("machine.code", "machine_registration", owner_only=True)
+def machine_code(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, user_id: Any = None,
+                 ttl_minutes: Any = roles.CODE_TTL_MINUTES) -> Result:
+    """A one-time registration code, already hashed by the caller (roles.new_registration_code() makes it,
+    the caller shows it once; the raw code never reaches the audit log or an idempotency record). Valid
+    for ttl_minutes (15), single use. user_id: a re-issue for that machine (its other open codes are
+    superseded); none: a new machine. -> {id, user_id, expires_at}."""
+    h = _sha256_hex(code_sha256, "code_sha256")
+    if isinstance(ttl_minutes, bool) or not isinstance(ttl_minutes, int) or not 1 <= ttl_minutes <= 24 * 60:
+        raise ValueError("ttl_minutes must be a whole number from 1 to 1440")
+    uid = None if user_id is None else int(_user(conn, user_id, kind="machine", active=True)["id"])
+    now = store._utcnow()
+    if uid is not None:
+        conn.execute("UPDATE machine_registrations SET used_at=? WHERE user_id=? AND used_at IS NULL",
+                     (store.iso_ms(now), uid))
+    expires = store.iso_ms(now + timedelta(minutes=ttl_minutes))
+    rid = store.add_machine_registration(conn, h, uid, ctx.actor, expires)
+    return Result({"id": rid, "user_id": uid, "expires_at": expires}, rid, None,
+                  {"user_id": uid, "expires_at": expires})
+
+
+@action("machine.register", "user")
+def machine_register(conn: sqlite3.Connection, ctx: Ctx, code_sha256: Any, token_sha256: Any,
+                     hostname: Any) -> Result:
+    """Spend a registration code and issue a machine token: no principal, the code is the credential (use
+    register_machine(), which makes the token and records a refusal for the rate limit). A new machine
+    gets a user (label = hostname) with no grants (D-195); a re-issue (the code was minted for a machine)
+    revokes that machine's old tokens in the same transaction. Only the sha256 of the token's random part
+    arrives here and is stored. Refused unseen after REGISTER_MAX_FAILURES refusals in REGISTER_WINDOW.
+    -> {user_id, token_id, label, reissued, revoked_tokens}: the caller joins token_id and its secret
+    (roles.format_token)."""
+    code_h, tok_h, host = _sha256_hex(code_sha256, "code_sha256"), _sha256_hex(token_sha256, "token_sha256"), _hostname(hostname)
+    since = store.iso_ms(store._utcnow() - REGISTER_WINDOW)
+    if store.count_audit_since(conn, "machine.register_failed", since) >= REGISTER_MAX_FAILURES:
+        raise RateLimited(f"too many refused registrations: wait {int(REGISTER_WINDOW.total_seconds() // 60)} minutes")
+    reg = store.get_machine_registration(conn, code_h)
+    now = store.now_iso()
+    if reg is None or not store.claim_machine_registration(conn, reg["id"], now):
+        raise RegistrationRefused("the registration code is not valid (unknown, already used or expired)")
+    revoked: list[int] = []
+    if reg["user_id"] is None:
+        user = store.add_user(conn, "machine", host, reg["created_by"])
+    else:
+        user = _user(conn, reg["user_id"], kind="machine", active=True)
+        revoked = store.revoke_machine_tokens(conn, user["id"])
+    tid = store.add_machine_token(conn, user["id"], tok_h, user["label"], host)
+    out = {"user_id": user["id"], "token_id": tid, "label": user["label"], "reissued": reg["user_id"] is not None,
+           "revoked_tokens": revoked}
+    return Result(out, user["id"], None, {**out, "hostname": host, "registration": reg["id"]})
+
+
+def register_machine(conn: sqlite3.Connection, code: str, hostname: str, *, actor: str, via: str) -> dict[str, Any]:
+    """The registration as callers use it: makes the token's secret, performs machine.register and returns
+    its result plus the raw `token` (shown once by the caller, never stored). A refused code is recorded
+    (machine.register_failed, no code in it) for the rate limit; a rate-limited attempt is not."""
+    secret = roles.new_token_secret()
+    try:
+        r = perform(conn, "machine.register", {"code_sha256": roles.code_sha256(code),
+                                               "token_sha256": roles.secret_sha256(secret), "hostname": hostname},
+                    actor=actor, via=via)
+    except RegistrationRefused:
+        def record() -> None:
+            with store.transaction(conn):
+                store.add_audit(conn, actor, via, "machine.register_failed", "machine_registration", None, None,
+                                {"hostname": str(hostname)[:HOSTNAME_MAX]})
+        store.retrying(record, conn)
+        raise
+    return {**r, "token": roles.format_token(r["token_id"], secret)}
+
+
+@action("machine.seen", "machine_token")
+def machine_seen(conn: sqlite3.Connection, ctx: Ctx, token_id: Any, hostname: Any = None,
+                 transport: Any = None) -> Result:
+    """A token was used: its last_seen_* record (no audit row, as auth_sessions.last_seen_at), and the
+    clone check (D-198): seen from another hostname than last time (or than it was issued for) within 24 h
+    returns an alert (result["alerts"], at most one a day per token) and writes an audit row."""
+    row = store.get_machine_token(conn, int(token_id))
+    if row is None or row["revoked_at"] is not None:
+        raise store.NotFound("no active machine token")
+    host = None if hostname is None else _hostname(hostname)
+    tr = None if transport is None else store._enum(transport, ("stdio", "http"), "transport")
+    now = store._utcnow()
+    base_host = row["last_hostname"] or row["hostname_at_issue"]
+    base_time = _when(row["last_seen_at"] or row["created_at"])
+    alerted = row["clone_alert_at"] is not None and now - _when(row["clone_alert_at"]) < CLONE_WINDOW
+    clone = (host is not None and base_host is not None and host.casefold() != base_host.casefold()
+             and now - base_time < CLONE_WINDOW and not alerted)
+    store.record_machine_seen(conn, row["id"], host or row["last_hostname"], tr or row["last_transport"], alerted=clone)
+    if not clone:
+        return Result({"alerts": []}, row["id"], None, None, changed=False)
+    user = store._user_row(conn, row["user_id"])
+    alert = {"subject": f"machine token of {user['label']} (user {user['id']}) seen from a second host",
+             "body": f"Token #{row['id']} was issued for {row['hostname_at_issue']}, last seen from {base_host}, "
+                     f"now from {host} within 24 hours: a cloned machine shares its token until re-issued "
+                     f"(afclaude machine register with a new code). Revoke it with: tasks.py machine revoke {user['id']}."}
+    return Result({"alerts": [alert]}, row["id"], {"last_hostname": base_host}, {"last_hostname": host, "alert": True},
+                  changed=True)
+
+
+TOUCH_MIN_INTERVAL = TOUCH_EVERY                 # a token's use is recorded at most once a minute (same host)
+
+
+def authenticate_machine(conn: sqlite3.Connection, token: str, hostname: str | None = None,
+                         transport: str | None = None, *, actor: str = "cli", via: str = "cli",
+                         notify: Callable[[str, str], Any] | None = None) -> dict[str, Any] | None:
+    """The token check the MCP server and 5b's transport use: a well-formed, unrevoked token of an
+    unrevoked machine user -> {user_id, token_id, label}; anything else None (no machine identity). Records the use
+    (machine.seen, at most once a minute unless the hostname changed) and delivers the clone alert, if
+    any, after the write. Constant-time on the secret; the token never reaches a log."""
+    try:
+        token_id, secret = roles.parse_token(token)
+    except ValueError:
+        return None
+    row = store.get_machine_token(conn, token_id)
+    ok = roles.secret_matches(row["token_sha256"] if row else "0" * 64, secret)
+    if row is None or not ok or row["revoked_at"] is not None:
+        return None
+    user = store.get_user(conn, row["user_id"])
+    if user is None or user["revoked_at"] is not None or user["kind"] != "machine":
+        return None
+    last = None if row["last_seen_at"] is None else _when(row["last_seen_at"])
+    same_host = hostname is None or (row["last_hostname"] or "").casefold() == hostname.casefold()
+    if last is None or not same_host or store._utcnow() - last >= TOUCH_MIN_INTERVAL:
+        r = perform(conn, "machine.seen", {"token_id": token_id, "hostname": hostname, "transport": transport},
+                    actor=actor, via=via)
+        deliver_alerts(r, notify)
+    return {"user_id": user["id"], "token_id": token_id, "label": user["label"]}
+
+
+def deliver_alerts(result: Mapping[str, Any] | None, notify: Callable[[str, str], Any] | None = None) -> None:
+    """Send the alerts an action returned (result["alerts"]: {subject, body}) through notify.py, after its
+    transaction. A failing notify raises (D-235): the caller reports it, the write stays."""
+    for a in (result or {}).get("alerts") or []:
+        fn = notify
+        if fn is None:
+            import notify as notify_mod
+            fn = notify_mod.notify
+        fn(a["subject"], a["body"])
 
 
 # ---------------------------------------------------------------- typed messages (goal 12 usage split S2)
