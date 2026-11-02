@@ -634,6 +634,12 @@ class ChildSide(unittest.TestCase):
 
 class Process(unittest.TestCase):
     def setUp(self):
+        # An earlier IsolatedAsyncioTestCase leaves the main thread without a current loop, and
+        # Python 3.9 binds Runner's asyncio.Event() to one at construction (the test builds a Runner).
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.addCleanup(asyncio.set_event_loop, None)
+        self.addCleanup(loop.close)
         testenv.unpause()
         self.addCleanup(testenv.unpause)
         conn = store.connect()
