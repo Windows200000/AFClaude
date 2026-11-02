@@ -383,7 +383,7 @@ def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[
 def question_view(conn: sqlite3.Connection, t: dict[str, Any]) -> dict[str, Any]:
     """An open question as the questions section shows it (D-279: the whole text, D-300: what the owner can
     answer with): `options` (a plain question's answer buttons, free text always allowed), or `decision`
-    for a question about an entry: its id, `kind` (proposal | confirm; None: it needs no decision any more,
+    for a question about an entry: its id, `kind` (proposal; None: it needs no decision any more,
     only the task-manager can close it), the `choices`, the entry's `version` the answer must carry and its
     `summary`."""
     out: dict[str, Any] = {"id": t["id"], "title": t["title"], "text": t["blocked_question"],
@@ -395,7 +395,7 @@ def question_view(conn: sqlite3.Connection, t: dict[str, Any]) -> dict[str, Any]
         return out
     e = store.get_decision_entry(conn, did)
     kind = decisions.question_kind(e) if e is not None else None
-    out["decision"] = {"id": did, "kind": kind, "choices": list(decisions.question_choices(kind)) if kind else [],
+    out["decision"] = {"id": did, "kind": kind, "choices": list(decisions.PROPOSAL_CHOICES) if kind else [],
                        "version": e["version"] if e is not None else None,
                        "summary": e["summary"] if e is not None else None}   # the edit box starts from it
     return out

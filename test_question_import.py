@@ -152,7 +152,7 @@ class Import(Env):
         self.assertEqual({t["project"] for t in qq}, {"Mgr"})
         self.assertEqual([i["chars"] for i in r["items"]], [len(t["blocked_question"]) for t in qq])
         self.assertEqual([i["title"] for i in r["items"]], [t["title"] for t in qq])
-        self.assertEqual(r["counts"], {"items": 2, "proposals": 0, "unconfirmed_entries": 0, "questions": 2})
+        self.assertEqual(r["counts"], {"items": 2, "proposals": 0, "questions": 2})
         self.assertEqual(r["question_ids"], [t["id"] for t in qq])
 
     def test_one_question_per_item_verbatim_section_format(self):
@@ -189,15 +189,14 @@ class Import(Env):
 
     def test_decision_questions_added_once(self):
         p1, p2 = self.add_entry(), self.add_entry()
-        t1 = self.add_entry("active")
+        self.add_entry("active")                             # the task-manager's own, active (D-322): nobody asks
         self.add_entry("active", confirmed=True)             # confirmed: nobody asks
         self.add_entry("active", author="owner")             # the owner's own: nobody asks
         r = self.run_import()
-        self.assertEqual(r["counts"], {"items": 2, "proposals": 2, "unconfirmed_entries": 1, "questions": 5})
+        self.assertEqual(r["counts"], {"items": 2, "proposals": 2, "questions": 4})
         by_decision = {t["decision_id"]: t for t in self.questions("blocked") if t["decision_id"]}
-        self.assertEqual(set(by_decision), {p1, p2, t1})
+        self.assertEqual(set(by_decision), {p1, p2})
         self.assertEqual(by_decision[p1]["options"], ["approve", "edit", "reject"])
-        self.assertEqual(by_decision[t1]["options"], ["confirm", "drop"])
         self.assertEqual(sorted(r["question_ids"]), sorted(t["id"] for t in self.questions("blocked")))
         # the catch-up is idempotent: nothing more is asked for the same entries
         c = self.conn()
@@ -206,7 +205,7 @@ class Import(Env):
                 self.assertEqual(actions.ensure_decision_questions(c, actions.Ctx("cli", "cli")), [])
         finally:
             c.close()
-        self.assertEqual(len(self.questions("blocked")), 5)
+        self.assertEqual(len(self.questions("blocked")), 4)
 
     def test_ensure_asks_only_what_has_no_open_question(self):
         p1 = self.add_entry()
@@ -230,7 +229,7 @@ class Import(Env):
         self.assertEqual(self.dump(), before)
         self.assertEqual(self.backups(), [])
         self.assertTrue(r["dry_run"])
-        self.assertEqual(r["counts"], {"items": 2, "proposals": 1, "unconfirmed_entries": 1, "questions": 4})
+        self.assertEqual(r["counts"], {"items": 2, "proposals": 1, "questions": 3})
         self.assertEqual([i["title"] for i in r["items"]], ["should the first thing happen?", "and the second?"])
         self.assertIsNone(self.meta(qs.SOURCE_META))
         real = self.run_import()                  # the real run says the same
