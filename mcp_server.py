@@ -495,7 +495,8 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
       "a compaction, record a SHORT structured note for your compacted self; it is injected into the continue "
       "message after the compaction. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
       "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); lessons; "
-      "working_notes (exact commands, gotchas); open_question_ids (AFClaude task ids of open questions for the "
+      "working_notes (exact commands, gotchas; carried over, drop_working_notes: numbers of obsolete ones; a "
+      "`tests:` note is required); open_question_ids (AFClaude task ids of open questions for the "
       "user); notes. session: your "
       "full session id (default: this session's, when the client passes it). A newer hand-off replaces the "
       "older one. Returns the stored hand-off's id.")
@@ -504,12 +505,13 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
                            in_flight: Optional[list[str]] = None, lessons: Optional[list[str]] = None,
                            working_notes: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
                            notes: Optional[str] = None, session: Optional[str] = None,
-                           project: Optional[str] = None, ctx: Optional[Context] = None) -> str:
+                           project: Optional[str] = None, drop_working_notes: Optional[list[int]] = None,
+                           ctx: Optional[Context] = None) -> str:
     body: dict[str, Any] = {"summary": summary, "done": done or [], "in_progress": in_progress or [],
                             "next_steps": next_steps or [], "owner_messages": owner_messages or [],
                             "in_flight": in_flight or [], "lessons": lessons or [],
                             "working_notes": working_notes or [], "open_question_ids": open_question_ids or [],
-                            "notes": notes}
+                            "notes": notes, "drop_working_notes": drop_working_notes or []}
     project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
@@ -522,7 +524,8 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
     finally:
         conn.close()
     return out(compact({"id": h["id"], "session_id": h["session_id"], "project_id": h["project_id"],
-                        "created": bt(h["created_at"]), "saved": "HANDOFF SAVED"}))
+                        "created": bt(h["created_at"]), "working_notes": len(h["body"]["working_notes"]),
+                        "saved": "HANDOFF SAVED"}))
 
 
 @tool("A project's docs in the AFClaude DB (D-161): progress, exceptions, alerts (logs: entries are appended), "
