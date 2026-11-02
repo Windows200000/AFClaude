@@ -28,7 +28,7 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 | Q1 (built, branch `4b-q1`) | `slug`, `project_id`, `author`, `origin`, `decision_topics`, `decision_links`, state `proposed`; `decision.add\|edit\|expire\|delete\|confirm\|link\|topics`, `tasks.py decision ...`, MCP `propose` | see Q1 |
 | not yet | proposals as questions, answers on the dashboard, the `OPEN_QUESTIONS.md` import (Q3) | — |
 | questions | `tasks` kind `question` (born blocked, closed by `task.answer`), MCP `afclaude_ask`; `OPEN_QUESTIONS.md` (local) read by the quickview in full (D-279) | two sources |
-| messages | `inbox_messages` (verbatim, triage, hold, delivery, `tasks.py inbox reply`), `inbox_api`/`inbox_worker`, quickview box | built for the AFClaude task-manager; no threads, no MCP reply tool |
+| messages | `inbox_messages` (verbatim, triage, hold, delivery, `tasks.py inbox reply`), `inbox_api`/`inbox_worker`, quickview box | built for the AFClaude task-manager; threads as `parent_id` cards (D-324), MCP `afclaude_reply` (Q4) |
 
 ## 2. What changes
 
@@ -66,9 +66,9 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
 - CLAUDE.md and the manager prompts: "delete resolved items from OPEN_QUESTIONS.md first" becomes "close the question in the DB first" (`tasks.py answer` / MCP).
 
 ### 3.5 Messages (4b)
-- `chat_threads(id, project_id, opened_by, opened_at, last_at, closed_at)` and `inbox_messages.thread_id` (additive). A message opens a thread or appends to the open one; a thread idle for `ui_chat_reset_hours` (built setting, D-178) closes.
-- The task-manager's answer (`tasks.py inbox reply`, new MCP `afclaude_reply`) is a message in the thread; MCP `afclaude_messages` lists the open thread. Triage, hold and delivery stay as built (D-241/D-244/D-252).
-- Waking: an owner's or manager's message is a `task_manager_message` request through 3b's run-now path (D-186); an editor's waits for the next start (only the owner exists until 5a).
+- Threads are built without a `chat_threads` table (D-324, 02.11., replaces D-246's single chat and D-304's "every thread stays until dismissed"): an answered message is a thread card; its follow-ups are `inbox_messages` rows with `parent_id` = the thread's first message (posted from the card, `inbox.post parent=`). The message box itself is always a fresh, empty input. A reply carries `needs_input` (`inbox.reply`, `tasks.py inbox reply --needs-input`, MCP `afclaude_reply`): only such threads show under "Needs your input" until the owner answers in the card or dismisses it; the others stay in the message area, collapsed after `ui_chat_reset_hours` of quiet (D-178: reset = collapse, not a closed row), until dismissed. Each thread shows once.
+- The task-manager's answer is `tasks.py inbox reply ID "…" [--needs-input]` or MCP `afclaude_reply(id, answer, needs_input)` (Q4; the id is the one in the delivered message, so no `afclaude_messages` list tool: it would only repeat what delivery already carries and costs tool-list bytes). Triage, hold and delivery stay as built (D-241/D-244/D-252); a follow-up is triaged like any message.
+- Waking: today every message goes through triage (now / note, D-237/D-252): "now" types it into the task-manager's session at once, no window and no budget (D-186); only the owner exists until 5a, so the role split (a manager's message wakes it as a `task_manager_message` request through 3b's run-now, an editor's waits for the next start) is deferred to 5a, whose `request.may_request` hook and roles it needs.
 
 ## 4. Order
 
@@ -258,10 +258,10 @@ Binding inputs: D-110 (the task-manager/delegation prompt for every project), D-
   - Before step 3: revert the code. The added columns stay, unused.
   - After step 3: `questions.py import --undo` and revert the text commit.
   - If `--undo` refuses (an answer was given): stay on the DB and fix forward. Restoring `<db>.preqimport-*.bak` loses every DB write since and needs the owner's OK.
-- **Accepted limits:** only the temp dashboard (the final dashboard, 6c/7a, builds its view on the same actions and endpoints); only the owner answers (managers and editors, D-196, come with 5a); options are not parsed out of imported texts; plain wording is a prompt rule, not checked; no conversation beyond answer and one reply (Q4).
+- **Accepted limits:** only the temp dashboard (the final dashboard, 6c/7a, builds its view on the same actions and endpoints); only the owner answers (managers and editors, D-196, come with 5a); options are not parsed out of imported texts; plain wording is a prompt rule, not checked; threads (answer and follow-ups) are Q4's.
 - **Done when:** the import has run; every proposal and every unconfirmed task-manager entry waits as a question or is decided; one proposal approved from the quickview with its originals deleted; one plain answer delivered to the task-manager through the inbox; then one week with questions asked and closed only through the DB.
 
-**Q4: message threads.** §3.5. **Tests:** thread open/append/reset; reply via MCP; waking by role (owner now; editors wait, simulated). **Done when:** a quickview message answered through `afclaude_reply`. **Risk:** depends on 3b S5.
+**Q4: message threads.** §3.5. **Built:** thread cards with `parent_id`, `needs_input` and the fresh box came with D-324 (msg-threads, 1496f06); Q4 adds MCP `afclaude_reply` (tool-list bound 19000). **Tests:** `test_inbox` (thread open / follow-up / reply / reset-collapse, needs_input), `test_mcp_server.test_reply_tool` (reply via MCP, needs_input, follow-up in the thread, audit as `mcp:<session>`). **Done when:** a quickview message answered through `afclaude_reply` (live: post a message in the box, answer it from a task-manager session with `afclaude_reply`, see the card). **Deferred to 5a:** waking by role (owner now, manager forced run, editor waits). The old risk (3b S5) is gone: run-now exists, and messages do not use it.
 
 **Q5: retire the files.** `DECISIONS.md` and `OPEN_QUESTIONS.md` are no longer read or written (no export, D-181); they stay on disk untouched for the owner to archive. Q5 also removes:
 - the `file` code paths;
