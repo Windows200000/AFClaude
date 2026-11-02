@@ -158,6 +158,21 @@ class WorkOnNow(Base):
         self.assertEqual(row["status"], "refused")
         self.assertIn("unknown target", self.result(row)["reason"])
 
+    def test_a_deleted_project_is_refused_and_gets_no_task_manager(self):
+        """D-323: a project deleted after the request was made is unknown to the registry (refused); one
+        deleted between a start's pick and the creation raises in create_task_manager, writing nothing."""
+        r = self.request("work_on_now", "gamma")
+        tm = next(t for t in store.task_managers(self.conn) if t["name"] == "gamma")
+        actions.perform(self.conn, "project.delete", {"project": "gamma", "reason": "test"}, actor="cli", via="cli")
+        row, _ = self.decide(r)
+        self.assertEqual(row["status"], "refused")
+        self.assertIn("does not exist", self.result(row)["reason"])
+        with mock.patch.object(ka, "rules_hooked", lambda path: False), \
+                self.assertRaisesRegex(ValueError, "does not exist any more"):
+            ka.create_task_manager(dict(tm), arm=True)
+        self.assertIsNone(store.get_project(self.conn, "gamma"))
+        self.assertEqual(self.fired, [])
+
     def test_failed_no_reply_alerts_and_pauses(self):
         """D-282 (for now; the pre-release step of design §13 makes it alert-only)."""
         self.reply = "no-reply-within-timeout"

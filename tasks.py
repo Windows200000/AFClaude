@@ -15,6 +15,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py project add NAME [-d TEXT] [--path DIR] [--rank N]
     tasks.py project list                  projects by rank (1 = top)
     tasks.py project move P RANK
+    tasks.py project delete P --reason TEXT
     tasks.py project prio P high|medium|low   every open stage of the project at once
     tasks.py project edit P [--name N] [-d TEXT] [--path DIR] [--manager SESSION|""]
     tasks.py project launch P [--model M] [--effort E]   the model / effort of P's task-manager session
@@ -353,6 +354,9 @@ def run_project(conn, args):
         if not f:
             raise ValueError("nothing to change (use --name/-d/--path/--manager)")
         p = act(conn, "project.edit", project=project_ref(args.project), **f)
+    elif pc == "delete":
+        r = act(conn, "project.delete", project=project_ref(args.project), reason=args.reason)
+        return dump(r) if args.json else print(f"project {r['name']} deleted")
     elif pc == "launch":
         if args.model is None and args.effort is None:
             v = manager_launch.view(store._project_row(conn, project_ref(args.project)))
@@ -992,6 +996,9 @@ def parser():
     q.add_argument("--manager", metavar="SESSION",
                    help="managed project: this session works its stages, the dispatcher starts no "
                         "task sessions for it (\"\" = unmanaged)")
+    q = ps.add_parser("delete", parents=[js], help="delete a project with nothing attached (D-323, owner-only)")
+    q.add_argument("project")
+    q.add_argument("--reason", required=True)
     q = ps.add_parser("launch", parents=[js], help="show / set the model and effort of the project's "
                       "task-manager session (D-260, owner-only)")
     q.add_argument("project")

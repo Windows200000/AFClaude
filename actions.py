@@ -472,6 +472,20 @@ def project_priority(conn: sqlite3.Connection, ctx: Ctx, project: Any, priority:
                   changed=bool(r["changed"]))
 
 
+@action("project.delete", "project", owner_only=True)
+def project_delete(conn: sqlite3.Connection, ctx: Ctx, project: Any, reason: Any, version: Any = None) -> Result:
+    """Delete a project that has nothing attached (D-323: the workspace folder never gets a task-manager;
+    a project made by mistake goes). Refused, not cascaded, while it has stages, a task-manager session or
+    any row bound to it (store.project_blockers). Owner-only like every setting; the whole old row and
+    the reason stay in the audit row."""
+    why = store._text(reason, "reason", required=True)
+    before = _project(conn, project)
+    _check_version(before, version, f"project {before['name']!r}")
+    store.delete_project(conn, before["id"])
+    return Result({"deleted": before["id"], "name": before["name"]}, before["id"],
+                  dict(before), {"deleted": True, "reason": why}, changed=True)
+
+
 @action("project.manager_launch", "project", owner_only=True)
 def project_manager_launch(conn: sqlite3.Connection, ctx: Ctx, project: Any, model: Any = None, effort: Any = None,
                            version: Any = None) -> Result:
