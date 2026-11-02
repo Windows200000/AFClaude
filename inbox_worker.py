@@ -316,8 +316,8 @@ def triage_text(conn: Any, m: dict[str, Any]) -> str:
 
 
 def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | None:
-    """Sort one message: "now" without a Haiku call while its task-manager is active (D-252) or when it is
-    a follow-up to a reply that asks the owner (D-324), else the Haiku verdict. A call refused at the account's usage limit holds the message until
+    """Sort one message: "now" without a Haiku call while its task-manager is active (D-252),
+    else the Haiku verdict. A call refused at the account's usage limit holds the message until
     the limit's reset (triage_hold, D-244); after that reset it is sorted once more, and a failure
     then (the limit again too) is an error. -> its verdict, "held" (waiting for the reset), or None
     (failed: the message shows the error)."""
@@ -327,16 +327,12 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
         return "held"
     try:
         active = manager_active(m["session_id"], now)
-        answers = inbox.answers_needs_input(conn, m)
     except Exception as e:   # noqa: BLE001 - an error on the message (D-235/D-244), never a triage instead
         failed(conn, m, "inbox activity check failed", f"{type(e).__name__}: {e}")
         return None
-    if answers:      # D-324: the owner answers what the task-manager asked: never a note, no Haiku call
-        t: dict[str, Any] = {"verdict": "now", "reason": "answer to a reply that waits for the owner: no triage",
+    if active:
+        t: dict[str, Any] = {"verdict": "now", "reason": f"task-manager active ({active}): no triage",
                              "cost_usd": None, "usage": None}
-    elif active:
-        t = {"verdict": "now", "reason": f"task-manager active ({active}): no triage",
-             "cost_usd": None, "usage": None}
     else:
         try:
             t = triage_call(triage_text(conn, m))

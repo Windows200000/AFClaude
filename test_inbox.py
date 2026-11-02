@@ -336,28 +336,6 @@ class Triage(FakeHaiku):
         self.assertIn("Goal for later: a dark mode.", kw["input"])
         self.assertEqual(self.fired, [])
 
-    def test_follow_up_to_a_reply_that_asks_the_owner_is_never_a_note(self):
-        """D-324: a follow-up in a thread whose latest reply needs input gets the verdict "now" without a Haiku call (the
-        fake Haiku would say note); one in a plain thread is triaged as usual."""
-        asked = self.post("Should the box expand?")
-        self.run_("inbox.reply", message_id=asked["id"], answer="A or B?", needs_input=True)
-        plain = self.post("Status?")
-        self.run_("inbox.reply", message_id=plain["id"], answer="Done.")
-        time.sleep(0.01)
-        a = actions.perform(self.conn, "inbox.post", {"text": "B please", "parent": asked["id"]}, actor="owner", via="dashboard")
-        b = actions.perform(self.conn, "inbox.post", {"text": "And the tests?", "parent": plain["id"]}, actor="owner", via="dashboard")
-        out = iw.process(self.conn, verify=lambda *a: None)
-        ra, rb = self.row(a["id"]), self.row(b["id"])
-        self.assertEqual(ra["verdict"], "now")                                # (the delivery is Delivery's test)
-        self.assertIn("no triage", ra["verdict_reason"])
-        self.assertEqual((rb["verdict"], rb["status"]), ("note", "noted"))   # the fake Haiku's verdict
-        self.assertEqual(len(self.calls), 1)                                  # one Haiku call, for the plain thread's
-        self.assertIn("And the tests?", self.calls[0][1]["input"])
-        # a second follow-up after the first one (the thread was answered by the owner): triaged normally again
-        c = actions.perform(self.conn, "inbox.post", {"text": "Also dark mode", "parent": asked["id"]}, actor="owner", via="dashboard")
-        iw.process(self.conn, verify=lambda *a: None)
-        self.assertEqual(self.row(c["id"])["verdict"], "note")
-
     def test_haiku_timeout_is_an_error_and_nothing_is_delivered(self):
         def boom(argv, **kw):
             raise subprocess.TimeoutExpired(argv, 120)
