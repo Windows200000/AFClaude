@@ -88,6 +88,8 @@ details > .md { padding: 8px 0 4px; }
 section.paused { background: #3b0d0d; border: 2px solid #ef4444; }
 section.paused h2 { color: #fecaca; }
 section.paused #paused-reason, section.paused .paused-project { color: #fff; font-weight: 600; word-break: break-word; }
+.item.login { background: #3b0d0d; border: 2px solid #ef4444; color: #fff; }
+.item.login strong { color: #fecaca; font-size: 16px; }
 .err { background: #3b0d0d; border: 1px solid #7f1d1d; color: #fecaca; border-radius: 8px; padding: 12px 14px; margin-bottom: 18px; }
 .sub { font-size: 15px; color: #e8eaed; margin: 16px 0 6px; }
 .decision { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; background: #161616; border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 8px 10px; word-break: break-word; }
@@ -610,8 +612,18 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     $("decision").textContent = s.latest_decision || "(no keep-alive log entries yet)";
   }
 
+  // D-320: an expired Claude login leads the needs-input items, with the fix, until a later call authenticates
+  function authItem(a) {
+    if (a.error) return '<div class="item login"><div class="src">Claude login</div><strong>Login state unknown</strong><br>' + esc(a.error) + "</div>";
+    if (!a.expired) return "";
+    return '<div class="item login"><div class="src">Claude login' + (a.since_berlin ? " · since " + esc(a.since_berlin) : "") +
+      '</div><strong>Claude login EXPIRED: AFClaude cannot reach Claude</strong><br>Fix: ' + esc(a.fix || "") +
+      (a.found ? '<div class="mut">Claude said: ' + esc(a.found) + (a.source ? " (" + esc(a.source) + ")" : "") + "</div>" : "") +
+      '<div class="mut">This notice goes away by itself with the next successful Claude call; then clear the pause.</div></div>';
+  }
   function renderInput(s) {
     var n = s.needs_input || {}, out = [];
+    authHtml = authItem(s.auth || {});
     (n.open_questions || []).forEach(function (q) {
       out.push('<div class="item">' + md(q) + "</div>");   // one markdown string per question, in full (D-279)
     });
@@ -622,14 +634,14 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     });
     if (n.error) out.push('<div class="item alert"><div class="src">task store</div>' + esc(n.error) + "</div>");
     inputHtml = out.join("");
-    inputCount = n.count || 0;
+    inputCount = (n.count || 0) + (authHtml ? 1 : 0);
     paintInput();
   }
 
   // D-304: the message-box threads the task-manager answered (inbox.view's threads, live from the
   // inbox API like the box) follow the open questions until the owner dismisses them (inbox.dismiss);
   // D-306: so do the notices (inbox.view's notices; Dismiss = notice.dismiss on the same API)
-  var inputHtml = "", inputCount = 0, threads = [], notices = [], questions = [], threadErr = "", threadKey = null;
+  var authHtml = "", inputHtml = "", inputCount = 0, threads = [], notices = [], questions = [], threadErr = "", threadKey = null;
   var qDraft = {};     // typed answers / notes by field key, kept over a repaint (a poll must not eat them)
   function noticeItem(n) {
     var src = (n.source ? "review" : "notice") + (n.project ? " · " + esc(n.project) : "") + " · " +
@@ -711,7 +723,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     });
   }
   function paintInput() {
-    var html = inputHtml + questionsHtml(questions) + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
+    var html = authHtml + inputHtml + questionsHtml(questions) + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
       (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
     var box = $("input"), on = document.activeElement, key = on && box.contains(on) ? on.getAttribute("data-draft") : null,
       at = key ? on.selectionStart : 0;

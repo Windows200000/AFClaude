@@ -766,7 +766,7 @@ def watch_sample(session_id, now, st=None, path=None):
     if not u or now - u["fetched_at"] > RUN_SAMPLE_REFRESH:
         r = ka.refresh_usage_checked(now=now)
         if not r.get("ok") or not r.get("usage"):
-            raise failstop.Failed(ka.USAGE_FAILED, ka.usage_failure_detail(r))
+            raise failstop.Failed(ka.usage_failure_subject(r), ka.usage_failure_detail(r))
         u = r["usage"]
     s, w = u.get("session") or {}, u.get("weekly") or {}
     row = {"at": iso(now), "run_start": iso(fire), "session": session_id, "fetched_at": iso(u.get("fetched_at")),

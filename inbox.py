@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import claude_auth  # noqa: E402
 import decisions  # noqa: E402
 import prompts  # noqa: E402
 import runner_state  # noqa: E402
@@ -71,6 +72,14 @@ NEWLINE = " ⏎ "             # a line break of the owner's text in a one-line s
 
 class TriageError(Exception):
     """The triage call failed or gave no usable verdict."""
+
+
+class TriageLoginExpired(TriageError):
+    """The triage call failed to authenticate: the Claude login is expired or invalid (D-320). `found` is
+    the CLI's own message (claude_auth.detect)."""
+    def __init__(self, found: str) -> None:
+        super().__init__(f"{claude_auth.SHORT}: {found}")
+        self.found = found
 
 
 class TriageLimit(TriageError):
@@ -106,7 +115,11 @@ def triage_prompt(text: str) -> str:
 
 def parse_triage(returncode: int, stdout: str, stderr: str = "") -> dict[str, Any]:
     """`claude -p --output-format json` output -> {verdict, reason, cost_usd, usage}. Anything
-    else (a failed call, an error result, no JSON object, an unknown verdict) is a TriageError."""
+    else (a failed call, an error result, no JSON object, an unknown verdict) is a TriageError; a call
+    that failed to authenticate (an expired login) is the TriageLoginExpired subclass (D-320)."""
+    found = claude_auth.detect(returncode, stdout, stderr)
+    if found:
+        raise TriageLoginExpired(found)
     if returncode != 0:
         raise TriageError(f"claude -p exited {returncode}: {(stderr or stdout or '').strip()[:300]}")
     try:

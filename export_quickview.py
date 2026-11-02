@@ -608,6 +608,21 @@ def automation_block():
             "resume": failstop.RESUME_CMD, "projects": projects}
 
 
+def auth_block():
+    """D-320: the Claude login state for the page: `expired` while a `claude -p` call of AFClaude failed to
+    authenticate and no later call has succeeded (claude_auth; the usage sampler's next successful read
+    clears it by itself). The page shows it at the top, with the needs-input items, with the fix. A state
+    that can't be read (the DB) is `error`, never "fine" (D-235)."""
+    import claude_auth
+    import runner_state
+    st = claude_auth.state(ka.USAGE_STATE_FILE)
+    err = runner_state.load_failed()
+    return {"expired": bool(st.get("expired")), "since_berlin": bstr(ka.parse_ts(st["since"])) if st.get("since") else None,
+            "last_berlin": bstr(ka.parse_ts(st["last"])) if st.get("last") else None,
+            "source": st.get("source"), "found": st.get("found"), "fix": claude_auth.FIX,
+            "subject": claude_auth.SHORT, "error": err}
+
+
 def manager_launch_block():
     """D-260: the code default and each project's task-manager launch (manager_launch.view: model,
     effort, source project|default per value). A display path: an error is shown, never raised."""
@@ -1184,6 +1199,7 @@ def main():
         "generated_berlin": bstr(now),
         "self_session_error": SELF_SESSION_ERROR,  # D-239: shown, never crashes the export
         "automation": automation_block(),
+        "auth": auth_block(),   # D-320: an expired Claude login, prominent on the page
         "manager_launch": manager_launch_block(),
         "remote_control": remote_control_block(),
         "keepalive": keepalive_and_usage(now),

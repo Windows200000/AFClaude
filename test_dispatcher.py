@@ -1055,6 +1055,19 @@ class RcThreads(HolderBase):
         self.assertEqual(len(self.alerts), 1)
         self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
 
+    def test_a_sender_that_cannot_log_in_is_the_plain_login_error(self):
+        """D-320: an expired Claude login is reported as that, one alert and pause, not as a thread problem."""
+        import claude_auth
+        self.addCleanup(claude_auth.record_ok, "test", ka.USAGE_STATE_FILE)
+        self.register()
+        bad = {"type": "result", "is_error": True,
+               "result": "Failed to authenticate: OAuth session expired and could not be refreshed"}
+        with self.sender(lambda n, t: subprocess.CompletedProcess(["claude"], 1, json.dumps(bad) + "\n", "")):
+            self.run_pass()
+        self.assertEqual(self.alerts, ["AFClaude STOPPED: " + claude_auth.SUBJECT])
+        self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+        self.assertTrue(claude_auth.is_expired(ka.USAGE_STATE_FILE))
+
     def test_held_message_is_an_error(self):
         """The thread's mode changed to bypass since it started: the message is held, so the thread's
         transcript never shows it (no keyword guess on the result text: the transcript is the proof)."""
