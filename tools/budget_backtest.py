@@ -287,9 +287,11 @@ def main():
                          (os.path.join(a.data, "dispatcher_state.json"), "sessions", "sent_at"),
                          (os.path.join(a.data, "usage_review_state.json"), "runs", "at")]
     rates, fsrc = pacing.fit_profile(upto, pacing.fire_times(), reset + timedelta(minutes=10))   # in-sample
+    prof = rates
     if rates:
         rates = [x * a.user_scale for x in rates]
-    fc = (lambda x, y: pacing.forecast_user(rates, x, y)) if rates else None   # D-308: no design chats
+    fc = ((lambda x, y: pacing.forecast_user(rates, x, y) + pacing.forecast_design(prof, x, y))   # D-325
+          if rates else None)
     try:
         import telemetry
         user_env, weeks, _ = usage_model.parse_user_model(telemetry.read_user_model(a.user_model))

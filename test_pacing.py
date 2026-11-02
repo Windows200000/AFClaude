@@ -306,26 +306,36 @@ class Activity(unittest.TestCase):
 
 
 class DesignGate(unittest.TestCase):
-    """D-308: the night gate and the last stretch forecast the user's other use only; design chats
-    are AFClaude's own (already in the weekly %), not forecast. Only the ETA forecasts them."""
+    """D-325 (refines D-308): the night gate and the last stretch add the owner's design chats from
+    the cleaned measure, pro rata (forecast_gate); design chats already used are in the weekly %."""
 
     @staticmethod
     def rates():
         r = pm.Profile([0.1] * 168)                 # other use 0.1 %/h
-        r.design_week = 84.0                        # a heavy trailing design-chat mean (0.5 %/h)
-        r.design_end, r.design_as_of, r.design_weight = R, SUN, 0.5
+        r.design_week = 84.0                        # a heavy design-chat amount (0.5 %/h)
         return r
 
-    def test_core_forecasts_other_use_only(self):
-        d = pm.decide_core(30, R, SUN, 600.0, None, None, None, True, 0.125, "auto", WIN, "auto", flat_fc(0.1))
+    def test_core_adds_the_design_forecast(self):
         h = (R - SUN).total_seconds() / 3600
-        self.assertAlmostEqual(d["forecast"], 0.1 * h)
+        d = pm.decide_core(30, R, SUN, 600.0, None, None, None, True, 0.125, "auto", WIN, "auto", flat_fc(0.1),
+                           flat_fc(0.05))
         self.assertAlmostEqual(d["forecast_other"], 0.1 * h)
-        self.assertNotIn("forecast_design", d)
-        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.1 * h)
-        self.assertIn("forecast other user use (design chats not forecast, D-308)", d["reason"])
+        self.assertAlmostEqual(d["forecast_design"], 0.05 * h)
+        self.assertAlmostEqual(d["forecast"], 0.15 * h)
+        self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + 0.15 * h)
+        self.assertIn(f"{0.05 * h:.1f}% your design chats (D-325)", d["reason"])
+        plain = pm.decide_core(30, R, SUN, 600.0, None, None, None, True, 0.125, "auto", WIN, "auto", flat_fc(0.1))
+        self.assertIsNone(plain["forecast_design"])
+        self.assertAlmostEqual(plain["predicted_end"], 30 + 12.5 + 0.1 * h)
 
-    def test_decide_and_next_run_leave_design_chats_out(self):
+    def test_forecast_design_is_pro_rata(self):
+        r = self.rates()
+        self.assertAlmostEqual(pm.forecast_design(r, SUN, SUN + pm.WEEK / 4), 21.0)
+        self.assertEqual(pm.forecast_design(r, SUN, SUN), 0.0)
+        self.assertEqual(pm.forecast_design(None, SUN, R), 0.0)
+        self.assertAlmostEqual(pm.forecast_gate(r, SUN, R), pm.forecast_user(r, SUN, R) + 84.0 * ((R - SUN) / pm.WEEK))
+
+    def test_decide_and_next_run_add_design_chats(self):
         rates = self.rates()
         u = {"weekly": {"percent": 30, "resets_at": R}, "session": {}}
         with mock.patch.object(pm, "profile", return_value=(rates, "t")), \
@@ -335,12 +345,11 @@ class DesignGate(unittest.TestCase):
                 mock.patch.object(pm.schedule, "load", return_value=WIN):
             d = pm.decide(u, SUN, params=(dict(pm.DEFAULTS), "t"), rows=[], fires=[], msu=600.0,
                           activity_known=True)
-            self.assertAlmostEqual(d["forecast"], pm.forecast_user(rates, SUN, R))
-            self.assertGreater(pm.forecast_gate(rates, SUN, R), d["forecast"] + 20)   # the ETA's view adds them
-            self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + pm.forecast_user(rates, SUN, R))
-            self.assertTrue(d["go"], d["reason"])          # with design chats forecast it would hold
-            self.assertGreater(30 + 12.5 + pm.forecast_gate(rates, SUN, R), d["threshold"])
-            self.assertIn("design chats not forecast", d["reason"])
+            self.assertAlmostEqual(d["forecast"], pm.forecast_gate(rates, SUN, R))
+            self.assertAlmostEqual(d["forecast_design"], pm.forecast_design(rates, SUN, R))
+            self.assertAlmostEqual(d["predicted_end"], 30 + 12.5 + pm.forecast_gate(rates, SUN, R))
+            self.assertFalse(d["go"], d["reason"])         # the design chats leave no room tonight
+            self.assertLessEqual(30 + 12.5 + pm.forecast_user(rates, SUN, R), d["threshold"])   # D-308 would run
             seen = []
             real = pm.next_run_core
 
@@ -349,21 +358,49 @@ class DesignGate(unittest.TestCase):
                 return real(*a, **k)
             with mock.patch.object(pm, "next_run_core", side_effect=spy):
                 pm.next_run(u, SUN, decision=d, rows=[], fires=[])
-            self.assertAlmostEqual(seen[0](SUN, R), pm.forecast_user(rates, SUN, R))
+            self.assertAlmostEqual(seen[0](SUN, R), pm.forecast_gate(rates, SUN, R))
 
-    def test_threshold_lines_show_no_design_forecast(self):
+    def test_threshold_lines_show_the_design_forecast(self):
         ti = {"ratio": {"value": 0.15, "spread": None, "n": 3, "source": "t"},
               "full_session_cost": {"value": 15.0, "sd": None},
               "model_error": {"n": 0, "note": "none"}, "predicted_end_sd": None,
-              "forecast": {"source": "t", "other_week": 16.8},
+              "forecast": {"source": "t", "other_week": 16.8, "design_week": 30.5, "design_booked_week": 59.2,
+                           "design_weeks": 4},
               "threshold": {"active": 85.0, "source": "dynamic", "dynamic_default": 85.0, "dynamic_default_sd": None},
               "now": {"predicted_end": 60.0, "threshold": 85.0, "slack": 25.0, "slack_in_sd": None,
-                      "forecast_other": 5.0}}
+                      "forecast_other": 5.0, "forecast_design": 9.0}}
         txt = "\n".join(pm.threshold_lines(ti))
-        self.assertIn("other user use 16.8% (design chats count as AFClaude's usage and are not forecast", txt)
-        self.assertIn("until the reset: other user use 5%", txt)
-        self.assertNotIn("+ design chats", txt)
+        self.assertIn("other user use 16.8% + your design chats 30.5% (cleaned, D-325; booked 59.2%", txt)
+        self.assertIn("until the reset: other user use 5% + your design chats 9%", txt)
+        self.assertNotIn("not forecast", txt)
 
+    def test_owner_design_cleans_nights_and_pre_d310_run_tails(self):
+        day = Z("2026-10-06T10:00:00Z")                                  # Tue 12:00 Berlin
+        self.assertEqual(pm.owner_design(day, day + timedelta(minutes=15), 2.0, []), 2.0)
+        night = Z("2026-10-06T21:00:00Z")                                # Tue 23:00 Berlin
+        self.assertEqual(pm.owner_design(night, night + timedelta(minutes=15), 2.0, []), 0.0)
+        dawn = Z("2026-10-07T04:45:00Z")                                 # 06:45-07:00 Berlin: still night
+        self.assertEqual(pm.owner_design(dawn, dawn + timedelta(minutes=15), 2.0, []), 0.0)
+        self.assertEqual(pm.owner_design(dawn + timedelta(minutes=15), dawn + timedelta(minutes=30), 2.0, []), 2.0)
+        end = day - timedelta(hours=1)
+        old = {"start": (end - timedelta(hours=2)).isoformat(), "end": end.isoformat()}
+        new = dict(old, work_end=end.isoformat())
+        self.assertEqual(pm.design_run_ends([old, new, {"start": "x"}]), [end])
+        self.assertEqual(pm.owner_design(day, day + timedelta(minutes=15), 2.0, pm.design_run_ends([old])), 0.0)
+        self.assertEqual(pm.owner_design(day, day + timedelta(minutes=15), 2.0, pm.design_run_ends([new])), 2.0)
+        later = end + pm.DESIGN_AFTER_RUN
+        self.assertEqual(pm.owner_design(later, later + timedelta(minutes=15), 2.0, [end]), 2.0)
+
+    def test_fit_rows_reads_the_fit_cycles_from_the_db(self):
+        now = Z("2026-11-02T21:00:00Z")
+        with mock.patch.object(pm.telemetry, "db_lines", return_value=['{"at": "2026-11-02T20:00:00Z"}', "bad"]) as m:
+            got = pm.fit_rows(now)
+        self.assertEqual(m.call_args.kwargs["since"], now - (pm.FIT_CYCLES + 1) * pm.WEEK)
+        self.assertEqual([r["at"] for r in got], ["2026-11-02T20:00:00Z"])
+        with mock.patch.object(pm.telemetry, "db_lines", return_value=None), \
+                mock.patch.object(pm, "tail_rows", return_value=["tail"]) as t:
+            self.assertEqual(pm.fit_rows(now), ["tail"])
+        self.assertEqual(t.call_args.kwargs["max_bytes"], pm.LONG_BYTES)
 
 class Predictor(unittest.TestCase):
     """The forecast: the user's typical rise per hour of the week from closed cycles."""
@@ -503,20 +540,16 @@ class Predictor(unittest.TestCase):
         self.assertEqual(rates.design_weeks, 1)
         self.assertAlmostEqual(rates.week_total, final - 8.0, places=2)    # the design chats are not the user's
         dw = rates.design_week
-        self.assertEqual((rates.design_end, rates.design_used, rates.design_weight), (R, 0.0, 0.5))
-        # after the open cycle: the steady amount, evenly; inside it blended with the week's amount left
+        self.assertAlmostEqual(rates.design_booked_week, dw, places=6)   # a daytime chat, no run: nothing cleaned
+        self.assertEqual(rates.design_used, 0.0)
+        # D-325: the steady amount spread evenly over the time, inside the open cycle too (no blend)
         self.assertAlmostEqual(pm.forecast_design(rates, R, R + pm.WEEK / 2), dw / 2, places=6)
-        self.assertAlmostEqual(pm.forecast_design(rates, now, now + pm.WEEK / 2),
-                               dw / 2 - 0.5 * dw / 2 + 0.5 * dw * 3.5 / 6, places=6)
-        self.assertAlmostEqual(pm.forecast_design(rates, now, R), 0.5 * dw * 6 / 7 + 0.5 * dw, places=6)  # none used yet
-        rates.design_used = dw + 5                                   # already above the weekly amount
-        self.assertAlmostEqual(pm.forecast_design(rates, now, R), 0.5 * dw * 6 / 7, places=6)
-        rates.design_used = 0.0
+        self.assertAlmostEqual(pm.forecast_design(rates, now, R), dw * 6 / 7, places=6)
         self.assertEqual(pm.forecast_design(rates, now, now), 0.0)
         self.assertAlmostEqual(pm.forecast_gate(rates, now, R),
                                pm.forecast_user(rates, now, R) + pm.forecast_design(rates, now, R), places=9)
         self.assertAlmostEqual(sum(d for _, _, d in pm.design_intervals(rows, [])), 8.0, places=3)
-        # outside runs = other use + design chats; the gate's forecast (and its backtest) the other use only (D-308)
+        # outside runs = other use + design chats; the backtest scores the other use (forecast_user)
         self.assertAlmostEqual(sum(x for _, _, x in pm.user_intervals(rows, [])), final - rows[0]["usage"]["weekly"]["percent"],
                                places=3)
         self.assertAlmostEqual(sum(x for _, _, x in pm.other_intervals(rows, [])),
@@ -643,8 +676,12 @@ class Predictor(unittest.TestCase):
         self.assertGreater(sum(tailed), sum(whole) + 1e-6)                   # not all the run's
         design = sum(0.1 / 4 * 0.75 for _ in tail)                           # 3/4 of the tail's rise: own tokens
         covered = (len(old) - 1) / 4                                         # hours of the closed week
-        self.assertAlmostEqual(plain.design_week - tailed.design_week, 168.0 * design / covered, places=6)
+        self.assertAlmostEqual(plain.design_booked_week - tailed.design_booked_week, 168.0 * design / covered,
+                               places=6)
         self.assertAlmostEqual(tailed.design_week, whole.design_week, places=6)
+        # D-325: the cleaned measure drops the 3 h after a row's end without a work_end, so the
+        # pre-D-310 row's tail is not counted as the owner's chats either
+        self.assertAlmostEqual(plain.design_week, tailed.design_week, places=6)
 
     def test_own_other_tokens(self):
         import usage_sampler
@@ -718,11 +755,12 @@ class Predictor(unittest.TestCase):
             self.assertAlmostEqual(errs[0]["actual"], actual)
             self.assertAlmostEqual(errs[0]["error"], 30.0 - actual)
             self.assertEqual(pm.forecast_errors(rows, [], self.OLD - timedelta(days=1), log), [])  # not closed
-            # a record with forecast_other (D-266 on) is scored against the other use only (D-308)
-            dd2 = dict(dd, forecast=25.0, forecast_other=25.0, t0=t0 + timedelta(hours=1))
+            # a record with forecast_other (D-266 on) is scored against the other use only; D-325 logs
+            # forecast_design beside it
+            dd2 = dict(dd, forecast=31.0, forecast_other=25.0, forecast_design=6.0, t0=t0 + timedelta(hours=1))
             self.assertTrue(pm.record_forecast(dd2, self.OLD, log))
             with open(log) as fh:
-                self.assertNotIn("forecast_design", json.loads(fh.readlines()[-1]))
+                self.assertEqual(json.loads(fh.readlines()[-1])["forecast_design"], 6.0)
             e2 = pm.forecast_errors(rows, [], R, log)[1]
             other = sum(v for a, b, v in pm.other_intervals(rows, []) if a >= t0 + timedelta(hours=1))
             self.assertEqual((e2["forecast"], round(e2["actual"], 6)), (25.0, round(other, 6)))
@@ -772,6 +810,38 @@ class Accuracy(unittest.TestCase):
         # no closed week before any decision point: nothing to back-calculate
         self.assertEqual(pm.forecast_backtest(self.cycles([0.2], R - pm.WEEK), [], R, WIN), [])
 
+    def test_backtest_scores_the_design_forecast_beside_the_other_use(self):
+        now = R + timedelta(days=1)
+        bt = pm.forecast_backtest(self.cycles([0.2, 0.2, 0.2], now), [], now, WIN)
+        self.assertTrue(bt)
+        for x in bt:            # no AFClaude tokens: no design chats, measured or forecast
+            self.assertEqual((x["design_predicted"], x["design_actual"]), (0.0, 0.0))
+            self.assertAlmostEqual(x["error_gate"], x["error"])
+
+    def test_threshold_info_shows_the_gates_forecast(self):
+        """Without rows, the shown forecast is the gate's own (profile(None): fit_rows), not a fit
+        on the byte tail the backtest and the ratio use (D-325)."""
+        now = R + timedelta(days=1)
+        rows = self.cycles([0.2, 0.2, 0.2], now)
+        gate, tail = pm.Profile([0.3] * 168), pm.Profile([0.1] * 168)
+        gate.design_week, tail.design_week = 32.0, 17.0
+        calls = []
+
+        def prof(r=None, *a, **k):
+            calls.append(r)
+            return (gate if r is None else tail), "t"
+        u = {"weekly": {"percent": 30, "resets_at": R + pm.WEEK}, "session": {}}
+        with mock.patch.object(pm, "tail_rows", return_value=rows), mock.patch.object(pm, "profile", side_effect=prof), \
+                mock.patch.object(pm, "run_rows", return_value=[]), mock.patch.object(pm, "fire_times", return_value=[]):
+            d = pm.decide(u, now, params=(dict(pm.DEFAULTS), "t"), msu=600.0, activity_known=True)
+            ti = pm.threshold_info(None, None, now, d)
+        self.assertEqual(calls, [None, None])   # the live gate and the shown forecast: the same fit
+        self.assertAlmostEqual(d["forecast_design"], pm.forecast_design(gate, now, R + pm.WEEK))
+        self.assertEqual((ti["forecast"]["other_week"], ti["forecast"]["design_week"]),
+                         (round(sum(gate), 1), 32.0))
+        with mock.patch.object(pm, "profile", side_effect=prof):
+            self.assertEqual(pm.threshold_info(rows, [], now)["forecast"]["design_week"], 17.0)   # given rows: theirs
+
     def test_ratio_stats(self):
         rs = pm.ratio_stats([dict(row(SUN, 10), limit_ratio=self.SNAP)])
         self.assertEqual((rs["value"], rs["kind"], rs["n"], rs["weighted_stdev"], rs["intrinsic_stdev"]),
@@ -792,8 +862,9 @@ class Accuracy(unittest.TestCase):
         self.assertAlmostEqual(ti["full_session_cost"]["sd"], 100 * (0.012 ** 2 + 0.005 ** 2) ** 0.5, places=1)
         self.assertEqual(ti["full_session_cost"]["spread"], 2.0)
         me = ti["model_error"]
-        for k in ("n", "n_closed", "bias", "sd", "rmse", "worst", "status", "note", "logged"):
+        for k in ("n", "n_closed", "bias", "sd", "rmse", "worst", "status", "note", "logged", "with_design"):
             self.assertIn(k, me)
+        self.assertIn("with your design chats (D-325)", "\n".join(pm.threshold_lines(ti)))
         self.assertEqual(me["status"], "ok")
         t = ti["threshold"]
         self.assertEqual((t["active"], t["source"], t["dynamic_default"], t["override"]), (85.0, "dynamic", 85.0, None))
