@@ -5,11 +5,12 @@ the afclaude container (`inbox_api.py serve`); the quickview's nginx proxies /af
 socket (quickview/nginx.conf: the socket's directory data/api/ is mounted into that container), so
 nothing new is published and the request has passed nginx's X-AFClaude-Key check (D-150) first.
 
-  GET  /afclaude/api/inbox               the box: the chat and the noted messages (inbox.view)
-  POST /afclaude/api/inbox               {"text": "..."} -> 201, the new message (pending); the
-                                         worker triages it (and delivers a "now" one) right away
+  GET  /afclaude/api/inbox               the box: the messages on their way, the thread cards (inbox.view)
+  POST /afclaude/api/inbox               {"text": "...", "parent"?: id} -> 201, the new message (pending); the
+                                         worker triages it (and delivers a "now" one) right away; `parent`: a
+                                         message of an answered thread, the text is a follow-up in it (D-324)
   POST /afclaude/api/inbox/<id>/retry    a failed message again -> 200
-  POST /afclaude/api/inbox/<id>/dismiss  an answered thread leaves the questions section (D-304) -> 200
+  POST /afclaude/api/inbox/<id>/dismiss  an answered thread (its first message's id) leaves the dashboard (D-304) -> 200
   POST /afclaude/api/inbox/notice/<id>/dismiss   a notice leaves the questions section (D-306) -> 200
   POST /afclaude/api/questions/<id>/answer   {"answer": "..."} or {"option": i} (the 0-based index of one of
                                          its options; the server stores the option's text) -> 200: a plain
@@ -182,12 +183,14 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return 200, inbox.view(conn)
             body = self.json_body()
-            if set(body) - {"text"}:
-                raise HTTPError(400, f"unknown field(s) {sorted(set(body) - {'text'})}")
+            if set(body) - {"text", "parent"}:
+                raise HTTPError(400, f"unknown field(s) {sorted(set(body) - {'text', 'parent'})}")
             if not inbox.rate_ok(conn):
                 raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
-            m = actions.perform(conn, "inbox.post", {"text": body.get("text")}, actor=ACTOR, via=VIA)
-            log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)")
+            params = {"text": body.get("text"), **({"parent": body["parent"]} if "parent" in body else {})}
+            m = actions.perform(conn, "inbox.post", params, actor=ACTOR, via=VIA)
+            log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)" +
+                (f", follow-up in the thread of #{m['parent_id']}" if m["parent_id"] is not None else ""))
             self.server.wake.set()
             return 201, inbox.message_view(m)
         question = QUESTION_RE.match(path)

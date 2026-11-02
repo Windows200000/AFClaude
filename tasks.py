@@ -41,7 +41,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py inbox list [--all]            the owner's messages from the dashboard (D-241): open ones
                                            (--all: the recent ones), newest first
     tasks.py inbox show ID                 one message in full, with its verdict, status and answer
-    tasks.py inbox reply ID "answer"       answer it (the owner reads it on the dashboard)
+    tasks.py inbox reply ID "answer" [--needs-input]   answer it (the owner reads it on the dashboard);
+                                           --needs-input: the reply asks the owner something or waits for
+                                           their decision (it then shows under "Needs your input")
     tasks.py inbox retry ID                send a failed message again (triage / delivery)
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
@@ -712,9 +714,11 @@ def print_inbox_message(m, full=False):
         print(f"   ERROR {berlin(m['error_at'])}: {m['error']}")
     if m["included_by"]:
         print(f"   sent along with {m['included_by']} at {berlin(m['included_at'])}")
+    if m["parent_id"] is not None:
+        print(f"   follow-up in the thread of #{m['parent_id']}")
     if m["answer"]:
         ans = m["answer"] if full else cut(" ".join(m["answer"].split()), 200)
-        print(f"   answer ({berlin(m['answered_at'])}): " + ans.replace("\n", "\n   "))
+        print(f"   answer ({berlin(m['answered_at'])}){', needs the owner' if m['needs_input'] else ''}: " + ans.replace("\n", "\n   "))
 
 
 def run_inbox_messages(conn, args):
@@ -733,7 +737,7 @@ def run_inbox_messages(conn, args):
         m = store.inbox_row(conn, args.id)
         return dump(m) if args.json else print_inbox_message(m, full=True)
     if ic == "reply":
-        m = act(conn, "inbox.reply", message_id=args.id, answer=args.answer)
+        m = act(conn, "inbox.reply", message_id=args.id, answer=args.answer, needs_input=args.needs_input)
     else:   # retry
         m = act(conn, "inbox.retry", message_id=args.id)
     if args.json:
@@ -1043,6 +1047,9 @@ def parser():
     q = ibs.add_parser("reply", parents=[js], help="answer a message (shown on the dashboard)")
     q.add_argument("id", type=int)
     q.add_argument("answer")
+    q.add_argument("--needs-input", action="store_true",
+                   help="the reply asks the owner something or waits for their decision: it shows under "
+                        "'Needs your input' until they answer or dismiss it (D-324)")
     q = ibs.add_parser("retry", parents=[js], help="send a failed message again")
     q.add_argument("id", type=int)
     p = sub.add_parser("handoff", help="compaction hand-offs (D-144)")

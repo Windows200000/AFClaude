@@ -29,10 +29,23 @@ section h2 { font-size: 19px; margin-bottom: 12px; display: flex; align-items: c
 .mut { color: #9ca3af; font-size: 13px; }
 .item { border-left: 3px solid #7e22ce; padding: 6px 0 6px 12px; margin: 8px 0; }
 .item .src { color: #9ca3af; font-size: 12px; margin-bottom: 2px; }
-/* D-304: a message-box thread the task-manager answered stays here (message, reply) until dismissed */
+/* D-304/D-324: a thread card (message, reply, follow-ups, a reply field for that topic): under "Needs your input"
+   while its latest reply waits for the owner (.item.thr), else in the message area, collapsed after the reset (details.card) */
 .item.thr { display: flex; flex-direction: column; gap: 6px; }
 .thr-end { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .thr-end .t { color: #fecaca; font-size: 13px; }
+.thr-reply { display: flex; align-items: flex-end; gap: 8px; }
+.thr textarea, .card textarea { flex: 1; min-width: 0; min-height: 40px; resize: vertical; background: #161616; color: #e8eaed;
+    border: 1px solid rgba(255,255,255,.15); border-radius: 8px; padding: 6px 10px; font: inherit; }
+.thr textarea:focus, .card textarea:focus { outline: none; border-color: #7e22ce; }
+details.card, details.card:first-of-type { border: 1px solid rgba(255,255,255,.1); border-radius: 8px; background: #161616; padding: 6px 10px; }
+details.card > summary { display: flex; align-items: baseline; gap: 10px; font-weight: 400; }
+details.card .sum-t::before { content: attr(data-t); }   /* the first message once: not as DOM text beside its bubble */
+details.card .sum-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+details.card .sum-o { display: none; flex: 1; color: #9ca3af; font-size: 13px; }
+details.card[open] .sum-t { display: none; } details.card[open] .sum-o { display: block; }
+details.card > summary .mut { flex: none; margin-left: 0; font-size: 12px; }
+.card-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 /* D-306: a notice for the owner (title, text) stays here until dismissed */
 .item.ntc { border-left-color: #0ea5e9; display: flex; flex-direction: column; gap: 4px; }
 /* phase 4b Q3 (D-300): an open question with its answer controls; decision questions sit under one heading */
@@ -643,19 +656,36 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   // D-306: so do the notices (inbox.view's notices; Dismiss = notice.dismiss on the same API)
   var authHtml = "", inputHtml = "", inputCount = 0, threads = [], notices = [], questions = [], threadErr = "", threadKey = null;
   var qDraft = {};     // typed answers / notes by field key, kept over a repaint (a poll must not eat them)
+  var cardOpen = {};   // D-324: the owner's open / closed choice for a card in the message area, kept over a repaint
   function noticeItem(n) {
     var src = (n.source ? "review" : "notice") + (n.project ? " · " + esc(n.project) : "") + " · " +
       esc(n.updated_berlin || n.posted_berlin);
     return '<div class="item ntc"><div class="src">' + src + "</div><strong>" + esc(n.title) + "</strong>" + md(n.text) +
       '<div class="thr-end"><span class="t"></span><button type="button" data-notice="' + n.id + '">Dismiss</button></div></div>';
   }
-  function threadItem(m) {
-    var q = m.question;     // an answer to a question: the thread shows the question, the answer, the reply (D-304)
-    return '<div class="item thr">' +
-      (q ? '<details><summary>Question #' + q.id + ": " + esc(q.title) + "</summary>" + md(q.text) + "</details>" : "") +
-      '<div class="m-row"><div class="m-me">' + esc(m.text) + '</div></div><div class="m-ai">' +
-      md(m.answer) + '</div><div class="thr-end"><span class="t"></span><button type="button" data-dismiss="' + m.id +
-      '" data-tip="Answered ' + esc(m.answered_berlin) + '">Dismiss</button></div></div>';
+  // D-324: a thread card's content: the first message and its reply, the follow-ups, a reply field for this
+  // topic only (a follow-up goes to the task-manager as part of the thread), Dismiss
+  function threadBody(t) {
+    var q = t.question;     // an answer to a question: the thread shows the question, the answer, the reply (D-304)
+    return (q ? '<details><summary>Question #' + q.id + ": " + esc(q.title) + "</summary>" + md(q.text) + "</details>" : "") +
+      t.rows.map(msgItem).join("") +
+      '<div class="thr-reply">' + draft("t" + t.id, 2, "Your reply in this thread") +
+      '<button type="button" data-thread="' + t.id + '">Send</button></div>' +
+      '<div class="thr-end"><span class="t"></span><button type="button" data-dismiss="' + t.id +
+      '" data-tip="Last activity ' + esc(t.activity_berlin) + '">Dismiss</button></div>';
+  }
+  function cardItem(t) {   // a thread in the message area: collapsed after ui_chat_reset_hours of quiet (t.collapsed)
+    var open = cardOpen[t.id] != null ? cardOpen[t.id] : !t.collapsed;
+    return '<details class="card" data-thread-id="' + t.id + '" data-def="' + (t.collapsed ? 0 : 1) + '"' + (open ? " open" : "") +
+      '><summary><span class="sum-t" data-t="' + esc(t.rows[0].text) + '"></span><span class="sum-o">Thread · inbox #' + t.id +
+      '</span><span class="mut">' + esc(t.activity_berlin) + '</span></summary><div class="card-body">' + threadBody(t) + "</div></details>";
+  }
+  // the threads whose latest reply waits for the owner: their own sub-box under the questions (D-324)
+  function waitingHtml(list) {
+    return list.length ? '<div class="qgrp"><h3>Replies waiting for you <span class="count">' + list.length + "</span></h3>" +
+      list.map(function (t) {
+        return '<div class="item thr"><div class="src">inbox #' + t.id + " · " + esc(t.activity_berlin) + "</div>" + threadBody(t) + "</div>";
+      }).join("") + "</div>" : "";
   }
   function draft(key, rows, label, value) {
     return '<textarea rows="' + rows + '" data-draft="' + key + '" aria-label="' + esc(label) + '">' +
@@ -706,9 +736,10 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     questions = qlist;
     threadErr = err;
     paintInput();
+    renderMessages(msgBox);      // the cards in the message area are the threads that do not wait for the owner
   }
-  function dismissButtons(attr, path, drop) {
-    Array.prototype.forEach.call($("input").querySelectorAll("button[" + attr + "]"), function (b) {
+  function dismissButtons(root, attr, path, drop) {
+    Array.prototype.forEach.call(root.querySelectorAll("button[" + attr + "]"), function (b) {
       b.addEventListener("click", function () {
         var id = Number(b.getAttribute(attr));
         b.disabled = true;
@@ -722,30 +753,63 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       });
     });
   }
-  function paintInput() {
-    var html = authHtml + inputHtml + questionsHtml(questions) + notices.map(noticeItem).join("") + threads.map(threadItem).join("") +
-      (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
-    var box = $("input"), on = document.activeElement, key = on && box.contains(on) ? on.getAttribute("data-draft") : null,
+  function dropThread(id) {
+    setThreads(threads.filter(function (m) { return m.id !== id; }), notices, questions, threadErr);
+  }
+  // innerHTML of a box with the cursor kept where the owner was typing
+  function repaint(box, html) {
+    var on = document.activeElement, key = on && box.contains(on) ? on.getAttribute("data-draft") : null,
       at = key ? on.selectionStart : 0;
-    box.innerHTML = html || '<p class="mut">Nothing open.</p>';
-    if (key) {        // a repaint keeps the cursor where the owner was typing
+    box.innerHTML = html;
+    if (key) {
       var again = box.querySelector('textarea[data-draft="' + key + '"]');
       if (again) { again.focus(); again.setSelectionRange(at, at); }
     }
-    dismissButtons("data-dismiss", function (id) { return "/" + id + "/dismiss"; }, function (id) {
-      setThreads(threads.filter(function (m) { return m.id !== id; }), notices, questions, threadErr);
-    });
-    dismissButtons("data-notice", function (id) { return "/notice/" + id + "/dismiss"; }, function (id) {
+  }
+  function paintInput() {
+    var waiting = threads.filter(function (t) { return t.needs_input; });
+    var html = authHtml + inputHtml + questionsHtml(questions) + notices.map(noticeItem).join("") + waitingHtml(waiting) +
+      (threadErr ? '<div class="item alert"><div class="src">message box</div>' + esc(threadErr) + "</div>" : "");
+    var box = $("input");
+    repaint(box, html || '<p class="mut">Nothing open.</p>');
+    dismissButtons(box, "data-dismiss", function (id) { return "/" + id + "/dismiss"; }, dropThread);
+    dismissButtons(box, "data-notice", function (id) { return "/notice/" + id + "/dismiss"; }, function (id) {
       setThreads(threads, notices.filter(function (n) { return n.id !== id; }), questions, threadErr);
     });
-    var count = inputCount + questions.length + notices.length + threads.length;
+    var count = inputCount + questions.length + notices.length + waiting.length;
     $("c-input").textContent = count;
     $("c-input").className = "count" + (count ? "" : " zero");
   }
   // one listener for the questions' controls (their DOM is rebuilt on a repaint)
-  $("input").addEventListener("input", function (ev) {
+  document.addEventListener("input", function (ev) {
     var k = ev.target.getAttribute && ev.target.getAttribute("data-draft");
     if (k) qDraft[k] = ev.target.value;
+  });
+  // D-324: Send in a thread card posts a follow-up linked to the thread (the same inbox path as the box); the
+  // thread no longer waits for the owner and its card shows the new message with its loading mark
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest && ev.target.closest("button[data-thread]");
+    if (!b) return;
+    var id = Number(b.getAttribute("data-thread")), text = qDraft["t" + id] || "", item = b.closest(".thr, .card"),
+      note = item && item.querySelector(".thr-end .t");
+    if (!text.trim()) return;
+    b.disabled = true;
+    if (note) note.textContent = "";
+    api("", { text: text, parent: id }).then(function (m) {
+      delete qDraft["t" + id];
+      setThreads(threads.map(function (t) {
+        if (t.id !== id) return t;
+        var n = JSON.parse(JSON.stringify(t));
+        n.needs_input = false;
+        n.collapsed = false;
+        n.rows.push(m);
+        return n;
+      }), notices, questions, threadErr);
+      pollMessages(true);
+    }).catch(function (e) {
+      b.disabled = false;
+      if (note) note.textContent = "Not sent: " + e.message;
+    });
   });
   $("input").addEventListener("click", function (ev) {
     var b = ev.target.closest && ev.target.closest("button[data-qact]");
@@ -838,12 +902,14 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   }
   function renderMessages(box) {
     msgBox = box;
-    var key = JSON.stringify([box.chat, box.messages]);
+    var cards = threads.filter(function (t) { return !t.needs_input; });
+    var key = JSON.stringify([cards, box.older, box.messages]);
     if (key === msgShown) return;          // unchanged: keep the DOM (an open tooltip, a focused mark)
     msgShown = key;
     var log = $("msg-log");
-    log.className = box.chat ? "chat" : "";
-    log.innerHTML = (box.messages || []).map(msgItem).join("");
+    log.className = cards.length ? "chat" : "";
+    repaint(log, (box.messages || []).map(msgItem).join("") + cards.map(cardItem).join("") +
+      (box.older ? '<div class="mut">' + box.older + " older thread" + (box.older > 1 ? "s" : "") + " not shown</div>" : ""));
     Array.prototype.forEach.call(log.querySelectorAll(".m-note .t"), function (t) {
       t.addEventListener("click", function () {
         var id = t.parentNode.getAttribute("data-id");
@@ -851,32 +917,42 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
         t.parentNode.classList.toggle("open", msgOpen[id]);
       });
     });
-    Array.prototype.forEach.call(log.querySelectorAll("button[data-retry]"), function (b) {
-      b.addEventListener("click", function () {
-        b.disabled = true;
-        msgError("");
-        api("/" + b.getAttribute("data-retry") + "/retry", {}).then(function () { pollMessages(true); })
-          .catch(function (e) { b.disabled = false; msgError("Retry failed: " + e.message); });
-      });
-    });
+    dismissButtons(log, "data-dismiss", function (id) { return "/" + id + "/dismiss"; }, dropThread);
   }
+  // a retry button is in the message area or in a thread card under "Needs your input"
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest && ev.target.closest("button[data-retry]");
+    if (!b) return;
+    b.disabled = true;
+    msgError("");
+    api("/" + b.getAttribute("data-retry") + "/retry", {}).then(function () { pollMessages(true); })
+      .catch(function (e) { b.disabled = false; msgError("Retry failed: " + e.message); });
+  });
+  // a card the owner opened or closed by hand keeps that choice; one left at its default follows the reset
+  $("msg-log").addEventListener("toggle", function (ev) {
+    var d = ev.target;
+    if (!d.classList || !d.classList.contains("card")) return;
+    var id = d.getAttribute("data-thread-id");
+    if (d.open === (d.getAttribute("data-def") === "1")) delete cardOpen[id]; else cardOpen[id] = d.open;
+  }, true);
   // -> how long until the next look: a message on its way 30 s; noted ones (to clear them once
   // included) or a chat (to reset it) 5 min; an empty box: none; null: a newer look started meanwhile
   function loadMessages(gen) {
     return api("").then(function (box) {
       if (gen !== msgGen) return null;
       $("msg-text").maxLength = box.max_chars || 4000;
-      renderMessages(box);
+      msgBox = box;                       // (older) before the threads repaint the cards
       setThreads(box.threads || [], box.notices || [], box.questions || [], "");
-      return box.busy ? 30000 : (box.messages || []).length || (box.questions || []).length ? 300000 : 0;
+      renderMessages(box);
+      return box.busy ? 30000 : (box.messages || []).length || (box.questions || []).length || (box.threads || []).length ? 300000 : 0;
     }).catch(function (e) {
       if (gen !== msgGen) return null;
+      var why = "Message box unavailable: " + e.message;
+      setThreads([], [], [], why);
       msgShown = null;
       $("msg-log").className = "";
-      var why = "Message box unavailable: " + e.message;
       $("msg-log").innerHTML = '<div class="m-err"><span class="t">' + esc(why) + '</span><span class="st s-err" tabindex="0" ' +
         'role="img" aria-label="' + esc(why) + '" data-tip="' + esc(why) + '"></span></div>';
-      setThreads([], [], [], why);
       return 0;
     });
   }
@@ -905,7 +981,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     msgError("");
     api("", { text: text }).then(function (m) {
       $("msg-text").value = "";          // the text moves above the box, with its loading mark
-      renderMessages({ chat: msgBox.chat, busy: true, messages: (msgBox.messages || []).concat([m]) });
+      renderMessages({ older: msgBox.older, busy: true, messages: (msgBox.messages || []).concat([m]) });
       pollMessages(true);
     }).catch(function (e) { msgError("Not sent: " + e.message); })
       .then(function () { $("msg-send").disabled = false; });

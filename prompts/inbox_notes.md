@@ -1,1 +1,1 @@
-The owner's messages noted in the AFClaude inbox since this session last heard from it (verbatim, oldest first; answer one only if it needs it, with `python3 tasks.py inbox reply <id> "<answer>"`): {notes}
+The owner's messages noted in the AFClaude inbox since this session last heard from it (verbatim, oldest first; answer one only if it needs it, with `python3 tasks.py inbox reply <id> "<answer>"`, plus --needs-input if it asks the owner something or waits for their decision): {notes}
