@@ -49,7 +49,8 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
                                            owner_messages, in_flight, lessons, working_notes,
-                                           open_question_ids, notes} ("-" = read it from stdin)
+                                           drop_working_notes, open_question_ids, notes}
+                                           ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
     tasks.py automation [status]           is automation paused (D-234/D-235), why, since when: the
                                            install-wide pause and every paused project (D-244)
@@ -385,7 +386,8 @@ def run_handoff(conn, args):
         body = sys.stdin.read() if args.body == "-" else args.body
         sid = resolve_session(conn, args.session)
         h = act(conn, "handoff.write", session_id=sid, body=body, project=project_ref(args.project))
-        return print(f"hand-off #{h['id']} saved for {h['session_id'][:8]}: HANDOFF SAVED")
+        return print(f"hand-off #{h['id']} saved for {h['session_id'][:8]} "
+                     f"({len(h['body']['working_notes'])} working notes): HANDOFF SAVED")
     sid = resolve_session(conn, args.session) if args.session else None
     rows = store.list_handoffs(conn, sid, limit=20 if args.all else 1)
     if args.json:
@@ -1065,7 +1067,8 @@ def parser():
     q.add_argument("--session", required=True, help="the writing session (full id or unique prefix)")
     q.add_argument("--json", dest="body", required=True, metavar="BODY",
                    help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, lessons, "
-                        "working_notes, open_question_ids, notes}; - = stdin")
+                        "working_notes, drop_working_notes (numbers of earlier notes that no longer hold; the last "
+                        "hand-off's working notes are carried over), open_question_ids, notes}; - = stdin")
     q.add_argument("--project", help="name or directory (default: the project the session manages)")
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")

@@ -224,6 +224,7 @@ class Env(unittest.TestCase):
     # ---- helpers
     def handoff(self, summary="state", at=None, **body):
         conn = store.connect()
+        body.setdefault("working_notes", ["tests: .venv/bin/python -m unittest -q test_x"])   # a manager's needs one
         try:
             h = actions.perform(conn, "handoff.write", {"session_id": SID, "body": dict(summary=summary, **body)},
                                 actor="cli", via="cli")
@@ -298,7 +299,8 @@ class CompactWhenIdle(Env):
         self.assertTrue(save.startswith(SAVE))
         self.assertNotIn("\n", save)
         for part in ("you have been idle for 50 min", "COMPACTS", "right after your reply", "afclaude_handoff",
-                     f'session "{SID}"', "tasks.py handoff write --session", "HANDOFF SAVED", "D-233", "D-238"):
+                     f'session "{SID}"', "tasks.py handoff write --session", "HANDOFF SAVED", "D-233", "D-238",
+                     "MANDATORY: a `tests:` note", "drop_working_notes", "FULL text"):   # review of 02.11.
             self.assertIn(part, save)
         self.assertTrue(compact.startswith("/compact Keep what the task-manager needs"))
         new = self.latest(unconsumed=False)
@@ -637,7 +639,7 @@ class SaveResend(Env):
         self.assertTrue(resend.startswith(RESEND))
         self.assertNotIn("\n", resend)
         for part in (f"#{early['id']}", "written before the save prompt", f'session "{SID}"',
-                     "tasks.py handoff write --session", "HANDOFF SAVED", "only reminder"):
+                     "tasks.py handoff write --session", "HANDOFF SAVED", "only reminder", "`tests:` note"):
             self.assertIn(part, resend)
         self.assertTrue(compact.startswith("/compact "))
         new = self.latest(unconsumed=False)

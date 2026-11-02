@@ -3494,6 +3494,12 @@ def prune_runner_runs(conn: sqlite3.Connection, cutoff: str, *, batch_size: int 
 # the know-how used afterwards). Optional on write and read: older hand-offs lack them.
 HANDOFF_LISTS = ("done", "in_progress", "next_steps", "owner_messages", "in_flight", "lessons", "working_notes")
 HANDOFF_KEYS = ("summary",) + HANDOFF_LISTS + ("open_question_ids", "notes")
+# Input only, never stored: the numbers (as in the hand-off message the session got back) of earlier
+# working notes that no longer hold. The notes of the last hand-off given back are carried into the
+# next one (handoff_body(carried=)) unless they are listed here: a note lost between two hand-offs
+# cost the task-manager its way back to a host (review:compaction-vs-handoff-2026-11-01).
+HANDOFF_DROP_KEY = "drop_working_notes"
+HANDOFF_TESTS_NOTE = "tests:"   # a task-manager's working notes must hold one (its unit-test command)
 HANDOFF_MAX = 12000            # characters of the whole body as JSON (~3k tokens, well below a summary)
 HANDOFF_TEXT_MAX = 2000        # summary, notes
 HANDOFF_ITEM_MAX = 500         # one list item
@@ -3529,11 +3535,19 @@ def _str_list(value: object, what: str, item_max: int = HANDOFF_ITEM_MAX) -> lis
     return out
 
 
-def handoff_body(value: object) -> dict[str, Any]:
+def _note_key(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def handoff_body(value: object, carried: Sequence[str] = (), need_tests_note: bool = False) -> dict[str, Any]:
     """Validate + normalize a hand-off body (a dict or its JSON text): summary (required),
     done / in_progress / next_steps / owner_messages (verbatim) / in_flight / lessons /
     working_notes (lists of short strings; a single string is one item; missing = empty),
-    open_question_ids (task ids), notes. Unknown keys and an oversized body are a ValueError."""
+    open_question_ids (task ids), notes. Unknown keys and an oversized body are a ValueError.
+    `carried`: the working notes of the hand-off the session was last given back; they go first
+    in working_notes (an identical new note is kept once), except the ones whose 1-based numbers
+    the input lists in drop_working_notes. `need_tests_note`: working_notes must hold a
+    `tests:` note (the project's exact unit-test command; `tests: none` if it has none)."""
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -3541,9 +3555,9 @@ def handoff_body(value: object) -> dict[str, Any]:
             raise ValueError(f"the hand-off is not valid JSON: {e}") from None
     if not isinstance(value, dict):
         raise ValueError(f"the hand-off must be a JSON object, got {type(value).__name__}")
-    unknown = sorted(set(value) - set(HANDOFF_KEYS))
+    unknown = sorted(set(value) - set(HANDOFF_KEYS) - {HANDOFF_DROP_KEY})
     if unknown:
-        raise ValueError(f"unknown hand-off field(s) {unknown} (known: {', '.join(HANDOFF_KEYS)})")
+        raise ValueError(f"unknown hand-off field(s) {unknown} (known: {', '.join(HANDOFF_KEYS)}, {HANDOFF_DROP_KEY})")
     summary = _text(value.get("summary"), "summary", required=True)
     notes = _text(value.get("notes"), "notes")
     for what, t in (("summary", summary), ("notes", notes)):
@@ -3558,11 +3572,42 @@ def handoff_body(value: object) -> dict[str, Any]:
     body: dict[str, Any] = {"summary": summary}
     for k in HANDOFF_LISTS:
         body[k] = _str_list(value.get(k), k, HANDOFF_OWNER_ITEM_MAX if k == "owner_messages" else HANDOFF_ITEM_MAX)
+    body["working_notes"] = _carry_notes(carried, body["working_notes"], value.get(HANDOFF_DROP_KEY))
+    if need_tests_note and not any(t.lower().startswith(HANDOFF_TESTS_NOTE) for t in body["working_notes"]):
+        raise ValueError(f"working_notes needs a note starting `{HANDOFF_TESTS_NOTE}` with the project's exact "
+                         f"unit-test command (wrapper, timeout, venv, the worktree venv recipe); "
+                         f"`{HANDOFF_TESTS_NOTE} none` if it has no tests")
     body["open_question_ids"] = ids
     body["notes"] = notes
     if len(json.dumps(body, ensure_ascii=False)) > HANDOFF_MAX:
-        raise ValueError(f"the hand-off is too long (> {HANDOFF_MAX} characters as JSON); keep it short")
+        raise ValueError(f"the hand-off is too long (> {HANDOFF_MAX} characters as JSON); keep it short"
+                         + (f" (the working notes carried over count; drop obsolete ones in {HANDOFF_DROP_KEY})"
+                            if carried else ""))
     return body
+
+
+def _carry_notes(carried: Sequence[str], new: list[str], drop_raw: object) -> list[str]:
+    """The carried working notes without the dropped ones (1-based numbers; one that names no
+    carried note is a ValueError), then the new ones that are not already there."""
+    if drop_raw is None:
+        drop_raw = []
+    if not isinstance(drop_raw, list):
+        raise ValueError(f"{HANDOFF_DROP_KEY} must be a list of note numbers, got {type(drop_raw).__name__}")
+    drop = {_position(x, f"a number in {HANDOFF_DROP_KEY}") for x in drop_raw}
+    bad = sorted(n for n in drop if n > len(carried))
+    if bad:
+        raise ValueError(f"{HANDOFF_DROP_KEY} names note(s) {bad}, but the last hand-off given back had "
+                         f"{len(carried)} working note(s)")
+    out = [t for i, t in enumerate(carried, 1) if i not in drop]
+    seen = {_note_key(t) for t in out}
+    for t in new:
+        if _note_key(t) not in seen:
+            seen.add(_note_key(t))
+            out.append(t)
+    if len(out) > HANDOFF_ITEMS_MAX:
+        raise ValueError(f"working_notes has too many items ({len(out)} > {HANDOFF_ITEMS_MAX}) with the carried "
+                         f"ones; list obsolete ones in {HANDOFF_DROP_KEY}")
+    return out
 
 
 def _handoff_dict(r: sqlite3.Row) -> Row:
@@ -3579,12 +3624,14 @@ def add_handoff(conn: sqlite3.Connection, session_id: object, body: object, proj
     """A new hand-off for the session. project: a name, path or id (unknown = NotFound); default
     the project this session is the task-manager of (projects.manager_session), else none."""
     sid = _session_id(session_id)
-    clean = handoff_body(body)
     if project is not None:
         project_id: int | None = _project_row(conn, project)["id"]
     else:
         mp = session_project(conn, sid)
         project_id = mp["id"] if mp else None
+    base = last_given_back_handoff(conn, sid)
+    clean = handoff_body(body, carried=(base["body"].get("working_notes") or []) if base else [],
+                         need_tests_note=project_id is not None)
     with transaction(conn):
         cur = conn.execute("INSERT INTO handoffs(session_id, project_id, created_at, created_by, body) "
                            "VALUES (?, ?, ?, ?, ?)",
@@ -3598,6 +3645,15 @@ def latest_handoff(conn: sqlite3.Connection, session_id: str, unconsumed: bool =
     """The session's newest hand-off (only an unconsumed one if `unconsumed`), or None."""
     sql = "SELECT * FROM handoffs WHERE session_id=?" + (" AND consumed_at IS NULL" if unconsumed else "")
     r = conn.execute(sql + " ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+    return _handoff_dict(r) if r else None
+
+
+def last_given_back_handoff(conn: sqlite3.Connection, session_id: str) -> Row | None:
+    """The newest consumed hand-off: the one the session was last given back (a consume also
+    closes the older ones, so the highest consumed id is it), or None. Hand-offs written since
+    are not it: a refresh or a retry replaces them and starts from the same base."""
+    r = conn.execute("SELECT * FROM handoffs WHERE session_id=? AND consumed_at IS NOT NULL "
+                     "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
     return _handoff_dict(r) if r else None
 
 

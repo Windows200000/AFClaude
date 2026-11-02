@@ -422,6 +422,18 @@ class Handoff(Env):
         self.assertEqual([h["body"][k] for k in ("owner_messages", "in_flight", "lessons", "working_notes")],
                          [["do X, verbatim"], ["branch b1"], ["retry first"], ["run it under .venv"]])   # D-305
         self.assertEqual((audit["actor"], audit["via"]), (f"mcp:{CALLER}", "mcp"))
+        self.assertEqual(r["working_notes"], 1)
+        c = self.conn()
+        try:
+            actions.perform(c, "handoff.consume", {"handoff_id": r["id"], "start_key": "k"}, actor="keepalive", via="runner")
+        finally:
+            c.close()
+        r = run(ms.afclaude_handoff("later", working_notes=["new"], drop_working_notes=[1]))   # carried unless dropped
+        self.assertEqual(r["working_notes"], 1)
+        r = run(ms.afclaude_handoff("later still"))
+        self.assertEqual(r["working_notes"], 1)
+        with self.assertRaisesRegex(ToolError, "names note"):
+            asyncio.run(ms.afclaude_handoff("x", drop_working_notes=[5]))
         with self.assertRaisesRegex(ToolError, "only its own"):          # not another session's
             asyncio.run(ms.afclaude_handoff("x", session=SID))
         with self.assertRaisesRegex(ToolError, "summary must not be empty"):
@@ -735,8 +747,8 @@ class Stdio(unittest.TestCase):
         # 12000 until afclaude_decisions (D-242), 13000 until afclaude_notice (D-306) and the hand-off's D-305 fields,
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
         # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
-        # then afclaude_ask's options (phase 4b Q3 W1: 17800)
-        self.assertLess(size, 18000, f"tool list is {size} bytes")
+        # then afclaude_ask's options (phase 4b Q3 W1: 17800), 18500 for the hand-off's drop_working_notes (was 17987)
+        self.assertLess(size, 18500, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

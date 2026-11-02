@@ -1291,10 +1291,47 @@ class Handoffs(Base):
     def test_project_defaults_to_the_managed_one(self):
         p = self.do("project.add", name="AFClaude")
         self.do("project.edit", project="AFClaude", manager_session=SID)
-        self.assertEqual(self.do("handoff.write", session_id=SID, body={"summary": "s"})["project_id"], p["id"])
+        body = {"summary": "s", "working_notes": ["tests: none"]}
+        self.assertEqual(self.do("handoff.write", session_id=SID, body=body)["project_id"], p["id"])
         self.assertIsNone(self.do("handoff.write", session_id=SID2, body={"summary": "s"})["project_id"])
         with self.assertRaises(store.NotFound):
             self.do("handoff.write", session_id=SID2, body={"summary": "s"}, project="nope")
+
+    def test_a_managers_working_notes_need_a_tests_note(self):
+        """The review of 02.11. (D-305): the exact test command was missing in 8 windows."""
+        self.do("project.add", name="AFClaude")
+        self.do("project.edit", project="AFClaude", manager_session=SID)
+        for notes in ([], ["deploy: tools/deploy.py"]):
+            with self.assertRaisesRegex(ValueError, "needs a note starting `tests:`"):
+                self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": notes})
+        self.assertEqual(self.count("handoffs"), 0)
+        h = self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": ["Tests: none"]})
+        self.assertEqual(h["body"]["working_notes"], ["Tests: none"])
+
+    def test_working_notes_carry_over_unless_dropped(self):
+        """The previous hand-off's working notes are kept (the lost ovm3 note, 02.11.), minus the
+        numbers in drop_working_notes; the base is the hand-off last given back, not a newer unconsumed one."""
+        def write(**kw):
+            return self.do("handoff.write", session_id=SID, body=dict({"summary": "s"}, **kw))["body"]
+        self.assertEqual(write(working_notes=["a", "b"])["working_notes"], ["a", "b"])   # nothing given back yet
+        with self.assertRaisesRegex(ValueError, "names note.s. \\[1\\].*had 0"):
+            write(drop_working_notes=[1])
+        first = store.latest_handoff(self.conn, SID)
+        self.do("handoff.consume", actor="keepalive", via="runner", handoff_id=first["id"], start_key="k1")
+        b = write(working_notes=["c", " B ", "a"], drop_working_notes=[1])      # drops "a"; "b" is not repeated
+        self.assertEqual(b["working_notes"], ["b", "c", "a"])
+        self.assertNotIn("drop_working_notes", b)
+        b2 = write(working_notes=["d"])                                           # a refresh: same base as above
+        self.assertEqual(b2["working_notes"], ["a", "b", "d"])
+        with self.assertRaisesRegex(ValueError, "names note.s. \\[3\\]"):
+            write(drop_working_notes=[3])
+        with self.assertRaisesRegex(ValueError, "list of note numbers"):
+            write(drop_working_notes="1")
+        self.do("handoff.consume", actor="keepalive", via="runner", handoff_id=store.latest_handoff(self.conn, SID)["id"],
+                start_key="k2")
+        self.assertEqual(write()["working_notes"], ["a", "b", "d"])              # carried again on the next one
+        with self.assertRaisesRegex(ValueError, "too many items.*drop_working_notes"):
+            write(working_notes=[f"n{i}" for i in range(30)])
 
     def test_latest_unconsumed_and_consume_supersedes_older(self):
         a = self.do("handoff.write", session_id=SID, body={"summary": "a"})
