@@ -171,7 +171,7 @@ class Env(unittest.TestCase):
         if message.startswith("/compact "):
             if self.compacts:
                 self.write([entry("system", now, subtype="compact_boundary", content="Conversation compacted",
-                                  compactMetadata={"trigger": "manual"}),
+                                  compactMetadata={"trigger": "manual", "preTokens": 401_000, "postTokens": 24_300}),
                             entry("user", now, isCompactSummary=True,
                                   message={"role": "user", "content": "This session is being continued ..."})], "a")
         elif message.startswith((SAVE, RESEND, REFRESH)):
@@ -487,6 +487,13 @@ class CompactAtRunEnd(Env):
         self.assertTrue(self.sent[2][1].startswith(AFTER + " right after the run ended"))
         self.assertEqual(self.fire_kw[2]["prompt"], "compact_after")                      # usage split S2
         self.assertEqual(rec["status"], "compacted")
+        # one /compact went out, and the message after it says it was one (inbox #46: the session view
+        # shows the /compact line twice): its time and the context before and after it
+        self.assertEqual([m for _, m in self.sent if m.startswith("/compact ")], [self.sent[1][1]])
+        self.assertEqual((rec["steps"]["pre_tokens"], rec["steps"]["post_tokens"]), (401_000, 24_300))
+        done = ka._hm(ka._entry_ts(rec["steps"], "done_at"))                  # the compact_boundary's time
+        self.assertIn(f"(D-144/D-238): one compaction (done at {done}, context 401k to 24k tokens); Claude Code "
+                      "shows the /compact line twice", self.sent[2][1])
         # the compaction's own writes never revive the run (run_active)
         self.assertIsNone(ka.run_active(SID, datetime.now(UTC)))
 
@@ -1680,6 +1687,17 @@ class FireFailures(unittest.TestCase):
         ka.host.run_on_host = lambda argv, **k: types.SimpleNamespace(returncode=0, stdout="not json", stderr="")
         with self.assertRaises(ValueError):
             ka.agent_entries(SID)
+
+
+class CompactionText(unittest.TestCase):
+    """compact_resume.md's {compaction} (inbox #46): one compaction, with what the marker gave."""
+    def test_what_the_marker_gave(self):
+        done = "2026-11-02T15:33:09.033Z"
+        self.assertEqual(ka.compaction_text({"done_at": done, "pre_tokens": 229_463, "post_tokens": 24_262}),
+                         "one compaction (done at 16:33 CET, context 229k to 24k tokens)")
+        self.assertEqual(ka.compaction_text({"done_at": done, "pre_tokens": None, "post_tokens": None}),
+                         "one compaction (done at 16:33 CET)")    # only the summary entry was found
+        self.assertEqual(ka.compaction_text(None), "one compaction")
 
 
 if __name__ == "__main__":
