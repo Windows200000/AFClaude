@@ -28,11 +28,11 @@ required/(total available-user usage)".
                         stretch fills what is left (100 - weekly % - the user's forecast during it)
                         in its slot starts; later weeks the same from 0%. A session window's
                         weekly cost = ratio x 100 (limit_ratio.preferred_ratio via pacing).
-                        Design chats (D-266): the gate's forecast is the user's other use + the
-                        design chats (pacing.forecast_gate, so the gate stays protective), and the
+                        Design chats (D-266, D-325): the gate's forecast is the user's other use +
+                        the owner's design chats (pacing.forecast_gate, as the live gate), and the
                         design chats are AFClaude work too: their steady weekly amount (D-264,
-                        pacing.forecast_design) / the full session's weekly % is capacity, one
-                        "design" slot per day.
+                        pacing.forecast_design: the cleaned measure, the same function the gate
+                        uses) / the full session's weekly % is capacity, one "design" slot per day.
     ETA                 the stages' cumulative sessions laid onto those slots in order: stage k is
                         done in the slot where the capacity reaches the sum of stages 1..k.
     stage share         (D-264, 25.10. ETA review: capacity all counted as stage work fell the ETA
@@ -169,7 +169,7 @@ def _no_usage(a: datetime, b: datetime) -> float:
 
 
 def _design(g: Gate, a: datetime, b: datetime) -> float:
-    """The design chats' forecast weekly % in [a, b) (pacing.forecast_design; without it the
+    """The design chats' forecast weekly % in [a, b) (pacing.forecast_design, D-325; without it the
     steady amount design_week spread evenly)."""
     if g.design_forecast is not None:
         return g.design_forecast(a, b)
@@ -177,7 +177,7 @@ def _design(g: Gate, a: datetime, b: datetime) -> float:
 
 
 def gate_forecast(g: Gate) -> Forecast:
-    """What the night gate adds (pacing.forecast_gate): the user's other use + the design chats."""
+    """What the night gate adds (pacing.forecast_gate, D-325): the user's other use + the design chats."""
     fc = g.forecast or _no_usage
     return lambda a, b: fc(a, b) + _design(g, a, b)
 
@@ -428,7 +428,7 @@ def assumptions_text(result: Mapping[str, Any]) -> str:
             f"~{a.get('sessions_per_day')} session windows/day already counts only the {share_pct}% of usage "
             f"that goes to stage work ({a.get('stage_share_info')}) "
             f"({a.get('gate_sessions_per_week')}/week: {a.get('night_sessions_per_week')} the night gate + last stretch "
-            f"allow + {a.get('design_sessions_per_week')} design chats ({a.get('design_forecast_week')}%/week, D-266); "
+            f"allow + {a.get('design_sessions_per_week')} design chats ({a.get('design_forecast_week')}%/week, cleaned, D-266/D-325); "
             f"owner's formula (100 - other user forecast {a.get('user_forecast_week')}%) / {a.get('full_session_cost')}% per session "
             f"x stage share = {a.get('formula_sessions_per_week')}/week; this week {a.get('this_week_sessions')} left). "
             f"Ratio {a.get('ratio')}, threshold {a.get('threshold')}%. Estimates: {src.get('estimate', 0)} set, "
