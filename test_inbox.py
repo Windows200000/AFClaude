@@ -336,6 +336,25 @@ class Triage(FakeHaiku):
         self.assertIn("Goal for later: a dark mode.", kw["input"])
         self.assertEqual(self.fired, [])
 
+    def test_triage_text_tells_haiku_a_follow_up_answers_a_question(self):
+        """D-324: a follow-up still goes through the Haiku triage (it may wait, D-237); the text it gets says it follows
+        a reply, and whether that reply asked the owner something."""
+        asked = self.post("Should the box expand?")
+        self.run_("inbox.reply", message_id=asked["id"], answer="A or B?", needs_input=True)
+        plain = self.post("Status?")
+        self.run_("inbox.reply", message_id=plain["id"], answer="Done.")
+        time.sleep(0.01)
+        a = actions.perform(self.conn, "inbox.post", {"text": "B please", "parent": asked["id"]}, actor="owner", via="dashboard")
+        b = actions.perform(self.conn, "inbox.post", {"text": "And the tests?", "parent": plain["id"]}, actor="owner", via="dashboard")
+        iw.process(self.conn, verify=lambda *a: None)
+        self.assertEqual(len(self.calls), 2)                                  # both triaged by Haiku
+        ta, tb = (c[1]["input"] for c in self.calls)
+        self.assertIn(f"follow-up to the task-manager's reply on inbox #{asked['id']}, which asked the owner something", ta)
+        self.assertIn("B please", ta)
+        self.assertIn(f"follow-up to the task-manager's reply on inbox #{plain['id']})", tb)
+        self.assertNotIn("asked the owner", tb)
+        self.assertEqual((self.row(a["id"])["verdict"], self.row(b["id"])["verdict"]), ("note", "note"))   # the fake's verdict
+
     def test_haiku_timeout_is_an_error_and_nothing_is_delivered(self):
         def boom(argv, **kw):
             raise subprocess.TimeoutExpired(argv, 120)

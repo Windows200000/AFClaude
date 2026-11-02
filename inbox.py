@@ -420,6 +420,18 @@ def thread_needs_input(rows: list[dict[str, Any]]) -> bool:
     return bool(last["needs_input"]) and all(m["created_at"] <= last["answered_at"] for m in rows if m is not last)
 
 
+def answers_needs_input(conn: sqlite3.Connection, m: dict[str, Any]) -> bool:
+    """D-324: `m` is a follow-up posted in a thread whose latest reply, before it, asked the owner (needs-input)."""
+    if m.get("parent_id") is None:
+        return False
+    root = store.get_inbox(conn, m["parent_id"])
+    if root is None:
+        return False
+    rows = [root] + [c for c in store.list_inbox(conn, session_id=m["session_id"], limit=1000)
+                     if c["parent_id"] == root["id"]]
+    return thread_needs_input([r for r in sorted(rows, key=lambda r: r["id"]) if r["id"] < m["id"]])
+
+
 def thread_view(conn: sqlite3.Connection, rows: list[dict[str, Any]], now: datetime, cfg: schedule.Config | None = None,
                 reset: timedelta | None = None) -> dict[str, Any]:
     """A thread card (D-324): the first message (`id`, the thread's id) and its follow-ups as `rows` (message_view

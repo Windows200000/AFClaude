@@ -308,7 +308,13 @@ def manager_active(sid: str, now: datetime) -> str | None:
 def triage_text(conn: Any, m: dict[str, Any]) -> str:
     """What Haiku is asked about: the message's text, and for an answer to a question the question in
     front of it ("(answer to the task-manager's question #N <title>)"), so a short "Daily" is judged as an
-    answer. Only for this call: the stored text stays what the owner wrote."""
+    answer; for a follow-up in a thread card (D-324) a line saying so, and whether the reply it follows asked
+    the owner something, so Haiku can weigh it (the triage still decides now or note). Only for this call: the
+    stored text stays what the owner wrote."""
+    if m.get("parent_id") is not None:
+        asked = (", which asked the owner something or waited for their decision"
+                 if inbox.answers_needs_input(conn, m) else "")
+        return f"(the owner's follow-up to the task-manager's reply on inbox #{m['parent_id']}{asked})\n{m['text']}"
     about = inbox.question_about(conn, m)
     if about is None:
         return str(m["text"])
