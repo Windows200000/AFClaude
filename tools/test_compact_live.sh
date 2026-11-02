@@ -300,7 +300,7 @@ try:
                    "the codeword from the hand-off above, then FRESH if that hand-off was introduced as the one "
                    "you saved before the compaction, or STALE if it was labelled stale.")
         sent_at = datetime.now(UTC)
-        rc, o, err = ka.fire(sid, cwd, msg, "send-keys")
+        rc, o, err = ka.fire(sid, cwd, msg, "send-keys", driver="auto", prompt="compact_live_test")
         res["continue_sent_at"] = sent_at.isoformat().replace("+00:00", "Z")
         res["continue_rc"] = rc
         if handoff and rc == 0:

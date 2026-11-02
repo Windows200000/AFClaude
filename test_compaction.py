@@ -100,6 +100,7 @@ class Env(unittest.TestCase):
         self.turn = self.turn_polls = 0
         self.turn_handoff = None
         self.alerts, self.sent = [], []
+        self.fire_kw = []                                   # fake_fire's keyword arguments (driver, prompt, ...)
         self.now = datetime.now(UTC)
         self.usage = {"session": {"percent": 50.0, "resets_at": self.now + timedelta(hours=2)},
                       "weekly": {"percent": 40.0, "resets_at": self.now + timedelta(days=3)},
@@ -159,7 +160,12 @@ class Env(unittest.TestCase):
         /compact (a compact_boundary + summary in the same transcript), answers the save prompt as
         self.saves says (write: a hand-off into the DB, then "HANDOFF SAVED"; silent: a reply
         without one; hang: still working on it; ignore: nothing reaches the transcript) and answers
-        anything else. The transcript is then quiet (old mtime), so the session reads as idle."""
+        anything else. The transcript is then quiet (old mtime), so the session reads as idle.
+        Like keepalive.fire, it needs `driver` (auto | owner) and `prompt` (usage split S2): a caller
+        that doesn't say fails the test."""
+        if kw.get("driver") not in ("auto", "owner") or not kw.get("prompt"):
+            raise TypeError(f"fire() needs driver= (auto|owner) and prompt=, got {kw}")
+        self.fire_kw.append(kw)
         self.sent.append((plan, message))
         now = datetime.now(UTC)
         if message.startswith("/compact "):
@@ -287,6 +293,8 @@ class CompactWhenIdle(Env):
         self.assertEqual((d.due, d.trigger), (True, "idle"))
         self.assertEqual([p for p, _ in self.sent], ["send-keys"] * 3)
         save, compact, after = (m for _, m in self.sent)
+        self.assertEqual([(k["driver"], k["prompt"]) for k in self.fire_kw],             # usage split S2
+                         [("auto", "session_end_save"), ("auto", "compact"), ("auto", "compact_after")])
         self.assertTrue(save.startswith(SAVE))
         self.assertNotIn("\n", save)
         for part in ("you have been idle for 50 min", "COMPACTS", "right after your reply", "afclaude_handoff",
@@ -477,6 +485,7 @@ class CompactAtRunEnd(Env):
         self.assertTrue(self.sent[0][1].startswith(SAVE))
         self.assertIn("the run is over", self.sent[0][1])
         self.assertTrue(self.sent[2][1].startswith(AFTER + " right after the run ended"))
+        self.assertEqual(self.fire_kw[2]["prompt"], "compact_after")                      # usage split S2
         self.assertEqual(rec["status"], "compacted")
         # the compaction's own writes never revive the run (run_active)
         self.assertIsNone(ka.run_active(SID, datetime.now(UTC)))
@@ -617,6 +626,7 @@ class SaveResend(Env):
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
         self.assertEqual([m[:len(SAVE)] for _, m in self.sent][:2], [SAVE, RESEND[:len(SAVE)]])
         save, resend, compact, after = (m for _, m in self.sent)
+        self.assertEqual([k["prompt"] for k in self.fire_kw][:2], ["session_end_save", "session_end_save_retry"])
         self.assertTrue(resend.startswith(RESEND))
         self.assertNotIn("\n", resend)
         for part in (f"#{early['id']}", "written before the save prompt", f'session "{SID}"',
@@ -712,7 +722,7 @@ class CompactionFailures(Env):
             if message.startswith(RESEND):
                 self.sent.append((plan, message))
                 return 1, "", "no tmux session"
-            return self.fake_fire(sid, cwd, message, plan)
+            return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
         self.assert_failed(rec, "the save prompt could not be sent (after the save prompt was re-sent", [SAVE, RESEND])
@@ -722,7 +732,7 @@ class CompactionFailures(Env):
             if message.startswith(SAVE):
                 self.sent.append((plan, message))
                 return 1, "", "no tmux session"
-            return self.fake_fire(sid, cwd, message, plan)
+            return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
         self.assert_failed(rec, "the save prompt could not be sent", [SAVE])
@@ -733,7 +743,7 @@ class CompactionFailures(Env):
         self.saves = "hang"
 
         def fire(sid, cwd, message, plan, new=False, **kw):
-            r = self.fake_fire(sid, cwd, message, plan)
+            r = self.fake_fire(sid, cwd, message, plan, **kw)
             os.utime(self.path, None)                                         # it just wrote: busy
             return r
         ka.fire = fire
@@ -799,7 +809,7 @@ class CompactionFailures(Env):
             if message.startswith(AFTER):
                 self.sent.append((plan, message))
                 return 1, "", "send-keys failed"
-            return self.fake_fire(sid, cwd, message, plan)
+            return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
         self.assert_failed(rec, "the hand-off could not be sent after the compaction", [SAVE, "/compact ", AFTER])
@@ -809,7 +819,7 @@ class CompactionFailures(Env):
         def fire(sid, cwd, message, plan, new=False, **kw):
             if message.startswith("/compact"):
                 raise OSError("host bridge down")
-            return self.fake_fire(sid, cwd, message, plan)
+            return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
         self.assert_failed(rec, "the /compact step failed", [SAVE])
@@ -934,6 +944,7 @@ class MidRunWithSubagents(Env):
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
         self.assertEqual([m[:len(REFRESH)] for _, m in self.sent][1], REFRESH)
         self.assertIn("a subagent's message (from ", self.sent[1][1])
+        self.assertEqual((self.fire_kw[1]["driver"], self.fire_kw[1]["prompt"]), ("auto", "session_end_save_refresh"))
         self.assertEqual(len(rec["steps"]["save"]["refreshes"]), 1)
 
     def test_a_message_delivered_into_the_save_turn_after_the_handoff_counts_too(self):
@@ -1639,13 +1650,13 @@ class FireFailures(unittest.TestCase):
         ka.pid_alive = lambda pid: True
         ka.TAKE_OVER_WAIT = 0
         with self.assertRaisesRegex(RuntimeError, r"pid\(s\) \[42\] still alive"):
-            ka.fire(SID, "/tmp", "go", "take-over:42")
+            ka.fire(SID, "/tmp", "go", "take-over:42", driver="auto", prompt="test")
         self.assertEqual(self.runs, [])                                      # never resumed
 
     def test_bg_stop_failure_raises(self):
         self.rc = 1
         with self.assertRaisesRegex(RuntimeError, "claude stop abcdef01. failed rc=1"):
-            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume")
+            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume", driver="auto", prompt="test")
         self.assertEqual(len(self.runs), 1)                                  # only the stop, no resume
 
     def test_a_failed_usage_cache_read_raises_in_the_decision_paths(self):

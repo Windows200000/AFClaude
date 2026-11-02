@@ -456,7 +456,8 @@ class Pass:
             return "dry-run", tmux
         try:
             rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model,
-                                   category=ka.remote_control.CONTINUE)   # D-269
+                                   category=ka.remote_control.CONTINUE,   # D-269
+                                   driver="auto", prompt="continue" if af else "continue_foreign", actor="dispatcher")
         except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "result": "launch-error",
                                        "error": f"{type(e).__name__}: {e}"[:300]}
@@ -505,6 +506,9 @@ class Pass:
         def sending(name):
             # recorded and saved BEFORE the sender starts: a pass killed from here on never sends again
             # (the stall is handled; the mark is an error the next pass alerts on, Pass.run)
+            # The typed_messages row first (usage split S2: rc_continue.send has no fire): a failed record
+            # raises out of send() before anything is sent, into the error handler below (D-235).
+            ka.record_typed(sid, msg, "auto", ka.remote_control.CONTINUE, "continue_foreign", "dispatcher")
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-sending",
                                        "thread": name}
             save_state(self.st)

@@ -109,21 +109,21 @@ class Fire(Base):
         super().tearDown()
 
     def test_default_is_unchanged(self):
-        ka.fire(SID, "/tmp", "go", "resume", new=True)
+        ka.fire(SID, "/tmp", "go", "resume", new=True, driver="auto", prompt="test")
         self.assertEqual(self.runs[-1][-1], "--new")
         self.assertNotIn(rcs.NO_RC_FLAG, self.runs[-1])
 
     def test_category_off(self):
         testenv.set_setting("remote_control_review", False)
-        ka.fire(SID, "/tmp", "go", "resume", category=rcs.REVIEW)
+        ka.fire(SID, "/tmp", "go", "resume", category=rcs.REVIEW, driver="auto", prompt="test")
         self.assertEqual(self.runs[-1][-1], rcs.NO_RC_FLAG)
-        ka.fire(SID, "/tmp", "go", "resume")                               # task_manager: still on
+        ka.fire(SID, "/tmp", "go", "resume", driver="auto", prompt="test")                               # task_manager: still on
         self.assertNotIn(rcs.NO_RC_FLAG, self.runs[-1])
 
     def test_invalid_aborts_before_any_host_call(self):
         testenv.put_raw("remote_control_task_manager", "maybe")
         with self.assertRaisesRegex(rcs.RemoteControlError, "remote_control_task_manager"):
-            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume")
+            ka.fire(SID, "/tmp", "go", "stop-bg-then-resume", driver="auto", prompt="test")
         self.assertEqual(self.runs, [])                                  # no `claude stop`, no resume
 
 

@@ -99,6 +99,8 @@ class RunOnce(Base):
         self.assertTrue(new)
         self.assertIn("one-off", k.get("name", ""))
         self.assertEqual(k.get("category"), "review")             # its Remote Control setting (D-269)
+        self.assertEqual((k["driver"], k["prompt"], k["actor"]),                  # usage split S2
+                         ("auto", "stage_eta_review_oneoff", "runner:usage_review"))
         self.assertEqual(self.claims, [(sid, "review", 0, {"actor": "runner:usage_review"})])   # named before the fire
         # only the one-off prompt + guard_respect + manager: never the regular usage_review.md
         # brief, and the owner's verbatim D-220/D-221 concerns are in it

@@ -1153,16 +1153,45 @@ def launch_for(session_id, name=None, model=None):
     return {**LAUNCH, **({"name": name} if name else {}), **({"model": model} if model else {}), **project}
 
 
-def fire(session_id, cwd, message, plan, new=False, name=None, model=None, category=remote_control.TASK_MANAGER):
+TYPED_DRIVERS = ("auto", "owner")    # fire(driver=): who the text is from (usage split S2, §3.1)
+
+
+def record_typed(session_id, message, driver, category, prompt, actor):
+    """The typed_messages row of a message fire() is about to send (goal 12 usage split S2,
+    docs/usage_split_plan.md §3.1): its driver, launch category, prompt name and the hash of its text
+    (usage_split.text_hash, what the sampler matches transcript prompts against), through actions.py's
+    typed.record (audited, actor = the sending component). A failure raises (D-235): the caller
+    sends nothing, no untracked message. -> the row."""
+    import actions
+    import store
+    import usage_split
+    conn = store.connect()
+    try:
+        return actions.perform(conn, "typed.record", {"session_id": session_id, "driver": driver,
+                                                      "category": category, "prompt": prompt,
+                                                      "text_sha256": usage_split.text_hash(message)},
+                               actor=actor, via="runner")
+    finally:
+        conn.close()
+
+
+def fire(session_id, cwd, message, plan, new=False, name=None, model=None, category=remote_control.TASK_MANAGER,
+         *, driver, prompt, actor="keepalive"):
     """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg) under the
     session's stored tmux name (tmux_name: its launcher stored it first, claim_tmux; none is an
     error). name (the Remote Control display name, default the tmux name) / model override
     LAUNCH's for this launch; a project's task-manager launch overrides both (launch_for, D-260);
-    `category` picks the Remote Control setting (D-269). All are resolved first, so a failure
-    there changes nothing."""
+    `category` picks the Remote Control setting (D-269). `driver` (required, no default: auto =
+    AFClaude's own text, owner = the owner's inbox message it delivers), `prompt` (the text's name)
+    and `actor` (the sending component) go into the typed_messages row recorded before the send
+    (record_typed, usage split S2). All are resolved first, so a failure there (the record
+    included: D-235, no untracked message) changes nothing."""
+    if driver not in TYPED_DRIVERS:
+        raise ValueError(f"fire: driver must be one of {'|'.join(TYPED_DRIVERS)}, got {driver!r}")
     tmux = tmux_name(session_id)
     launch = launch_for(session_id, name, model)
     remote = remote_control.launch_flags(category)
+    record_typed(session_id, message, driver, category, prompt, actor)
     if plan.startswith("take-over:"):
         pids = [int(x) for x in plan.split(":", 1)[1].split(",")]
         for pid in pids:
@@ -2561,7 +2590,8 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
         conn.close()
     sent_at = datetime.now(UTC)
     try:
-        rc, so, se = fire(sid, path, msg, "resume", new=True)
+        rc, so, se = fire(sid, path, msg, "resume", new=True, driver="auto", prompt="manager_first_start",
+                          actor=actor)
     except subprocess.TimeoutExpired as e:
         if tmux_has(tmux):   # a raise here (the check failed) keeps it too: unknown is not taken back
             raise RuntimeError(f"the launch of the new task-manager of {project['name']!r} timed out ({e}), "
@@ -2691,7 +2721,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     at_fire = _fire_usage()          # the run's start values (run_metrics.py, D-207)
     offset = os.path.getsize(path) if held_ids and path else 0   # the held messages' markers come after
     sent_at = datetime.now(UTC)
-    rc, out, err = fire(sid, cwd, msg, plan)
+    rc, out, err = fire(sid, cwd, msg, plan, driver="auto", prompt=stall.get("prompt", "continue"))
     errors = []                      # failures after the continue went out: recorded, then raised;
                                      # (subject, detail[, session]): an inbox one pauses only sid's project (D-244)
     if not stall.get("run_now"):     # a run-now (3b S5, D-153) is not one of the night's capped starts
@@ -3148,7 +3178,7 @@ def compact_session(sid, cwd, path):
     if not wait_idle(path, COMPACT_TURN_WAIT):
         return compaction_busy(sid, "before /compact", COMPACT_TURN_WAIT)
     since = datetime.now(UTC)
-    rc, out, err = fire(sid, cwd, compact_command(), "send-keys")
+    rc, out, err = fire(sid, cwd, compact_command(), "send-keys", driver="auto", prompt="compact")
     log(f"compaction: sent /compact to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     if rc != 0:
         return {"status": "send-failed", "sent_at": since, "rc": rc,
@@ -3294,21 +3324,22 @@ def save_before_compaction(sid, cwd, path, trigger="run-end"):
     except Exception as e:   # noqa: BLE001 - an error (D-234): no save prompt, the start is aborted
         log(f"compaction: {sid[:8]}'s hand-offs unreadable ({type(e).__name__}: {e}); no save prompt")
         return dict(out, status="db-error", error=f"{type(e).__name__}: {e}"[:200])
-    res = _await_save(sid, cwd, path, save_text(sid, trigger), before, dict(out), "sent_at")
+    res = _await_save(sid, cwd, path, save_text(sid, trigger), before, dict(out), "sent_at", "session_end_save")
     if res["status"] != "no-handoff":
         return res
     log(f"compaction: {sid[:8]} answered the save prompt without a new hand-off (newest #{before}, "
         "from before it); re-sending it once")
-    return _await_save(sid, cwd, path, save_retry_text(sid, before), before, res, "resent_at")
+    return _await_save(sid, cwd, path, save_retry_text(sid, before), before, res, "resent_at",
+                       "session_end_save_retry")
 
 
-def _await_save(sid, cwd, path, text, before, out, at_key):
+def _await_save(sid, cwd, path, text, before, out, at_key, prompt):
     """Type `text` (a save prompt) and wait for a hand-off row of the session newer than `before`
     (see save_before_compaction). `out` gets the send time under `at_key`. Only a reply newer than
     the transcript's last entry before the send counts (the re-send: not the first reply again)."""
     prev = last_activity(path)
     since = datetime.now(UTC)
-    rc, o, err = fire(sid, cwd, text, "send-keys")
+    rc, o, err = fire(sid, cwd, text, "send-keys", driver="auto", prompt=prompt)
     log(f"compaction: sent the save prompt to {sid[:8]} ({at_key}) rc={rc} stdout={o.strip()!r} "
         f"stderr={err.strip()!r}")
     out[at_key] = since
@@ -3362,7 +3393,7 @@ def refresh_stale_handoff(sid, cwd, path, save):
         what = f"{' and '.join(sorted({w for _, w in new}))} (from {_hm(new[0][0])})"
         log(f"compaction: {what} reached {sid[:8]} after its hand-off #{save['handoff_id']}; asking for it again")
         res = _await_save(sid, cwd, path, save_refresh_text(sid, save["handoff_id"], what), save["handoff_id"],
-                          {"after": what, "stale_id": save["handoff_id"]}, "sent_at")
+                          {"after": what, "stale_id": save["handoff_id"]}, "sent_at", "session_end_save_refresh")
         save["refreshes"].append(_jsonable(res))
         if res["status"] != "saved":
             return dict(save, status=res["status"], error=res.get("error"), still_busy=res.get("still_busy"))
@@ -3968,7 +3999,8 @@ def _compact_now(sid, path, d, rec, head):
             msg = session_message("compact_after_run", repo=proj["repo"], hooked=rules_hooked(cwd), resume=insert,
                                   insert=notes, **run)
         sent_at = datetime.now(UTC)
-        rc, out, err = fire(sid, cwd, msg, "send-keys")
+        rc, out, err = fire(sid, cwd, msg, "send-keys", driver="auto",
+                            prompt="compact_after" if run is None else "compact_after_run")
         if rc != 0:
             return _compaction_failed(sid, d.key, rec, "the hand-off could not be sent after the compaction",
                                       f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip())

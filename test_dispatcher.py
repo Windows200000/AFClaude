@@ -16,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import dispatcher as dp  # noqa: E402
+import usage_split  # noqa: E402
 import keepalive as ka  # noqa: E402
 import stalled  # noqa: E402
 import store  # noqa: E402
@@ -230,6 +231,11 @@ class Stalled(Base):
         self.assertIn("Guard hooks", msg)
         self.assertNotIn("TASK-MANAGER", msg)                     # neutral: no manager rules
         self.assertEqual(call[call.index("--model") + 1], "claude-sonnet-test")   # its own model
+        typed = self.conn.execute("SELECT driver, prompt, category, actor, text_sha256 FROM typed_messages "
+                                  "WHERE session_id=?", (sid(1),)).fetchall()                # usage split S2
+        self.assertEqual([tuple(r)[:4] for r in typed], [("auto", "continue_foreign", "continue", "dispatcher")])
+        sent = " ".join(call[call.index("--message") + 1:call.index("--cwd")])   # (the fake log splits on spaces)
+        self.assertEqual(typed[0][4], usage_split.text_hash(sent))
         skips = "\n".join(rep["skip"])
         self.assertIn(f"{sid(2)[:8]}: undecided", skips)
         self.assertIn(f"{sid(3)[:8]}: ignored", skips)
@@ -1026,6 +1032,26 @@ class RcThreads(HolderBase):
             self.assertEqual((h["result"], h["thread"]), ("rc-delivered", "work-a1"))
             self.run_pass()                                          # one continue per stall (D-206)
         self.assertEqual(len(self.sent), 1)
+
+    def test_the_continue_is_recorded_as_an_auto_typed_row(self):
+        """Usage split S2: rc_continue.send has no fire, so the dispatcher records the text itself, before
+        the send (the sampler matches the thread's transcript prompt against it)."""
+        self.register()
+        with self.sender():
+            self.run_pass()
+        rows = self.conn.execute("SELECT driver, prompt, category, actor, text_sha256 FROM typed_messages "
+                                 "WHERE session_id=?", (sid(1),)).fetchall()
+        self.assertEqual([tuple(r)[:4] for r in rows], [("auto", "continue_foreign", "continue", "dispatcher")])
+        self.assertEqual(rows[0][4], usage_split.text_hash(self.sent[0][1]))
+
+    def test_a_failed_record_means_no_send(self):
+        self.register()
+        with self.sender(), mock.patch.object(ka, "record_typed", side_effect=RuntimeError("db down")):
+            rep = self.run_pass()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.st["handled"][self.stall_key()]["result"], "rc-send-error")
+        self.assertTrue(any("db down" in x for x in rep["skip"]), rep["skip"])
 
     def test_dry_run_sends_nothing(self):
         self.register()

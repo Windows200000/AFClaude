@@ -3426,6 +3426,34 @@ def setup_claim_code(conn: sqlite3.Connection, ctx: Ctx, id: Any, kind: Any, use
     return Result({"id": cid, "kind": k, "user_id": uid}, cid, {"used_at": None}, {"used_at": now})
 
 
+# ---------------------------------------------------------------- typed messages (goal 12 usage split S2)
+#
+# docs/usage_split_plan.md §3.1: keepalive.fire records every message AFClaude types or launches with
+# BEFORE it sends it (a failed record aborts the send, D-235); the sampler matches transcript prompts
+# against these rows to learn who drove each turn. The raw text never reaches the DB, only its hash.
+
+TYPED_PROMPT_MAX = 64
+
+
+@action("typed.record", "typed_message")
+def typed_record(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, driver: Any, category: Any, prompt: Any,
+                 text_sha256: Any) -> Result:
+    """One typed_messages row: `session_id` the session the text goes to, `driver` auto (AFClaude's own
+    text) | owner (the owner's inbox message it delivers), `category` the launch's Remote Control category
+    (remote_control.CATEGORIES), `prompt` the sender's name for the text, `text_sha256` =
+    usage_split.text_hash(text). The actor is the sending component; the runners' step, not for MCP.
+    -> the row."""
+    _runner_only(ctx, "typed.record")
+    sid = store._session_id(session_id)
+    d = store._enum(driver, store.TYPED_DRIVERS, "driver")
+    cat = store._enum(category, tuple(remote_control.CATEGORIES), "category")
+    name = store._text(prompt, "prompt", required=True)
+    if len(name) > TYPED_PROMPT_MAX:
+        raise ValueError(f"prompt must be at most {TYPED_PROMPT_MAX} characters")
+    row = store.add_typed_message(conn, sid, d, cat, name, _sha256_hex(text_sha256, "text_sha256"), ctx.actor)
+    return Result(row, row["id"], None, row)
+
+
 # ---------------------------------------------------------------- telemetry appenders (§7.3, phase 2c, D-161)
 #
 # Append-only telemetry rows (usage samples, the weekly series, session windows, the forecast

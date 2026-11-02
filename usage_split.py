@@ -10,7 +10,9 @@ transcript entries, typed-message rows and cost-model records as plain data.
     keep-alive prefix list decides (owner_words.KEEPALIVE_PREFIXES, a delivered inbox message is the owner's).
     Both return a `DriverTrack` carrying its `source` ("typed" | "prefix": never mixed silently);
     `DriverTrack.at(ts)` is the driver in force at a time, which is what a subagent's request (its own
-    transcript) takes from its parent session.
+    transcript) takes from its parent session. `classify()` is either matcher plus each prompt's verdict
+    (`PromptDriver`), with `missed` set where the typed matcher found no row for a text the prefix list
+    calls AFClaude's (a "missed send": the sampler logs and counts it, no alert).
   - `cost_of()`: one request's modeled cost in session-% from compact_timing's cost model (`per_token`, the
     API-price features by token kind, the 5-min and 1-h cache writes apart). A model with no price raises
     `UnpricedModel` (D-235): no default price.
@@ -205,6 +207,45 @@ def driver_of_prefix(entries: Iterable[Mapping[str, Any]], initial: Optional[Dri
     """The same for history from before the typed-message record: the prompt-prefix list decides
     (`prefix_driver`); the track's source is "prefix", never to be mixed with a typed one."""
     return _track(entries, initial, SOURCE_PREFIX, _PrefixMatcher())
+
+
+@dataclass(frozen=True)
+class PromptDriver:
+    """One real prompt's verdict (classify): its driver and `via` as in DriverChange; `missed` = no typed
+    row matched although the text starts with a keep-alive prefix (prefix_driver says auto): an AFClaude
+    send the record lacks (a send path around keepalive.fire), or the owner typing such a text. The
+    caller logs and counts it (no alert: owner-typed prefixes, late queued prompts and the deploy
+    changeover fire it falsely); the verdict stays the typed matcher's (owner), never guessed."""
+    at: datetime
+    uuid: str
+    driver: Driver
+    via: str
+    missed: bool = False
+
+
+def classify(session: str, entries: Iterable[Mapping[str, Any]], typed: Iterable[TypedRow],
+             initial: Optional[Driver] = None, source: str = SOURCE_TYPED) -> tuple[DriverTrack, tuple[PromptDriver, ...]]:
+    """driver_of (source "typed") or driver_of_prefix (source "prefix") plus every real prompt's verdict,
+    in entry order: the sampler needs each prompt's driver (Haiku leaves out AFClaude's, D-131) and the
+    typed matcher's cross-check against the keep-alive prefixes (`missed`)."""
+    entries = list(entries)
+    matcher: Callable[[datetime, str], tuple[Driver, str]]
+    if source == SOURCE_TYPED:
+        matcher = _TypedMatcher(session, typed)
+    elif source == SOURCE_PREFIX:
+        matcher = _PrefixMatcher()
+    else:
+        raise SplitError(f"unknown matcher source {source!r}")
+    verdicts: list[tuple[datetime, Driver, str, bool]] = []
+
+    def decide(at: datetime, text: str) -> tuple[Driver, str]:
+        driver, via = matcher(at, text)
+        verdicts.append((at, driver, via, via == "unmatched" and prefix_driver(text) == "auto"))
+        return driver, via
+    track = _track(entries, initial, source, decide)
+    prompts = [e for e in entries if real_prompt(e) is not None]
+    return track, tuple(PromptDriver(at, str(e.get("uuid") or ""), d, via, missed)
+                        for e, (at, d, via, missed) in zip(prompts, verdicts))
 
 
 # ---------------------------------------------------------------- category and cost

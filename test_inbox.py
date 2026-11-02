@@ -497,6 +497,8 @@ class Delivery(tc.Env):
         self.assertEqual(self.deliver(m), "delivered")
         plan, msg = self.sent[0]
         self.assertEqual(plan, "send-keys")
+        kw = self.fire_kw[0]                          # usage split S2: the owner wrote it, AFClaude typed it
+        self.assertEqual((kw["driver"], kw["prompt"], kw["actor"]), ("owner", "inbox", "runner:inbox"))
         self.assertTrue(msg.startswith(inbox.marker(m["id"])))
         self.assertIn('"Is the login page live?"', msg)
         self.assertIn(f"python3 tasks.py inbox reply {m['id']}", msg)
@@ -805,6 +807,7 @@ class HeldInStarts(tc.Env):
         self.start()
         msg = self.sent[0][1]
         self.assertTrue(msg.startswith("[keep-alive] A new run starts"))
+        self.assertEqual((self.fire_kw[0]["driver"], self.fire_kw[0]["prompt"]), ("auto", "continue"))   # S2: a start
         self.assertIn(f'{inbox.marker(self.held)} (', msg)
         self.assertIn('"Why did the 04:00 run stop? ⏎ Please check."', msg)
         self.assertIn('python3 tasks.py inbox reply <id> "<your answer>"', msg)
