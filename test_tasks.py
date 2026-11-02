@@ -917,6 +917,21 @@ class CLI(Base):
         rc, _, err = self.run_cli("project", "add", "B")
         self.assertIn("already exists", err)
 
+    def test_project_delete(self):
+        """D-323: `project delete P --reason` removes an empty project; one with a stage is refused."""
+        self.run_cli("project", "add", "A")
+        self.run_cli("project", "add", "B")
+        self.run_cli("add", "s1", "--project", "A")
+        rc, _, err = self.run_cli("project", "delete", "A", "--reason", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("can't be deleted", err)
+        with self.assertRaises(SystemExit):                                # --reason is required
+            self.run_cli("project", "delete", "B")
+        rc, out, _ = self.run_cli("project", "delete", "B", "--reason", "mistake")
+        self.assertEqual((rc, out.strip()), (0, "project B deleted"))
+        rc, out, _ = self.run_cli("project", "list")
+        self.assertNotIn("\nB", out)
+
     def test_project_launch(self):
         """D-260: show / set / clear a project's task-manager model and effort."""
         self.run_cli("project", "add", "A")

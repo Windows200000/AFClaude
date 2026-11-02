@@ -447,6 +447,69 @@ class ProjectActions(Base):
         last = self.audit(target_type="project")[-1]
         self.assertEqual((last["before"], last["after"]), ({"manager_session": SID}, {"manager_session": None}))
 
+    def test_delete(self):
+        """D-323: a project with nothing attached is deleted (audited with the reason, ranks close up); any
+        stage, session or bound row refuses it, nothing is cascaded."""
+        self.do("project.add", name="A", path="/home/x/a")
+        self.do("project.add", name="B", path="/home/x/b")
+        self.do("project.add", name="C")
+        with self.assertRaisesRegex(ValueError, "reason"):
+            self.do("project.delete", project="B")
+        r = self.do("project.delete", project="B", reason="made by mistake")
+        self.assertEqual((r["deleted"], r["name"]), (2, "B"))
+        self.assertIsNone(store.get_project(self.conn, "B"))
+        self.assertEqual([(p["name"], p["rank"]) for p in store.list_projects(self.conn)], [("A", 1), ("C", 2)])
+        last = self.audit(target_type="project")[-1]
+        self.assertEqual(last["action"], "project.delete")
+        self.assertEqual((last["before"]["name"], last["before"]["path"]), ("B", "/home/x/b"))
+        self.assertEqual((last["after"]["deleted"], last["after"]["reason"]), (True, "made by mistake"))
+        with self.assertRaises(store.NotFound):
+            self.do("project.delete", project="B", reason="again")
+
+    def test_delete_refuses_what_it_would_orphan(self):
+        pid = self.do("project.add", name="P", path="/home/x/p")["id"]
+
+        def refused(what):
+            n = self.count("audit_log")
+            with self.assertRaisesRegex(ValueError, f"can't be deleted.*{what}"):
+                self.do("project.delete", project="P", reason="test")
+            self.assertIsNotNone(store.get_project(self.conn, "P"))
+            self.assertEqual(self.count("audit_log"), n)                 # a refusal writes nothing
+
+        self.do("project.edit", project="P", manager_session=SID)
+        refused("task-manager session")
+        self.do("project.edit", project="P", manager_session=None)
+        for table, sql in (
+                ("notices", "INSERT INTO notices(created_at, created_by, project_id, title, text) "
+                            "VALUES ('2026-01-01', 'x', ?, 't', 't')"),
+                ("project_pauses", "INSERT INTO project_pauses(project_id, paused, updated_at) "
+                                   "VALUES (?, 0, '2026-01-01')"),
+                ("prompt_vars", "INSERT INTO prompt_vars(project_id, name, updated_at) "
+                                "VALUES (?, 'v', '2026-01-01')")):
+            self.conn.execute(sql, (pid,))
+            self.conn.commit()
+            refused(f"1 {table} row")
+            self.conn.execute(f"DELETE FROM {table}")
+            self.conn.commit()
+        self.do("task.add", title="s", project="P")
+        refused("1 tasks row")                                           # a stage, whatever its status
+        self.do("task.cancel", task_id=1)
+        refused("1 tasks row")
+
+    def test_delete_covers_every_table_that_references_projects(self):
+        """A table added later with a foreign key to projects must be in store.PROJECT_REFERENCES."""
+        found = set()
+        for (name,) in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+            if any(r[2] == "projects" for r in self.conn.execute(f"PRAGMA foreign_key_list({name})")):
+                found.add(name)
+        self.assertEqual(found, set(store.PROJECT_REFERENCES))
+
+    def test_delete_is_owner_only(self):
+        self.do("project.add", name="P")
+        with self.assertRaises(actions.Forbidden):
+            self.do("project.delete", project="P", reason="x", actor="mcp", via="mcp", autonomous=True)
+        self.assertIsNotNone(store.get_project(self.conn, "P"))
+
     def test_manager_launch(self):
         """D-260: a project's task-manager model / effort: checked, audited, "default" clears it."""
         self.do("project.add", name="P", path="/home/x/p")
@@ -520,6 +583,7 @@ class Autonomous(Base):
     OWNER_ONLY = {"session.decide", "session.clear", "rule.add", "rule.remove", "setting.set", "setting.reset",
                   "setting.import", "automation.set", "automation.set_project", "window.set", "prompt.set", "prompt.reset", "request.add",
                   "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss", "project.manager_launch",
+                  "project.delete",                                            # D-323
                   "prompt_var.set", "prompt_var.reset", "prompt_var.migrate",   # D-197: the people set them (5a)
                   "question.decide", "question.answer",                        # phase 4b Q3: the owner's answer
                   # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
@@ -1100,6 +1164,7 @@ class EveryAction(Base):
             ("project.add", {"name": "Q"}), ("project.edit", {"project": "Q", "description": "d"}),
             ("project.move", {"project": "Q", "rank": 1}), ("project.priority", {"project": "P", "priority": "low"}),
             ("project.manager_launch", {"project": "Q", "model": "claude-sonnet-5-5"}),
+            ("project.add", {"name": "Gone"}), ("project.delete", {"project": "Gone", "reason": "mistake"}),
             ("session.decide", {"session_id": SID, "decision": "continue"}), ("session.clear", {"session_id": SID}),
             ("rule.add", {"scope": "session", "match": SID, "decision": "ignore"}),
             ("rule.remove", {"rule_id": 1}),

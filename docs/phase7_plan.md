@@ -25,7 +25,7 @@ Binding inputs: D-154 (one write path with audit), D-184 / D-190 / D-192 (manage
 | answer a question / blocked task | `task.answer` (dashboard double-submit is a no-op) | `tasks.py answer`, MCP `afclaude_answer_task` | none (5a) |
 | tasks: add, edit, priority, move, block, cancel, reopen, start, finish, update | `task.*` | `tasks.py`, MCP `afclaude_add_task` / `afclaude_update_task` | none |
 | questions | `task.ask` | MCP `afclaude_ask` | none |
-| projects: add, edit, rank, whole-project priority, launch model | `project.add/edit/move/priority`, `project.manager_launch` (owner-only) | `tasks.py project …`, MCP `afclaude_project` | launch only |
+| projects: add, edit, rank, whole-project priority, launch model | `project.add/edit/move/priority`, `project.manager_launch` (owner-only), `project.delete` (owner-only, D-323) | `tasks.py project …`, MCP `afclaude_project` | launch only |
 | stalls and rules | `session.decide/clear`, `rule.add/remove` (owner-only) | `tasks.py decide|rule`, MCP `afclaude_decide_session` / `afclaude_rule` | owner-only refuses autonomous MCP |
 | messages | `inbox.post` (owner-only, target = the AFClaude task-manager session), `inbox.retry`, `inbox.reply`; runner steps `triage/hold/deliver/include/fail` | temp dashboard box (`inbox_api.py`: `POST /afclaude/api/inbox`, `…/<id>/retry`, key header), `tasks.py inbox reply|retry` | key header = owner |
 | pause | `automation.set`, `automation.set_project` (owner-only) | `tasks.py automation pause|resume [--project]` | owner-only |

@@ -2151,6 +2151,42 @@ def set_project_launch(conn: sqlite3.Connection, ref: object, **fields: str | No
         return _project_row(conn, p["id"])
 
 
+# Every table that points at projects(id) (a test checks the list against the schema's foreign keys): a
+# project that any of them still has a row for is not deleted (D-323), nothing is cascaded.
+PROJECT_REFERENCES = ("tasks", "driven_sessions", "handoffs", "project_pauses", "notices", "docs",
+                      "prompt_vars", "decisions")
+
+
+def project_blockers(conn: sqlite3.Connection, project_id: int) -> list[str]:
+    """What still ties a project down, as readable parts: its task-manager session, and a row count per
+    table of PROJECT_REFERENCES (stages and their questions, driven-session and handoff history, pause,
+    notices, docs, prompt variables, decisions bound to it). Empty = nothing is orphaned by deleting it."""
+    out: list[str] = []
+    p = conn.execute("SELECT manager_session FROM projects WHERE id=?", (project_id,)).fetchone()
+    if p is not None and p["manager_session"]:
+        out.append(f"task-manager session {str(p['manager_session'])[:8]}")
+    for table in PROJECT_REFERENCES:
+        n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id=?", (project_id,)).fetchone()[0]
+        if n:
+            out.append(f"{n} {table} row(s)")
+    return out
+
+
+def delete_project(conn: sqlite3.Connection, ref: object) -> Row:
+    """Remove a project that has nothing attached (project_blockers empty, D-323: refuse, never cascade);
+    the ranks of the others close up. -> the deleted row."""
+    with transaction(conn):
+        p = _project_row(conn, ref)
+        blockers = project_blockers(conn, int(p["id"]))
+        if blockers:
+            raise ValueError(f"project {p['name']!r} can't be deleted, it still has: {'; '.join(blockers)}")
+        conn.execute("DELETE FROM projects WHERE id=?", (p["id"],))
+        ts = now_iso()
+        for rank, pid in enumerate([r[0] for r in conn.execute("SELECT id FROM projects ORDER BY rank, id")], 1):
+            conn.execute("UPDATE projects SET rank=?, updated_at=? WHERE id=? AND rank != ?", (rank, ts, pid, rank))
+        return p
+
+
 def _reorder(ids: list[int], item: int, new_pos: int) -> list[int]:
     """ids without item, item re-inserted at 1-based new_pos (clamped)."""
     rest = [i for i in ids if i != item]

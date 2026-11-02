@@ -2624,8 +2624,11 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
     conn = store.connect()
     try:
         row = store.retrying(lambda: store.get_project(conn, project["project_id"]), conn)
-        if row is None or row.get("manager_session"):
-            raise ValueError(f"project {project['name']!r} has a task-manager session already (or is gone): "
+        if row is None:        # deleted since the start picked it (project.delete, D-323): no session for it
+            raise ValueError(f"project {project['name']!r} (#{project['project_id']}) does not exist any more: "
+                             "no task-manager session is created for it")
+        if row.get("manager_session"):
+            raise ValueError(f"project {project['name']!r} has a task-manager session already: "
                              "not created twice")
         tmux = _free_tmux(conn, sid, "task-manager", project["name"], None, arm, actor)
         msg = session_message("manager_first_start", project=project["name"], desc=row.get("description") or "",
