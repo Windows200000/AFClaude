@@ -588,7 +588,9 @@ class Autonomous(Base):
                   "question.decide", "question.answer",                        # phase 4b Q3: the owner's answer
                   # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
                   # message naming the id (phase 4b Q2, owner_words.py), D-104/D-285
-                  "install.stamp", "install.restored"}                           # phase 5c: backup.py
+                  "install.stamp", "install.restored",                          # phase 5c: backup.py
+                  "grant.set", "grant.remove", "grant.sync_groups", "user.rename", "user.revoke",   # phase 5a A1
+                  "machine.code", "machine.rename", "machine.revoke"}
 
     def test_owner_only_set(self):
         self.assertEqual({n for n, s in actions.ACTIONS.items() if s.owner_only}, self.OWNER_ONLY)
@@ -1235,6 +1237,18 @@ class EveryAction(Base):
             ("auth.session_login", {"user_id": 7, "id_sha256": "5" * 64, "csrf_sha256": "6" * 64,
                                     "factors": ["oidc"]}),
             ("auth.session_revoke", {"user_id": 7}),
+            # phase 5a A1: machine 1 (registered with a code), person 2 (made by hand: 6a creates them)
+            ("machine.code", {"code_sha256": "a" * 64}),
+            ("machine.register", {"code_sha256": "a" * 64, "token_sha256": "b" * 64, "hostname": "host-a"}),
+            ("grant.set", {"user_id": 1, "scope": "project", "project": "P", "level": "editor"}),
+            ("machine.seen", {"token_id": 1, "hostname": "host-b"}),        # a second host: the audit row
+            ("grant.remove", {"user_id": 1, "scope": "project", "project": "P"}),
+            ("machine.rename", {"user_id": 1, "label": "build box"}),
+            ("user.rename", {"user_id": 1, "label": "build box 2"}),
+            ("grant.sync_groups", {"user_id": 2, "groups": ["eng"], "provider": "idp",
+                                   "group_map": [{"group": "eng", "grant": "project:P:viewer"}]}),
+            ("user.revoke", {"user_id": 2}),
+            ("machine.revoke", {"user_id": 1}),
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
@@ -1245,6 +1259,9 @@ class EveryAction(Base):
                                                  "question.import", "decision.activate_own"})
         extra = 0                               # decision.confirm also audits the deletion of what it replaces
         for i, (name, params) in enumerate(script, 1):
+            if name == "grant.sync_groups":     # a person user, as phase 6a will create them
+                store.add_user(self.conn, "person", "someone", "owner")
+                self.conn.commit()
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
                 self.conn.commit()

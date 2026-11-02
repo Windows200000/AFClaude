@@ -89,6 +89,12 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                typed_messages (goal 12 S2, additive the same way, TYPED_SCHEMA): every message
                AFClaude typed or launched with (keepalive.fire; actions.py's typed.record), its driver
                and the hash of its text, for the usage split's "who drove a turn".
+               Phase 5a A1 (additive the same way, ROLES_SCHEMA; COLUMNS tasks.blocked_by /
+               forwarded_at): users (person | machine), grants (owner or project, level, source
+               manual | oidc:<group>), machine_tokens (never deleted, only revoked),
+               machine_registrations (one-time codes, hashes only), agent_proposals and agent_runs
+               (empty until A4); `users` and `grants` carry the trigger-bumped `version`
+               (actions.py's grant.*, user.* and machine.* write them; roles.py holds the rules).
 
 Schema guard (docs/dashboard_design/07_data_model.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -860,6 +866,101 @@ CREATE TABLE IF NOT EXISTS typed_messages (
 CREATE INDEX IF NOT EXISTS typed_messages_session ON typed_messages(session_id, sent_at);
 """
 
+# ---- users, grants and machine credentials (phase 5a A1, docs/phase5a_plan.md §3.2; D-149, D-172, D-183,
+# D-195, D-198). users: a person (6a: dashboard logins) or a machine (one per machine running Claude
+# Code with the MCP server, D-195); revoked_at ends it, a row is never deleted. grants: `owner` (no project,
+# no level) or `project` (project + viewer|editor|manager), source `manual` or `oidc:<group>` (grant.sync_groups
+# adds and removes only the latter); one row per (user, scope, project, source). machine_tokens: the sha256 of
+# a token's random part (roles.secret_sha256; the raw token is shown once, never stored), the hostname it was
+# issued for and the last one it was seen from (a second hostname within 24 h alerts, D-198);
+# clone_alert_at is the last such alert (one a day per token); rows are never deleted (a trigger), only revoked.
+# machine_registrations: one-time codes (hash only, 15 minutes); user_id set = a re-issue for that machine.
+# agent_proposals / agent_runs (§3.7, §3.8) are created now and used from A4. Written only through actions.py.
+# Additive, no schema_version bump.
+ROLES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL CHECK (kind IN ('person', 'machine')),
+    label       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL,            -- the actor
+    revoked_at  TEXT,
+    version     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS grants (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    scope       TEXT NOT NULL CHECK (scope IN ('owner', 'project')),
+    project_id  INTEGER REFERENCES projects(id),
+    level       TEXT CHECK (level IN ('viewer', 'editor', 'manager')),
+    source      TEXT NOT NULL DEFAULT 'manual' CHECK (source = 'manual' OR source LIKE 'oidc:_%'),
+    created_at  TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 0,
+    CHECK ((scope = 'owner' AND project_id IS NULL AND level IS NULL)
+           OR (scope = 'project' AND project_id IS NOT NULL AND level IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS grants_unique ON grants(user_id, scope, COALESCE(project_id, 0), source);
+CREATE INDEX IF NOT EXISTS grants_project ON grants(project_id);
+CREATE TABLE IF NOT EXISTS machine_tokens (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL REFERENCES users(id),
+    token_sha256      TEXT NOT NULL UNIQUE,
+    label             TEXT,
+    hostname_at_issue TEXT,
+    created_at        TEXT NOT NULL,
+    revoked_at        TEXT,
+    last_seen_at      TEXT,
+    last_hostname     TEXT,
+    last_transport    TEXT,
+    clone_alert_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS machine_tokens_user ON machine_tokens(user_id, revoked_at);
+CREATE TRIGGER IF NOT EXISTS machine_tokens_no_delete BEFORE DELETE ON machine_tokens
+BEGIN SELECT RAISE(ABORT, 'machine_tokens is never deleted (revoke the token instead)'); END;
+CREATE TABLE IF NOT EXISTS machine_registrations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    code_sha256 TEXT NOT NULL UNIQUE,
+    user_id     INTEGER REFERENCES users(id),       -- NULL: a new machine; else the machine a token is re-issued for
+    created_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    used_at     TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER REFERENCES projects(id),
+    session_id  TEXT NOT NULL,
+    agent_id    TEXT,
+    task_id     INTEGER,
+    kind        TEXT NOT NULL CHECK (kind IN ('subagent', 'session')),
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT,
+    end_reason  TEXT,
+    summary     TEXT,                              -- JSON
+    reviewed_by TEXT,
+    reviewed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_runs_project ON agent_runs(project_id, started_at);
+CREATE TABLE IF NOT EXISTS agent_proposals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   INTEGER REFERENCES projects(id),
+    run_id       INTEGER REFERENCES agent_runs(id),
+    actor        TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    payload      TEXT NOT NULL,                    -- JSON: the action's params
+    version_seen INTEGER,
+    summary      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'proposed'
+                 CHECK (status IN ('proposed', 'approved', 'edited', 'rejected', 'postponed')),
+    reviewer     TEXT,
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    decided_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_proposals_open ON agent_proposals(project_id, status);
+"""
+
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
 # owner / task-manager decision. Until the seeding step (Q2) it is still mirrored from DECISIONS.md
 # (origin 'file': actions.decision_import, audited) with the full entry text and its fields; from Q1
@@ -934,7 +1035,7 @@ DECISION_ID_RE = re.compile(r"^[DM]-\d{1,5}$")
 # trigger's own UPDATE doesn't fire it again.
 VERSIONED = {"projects": "id", "tasks": "id", "standing_rules": "id", "session_decisions": "session_id",
              "settings": "key", "prompt_overrides": "name", "inbox_messages": "id", "project_pauses": "project_id",
-             "decisions": "id", "notices": "id"}
+             "decisions": "id", "notices": "id", "users": "id", "grants": "id"}
 VERSION_TRIGGERS = [
     f"CREATE TRIGGER IF NOT EXISTS {t}_version AFTER UPDATE ON {t} FOR EACH ROW "
     f"WHEN NEW.version IS OLD.version BEGIN "
@@ -985,7 +1086,10 @@ COLUMNS = {
     # D-213: stage_eta.py. Phase 4b Q3: a question's answer choices (options: a JSON list of short strings,
     # optional) and the decision it asks about (decision_id, no FK: the decision may go while the closed
     # question stays; a unique index below allows one open question per decision)
-    "tasks": [VERSION_COL, ("estimated_sessions", "REAL"), ("options", "TEXT"), ("decision_id", "TEXT")],
+    "tasks": [VERSION_COL, ("estimated_sessions", "REAL"), ("options", "TEXT"), ("decision_id", "TEXT"),
+              # phase 5a A1 (§3.2): who blocked it when an agent did, and when its task-manager forwarded the
+              # question to the human inbox (A4 uses them; NULL everywhere until then)
+              ("blocked_by", "TEXT"), ("forwarded_at", "TEXT")],
     "task_events": [],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
@@ -1245,6 +1349,7 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     conn.executescript(AUTH_SCHEMA)
     conn.executescript(SETUP_SCHEMA)
     conn.executescript(TYPED_SCHEMA)
+    conn.executescript(ROLES_SCHEMA)
     with transaction(conn):    # BEGIN IMMEDIATE: concurrent connects add each column once
         _init_decisions_fts(conn)
         conn.execute("INSERT OR IGNORE INTO accounts(id, label, created_at) VALUES (?, ?, ?)",
@@ -2154,7 +2259,7 @@ def set_project_launch(conn: sqlite3.Connection, ref: object, **fields: str | No
 # Every table that points at projects(id) (a test checks the list against the schema's foreign keys): a
 # project that any of them still has a row for is not deleted (D-323), nothing is cascaded.
 PROJECT_REFERENCES = ("tasks", "driven_sessions", "handoffs", "project_pauses", "notices", "docs",
-                      "prompt_vars", "decisions")
+                      "prompt_vars", "decisions", "grants", "agent_runs", "agent_proposals")
 
 
 def project_blockers(conn: sqlite3.Connection, project_id: int) -> list[str]:
@@ -2992,6 +3097,151 @@ def claim_setup_code(conn: sqlite3.Connection, code_id: int, now: str) -> bool:
     (SQLite serialises writers; only one UPDATE matches used_at IS NULL). -> whether this call won."""
     return conn.execute("UPDATE setup_codes SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at > ?",
                         (now, code_id, now)).rowcount == 1
+
+
+# ---- users, grants and machine credentials (ROLES_SCHEMA; written only through actions.py: grant.*, user.*,
+# machine.*). Raw reads and writes; the rules (who may grant what, the last owner) are roles.py's.
+
+USER_KINDS = ("person", "machine")
+GRANT_SCOPES = ("owner", "project")
+GRANT_LEVELS = ("viewer", "editor", "manager")
+
+
+def add_user(conn: sqlite3.Connection, kind: str, label: str, created_by: str) -> Row:
+    _enum(kind, USER_KINDS, "kind")
+    cur = conn.execute("INSERT INTO users(kind, label, created_at, created_by) VALUES (?, ?, ?, ?)",
+                       (kind, _text(label, "label", required=True), now_iso(), created_by))
+    return _user_row(conn, _rowid(cur))
+
+
+def get_user(conn: sqlite3.Connection, user_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def _user_row(conn: sqlite3.Connection, user_id: int) -> Row:
+    row = get_user(conn, user_id)
+    if row is None:
+        raise NotFound(f"no user {user_id}")
+    return row
+
+
+def list_users(conn: sqlite3.Connection, kind: str | None = None) -> list[Row]:
+    rows = conn.execute("SELECT * FROM users" + (" WHERE kind=?" if kind else "") + " ORDER BY id",
+                        (kind,) if kind else ())
+    return [dict(r) for r in rows]
+
+
+def rename_user(conn: sqlite3.Connection, user_id: int, label: str) -> Row:
+    conn.execute("UPDATE users SET label=? WHERE id=?", (_text(label, "label", required=True), user_id))
+    return _user_row(conn, user_id)
+
+
+def revoke_user_row(conn: sqlite3.Connection, user_id: int) -> bool:
+    """Set revoked_at (once: a revoked user keeps its first). -> whether it was active."""
+    return conn.execute("UPDATE users SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+                        (now_iso(), user_id)).rowcount == 1
+
+
+def add_grant(conn: sqlite3.Connection, user_id: int, scope: str, project_id: int | None, level: str | None,
+              source: str, created_by: str) -> Row:
+    cur = conn.execute("INSERT INTO grants(user_id, scope, project_id, level, source, created_at, created_by) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, scope, project_id, level, source, now_iso(), created_by))
+    r = conn.execute("SELECT * FROM grants WHERE id=?", (_rowid(cur),)).fetchone()
+    return dict(r)
+
+
+def get_grant(conn: sqlite3.Connection, user_id: int, scope: str, project_id: int | None, source: str) -> Row | None:
+    r = conn.execute("SELECT * FROM grants WHERE user_id=? AND scope=? AND project_id IS ? AND source=?",
+                     (user_id, scope, project_id, source)).fetchone()
+    return dict(r) if r else None
+
+
+def set_grant_level(conn: sqlite3.Connection, grant_id: int, level: str) -> Row:
+    conn.execute("UPDATE grants SET level=? WHERE id=?", (level, grant_id))
+    return dict(conn.execute("SELECT * FROM grants WHERE id=?", (grant_id,)).fetchone())
+
+
+def delete_grant(conn: sqlite3.Connection, grant_id: int) -> None:
+    conn.execute("DELETE FROM grants WHERE id=?", (grant_id,))
+
+
+def list_grants(conn: sqlite3.Connection, user_id: int | None = None, project_id: int | None = None) -> list[Row]:
+    where, args = [], []
+    if user_id is not None:
+        where.append("user_id=?")
+        args.append(user_id)
+    if project_id is not None:
+        where.append("project_id=?")
+        args.append(project_id)
+    rows = conn.execute("SELECT * FROM grants" + (" WHERE " + " AND ".join(where) if where else "")
+                        + " ORDER BY user_id, scope DESC, project_id, source", args)
+    return [dict(r) for r in rows]
+
+
+def add_machine_token(conn: sqlite3.Connection, user_id: int, token_sha256: str, label: str | None,
+                      hostname: str | None) -> int:
+    cur = conn.execute("INSERT INTO machine_tokens(user_id, token_sha256, label, hostname_at_issue, created_at) "
+                       "VALUES (?, ?, ?, ?, ?)", (user_id, token_sha256, label, hostname, now_iso()))
+    return _rowid(cur)
+
+
+def get_machine_token(conn: sqlite3.Connection, token_id: int) -> Row | None:
+    r = conn.execute("SELECT * FROM machine_tokens WHERE id=?", (token_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_machine_tokens(conn: sqlite3.Connection, user_id: int | None = None, active_only: bool = False) -> list[Row]:
+    where, args = [], []
+    if user_id is not None:
+        where.append("user_id=?")
+        args.append(user_id)
+    if active_only:
+        where.append("revoked_at IS NULL")
+    rows = conn.execute("SELECT * FROM machine_tokens" + (" WHERE " + " AND ".join(where) if where else "")
+                        + " ORDER BY id", args)
+    return [dict(r) for r in rows]
+
+
+def revoke_machine_tokens(conn: sqlite3.Connection, user_id: int) -> list[int]:
+    """Revoke every active token of a machine user. -> their ids."""
+    ids = [r[0] for r in conn.execute("SELECT id FROM machine_tokens WHERE user_id=? AND revoked_at IS NULL "
+                                      "ORDER BY id", (user_id,))]
+    conn.execute("UPDATE machine_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+                 (now_iso(), user_id))
+    return ids
+
+
+def record_machine_seen(conn: sqlite3.Connection, token_id: int, hostname: str | None, transport: str | None,
+                        alerted: bool = False) -> None:
+    """The token's own use record (no audit row, like auth_sessions.last_seen_at)."""
+    ts = now_iso()
+    conn.execute("UPDATE machine_tokens SET last_seen_at=?, last_hostname=?, last_transport=?, "
+                 "clone_alert_at=CASE WHEN ? THEN ? ELSE clone_alert_at END WHERE id=?",
+                 (ts, hostname, transport, 1 if alerted else 0, ts, token_id))
+
+
+def add_machine_registration(conn: sqlite3.Connection, code_sha256: str, user_id: int | None, created_by: str,
+                             expires_at: str) -> int:
+    cur = conn.execute("INSERT INTO machine_registrations(code_sha256, user_id, created_by, created_at, expires_at) "
+                       "VALUES (?, ?, ?, ?, ?)", (code_sha256, user_id, created_by, now_iso(), expires_at))
+    return _rowid(cur)
+
+
+def get_machine_registration(conn: sqlite3.Connection, code_sha256: str) -> Row | None:
+    r = conn.execute("SELECT * FROM machine_registrations WHERE code_sha256=?", (code_sha256,)).fetchone()
+    return dict(r) if r else None
+
+
+def claim_machine_registration(conn: sqlite3.Connection, reg_id: int, now: str) -> bool:
+    """Spend a registration code (single use, not expired): the UPDATE is the race guard. -> whether this call won."""
+    return conn.execute("UPDATE machine_registrations SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at > ?",
+                        (now, reg_id, now)).rowcount == 1
+
+
+def count_audit_since(conn: sqlite3.Connection, action: str, since: str) -> int:
+    """Audit rows of one action at or after `since` (the registration rate limit counts its refusals)."""
+    return int(conn.execute("SELECT COUNT(*) FROM audit_log WHERE action=? AND ts>=?", (action, since)).fetchone()[0])
 
 
 def add_run_log(conn: sqlite3.Connection, component: object, decision: object, reason: str | None = None,

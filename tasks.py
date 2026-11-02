@@ -107,6 +107,19 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            dashboard (D-306), shown until the owner dismisses it
     tasks.py notice list [--all]           the notices still shown (--all: the dismissed ones too)
     tasks.py notice dismiss ID             dismiss one (the owner; the dashboard's Dismiss button)
+    tasks.py machine code [--user ID] [--ttl MINUTES]   a one-time registration code for a machine user
+                                           (phase 5a, D-195): shown once, valid 15 minutes (--ttl up to 60), single use;
+                                           --user: re-issue the token of that machine
+    tasks.py machine register CODE [--label L] [--file F | --print]   spend a code: a machine user (label = L or the
+                                           hostname, no access until granted) and its token, written to the
+                                           token file (mode 0600; --file F: elsewhere, --print: show it once
+                                           instead; an existing file is kept unless --force)
+    tasks.py machine list | rename ID LABEL | revoke ID   the machine users, their tokens and grants
+    tasks.py grant set USER --owner | --project P --level viewer|editor|manager   give a user the owner role
+                                           or a level on a project (D-172, D-192); making an owner alerts
+    tasks.py grant remove USER --owner | --project P   take a manual grant away (the last manual person
+                                           owner stays, D-183)
+    tasks.py grant list [--user ID]        the grants (source manual or oidc:<group>), users by id
 
 Tasks are the stages of a project; projects form a ranked list. Execution
 order: every high stage (by project rank, then stage), then every medium one,
@@ -314,6 +327,151 @@ def autonomous_caller(conn):
 def act(conn, action, /, **params):
     """One write through the shared write path (actions.py), as the CLI."""
     return actions.perform(conn, action, params, actor="cli", via="cli", autonomous=autonomous_caller(conn))
+
+
+def deliver(result):
+    """The alerts an action returned (a new owner, a token seen from two hosts), pushed after its
+    transaction (actions.deliver_alerts); a failure is an error the caller sees (D-235), the write stays."""
+    try:
+        actions.deliver_alerts(result)
+    except Exception as e:      # noqa: BLE001 - reported, not swallowed: the change itself is committed
+        raise ValueError(f"the change was saved but its alert failed: {type(e).__name__}: {e}") from e
+
+
+# The machine token file (phase 5a A1, plan §3.3): where `machine register` leaves this host's token and the
+# host-side MCP server will read it (A2). Mode 0600; AFCLAUDE_MACHINE_FILE overrides the path.
+MACHINE_FILE = os.environ.get("AFCLAUDE_MACHINE_FILE", os.path.expanduser("~/.config/afclaude/machine.json"))
+
+
+def machine_file_free(path, force):
+    """Refuse before registering when the token file can't be written (the code would be spent and the
+    token lost)."""
+    if os.path.lexists(path) and not force:
+        raise ValueError(f"{path} exists: this machine has a token already (--force replaces it, --print shows "
+                         "the new one instead)")
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    if not os.access(os.path.dirname(path) or ".", os.W_OK):
+        raise ValueError(f"{path} is not writable")
+
+
+def write_machine_file(path, rec):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(rec, fh, indent=1)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def run_machine(conn, args):
+    """Phase 5a A1 (D-195, D-198): machine users: code | register | list | rename | revoke."""
+    mc = args.machine_cmd
+    if mc == "code":
+        import roles
+        code = roles.new_registration_code()
+        params = {"code_sha256": roles.code_sha256(code), "ttl_minutes": args.ttl}
+        if args.user is not None:
+            params["user_id"] = args.user
+        r = act(conn, "machine.code", **params)
+        if args.json:
+            return dump({**r, "code": code})
+        return print(f"registration code (shown once, valid until {berlin(r['expires_at'])}, single use"
+                     + (f", re-issues machine {r['user_id']}" if r["user_id"] else "") + f"):\n  {code}\n"
+                     "on the machine:  python3 tasks.py machine register <code>")
+    if mc == "register":
+        import socket
+        host = socket.gethostname()          # always the real one: the clone check compares against it
+        path = args.file or MACHINE_FILE
+        if not args.print:
+            machine_file_free(path, args.force)
+        r = actions.register_machine(conn, args.code, host, actor="cli", via="cli", label=args.label)
+        out = {k: v for k, v in r.items() if k != "token"}
+        if args.print:
+            out["token"] = r["token"]
+        else:
+            try:
+                write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
+                                          "token_id": r["token_id"], "hostname": host})
+            except OSError as e:     # the code is spent: the token must not be lost with the error
+                raise ValueError(f"the token file could not be written ({e}); the token, shown once: "
+                                 f"{r['token']}") from e
+            out["file"] = path
+        if args.json:
+            return dump(out)
+        what = "re-issued for" if r["reissued"] else "registered"
+        print(f"machine {r['user_id']} ({r['label']}) {what}: token #{r['token_id']}"
+              + (f" written to {path}" if not args.print else f"\n  {r['token']}\n  (shown once)"))
+        return print("no access until an owner grants it a role: tasks.py grant set "
+                     f"{r['user_id']} --owner | --project P --level L") if not r["reissued"] else None
+    if mc == "list":
+        rows = []
+        for u in store.list_users(conn, "machine"):
+            rows.append({**u, "tokens": store.list_machine_tokens(conn, u["id"]),
+                         "grants": store.list_grants(conn, u["id"])})
+        for r in rows:       # the hash never leaves the store
+            for t in r["tokens"]:
+                t.pop("token_sha256", None)
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print("no machine users")
+        for u in rows:
+            live = [t for t in u["tokens"] if not t["revoked_at"]]
+            seen = max((t["last_seen_at"] or "" for t in live), default="")
+            grants = ", ".join(grant_text(conn, g) for g in u["grants"]) or "no access"
+            print(f"#{u['id']}  {u['label']}  {'REVOKED ' + berlin(u['revoked_at']) if u['revoked_at'] else 'active'}  "
+                  f"tokens {len(live)}  last seen {berlin(seen) if seen else '-'}  {grants}")
+        return None
+    if mc == "rename":
+        r = act(conn, "machine.rename", user_id=args.id, label=args.label)
+    else:   # revoke
+        r = act(conn, "machine.revoke", user_id=args.id)
+    return dump(r) if args.json else print(f"machine {r['id']} ({r['label']}): "
+                                           + ("revoked" if r["revoked_at"] else "renamed"))
+
+
+def grant_text(conn, g):
+    if g["scope"] == "owner":
+        what = "owner"
+    else:
+        p = store.get_project(conn, g["project_id"])
+        what = f"{g['level']} of {p['name'] if p else g['project_id']}"
+    return what + ("" if g["source"] == "manual" else f" ({g['source']})")
+
+
+def run_grant(conn, args):
+    """Phase 5a A1 (D-172, D-192): grants: set | remove | list."""
+    gc = args.grant_cmd
+    if gc == "list":
+        rows = store.list_grants(conn, args.user)
+        if args.json:
+            return dump(rows)
+        if not rows:
+            return print("no grants")
+        for g in rows:
+            u = store.get_user(conn, g["user_id"])
+            print(f"#{g['id']}  user {g['user_id']} ({u['kind']} {u['label']}"
+                  f"{', revoked' if u['revoked_at'] else ''})  {grant_text(conn, g)}")
+        return None
+    params = {"user_id": args.user, "scope": "owner" if args.owner else "project"}
+    if not args.owner:
+        params["project"] = project_ref(args.project)
+    if gc == "set":
+        params["level"] = args.level
+        r = act(conn, "grant.set", **params)
+    else:
+        r = act(conn, "grant.remove", **params)
+    deliver(r)
+    if args.json:
+        return dump(r)
+    return print(f"grant #{r['id']} user {r['user_id']}: "
+                 + ("removed" if r.get("removed") else "unchanged" if r.get("unchanged") else "set")
+                 + f" ({'owner' if r['scope'] == 'owner' else r['level']})")
 
 
 def maybe_scan(conn, args):
@@ -691,6 +849,10 @@ def run(conn, args):
         return run_now(conn, args) or 0
     elif c == "notice":
         run_notice(conn, args)
+    elif c == "machine":
+        return run_machine(conn, args) or 0
+    elif c == "grant":
+        return run_grant(conn, args) or 0
     elif c == "question":
         run_question(conn, args)
     elif c == "inbox" and args.inbox_cmd:
@@ -1224,6 +1386,40 @@ def parser():
     q.add_argument("--all", action="store_true", help="also the dismissed ones")
     q = ns.add_parser("dismiss", parents=[js], help="dismiss a notice")
     q.add_argument("id", type=int)
+
+    p = sub.add_parser("machine", help="machine users, one per machine running Claude Code (D-195, phase 5a): "
+                                       "code | register | list | rename | revoke")
+    ms = p.add_subparsers(dest="machine_cmd", required=True)
+    q = ms.add_parser("code", parents=[js], help="a one-time registration code (shown once, 15 minutes)")
+    q.add_argument("--user", type=int, help="re-issue the token of this machine user")
+    q.add_argument("--ttl", type=int, default=15, help="minutes it stays valid (default 15, at most 60)")
+    q = ms.add_parser("register", parents=[js], help="spend a code: a machine user and its token")
+    q.add_argument("code")
+    q.add_argument("--label", help="the machine user's name (default: this host's name)")
+    where = q.add_mutually_exclusive_group()
+    where.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
+    where.add_argument("--print", action="store_true", help="show the token once instead of writing a file")
+    q.add_argument("--force", action="store_true", help="replace an existing token file")
+    ms.add_parser("list", parents=[js], help="the machine users, their tokens and grants")
+    q = ms.add_parser("rename", parents=[js], help="change a machine user's label")
+    q.add_argument("id", type=int)
+    q.add_argument("label")
+    q = ms.add_parser("revoke", parents=[js], help="end a machine user: every token revoked")
+    q.add_argument("id", type=int)
+
+    p = sub.add_parser("grant", help="roles (phase 5a, D-172, D-192): set | remove | list")
+    gs = p.add_subparsers(dest="grant_cmd", required=True)
+    for name, helptext in (("set", "give a user the owner role or a level on a project"),
+                           ("remove", "take a manual grant away")):
+        q = gs.add_parser(name, parents=[js], help=helptext)
+        q.add_argument("user", type=int, help="the user id (machine list shows it)")
+        what = q.add_mutually_exclusive_group(required=True)
+        what.add_argument("--owner", action="store_true", help="the owner role")
+        what.add_argument("--project", help="a project (name or directory)")
+        if name == "set":
+            q.add_argument("--level", choices=("viewer", "editor", "manager"), help="for --project")
+    q = gs.add_parser("list", parents=[js], help="the grants")
+    q.add_argument("--user", type=int, help="only this user's")
     return ap
 
 
