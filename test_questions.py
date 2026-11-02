@@ -61,6 +61,9 @@ class Env(unittest.TestCase):
                        summary=kw.pop("summary", "Titles stay short."), **kw)
 
     def proposal(self, title="Reworded titles", supersedes=None, **kw):
+        """A task-manager entry that changes an owner's one (D-322: only that waits as a proposal)."""
+        if supersedes is None:
+            supersedes = [self.owner_entry(f"Base of {title}")["id"]]
         return self.do("decision.add", title=title, topics=["lists"], author="task-manager",
                        summary=kw.pop("summary", "A merged rewording."), supersedes=supersedes, **kw)
 
@@ -141,37 +144,31 @@ class Decide(Env):
         self.assertEqual(d["after"]["reason"], "rejected by the owner: not what I said")
         self.assertEqual(self.task(q["id"])["answer"], "reject")
 
-    def test_confirm_and_drop_an_active_task_manager_entry(self):
-        p = self.proposal(title="Mine")
-        self.do("decision.confirm", decision=p["id"])                     # active and confirmed already
-        # an active, unconfirmed entry (what the seeding left): write it as the old code would have
-        self.conn.execute("UPDATE decisions SET confirmed_at = NULL, confirmed_by = NULL WHERE id = ?", (p["id"],))
-        self.conn.commit()
+    def test_an_active_task_manager_entry_needs_no_question(self):
+        """D-322: the task-manager's own entry is active at once; no question, nothing to confirm or drop."""
+        p = self.do("decision.add", title="Mine", topics=["lists"], author="task-manager", summary="Mine.")
+        self.assertEqual(p["state"], "active")
+        self.assertIsNone(self.question_of(p["id"]))
+        self.assertNotIn("question", p)
+        with self.assertRaisesRegex(ValueError, "needs nothing from the owner"):
+            with self.conn:
+                actions.ask_decision_question(self.conn, actions.Ctx("cli", "cli"), self.entry(p["id"]))
+        self.assertFalse(self.do("decision.confirm", decision=p["id"])["version"] != p["version"])   # a no-op
+        self.assertIsNone(self.entry(p["id"])["confirmed_at"])
+        self.do("decision.edit", decision=p["id"], summary="Still mine.", **MCP)           # its author's to change
+        self.do("decision.delete", decision=p["id"], reason="no longer", **MCP)
+        self.assertIsNone(self.entry(p["id"]))
+
+    def test_an_older_confirm_question_is_refused_and_closable(self):
+        """A question about an active task-manager entry (made before D-322) is not decided any more."""
+        p = self.do("decision.add", title="Mine", topics=["lists"], author="task-manager", summary="Mine.")
         e = self.entry(p["id"])
-        t = self.do("task.ask", question="x")                              # not a decision question: refused
-        with self.assertRaisesRegex(ValueError, "isn't a decision question"):
-            self.dash("question.decide", task_id=t["id"], choice="confirm", decision_version=e["version"])
-        with self.conn:
-            q = actions.ask_decision_question(self.conn, actions.Ctx("cli", "cli"), e)
-        self.assertEqual(q["options"], ["confirm", "drop"])
-        self.assertIn("recorded on its own", q["blocked_question"])
-        self.dash("question.decide", task_id=q["id"], choice="confirm", decision_version=e["version"])
-        e = self.entry(p["id"])
-        self.assertEqual((e["state"], e["confirmed_by"]), ("active", "owner"))
-        self.assertIsNotNone(e["confirmed_at"])
-        self.assertEqual(self.task(q["id"])["answer"], "confirm")
-        # drop
-        p2 = self.proposal(title="Other")
-        self.do("decision.confirm", decision=p2["id"])
-        self.conn.execute("UPDATE decisions SET confirmed_at = NULL, confirmed_by = NULL WHERE id = ?", (p2["id"],))
+        q = store.ask_question(self.conn, "Confirm this?", None, None, "Confirm", ["confirm", "drop"], p["id"])
         self.conn.commit()
-        e2 = self.entry(p2["id"])
-        with self.conn:
-            q2 = actions.ask_decision_question(self.conn, actions.Ctx("cli", "cli"), e2)
-        self.dash("question.decide", task_id=q2["id"], choice="drop", decision_version=e2["version"])
-        self.assertIsNone(self.entry(p2["id"]))
-        d = [x for x in self.audit(target_type="decision", target_id=p2["id"]) if x["action"] == "decision.delete"][0]
-        self.assertEqual(d["after"]["reason"], "dropped by the owner")
+        with self.assertRaisesRegex(store.InvalidTransition, "needs no decision any more"):
+            self.dash("question.decide", task_id=q["id"], choice="confirm", decision_version=e["version"])
+        self.do("question.close", task_id=q["id"], reason="D-322")
+        self.assertEqual(self.task(q["id"])["status"], "cancelled")
 
     def test_a_stale_version_and_wrong_choices_are_refused(self):
         p = self.proposal()
@@ -274,7 +271,7 @@ class Invariant(Env):
     def test_confirming_a_replacing_proposal_closes_the_questions_of_the_replaced_ones(self):
         old = self.proposal(title="Old proposal")
         q_old = self.question_of(old["id"])
-        new = self.proposal(title="New", supersedes=[old["id"]])
+        new = self.proposal(title="New", supersedes=[old["id"], self.owner_entry("Also replaced")["id"]])
         self.do("decision.confirm", decision=new["id"])
         self.assertIsNone(self.entry(old["id"]))
         self.assertEqual(self.task(q_old["id"])["status"], "cancelled")
@@ -319,30 +316,18 @@ class Invariant(Env):
         self.assertEqual(self.task(q2["id"])["priority"], "low")
 
     def test_a_question_whose_proposal_an_older_code_confirmed_is_not_stuck(self):
-        """F3: the entry is active and unconfirmed now (kind confirm), the question still offers approve."""
+        """F3: the entry is active now (needs no decision), the question still offers approve."""
         p = self.proposal()
         q = self.question_of(p["id"])
         body = self.entry(p["id"])["body"]
         self.conn.execute("UPDATE decisions SET state = 'active', status = 'active' WHERE id = ?", (p["id"],))
         self.conn.commit()                                                   # what older code's confirm wrote
         e = self.entry(p["id"])
-        with self.assertRaisesRegex(ValueError, "choice must be one of confirm\\|drop"):
+        with self.assertRaisesRegex(store.InvalidTransition, "needs no decision any more"):
             self.dash("question.decide", task_id=q["id"], choice="approve", decision_version=e["version"])
         self.do("question.close", task_id=q["id"], reason="confirmed by older code")
         self.assertEqual(self.task(q["id"])["status"], "cancelled")
         self.assertIn(p["id"], body)
-
-    def test_an_edit_refreshes_the_choices_of_a_stale_question(self):
-        p = self.proposal()
-        q = self.question_of(p["id"])
-        self.conn.execute("UPDATE decisions SET state = 'active', status = 'active' WHERE id = ?", (p["id"],))
-        self.conn.commit()
-        self.do("decision.edit", decision=p["id"], title="Retitled")
-        q2 = self.task(q["id"])
-        self.assertEqual(q2["options"], ["confirm", "drop"])
-        self.assertIn("recorded on its own", q2["blocked_question"])
-        self.dash("question.decide", task_id=q["id"], choice="confirm", decision_version=self.entry(p["id"])["version"])
-        self.assertIsNotNone(self.entry(p["id"])["confirmed_at"])
 
     def test_a_dangling_question_can_be_closed(self):
         p = self.proposal()
@@ -516,8 +501,10 @@ class DeployPath(unittest.TestCase):
         self.assertEqual(store.get_meta(conn, "schema_version"), str(store.SCHEMA_VERSION))   # no bump
         actions.perform(conn, "doc.append", {"project": "P", "name": "progress", "text": "- deploy\n"},
                         actor="cli", via="cli")
-        p = actions.perform(conn, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager"},
-                            actor="cli", via="cli")
+        o = actions.perform(conn, "decision.add", {"title": "Said", "topics": ["x"], "author": "owner",
+                                                   "words": "the owner's own words"}, actor="cli", via="cli")
+        p = actions.perform(conn, "decision.add", {"title": "Prop", "topics": ["x"], "author": "task-manager",
+                                                   "supersedes": [o["id"]]}, actor="cli", via="cli")
         self.assertEqual(store.open_decision_question(conn, p["id"])["id"], p["question"])
         store.connect(self.path).close()                         # a second connect changes nothing, raises nothing
 

@@ -26,6 +26,8 @@ imports it, and builds what the task-manager reads:
   - the seeding (Q2, the cut-over, run once by the task-manager; it re-keys what the import already holds):
         python3 decisions.py seed --topics F --merges F [--file PATH] [--dry-run]     action decision.seed
         python3 decisions.py seed --undo
+  - the D-322 migration (one-off, idempotent; backs the DB up first):
+        python3 decisions.py activate-own [--owner-entry ID ...] [--dry-run]         action decision.activate_own (D-322)
     F = two JSON files (see seed_plan): topics {"D-001": ["topic", ...]} for every surviving entry (1-3 each,
     D-284), and merges {"merges": [{title, summary, topics, supersedes, scope?, interpretation?}], "keep": [ids]}.
     The classes: active and partly superseded entries become the DB's own (origin db), unchanged, with their
@@ -53,11 +55,12 @@ imports it, and builds what the task-manager reads:
     acting on it).
   - native entries (phase 4b Q1, actions.decision_add|edit|expire|delete|confirm|link|topics): written
     in the DB itself (origin 'db'), their text rendered here (render_body) from the fields; an
-    owner's words are active at once, the task-manager's own entries 'proposed' (not in the TLDR)
-    until the owner confirms (D-285). The import above leaves them alone.
-  - decision questions (phase 4b Q3): an open proposal and an unconfirmed task-manager entry each have one
-    question for the owner (actions.ask_decision_question); question_kind / question_text say which kind it
-    is and render it in plain words and in full (D-263, D-279); confirmed entries are protected (D-104).
+    owner's words are active at once (D-285), and so are the task-manager's own entries (D-322); only
+    a task-manager entry that replaces, rewords or merges an owner's entry (its `supersedes` names one) is
+    'proposed' (not in the TLDR) until the owner confirms it. The import above leaves them alone.
+  - decision questions (phase 4b Q3): an open proposal has one question for the owner
+    (actions.ask_decision_question); question_kind / question_text render it in plain words and in full
+    (D-263, D-279); owner's and confirmed entries are protected (D-104).
 
     python3 decisions.py tldr | import [--file PATH] | seed ... | hook --part N --of M
 (the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords|import`)
@@ -97,9 +100,10 @@ TRAIL_RE = re.compile(r"(?:\s*(?:·|\n\s*-|\n\s*---))+\s*$")
 FIELDS = {"type": "type", "date": "date", "status": "status", "supersedes": "supersedes",
           "summary": "summary", "keywords": "keywords", "owner's words": "words", "source": "source",
           "scope": "scope"}
-STATES = store.DECISION_STATES                       # + proposed: the task-manager's own, waiting for the owner
+STATES = store.DECISION_STATES                       # + proposed: a task-manager change to an owner's entry
 CURRENT = ("active", "partial")                      # what the TLDR and a default find show (not proposed)
-PROPOSED_STATUS = "proposed (the task-manager's own entry, waiting for the owner's confirmation, D-285)"
+PROPOSED_STATUS = "proposed (the task-manager's change to an owner's decision, waiting for the owner's confirmation, D-322)"
+PROPOSED_PREFIX = "proposed ("                      # an entry made before D-322 says "...own entry... D-285" instead
 BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active until" date is Berlin time
 
 
@@ -304,6 +308,15 @@ def supersedes_ids(text: Optional[str]) -> list[str]:
     return list(dict.fromkeys(ID_RE.findall(text or "")))
 
 
+ID_LIST_RE = re.compile(r"^\s*[DM]-\d{3,}(?:\s*,\s*[DM]-\d{3,})*\s*$")
+
+
+def replaced_ids(text: Optional[str]) -> list[str]:
+    """supersedes_ids of a column that is a plain id list (what decision.add writes); free text ("none;
+    refines how D-266 ...", an old entry's prose) names no replaced entry, so it is []."""
+    return supersedes_ids(text) if ID_LIST_RE.match(text or "") else []
+
+
 def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str], status: Optional[str],
                 summary: Optional[str], words: Optional[str], source: Optional[str], scope: Optional[str],
                 interpretation: Optional[str], supersedes: Optional[str] = None) -> str:
@@ -323,26 +336,18 @@ def render_body(did: str, title: str, *, type: Optional[str], date: Optional[str
 
 # ---------------------------------------------------------------- decision questions (Q3)
 
-PROPOSAL_CHOICES = ("approve", "edit", "reject")      # a proposed entry
-CONFIRM_CHOICES = ("confirm", "drop")                 # an active, unconfirmed task-manager entry
+PROPOSAL_CHOICES = ("approve", "edit", "reject")      # a proposed entry (the only kind of decision question)
 QUESTION_TITLE_MAX = 120
 
 
 def question_kind(d: dict[str, Any]) -> Optional[str]:
-    """What the owner is asked about entry `d`: "proposal" (state proposed), "confirm" (an active
-    task-manager entry nobody confirmed), None (nothing: an owner's entry, a confirmed one, any other
-    state). An entry that mirrors the file (origin 'file') is never asked."""
+    """What the owner is asked about entry `d`: "proposal" (state proposed: a task-manager entry that changes
+    an owner's decision), None (nothing: an owner's entry, an active task-manager entry, which needs no
+    confirmation since D-322, any other state). An entry that mirrors the file (origin 'file') is never
+    asked."""
     if d.get("origin") != "db":
         return None
-    if d["state"] == "proposed":
-        return "proposal"
-    if d["state"] == "active" and d["author"] == "task-manager" and not d.get("confirmed_at"):
-        return "confirm"
-    return None
-
-
-def question_choices(kind: str) -> tuple[str, ...]:
-    return PROPOSAL_CHOICES if kind == "proposal" else CONFIRM_CHOICES
+    return "proposal" if d["state"] == "proposed" else None
 
 
 def _entry_lines(d: dict[str, Any]) -> list[str]:
@@ -357,25 +362,19 @@ def _entry_lines(d: dict[str, Any]) -> list[str]:
     return out
 
 
-def question_text(d: dict[str, Any], kind: str, replaced: list[dict[str, Any]]) -> tuple[str, str]:
-    """(title, text) of the question about entry `d` (plain words, nothing cut: D-263, D-279). `replaced`:
-    the entries a proposal replaces, each with its own title, date and the owner's words."""
+def question_text(d: dict[str, Any], replaced: list[dict[str, Any]]) -> tuple[str, str]:
+    """(title, text) of the question about proposal `d` (plain words, nothing cut: D-263, D-279). `replaced`:
+    the entries it replaces, each with its own title, date and the owner's words."""
     head = d["title"] if len(d["title"]) <= QUESTION_TITLE_MAX else d["title"][:QUESTION_TITLE_MAX - 1] + "…"
-    if kind == "proposal":
-        title = f"Approve {d['id']}: {head}"
-        lines = ["Approve this decision the task-manager proposes?", "", *_entry_lines(d)]
-        if replaced:
-            lines += ["", "It replaces these entries, which are deleted when you approve it:"]
-            for o in replaced:
-                lines += [""] + _entry_lines(o)
-        lines += ["", "approve: it becomes your decision" + (" and the entries above are deleted" if replaced else "")
-                  + ". edit: you rewrite its summary, then it is approved. reject: it is deleted and "
-                  + ("the entries above stay." if replaced else "nothing else changes.")]
-    else:
-        title = f"Confirm {d['id']}: {head}"
-        lines = ["Confirm this decision the task-manager recorded on its own?", "", *_entry_lines(d), "",
-                 "confirm: it becomes yours and the task-manager can no longer change or delete it. "
-                 "drop: it is deleted."]
+    title = f"Approve {d['id']}: {head}"
+    lines = ["Approve this change to your decisions the task-manager proposes?", "", *_entry_lines(d)]
+    if replaced:
+        lines += ["", "It replaces these entries, which are deleted when you approve it:"]
+        for o in replaced:
+            lines += [""] + _entry_lines(o)
+    lines += ["", "approve: it becomes your decision" + (" and the entries above are deleted" if replaced else "")
+              + ". edit: you rewrite its summary, then it is approved. reject: it is deleted and "
+              + ("the entries above stay." if replaced else "nothing else changes.")]
     return title, "\n".join(lines)
 
 
@@ -661,6 +660,29 @@ def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Opt
             params["backup"] = store._backup_copy(conn, db_file, "preseed")
         result: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
         return result
+    finally:
+        conn.close()
+
+
+def activate_own(owner_entries: Optional[list[str]] = None, *, db_path: Optional[str] = None,
+                 dry_run: bool = False) -> dict[str, Any]:
+    """The D-322 migration (action decision.activate_own, CLI only): a dry run of the action first, then the
+    database is backed up (<db>.pred322-<utc>.bak, store._backup_copy) and the action runs in one transaction.
+    -> the action's result (which entries go active, which questions close, which stay proposed)."""
+    import actions
+    params: dict[str, Any] = {"dry_run": True, "owner_entries": owner_entries or []}
+    conn = store.connect(db_path)
+    try:
+        report: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor="cli", via="cli")
+        if dry_run or not (report["active"] or report["active_as_owners"]):
+            return dict(report, dry_run=dry_run)
+        db_file = store._db_file(conn)
+        if db_file is None:
+            raise SeedRefused("the database is not a file: no backup can be made")
+        params["dry_run"] = False
+        report["backup"] = store._backup_copy(conn, db_file, "pred322")
+        result: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor="cli", via="cli")
+        return dict(result, backup=report["backup"])
     finally:
         conn.close()
 
@@ -952,6 +974,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     sd.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     sd.add_argument("--dry-run", action="store_true", help="check and count, write nothing")
     sd.add_argument("--undo", action="store_true", help="restore the file as the source (refused after an edit)")
+    ao = sub.add_parser("activate-own", help="the D-322 migration: the task-manager's entries that change no "
+                        "owner's decision become active, their questions close; --dry-run first")
+    ao.add_argument("--owner-entry", action="append", default=[], metavar="ID",
+                    help="a task-manager entry that records the owner's own answer (active and confirmed; repeat)")
+    ao.add_argument("--dry-run", action="store_true", help="list what would change, write nothing")
     args = ap.parse_args(argv)
     if args.cmd == "hook":
         if not 1 <= args.part <= args.of:
@@ -961,6 +988,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.cmd == "seed":
             print(json.dumps(seed(args.topics, args.merges, db_path=args.db, path=args.file,
                                   dry_run=args.dry_run, undo=args.undo), indent=1, ensure_ascii=False))
+            return 0
+        if args.cmd == "activate-own":
+            print(json.dumps(activate_own(args.owner_entry, db_path=args.db, dry_run=args.dry_run),
+                             indent=1, ensure_ascii=False))
             return 0
         if args.cmd == "import":
             print(json.dumps(import_file(args.file, args.db, actor="cli", via="cli", force=args.force),

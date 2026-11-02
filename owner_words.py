@@ -64,10 +64,13 @@ class Evidence:
     ref: str
     at: datetime
     text: str
+    source: Optional[str] = None            # a label of its own (an option answer says which question)
 
     @property
     def label(self) -> str:
         """What a decision's source and the audit row say: `inbox #N <time>` / `chat <session> <time>`."""
+        if self.source:
+            return self.source
         when = self.at.astimezone(BERLIN).strftime("%d.%m. %H:%M")
         kind, _, rest = self.ref.partition(":")
         if kind == "inbox":
@@ -183,6 +186,33 @@ def inbox_messages(conn: sqlite3.Connection, session: str) -> list[Evidence]:
         if at is not None:
             out.append(Evidence(f"inbox:{r['id']}", at, r["text"]))
     return out
+
+
+def option_answer(conn: sqlite3.Connection, quotes: Sequence[str] | str, session: Optional[str],
+                  ref: Optional[str]) -> Optional[Evidence]:
+    """The owner's click on an answer button as the proof of a decision: `ref` is `inbox:N` and that row is the
+    owner's option answer (origin option, to a question) in `session`. Only then, and only for the exact text of
+    the option the owner picked (one quote, equal to the row's text after whitespace normalisation): a click is
+    not free speech, so no other words and no quote from inside it (a typed message is found by find, a
+    click never by it). None: `ref` is not such a row (the caller goes on with find, which says what is wrong).
+    An OwnerWordsError if it is one and the words are not its text."""
+    m = re.fullmatch(r"inbox:([1-9][0-9]*)", ref or "")
+    if m is None or not session or not any(c["name"] == "origin" for c in conn.execute(
+            "PRAGMA table_info(inbox_messages)")):
+        return None
+    r = conn.execute("SELECT id, created_at, text, question_id FROM inbox_messages WHERE id = ? AND session_id = ? "
+                     "AND created_by = 'owner' AND origin = 'option' AND question_id IS NOT NULL",
+                     (int(m.group(1)), session)).fetchone()
+    at = store.parse_iso(r["created_at"]) if r is not None else None
+    if r is None or at is None:
+        return None
+    qs = [normalise(q) for q in ([quotes] if isinstance(quotes, str) else quotes)]
+    if qs != [normalise(r["text"])]:
+        raise OwnerWordsError(f"inbox #{r['id']} is the owner's click on an answer button of question "
+                              f"#{r['question_id']}: only the option's exact text counts as their words "
+                              f"(\"{normalise(r['text'])}\"), no other words and no part of it")
+    return Evidence(f"inbox:{r['id']}", at, r["text"],
+                    f"option \"{normalise(r['text'])}\" of question #{r['question_id']} (inbox #{r['id']})")
 
 
 # ---------------------------------------------------------------- the lookup

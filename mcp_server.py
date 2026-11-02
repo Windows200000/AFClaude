@@ -596,9 +596,10 @@ def decision_full(d: Mapping[str, Any]) -> dict[str, Any]:
 @tool("The owner's decisions (D-242). find (keywords/topics; all: also done, superseded, proposed): id, title, "
       "topics only, NOT enough to act on: expand (full=true, or show) before acting. show (id D-NNN): the full "
       "entry. propose (title, topics 1+, optional words/scope/interpretation/keywords/project/supersedes ids): your "
-      "own decision, waits for the owner; topics are few free keywords ('all' if general), reuse existing ones. "
+      "own decision, active at once (D-322; if supersedes names an owner's entry it waits for the owner's confirmation); topics are few free keywords ('all' if general), reuse existing ones. "
       "record (title, topics, words = the owner's verbatim quote(s) from one owner message of this session, inbox "
-      "or chat; ref only if several match): the owner's decision, active at once.")
+      "or chat; ref only if several match; ref inbox:N may also name the owner's click on an answer button, "
+      "then words = that option's exact text): the owner's decision, active at once.")
 async def afclaude_decisions(action: Literal["find", "show", "propose", "record"],
                              keywords: Optional[list[str]] = None,
                              id: Optional[str] = None, full: bool = False, all: bool = False,
@@ -617,7 +618,9 @@ async def afclaude_decisions(action: Literal["find", "show", "propose", "record"
             return out(compact({"id": r["id"], "title": r["title"], "state": r["state"], "topics": r["topics"],
                                 "supersedes": r["supersedes"], "new_topics": r.get("new_topics"),
                                 "topic_note": r.get("topic_note"),
-                                "note": "Proposed: it waits for the owner's confirmation."}))
+                                "note": ("Proposed: it changes an owner's decision, so it waits for the owner's "
+                                         "confirmation." if r["state"] == "proposed"
+                                         else "Recorded as your own decision, active at once (D-322).")}))
         if action == "record":
             if not title or not words:
                 raise ValueError("record needs title and words (the owner's exact quote)")

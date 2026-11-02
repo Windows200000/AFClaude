@@ -1148,9 +1148,10 @@ class EveryAction(Base):
             ("decision.edit", {"decision": "D-002", "title": "Native 2"}),
             ("decision.topics", {"decision": "D-002", "op": "add", "topics": ["u"]}),
             ("decision.link", {"decision": "D-002", "to": "D-001", "kind": "refines"}),
-            ("decision.add", {"title": "Prop", "topics": ["t"], "author": "task-manager"}),
-            ("decision.confirm", {"decision": "D-003"}),
-            ("decision.expire", {"decision": "D-003"}),
+            ("decision.add", {"title": "Base", "topics": ["t"], "words": "w", "author": "owner"}),
+            ("decision.add", {"title": "Prop", "topics": ["t"], "author": "task-manager", "supersedes": ["D-003"]}),
+            ("decision.confirm", {"decision": "D-004"}),
+            ("decision.expire", {"decision": "D-004"}),
             ("decision.delete", {"decision": "D-002", "reason": "r"}),
             ("install.restored", {"source": {"install_id": store.get_meta(self.conn, "install_id"),
                                              "install_epoch": 0, "created_at": "2026-10-22T03:00:00.000Z",
@@ -1172,10 +1173,12 @@ class EveryAction(Base):
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
-        # (both in test_questions); question.import is CLI-only too (test_question_import)
+        # (both in test_questions); question.import is CLI-only too (test_question_import), so is
+        # decision.activate_own (test_decisions_d322)
         self.assertEqual({n for n, _ in script},
                          set(actions.ACTIONS) - {"decision.seed", "question.decide", "question.answer",
-                                                 "question.import"})
+                                                 "question.import", "decision.activate_own"})
+        extra = 0                               # decision.confirm also audits the deletion of what it replaces
         for i, (name, params) in enumerate(script, 1):
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
@@ -1183,7 +1186,8 @@ class EveryAction(Base):
             own_session = name.startswith("auth.session_") and name != "auth.session_revoke"   # the user's own
             self.do(name, actor="user:7" if own_session else "owner", via="dashboard", idem=f"every-{i:04d}", **params)
             rows = self.audit()
-            self.assertEqual(len(rows), i, name)
+            extra += name == "decision.confirm"
+            self.assertEqual(len(rows), i + extra, name)
             self.assertEqual((rows[-1]["action"], rows[-1]["request_id"]), (name, f"every-{i:04d}"))
 
 
