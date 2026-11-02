@@ -810,6 +810,38 @@ class Accuracy(unittest.TestCase):
         # no closed week before any decision point: nothing to back-calculate
         self.assertEqual(pm.forecast_backtest(self.cycles([0.2], R - pm.WEEK), [], R, WIN), [])
 
+    def test_backtest_scores_the_design_forecast_beside_the_other_use(self):
+        now = R + timedelta(days=1)
+        bt = pm.forecast_backtest(self.cycles([0.2, 0.2, 0.2], now), [], now, WIN)
+        self.assertTrue(bt)
+        for x in bt:            # no AFClaude tokens: no design chats, measured or forecast
+            self.assertEqual((x["design_predicted"], x["design_actual"]), (0.0, 0.0))
+            self.assertAlmostEqual(x["error_gate"], x["error"])
+
+    def test_threshold_info_shows_the_gates_forecast(self):
+        """Without rows, the shown forecast is the gate's own (profile(None): fit_rows), not a fit
+        on the byte tail the backtest and the ratio use (D-325)."""
+        now = R + timedelta(days=1)
+        rows = self.cycles([0.2, 0.2, 0.2], now)
+        gate, tail = pm.Profile([0.3] * 168), pm.Profile([0.1] * 168)
+        gate.design_week, tail.design_week = 32.0, 17.0
+        calls = []
+
+        def prof(r=None, *a, **k):
+            calls.append(r)
+            return (gate if r is None else tail), "t"
+        u = {"weekly": {"percent": 30, "resets_at": R + pm.WEEK}, "session": {}}
+        with mock.patch.object(pm, "tail_rows", return_value=rows), mock.patch.object(pm, "profile", side_effect=prof), \
+                mock.patch.object(pm, "run_rows", return_value=[]), mock.patch.object(pm, "fire_times", return_value=[]):
+            d = pm.decide(u, now, params=(dict(pm.DEFAULTS), "t"), msu=600.0, activity_known=True)
+            ti = pm.threshold_info(None, None, now, d)
+        self.assertEqual(calls, [None, None])   # the live gate and the shown forecast: the same fit
+        self.assertAlmostEqual(d["forecast_design"], pm.forecast_design(gate, now, R + pm.WEEK))
+        self.assertEqual((ti["forecast"]["other_week"], ti["forecast"]["design_week"]),
+                         (round(sum(gate), 1), 32.0))
+        with mock.patch.object(pm, "profile", side_effect=prof):
+            self.assertEqual(pm.threshold_info(rows, [], now)["forecast"]["design_week"], 17.0)   # given rows: theirs
+
     def test_ratio_stats(self):
         rs = pm.ratio_stats([dict(row(SUN, 10), limit_ratio=self.SNAP)])
         self.assertEqual((rs["value"], rs["kind"], rs["n"], rs["weighted_stdev"], rs["intrinsic_stdev"]),
@@ -830,8 +862,9 @@ class Accuracy(unittest.TestCase):
         self.assertAlmostEqual(ti["full_session_cost"]["sd"], 100 * (0.012 ** 2 + 0.005 ** 2) ** 0.5, places=1)
         self.assertEqual(ti["full_session_cost"]["spread"], 2.0)
         me = ti["model_error"]
-        for k in ("n", "n_closed", "bias", "sd", "rmse", "worst", "status", "note", "logged"):
+        for k in ("n", "n_closed", "bias", "sd", "rmse", "worst", "status", "note", "logged", "with_design"):
             self.assertIn(k, me)
+        self.assertIn("with your design chats (D-325)", "\n".join(pm.threshold_lines(ti)))
         self.assertEqual(me["status"], "ok")
         t = ti["threshold"]
         self.assertEqual((t["active"], t["source"], t["dynamic_default"], t["override"]), (85.0, "dynamic", 85.0, None))
