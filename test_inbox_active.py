@@ -8,8 +8,10 @@ keep-alive's compaction flow is no activity: from its start and after it message
 "now" verdict made during it goes in after its READY. A temp DB, the fake tmux session and
 transcript of test_compaction.Env, a fake Haiku; no real Claude, no tmux."""
 import functools
+import json
 import os
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
 import actions  # noqa: E402
+import claude_auth  # noqa: E402
 import compact_timing as ct  # noqa: E402
 import failstop  # noqa: E402
 import host  # noqa: E402
@@ -163,6 +166,43 @@ class Active(tc.Env):
         self.addCleanup(setattr, ka, "load_state", old)
         m = self.post()
         self.assert_check_failed(m, self.process(), "the keepalive state can't be read")
+
+
+class LoginExpired(Active):
+    """D-320: the triage call can't log in (an expired Claude login): one plain error, everything paused
+    (not only the message's project), the dashboard's state set; a later good triage clears it."""
+    def setUp(self):
+        super().setUp()
+        self.state_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state_tmp.cleanup)
+        self.addCleanup(setattr, ka, "USAGE_STATE_FILE", ka.USAGE_STATE_FILE)
+        ka.USAGE_STATE_FILE = os.path.join(self.state_tmp.name, "usage_state.json")
+        self.addCleanup(testenv.unpause)
+
+    def expired(self):
+        out = json.dumps({"type": "result", "is_error": True,
+                          "result": "Failed to authenticate: OAuth session expired and could not be refreshed"})
+        host.run_on_host = lambda argv, **kw: types.SimpleNamespace(returncode=1, stdout=out, stderr="")
+
+    def test_an_expired_login_pauses_everything_with_the_plain_message(self):
+        self.expired()
+        m = self.post()
+        out = self.process()
+        r = self.row(m)
+        self.assertEqual(out, {"failed": 1})
+        self.assertEqual((r["status"], r["verdict"]), ("error", None))
+        self.assertIn("Claude login expired", r["error"])
+        p = failstop.paused()                                      # install-wide, not only the message's project
+        self.assertTrue(p["paused"])
+        self.assertIn("Claude login expired: run `claude`", p["reason"])
+        self.assertEqual(self.notified, ["AFClaude STOPPED: " + claude_auth.SUBJECT])
+        self.assertTrue(claude_auth.is_expired(ka.USAGE_STATE_FILE))
+
+    def test_a_good_triage_clears_the_state(self):
+        claude_auth.record_expired("usage read", "old", ka.USAGE_STATE_FILE)
+        self.post()
+        self.assertEqual(self.process(), {"note": 1})
+        self.assertFalse(claude_auth.is_expired(ka.USAGE_STATE_FILE))
 
 
 class DuringAndAfterCompaction(Active):

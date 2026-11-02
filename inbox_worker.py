@@ -81,6 +81,7 @@ from typing import Any, Callable
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
+import claude_auth  # noqa: E402
 import compact_timing  # noqa: E402
 import failstop  # noqa: E402
 import host  # noqa: E402
@@ -137,7 +138,8 @@ def failed(conn: Any, m: dict[str, Any], subject: str, detail: str) -> None:
         _act(conn, "inbox.fail", message_id=m["id"], error=f"{subject}: {detail}")
     except Exception as e:   # noqa: BLE001 - reported with the alert below
         detail += f" (and the error could not be stored on the message: {type(e).__name__}: {e})"
-    fail_stop(subject, f"message #{m['id']}: {detail}", session=m["session_id"])
+    # an expired login (D-320) stops everything, not only this message's project: no call works for any
+    fail_stop(subject, f"message #{m['id']}: {detail}", session=None if subject == claude_auth.SUBJECT else m["session_id"])
 
 
 # ---------------------------------------------------------------- triage
@@ -181,7 +183,13 @@ def triage_call(text: str) -> dict[str, Any]:
     hit = limit_notice(r.returncode, r.stdout or "", r.stderr or "")
     if hit:
         raise inbox.TriageLimit(*hit)
-    return inbox.parse_triage(r.returncode, r.stdout or "", r.stderr or "")
+    try:
+        t = inbox.parse_triage(r.returncode, r.stdout or "", r.stderr or "")
+    except inbox.TriageLoginExpired as e:
+        ka.auth_expired("inbox triage", e.found)   # D-320: the dashboard shows it
+        raise
+    ka.auth_ok("inbox triage")   # parse_triage took the answer: the call worked, so the login state is cleared
+    return t
 
 
 def limit_reset(e: inbox.TriageLimit, now: datetime) -> datetime | None:
@@ -329,6 +337,9 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
         try:
             t = triage_call(triage_text(conn, m))
         except inbox.TriageError as e:
+            if isinstance(e, inbox.TriageLoginExpired):   # D-320: plain message, and everything is paused
+                failed(conn, m, claude_auth.SUBJECT, claude_auth.failure_detail(e.found))
+                return None
             if retry is not None:
                 failed(conn, m, "inbox message triage failed after the usage limit's reset",
                        f"held until {ka.berlin(retry)}, sorted again: {e}")

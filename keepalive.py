@@ -87,6 +87,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import claude_auth  # D-320: an expired login, told apart from other failures
 import runner_state  # phase 2d: the state lives in the DB only (D-161); the log is dual-written
 import schedule
 import usage_stale
@@ -123,6 +124,7 @@ RESET_GRACE = timedelta(seconds=90)       # fire this long after the reset time
 USAGE_MAX_AGE = timedelta(minutes=10)     # refresh /usage if cache older than this
 REFRESH_OK_AGE = timedelta(minutes=2)     # /usage left the cache this young: OK (claude skips the rewrite < 60 s)
 POKE_MIN_INTERVAL = timedelta(minutes=30) # at most one token-refresh request per this (sampler + watcher + cron)
+POKE_EXPIRED_INTERVAL = timedelta(minutes=5)   # ... per this while the login is expired (D-320): a re-login shows up soon
 USAGE_STATE_FILE = os.path.join(STATE_DIR, "usage_refresh_state.json")
 HOLD_RECHECK = timedelta(minutes=15)      # re-evaluate a HOLD decision this often
 MAX_FIRES_PER_WINDOW = 4                  # safety cap per night
@@ -437,7 +439,8 @@ def refresh_usage(cwd=HERE):
     try:
         r = host.run_on_host(["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
                              cwd=cwd, env=SCRUBBED_ENV, timeout=120)
-        return r.returncode, r.stdout
+        err = (r.stderr or "").strip()
+        return r.returncode, r.stdout + (("\n" + err) if err else "")   # stderr too: a login error is printed there
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, str(e)
 
@@ -459,15 +462,31 @@ def _save_usage_state(d):
         log("usage state not saved (recorded in data/ALERTS.fallback.md)")
 
 
-def poke_auth(cwd=HERE, now=None):
+def auth_expired(source, found, now=None):
+    """D-320: the Claude login is expired (claude_auth.detect found `found` in a call of `source`): the state
+    the quickview shows until a later call authenticates. In the keepalive's state doc (USAGE_STATE_FILE)."""
+    return claude_auth.record_expired(source, found, USAGE_STATE_FILE, now)
+
+
+def auth_ok(source, now=None):
+    """D-320: a Claude call authenticated: clears the "login expired" state, if it was set."""
+    if claude_auth.record_ok(source, USAGE_STATE_FILE, now):
+        log(f"Claude login works again ({source}): the 'login expired' state is cleared")
+
+
+def poke_auth(cwd=HERE, now=None, verdict=None):
     """One minimal real model request, to renew the OAuth access token. `-p /usage` is a local
     command: on 03./04.10.2026 it printed only the cost summary and refreshed nothing for
     34 h, until the first real request renewed the token (see usage_stale.py). Throttled to
-    one per POKE_MIN_INTERVAL across all callers. -> short result text."""
+    one per POKE_MIN_INTERVAL across all callers (POKE_EXPIRED_INTERVAL while the login is known to be
+    expired, so a re-login is noticed soon). A request refused for an expired login is recorded as the
+    "login expired" state, one that authenticated clears it (D-320); `verdict` (a dict, optional) gets
+    "found": the CLI's login-error message. -> short result text."""
     now = now or datetime.now(UTC)
     st = _load_usage_state()
     last = usage_stale.ts(st.get("poke_at"))
-    if last and timedelta(0) <= now - last < POKE_MIN_INTERVAL:
+    interval = POKE_EXPIRED_INTERVAL if claude_auth.is_expired(USAGE_STATE_FILE) else POKE_MIN_INTERVAL
+    if last and timedelta(0) <= now - last < interval:
         return f"skipped (last token-refresh request {berlin(last)})"
     st["poke_at"] = now.isoformat()
     _save_usage_state(st)
@@ -475,11 +494,18 @@ def poke_auth(cwd=HERE, now=None):
         r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=cwd, env=SCRUBBED_ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
         return f"failed: {type(e).__name__}: {e}"[:200]
+    found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
     try:
         o = json.loads(r.stdout or "{}")
-        res = f"is_error={o.get('is_error')} result={str(o.get('result'))[:60]!r}"
+        res = f"is_error={o.get('is_error')} result={str(o.get('result'))[:120]!r}"
     except ValueError:
-        res = f"output {(r.stdout or r.stderr or '').strip()[:80]!r}"
+        res = f"output {(r.stdout or r.stderr or '').strip()[:120]!r}"
+    if found:
+        auth_expired("token-refresh request", found, now)
+        if verdict is not None:
+            verdict["found"] = found
+    elif claude_auth.succeeded(r.returncode, r.stdout or ""):
+        auth_ok("token-refresh request", now)
     return f"rc={r.returncode} {res}"
 
 
@@ -498,22 +524,37 @@ def refresh_usage_checked(cwd=HERE, now=None):
     OAuth token) and /usage again. This one retry is DELIBERATE (D-235 allows deliberate,
     documented retries; task-manager decision 14.10.): `-p /usage` alone does not renew an expired
     token (the 03./04.10. incident, usage_stale.py). If it still did not refresh, the callers treat
-    it as an error (fresh_usage: fail_stop), never a second silent retry. -> dict rc, out (last /usage output), usage (cache after,
-    or None), ok (refreshed), retried, poke (poke_auth result or None)."""
+    it as an error (fresh_usage: fail_stop), never a second silent retry. If the failure is an expired
+    login (the request or /usage printed the CLI's authentication error), `auth` carries its message
+    and the callers fail with claude_auth.SUBJECT (D-320). -> dict rc, out (last /usage output), usage
+    (cache after, or None), ok (refreshed), retried, poke (poke_auth result or None), auth (the CLI's
+    login-error message or None)."""
     now = now or datetime.now(UTC)
     before = (read_usage_cache() or {}).get("fetched_at")
     rc, out = refresh_usage(cwd)
     u = read_usage_cache()
-    res = {"rc": rc, "out": out, "usage": u, "ok": _refreshed(u, before, now), "retried": False, "poke": None}
+    res = {"rc": rc, "out": out, "usage": u, "ok": _refreshed(u, before, now), "retried": False, "poke": None,
+           "auth": claude_auth.detect(rc, out, local=True)}
     if not res["ok"]:
         log(f"/usage did not refresh the cache (rc={rc}, cache from "
             f"{berlin(u['fetched_at']) if u else 'n/a'}): {out.strip()[:120]!r}; trying a token-refresh request")
-        res["poke"] = poke_auth(cwd, now)
+        verdict = {}
+        res["poke"] = poke_auth(cwd, now, verdict)
+        found = verdict.get("found")
         res["retried"] = True
         log(f"token-refresh request: {res['poke']}")
         rc, out = refresh_usage(cwd)
         u = read_usage_cache()
         res.update(rc=rc, out=out, usage=u, ok=_refreshed(u, before, max(now, datetime.now(UTC))))
+        res["auth"] = found or claude_auth.detect(rc, out, local=True)   # the latest verdicts only
+    if res["ok"]:
+        res["auth"] = None
+        auth_ok("/usage", now)
+    elif not res["auth"] and (res["poke"] or "").startswith("skipped"):
+        res["auth"] = claude_auth.state(USAGE_STATE_FILE).get("found") if claude_auth.is_expired(USAGE_STATE_FILE) \
+            else None   # the request is throttled: the last one's verdict still stands
+    if res["auth"]:
+        auth_expired("usage read", res["auth"], now)
     LAST_REFRESH.clear()
     LAST_REFRESH.update(res, at=now)
     return res
@@ -522,13 +563,21 @@ def refresh_usage_checked(cwd=HERE, now=None):
 USAGE_FAILED = "usage reading failed: /usage did not refresh the usage cache"
 
 
+def usage_failure_subject(r):
+    """The fail-stop subject of a failed usage refresh `r`: the plain login message when the Claude login
+    expired (D-320), else USAGE_FAILED."""
+    return claude_auth.SUBJECT if r.get("auth") else USAGE_FAILED
+
+
 def usage_failure_detail(r):
     """The alert text of a failed usage refresh (refresh_usage_checked's result `r`)."""
     cache = (r.get("usage") or read_usage_cache() or {}).get("fetched_at")
-    return (f"`claude -p /usage` did not refresh ~/.claude.json (cache from {berlin(cache) if cache else 'n/a'}), "
-            f"also not after a token-refresh request ({r.get('poke') or 'not tried'}); rc={r.get('rc')}. Last "
-            f"/usage output: {(r.get('out') or '').strip()[:300]!r}. A real Claude request (or `claude /login`) "
-            "on the host usually fixes it.")
+    generic = (f"`claude -p /usage` did not refresh ~/.claude.json (cache from {berlin(cache) if cache else 'n/a'}), "
+               f"also not after a token-refresh request ({r.get('poke') or 'not tried'}); rc={r.get('rc')}. Last "
+               f"/usage output: {(r.get('out') or '').strip()[:300]!r}.")
+    if r.get("auth"):
+        return f"{claude_auth.failure_detail(r['auth'])} {generic}"
+    return generic + " A real Claude request (or `claude /login`) on the host usually fixes it."
 
 
 def fresh_usage(now, force=False, display=False):
@@ -543,9 +592,9 @@ def fresh_usage(now, force=False, display=False):
         u = r["usage"]
         if not u or now - u["fetched_at"] > USAGE_MAX_AGE:
             if display:
-                log(f"ERROR (display only, not paused): {USAGE_FAILED}: {usage_failure_detail(r)}")
+                log(f"ERROR (display only, not paused): {usage_failure_subject(r)}: {usage_failure_detail(r)}")
             else:
-                fail_stop(USAGE_FAILED, usage_failure_detail(r))
+                fail_stop(usage_failure_subject(r), usage_failure_detail(r))
             return None
     return u
 
@@ -1964,6 +2013,12 @@ def window_ping(sid, now, key, u, why, args):
         problem = None if r.returncode == 0 and not o.get("is_error") else \
             f"rc={r.returncode} is_error={o.get('is_error')} result={str(o.get('result'))[:80]!r} " \
             f"stderr={(r.stderr or '').strip()[:200]!r}"
+        found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
+        if found:   # D-320: the dashboard shows it; the ping itself stays unalerted (D-280)
+            auth_expired("window-start ping", found)
+            problem = f"{claude_auth.SHORT}: {found!r} ({problem})"
+        elif problem is None:
+            auth_ok("window-start ping")
         rec["cost_usd"] = o.get("total_cost_usd")
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:   # ValueError: no JSON, no bridge shape
         problem = f"{type(e).__name__}: {e}"
@@ -1977,7 +2032,8 @@ def window_ping(sid, now, key, u, why, args):
     _sleep(WINDOW_PING_VERIFY_AFTER.total_seconds())
     res = refresh_usage_checked(now=_now())
     if not res.get("ok") or not res.get("usage"):
-        rec.update(status="verify-failed", error=usage_failure_detail(res)[:300])
+        rec.update(status="verify-failed", error=(claude_auth.SHORT + ": " if res.get("auth") else "")
+                   + usage_failure_detail(res)[:300])
         record_window_ping(key, rec)
         _ping_problem("window-start ping: the usage reading after it failed", f"{key}: {rec['error']}")
         progress_note(f"window-ping {berlin(at)}: sent, but the usage reading after it failed (D-277)")

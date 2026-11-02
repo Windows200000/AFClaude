@@ -31,6 +31,7 @@ import re
 import subprocess
 import time
 
+import claude_auth
 import host
 import keepalive as ka
 
@@ -44,6 +45,10 @@ NOT_REACHABLE = re.compile(r"no agent named|not reachable", re.I)
 
 class RcError(Exception):
     """The rc continue failed: an error the owner sees (D-235)."""
+
+
+class LoginExpired(RcError):
+    """The Haiku sender failed to authenticate: the Claude login is expired or invalid (D-320)."""
 
 
 class Busy(Exception):
@@ -109,7 +114,12 @@ def _norm(s):
 
 def check_sender(r, name, text):
     """The sender's CompletedProcess (stream-json on stdout): one SendMessage to `name` carrying
-    `text`, not failed. -> the tool result's text. RcError otherwise."""
+    `text`, not failed. -> the tool result's text. RcError otherwise; LoginExpired (an RcError) when the
+    sender failed to authenticate (D-320)."""
+    found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
+    if found:
+        ka.auth_expired("rc-continue sender", found)   # the dashboard shows it
+        raise LoginExpired(f"{claude_auth.SHORT}: {found}")
     if r.returncode != 0:
         why = {126: " (the host bridge denied the rc-send shape)",
                124: " (the host stopped the sender at its timeout)"}.get(r.returncode, "")
@@ -145,6 +155,7 @@ def check_sender(r, name, text):
     final = [ev for ev in events if ev.get("type") == "result"]
     if not final or final[-1].get("is_error"):
         raise RcError(f"the Haiku sender's run ended in an error: {json.dumps(final[-1:])[:300]}")
+    ka.auth_ok("rc-continue sender")   # the call authenticated: clears the "login expired" state
     return got
 
 

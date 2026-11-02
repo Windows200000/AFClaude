@@ -64,6 +64,7 @@ import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ig
 import telemetry  # noqa: E402  (phase 2c: every row also goes into the DB, dual-write)
 import runner_state  # noqa: E402  (phase 2d: the sampler state and log lines too)
 import failstop  # noqa: E402  (D-234/D-235: every failure is an error the owner sees)
+import claude_auth  # noqa: E402  (D-320: an expired Claude login is told apart)
 import prompts as prompt_registry  # noqa: E402  (phase 4a; "prompts" is a local name here)
 import usage_split  # noqa: E402  (goal 12: who drove a turn, the typed-message matcher)
 
@@ -115,7 +116,7 @@ def usage_now(t=None):
     res = ka.refresh_usage_checked(cwd=DATA, now=t)
     rc, out = res["rc"], res["out"]
     if not res.get("ok") or not res.get("usage"):
-        raise failstop.Failed(ka.USAGE_FAILED, ka.usage_failure_detail(res))
+        raise failstop.Failed(ka.usage_failure_subject(res), ka.usage_failure_detail(res))
     u = res["usage"] or {}
     row = {"rc": rc, "fetched_at": u.get("fetched_at")}
     for k in ("session", "weekly"):
@@ -540,14 +541,26 @@ def haiku_judgement(st, t):
                                   "--output-format", "json", "--tools=", "--strict-mcp-config", "--permission-mode", "dontAsk",
                                   "--disable-slash-commands"], input=prompt,
                                  cwd=DATA, env=ka.SCRUBBED_ENV, timeout=180)
-            out = json.loads(r.stdout)
-            row["cost_usd"] = out.get("total_cost_usd")
-            row["usage"] = out.get("usage")
-            res = out.get("result", "")
-            m = re.search(r"\{.*\}", res, re.S)
-            row["answer"] = json.loads(m.group(0)) if m else None
-            if not m:
-                row["raw"] = res[:500]
+            found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
+            if found:   # D-320: an expired login is no "raw" answer: the row carries it, main fails with it
+                ka.auth_expired("Haiku usage judgement", found, t)
+                row["error"], row["auth"] = f"{claude_auth.SHORT}: {found}", found
+            else:
+                out = json.loads(r.stdout)
+                res = out.get("result", "")
+                failed = r.returncode != 0 or bool(out.get("is_error"))
+                limit = next((x for x in (res, r.stderr) if failed and isinstance(x, str) and ka.LIMIT_TEXT_RE.search(x)), None)
+                if claude_auth.succeeded(r.returncode, r.stdout):
+                    ka.auth_ok("Haiku usage judgement", t)
+                if limit:   # refused at the usage limit (as the triage reads it): nothing to judge now, no error
+                    row["skipped"] = f"usage limit: {limit.strip()[:200]}"
+                else:       # (any other failed call keeps its old shape: a raw row, no error)
+                    row["cost_usd"] = out.get("total_cost_usd")
+                    row["usage"] = out.get("usage")
+                    m = re.search(r"\{.*\}", res, re.S)
+                    row["answer"] = json.loads(m.group(0)) if m else None
+                    if not m:
+                        row["raw"] = res[:500]
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as e:
             row["error"] = f"{type(e).__name__}: {e}"[:300]     # kept in the row; main raises it
         meta["last_haiku_at"] = t.isoformat()
@@ -769,7 +782,10 @@ def sample(args, t):
     if not args.no_haiku and args.tag == "cron":
         try:
             bad = [r for r in haiku_judgement(st, t) if r.get("error")]
-            if bad:
+            login = next((r["auth"] for r in bad if r.get("auth")), None)
+            if login:   # D-320: the plain login message, not "Haiku usage judgement failed"
+                errors.append((claude_auth.SUBJECT, claude_auth.failure_detail(login)))
+            elif bad:
                 errors.append(("Haiku usage judgement failed",
                                "; ".join(f"{r.get('name')}: {r['error']}" for r in bad)[:500]))
         except Exception as e:   # noqa: BLE001

@@ -70,6 +70,7 @@ import store  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161; the log dual-written)
 import afclaude_config  # noqa: E402  (settings from the DB; local identity: the task-manager session)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
+import claude_auth  # noqa: E402  (D-320: an expired Claude login is reported plainly)
 import rc_continue  # noqa: E402  (an approved continue of a live `claude rc` thread, D-288)
 
 UTC = timezone.utc
@@ -522,7 +523,9 @@ class Pass:
             err = f"{type(e).__name__}: {e}"[:500]
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-send-error",
                                        "error": err}
-            self.alert_once(f"rc-send:{key}", f"dispatcher did NOT continue the rc thread {sid[:8]}", err)
+            # an expired login (D-320) is reported plainly, as that one error (it stops every call, not this thread)
+            self.alert_once(f"rc-send:{key}", claude_auth.SUBJECT if isinstance(e, rc_continue.LoginExpired)
+                            else f"dispatcher did NOT continue the rc thread {sid[:8]}", err)
             self.skip(label, "rc thread continue failed: " + err)
             return "failed", "rc thread continue failed: " + err
         entry.update(thread=res["name"], pid=res["pid"], seconds=res["seconds"])

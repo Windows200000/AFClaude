@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import claude_auth  # noqa: E402  (D-320: an expired Claude login is told apart)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import project_docs  # noqa: E402  (the alert into the DB: doc.append)
 ACTOR = "runner:notify"
@@ -40,6 +41,12 @@ def push(text):
                              env=ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"push failed: {e}"
+    found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
+    if found:   # D-320: the alert itself still goes to the alerts doc; the dashboard shows the login state
+        claude_auth.record_expired("push notification", found)
+        return f"push failed: {claude_auth.SHORT} ({found[:120]})"
+    if claude_auth.succeeded(r.returncode, r.stdout or ""):
+        claude_auth.record_ok("push notification")
     for line in r.stdout.splitlines():
         try:
             o = json.loads(line)
