@@ -1350,10 +1350,14 @@ class Quickview(DB):
         self.assertLess(box, page.index("Keep-alive &amp; usage"))
         for s in ('id="msg-log"', 'id="msg-form"', 'id="msg-text"', 'id="msg-send"', 'API = BASE + "api/inbox"',
                   '"Content-Type": "application/json"', "data-retry", "/retry", "m.answer", "m.error", "m.state", "m.tip",
-                  "data-tip", "box.chat", "box.busy", "s-spin", "s-check", "s-err", "Ctrl+Enter"):
+                  "data-tip", "box.busy", "s-spin", "s-check", "s-err", "Ctrl+Enter"):
             self.assertIn(s, page, s)
-        for s in ("box.threads", "data-dismiss", '"/dismiss"', "m.answered_berlin"):   # D-304: answered threads
+        for s in ("box.threads", "data-dismiss", '"/dismiss"', "t.activity_berlin"):   # D-304: answered threads
             self.assertIn(s, page, s)
+        for s in ("t.needs_input", "waitingHtml", "Replies waiting for you", "cardItem", "details.card", "data-thread",
+                  "parent: id", "t.collapsed"):                                # D-324: thread cards, follow-ups
+            self.assertIn(s, page, s)
+        self.assertNotIn("threadItem", page)                                  # one card model, no second thread list
         for s in ("box.notices", "data-notice", '"/notice/"', "n.title", "n.text"):   # D-306: notices
             self.assertIn(s, page, s)
         for s in ("m.verdict_reason", "m.hold", "msg-list", "noted for the next session"):   # D-246: no thread list, no labels
