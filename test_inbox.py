@@ -31,6 +31,7 @@ import export_quickview  # noqa: E402
 import failstop  # noqa: E402
 import host  # noqa: E402
 import inbox  # noqa: E402
+import prompts  # noqa: E402
 import inbox_api  # noqa: E402
 import inbox_worker as iw  # noqa: E402
 import keepalive as ka  # noqa: E402
@@ -188,6 +189,56 @@ class Actions(DB):
             actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")
         r = actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "More."}, actor="cli", via="cli")
         self.assertIsNone(r["dismissed_at"])
+
+    def test_reply_flags_needs_input(self):
+        """D-324: a reply carries a needs-input flag, set anew by each reply (a later one without it clears it)."""
+        m = self.post()
+        r = actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "Which one?", "needs_input": True},
+                            actor="cli", via="cli")
+        self.assertEqual(r["needs_input"], 1)
+        r = actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "Never mind."}, actor="cli", via="cli")
+        self.assertEqual(r["needs_input"], 0)
+        with self.assertRaises(ValueError):
+            actions.perform(self.conn, "inbox.reply", {"message_id": m["id"], "answer": "x", "needs_input": "yes"},
+                            actor="cli", via="cli")
+
+    def test_follow_up_in_a_thread(self):
+        """D-324: a follow-up is a message of its own linked to the thread's first one (always the root), for
+        the thread's session; only an answered thread takes one; its delivery header names the thread."""
+        m = self.post(sid="00000000-0000-4000-8000-0000000000aa")
+        with self.assertRaises(store.InvalidTransition):                      # no reply yet
+            actions.perform(self.conn, "inbox.post", {"text": "more", "parent": m["id"]}, actor="owner", via="dashboard")
+        self.run_("inbox.reply", message_id=m["id"], answer="Which one?", needs_input=True)
+        f = actions.perform(self.conn, "inbox.post", {"text": "The second.", "parent": m["id"]}, actor="owner", via="dashboard")
+        self.assertEqual((f["parent_id"], f["session_id"], f["status"]), (m["id"], "00000000-0000-4000-8000-0000000000aa", "pending"))
+        self.run_("inbox.reply", message_id=f["id"], answer="Done.")
+        g = actions.perform(self.conn, "inbox.post", {"text": "Thanks, and?", "parent": f["id"]}, actor="owner", via="dashboard")
+        self.assertEqual(g["parent_id"], m["id"])                             # a follow-up of a follow-up: the root
+        with self.assertRaises(ValueError):
+            actions.perform(self.conn, "inbox.post", {"text": "x", "parent": m["id"], "project": "p"}, actor="owner", via="dashboard")
+        with self.assertRaises(store.NotFound):
+            actions.perform(self.conn, "inbox.post", {"text": "x", "parent": 999}, actor="owner", via="dashboard")
+        self.assertIn(f"follow-up to your reply on inbox #{m['id']}", inbox.question_about(self.conn, g))
+        for msg in (inbox.now_message(g, None), prompts.text("inbox_held"), prompts.text("inbox_notes")):
+            self.assertIn("--needs-input", msg)                               # when the task-manager flags a reply
+
+    def test_dismiss_a_thread_and_its_revival(self):
+        """D-324: dismiss takes the thread's first message; a follow-up or a reply to one after it brings the thread back."""
+        m = self.post()
+        self.run_("inbox.reply", message_id=m["id"], answer="A.")
+        f = actions.perform(self.conn, "inbox.post", {"text": "More?", "parent": m["id"]}, actor="owner", via="dashboard")
+        with self.assertRaises(store.InvalidTransition):                      # a follow-up is not dismissed on its own
+            actions.perform(self.conn, "inbox.dismiss", {"message_id": f["id"]}, actor="owner", via="dashboard")
+        actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")
+        self.assertEqual(store.inbox_threads(self.conn), [])                  # the follow-up predates the dismissal
+        time.sleep(0.01)
+        self.run_("inbox.reply", message_id=f["id"], answer="B.")
+        self.assertEqual([[x["id"] for x in t] for t in store.inbox_threads(self.conn)], [[m["id"], f["id"]]])
+        actions.perform(self.conn, "inbox.dismiss", {"message_id": m["id"]}, actor="owner", via="dashboard")   # again
+        self.assertEqual(store.inbox_threads(self.conn), [])
+        time.sleep(0.01)
+        g = actions.perform(self.conn, "inbox.post", {"text": "And?", "parent": m["id"]}, actor="owner", via="dashboard")
+        self.assertEqual([[x["id"] for x in t] for t in store.inbox_threads(self.conn)], [[m["id"], f["id"], g["id"]]])
 
     def test_include_only_noted(self):
         a, b = self.post("n1"), self.post("n2")
@@ -895,15 +946,18 @@ class View(DB):
     def test_thread_and_reset(self):
         now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
         old, a, b = self.post("old"), self.post("q1"), self.post("q2")
-        self.at(old, now - timedelta(hours=12), status="answered")
+        self.at(old, now - timedelta(hours=12), status="answered", answer="a0", answered_at=now - timedelta(hours=12))
         self.at(a, now - timedelta(hours=4), status="answered", answered_at=now - timedelta(hours=3))
         self.at(b, now - timedelta(minutes=10), status="delivered")
         v = inbox.view(self.conn, now)
-        self.assertEqual([m["text"] for m in v["messages"]], ["q1", "q2"])   # the 12 h old one: a new thread
+        self.assertEqual([m["text"] for m in v["messages"]], ["q2"])         # on its way: the box; answered ones are cards
+        self.assertEqual([(t["id"], t["collapsed"]) for t in v["threads"]], [(old["id"], True), (a["id"], False)])
         self.assertEqual(v["reset_hours"], 5.0)
         self.assertEqual(inbox.view(self.conn, now + timedelta(hours=6))["messages"], [])   # box empty again
+        self.assertEqual([t["collapsed"] for t in inbox.view(self.conn, now + timedelta(hours=6))["threads"]], [True] * 2)
         testenv.set_setting("ui_chat_reset_hours", 24)
-        self.assertEqual(len(inbox.view(self.conn, now)["messages"]), 3)
+        v = inbox.view(self.conn, now)
+        self.assertEqual((len(v["messages"]), [t["collapsed"] for t in v["threads"]]), (1, [False, False]))
 
     def test_each_state_has_its_mark_and_tooltip(self):
         """D-246: the box shows a mark per message, its tooltip says the rest (no labels on the page)."""
@@ -925,20 +979,22 @@ class View(DB):
             ("failed", "error", f"Failed {when}: Haiku timed out")])
         self.assertEqual((v["busy"], v["chat"]), (True, False))
 
-    def test_an_answer_makes_it_a_chat_until_the_reset(self):
-        """D-246: a passed-on message's answer turns the box into a chat, a later one continues it,
-        and D-178's reset empties it after ui_chat_reset_hours of quiet."""
+    def test_an_answer_makes_it_a_card_that_collapses_after_the_reset(self):
+        """D-324 (D-246/D-178): a passed-on message's answer turns it into a thread card in the message area; it
+        collapses after ui_chat_reset_hours of quiet and stays until dismissed."""
         now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
         a, b = self.post("q1"), self.post("q2")
         self.at(a, now - timedelta(hours=2), verdict="now", status="answered", answer="a1", answered_at=now - timedelta(hours=1))
         self.at(b, now - timedelta(minutes=1), verdict="now", status="delivered", delivered_at=now - timedelta(minutes=1))
         v = inbox.view(self.conn, now)
-        self.assertEqual([(x["text"], x["state"], x["answer"]) for x in v["messages"]],
-                         [("q1", "answered", "a1"), ("q2", "delivered", None)])
+        self.assertEqual([(x["text"], x["state"]) for x in v["messages"]], [("q2", "delivered")])
+        self.assertEqual([(t["id"], t["needs_input"], t["collapsed"], [(r["text"], r["answer"]) for r in t["rows"]])
+                          for t in v["threads"]], [(a["id"], False, False, [("q1", "a1")])])
         self.assertEqual((v["chat"], v["busy"]), (True, True))
         self.at(b, now - timedelta(minutes=1), status="answered", answer="a2", answered_at=now)
         v = inbox.view(self.conn, now + timedelta(hours=5, minutes=1))
-        self.assertEqual((v["messages"], v["chat"], v["busy"]), ([], False, False))
+        self.assertEqual((v["messages"], v["chat"], v["busy"]), ([], True, False))
+        self.assertEqual([t["collapsed"] for t in v["threads"]], [True, True])
 
     def test_a_noted_message_stays_until_it_is_included(self):
         """D-248: a noted message waits in the box (whatever the chat's reset) and clears once a
@@ -948,14 +1004,16 @@ class View(DB):
         self.at(n, now - timedelta(hours=9), verdict="note", status="noted", triaged_at=now - timedelta(hours=9))
         self.at(q, now - timedelta(hours=20), verdict="now", status="answered", answer="a", answered_at=now - timedelta(hours=19))
         v = inbox.view(self.conn, now)
-        self.assertEqual([(x["text"], x["state"]) for x in v["messages"]], [("note it", "noted")])   # the chat reset
-        self.assertEqual((v["chat"], v["busy"]), (False, False))
+        self.assertEqual([(x["text"], x["state"]) for x in v["messages"]], [("note it", "noted")])   # a noted one: current behaviour
+        self.assertEqual([(t["id"], t["collapsed"]) for t in v["threads"]], [(q["id"], True)])      # a card, collapsed
+        self.assertEqual((v["chat"], v["busy"]), (True, False))
         self.run_("inbox.include", message_ids=[n["id"]], by="start")
         self.assertEqual(inbox.view(self.conn, now)["messages"], [])
         actions.perform(self.conn, "inbox.reply", {"message_id": n["id"], "answer": "done"}, actor="cli", via="cli")
         v = inbox.view(self.conn)                                             # its answer is the latest activity
-        self.assertEqual([(x["text"], x["state"], x["answer"]) for x in v["messages"]], [("note it", "answered", "done")])
-        self.assertTrue(v["chat"])
+        self.assertEqual(v["messages"], [])
+        self.assertEqual([[(r["text"], r["answer"]) for r in t["rows"]] for t in v["threads"]],
+                         [[("q", "a")], [("note it", "done")]])
 
     def test_errors_stay_in_view(self):
         now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
@@ -964,6 +1022,55 @@ class View(DB):
         v = inbox.view(self.conn, now)
         self.assertEqual([(x["text"], x["status"], x["error"]) for x in v["messages"]],
                          [("failed one", "error", "Haiku timed out")])
+
+    def test_a_thread_shows_once_where_its_latest_reply_puts_it(self):
+        """D-324: a thread whose latest reply needs input sits under needs-input (whatever its age), every other
+        one in the message area, collapsed after the reset; none is in both, none is a loose message."""
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+        a, b, c = self.post("q1"), self.post("q2"), self.post("q3")
+        for m in (a, b, c):
+            self.at(m, now - timedelta(hours=30), verdict="now")
+        self.run_("inbox.reply", message_id=a["id"], answer="plain")
+        self.run_("inbox.reply", message_id=b["id"], answer="which?", needs_input=True)
+        self.run_("inbox.reply", message_id=c["id"], answer="which?", needs_input=True)
+        for m in (a, b, c):
+            self.at(m, now - timedelta(hours=30), answered_at=now - timedelta(hours=29))
+        # c: the owner answered in its card after the reply, so it no longer waits for them
+        f = actions.perform(self.conn, "inbox.post", {"text": "the second", "parent": c["id"]}, actor="owner", via="dashboard")
+        self.at(f, now - timedelta(hours=28), verdict="now", status="delivered", delivered_at=now - timedelta(hours=28))
+        v = inbox.view(self.conn, now)
+        by = {t["id"]: t for t in v["threads"]}
+        self.assertEqual({k: (t["needs_input"], t["collapsed"]) for k, t in by.items()},
+                         {a["id"]: (False, True), b["id"]: (True, False), c["id"]: (False, True)})
+        self.assertEqual([r["text"] for r in by[c["id"]]["rows"]], ["q3", "the second"])
+        self.assertEqual(by[c["id"]]["rows"][1]["state"], "delivered")
+        self.assertEqual(v["messages"], [])                                   # the follow-up is not a loose message
+        ids = [r["id"] for t in v["threads"] for r in t["rows"]]
+        self.assertEqual(len(ids), len(set(ids)))                             # no message twice
+        self.assertTrue(v["busy"])                                            # the follow-up is on its way
+        self.run_("inbox.reply", message_id=f["id"], answer="ok?", needs_input=True)   # a new reply asks again
+        self.assertTrue({t["id"]: t["needs_input"] for t in inbox.view(self.conn, now)["threads"]}[c["id"]])
+
+    def test_old_answered_threads_still_render(self):
+        """D-324: a thread answered before the flag existed (needs_input 0, no parent) is a plain card."""
+        m = self.post("old question")
+        self.conn.execute("UPDATE inbox_messages SET status='answered', answer='old answer', answered_at=?, "
+                          "needs_input=0, parent_id=NULL WHERE id=?", (store.now_iso(), m["id"]))
+        self.conn.commit()
+        v = inbox.view(self.conn)
+        self.assertEqual([(t["id"], t["needs_input"], t["collapsed"], t["rows"][0]["answer"]) for t in v["threads"]],
+                         [(m["id"], False, False, "old answer")])
+        self.assertEqual(v["messages"], [])
+
+    def test_cards_are_capped_needs_input_never(self):
+        now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+        ms = [self.post(f"q{i}") for i in range(inbox.CARDS_MAX + 3)]
+        for i, m in enumerate(ms):
+            self.run_("inbox.reply", message_id=m["id"], answer="a", needs_input=(i == 0))
+            self.at(m, now - timedelta(hours=1), answered_at=now - timedelta(minutes=60 - i))
+        v = inbox.view(self.conn, now)
+        self.assertEqual((len(v["threads"]), v["older"]), (inbox.CARDS_MAX + 1, 2))   # the needs-input one is extra
+        self.assertTrue(v["threads"][0]["needs_input"] and v["threads"][0]["id"] == ms[0]["id"])
 
     def test_summary_has_no_texts(self):
         self.post("secret plans")
@@ -1068,7 +1175,7 @@ class Endpoint(DB):
                           "answered_at='2026-01-01T01:00:00Z' WHERE id=?", (a["id"],))   # long out of the chat
         self.conn.commit()
         st, v = self.call("GET")
-        self.assertEqual([(t["id"], t["text"], t["answer"]) for t in v["threads"]],
+        self.assertEqual([(t["id"], t["rows"][0]["text"], t["rows"][0]["answer"]) for t in v["threads"]],
                          [(a["id"], "q1", f"a{a['id']}"), (b["id"], "q2", f"a{b['id']}")])
         self.assertNotIn(a["id"], [x["id"] for x in v["messages"]])
         self.wake.clear()
@@ -1081,6 +1188,26 @@ class Endpoint(DB):
         self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{c['id']}/dismiss", {})[0], 409)   # unanswered
         self.assertEqual(self.call("POST", f"/afclaude/api/inbox/{b['id']}/dismiss", {}, key="wrong")[0], 401)
         self.assertEqual(self.call("GET", f"/afclaude/api/inbox/{b['id']}/dismiss")[0], 405)
+
+    def test_follow_up_from_a_card(self):
+        """D-324: POST {"text", "parent"} posts a follow-up in the thread (pending, woken); a thread's follow-up shows in
+        its card, not as a message; an unanswered parent is a 409, an unknown one 404, an extra field a 400."""
+        m = self.post("q1")
+        self.assertEqual(self.call("POST", body={"text": "more", "parent": m["id"]})[0], 409)   # no reply yet
+        self.run_("inbox.reply", message_id=m["id"], answer="which?", needs_input=True)
+        st, v = self.call("GET")
+        self.assertEqual([(t["id"], t["needs_input"]) for t in v["threads"]], [(m["id"], True)])
+        self.wake.clear()
+        st, f = self.call("POST", body={"text": "the second", "parent": m["id"]})
+        self.assertEqual((st, f["parent"], f["status"]), (201, m["id"], "pending"))
+        self.assertTrue(self.wake.is_set())
+        st, v = self.call("GET")
+        self.assertEqual(v["messages"], [])
+        self.assertEqual([(t["needs_input"], [r["text"] for r in t["rows"]]) for t in v["threads"]],
+                         [(False, ["q1", "the second"])])
+        self.assertEqual(self.call("POST", body={"text": "x", "parent": 999})[0], 404)
+        self.assertEqual(self.call("POST", body={"text": "x", "parents": 1})[0], 400)
+        self.assertEqual(store.audit_log(self.conn, 1, "inbox", f["id"])[0]["via"], "dashboard")
 
     def test_notices_and_dismiss(self):
         """D-306: GET lists the shown notices; POST .../notice/<id>/dismiss runs notice.dismiss (owner, audited)."""
@@ -1193,6 +1320,15 @@ class CLI(DB):
         rc, out = self.cli("inbox", "list")
         self.assertIn("no open messages", out)                                # answered: not open
         self.assertIn(f"#{m['id']}", self.cli("inbox", "list", "--all")[1])
+
+    def test_reply_needs_input(self):
+        m = self.post("Which way?")
+        rc, out = self.cli("inbox", "reply", str(m["id"]), "A or B?", "--needs-input")
+        self.assertEqual((rc, out.strip()), (0, f"inbox #{m['id']}: answered"))
+        self.assertEqual(store.get_inbox(self.conn, m["id"])["needs_input"], 1)
+        self.assertIn("needs the owner", self.cli("inbox", "show", str(m["id"]))[1])
+        self.cli("inbox", "reply", str(m["id"]), "Fine.")
+        self.assertEqual(store.get_inbox(self.conn, m["id"])["needs_input"], 0)
 
     def test_old_inbox_still_works(self):
         rc, out = self.cli("inbox", "--no-scan")

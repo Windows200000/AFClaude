@@ -1712,8 +1712,9 @@ def handoff_consume(conn: sqlite3.Connection, ctx: Ctx, handoff_id: Any, start_k
 # holds the text as typed and is its only copy (D-241): the audit rows name a text by its size and
 # sha256, never repeat it. inbox.post is the owner's (the dashboard, the CLI); the triage and the
 # delivery steps are the runner's (inbox_api.py's worker, the keep-alive), never MCP's; inbox.reply
-# is the task-manager's answer (`tasks.py inbox reply`); inbox.dismiss is the owner's: an answered
-# thread leaves the dashboard's questions section (D-304).
+# is the task-manager's answer (`tasks.py inbox reply`, --needs-input when the reply waits for the
+# owner); inbox.dismiss is the owner's: an answered thread leaves the dashboard (D-304, D-324). A
+# follow-up the owner writes in a thread's card is an inbox.post with `parent`.
 
 INBOX_REASON_MAX = 300
 INBOX_ERROR_MAX = 1000
@@ -1768,15 +1769,28 @@ def _inbox_session(conn: sqlite3.Connection, project: Any = None) -> str:
 
 
 @action("inbox.post", "inbox", owner_only=True)
-def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None, project: Any = None) -> Result:
+def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = None, project: Any = None,
+               parent: Any = None) -> Result:
     """A message from the owner to a task-manager, pending until the triage sorts it. The target is a
     project (its task-manager from the registry, phase 3b S3) or a session id; with neither, the first
     project's task-manager (rank order, D-064: AFClaude today). A project without a task-manager session
-    yet, or no task-manager at all, is an error (D-235), not a guess."""
+    yet, or no task-manager at all, is an error (D-235), not a guess. `parent`: the id of a message of an
+    answered thread: the text is a follow-up in that thread (D-324), for the thread's own session, linked
+    to the thread's first message."""
     if session_id is not None and project is not None:
         raise ValueError("name a project or a session, not both")
-    sid = session_id if session_id is not None else _inbox_session(conn, project)
-    m = store.add_inbox(conn, text, sid, ctx.actor)
+    root_id = None
+    if parent is not None:
+        if session_id is not None or project is not None:
+            raise ValueError("a follow-up goes to its thread's task-manager: name no project or session")
+        p = store.inbox_row(conn, parent)
+        root = store.inbox_row(conn, p["parent_id"]) if p["parent_id"] is not None else p
+        if root["status"] != "answered":
+            raise store.InvalidTransition(f"inbox message #{root['id']} has no reply yet: nothing to follow up")
+        sid, root_id = root["session_id"], root["id"]
+    else:
+        sid = session_id if session_id is not None else _inbox_session(conn, project)
+    m = store.add_inbox(conn, text, sid, ctx.actor, parent_id=root_id)
     return Result(m, m["id"], None, _inbox_audit(m))
 
 
@@ -1899,25 +1913,33 @@ def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
 
 
 @action("inbox.reply", "inbox")
-def inbox_reply(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, answer: Any) -> Result:
+def inbox_reply(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, answer: Any, needs_input: Any = False) -> Result:
     """The task-manager's answer, shown on the dashboard. A second reply is added below the first and
-    brings a dismissed thread back (D-304)."""
+    brings a dismissed thread back (D-304). `needs_input` (D-324): the reply asks the owner something or waits
+    for their decision; its thread then shows under "Needs your input" until the owner answers or dismisses it.
+    Each reply sets the flag anew: a later one without it clears it."""
     text = store._text(answer, "answer", required=True)
     if len(text) > store.INBOX_TEXT_MAX:
         raise ValueError(f"answer is too long ({len(text)} > {store.INBOX_TEXT_MAX} characters)")
+    if not isinstance(needs_input, bool):
+        raise ValueError(f"needs_input must be true or false, got {needs_input!r}")
     before = store.inbox_row(conn, message_id)
     full = f"{before['answer']}\n\n{text}" if before["answer"] else text
     after = store.update_inbox(conn, before["id"], ("pending", "delivered", "noted", "included", "answered"),
                                status="answered", answer=full, answered_at=store.now_iso(), hold=None,
-                               dismissed_at=None)
+                               dismissed_at=None, needs_input=int(needs_input))
     return _inbox_change(before, after)
 
 
 @action("inbox.dismiss", "inbox", owner_only=True)
 def inbox_dismiss(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
-    """The owner dismisses an answered thread: it leaves the dashboard's questions section (D-304)."""
+    """The owner dismisses an answered thread (its first message): it leaves the dashboard (D-304, D-324) until
+    a follow-up, or a reply to one, comes after."""
     before = store.inbox_row(conn, message_id)
-    if before["dismissed_at"] is not None:
+    if before["parent_id"] is not None:
+        raise store.InvalidTransition(f"inbox message #{before['id']} is a follow-up: dismiss its thread "
+                                      f"#{before['parent_id']}")
+    if before["dismissed_at"] is not None and not store.inbox_revived(conn, before):
         raise store.InvalidTransition(f"inbox message #{before['id']} is already dismissed")
     after = store.update_inbox(conn, before["id"], ("answered",), dismissed_at=store.now_iso())
     return _inbox_change(before, after)

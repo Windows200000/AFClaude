@@ -8,8 +8,12 @@ The owner types a message on the temp dashboard (the quickview page); inbox_api.
   now   it is typed into the task-manager's tmux session at once (D-186: no window, no budget),
         through the keep-alive's own send path and checks (the session lock, preflight's
         owner_holds, owner_typing), with the message id and how to answer
-        (`tasks.py inbox reply <id> "..."`); the answer shows on the dashboard: in the box's chat for
-        ui_chat_reset_hours, and in the questions section until the owner dismisses it (D-304).
+        (`tasks.py inbox reply <id> "..."`, with --needs-input when the reply asks the owner
+        something); the answered message becomes a thread card on the dashboard (D-324): message,
+        reply and a reply field for follow-ups (each a message of its own, parent_id = the thread's
+        first message). A thread whose latest reply needs the owner sits in "Needs your input"
+        until the owner answers in the card or dismisses it; every other card stays in the message
+        area, collapsed after ui_chat_reset_hours of quiet, until dismissed.
   note  it waits in the DB; the next message the keep-alive sends into the session (a run's
         continue, a fill-up, the message after a compaction, or a "now" message) lists the
         noted ones verbatim and marks them included, so the session never wakes (and re-reads
@@ -154,7 +158,10 @@ def parse_triage(returncode: int, stdout: str, stderr: str = "") -> dict[str, An
 def question_about(conn: sqlite3.Connection, m: dict[str, Any]) -> str | None:
     """The delivery header of a message that answers a question (phase 4b Q3): "answer to your question #N
     <title>", and what the owner chose: for a decision question its choice (on the question, not in the
-    message's text), for an option button the option's number. None for any other message."""
+    message's text), for an option button the option's number. A follow-up in a thread's card (D-324) names the
+    thread's first message instead. None for any other message."""
+    if m.get("parent_id") is not None:
+        return f"follow-up to your reply on inbox #{m['parent_id']} (python3 tasks.py inbox show {m['parent_id']})"
     qid = m.get("question_id")
     if qid is None:
         return None
@@ -306,20 +313,21 @@ def activity(m: dict[str, Any]) -> datetime:
     return max(t for t in times if t is not None)
 
 
-CHAT_STATUSES = ("pending", "delivered", "answered", "error")   # the chat; noted ones are lines, included ones gone
+CHAT_STATUSES = ("pending", "delivered", "error")   # a message on its way; answered ones are thread cards (D-324), noted ones lines, included ones gone
+CARDS_MAX = 20              # thread cards in the message area (the older ones: their count; dismissed ones are out)
 BUSY_STATES = ("sorting", "sending", "held", "delivered")         # the box shows a loading animation
 VIEW_FMT = "%a %d.%m. %H:%M"
 
 
 def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[str, Any]]:
-    """The box's chat, oldest first (D-178, D-246): the messages passed on to the task-manager or on
-    their way (not the noted or included ones), newest back to the first gap longer than
-    ui_chat_reset_hours (none in the last ui_chat_reset_hours: the chat is empty again), at most
-    VIEW_MAX; a message still waiting or failed always stays in view. Walked by last activity, not
-    id: an old message answered now (a noted one, included, then answered) is the newest."""
+    """The messages on their way to or from the task-manager, oldest first (D-178, D-246): passed on and not
+    answered yet (the answered ones are thread cards, D-324; not the noted or included ones, nor a
+    follow-up, which sits in its card), newest back to the first gap longer than ui_chat_reset_hours (none
+    in the last ui_chat_reset_hours: empty again), at most VIEW_MAX; a message still waiting or failed always
+    stays in view. Walked by last activity, not id."""
     now = now or datetime.now(UTC)
     reset = timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
-    rows = store.list_inbox(conn, CHAT_STATUSES, limit=200)
+    rows = [m for m in store.list_inbox(conn, CHAT_STATUSES, limit=200) if m["parent_id"] is None]
     out: list[dict[str, Any]] = []
     edge = now
     for m in sorted(rows, key=activity, reverse=True):
@@ -377,7 +385,8 @@ def message_view(m: dict[str, Any], cfg: schedule.Config | None = None) -> dict[
             "hold_until_berlin": until.astimezone(BERLIN).strftime(VIEW_FMT) if until else None,
             "delivered_berlin": berlin(m["delivered_at"]),
             "included_berlin": berlin(m["included_at"]), "answer": m["answer"],
-            "answered_berlin": berlin(m["answered_at"]), "error": m["error"]}
+            "answered_berlin": berlin(m["answered_at"]), "error": m["error"], "parent": m["parent_id"],
+            "needs_input": bool(m["needs_input"])}
 
 
 def question_view(conn: sqlite3.Connection, t: dict[str, Any]) -> dict[str, Any]:
@@ -401,13 +410,30 @@ def question_view(conn: sqlite3.Connection, t: dict[str, Any]) -> dict[str, Any]
     return out
 
 
-def thread_view(conn: sqlite3.Connection, m: dict[str, Any]) -> dict[str, Any]:
-    """An answered message for the questions section (D-304); one that answers a question carries the
-    question (id, title, text) so the thread shows question, answer and reply."""
-    out = message_view(m)
-    q = store.get_task(conn, m["question_id"]) if m.get("question_id") is not None else None
-    out["question"] = ({"id": q["id"], "title": q["title"], "text": q["blocked_question"]} if q is not None else None)
-    return out
+def thread_needs_input(rows: list[dict[str, Any]]) -> bool:
+    """D-324: the thread waits for the owner: its latest reply (by answered_at) carries the needs-input flag and the
+    owner has written nothing since (a follow-up posted after it answers it)."""
+    replies = [m for m in rows if m["answered_at"]]
+    if not replies:
+        return False
+    last = max(replies, key=lambda m: m["answered_at"])        # store.now_iso stamps: fixed width, compare as text
+    return bool(last["needs_input"]) and all(m["created_at"] <= last["answered_at"] for m in rows if m is not last)
+
+
+def thread_view(conn: sqlite3.Connection, rows: list[dict[str, Any]], now: datetime, cfg: schedule.Config | None = None,
+                reset: timedelta | None = None) -> dict[str, Any]:
+    """A thread card (D-324): the first message (`id`, the thread's id) and its follow-ups as `rows` (message_view
+    each, oldest first; the first answers a question: `question` carries id, title, text, D-304), `needs_input`
+    (it belongs under "Needs your input"), `collapsed` (any other card quiet for ui_chat_reset_hours)."""
+    root = rows[0]
+    q = store.get_task(conn, root["question_id"]) if root.get("question_id") is not None else None
+    needs = thread_needs_input(rows)
+    last = max(activity(m) for m in rows)
+    reset = reset if reset is not None else timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
+    return {"id": root["id"], "rows": [message_view(m, cfg) for m in rows], "needs_input": needs,
+            "collapsed": not needs and now - last > reset, "activity": last.isoformat(),
+            "activity_berlin": berlin(last.isoformat(), VIEW_FMT),
+            "question": ({"id": q["id"], "title": q["title"], "text": q["blocked_question"]} if q is not None else None)}
 
 
 def notice_view(n: dict[str, Any]) -> dict[str, Any]:
@@ -418,22 +444,33 @@ def notice_view(n: dict[str, Any]) -> dict[str, Any]:
 
 
 def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
-    """What the box shows (D-246/D-248), oldest first: the chat (thread) and the noted messages
-    still waiting for the next message into the session (an included one is gone; a noted one
-    stays until then, whatever the chat's reset). `chat`: an answer is in view (the box shows it
-    as a chat); `busy`: a message is still on its way (the page polls faster). `threads`: every
-    answered message the owner has not dismissed, whatever its age, for the questions section (D-304);
-    `notices`: every notice the owner has not dismissed, oldest first, for the same section (D-306);
+    """What the box shows (D-246/D-248/D-324), oldest first: `messages`, the ones on their way (thread) and the
+    noted ones still waiting for the next message into the session (an included one is gone; a noted one
+    stays until then, whatever the chat's reset). `threads`: the thread cards (thread_view), each shown once,
+    where its `needs_input` says: under "Needs your input" (every such thread, whatever its age) or in the message
+    area (the CARDS_MAX most recently active, the others counted in `older`; `collapsed` after
+    ui_chat_reset_hours of quiet). `chat`: a card is in the message area; `busy`: a message is on its way
+    (the page polls faster). `notices`: every notice the owner has not dismissed, oldest first (D-306);
     `questions`: every open question in full, oldest first, with its options or decision choices (D-300)."""
-    ms = sorted(thread(conn, now) + store.list_inbox(conn, "noted", limit=200), key=lambda m: m["id"])
-    cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in ms) else None   # one DB read
-    out = [message_view(m, cfg) for m in ms]
+    now = now or datetime.now(UTC)
+    loose = sorted([m for m in thread(conn, now) + store.list_inbox(conn, "noted", limit=200) if m["parent_id"] is None],
+                   key=lambda m: m["id"])
+    ths = store.inbox_threads(conn)
+    rows = loose + [m for t in ths for m in t]
+    cfg = schedule.load() if any(m["hold"] and m["status"] == "pending" for m in rows) else None   # one DB read
+    out = [message_view(m, cfg) for m in loose]
+    reset = timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
+    views = [thread_view(conn, t, now, cfg, reset)
+             for t in sorted(ths, key=lambda t: (max(activity(m) for m in t), t[0]["id"]))]
+    cards = [t for t in views if not t["needs_input"]]
+    older = len(cards) - CARDS_MAX
+    shown = [t for t in views if t["needs_input"] or t in cards[-CARDS_MAX:]]
     questions = sorted(store.list_tasks(conn, status="blocked", kind=store.QUESTION_KIND), key=lambda t: t["id"])
-    return {"messages": out, "threads": [thread_view(conn, m) for m in store.inbox_threads(conn)],
+    return {"messages": out, "threads": shown, "older": max(0, older),
             "notices": [notice_view(n) for n in store.list_notices(conn)],
             "questions": [question_view(conn, t) for t in questions],
-            "chat": any(m["answer"] for m in ms),
-            "busy": any(m["state"] in BUSY_STATES for m in out),
+            "chat": any(not t["needs_input"] for t in shown),
+            "busy": any(m["state"] in BUSY_STATES for m in out + [r for t in shown for r in t["rows"]]),
             "reset_hours": float(actions.get_setting(conn, "ui_chat_reset_hours")), "max_chars": store.INBOX_TEXT_MAX}
 
 

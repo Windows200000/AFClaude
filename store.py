@@ -1012,7 +1012,13 @@ COLUMNS = {
                        # phase 4b Q3 W2: who wrote the text: typed (the owner), option (an option button: the
                        # task-manager's wording), edit (an edit of the task-manager's summary). owner_words
                        # counts only typed rows as the owner's words (D-285); a row without it is typed
-                       ("origin", "TEXT NOT NULL DEFAULT 'typed'")],
+                       ("origin", "TEXT NOT NULL DEFAULT 'typed'"),
+                       # D-324: a follow-up the owner wrote in a thread's card names the thread's first message
+                       # (always the root: a follow-up of a follow-up points at the root too)
+                       ("parent_id", "INTEGER"),
+                       # D-324: this reply asks the owner something or waits for their decision (inbox reply
+                       # --needs-input): the thread then sits in "Needs your input" until the owner answers
+                       ("needs_input", "INTEGER NOT NULL DEFAULT 0")],
     # phase 4b Q3: the owner confirmed this task-manager entry (decision.confirm, question.decide); from then
     # on it is protected like an owner's entry (D-104)
     "decisions": [("confirmed_at", "TEXT"), ("confirmed_by", "TEXT")],
@@ -3622,7 +3628,7 @@ INBOX_VERDICTS = ("now", "note")
 INBOX_TEXT_MAX = 4000          # characters (a "now" message is typed into tmux in one go)
 INBOX_FIELDS = ("status", "verdict", "verdict_reason", "triaged_at", "triage_cost_usd", "triage_usage",
                 "hold", "hold_since", "retry_after", "delivered_at", "delivered_via", "included_at", "included_by",
-                "answer", "answered_at", "error", "error_at", "dismissed_at")
+                "answer", "answered_at", "error", "error_at", "dismissed_at", "needs_input")
 
 
 def inbox_text(value: object) -> str:
@@ -3659,18 +3665,20 @@ INBOX_ORIGINS = ("typed", "option", "edit")
 
 
 def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str,
-              question_id: int | None = None, noted: str | None = None, origin: str = "typed") -> Row:
+              question_id: int | None = None, noted: str | None = None, origin: str = "typed",
+              parent_id: int | None = None) -> Row:
     """A new message. question_id: the question the text answers (the delivery names it). noted: the reason of a
     verdict "note" given at once, without a triage (a decision answer's note: the change is already
     applied); the message is then noted, not pending. origin: typed | option | edit (INBOX_ORIGINS); only a
-    typed text is the owner's own words."""
+    typed text is the owner's own words. parent_id: the thread's first message a follow-up belongs to (D-324)."""
     _enum(origin, INBOX_ORIGINS, "origin")
     clean = inbox_text(text)
     sid = _session_id(session_id)
     with transaction(conn):
         ts = now_iso()
-        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, question_id, origin) "
-                           "VALUES (?, ?, ?, ?, ?, ?)", (ts, created_by, sid, clean, question_id, origin))
+        cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, question_id, origin, "
+                           "parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (ts, created_by, sid, clean, question_id, origin, parent_id))
         if noted is not None:
             conn.execute("UPDATE inbox_messages SET status='noted', verdict='note', verdict_reason=?, triaged_at=? "
                          "WHERE id=?", (noted, ts, _rowid(cur)))
@@ -3697,11 +3705,29 @@ def list_inbox(conn: sqlite3.Connection, status: str | Iterable[str] | None = No
     return [_inbox_dict(r) for r in rows]
 
 
-def inbox_threads(conn: sqlite3.Connection, limit: int = 200) -> list[Row]:
-    """The answered messages the owner has not dismissed (D-304), oldest first."""
-    rows = conn.execute("SELECT * FROM inbox_messages WHERE status='answered' AND dismissed_at IS NULL "
-                        f"ORDER BY id LIMIT {int(limit)}")
-    return [_inbox_dict(r) for r in rows]
+def inbox_threads(conn: sqlite3.Connection, limit: int = 200) -> list[list[Row]]:
+    """The threads the owner can see (D-324), oldest first: each is its first message (answered, no parent)
+    followed by its follow-ups, in id order. A dismissed thread is out until a follow-up or a reply to one
+    came after the dismissal (inbox_revived)."""
+    roots = conn.execute(
+        "SELECT * FROM inbox_messages r WHERE r.status='answered' AND r.parent_id IS NULL AND (r.dismissed_at IS NULL "
+        "OR EXISTS (SELECT 1 FROM inbox_messages c WHERE c.parent_id=r.id AND "
+        "(c.created_at > r.dismissed_at OR c.answered_at > r.dismissed_at))) "
+        f"ORDER BY r.id DESC LIMIT {int(limit)}").fetchall()
+    kids: dict[int, list[Row]] = {}
+    if roots:
+        ids = [r["id"] for r in roots]
+        for c in conn.execute(f"SELECT * FROM inbox_messages WHERE parent_id IN ({','.join('?' * len(ids))}) ORDER BY id",
+                              ids):
+            kids.setdefault(c["parent_id"], []).append(_inbox_dict(c))
+    return [[_inbox_dict(r), *kids.get(r["id"], [])] for r in reversed(roots)]
+
+
+def inbox_revived(conn: sqlite3.Connection, root: Mapping[str, Any]) -> bool:
+    """A dismissed thread had a follow-up, or a reply to one, after the dismissal (so it shows again)."""
+    r = conn.execute("SELECT COUNT(*) FROM inbox_messages WHERE parent_id=? AND (created_at > ? OR answered_at > ?)",
+                     (root["id"], root["dismissed_at"], root["dismissed_at"])).fetchone()
+    return bool(r[0])
 
 
 def inbox_posted_since(conn: sqlite3.Connection, since: str) -> int:
