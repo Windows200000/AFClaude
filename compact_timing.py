@@ -28,18 +28,20 @@ samples on the transcript tokens, R² 0.92; three single re-reads checked agains
 jump). `python3 compact_timing.py fit [--store]` re-fits it from the samples and the transcripts
 (the monthly usage review runs it); `model` prints the one in use.
 
-Break-even (tokens). Compacting a context of C tokens now costs (all while the cache is warm):
-    cost(C) = C·r                (the summarization request reads the context from the cache)
-            + (S + H)·o          (the summary and the hand-off the session writes, output)
-            + B·w                (the compacted context, B tokens, written into the cache)
-and saves, at the next re-read after a break, (C − B)·w (re-reading B instead of C). It pays off
-from the first later re-read on when (C − B)·w ≥ cost(C), i.e. from
-    C* = ((S + H)·o + 2·B·w) / (w − r)
-r, w, o: the model's cache-read / cache-write / output weights; B: the context right after a
-compaction (system prompt, tools, summary, hand-off and rules; ~57k measured), S: the summary
-(~12k output tokens), H: the hand-off turn's output (~2k). With the built-in model C* ≈ 177k
-(D-238: "today ≈180k"), and cost(C*) ≈ 1.8 session-%. The save turn's own tool calls (commit,
-PROGRESS) are part of H; the decision ignores them.
+Break-even (tokens). Resetting a context of C tokens now (the whole flow, D-328: the save turn,
+/clear, the first turn after it; all while the cache is warm) costs
+    cost(C) = n·C·r              (the save turn's requests read the context from the cache, n ≈ SAVE_READS)
+            + H·o                (the hand-off the session writes, output)
+            + B·w                (the new session's context, B tokens, written into the cache)
+(the /clear itself is a local command: no request) and saves, at the next re-read after a break,
+(C − B)·w (re-reading B instead of C). It pays off from the first later re-read on when
+(C − B)·w ≥ cost(C), i.e. from
+    C* = (H·o + 2·B·w) / (w − n·r)
+r, w, o: the model's cache-read / cache-write / output weights; B: the context the new session
+starts with (system prompt, tools, rules and the hand-off message; built-in 45k, `fit` measures
+it), H: the hand-off turn's output (~2k). Under /compact the flow also wrote a summary (~12k
+output) and counted one read only; the threshold that triggers it is the setting
+compaction_threshold_tokens (D-307), the break-even is information.
 
 Transcript conventions (keepalive.iter_entries reads the file): a request is an assistant entry
 with `message.usage` (deduplicated by requestId: a request's content blocks are separate entries);
@@ -79,6 +81,8 @@ REREAD_FRACTION = 0.8               # cache_creation >= this x the context = a r
 IDLE_AFTER = timedelta(minutes=50)  # D-238 (b): compact after this long without a request
 SEND_MARGIN = timedelta(minutes=3)  # the save prompt must go out at least this long before the cache expires
 RUN_END_SLACK = timedelta(seconds=5)
+CLEAR_MARK = "<command-name>/clear</command-name>"   # the first user entry of a transcript after /clear
+SAVE_READS = 3                      # the save turn reads the whole context about this often (02.11.: ~3 of ~228k)
 MID_RUN_GAP = timedelta(minutes=60)          # D-307 (c): no mid-run compaction this soon after the last one
 MID_RUN_OWNER_QUIET = timedelta(minutes=10)  # ... nor this soon after the owner's last message
 MID_RUN_UNCHECKED = "no mid-run compaction checked"   # decide()'s default: a run holds it
@@ -108,11 +112,14 @@ BUILTIN: dict[str, Any] = {
     "weights": {"cache_read": 0.61, "cache_write": 15.3, "input": 12.2, "output": 61.0},
     "weekly_per_session": 0.157,
     "cache_ttl_min": 60,
-    "compaction": {"base_tokens": 57_000, "summary_tokens": 12_000, "handoff_tokens": 2_000},
+    # base: the context the new session starts with after a /clear (system prompt, tools, rules, the
+    # hand-off message; 02.11.'s 24k after a /compact held a summary): measured by `fit` (the first
+    # request after each reset). summary_tokens: only an old stored model's; nothing uses it (D-328).
+    "compaction": {"base_tokens": 45_000, "handoff_tokens": 2_000},
     "fit": {"n": 206, "r2": 0.92, "const_pct": 1.3},
 }
 WEIGHT_KEYS = ("cache_read", "cache_write", "input", "output")
-COMPACTION_KEYS = ("base_tokens", "summary_tokens", "handoff_tokens")
+COMPACTION_KEYS = ("base_tokens", "handoff_tokens")
 
 
 class FitError(ValueError):
@@ -204,19 +211,20 @@ def per_token(m: Mapping[str, Any], model: Optional[str] = None) -> dict[str, fl
 
 
 def break_even(m: Mapping[str, Any]) -> int:
-    """C* in tokens (see the module doc): ((S + H)·o + 2·B·w) / (w − r)."""
+    """C* in tokens (see the module doc): (H·o + 2·B·w) / (w − n·r)."""
     k = per_token(m)
     c = m["compaction"]
-    out_tokens = float(c["summary_tokens"]) + float(c["handoff_tokens"])
-    return int(round((out_tokens * k["output"] + 2 * float(c["base_tokens"]) * k["write_1h"])
-                     / (k["write_1h"] - k["read"])))
+    return int(round((float(c["handoff_tokens"]) * k["output"] + 2 * float(c["base_tokens"]) * k["write_1h"])
+                     / (k["write_1h"] - SAVE_READS * k["read"])))
 
 
 def compaction_cost(m: Mapping[str, Any], context: float) -> float:
-    """Session-% a warm compaction of `context` tokens costs (the module doc's cost(C))."""
+    """Session-% the whole warm flow of a `context`-token session costs (the module doc's cost(C)):
+    the save turn (n reads of the context, the hand-off written), the /clear (local, free) and the
+    first turn after it (the new context written into the cache)."""
     k = per_token(m)
     c = m["compaction"]
-    return (context * k["read"] + (float(c["summary_tokens"]) + float(c["handoff_tokens"])) * k["output"]
+    return (SAVE_READS * context * k["read"] + float(c["handoff_tokens"]) * k["output"]
             + float(c["base_tokens"]) * k["write_1h"])
 
 
@@ -315,7 +323,7 @@ class Prompt:
 class Scan:
     requests: list[Request] = field(default_factory=list)
     prompts: list[Prompt] = field(default_factory=list)
-    compactions: list[datetime] = field(default_factory=list)   # compact_boundary times
+    compactions: list[datetime] = field(default_factory=list)   # resets: compact_boundary and /clear times
 
 
 def request_of(e: Mapping[str, Any]) -> Optional[tuple[str, Request]]:
@@ -345,8 +353,10 @@ prompt_kind = owner_words.prompt_kind
 
 
 def scan(path: str) -> Scan:
-    """The main session's requests, prompts and compactions (sidechain entries are skipped; a
-    subagent writes its own transcript). OSError if the file can't be read."""
+    """The main session's requests, prompts and resets (sidechain entries are skipped; a subagent
+    writes its own transcript). A reset is a compact_boundary (a /compact, Claude Code's own or an
+    earlier keep-alive's) or the `/clear` entry a session cleared by the keep-alive starts its new
+    transcript with (D-328). OSError if the file can't be read."""
     reqs: dict[str, Request] = {}
     out = Scan()
     for e in _iter_entries(path):
@@ -363,6 +373,9 @@ def scan(path: str) -> Scan:
         elif t == "user":
             text = _text(e)
             ts = _ts(e.get("timestamp"))
+            raw = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+            if ts is not None and isinstance(raw, str) and raw.lstrip().startswith(CLEAR_MARK):
+                out.compactions.append(ts)
             if text is not None and ts is not None and not text.startswith("[Request interrupted"):
                 out.prompts.append(Prompt(ts, prompt_kind(e, text)))
         elif t == "system" and e.get("subtype") == "compact_boundary":

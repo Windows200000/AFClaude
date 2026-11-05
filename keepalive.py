@@ -33,10 +33,10 @@ A run ends at the earliest of (D-224, run_active()): the task-manager's clean st
 `keepalive.py --run-stopped`), a limit hit, RUN_IDLE without a transcript write, and the end of
 its session window. The owner's own messages to the session never end a run.
 
-Compaction (D-238): the watcher compacts the task-manager (save a hand-off, /compact, give the
-hand-off back; D-233) when a run has ended and after 50 min without a request, while its prompt
-cache is still warm, if its context is at or above the break-even from the stored cost model
-(compact_timing.py); never at a start any more (compaction_pass).
+Compaction (D-238, D-328): the watcher resets the task-manager (save a hand-off, /clear, give the
+hand-off back into the new session; D-233) when a run has ended, after 50 min without a request,
+and during a run (D-307), while its prompt cache is still warm, if its context is at or above the
+threshold (compaction_threshold_tokens); never at a start (compaction_pass).
 
 Budget rule: by default pacing.py (the original linear rule evolved into a night gate: a
 night runs a FULL session window only if the week is then predicted to end at or below the
@@ -1332,25 +1332,30 @@ def run_active(session_id, now, st=None):
     longer keeps the run going; a later fire starts a new run. A compaction started after the fire
     (D-238: a run-end or idle one, only ever when the run was over) counts as an end too, so its
     own transcript writes never revive the run; a mid-run one (D-307) does not: the run goes on
-    after it. -> the fire time or None."""
+    after it, in the session the /clear made (D-328: the fires, stops and compactions of the ids
+    this one was cleared from count, session_chain). -> the fire time or None."""
     st = st if st is not None else load_state()
+    chain = session_chain(session_id, st)   # D-328: a run fired into the id this one was cleared from
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()     # this session's (3b S4)
-             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") == session_id]
+             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") in chain]
     fired = [t for t in fired if t and now - afclaude_config.SESSION_LENGTH <= t <= now]
     if not fired:
         return None
     fire = max(fired)
-    stops = [usage_stale.ts(t) for t, sid in (st.get("run_stops") or {}).items() if sid in (None, session_id)]
+    stops = [usage_stale.ts(t) for t, sid in (st.get("run_stops") or {}).items() if sid is None or sid in chain]
     hits = [usage_stale.ts(t) for t in (st.get("limit_hits") or {}).values()]
     comps = [usage_stale.ts(v.get("at")) for v in (st.get("compactions") or {}).values()
-             if isinstance(v, dict) and v.get("session") in (None, session_id) and v.get("status") in COMPACT_STARTED
-             and v.get("trigger") != "mid-run"]
+             if isinstance(v, dict) and (v.get("session") is None or v.get("session") in chain)
+             and v.get("status") in COMPACT_STARTED and v.get("trigger") != "mid-run"]
     if any(t and fire <= t <= now for t in stops + hits + comps):
         return None
     path = transcript_path(session_id)
     if not path or stall_info(last_message(path)):
         return None
-    files = [path] + glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
+    # the subagents of the ids this one was cleared from too: a worker started before a mid-run /clear
+    # goes on writing there (D-328)
+    files = [path] + [f for p in [path] + [transcript_path(s) for s in chain[1:]] if p
+                      for f in glob.glob(os.path.join(p[:-len(".jsonl")], "subagents", "*.jsonl"))]
     try:
         last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
     except ValueError:
@@ -3068,29 +3073,35 @@ def plan_fillup_test(sid, remaining, args):
     print(f"scheduled (DB: keepalive.fillup); the running watcher fires it at {berlin(p['start'])}")
 
 
-# ---------------------------------------------------------------- compaction (D-144, D-233, D-234, D-238, D-307)
-# When (D-238, replacing D-191/D-218's "at a start, by the conversation's age"): the watcher compacts
+# ---------------------------------------------------------------- compaction = hand-off + /clear (D-144, D-233, D-234, D-238, D-307, D-328)
+# "Compaction" names the whole save-and-reset flow (D-328: the owner's word for it); the reset is
+# `/clear`, not `/compact` any more (D-328, after the D-305 review of 02.11.: the session worked from
+# its hand-off, not from the summary). The names (compaction_pass, the state's "compactions", the
+# settings compaction_enabled / compaction_threshold_tokens, the prompts compact_*.md) stay as the
+# DB, the runner and the quickview read them; the texts the owner and the session see say
+# "cleared after a hand-off".
+# When (D-238, replacing D-191/D-218's "at a start, by the conversation's age"): the watcher resets
 # the task-manager while its prompt cache is still warm, (a) right when a keep-alive run has ended
 # (D-224) and (b) after compact_timing.IDLE_AFTER (50 min) without a request, shortly before the
 # 1-hour cache expires (this also covers the owner's daytime chats), each only if its context is at
 # or above the setting compaction_threshold_tokens (D-307, default 150k; it replaced the break-even
 # computed from the stored cost model, which the records and the quickview still show), and (c)
-# during a run (D-307: "mid-run"), at the first idle point once the context passed that threshold,
-# unless compact_timing.mid_run_hold says no (within an hour of the last compaction, the context not
-# grown past the threshold anew since then, the owner's message within 10 min); (c) needs only the
-# session itself idle at its prompt: background subagents may still be working (the task-manager
-# almost always waits on them), they survive the compaction and the hand-off lists them as in
-# flight. compaction_pass() looks once a minute (run()) and holds while a run uses the session
+# during a run (D-307: "mid-run", D-328: also with /clear), at the first idle point once the context
+# passed that threshold, unless compact_timing.mid_run_hold says no (the owner's message within 10
+# min); (c) needs only the session itself idle at its prompt: background subagents may still be
+# working (the task-manager almost always waits on them), they survive the /clear (Claude Code keeps
+# running background agents across it) and the hand-off lists them as in flight. compaction_pass()
+# looks once a minute (run()) and holds while a run uses the session
 # (run_active; except for (c)), a turn (for (a)/(b) also a subagent) is running, the owner is typing (an attached terminal with recent keystrokes,
 # a draft in the input box, a dialog open), the owner holds the session elsewhere (preflight: Remote
 # Control, another process), the session isn't live in our tmux session, it stopped at a limit or
 # its session limit is nearly used up, or a start that types into it is due within COMPACT_GUARD
-# (the start uses the warm cache; the run's end compacts). How: compact_with_handoff(), then the
+# (the start uses the warm cache; the run's end resets it). How: compact_with_handoff(), then the
 # hand-off goes back:
 #   1. once the session's turn has ended (up to COMPACT_IDLE_WAIT), types the save prompt
 #      (prompts/session_end_save.md) and waits for the session's NEW hand-off in the DB
 #      (afclaude_handoff / tasks.py handoff write; up to SAVE_TIMEOUT). The hand-off is written
-#      directly before the compaction (D-233), so it also holds the owner's interactive chats; a
+#      directly before the reset (D-233), so it also holds the owner's interactive chats; a
 #      reply without one (e.g. the session pointing at a hand-off it wrote before the prompt) gets
 #      the save prompt re-sent once, saying no new hand-off was found (session_end_save_retry.md);
 #      then (refresh_stale_handoff, D-307) waits for a turn that started after the hand-off (a
@@ -3098,26 +3109,35 @@ def plan_fillup_test(sid, remaining, args):
 #      anything reached the session after the hand-off was written (inputs_since), asks for it
 #      again (session_end_save_refresh.md: a hand-off newer than the out-of-date one), at most
 #      HANDOFF_REFRESHES times;
-#   2. once the session's turn has ended (up to COMPACT_TURN_WAIT), sends
-#      `/compact <prompts/compact.md>` and waits for the compaction in the transcript (a
-#      compact_boundary / isCompactSummary entry; up to COMPACT_TIMEOUT);
-#   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md): the session
-#      answers "READY" without starting work; the hand-off is consumed. After a mid-run compaction
-#      it gets prompts/compact_after_run.md instead (mid_run_text: the run's budget now, the end
-#      of its window, its pacing): the run goes on with the hand-off's next steps. A mid-run
-#      compaction is no run end (run_active).
+#   2. once the session's turn has ended (up to COMPACT_TURN_WAIT), types `/clear` and waits (up to
+#      CLEAR_TIMEOUT) until Claude Code goes on under a new session id (clear_session): the same
+#      process's registry entry (~/.claude/sessions/<pid>.json) names a new sessionId AND that
+#      session's new transcript, in the same project directory, holds the `/clear` command entry
+#      written after the send. Then follow_clear moves the bookkeeping to the new id (the
+#      session.cleared action: the driven_sessions row with the tmux name, the project's
+#      manager_session, the inbox messages on their way; the keepalive state's "cleared" chain,
+#      which run_active / latest_run_fire / run_metrics follow so a mid-run reset keeps its run);
+#   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md) into the new
+#      session: it answers "READY" without starting work; the hand-off is consumed. After a mid-run
+#      reset it gets prompts/compact_after_run.md instead (mid_run_text: the run's budget now, the
+#      end of its window, its pacing): the run goes on with the hand-off's next steps. A mid-run
+#      reset is no run end (run_active). The SessionStart hook (matcher `clear`) loads the standing
+#      rules into the new session (D-225).
 # Any failure or timeout on the way (a busy session, no new hand-off, a hand-off still out of date
-# after HANDOFF_REFRESHES asks, a send failure, no compaction marker, the saved hand-off not found, no reply, a DB error) is an error (D-234/D-235): the
-# compaction stops right there (no /compact after a failed save), the attempt is recorded (the
-# keepalive state's "compactions", one per activity: never retried), alerted, and automation is
-# paused until the owner has looked at it. An older hand-off is never injected in place of a fresh
-# one. The session lock (session_lock) keeps a compaction and a start from typing into the session
-# at the same time: a start (the cron's window-start) waits for a running compaction up to
-# COMPACT_LOCK_WAIT, then is aborted.
+# after HANDOFF_REFRESHES asks, a send failure, not exactly one live process holding the session, no
+# new session after /clear, the bookkeeping not moved, the saved hand-off not found, no reply, a DB
+# error) is an error (D-234/D-235): the flow stops right there (no /clear after a failed save), the
+# attempt is recorded (the keepalive state's "compactions", one per activity: never retried),
+# alerted, and automation is paused until the owner has looked at it. An older hand-off is never
+# injected in place of a fresh one. The session lock (session_lock) keeps the flow and a start from
+# typing into the session at the same time (the new id's lock too, from the follow to the reply): a
+# start (the cron's window-start) waits for a running flow up to COMPACT_LOCK_WAIT, then is aborted.
 
-COMPACT_TIMEOUT = timedelta(minutes=10)     # wait this long for the compaction marker, then: error
+CLEAR_TIMEOUT = timedelta(minutes=2)        # wait this long for the new session after /clear, then: error
+CLEAR_COMMAND = "/clear"
+CLEARS_KEPT = 50                            # st["cleared"]: the last old -> new session links
 COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn, then: error
-COMPACT_TURN_WAIT = timedelta(minutes=10)   # after the save: wait this long for a turn (a task notification) to end before /compact, then: error
+COMPACT_TURN_WAIT = timedelta(minutes=10)   # after the save: wait this long for a turn (a task notification) to end before /clear, then: error
 HANDOFF_REFRESHES = 3                       # a hand-off made stale by new input is asked for again at most this often, then: error
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
 COMPACT_POLL = 10                           # seconds
@@ -3125,7 +3145,7 @@ SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off af
 TASKS_PY = os.path.join(HERE, "tasks.py")
 COMPACT_GUARD = timedelta(minutes=40)       # no compaction this close before a start that types into the session
 COMPACT_LOCK_WAIT = timedelta(minutes=40)   # a start waits this long for a running compaction, then: error
-COMPACT_SESSION_RESERVE = 3.0               # session % a compaction needs (~2 %, D-238)
+COMPACT_SESSION_RESERVE = 3.0               # session % the save turn and the first turn after the reset need (~2 %, D-238)
 OWNER_QUIET = timedelta(minutes=10)         # keystrokes in an attached terminal this recent: the owner is typing
 SUBAGENT_QUIET = timedelta(minutes=5)       # a subagent transcript written this recently: still working
 COMPACTIONS_KEPT = 30                       # st["compactions"]: the last attempts (and missed ones)
@@ -3134,8 +3154,8 @@ SESSION_LOCK_DIR = os.environ.get("KEEPALIVE_LOCK_DIR", STATE_DIR)
 TRIGGER_TEXT = {   # trigger -> (the save prompt's why, the resume text's when)
     "run-end": ("the run is over", "right after the run ended"),
     "idle": ("you have been idle for 50 min and your prompt cache expires soon", "while it was idle"),
-    "mid-run": ("your context passed the compaction threshold during the run (D-307); the run goes on right "
-                "after the compaction", "during the run, when its context passed the threshold"),
+    "mid-run": ("your context passed the threshold during the run (D-307); the run goes on right "
+                "after the reset", "during the run, when its context passed the threshold"),
 }
 
 
@@ -3194,24 +3214,6 @@ def session_idle(path, now=None):
     return message_text(last).lstrip().startswith(("<local-command", "<command-name>"))
 
 
-def compacted_since(path, since):
-    """The compaction marker newer than `since` (5 s of clock slack): the compact_boundary system
-    entry or the isCompactSummary user entry Claude Code writes into the same transcript."""
-    if not path or not os.path.exists(path):
-        return None
-    floor = since - timedelta(seconds=5)
-    for e in iter_entries(path):
-        if (e.get("type") == "system" and e.get("subtype") == "compact_boundary") or e.get("isCompactSummary"):
-            ts = parse_ts(e.get("timestamp"))
-            if ts and ts >= floor:
-                return e
-    return None
-
-
-def compact_command():
-    return "/compact " + " ".join(load_prompt("compact").split())
-
-
 def wait_idle(path, wait=None):
     """Wait up to `wait` (default COMPACT_IDLE_WAIT) for the session to finish its turn. -> True
     (idle) / False."""
@@ -3229,35 +3231,128 @@ def compaction_busy(sid, what, wait=None):
     return {"status": "busy", "busy_before": what}
 
 
-def compact_session(sid, cwd, path):
-    """Send /compact into our live tmux session and wait until the transcript shows it finished.
-    A compacted result carries the marker's time (done_at) and, from the compact_boundary's
-    compactMetadata, the context before and after it (pre_tokens / post_tokens; None when only the
-    summary entry was found): compact_resume_text names them.
-    -> dict status: compacted | timeout (no marker within COMPACT_TIMEOUT) | busy (still mid-turn
-    after COMPACT_TURN_WAIT: a turn that started after the save, e.g. a task notification, D-307) |
-    send-failed. Only "compacted" lets the start go on (compact_with_handoff)."""
+def context_tokens(path):
+    """The context of the transcript's last request (input + cache writes + cache reads), or None."""
+    import compact_timing
+    reqs = compact_timing.scan(path).requests if path and os.path.exists(path) else []
+    return reqs[-1].context if reqs else None
+
+
+def first_context(path):
+    """The context of the transcript's first request (after a /clear: what the new session started
+    with, the hand-off message's turn), or None."""
+    import compact_timing
+    reqs = compact_timing.scan(path).requests if path and os.path.exists(path) else []
+    return reqs[0].context if reqs else None
+
+
+def clear_marker(path, since):
+    """The `/clear` command entry Claude Code writes at the top of the new session's transcript,
+    newer than `since` (5 s of clock slack), or None."""
+    if not path or not os.path.exists(path):
+        return None
+    floor = since - timedelta(seconds=5)
+    for e in iter_entries(path):
+        if e.get("type") == "user" and message_text(e).lstrip().startswith(f"<command-name>{CLEAR_COMMAND}</command-name>"):
+            ts = _entry_ts(e)
+            if ts and ts >= floor:
+                return e
+    return None
+
+
+def cleared_into(pid, sid, since):
+    """D-328: the session the process `pid` went on with after `/clear`: its registry entry names a
+    session other than `sid` and that session's transcript holds the `/clear` entry newer than
+    `since`. -> {session, path, at} or None (not yet)."""
+    new = session_entry(pid).get("sessionId")
+    if not isinstance(new, str) or new == sid or not re.fullmatch(SESSION_RE, new):
+        return None
+    path = transcript_path(new)
+    hit = clear_marker(path, since)
+    return {"session": new, "path": path, "at": _entry_ts(hit)} if hit else None
+
+
+def clear_session(sid, cwd, path):
+    """D-328: send `/clear` into our live tmux session and wait until Claude Code goes on under a new
+    session id (cleared_into: the same process's registry entry and the new transcript's `/clear`
+    entry). The context before it (pre_tokens) is the old transcript's last request.
+    -> dict status: cleared (+ new_session, new_path, done_at, pid, pre_tokens) | busy (still
+    mid-turn after COMPACT_TURN_WAIT: a turn that started after the save, e.g. a task notification,
+    D-307) | no-process (not exactly one live process holds the session: nothing is typed) |
+    timeout (no new session within CLEAR_TIMEOUT) | send-failed. Only "cleared" lets the flow go on
+    (compact_with_handoff)."""
     if not wait_idle(path, COMPACT_TURN_WAIT):
-        return compaction_busy(sid, "before /compact", COMPACT_TURN_WAIT)
+        return compaction_busy(sid, "before /clear", COMPACT_TURN_WAIT)
+    pids = sorted(registry_holders(sid))
+    if len(pids) != 1:
+        log(f"compaction: {len(pids)} live processes hold {sid[:8]} ({pids}); no /clear")
+        return {"status": "no-process", "error": f"live processes holding the session: {pids or 'none'}"}
+    pid, pre = pids[0], context_tokens(path)
     since = datetime.now(UTC)
-    rc, out, err = fire(sid, cwd, compact_command(), "send-keys", driver="auto", prompt="compact")
-    log(f"compaction: sent /compact to {sid[:8]} rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
+    rc, out, err = fire(sid, cwd, CLEAR_COMMAND, "send-keys", driver="auto", prompt="clear")
+    log(f"compaction: sent /clear to {sid[:8]} (pid {pid}) rc={rc} stdout={out.strip()!r} stderr={err.strip()!r}")
     if rc != 0:
         return {"status": "send-failed", "sent_at": since, "rc": rc,
                 "error": f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip()}
-    deadline = time.time() + COMPACT_TIMEOUT.total_seconds()
+    deadline = time.time() + CLEAR_TIMEOUT.total_seconds()
     while True:
-        hit = compacted_since(path, since)
+        hit = cleared_into(pid, sid, since)
         if hit:
-            meta = hit.get("compactMetadata") or {}
-            log(f"compaction: {sid[:8]} compacted ({hit.get('subtype') or 'summary'} at {hit.get('timestamp')}"
-                + (f", {meta['preTokens']} -> {meta['postTokens']} tokens" if meta.get("postTokens") else "") + ")")
-            return {"status": "compacted", "sent_at": since, "done_at": hit.get("timestamp"),
-                    "pre_tokens": meta.get("preTokens"), "post_tokens": meta.get("postTokens")}
+            log(f"compaction: {sid[:8]} cleared at {hit['at']}: pid {pid} goes on as {hit['session'][:8]}")
+            return {"status": "cleared", "sent_at": since, "done_at": hit["at"].isoformat(), "pid": pid, "pre_tokens": pre,
+                    "new_session": hit["session"], "new_path": hit["path"]}
         if time.time() >= deadline:
-            log(f"compaction: no compaction marker in {sid[:8]}'s transcript after {COMPACT_TIMEOUT}")
-            return {"status": "timeout", "sent_at": since}
+            log(f"compaction: pid {pid} did not go on under a new session within {CLEAR_TIMEOUT} of /clear "
+                f"(its registry names {str(session_entry(pid).get('sessionId'))[:8]})")
+            return {"status": "timeout", "sent_at": since, "pid": pid}
         time.sleep(COMPACT_POLL)
+
+
+def follow_clear(old, new, at):
+    """D-328: after `/clear` the session `old` goes on as `new`: the DB's bookkeeping moves in one
+    transaction (the session.cleared action: the driven row with the tmux name, the project's
+    manager_session, the inbox messages on their way), then the keepalive state's "cleared" chain
+    gets old -> new (run_active, latest_run_fire and run_metrics follow it: a mid-run reset keeps
+    its run; the last CLEARS_KEPT). A failure raises (the caller's error, D-235)."""
+    import actions
+    import store
+    conn = store.connect()
+    try:
+        res = actions.perform(conn, "session.cleared", {"old_session": old, "new_session": new},
+                              actor="keepalive", via="runner")
+    finally:
+        conn.close()
+    disk = load_state()
+    links = disk.setdefault("cleared", {})
+    links[old] = {"to": new, "at": at.isoformat() if isinstance(at, datetime) else at}
+    for k in sorted(links, key=lambda k: str((links[k] or {}).get("at")))[:-CLEARS_KEPT]:
+        links.pop(k, None)
+    if not save_state(disk):
+        raise RuntimeError(f"the link {old[:8]} -> {new[:8]} could not be stored in the keepalive state")
+    log(f"compaction: {old[:8]} goes on as {new[:8]} (tmux {res.get('tmux')}, projects {res.get('projects')}, "
+        f"{res.get('inbox_moved')} inbox message(s) moved)")
+    return res
+
+
+def session_chain(sid, st=None):
+    """The session and the ones it was cleared from, newest first (the keepalive state's "cleared"
+    links, follow_clear): a run fired into an earlier id goes on in this one."""
+    st = st if st is not None else load_state()
+    back = {v.get("to"): k for k, v in (st.get("cleared") or {}).items() if isinstance(v, dict)}
+    out = [sid]
+    while out[-1] in back and back[out[-1]] not in out and len(out) <= CLEARS_KEPT:
+        out.append(back[out[-1]])
+    return out
+
+
+def session_successors(sid, st=None):
+    """The session and the ones it was cleared into, oldest first (session_chain the other way)."""
+    st = st if st is not None else load_state()
+    links = {k: v.get("to") for k, v in (st.get("cleared") or {}).items() if isinstance(v, dict)}
+    out = [sid]
+    while links.get(out[-1]) and links[out[-1]] not in out and len(out) <= CLEARS_KEPT:
+        out.append(links[out[-1]])
+    return out
 
 
 def _entry_ts(e, key="timestamp"):
@@ -3353,21 +3448,23 @@ def save_retry_text(sid, newest):
 
 
 SAVE_WHY = {   # why there is no new hand-off: the error says it (D-234)
-    "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the compaction "
+    "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the reset "
             "was due, so no save prompt was sent",
     "timeout": f"no new hand-off within {SAVE_TIMEOUT.total_seconds() / 60:g} min of the save prompt",
     "no-handoff": "the session answered the save prompt and its re-send without writing a hand-off",
     "send-failed": "the save prompt could not be sent",
     "db-error": "the hand-offs could not be read",
     "stale": f"new input kept reaching the session after its hand-off ({HANDOFF_REFRESHES} hand-offs asked for "
-             "again were each out of date before the /compact)",
+             "again were each out of date before the /clear)",
     "turn-busy": f"a turn that started after the hand-off (e.g. a task notification) was still running "
                  f"{COMPACT_TURN_WAIT.total_seconds() / 60:g} min later",
 }
 COMPACT_WHY = {
-    "busy": f"the session was still mid-turn {COMPACT_IDLE_WAIT.total_seconds() / 60:g} min after the save",
-    "timeout": f"no compaction marker within {COMPACT_TIMEOUT.total_seconds() / 60:g} min of /compact",
-    "send-failed": "/compact could not be sent",
+    "busy": f"the session was still mid-turn {COMPACT_TURN_WAIT.total_seconds() / 60:g} min after the save",
+    "no-process": "not exactly one live process holds the session, so no /clear was sent",
+    "timeout": f"the session did not go on under a new id within {CLEAR_TIMEOUT.total_seconds() / 60:g} min "
+               "of /clear",
+    "send-failed": "/clear could not be sent",
 }
 
 
@@ -3430,7 +3527,7 @@ def _await_save(sid, cwd, path, text, before, out, at_key, prompt):
 
 
 def refresh_stale_handoff(sid, cwd, path, save):
-    """D-307: the hand-off must still be current at the /compact. A turn can start after it was
+    """D-307: the hand-off must still be current at the /clear. A turn can start after it was
     written (a background subagent's task notification: a mid-run compaction goes on while they
     work; the owner's message). Wait for the session's turn to end (up to COMPACT_TURN_WAIT; still
     running: turn-busy); if anything reached the session after the hand-off (inputs_since) and the
@@ -3465,26 +3562,24 @@ def refresh_stale_handoff(sid, cwd, path, save):
         save.update(handoff_id=res["handoff_id"], saved_at=res["saved_at"])
 
 
-def compaction_text(comp):
-    """compact_resume.md's {compaction}: the one compaction that ran (compact_session's result: its
-    time and the context before and after it). Claude Code shows the /compact line twice, before its
-    summary and again under it, and the summary opens with "ran out of context": owners read that as
-    a second compaction (inbox #46, 02.11.), so the message the session view shows right below
-    says it was one."""
+def reset_text(comp):
+    """compact_resume.md's {compaction}: the reset that ran (clear_session's result: its time and
+    the context before it; the new session starts from this message, so its size after is the
+    first turn's, recorded once that turn is done)."""
     comp = comp or {}
     done = _entry_ts(comp, "done_at")
     parts = ([f"done at {_hm(done)}"] if done else []) + (
-        [f"context {comp['pre_tokens'] / 1000:.0f}k to {comp['post_tokens'] / 1000:.0f}k tokens"]
-        if comp.get("pre_tokens") and comp.get("post_tokens") else [])
-    return "one compaction" + (f" ({', '.join(parts)})" if parts else "")
+        [f"context {comp['pre_tokens'] / 1000:.0f}k before it, a new one after it (this message starts it)"]
+        if comp.get("pre_tokens") else [])
+    return "cleared after a hand-off" + (f" ({', '.join(parts)})" if parts else "")
 
 
 def compact_resume_text(sid, save, trigger="run-end", progress=None, comp=None):
-    """The text that gives the session its hand-off back after a compaction -> (text, hand-off row):
-    the session's latest unconsumed hand-off, which must be the one the save right before this
-    compaction wrote (`save`: save_before_compaction's result, status "saved"; compact_resume.md),
-    pointing at `progress` (default: the session's project's PROGRESS.md, session_progress), and
-    naming the compaction `comp` (compact_session's result: compaction_text).
+    """The text that gives the session its hand-off back after the reset -> (text, hand-off row):
+    the session's (`sid`: the id it had before the /clear) latest unconsumed hand-off, which must be
+    the one the save right before this reset wrote (`save`: save_before_compaction's result, status
+    "saved"; compact_resume.md), pointing at `progress` (default: the session's project's
+    PROGRESS.md, session_progress), and naming the reset `comp` (clear_session's result: reset_text).
     Anything else raises failstop.Failed (D-234): no save, the saved hand-off not found (e.g.
     consumed or gone meanwhile), no project, or the DB could not be read."""
     import failstop
@@ -3506,7 +3601,7 @@ def compact_resume_text(sid, save, trigger="run-end", progress=None, comp=None):
                               f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
                               + (f"#{h['id']}" if h else "none"))
     return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress,
-                                                when=TRIGGER_TEXT[trigger][1], compaction=compaction_text(comp)), h
+                                                when=TRIGGER_TEXT[trigger][1], compaction=reset_text(comp)), h
 
 
 def _jsonable(d):
@@ -3514,13 +3609,13 @@ def _jsonable(d):
 
 
 def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
-    """The compaction (D-233/D-234/D-238): save_before_compaction -> compact_session ->
-    compact_resume_text. trigger: run-end | idle (TRIGGER_TEXT: the prompts' wording). -> (the
-    hand-off text to send after the compaction, the hand-off row to consume once it went out, the
-    record: save (its result), status "compacted", sent_at, done_at, handoff_id). Every failure or
-    timeout raises failstop.Failed(why, detail, record) and stops right there: no /compact after a
-    failed save, no hand-off after a failed compaction (the caller records and reports it,
-    compaction_pass). progress: the PROGRESS.md the hand-off text names (default: the session's
+    """The flow (D-233/D-234/D-238/D-328): save_before_compaction -> clear_session -> follow_clear
+    -> compact_resume_text. trigger: run-end | idle | mid-run (TRIGGER_TEXT: the prompts' wording).
+    -> (the hand-off text to send into the new session, the hand-off row to consume once it went
+    out, the record: save (its result), status "cleared", sent_at, done_at, pre_tokens,
+    new_session, new_path, handoff_id). Every failure or timeout raises failstop.Failed(why,
+    detail, record) and stops right there: no /clear after a failed save, no hand-off after a
+    failed /clear or follow (the caller records and reports it, compaction_pass). progress: the PROGRESS.md the hand-off text names (default: the session's
     project's, session_progress, looked up before anything is typed: no project, no save prompt).
     Also the live test (tools/test_compact_live.sh) runs exactly this."""
     import failstop
@@ -3542,7 +3637,7 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
     try:
         save = refresh_stale_handoff(sid, cwd, path, save)
     except Exception as e:   # noqa: BLE001
-        raise failstop.Failed("the hand-off check before /compact failed", f"{type(e).__name__}: {e}"[:300],
+        raise failstop.Failed("the hand-off check before /clear failed", f"{type(e).__name__}: {e}"[:300],
                               rec) from None
     rec["save"] = _jsonable(save)
     if save["status"] != "saved":
@@ -3554,13 +3649,18 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
             why += " (the session was still working on it)"
         raise failstop.Failed(f"no current hand-off before the compaction: {why}", save.get("error") or "", rec)
     try:
-        comp = compact_session(sid, cwd, path)
+        comp = clear_session(sid, cwd, path)
     except Exception as e:   # noqa: BLE001
-        raise failstop.Failed("the /compact step failed", f"{type(e).__name__}: {e}"[:300], rec) from None
+        raise failstop.Failed("the /clear step failed", f"{type(e).__name__}: {e}"[:300], rec) from None
     rec.update(_jsonable(comp))
-    if comp["status"] != "compacted":
-        raise failstop.Failed(f"compaction not done: {COMPACT_WHY.get(comp['status'], comp['status'])}",
+    if comp["status"] != "cleared":
+        raise failstop.Failed(f"no reset: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
+    try:
+        follow_clear(sid, comp["new_session"], comp["done_at"] or comp["sent_at"])
+    except Exception as e:   # noqa: BLE001 - the session is cleared, its bookkeeping not moved: an error
+        raise failstop.Failed(f"{sid[:8]} was cleared and goes on as {comp['new_session'][:8]}, but its "
+                              "bookkeeping could not be moved there", f"{type(e).__name__}: {e}"[:300], rec) from None
     try:
         insert, h = compact_resume_text(sid, save, trigger, progress, comp)
     except failstop.Failed as e:
@@ -3802,9 +3902,11 @@ def compaction_busy_reason(path, now, subagents=True):
 def latest_run_fire(sid, st, now):
     """The latest fire that started a run of this session (as run_active counts them), or None. A
     record without "session" (before 3b) is no session's (3c S1): it must not give a second
-    task-manager a run it never had."""
+    task-manager a run it never had. A run fired into an id this session was cleared from is its run
+    (session_chain, D-328)."""
+    chain = session_chain(sid, st)
     fired = [parse_ts(v.get("at")) for v in (st.get("handled") or {}).values()
-             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") == sid]
+             if isinstance(v, dict) and v.get("result") in RUN_RESULTS and v.get("session") in chain]
     fired = [t for t in fired if t and t <= now]
     return max(fired) if fired else None
 
@@ -3874,7 +3976,7 @@ def _compaction_hold(sid, now, path):
             return f"the owner holds the session ({problems[0]})"
         raise RuntimeError("preflight failed: " + "; ".join(problems))
     if plan != "send-keys":
-        return f"the session is not live in its tmux session (plan {plan}): nothing to type /compact into"
+        return f"the session is not live in its tmux session (plan {plan}): nothing to type /clear into"
     return owner_typing(sid, now)
 
 
@@ -4036,16 +4138,22 @@ def _compaction_logged(sid, key, decision, line):
                   f"{type(e).__name__}: {e}")
 
 
-def _compaction_failed(sid, key, rec, why, detail="", steps=None):
+def _compaction_failed(sid, key, rec, why, detail="", steps=None, repo=None):
+    """The attempt failed: recorded, noted in the project's progress (`repo`; default the session's
+    project: after a /clear the old id has none any more, so the flow passes it), logged, alerted
+    and paused (D-234/D-235)."""
     import failstop
     rec.update(status="failed", error=(f"{why}: {detail}" if detail else why)[:500], done_at=datetime.now(UTC))
     if steps:
         rec["steps"] = _jsonable(steps)
+        if steps.get("new_session"):
+            rec["new_session"] = steps["new_session"]
     record_compaction(sid, key, rec)
-    try:
-        repo = session_progress(sid)["repo"]
-    except failstop.Failed as e:   # no project to note it in: the alert below carries it
-        repo, detail = None, f"{detail}; no progress note ({e.why})".lstrip("; ")
+    if repo is None:
+        try:
+            repo = session_progress(sid)["repo"]
+        except failstop.Failed as e:   # no project to note it in: the alert below carries it
+            repo, detail = None, f"{detail}; no progress note ({e.why})".lstrip("; ")
     if repo:
         progress_note(f"compaction of {sid[:8]} FAILED ({rec.get('trigger')}): {why}; automation paused until "
                       "the owner clears it (D-234/D-235)", repo=repo)
@@ -4054,24 +4162,34 @@ def _compaction_failed(sid, key, rec, why, detail="", steps=None):
 
 
 def _compact_now(sid, path, d, rec, head):
-    """The compaction (compact_with_handoff), then the hand-off back to the session
-    (compact_after.md; after a mid-run one compact_after_run.md: the run goes on) and its reply;
-    recorded either way. A failure: _compaction_failed."""
+    """The flow (compact_with_handoff: save, /clear, follow), then the hand-off back into the new
+    session (compact_after.md; after a mid-run reset compact_after_run.md: the run goes on) and its
+    reply, under the new id's send lock too; recorded either way (the record keeps the old id as
+    "session", the new one as "new_session"; post_tokens: the new session's first turn). A failure:
+    _compaction_failed."""
     import failstop
     cwd = session_cwd(path)
-    log(head + f"COMPACTING ({d.trigger}: {d.reason})")
+    log(head + f"COMPACTING ({d.trigger}: {d.reason}): hand-off + /clear")
     record_compaction(sid, d.key, dict(rec, status="running"))
+    lock, proj = None, None
     try:
         try:
             # the project and a mid-run one's run part come before anything is typed: their failure
-            # leaves the session as it was (3c S1: no project = no save prompt, no /compact)
+            # leaves the session as it was (3c S1: no project = no save prompt, no /clear)
             proj = session_progress(sid)
             run = mid_run_text(sid, rec["threshold"], datetime.now(UTC)) if d.trigger == "mid-run" else None
             insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger, proj["progress"])
         except failstop.Failed as e:
-            return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record)
+            return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record, repo=(proj or {}).get("repo"))
         rec["steps"] = _jsonable(steps)
-        notes, note_ids = inbox_notes(sid)   # D-241: the owner's noted inbox messages, read after the hand-off
+        new, npath = steps["new_session"], steps["new_path"]
+        rec["new_session"] = new
+        record_compaction(sid, d.key, dict(rec, status="running"))   # the inbox worker holds for the new id too
+        lock = session_lock(new)
+        if lock is None:
+            return _compaction_failed(sid, d.key, rec, f"the send lock of the new session {new[:8]} is held",
+                                      "a start types into it", repo=proj["repo"])
+        notes, note_ids = inbox_notes(new)   # D-241: the owner's noted inbox messages (moved to the new id)
         if run is None:
             msg = session_message("compact_after", repo=proj["repo"], hooked=rules_hooked(cwd),
                                   resume=with_notes(insert, notes))
@@ -4079,34 +4197,41 @@ def _compact_now(sid, path, d, rec, head):
             msg = session_message("compact_after_run", repo=proj["repo"], hooked=rules_hooked(cwd), resume=insert,
                                   insert=notes, **run)
         sent_at = datetime.now(UTC)
-        rc, out, err = fire(sid, cwd, msg, "send-keys", driver="auto",
+        rc, out, err = fire(new, cwd, msg, "send-keys", driver="auto",
                             prompt="compact_after" if run is None else "compact_after_run")
         if rc != 0:
-            return _compaction_failed(sid, d.key, rec, "the hand-off could not be sent after the compaction",
-                                      f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip())
+            return _compaction_failed(sid, d.key, rec, "the hand-off could not be sent after the /clear",
+                                      f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip(), repo=proj["repo"])
         if note_ids:
             rec["inbox_notes"] = note_ids
             if not inbox_included(note_ids, f"compaction {d.key}"):
-                fail_stop(f"inbox notes sent after the compaction of {sid[:8]} not marked included",
-                          f"messages {note_ids}; they would go out once more", session=sid)   # D-244
+                fail_stop(f"inbox notes sent after the reset of {sid[:8]} not marked included",
+                          f"messages {note_ids}; they would go out once more", session=new)   # D-244
         consumed = consume_handoff(h, d.key)
-        reply = verify_reply(path, sent_at)
+        reply = verify_reply(npath, sent_at)
+        post = first_context(npath) if reply else None
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, reported
-        return _compaction_failed(sid, d.key, rec, f"compaction step failed: {type(e).__name__}", str(e)[:500])
+        return _compaction_failed(sid, d.key, rec, f"compaction step failed: {type(e).__name__}", str(e)[:500],
+                                  repo=(proj or {}).get("repo"))
+    finally:
+        release_lock(lock)
+    pre = steps.get("pre_tokens") or rec["context"]
     rec.update(status="compacted", handoff_id=h["id"], handoff_consumed=consumed, replied=bool(reply),
-               done_at=datetime.now(UTC))
+               pre_tokens=pre, post_tokens=post, done_at=datetime.now(UTC))
     record_compaction(sid, d.key, rec)
-    progress_note(f"compacted {sid[:8]} ({d.trigger}, D-238/D-307): context {rec['context'] / 1000:.0f}k >= threshold "
-                  f"{rec['threshold'] / 1000:.0f}k, est. cost ~{rec['est_cost_pct']}% session, saves "
-                  f"~{rec['saves_per_reread_pct']}% per later re-read; hand-off #{h['id']} given back"
-                  + ("; the run goes on" if run is not None else ""), repo=proj["repo"])
+    sizes = f"{pre / 1000:.0f}k -> " + (f"{post / 1000:.0f}k" if post else "?")
+    progress_note(f"cleared {sid[:8]} after a hand-off ({d.trigger}, D-328): context {rec['context'] / 1000:.0f}k "
+                  f">= threshold {rec['threshold'] / 1000:.0f}k, {sizes}; goes on as {new[:8]}, hand-off #{h['id']} "
+                  f"given back, est. cost ~{rec['est_cost_pct']}% session" + ("; the run goes on" if run is not None else ""),
+                  repo=proj["repo"])
     _compaction_logged(sid, d.key, "COMPACT", f"{d.trigger}: {d.reason}; context {rec['context'] / 1000:.0f}k, "
-                       f"threshold {rec['threshold'] / 1000:.0f}k; hand-off #{h['id']} given back")
+                       f"threshold {rec['threshold'] / 1000:.0f}k; cleared ({sizes}), goes on as {new[:8]}; "
+                       f"hand-off #{h['id']} given back")
     if not consumed:
-        fail_stop(f"hand-off #{h['id']} of {sid[:8]} not marked consumed after its compaction",
-                  "it was sent; a later compaction would not find a fresh one")
+        fail_stop(f"hand-off #{h['id']} of {sid[:8]} not marked consumed after the reset",
+                  "it was sent; a later reset would not find a fresh one")
     if not reply:
-        fail_stop(f"no reply from {sid[:8]} to its hand-off after the compaction",
+        fail_stop(f"no reply from {new[:8]} (cleared from {sid[:8]}) to its hand-off",
                   f"none within {VERIFY_TIMEOUT} of the message")
     return None
 

@@ -4,9 +4,9 @@ the watcher's compaction_pass compacts when a run ended (D-224) or after 50 min 
 prompt cache is warm, only at or above the threshold (compaction_threshold_tokens, D-307), and during
 a run once the context passed it (D-307: the run goes on after it, and background subagents may
 still be working); otherwise never while a run uses the session, a turn or subagent runs or the
-owner is typing; the save prompt right before the /compact (D-233), asked for again when a turn
+owner is typing; the save prompt right before the /clear (D-233, D-328), asked for again when a turn
 (a task notification) made it out of date, the fresh hand-off given back and consumed; every failure or timeout on the way
-(no new hand-off, a busy session, no compaction marker, DB and send failures) is recorded and
+(no new hand-off, a busy session, no new session after /clear, DB and send failures) is recorded and
 pauses automation (D-234/D-235). Starts never compact any more; they wait for a running one.
 A fake tmux (fire / preflight / owner_typing) and a fake transcript; no real Claude, no tmux."""
 import json
@@ -35,7 +35,10 @@ RESET = S2                                              # the 23:00 run's sessio
 SAVE = "[keep-alive] Save your work now"
 RESEND = "[keep-alive] No new hand-off found"
 REFRESH = "[keep-alive] Your hand-off #"
-AFTER = "[keep-alive] This session was compacted"
+AFTER = "[keep-alive] This session was cleared after a hand-off"
+NEW = "fedcba98-7654-4321-8abc-def012345678"             # the id the fake session goes on with after /clear
+PID = 4242                                              # the fake session's process
+CLEAR = "<command-name>/clear</command-name>"
 _N = [0]
 
 
@@ -71,9 +74,10 @@ class Env(unittest.TestCase):
     """Temp state files, transcripts root and PROGRESS.md; the keep-alive's host calls faked."""
     NAMES = ("PROJECTS_DIR", "STATE_FILE", "PROGRESS_FILE", "FILLUP_FILE", "DEFER_FILE",
              "USAGE_STATE_FILE", "alert", "fire", "preflight", "read_usage_cache", "db_paused",
-             "agent_entries", "_limit_hit_in", "fresh_usage", "budget_eval", "COMPACT_TIMEOUT",
+             "agent_entries", "_limit_hit_in", "fresh_usage", "budget_eval", "CLEAR_TIMEOUT",
              "COMPACT_IDLE_WAIT", "COMPACT_POLL", "SAVE_TIMEOUT", "_fire_usage", "owner_typing", "start_soon",
-             "VERIFY_TIMEOUT", "COMPACT_LOCK_WAIT", "COMPACT_TURN_WAIT", "session_idle")
+             "VERIFY_TIMEOUT", "COMPACT_LOCK_WAIT", "COMPACT_TURN_WAIT", "session_idle", "SESSIONS_DIR",
+             "registry_holders")
 
     def setUp(self):
         testenv.clear_settings()
@@ -84,6 +88,7 @@ class Env(unittest.TestCase):
         ka.STATE_FILE, ka.PROGRESS_FILE = os.path.join(d, "state.json"), os.path.join(d, "PROGRESS.md")
         testenv.notes_project(d)                     # the progress notes go to its doc in the DB (§7.7)
         self.addCleanup(self.manage(d))              # ... SID is its task-manager (3c S1: the texts' project)
+        self.drive(d)                                # ... with its driven row (tmux name), D-328's follow moves it
         ka.FILLUP_FILE = os.path.join(d, "fillup.json")
         ka.DEFER_FILE, ka.USAGE_STATE_FILE = os.path.join(d, "deferred.json"), os.path.join(d, "usage.json")
         ka.alert = lambda subject, body="": self.alerts.append(subject)
@@ -106,7 +111,11 @@ class Env(unittest.TestCase):
                       "weekly": {"percent": 40.0, "resets_at": self.now + timedelta(days=3)},
                       "fetched_at": self.now - timedelta(minutes=3)}
         ka.read_usage_cache = lambda: self.usage
-        self.compacts = True                                # the fake session compacts on /compact
+        self.clears = True                                  # the fake session goes on as NEW on /clear
+        self.live = SID                                     # ... the id its process (PID) has now
+        ka.SESSIONS_DIR = os.path.join(d, "sessions")
+        os.makedirs(ka.SESSIONS_DIR)
+        ka.registry_holders = lambda sid: {PID} if sid == self.live else set()
         self.saves = "write"                                # ... and answers the save prompt (see fake_fire)
         self.resaves = "silent"                             # ... and its re-send (the same modes)
         self.refreshes = "write"                            # ... and a hand-off asked for again (D-307)
@@ -126,6 +135,17 @@ class Env(unittest.TestCase):
         """Make SID the task-manager of the project in `d` (its notes project). -> the cleanup."""
         return testenv.managed_project("notes-" + os.path.basename(os.path.normpath(d)), SID)
 
+    def drive(self, d):
+        """SID's live driven row: the task-manager of the notes project, in tmux afc-test."""
+        conn = store.connect()
+        try:
+            p = store.get_project(conn, "notes-" + os.path.basename(os.path.normpath(d)))
+            with store.transaction(conn):
+                conn.execute("DELETE FROM driven_sessions")
+                store.upsert_driven_session(conn, SID, kind="task-manager", tmux="afc-test", project_id=p["id"])
+        finally:
+            conn.close()
+
     def tearDown(self):
         for n, v in self.old.items():
             setattr(ka, n, v)
@@ -135,6 +155,7 @@ class Env(unittest.TestCase):
         try:
             with store.transaction(conn):
                 conn.execute("DELETE FROM handoffs")
+                conn.execute("DELETE FROM driven_sessions")
         finally:
             conn.close()
 
@@ -157,7 +178,8 @@ class Env(unittest.TestCase):
 
     def fake_fire(self, sid, cwd, message, plan, new=False, **kw):
         """ka_resume.sh into a live tmux session: the message is typed; the fake Claude compacts on
-        /compact (a compact_boundary + summary in the same transcript), answers the save prompt as
+        /clear (its process's registry entry names NEW, whose new transcript starts with the /clear
+        entry; the tmux session then runs NEW: typing into SID fails the test), answers the save prompt as
         self.saves says (write: a hand-off into the DB, then "HANDOFF SAVED"; silent: a reply
         without one; hang: still working on it; ignore: nothing reaches the transcript) and answers
         anything else. The transcript is then quiet (old mtime), so the session reads as idle.
@@ -165,15 +187,19 @@ class Env(unittest.TestCase):
         that doesn't say fails the test."""
         if kw.get("driver") not in ("auto", "owner") or not kw.get("prompt"):
             raise TypeError(f"fire() needs driver= (auto|owner) and prompt=, got {kw}")
+        if plan == "send-keys" and sid != self.live:
+            raise AssertionError(f"typed into {sid[:8]}, but the tmux session runs {self.live[:8]}")
         self.fire_kw.append(kw)
         self.sent.append((plan, message))
         now = datetime.now(UTC)
-        if message.startswith("/compact "):
-            if self.compacts:
-                self.write([entry("system", now, subtype="compact_boundary", content="Conversation compacted",
-                                  compactMetadata={"trigger": "manual", "preTokens": 401_000, "postTokens": 24_300}),
-                            entry("user", now, isCompactSummary=True,
-                                  message={"role": "user", "content": "This session is being continued ..."})], "a")
+        if message == "/clear":
+            if self.clears:                  # Claude Code goes on in the same process under a new id
+                with open(os.path.join(ka.SESSIONS_DIR, f"{PID}.json"), "w") as fh:
+                    json.dump({"pid": PID, "sessionId": NEW}, fh)
+                self.live, self.path = NEW, os.path.join(self.proj, f"{NEW}.jsonl")
+                self.write([entry("user", now, isMeta=True, message={"role": "user", "content": "<local-command-caveat>"}),
+                            entry("user", now, message={"role": "user", "content": CLEAR + "\n<command-message>clear"}),
+                            entry("system", now, subtype="local_command", content="<local-command-stdout>")])
         elif message.startswith((SAVE, RESEND, REFRESH)):
             mode = {SAVE: self.saves, RESEND: self.resaves, REFRESH: self.refreshes}[
                 next(p for p in (SAVE, RESEND, REFRESH) if message.startswith(p))]
@@ -187,7 +213,8 @@ class Env(unittest.TestCase):
             if mode == "write" and self.after_save:
                 self.arrive(*self.after_save.pop(0))
         else:
-            self.write([keepalive_msg(now, message), assistant(now + timedelta(seconds=1))], "a")
+            self.write([keepalive_msg(now, message),
+                        assistant(now + timedelta(seconds=1), ctx=46_000 if self.live == NEW else None)], "a")
         self.make_old()
         return 0, "sent-keys afc-abcdef01", ""
 
@@ -247,9 +274,10 @@ class Env(unittest.TestCase):
     def progress(self):
         return testenv.notes(self.tmp.name)
 
-    def compact(self, args=None, now=None):
-        """One compaction pass of the watcher -> (decision, the recorded attempt or None)."""
-        d = ka.compaction_pass(SID, now or datetime.now(UTC), args or Armed())
+    def compact(self, args=None, now=None, sid=None):
+        """One compaction pass of the watcher on the live id (sid: another) -> (decision, the
+        recorded attempt or None)."""
+        d = ka.compaction_pass(sid or self.live, now or datetime.now(UTC), args or Armed())
         recs = ka.load_state().get("compactions") or {}
         return d, (recs.get(d.key) if d is not None and d.key else None)
 
@@ -295,16 +323,28 @@ class CompactWhenIdle(Env):
         self.assertEqual([p for p, _ in self.sent], ["send-keys"] * 3)
         save, compact, after = (m for _, m in self.sent)
         self.assertEqual([(k["driver"], k["prompt"]) for k in self.fire_kw],             # usage split S2
-                         [("auto", "session_end_save"), ("auto", "compact"), ("auto", "compact_after")])
+                         [("auto", "session_end_save"), ("auto", "clear"), ("auto", "compact_after")])
         self.assertTrue(save.startswith(SAVE))
         self.assertNotIn("\n", save)
-        for part in ("you have been idle for 50 min", "COMPACTS", "right after your reply", "afclaude_handoff",
-                     f'session "{SID}"', "tasks.py handoff write --session", "HANDOFF SAVED", "D-233", "D-238",
+        for part in ("you have been idle for 50 min", "CLEARS this session (/clear, D-328)", "ALL you will know", "right after your reply", "afclaude_handoff",
+                     f'session "{SID}"', "tasks.py handoff write --session", "HANDOFF SAVED", "D-233", "D-328",
                      "MANDATORY: a `tests:` note", "drop_working_notes", "FULL text"):   # review of 02.11.
             self.assertIn(part, save)
-        self.assertTrue(compact.startswith("/compact Keep what the task-manager needs"))
+        self.assertEqual(compact, "/clear")
         new = self.latest(unconsumed=False)
-        self.assertTrue(after.startswith(AFTER + " while it was idle (D-144/D-238)"), after[:80])
+        self.assertTrue(after.startswith(AFTER + " (done at "), after[:80])
+        self.assertIn("context 300k before it, a new one after it (this message starts it)) while it was idle "
+                      "(D-144/D-238/D-328)", after)
+        # D-328: the bookkeeping went to the new id
+        conn = store.connect()
+        try:
+            self.assertEqual(store.get_driven_session(conn, NEW)["tmux"], "afc-test")
+            self.assertIsNotNone(store.get_driven_session(conn, SID)["ended_at"])
+            self.assertEqual([t["session"] for t in store.task_managers(conn) if t["session"] in (SID, NEW)], [NEW])
+        finally:
+            conn.close()
+        self.assertEqual(ka.load_state()["cleared"][SID]["to"], NEW)
+        self.assertEqual((rec["new_session"], rec["pre_tokens"], rec["post_tokens"]), (NEW, 300_000, 46_000))
         for part in (f"Hand-off #{new['id']}", "Summary: Phase 2 merged.", "Next steps: (1) go on",
                      "don't start any work", 'Reply "READY"', "SessionStart hook"):
             self.assertIn(part, after)
@@ -318,7 +358,7 @@ class CompactWhenIdle(Env):
         self.assertIsNone(self.latest())                                       # consumed, the older one too
         self.assertEqual(new["consumed_by_start"], d.key)
         self.assertGreater(new["id"], old["id"])
-        self.assertIn(f"compacted {SID[:8]} (idle, D-238/D-307): context 300k >= threshold 150k", self.progress())
+        self.assertIn(f"cleared {SID[:8]} after a hand-off (idle, D-328): context 300k >= threshold 150k, 300k -> 46k; goes on as {NEW[:8]}", self.progress())
         self.assertFalse(self.paused()["paused"])
         # the next pass: the context is small now (the compaction marker), nothing more
         self.sent.clear()
@@ -456,6 +496,8 @@ class CompactWhenIdle(Env):
         m["weights"]["cache_write"] = 5.0
         ct.store_model(m)
         try:
+            m["weights"]["cache_write"] = 2.0
+            ct.store_model(m)
             self.assertGreater(ct.break_even(m), 300_400)
             d, rec = self.compact()
             self.assertEqual((d.due, rec["status"], rec["break_even"]), (True, "compacted", ct.break_even(m)))
@@ -486,16 +528,15 @@ class CompactAtRunEnd(Env):
         self.assertEqual((d.due, d.trigger), (True, "run-end"))
         self.assertTrue(self.sent[0][1].startswith(SAVE))
         self.assertIn("the run is over", self.sent[0][1])
-        self.assertTrue(self.sent[2][1].startswith(AFTER + " right after the run ended"))
+        self.assertTrue(self.sent[2][1].startswith(AFTER + " (done at "))
         self.assertEqual(self.fire_kw[2]["prompt"], "compact_after")                      # usage split S2
         self.assertEqual(rec["status"], "compacted")
-        # one /compact went out, and the message after it says it was one (inbox #46: the session view
-        # shows the /compact line twice): its time and the context before and after it
-        self.assertEqual([m for _, m in self.sent if m.startswith("/compact ")], [self.sent[1][1]])
-        self.assertEqual((rec["steps"]["pre_tokens"], rec["steps"]["post_tokens"]), (401_000, 24_300))
+        # one /clear went out; the message after it names its time and the context before it
+        self.assertEqual([m for _, m in self.sent if m == "/clear"], [self.sent[1][1]])
+        self.assertEqual((rec["steps"]["pre_tokens"], rec["pre_tokens"], rec["post_tokens"]), (400_000, 400_000, 46_000))
         done = ka._hm(ka._entry_ts(rec["steps"], "done_at"))                  # the compact_boundary's time
-        self.assertIn(f"(D-144/D-238): one compaction (done at {done}, context 401k to 24k tokens); Claude Code "
-                      "shows the /compact line twice", self.sent[2][1])
+        self.assertIn(f"cleared after a hand-off (done at {done}, context 400k before it, a new one after it (this "
+                      "message starts it)) right after the run ended (D-144/D-238/D-328)", self.sent[2][1])
         # the compaction's own writes never revive the run (run_active)
         self.assertIsNone(ka.run_active(SID, datetime.now(UTC)))
 
@@ -550,19 +591,23 @@ class CompactMidRun(Env):
         self.assertEqual((d.due, d.trigger), (True, "mid-run"))
         save, compact, after = (m for _, m in self.sent)
         self.assertTrue(save.startswith(SAVE))
-        self.assertIn("your context passed the compaction threshold during the run (D-307); the run goes on", save)
-        self.assertTrue(compact.startswith("/compact "))
-        self.assertTrue(after.startswith(AFTER + " during the run, when its context passed the threshold"), after[:90])
+        self.assertIn("your context passed the threshold during the run (D-307); the run goes on", save)
+        self.assertTrue(compact == "/clear")
+        self.assertTrue(after.startswith(AFTER + " (done at "), after[:90])
+        self.assertIn("during the run, when its context passed the threshold", after)
         new = self.latest(unconsumed=False)
-        for part in (f"Hand-off #{new['id']}", "The run goes on (D-307)", "passed 150k tokens",
+        for part in (f"Hand-off #{new['id']}", "The run goes on (D-307/D-328)", "cleared this session after a hand-off", "passed 150k tokens",
                      f"The run started at {ka._hm(self.fire)} (window start, GO)", self.BUDGET,
                      f"which ends at {ka._hm(self.run_end)}", "hand-off's next steps", "--run-stopped"):
             self.assertIn(part, after)
         self.assertNotIn("READY", after)
         self.assertNotIn("fill-up", after)
         self.assertEqual((rec["status"], rec["trigger"], rec["threshold"]), ("compacted", "mid-run", 150_000))
-        self.assertIn(f"compacted {SID[:8]} (mid-run, D-238/D-307): context 200k", self.progress())
+        self.assertIn(f"cleared {SID[:8]} after a hand-off (mid-run, D-328): context 200k", self.progress())
         self.assertIn("the run goes on", self.progress())
+        # D-328: the run goes on under the new id (its fire was SID's)
+        self.assertEqual(ka.run_active(NEW, datetime.now(UTC)), ka.run_active(SID, datetime.now(UTC)) or self.fire)
+        self.assertEqual(ka.latest_run_fire(NEW, ka.load_state(), datetime.now(UTC)), self.fire)
         self.assertFalse(self.paused()["paused"])
         # no run end: the run is still going (its fire), so a run-end compaction doesn't follow
         self.assertEqual(ka.run_active(SID, datetime.now(UTC)), self.fire)
@@ -641,7 +686,7 @@ class SaveResend(Env):
         for part in (f"#{early['id']}", "written before the save prompt", f'session "{SID}"',
                      "tasks.py handoff write --session", "HANDOFF SAVED", "only reminder", "`tests:` note"):
             self.assertIn(part, resend)
-        self.assertTrue(compact.startswith("/compact "))
+        self.assertTrue(compact == "/clear")
         new = self.latest(unconsumed=False)
         self.assertGreater(new["id"], early["id"])
         self.assertIn("Summary: Written after the re-send.", after)
@@ -760,11 +805,29 @@ class CompactionFailures(Env):
         self.assert_failed(rec, "(the session was still working on it)", [SAVE])
 
     def test_compaction_marker_timeout(self):
-        """No marker within COMPACT_TIMEOUT: no hand-off sent; the saved one stays unconsumed."""
-        self.compacts = False
-        ka.COMPACT_TIMEOUT = timedelta(0)
+        """No new session within CLEAR_TIMEOUT: no hand-off sent; the saved one stays unconsumed."""
+        self.clears = False
+        ka.CLEAR_TIMEOUT = timedelta(0)
         d, rec = self.compact()
-        self.assert_failed(rec, "no compaction marker within 10 min of /compact", [SAVE, "/compact "])
+        self.assert_failed(rec, "the session did not go on under a new id within 2 min of /clear", [SAVE, "/clear"])
+
+    def test_not_exactly_one_process(self):
+        """D-328: no process (or two) holding the session: nothing typed after the save, an error."""
+        ka.registry_holders = lambda sid: set()
+        d, rec = self.compact()
+        self.assert_failed(rec, "not exactly one live process holds the session", [SAVE])
+
+    def test_the_follow_failing(self):
+        """D-328: cleared, but the bookkeeping can't move (here: no live driven row): an error, no hand-off."""
+        conn = store.connect()
+        try:
+            with store.transaction(conn):
+                conn.execute("DELETE FROM driven_sessions")
+        finally:
+            conn.close()
+        d, rec = self.compact()
+        self.assert_failed(rec, "bookkeeping could not be moved there", [SAVE, "/clear"])
+        self.assertEqual(rec["new_session"], NEW)
         self.assertEqual(self.latest()["id"], rec["steps"]["save"]["handoff_id"])
 
     def test_a_busy_session_after_the_check(self):
@@ -788,7 +851,7 @@ class CompactionFailures(Env):
 
         def fire(sid, cwd, message, plan, new=False, **kw):
             r = orig(sid, cwd, message, plan, new, **kw)
-            if message.startswith("/compact "):
+            if message == "/clear":
                 h = self.latest()
                 conn = store.connect()
                 try:
@@ -799,7 +862,7 @@ class CompactionFailures(Env):
             return r
         ka.fire = fire
         d, rec = self.compact()
-        self.assert_failed(rec, "the saved hand-off was not found", [SAVE, "/compact "])
+        self.assert_failed(rec, "the saved hand-off was not found", [SAVE, "/clear"])
 
     def test_db_error(self):
         old = store.latest_handoff
@@ -821,17 +884,17 @@ class CompactionFailures(Env):
             return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
-        self.assert_failed(rec, "the hand-off could not be sent after the compaction", [SAVE, "/compact ", AFTER])
+        self.assert_failed(rec, "the hand-off could not be sent after the /clear", [SAVE, "/clear", AFTER])
         self.assertIsNotNone(self.latest())                                   # not consumed
 
     def test_a_raising_step(self):
         def fire(sid, cwd, message, plan, new=False, **kw):
-            if message.startswith("/compact"):
+            if message == "/clear":
                 raise OSError("host bridge down")
             return self.fake_fire(sid, cwd, message, plan, **kw)
         ka.fire = fire
         d, rec = self.compact()
-        self.assert_failed(rec, "the /compact step failed", [SAVE])
+        self.assert_failed(rec, "the /clear step failed", [SAVE])
         self.assertIn("host bridge down", rec["error"])
 
     def test_no_reply_to_the_handoff(self):
@@ -842,7 +905,7 @@ class CompactionFailures(Env):
         finally:
             ka.verify_reply = old
         self.assertEqual((rec["status"], rec["replied"]), ("compacted", False))
-        self.assertIn("no reply from abcdef01 to its hand-off after the compaction", self.paused()["reason"])
+        self.assertIn("no reply from fedcba98 (cleared from abcdef01) to its hand-off", self.paused()["reason"])
 
     def test_a_failing_check_is_reported(self):
         """An error before the compaction (here the cost model can't be read) raises out of the
@@ -887,17 +950,18 @@ class MidRunWithSubagents(Env):
     def test_a_running_subagent_does_not_hold_a_mid_run_compaction(self):
         d, rec = self.compact()
         self.assertEqual((d.due, d.trigger), (True, "mid-run"), d.reason)
-        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/compact ", AFTER[:9]])
+        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/clear", AFTER[:9]])
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
         self.assertEqual(rec["steps"]["save"]["refreshes"], [])
         # the run-end and idle triggers still wait for it (the subagent is part of the session's work)
-        self.assertEqual(ka.compaction_busy_reason(self.path, datetime.now(UTC)), "a subagent is working")
-        self.assertIsNone(ka.compaction_busy_reason(self.path, datetime.now(UTC), subagents=False))
+        old = os.path.join(self.proj, f"{SID}.jsonl")   # the subagent writes under the id it started in
+        self.assertEqual(ka.compaction_busy_reason(old, datetime.now(UTC)), "a subagent is working")
+        self.assertIsNone(ka.compaction_busy_reason(old, datetime.now(UTC), subagents=False))
 
     def test_the_save_prompt_asks_for_the_subagents_in_flight(self):
         text = ka.save_text(SID, "mid-run")
         for part in ("in_flight", "subagent still running in the background with its agent id", "its branch",
-                     "keeps running through the compaction"):
+                     "keeps running through the /clear"):
             self.assertIn(part, text)
 
     def test_a_notification_turn_after_the_handoff_is_waited_for_then_compacted(self):
@@ -923,7 +987,7 @@ class MidRunWithSubagents(Env):
                      "HANDOFF SAVED", "no new work"):
             self.assertIn(part, refresh)
         self.assertNotIn("\n", refresh)
-        self.assertTrue(compact.startswith("/compact "))
+        self.assertTrue(compact == "/clear")
         self.assertEqual(self.turn_polls, 4)                                     # waited for the turn's end
         new = self.latest(unconsumed=False)
         self.assertGreater(new["id"], first[0])
@@ -941,7 +1005,7 @@ class MidRunWithSubagents(Env):
         self.turn_handoff = "Brought up to date in the notification turn."
         d, rec = self.compact()
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
-        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/compact ", AFTER[:9]])
+        self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/clear", AFTER[:9]])
         self.assertIn("Summary: Brought up to date in the notification turn.", self.sent[-1][1])
         self.assertEqual(rec["steps"]["save"]["handoff_id"], self.latest(unconsumed=False)["id"])
 
@@ -1108,19 +1172,20 @@ class ThroughTheRunner:
         ka.compaction_plan = spy
         self.addCleanup(setattr, ka, "compaction_plan", plan)
 
-    def compact(self, args=None, now=None):
+    def compact(self, args=None, now=None, sid=None):
         if args is not None and not getattr(args, "arm", False):
             self.skipTest("the runner's passes are always armed")
         t = now or datetime.now(UTC)
+        sid = sid or self.live                                            # after a /clear: the new id (D-328)
         self.checks.clear()
-        res = testenv.runner_pass(ka, "compaction_check", now=t, session=SID)
+        res = testenv.runner_pass(ka, "compaction_check", now=t, session=sid)
         self.assertEqual(res["status"], "ok")
         d = self.checks[0]
-        act = testenv.act_of(ka, "compaction", SID)
+        act = testenv.act_of(ka, "compaction", sid)
         if act is not None:
             self.assertEqual(act["key"], d.key)
-            testenv.runner_act(ka, "compaction", now=t, session=SID)
-            self.assertIsNone(testenv.act_of(ka, "compaction", SID))          # the act ended: its entry is dropped
+            testenv.runner_act(ka, "compaction", now=t, session=sid)
+            self.assertIsNone(testenv.act_of(ka, "compaction", sid))          # the act ended: its entry is dropped
         recs = ka.load_state().get("compactions") or {}
         return d, (recs.get(d.key) if d is not None and d.key else None)
 
@@ -1422,7 +1487,7 @@ class SeveralTaskManagers(Env):
         after = self.sent[-1][1]
         self.assertIn(f"latest Status line in {os.path.join(d, 'PROGRESS.md')}", after)
         self.assertNotIn(ka.PROGRESS_FILE, after)
-        self.assertIn(f"compacted {SID[:8]} (idle", self.progress())
+        self.assertIn(f"cleared {SID[:8]} after a hand-off (idle", self.progress())
         self.assertNotIn("compacted", testenv.notes(afc))
         rows = self.rows()
         self.assertEqual([r["decision"] for r in rows], ["COMPACT"])
@@ -1691,15 +1756,23 @@ class FireFailures(unittest.TestCase):
             ka.agent_entries(SID)
 
 
-class CompactionText(unittest.TestCase):
-    """compact_resume.md's {compaction} (inbox #46): one compaction, with what the marker gave."""
-    def test_what_the_marker_gave(self):
+class ResetText(unittest.TestCase):
+    """compact_resume.md's {compaction} (D-328): cleared after a hand-off, its time and the context before."""
+    def test_what_the_clear_gave(self):
         done = "2026-11-02T15:33:09.033Z"
-        self.assertEqual(ka.compaction_text({"done_at": done, "pre_tokens": 229_463, "post_tokens": 24_262}),
-                         "one compaction (done at 16:33 CET, context 229k to 24k tokens)")
-        self.assertEqual(ka.compaction_text({"done_at": done, "pre_tokens": None, "post_tokens": None}),
-                         "one compaction (done at 16:33 CET)")    # only the summary entry was found
-        self.assertEqual(ka.compaction_text(None), "one compaction")
+        self.assertEqual(ka.reset_text({"done_at": done, "pre_tokens": 229_463}),
+                         "cleared after a hand-off (done at 16:33 CET, context 229k before it, a new one after it "
+                         "(this message starts it))")
+        self.assertEqual(ka.reset_text({"done_at": done, "pre_tokens": None}), "cleared after a hand-off (done at 16:33 CET)")
+        self.assertEqual(ka.reset_text(None), "cleared after a hand-off")
+
+
+class SessionChain(unittest.TestCase):
+    def test_chain_and_successors(self):
+        st = {"cleared": {"a": {"to": "b"}, "b": {"to": "c"}, "x": {"to": "x"}}}
+        self.assertEqual(ka.session_chain("c", st), ["c", "b", "a"])
+        self.assertEqual(ka.session_successors("a", st), ["a", "b", "c"])
+        self.assertEqual(ka.session_chain("x", st), ["x"])           # a self-link never loops
 
 
 if __name__ == "__main__":

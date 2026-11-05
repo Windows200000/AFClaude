@@ -1697,6 +1697,42 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
     return Result(after, sid, before, after)
 
 
+CLEARED_INBOX = ("pending", "noted", "delivered")   # still on their way to (or answered by) the session
+
+
+@action("session.cleared", "driven_session")
+def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_session: Any) -> Result:
+    """D-328: the keep-alive cleared a driven session after its hand-off (`/clear`), and Claude Code
+    went on in the same process under a new session id: everything that names the session moves
+    to the new one in one transaction. The old row ends, a new live row takes its kind, tmux name,
+    project and task; the project whose task-manager it was points at the new id; the inbox
+    messages still on their way to it (CLEARED_INBOX) go to the new one. The old row must be a
+    live driven row and the new id unknown (else ValueError: nothing moves). The keep-alive's step;
+    not for MCP callers."""
+    _runner_only(ctx, "session.cleared")
+    old, new = store._session_id(old_session), store._session_id(new_session)
+    if old == new:
+        raise ValueError("a cleared session has a new id: old_session and new_session are the same")
+    before = store.get_driven_session(conn, old)
+    if before is None or before["kind"] not in DRIVEN_KINDS or before.get("ended_at"):
+        raise ValueError(f"{old} has no live driven row ({'none' if before is None else before['kind']}"
+                         f"{', ended' if before and before.get('ended_at') else ''}): nothing to follow")
+    if store.get_driven_session(conn, new) is not None:
+        raise ValueError(f"{new} has a driven row already: not a fresh session after a /clear")
+    now = store.now_iso()
+    store.upsert_driven_session(conn, old, ended_at=now)
+    after = store.upsert_driven_session(conn, new, **{k: before[k] for k in ("kind", "tmux", "project_id", "task_id")
+                                                      if before.get(k) is not None}, started_at=now)
+    projects = [str(r[0]) for r in conn.execute("SELECT name FROM projects WHERE manager_session=?", (old,))]
+    for name in projects:
+        store.update_project(conn, name, manager_session=new)
+    marks = ",".join("?" for _ in CLEARED_INBOX)
+    moved = conn.execute(f"UPDATE inbox_messages SET session_id=? WHERE session_id=? AND status IN ({marks})",
+                         (new, old) + CLEARED_INBOX).rowcount
+    out = dict(after or {}, cleared_from=old, projects=projects, inbox_moved=moved)
+    return Result(out, new, dict(before, projects=projects), out)
+
+
 # ---------------------------------------------------------------- compaction hand-offs (§5.5)
 
 @action("handoff.write", "handoff")

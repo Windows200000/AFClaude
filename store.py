@@ -3750,6 +3750,7 @@ HANDOFF_KEYS = ("summary",) + HANDOFF_LISTS + ("open_question_ids", "notes")
 # cost the task-manager its way back to a host (review:compaction-vs-handoff-2026-11-01).
 HANDOFF_DROP_KEY = "drop_working_notes"
 HANDOFF_TESTS_NOTE = "tests:"   # a task-manager's working notes must hold one (its unit-test command)
+HANDOFF_TESTS_MIN = 12          # ... with at least this many characters after "tests:" (or "none")
 HANDOFF_MAX = 12000            # characters of the whole body as JSON (~3k tokens, well below a summary)
 HANDOFF_TEXT_MAX = 2000        # summary, notes
 HANDOFF_ITEM_MAX = 500         # one list item
@@ -3783,6 +3784,15 @@ def _str_list(value: object, what: str, item_max: int = HANDOFF_ITEM_MAX) -> lis
             raise ValueError(f"an item of {what} is too long ({len(t)} > {item_max} characters)")
         out.append(t)
     return out
+
+
+def _tests_note_ok(text: str) -> bool:
+    """A `tests:` note that holds a command (D-328: after a /clear the session knows only what its
+    hand-off says), or `tests: none`; a bare `tests:` or a word or two is not one."""
+    if not text.lower().startswith(HANDOFF_TESTS_NOTE):
+        return False
+    rest = text[len(HANDOFF_TESTS_NOTE):].strip()
+    return rest.lower().rstrip(".") == "none" or len(rest) >= HANDOFF_TESTS_MIN
 
 
 def _note_key(text: str) -> str:
@@ -3823,7 +3833,7 @@ def handoff_body(value: object, carried: Sequence[str] = (), need_tests_note: bo
     for k in HANDOFF_LISTS:
         body[k] = _str_list(value.get(k), k, HANDOFF_OWNER_ITEM_MAX if k == "owner_messages" else HANDOFF_ITEM_MAX)
     body["working_notes"] = _carry_notes(carried, body["working_notes"], value.get(HANDOFF_DROP_KEY))
-    if need_tests_note and not any(t.lower().startswith(HANDOFF_TESTS_NOTE) for t in body["working_notes"]):
+    if need_tests_note and not any(_tests_note_ok(t) for t in body["working_notes"]):
         raise ValueError(f"working_notes needs a note starting `{HANDOFF_TESTS_NOTE}` with the project's exact "
                          f"unit-test command (wrapper, timeout, venv, the worktree venv recipe); "
                          f"`{HANDOFF_TESTS_NOTE} none` if it has no tests")
@@ -3879,7 +3889,7 @@ def add_handoff(conn: sqlite3.Connection, session_id: object, body: object, proj
     else:
         mp = session_project(conn, sid)
         project_id = mp["id"] if mp else None
-    base = last_given_back_handoff(conn, sid)
+    base = last_given_back_handoff(conn, sid, project_id)
     clean = handoff_body(body, carried=(base["body"].get("working_notes") or []) if base else [],
                          need_tests_note=project_id is not None)
     with transaction(conn):
@@ -3898,12 +3908,19 @@ def latest_handoff(conn: sqlite3.Connection, session_id: str, unconsumed: bool =
     return _handoff_dict(r) if r else None
 
 
-def last_given_back_handoff(conn: sqlite3.Connection, session_id: str) -> Row | None:
+def last_given_back_handoff(conn: sqlite3.Connection, session_id: str, project_id: int | None = None) -> Row | None:
     """The newest consumed hand-off: the one the session was last given back (a consume also
     closes the older ones, so the highest consumed id is it), or None. Hand-offs written since
-    are not it: a refresh or a retry replaces them and starts from the same base."""
-    r = conn.execute("SELECT * FROM handoffs WHERE session_id=? AND consumed_at IS NOT NULL "
-                     "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+    are not it: a refresh or a retry replaces them and starts from the same base. With
+    `project_id` (a task-manager's hand-off): the project's newest consumed one, whichever
+    session wrote it: after a hand-off + /clear (D-328) the session goes on under a new id and
+    was given back its old id's hand-off."""
+    if project_id is not None:
+        r = conn.execute("SELECT * FROM handoffs WHERE project_id=? AND consumed_at IS NOT NULL "
+                         "ORDER BY id DESC LIMIT 1", (project_id,)).fetchone()
+    else:
+        r = conn.execute("SELECT * FROM handoffs WHERE session_id=? AND consumed_at IS NOT NULL "
+                         "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
     return _handoff_dict(r) if r else None
 
 

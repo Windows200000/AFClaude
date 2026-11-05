@@ -110,10 +110,10 @@ HOLD_LOCKED = "a compaction or a start is typing into the session"
 # compact_after, READY) is no task-manager activity, and a "now" message waits until it is over.
 # Every step has a timeout, so a flow still recorded "running" this long after its start is over
 # (the save and its re-send; D-307: each hand-off asked for again, with the turn before it, and the
-# turns before and after the last one and before /compact)
+# turns before and after the last one and before /clear)
 COMPACT_FLOW_MAX = (ka.COMPACT_IDLE_WAIT + 2 * ka.SAVE_TIMEOUT
                     + ka.HANDOFF_REFRESHES * (ka.COMPACT_TURN_WAIT + ka.SAVE_TIMEOUT)
-                    + 2 * ka.COMPACT_TURN_WAIT + ka.COMPACT_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
+                    + 2 * ka.COMPACT_TURN_WAIT + ka.CLEAR_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
 HOLD_COMPACTING = "the keep-alive's compaction flow is running (it goes in after the READY, D-262)"
 
 
@@ -250,7 +250,8 @@ def compaction_flow(sid: str, st: Any, now: datetime) -> tuple[datetime, datetim
     alert (once) so the owner sees it."""
     best: tuple[datetime, datetime | None, str] | None = None
     for key, v in (st.get("compactions") or {}).items():
-        if not isinstance(v, dict) or v.get("session") not in (None, sid) or v.get("status") not in ka.COMPACT_STARTED:
+        if (not isinstance(v, dict) or (v.get("session") not in (None, sid) and v.get("new_session") != sid)
+                or v.get("status") not in ka.COMPACT_STARTED):   # D-328: after the /clear it is the new id's flow
             continue
         save = (v.get("steps") or {}).get("save")
         if v.get("status") == "failed" and isinstance(save, dict) and not save.get("sent_at"):

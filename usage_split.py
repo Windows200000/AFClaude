@@ -48,7 +48,7 @@ HUMAN_ORIGINS = (None, "human")          # origin kinds of a prompt somebody typ
 NOT_A_PROMPT_ORIGINS = ("peer", "task-notification")   # delivered by Claude Code, not typed by a driver
 # Text starts of the entries that are local commands or notifications, not prompts (the sampler's list).
 NOT_A_PROMPT_TEXT = ("<local-command", "<command-", "<system-reminder", "<task-notification",
-                     owner_words.INTERRUPT_PREFIX, "/compact")
+                     owner_words.INTERRUPT_PREFIX, "/compact", "/clear")
 
 Driver = Literal["auto", "owner"]
 SessionClass = Literal["afclaude", "owner"]
