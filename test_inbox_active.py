@@ -317,6 +317,16 @@ class DuringAndAfterCompaction(Active):
         self.assertEqual(self.haiku, [ka.POKE_ARGV])                            # triaged: the run is over
         self.assertEqual(self.sent, [])
 
+    def test_a_flow_of_an_earlier_id_in_the_chain_counts(self):
+        """Review S1 (D-328): a record of the id this session was cleared from (its flow ended or still
+        going) is this session's flow."""
+        now = datetime.now(UTC)
+        st = {"cleared": {"0ld": {"to": "mid"}, "mid": {"to": SID}},
+              "compactions": {"k": {"session": "0ld", "status": "compacted", "at": (now - timedelta(minutes=5)).isoformat(),
+                                    "done_at": (now - timedelta(minutes=4)).isoformat()}}}
+        self.assertEqual(iw.compaction_flow(SID, st, now), (now - timedelta(minutes=5), now - timedelta(minutes=4)))
+        self.assertIsNone(iw.compaction_flow("other", st, now))
+
     def test_a_stale_running_record_is_over_and_alerted_once(self):
         now = datetime.now(UTC)
         start = now - iw.COMPACT_FLOW_MAX - timedelta(minutes=3)              # "over" 3 min ago

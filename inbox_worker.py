@@ -249,9 +249,11 @@ def compaction_flow(sid: str, st: Any, now: datetime) -> tuple[datetime, datetim
     running any more (every step has a timeout; the keep-alive died in it): it ended there, with an
     alert (once) so the owner sees it."""
     best: tuple[datetime, datetime | None, str] | None = None
+    chain = ka.session_chain(sid, st)   # D-328: a flow of an id this one was cleared from is this session's too
     for key, v in (st.get("compactions") or {}).items():
-        if (not isinstance(v, dict) or (v.get("session") not in (None, sid) and v.get("new_session") != sid)
-                or v.get("status") not in ka.COMPACT_STARTED):   # D-328: after the /clear it is the new id's flow
+        if (not isinstance(v, dict) or (v.get("session") is not None and v.get("session") not in chain
+                                        and v.get("new_session") not in chain)
+                or v.get("status") not in ka.COMPACT_STARTED):   # ... and after the /clear it is the new id's flow
             continue
         save = (v.get("steps") or {}).get("save")
         if v.get("status") == "failed" and isinstance(save, dict) and not save.get("sent_at"):

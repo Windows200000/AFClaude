@@ -3691,7 +3691,7 @@ def _jsonable(d):
     return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
 
 
-def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
+def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, before_follow=None):
     """The flow (D-233/D-234/D-238/D-328): save_before_compaction -> clear_session -> follow_clear
     -> compact_resume_text. trigger: run-end | idle | mid-run (TRIGGER_TEXT: the prompts' wording).
     -> (the hand-off text to send into the new session, the hand-off row to consume once it went
@@ -3700,6 +3700,8 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
     detail, record) and stops right there: no /clear after a failed save, no hand-off after a
     failed /clear or follow (the caller records and reports it, compaction_pass). progress: the PROGRESS.md the hand-off text names (default: the session's
     project's, session_progress, looked up before anything is typed: no project, no save prompt).
+    before_follow(new id): called after the /clear, before follow_clear moves the bookkeeping (the
+    caller takes the new id's send lock there, D-262; its failstop.Failed stops the flow).
     Also the live test (tools/test_compact_live.sh) runs exactly this."""
     import failstop
     rec = {}
@@ -3741,6 +3743,11 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
     if comp["status"] != "cleared":
         raise failstop.Failed(f"no reset: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
+    if before_follow is not None:
+        try:
+            before_follow(comp["new_session"])
+        except failstop.Failed as e:
+            raise failstop.Failed(e.why, e.detail, rec) from None
     try:
         follow_clear(sid, comp["new_session"], comp["done_at"] or comp["sent_at"])
     except Exception as e:   # noqa: BLE001 - the session is cleared, its bookkeeping not moved: an error
@@ -4260,24 +4267,25 @@ def _compact_now(sid, path, d, rec, head):
     cwd = session_cwd(path)
     log(head + f"COMPACTING ({d.trigger}: {d.reason}): hand-off + /clear")
     record_compaction(sid, d.key, dict(rec, status="running"))
-    lock, proj = None, None
+    held, proj = {}, None
+
+    def before_follow(new):   # D-262: the new id is ours before the DB names it (review S1)
+        rec["new_session"] = new
+        record_compaction(sid, d.key, dict(rec, status="running"))   # the inbox worker holds for the new id too
+        held["lock"] = session_lock(new)
+        if held["lock"] is None:
+            raise failstop.Failed(f"the send lock of the new session {new[:8]} is held", "a start types into it")
     try:
         try:
             # the project and a mid-run one's run part come before anything is typed: their failure
             # leaves the session as it was (3c S1: no project = no save prompt, no /clear)
             proj = session_progress(sid)
             run = mid_run_text(sid, rec["threshold"], datetime.now(UTC)) if d.trigger == "mid-run" else None
-            insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger, proj["progress"])
+            insert, h, steps = compact_with_handoff(sid, cwd, path, d.trigger, proj["progress"], before_follow)
         except failstop.Failed as e:
             return _compaction_failed(sid, d.key, rec, e.why, e.detail, e.record, repo=(proj or {}).get("repo"))
         rec["steps"] = _jsonable(steps)
         new, npath = steps["new_session"], steps["new_path"]
-        rec["new_session"] = new
-        record_compaction(sid, d.key, dict(rec, status="running"))   # the inbox worker holds for the new id too
-        lock = session_lock(new)
-        if lock is None:
-            return _compaction_failed(sid, d.key, rec, f"the send lock of the new session {new[:8]} is held",
-                                      "a start types into it", repo=proj["repo"])
         notes, note_ids = inbox_notes(new)   # D-241: the owner's noted inbox messages (moved to the new id)
         if run is None:
             msg = session_message("compact_after", repo=proj["repo"], hooked=rules_hooked(cwd),
@@ -4303,7 +4311,7 @@ def _compact_now(sid, path, d, rec, head):
         return _compaction_failed(sid, d.key, rec, f"compaction step failed: {type(e).__name__}", str(e)[:500],
                                   repo=(proj or {}).get("repo"))
     finally:
-        release_lock(lock)
+        release_lock(held.get("lock"))
     pre = steps.get("pre_tokens") or rec["context"]
     rec.update(status="compacted", handoff_id=h["id"], handoff_consumed=consumed, replied=bool(reply),
                pre_tokens=pre, post_tokens=post, done_at=datetime.now(UTC))

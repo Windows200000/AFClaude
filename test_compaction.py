@@ -841,6 +841,24 @@ class CompactionFailures(Env):
         ka.compaction_plan(SID, datetime.now(UTC), Armed())
         self.assertEqual(len(self.alerts), 1, self.alerts)                 # alerted once
 
+    def test_the_new_ids_lock_comes_before_the_db_move(self):
+        """Review S1 (D-262): the new id's send lock is taken, and recorded as the flow's, before
+        follow_clear moves the bookkeeping (no owner message typed in before the hand-off)."""
+        order, lock, follow = [], ka.session_lock, ka.follow_clear
+
+        def locked(sid, *a):
+            order.append(("lock", sid))
+            return lock(sid, *a)
+
+        def followed(old, new, at):
+            rec = [v for v in ka.load_state()["compactions"].values() if v.get("status") == "running"]
+            order.append(("follow", new, rec[-1].get("new_session")))
+            return follow(old, new, at)
+        with mock.patch.object(ka, "session_lock", locked), mock.patch.object(ka, "follow_clear", followed):
+            d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual(order[-2:], [("lock", NEW), ("follow", NEW, NEW)])
+
     def test_not_exactly_one_process(self):
         """D-328: no process (or two) holding the session: nothing typed after the save, an error."""
         ka.registry_holders = lambda sid: set()
