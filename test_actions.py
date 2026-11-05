@@ -1335,6 +1335,16 @@ class SessionCleared(Base):
         self.do("inbox.retry", message_id=failed)
         self.assertEqual(store.inbox_row(self.conn, failed)["session_id"], self.NEW)
 
+    def test_two_follows_keep_both_links(self):
+        """Review S2: "cleared" is a split part of the keepalive state: two writers each add a link."""
+        base = store.state_rows(self.conn, "keepalive")
+        for old in ("a", "b"):
+            doc = actions.state_unflatten("keepalive", base)
+            doc["cleared"][old] = {"to": old + "2", "at": "t"}
+            actions.state_save(self.conn, "keepalive", doc, base=base, actor="keepalive", via="runner")
+        links = actions.state_unflatten("keepalive", store.state_rows(self.conn, "keepalive"))["cleared"]
+        self.assertEqual(sorted(links), ["a", "b"])
+
     def test_refusals_move_nothing(self):
         with self.assertRaisesRegex(actions.Forbidden, "runner's step"):
             self.do("session.cleared", via="mcp", old_session=SID, new_session=self.NEW)

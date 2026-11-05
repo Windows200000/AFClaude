@@ -4293,7 +4293,7 @@ class StateComponent:
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions",
-                                                      "window_pings", "window_starts")),
+                                                      "window_pings", "window_starts", "cleared")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     # the watcher passes under the resident runner (phase 3a S6): acts = the act run each pass's plan

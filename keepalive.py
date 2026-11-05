@@ -3371,19 +3371,15 @@ def report_late_clear(sid, now):
 
 
 def follow_clear(old, new, at):
-    """D-328: after `/clear` the session `old` goes on as `new`: the DB's bookkeeping moves in one
-    transaction (the session.cleared action: the driven row with the tmux name, the project's
-    manager_session, the inbox messages on their way), then the keepalive state's "cleared" chain
-    gets old -> new (run_active, latest_run_fire and run_metrics follow it: a mid-run reset keeps
-    its run; the last CLEARS_KEPT). A failure raises (the caller's error, D-235)."""
+    """D-328: after `/clear` the session `old` goes on as `new`: first the keepalive state's
+    "cleared" chain gets old -> new (one row per link, a split part: concurrent follows keep both;
+    run_active, latest_run_fire and run_metrics follow it: a mid-run reset keeps its run; the last
+    CLEARS_KEPT; from here on nothing drives `old`, cleared_refusal), then the DB's bookkeeping
+    moves in one transaction (the session.cleared action: the driven row with the tmux name, the
+    project's manager_session, the inbox messages on their way). A failure raises (the caller's
+    error, D-235)."""
     import actions
     import store
-    conn = store.connect()
-    try:
-        res = actions.perform(conn, "session.cleared", {"old_session": old, "new_session": new},
-                              actor="keepalive", via="runner")
-    finally:
-        conn.close()
     disk = load_state()
     links = disk.setdefault("cleared", {})
     links[old] = {"to": new, "at": at.isoformat() if isinstance(at, datetime) else at}
@@ -3391,6 +3387,12 @@ def follow_clear(old, new, at):
         links.pop(k, None)
     if not save_state(disk):
         raise RuntimeError(f"the link {old[:8]} -> {new[:8]} could not be stored in the keepalive state")
+    conn = store.connect()
+    try:
+        res = actions.perform(conn, "session.cleared", {"old_session": old, "new_session": new},
+                              actor="keepalive", via="runner")
+    finally:
+        conn.close()
     log(f"compaction: {old[:8]} goes on as {new[:8]} (tmux {res.get('tmux')}, projects {res.get('projects')}, "
         f"{res.get('inbox_moved')} inbox message(s) moved)")
     return res
