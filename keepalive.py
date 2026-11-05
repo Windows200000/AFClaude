@@ -3320,10 +3320,54 @@ def clear_session(sid, cwd, path):
             return {"status": "cleared", "sent_at": since, "done_at": hit["at"].isoformat(), "pid": pid, "pre_tokens": pre,
                     "new_session": hit["session"], "new_path": hit["path"]}
         if time.time() >= deadline:
-            log(f"compaction: pid {pid} did not go on under a new session within {CLEAR_TIMEOUT} of /clear "
-                f"(its registry names {str(session_entry(pid).get('sessionId'))[:8]})")
+            hit = cleared_into(pid, sid, since)   # once more: the registry may have turned meanwhile
+            if hit:
+                continue
+            log(f"compaction: no new session id for pid {pid} within {CLEAR_TIMEOUT} of /clear (its registry "
+                f"names {str(session_entry(pid).get('sessionId'))[:8]}); a late /clear is caught by late_clear")
             return {"status": "timeout", "sent_at": since, "pid": pid}
         time.sleep(COMPACT_POLL)
+
+
+CLEAR_LATE_WINDOW = timedelta(hours=12)   # late_clear: a timed-out /clear is watched this long
+
+
+def late_clear(sid, now, st=None):
+    """Review B2 (D-328): a /clear that timed out (CLEAR_TIMEOUT, e.g. queued behind a turn) may
+    still land: the process then goes on under a new id while the DB and the keepalive state name
+    `sid`. -> [(attempt key, its record, cleared_into's hit)] for the timed-out attempts of `sid`
+    (the last CLEAR_LATE_WINDOW, not reported yet) whose process now registers another id whose
+    transcript has that /clear."""
+    st = st if st is not None else load_state()
+    out = []
+    for key, rec in (st.get("compactions") or {}).items():
+        t = (rec or {}).get("clear_timeout") if isinstance(rec, dict) else None
+        if not isinstance(t, dict) or rec.get("session") != sid or rec.get("late_clear"):
+            continue
+        sent = _entry_ts(t, "sent_at")
+        if sent is None or now - sent > CLEAR_LATE_WINDOW:
+            continue
+        hit = cleared_into(t.get("pid"), sid, sent)
+        if hit:
+            out.append((key, rec, hit))
+    return out
+
+
+def report_late_clear(sid, now):
+    """compaction_plan's first check (before the pause holds it: the timeout paused automation):
+    a late /clear (late_clear) is alerted once with both ids and the attempt record notes it; the
+    bookkeeping is not moved (the owner decides: the session went on without its resume message).
+    -> True when one was found."""
+    found = late_clear(sid, now)
+    for key, rec, hit in found:
+        new = hit["session"]
+        rec = dict(rec, late_clear={"session": new, "at": hit["at"].isoformat() if hit["at"] else None})
+        record_compaction(sid, key, rec)
+        fail_stop(f"compaction of {sid[:8]}: its /clear landed late, pid {rec['clear_timeout'].get('pid')} goes on as "
+                  f"{new[:8]}", f"{sid[:8]} timed out waiting for the /clear ({key}), then the process went on as "
+                  f"{new}; the DB and the keep-alive state still name {sid} (nothing moved, no resume message "
+                  "sent): follow it by hand or restart the task-manager")
+    return bool(found)
 
 
 def follow_clear(old, new, at):
@@ -3499,8 +3543,8 @@ SAVE_WHY = {   # why there is no new hand-off: the error says it (D-234)
 COMPACT_WHY = {
     "busy": f"the session was still mid-turn {COMPACT_TURN_WAIT.total_seconds() / 60:g} min after the save",
     "no-process": "not exactly one live process holds the session, so no /clear was sent",
-    "timeout": f"the session did not go on under a new id within {CLEAR_TIMEOUT.total_seconds() / 60:g} min "
-               "of /clear",
+    "timeout": f"no new session id within {CLEAR_TIMEOUT.total_seconds() / 60:g} min of /clear (it may still "
+               "land after a running turn: the next compaction check alerts with the new id then)",
     "send-failed": "/clear could not be sent",
 }
 
@@ -3690,6 +3734,8 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None):
     except Exception as e:   # noqa: BLE001
         raise failstop.Failed("the /clear step failed", f"{type(e).__name__}: {e}"[:300], rec) from None
     rec.update(_jsonable(comp))
+    if comp["status"] == "timeout":   # the /clear may still land after a running turn: late_clear watches for it
+        rec["clear_timeout"] = _jsonable({"pid": comp.get("pid"), "sent_at": comp.get("sent_at")})
     if comp["status"] != "cleared":
         raise failstop.Failed(f"no reset: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
@@ -4064,6 +4110,8 @@ def compaction_plan(sid, now, args):
     the attempt's record, the log head) when it is due and armed: compaction_act then compacts).
     Holds are logged once per reason, a missed or dry-run attempt is recorded here."""
     import compact_timing as ct
+    if report_late_clear(sid, now):   # review B2: a timed-out /clear that landed after all
+        return None, None
     cfg = _compaction_settings()
     if not cfg["compaction_enabled"]:
         _compact_log("compaction: compaction_enabled is off")
@@ -4185,6 +4233,8 @@ def _compaction_failed(sid, key, rec, why, detail="", steps=None, repo=None):
         rec["steps"] = _jsonable(steps)
         if steps.get("new_session"):
             rec["new_session"] = steps["new_session"]
+        if steps.get("clear_timeout"):   # late_clear watches it
+            rec["clear_timeout"] = steps["clear_timeout"]
     record_compaction(sid, key, rec)
     if repo is None:
         try:

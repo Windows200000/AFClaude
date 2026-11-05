@@ -71,6 +71,16 @@ def keepalive_msg(ts, text="[keep-alive] A new run starts: go"):
     return entry("user", ts, origin={"kind": "human"}, promptSource="typed", message={"role": "user", "content": text})
 
 
+def store_driven(sid):
+    """The live driven row's id for `sid` (None: ended or none)."""
+    conn = store.connect()
+    try:
+        r = store.get_driven_session(conn, sid)
+    finally:
+        conn.close()
+    return sid if r and not r.get("ended_at") else None
+
+
 class Env(unittest.TestCase):
     """Temp state files, transcripts root and PROGRESS.md; the keep-alive's host calls faked."""
     NAMES = ("PROJECTS_DIR", "STATE_FILE", "PROGRESS_FILE", "FILLUP_FILE", "DEFER_FILE",
@@ -810,7 +820,26 @@ class CompactionFailures(Env):
         self.clears = False
         ka.CLEAR_TIMEOUT = timedelta(0)
         d, rec = self.compact()
-        self.assert_failed(rec, "the session did not go on under a new id within 2 min of /clear", [SAVE, "/clear"])
+        self.assert_failed(rec, "no new session id within 2 min of /clear", [SAVE, "/clear"])
+
+    def test_a_clear_that_lands_after_the_timeout(self):
+        """Review B2: the next check sees the process under a new id after the timed-out /clear:
+        an alert with both ids, once; nothing moved."""
+        self.clears = False
+        ka.CLEAR_TIMEOUT = timedelta(0)
+        d, rec = self.compact()
+        self.assertEqual(rec["clear_timeout"]["pid"], PID)
+        self.assertEqual(ka.late_clear(SID, datetime.now(UTC)), [])        # not landed yet
+        self.clears = True
+        self.fake_fire(SID, "/w", "/clear", "send-keys", driver="auto", prompt="clear")   # it lands late
+        self.alerts.clear()
+        self.assertEqual(ka.compaction_plan(SID, datetime.now(UTC), Armed()), (None, None))
+        self.assertEqual(len(self.alerts), 1, self.alerts)
+        self.assertIn(f"its /clear landed late, pid {PID} goes on as {NEW[:8]}", self.alerts[0])
+        self.assertEqual(ka.load_state()["compactions"][d.key]["late_clear"]["session"], NEW)
+        self.assertEqual(store_driven(SID), SID)                           # the bookkeeping was not moved
+        ka.compaction_plan(SID, datetime.now(UTC), Armed())
+        self.assertEqual(len(self.alerts), 1, self.alerts)                 # alerted once
 
     def test_not_exactly_one_process(self):
         """D-328: no process (or two) holding the session: nothing typed after the save, an error."""
