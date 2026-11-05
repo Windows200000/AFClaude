@@ -1318,6 +1318,23 @@ class SessionCleared(Base):
         self.assertEqual((row["action"], row["target_id"], row["actor"], row["via"]),
                          ("session.cleared", self.NEW, "keepalive", "runner"))
 
+    def link(self):
+        for path, payload in actions.state_flatten("keepalive", {"cleared": {SID: {"to": self.NEW, "at": "t"}}}).items():
+            store.state_set(self.conn, "keepalive", path, payload, "keepalive", "runner")
+
+    def test_a_follow_up_and_a_retry_go_to_the_new_id(self):
+        """Review B1: a thread answered before the clear, an error message: never the pre-/clear id."""
+        answered, failed = self.post("q", "dismissed"), self.post("e", "delivered")
+        self.do("inbox.fail", actor="keepalive", via="runner", message_id=failed, error="boom")
+        self.do("session.cleared", actor="keepalive", via="runner", old_session=SID, new_session=self.NEW)
+        self.link()
+        self.assertEqual(actions.current_session(self.conn, SID), self.NEW)
+        self.assertEqual(actions.current_session(self.conn, SID2), SID2)
+        f = self.do("inbox.post", text="more", parent=answered)
+        self.assertEqual(f["session_id"], self.NEW)
+        self.do("inbox.retry", message_id=failed)
+        self.assertEqual(store.inbox_row(self.conn, failed)["session_id"], self.NEW)
+
     def test_refusals_move_nothing(self):
         with self.assertRaisesRegex(actions.Forbidden, "runner's step"):
             self.do("session.cleared", via="mcp", old_session=SID, new_session=self.NEW)

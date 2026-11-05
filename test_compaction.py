@@ -15,6 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1773,6 +1774,42 @@ class SessionChain(unittest.TestCase):
         self.assertEqual(ka.session_chain("c", st), ["c", "b", "a"])
         self.assertEqual(ka.session_successors("a", st), ["a", "b", "c"])
         self.assertEqual(ka.session_chain("x", st), ["x"])           # a self-link never loops
+
+    def test_current_session_and_the_guard(self):
+        """Review B1: the resolver, and preflight/fire refuse a pre-/clear id (D-234)."""
+        st = {"cleared": {"a": {"to": "b"}, "b": {"to": "c"}}}
+        self.assertEqual((ka.current_session("a", st), ka.current_session("c", st)), ("c", "c"))
+        self.assertEqual(ka.cleared_refusal("a", st), "a was cleared into c; not resumed")
+        self.assertIsNone(ka.cleared_refusal("c", st))
+        with mock.patch.object(ka, "load_state", return_value=st), mock.patch.object(ka, "_preflight") as pf, \
+                mock.patch.object(ka, "record_typed") as rec, mock.patch.object(ka.host, "run_on_host") as run:
+            self.assertEqual(ka.preflight("b"), (False, ["b was cleared into c; not resumed"], None))
+            with self.assertRaisesRegex(RuntimeError, "cleared into c; not resumed"):
+                ka.fire("a", "/w", "go", "send-keys", driver="auto", prompt="x")
+            pf.assert_not_called()
+            rec.assert_not_called()
+            run.assert_not_called()
+
+    def test_a_start_that_waited_on_the_clear_starts_the_new_id(self):
+        """Review B1: _start_session re-resolves the id after the compaction lock, and re-checks the pause."""
+        st = {"handled": {}, "cleared": {}}
+        stall = {"uuid": "k"}
+        chain = {"cleared": {"old": {"to": "new"}}}
+        with mock.patch.object(ka, "session_lock", return_value="L") as lk, mock.patch.object(ka, "release_lock"), \
+                mock.patch.object(ka, "load_state", return_value=chain), \
+                mock.patch.object(ka, "_preflight", return_value=(True, [], "send-keys")) as pf, \
+                mock.patch.object(ka, "automation_paused", return_value=False), \
+                mock.patch.object(ka, "_fire_start", return_value=None) as fs:
+            ka._start_session("old", (True, [], "send-keys"), stall, "r", st, None, "k", "n")
+        self.assertEqual([c.args[0] for c in lk.call_args_list], ["old", "new"])
+        pf.assert_called_once_with("new", None)
+        self.assertEqual(fs.call_args.args[0], "new")
+        with mock.patch.object(ka, "session_lock", return_value="L"), mock.patch.object(ka, "release_lock"), \
+                mock.patch.object(ka, "load_state", return_value={}), \
+                mock.patch.object(ka, "automation_paused", return_value=True), \
+                mock.patch.object(ka, "_fire_start") as fs:
+            self.assertEqual(ka._start_session("old", (True, [], "send-keys"), stall, "r", st, None, "k", "n"), "paused")
+        fs.assert_not_called()
 
 
 if __name__ == "__main__":

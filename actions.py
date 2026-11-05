@@ -1697,6 +1697,21 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
     return Result(after, sid, before, after)
 
 
+def current_session(conn: sqlite3.Connection, sid: str) -> str:
+    """D-328: the id the session `sid` goes on as after its /clears: the keepalive state's "cleared"
+    links (keepalive.follow_clear; keepalive.current_session reads the same chain), `sid` itself
+    when it was never cleared. A follow-up or a retry goes there, never to a pre-/clear id."""
+    links = state_unflatten("keepalive", store.state_rows(conn, "keepalive")).get("cleared") or {}
+    chain = [sid]
+    while len(chain) <= len(links):
+        link = links.get(chain[-1])
+        to = link.get("to") if isinstance(link, dict) else None
+        if not to or to in chain:
+            break
+        chain.append(str(to))
+    return chain[-1]
+
+
 CLEARED_INBOX = ("pending", "noted", "delivered")   # still on their way to (or answered by) the session
 
 
@@ -1838,7 +1853,7 @@ def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = 
         root = store.inbox_row(conn, p["parent_id"]) if p["parent_id"] is not None else p
         if root["status"] != "answered":
             raise store.InvalidTransition(f"inbox message #{root['id']} has no reply yet: nothing to follow up")
-        sid, root_id = root["session_id"], root["id"]
+        sid, root_id = current_session(conn, root["session_id"]), root["id"]
     else:
         sid = session_id if session_id is not None else _inbox_session(conn, project)
     m = store.add_inbox(conn, text, sid, ctx.actor, parent_id=root_id)
@@ -1955,9 +1970,13 @@ def inbox_fail(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, error: Any) 
 @action("inbox.retry", "inbox", owner_only=True)
 def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
     """The owner retries a failed message: pending again (triaged again if it has no verdict yet,
-    otherwise delivered or noted per its verdict). The old error stays in the audit row."""
+    otherwise delivered or noted per its verdict). The old error stays in the audit row. A message
+    to a session cleared since goes to the id it goes on as (current_session, D-328)."""
     before = store.inbox_row(conn, message_id)
     status = "noted" if before["verdict"] == "note" else "pending"
+    cur = current_session(conn, before["session_id"])
+    if cur != before["session_id"] and before["status"] == "error":
+        conn.execute("UPDATE inbox_messages SET session_id=? WHERE id=?", (cur, before["id"]))
     after = store.update_inbox(conn, before["id"], ("error",), status=status, error=None, error_at=None,
                                hold=None, hold_since=None, retry_after=None)
     return _inbox_change(before, after)

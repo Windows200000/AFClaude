@@ -1115,7 +1115,11 @@ def archived_since_last_message(path):
 def preflight(session_id, tmux=None):
     """_preflight(), failing safe (refuse) if the host's process info is unavailable
     (inside the container it comes over the SSH bridge) or the session has no stored tmux name.
-    `tmux`: the name its launcher chose (claim_tmux) when it isn't stored yet (a dry run)."""
+    `tmux`: the name its launcher chose (claim_tmux) when it isn't stored yet (a dry run). A
+    session cleared into another id is refused (cleared_refusal, D-328)."""
+    why = cleared_refusal(session_id)
+    if why:
+        return False, [why], None
     try:
         return _preflight(session_id, tmux)
     except NoTmuxName as e:
@@ -1234,9 +1238,13 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None, categ
     AFClaude's own text, owner = the owner's inbox message it delivers), `prompt` (the text's name)
     and `actor` (the sending component) go into the typed_messages row recorded before the send
     (record_typed, usage split S2). All are resolved first, so a failure there (the record
-    included: D-235, no untracked message) changes nothing."""
+    included: D-235, no untracked message) changes nothing. A session cleared into another id
+    raises (cleared_refusal, D-328)."""
     if driver not in TYPED_DRIVERS:
         raise ValueError(f"fire: driver must be one of {'|'.join(TYPED_DRIVERS)}, got {driver!r}")
+    why = cleared_refusal(session_id)
+    if why:
+        raise RuntimeError(why)
     tmux = tmux_name(session_id)
     launch = launch_for(session_id, name, model)
     remote = remote_control.launch_flags(category)
@@ -2415,6 +2423,16 @@ def _start_session(sid, pre, stall, reason, st, args, key, night):
         if lock is None:
             raise failstop.Failed("the session is still busy with a compaction",
                                   f"its lock was held for {COMPACT_LOCK_WAIT} (keepalive_session_{sid[:8]}.lock)")
+        # the compaction we waited for may have cleared the session (D-328): start its new id
+        # instead (preflight, lock and all), and a failure it paused automation on holds the start
+        cur = current_session(sid)
+        if cur != sid:
+            log(f"start {key}: {sid[:8]} was cleared into {cur[:8]} meanwhile; starting {cur[:8]}")
+            release_lock(lock)
+            lock = None
+            return _start_session(cur, None, stall, reason, st, args, key, night)
+        if automation_paused(f"{sid[:8]} ({reason}, after the compaction lock)", sid):
+            return "paused"
         if stall.get("owner_check") and plan == "send-keys":   # D-259: never type into the owner's typing
             why = owner_typing(sid, datetime.now(UTC))           # (a failed tmux read raises: aborted)
             if why:
@@ -3353,6 +3371,25 @@ def session_successors(sid, st=None):
     while links.get(out[-1]) and links[out[-1]] not in out and len(out) <= CLEARS_KEPT:
         out.append(links[out[-1]])
     return out
+
+
+def current_session(sid, st=None):
+    """D-328: the id the session `sid` goes on as now, the last of its "cleared" chain
+    (session_successors; `sid` itself when it was never cleared). What a start, an inbox follow-up
+    or a retry drives: never a pre-/clear id (cleared_refusal)."""
+    return session_successors(sid, st)[-1]
+
+
+def cleared_refusal(sid, st=None):
+    """D-328's hard guard (preflight, fire): why `sid` must not be driven when it was cleared into
+    another id, else None. Typing into it would land in the new conversation while the checks read
+    the old transcript; resuming it would start the pre-/clear conversation as a second
+    task-manager (D-234: refused, never redirected here)."""
+    st = st if st is not None else load_state()
+    link = (st.get("cleared") or {}).get(sid)
+    if not (isinstance(link, dict) and link.get("to")):
+        return None
+    return f"{sid[:8]} was cleared into {current_session(sid, st)[:8]}; not resumed"
 
 
 def _entry_ts(e, key="timestamp"):

@@ -333,7 +333,7 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
     if retry is not None and now < retry + TRIAGE_RETRY_MARGIN:
         return "held"
     try:
-        active = manager_active(m["session_id"], now)
+        active = manager_active(ka.current_session(m["session_id"]), now)   # D-328: never a pre-/clear id
     except Exception as e:   # noqa: BLE001 - an error on the message (D-235/D-244), never a triage instead
         failed(conn, m, "inbox activity check failed", f"{type(e).__name__}: {e}")
         return None
@@ -437,8 +437,9 @@ def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[
 
 def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., Any] | None = None) -> str:
     """Try to type one "now" message into its session. -> "delivered" | "held" | "failed" |
-    "gone" (a start took it along meanwhile, or it changed: nothing to do)."""
-    sid = m["session_id"]
+    "gone" (a start took it along meanwhile, or it changed: nothing to do). A message to a session
+    cleared since goes to the id it goes on as (D-328; fire refuses a pre-/clear id)."""
+    sid = ka.current_session(m["session_id"])
     path = ka.transcript_path(sid)
     if not path:
         failed(conn, m, "inbox message not delivered", f"no transcript of the session {sid[:8]}")
