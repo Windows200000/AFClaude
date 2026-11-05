@@ -206,7 +206,7 @@ class LoginExpired(Active):
 
 
 class DuringAndAfterCompaction(Active):
-    """D-262: the compaction flow (save prompt, hand-off, /compact, compact_after, READY) is no
+    """D-262: the compaction flow (save prompt, hand-off, /clear, compact_after, READY) is no
     activity; a "now" verdict made during it waits for the READY."""
 
     def setUp(self):
@@ -246,7 +246,7 @@ class DuringAndAfterCompaction(Active):
 
         def at_compact():
             seen.append(("compact", self.process(), self.row(msgs[0])["hold"]))
-        self.during = {tc.SAVE: at_save, "/compact ": at_compact}
+        self.during = {tc.SAVE: at_save, "/clear": at_compact}
         d, rec = self.compact()
         self.assertEqual((d.due, rec["status"]), (True, "compacted"))
         self.assertEqual(self.haiku, [ka.POKE_ARGV])                            # triaged, not "active"
@@ -254,7 +254,7 @@ class DuringAndAfterCompaction(Active):
         self.assertEqual((r["verdict"], r["verdict_reason"]), ("now", "a question"))
         self.assertEqual(seen, [("save", {"now": 1, "held": 1}, iw.HOLD_LOCKED),
                                 ("compact", {"held": 1}, iw.HOLD_LOCKED)])     # never typed in mid-flow
-        self.assertEqual([m[:20] for _, m in self.sent], [tc.SAVE[:20], "/compact Keep what t", tc.AFTER[:20]])
+        self.assertEqual([m[:20] for _, m in self.sent], [tc.SAVE[:20], "/clear", tc.AFTER[:20]])
         # READY is in: the next pass delivers it, through the usual checks
         self.assertEqual(self.process(), {"delivered": 1})
         self.assertEqual(self.row(msgs[0])["status"], "delivered")
@@ -278,7 +278,7 @@ class DuringAndAfterCompaction(Active):
         t = datetime.now(UTC) + timedelta(seconds=2)
         self.write([tc.owner(t), old(t + timedelta(seconds=1), ctx=160_000)], "a")
         self.make_old()
-        self.assertIn("its last request was", iw.manager_active(SID, t + timedelta(minutes=1)))
+        self.assertIn("its last request was", iw.manager_active(tc.NEW, t + timedelta(minutes=1)))
 
     def test_activity_before_the_flow_no_longer_counts_after_it(self):
         """The run's last request 8 min ago, then a 4-minute flow: triaged (D-262: after the

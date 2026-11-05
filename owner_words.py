@@ -42,7 +42,7 @@ UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
 INBOX_PREFIX = "[AFClaude inbox #"           # the owner's dashboard message delivered into the session
 KEEPALIVE_PREFIXES = ("[keep-alive]", "This session was compacted", "You are the long-running", "[AFClaude",
-                      "/compact", "<command-name>/compact")
+                      "/compact", "<command-name>/compact", "/clear", "<command-name>/clear")   # D-328: the /clear it types
 INTERRUPT_PREFIX = "[Request interrupted"
 # Claude Code stores a long text typed with `tmux send-keys -l` as a bracketed paste: the prompt text is
 # "\n\n<pasted_content id=\"..\">\n<text>\n</pasted_content id=\"..\">\n", origin human, promptSource "typed".

@@ -482,15 +482,17 @@ class Typed(unittest.TestCase):
             if not b.flat:
                 continue                                                  # hook context or a Haiku call: not typed
             if kind == "compact":
-                text = keepalive.compact_command()                        # /compact <instruction>
-            else:
-                system = {v: "x" for v in prompts.bundle_system(kind)}
-                text = prompts.bundle(kind, insert="an insert", **system)
+                continue                                                  # unused since D-328: no /compact is typed
+            system = {v: "x" for v in prompts.bundle_system(kind)}
+            text = prompts.bundle(kind, insert="an insert", **system)
             self.assertTrue(text.lstrip().startswith(owner_words.KEEPALIVE_PREFIXES), f"{kind}: {text[:60]!r}")
             self.assertIsNone(owner_words.owner_prompt(entry(text)), kind)
             self.assertIsNone(owner_words.owner_prompt(typed_entry(text)), kind)   # as a stored bracketed paste
             checked.append(kind)
         self.assertIn("continue", checked)
+        # D-328: the /clear the keep-alive types; Claude Code writes it as a command entry, never as the owner's words
+        clear = f"<command-name>{keepalive.CLEAR_COMMAND}</command-name>\n<command-message>clear</command-message>"
+        self.assertIsNone(owner_words.owner_prompt(entry(clear)))
         self.assertIn("inbox_now", checked)
         self.assertIn("session_end_save", checked)
 

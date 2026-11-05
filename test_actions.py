@@ -1186,6 +1186,9 @@ class EveryAction(Base):
             ("request.add", {"kind": "work_on_now", "target": "P"}),
             ("request.finish", {"request_id": 2, "status": "refused", "reason": "running"}),
             ("driven.set", {"session_id": SID, "kind": "review", "tmux": "afc-review"}),
+            ("driven.set", {"session_id": "cccccccc-1111-4111-8111-cccccccccccc", "kind": "review", "tmux": "afc-r2"}),
+            ("session.cleared", {"old_session": "cccccccc-1111-4111-8111-cccccccccccc",
+                                 "new_session": "dddddddd-1111-4111-8111-dddddddddddd"}),
             ("handoff.write", {"session_id": SID, "body": {"summary": "s"}}),
             ("handoff.consume", {"handoff_id": 1, "start_key": "window-start-2026-10-09"}),
             ("log.prune", {}), ("runner.prune", {}),
@@ -1275,6 +1278,62 @@ class EveryAction(Base):
 
 # ---------------------------------------------------------------- compaction hand-offs (D-144, D-155)
 
+class SessionCleared(Base):
+    """D-328: session.cleared, the keep-alive's step after a /clear (runner only)."""
+    NEW = "dddddddd-1111-4111-8111-dddddddddddd"
+
+    def setUp(self):
+        super().setUp()
+        self.do("project.add", name="P")
+        self.do("project.edit", project="P", manager_session=SID)
+        self.do("driven.set", actor="keepalive", via="runner", session_id=SID, kind="task-manager", tmux="afc-mgr", project="P")
+
+    def post(self, text, status=None):
+        m = self.do("inbox.post", text=text, session_id=SID)
+        if status:
+            self.do("inbox.triage", message_id=m["id"], verdict="note" if status == "noted" else "now", reason="r")
+        if status in ("delivered", "dismissed"):
+            self.do("inbox.deliver", message_id=m["id"], plan="send-keys")
+        if status == "dismissed":
+            self.do("inbox.reply", message_id=m["id"], answer="a")
+            self.do("inbox.dismiss", message_id=m["id"])
+        return m["id"]
+
+    def test_it_moves_the_session_row_the_project_and_the_inbox(self):
+        pending, noted, delivered, dismissed = (self.post("a"), self.post("b", "noted"), self.post("c", "delivered"),
+                                                self.post("d", "dismissed"))
+        r = self.do("session.cleared", actor="keepalive", via="runner", old_session=SID, new_session=self.NEW)
+        old, new = store.get_driven_session(self.conn, SID), store.get_driven_session(self.conn, self.NEW)
+        self.assertIsNotNone(old["ended_at"])
+        self.assertEqual((new["kind"], new["tmux"], new["ended_at"]), ("task-manager", "afc-mgr", None))
+        self.assertEqual(new["project_id"], store.get_project(self.conn, "P")["id"])
+        self.assertEqual(store.get_project(self.conn, "P")["manager_session"], self.NEW)
+        status = {m: (self.conn.execute("SELECT session_id, status FROM inbox_messages WHERE id=?", (m,)).fetchone())
+                  for m in (pending, noted, delivered, dismissed)}
+        self.assertEqual({m: tuple(v) for m, v in status.items()},
+                         {pending: (self.NEW, "pending"), noted: (self.NEW, "noted"), delivered: (self.NEW, "delivered"),
+                          dismissed: (SID, "answered")})                    # an answered message stays with its session
+        self.assertEqual((r["cleared_from"], r["projects"], r["inbox_moved"]), (SID, ["P"], 3))
+        row = self.audit()[-1]
+        self.assertEqual((row["action"], row["target_id"], row["actor"], row["via"]),
+                         ("session.cleared", self.NEW, "keepalive", "runner"))
+
+    def test_refusals_move_nothing(self):
+        with self.assertRaisesRegex(actions.Forbidden, "runner's step"):
+            self.do("session.cleared", via="mcp", old_session=SID, new_session=self.NEW)
+        for old, new, msg in ((SID, SID, "same"), (SID2, self.NEW, "no live driven row"),
+                              (SID, SID, "same")):
+            with self.assertRaisesRegex(ValueError, msg):
+                self.do("session.cleared", actor="keepalive", via="runner", old_session=old, new_session=new)
+        self.do("session.cleared", actor="keepalive", via="runner", old_session=SID, new_session=self.NEW)
+        with self.assertRaisesRegex(ValueError, "no live driven row"):       # the old row has ended: not twice
+            self.do("session.cleared", actor="keepalive", via="runner", old_session=SID, new_session=SID2)
+        self.do("driven.set", actor="keepalive", via="runner", session_id=SID2, kind="review", tmux="afc-r")
+        with self.assertRaisesRegex(ValueError, "driven row already"):
+            self.do("session.cleared", actor="keepalive", via="runner", old_session=SID2, new_session=self.NEW)
+        self.assertEqual(store.get_project(self.conn, "P")["manager_session"], self.NEW)
+
+
 class Handoffs(Base):
     BODY = {"summary": "Phase 2 merged; compaction in review.", "done": ["merged p2"], "in_progress": "review",
             "next_steps": ["merge compaction", "live test"], "open_question_ids": [7], "notes": "see D-214"}
@@ -1324,6 +1383,33 @@ class Handoffs(Base):
         self.assertEqual(self.count("handoffs"), 0)
         h = self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": ["Tests: none"]})
         self.assertEqual(h["body"]["working_notes"], ["Tests: none"])
+
+    def test_a_tests_note_holds_a_command_or_none(self):
+        """D-328: after a /clear the session knows only its hand-off: `tests:` needs 12+ characters
+        after the prefix, or `none`."""
+        self.do("project.add", name="AFClaude")
+        self.do("project.edit", project="AFClaude", manager_session=SID)
+        for note in ("tests:", "tests: x", "tests: unittest", "tests:   see above  "):
+            with self.assertRaisesRegex(ValueError, "needs a note starting `tests:`", msg=note):
+                self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": [note]})
+        self.assertEqual(self.count("handoffs"), 0)
+        for note in ("tests: none", "TESTS: None.", "tests: python3 -m unittest x", "tests: " + "x" * 12):
+            h = self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": [note]})
+            self.assertEqual(h["body"]["working_notes"], [note])
+
+    def test_working_notes_carry_over_the_clear(self):
+        """D-328: the task-manager goes on under a new session id after a /clear; its notes are the
+        project's last hand-off given back, whichever session wrote it. A session without a project
+        still has its own chain."""
+        self.do("project.add", name="AFClaude")
+        self.do("project.edit", project="AFClaude", manager_session=SID)
+        first = self.do("handoff.write", session_id=SID, body={"summary": "s", "working_notes": ["tests: none", "deploy: x"]})
+        self.do("handoff.consume", actor="keepalive", via="runner", handoff_id=first["id"], start_key="k1")
+        self.do("project.edit", project="AFClaude", manager_session=SID2)         # the session after the /clear
+        h = self.do("handoff.write", session_id=SID2, body={"summary": "s2", "working_notes": ["new note"]})
+        self.assertEqual(h["body"]["working_notes"], ["tests: none", "deploy: x", "new note"])
+        self.assertIsNone(store.last_given_back_handoff(self.conn, SID2))        # session-wise: nothing of SID2's own yet
+        self.assertEqual(store.last_given_back_handoff(self.conn, SID2, h["project_id"])["id"], first["id"])
 
     def test_working_notes_carry_over_unless_dropped(self):
         """The previous hand-off's working notes are kept (the lost ovm3 note, 02.11.), minus the

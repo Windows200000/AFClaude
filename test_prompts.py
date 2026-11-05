@@ -398,7 +398,6 @@ class SameTextTest(unittest.TestCase):
         out["run_project"] = ka.load_prompt("run_project").format(project="N")   # a fragment, as keepalive uses it
         for part in ka.RULES_PARTS:
             out[f"standing_rules {part}"] = ka.standing_rules(part)
-        out["compact_command"] = ka.compact_command()
         for trigger in ka.TRIGGER_TEXT:
             out[f"save_text {trigger}"] = ka.save_text(SID, trigger)
             out[f"compact_resume {trigger}"] = ka.compact_resume_text(
@@ -478,7 +477,7 @@ class SameTextTest(unittest.TestCase):
         with mock.patch.object(prompts, "default", spy):
             self.renders()
         used = set(loaded)
-        senders = set(prompts.PROMPTS) - {"task_start", "usage_haiku"}   # unused since D-205; read at import
+        senders = set(prompts.PROMPTS) - {"task_start", "usage_haiku", "compact"}   # unused since D-205 / D-328; read at import
         self.assertEqual(senders - used, set())
 
 
@@ -620,7 +619,7 @@ class OverrideSenderTest(SameTextTest):
     def test_every_prompt_reaches_its_senders_and_only_them(self):
         base = self.renders()
         for name in sorted(prompts.PROMPTS):
-            if name in ("task_start", "usage_haiku"):       # unused since D-205; the sampler: its own test
+            if name in ("task_start", "usage_haiku", "compact"):   # unused since D-205 / D-328; the sampler: its own test
                 continue
             marker = f"OVRD_{name}"
             conn = store.connect(self.db)
@@ -654,7 +653,6 @@ class OverrideTest(unittest.TestCase):
         self.assertEqual(prompts.text("compact"), prompts.default("compact"))
         set_override(self.conn, "compact", "Compact now. OVRD")
         self.assertEqual(prompts.text("compact"), "Compact now. OVRD")
-        self.assertEqual(ka.compact_command(), "/compact Compact now. OVRD")
         self.assertEqual(prompts.default("compact"), _legacy_ka("compact"))      # the file itself is untouched
         actions.perform(self.conn, "prompt.reset", {"name": "compact.md"}, actor="owner", via="dashboard")
         self.assertEqual(prompts.text("compact"), prompts.default("compact"))
@@ -763,7 +761,6 @@ class OverrideTest(unittest.TestCase):
             "text": lambda: prompts.text("compact"),
             "render": lambda: prompts.render("compact"),
             "bundle": lambda: prompts.bundle("compact"),
-            "compact_command": ka.compact_command,
             "save_text": lambda: ka.save_text(SID, "manual"),
             "nightly": lambda: nightly_tasks._prompt("nightly_tasks_due"),
             "inbox": lambda: inbox.triage_prompt("t"),

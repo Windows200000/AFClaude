@@ -56,14 +56,15 @@ def reset_model():
 
 class BreakEven(unittest.TestCase):
     def test_the_builtin_break_even(self):
-        """D-238: ≈180k with the evaluation's weights; at C* a compaction costs exactly what one
-        later re-read of C* instead of the compacted base saves (the formula's definition)."""
+        """D-328: ≈111k with the evaluation's weights (hand-off + /clear: the save turn reads the context
+        SAVE_READS times, the new base is 45k); at C* the flow costs exactly what one later re-read of
+        C* instead of the new base saves (the formula's definition)."""
         m = ct.builtin()
         be = ct.break_even(m)
-        self.assertAlmostEqual(be, 176_869, delta=50)
+        self.assertAlmostEqual(be, 111_284, delta=50)
         base = m["compaction"]["base_tokens"]
         self.assertAlmostEqual(ct.compaction_cost(m, be), ct.reread_cost(m, be - base), places=4)
-        self.assertAlmostEqual(ct.compaction_cost(m, be), 1.83, places=2)          # "≈2 session-%"
+        self.assertAlmostEqual(ct.compaction_cost(m, be), 1.01, places=2)          # "≈1 session-%"
         self.assertAlmostEqual(ct.reread_cost(m, 650_000), 9.945, places=3)        # the eval: 650k ≈ 10 %
         self.assertAlmostEqual(ct.weekly(m, 10.0), 1.57)
 
@@ -72,7 +73,7 @@ class BreakEven(unittest.TestCase):
         m["weights"]["cache_write"] = 30.0                                          # dearer re-reads: earlier
         self.assertLess(ct.break_even(m), ct.break_even(ct.builtin()))
         m = ct.builtin()
-        m["compaction"]["summary_tokens"] = 30_000                                  # dearer compaction: later
+        m["compaction"]["handoff_tokens"] = 30_000                                  # dearer hand-off: later
         self.assertGreater(ct.break_even(m), ct.break_even(ct.builtin()))
 
     def test_other_models_are_scaled_by_price(self):
@@ -138,7 +139,7 @@ class StoredModel(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(ct.main(["model"]), 0)
-        self.assertIn("break-even 177k tokens", out.getvalue())
+        self.assertIn("break-even 111k tokens", out.getvalue())
 
 
 class Transcript(unittest.TestCase):
@@ -177,8 +178,19 @@ class Transcript(unittest.TestCase):
         self.assertEqual([p.kind for p in s.prompts], ["owner", "keepalive", "other", "summary"])
         self.assertEqual(s.compactions, [T0 + timedelta(minutes=9)])
         st = ct.context_state(s, self.m, T0 + timedelta(minutes=10))
-        self.assertEqual((st["context"], st["estimated"]), (57_000, True))     # compacted since: the base
+        self.assertEqual((st["context"], st["estimated"]), (45_000, True))     # reset since: the base
         self.assertFalse(st["above"])
+
+    def test_a_clear_entry_is_a_reset(self):
+        """D-328: the new transcript of a session cleared by the keep-alive starts with the /clear command."""
+        write(self.path, [
+            prompt(T0, "<command-name>/clear</command-name>\n<command-message>clear</command-message>", kind=None),
+            prompt(T0 + timedelta(seconds=2), "a plain message mentioning /clear"),
+            req(T0 + timedelta(seconds=5), 45_000, write=45_000)])
+        s = ct.scan(self.path)
+        self.assertEqual(s.compactions, [T0])
+        st = ct.context_state(s, self.m, T0 + timedelta(minutes=1))
+        self.assertEqual((st["context"], st["estimated"]), (45_400, False))
 
     def test_context_state(self):
         write(self.path, [prompt(T0, "q"), req(T0 + timedelta(seconds=3), 250_000, write=2000)])
@@ -328,6 +340,7 @@ class MidRunHold(unittest.TestCase):
         s = self.scan([(T0, 160_000)])
         st = ct.context_state(s, m, T0, 150_000)
         self.assertEqual((st["threshold"], st["above"], st["break_even"]), (150_000, True, ct.break_even(m)))
+        s = self.scan([(T0, 100_000)])
         st = ct.context_state(s, m, T0)                                            # no threshold: the break-even
         self.assertEqual((st["threshold"], st["above"]), (ct.break_even(m), False))
 
@@ -377,7 +390,7 @@ class Fit(unittest.TestCase):
         self.assertGreater(m["fit"]["r2"], 0.99)
         self.assertAlmostEqual(m["fit"]["const_pct"], 0.5, delta=0.05)
         self.assertEqual((m["fit"]["n"], m["compaction"]["base_tokens"]), (120, 55_010))
-        self.assertEqual(m["compaction"]["summary_tokens"], 12_000)                # kept
+        self.assertNotIn("summary_tokens", m["compaction"])                        # D-328: no summary any more
         ct.validate(m)
 
     def test_refuses_a_poor_fit(self):
