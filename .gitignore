@@ -38,7 +38,7 @@ id_ecdsa*
 .public-denylist
 
 # tooling
-.venv/
+.venv
 __pycache__/
 *.pyc
 DECISIONS.md
