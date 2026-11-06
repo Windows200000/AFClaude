@@ -3471,6 +3471,34 @@ def state_rows(conn: sqlite3.Connection, component: str, account_id: str = DEFAU
     return {str(r[0]): str(r[1]) for r in rows}
 
 
+def cleared_links(conn: sqlite3.Connection, account_id: str = DEFAULT_ACCOUNT) -> dict[str, str]:
+    """D-328: old session id -> the id it went on as after its /clear (the keepalive state's "cleared"
+    split part, keepalive.follow_clear), read straight from its rows."""
+    out: dict[str, str] = {}
+    for path, payload in state_rows(conn, "keepalive", account_id).items():
+        keys = json.loads(path)
+        if not (isinstance(keys, list) and len(keys) == 2 and keys[0] == "cleared"):
+            continue
+        link = json.loads(payload)
+        to = link.get("to") if isinstance(link, dict) else None
+        if isinstance(to, str) and to:
+            out[str(keys[1])] = to
+    return out
+
+
+def session_family(conn: sqlite3.Connection, sid: str, account_id: str = DEFAULT_ACCOUNT) -> list[str]:
+    """D-328: `sid`, the ids it was cleared from and the ids it was cleared into (the whole "cleared"
+    chain both ways, oldest first): one task-manager's conversation across its /clears."""
+    links = cleared_links(conn, account_id)
+    back = {v: k for k, v in links.items()}
+    chain = [sid]
+    while chain[0] in back and back[chain[0]] not in chain:
+        chain.insert(0, back[chain[0]])
+    while chain[-1] in links and links[chain[-1]] not in chain:
+        chain.append(links[chain[-1]])
+    return chain
+
+
 def state_set(conn: sqlite3.Connection, component: str, path: str, payload: str, actor: str, via: str,
               account_id: str = DEFAULT_ACCOUNT) -> str:
     """Insert or update one row. -> 'inserted' | 'updated' | 'same'."""

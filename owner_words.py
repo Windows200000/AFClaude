@@ -200,9 +200,11 @@ def option_answer(conn: sqlite3.Connection, quotes: Sequence[str] | str, session
     if m is None or not session or not any(c["name"] == "origin" for c in conn.execute(
             "PRAGMA table_info(inbox_messages)")):
         return None
-    r = conn.execute("SELECT id, created_at, text, question_id FROM inbox_messages WHERE id = ? AND session_id = ? "
+    r = conn.execute("SELECT id, created_at, text, question_id, session_id FROM inbox_messages WHERE id = ? "
                      "AND created_by = 'owner' AND origin = 'option' AND question_id IS NOT NULL",
-                     (int(m.group(1)), session)).fetchone()
+                     (int(m.group(1)),)).fetchone()
+    if r is not None and r["session_id"] not in store.session_family(conn, session):   # D-328: across its /clears
+        r = None
     at = store.parse_iso(r["created_at"]) if r is not None else None
     if r is None or at is None:
         return None
@@ -235,13 +237,14 @@ def _excerpt(ev: Evidence, quote: str) -> str:
     return ("..." if a else "") + cut + ("..." if a + EXCERPT < len(text) else "")
 
 
-def check_ref(ref: str, session: str) -> None:
-    """`inbox:<id>` or `chat:<this session>:<uuid>`, else an OwnerWordsError."""
+def check_ref(ref: str, session: str, family: Sequence[str] = ()) -> None:
+    """`inbox:<id>` or `chat:<this session>:<uuid>` (or one of `family`: the ids it was cleared from or
+    into, D-328), else an OwnerWordsError."""
     m = re.fullmatch(r"inbox:([1-9][0-9]*)|chat:([^:\s]+):(\S+)", ref)
     if m is None:
         raise OwnerWordsError(f"--from {ref!r}: write inbox:<id> or chat:<session>:<uuid> (as listed when several "
                               "owner messages match)")
-    if m.group(2) is not None and m.group(2) != session:
+    if m.group(2) is not None and m.group(2) != session and m.group(2) not in family:
         raise OwnerWordsError(f"--from {ref!r} names another session's chat; only this session's ({session}) "
                               "owner messages count")
 
@@ -249,6 +252,9 @@ def check_ref(ref: str, session: str) -> None:
 def find(conn: sqlite3.Connection, quotes: Sequence[str] | str, session: Optional[str], ref: Optional[str] = None,
          *, word: bool = False, since: Optional[datetime] = None) -> Evidence:
     """The one stored owner message of `session` (inbox rows, then its transcript) that contains every quote.
+    `session` counts with the ids it was cleared from and into (store.session_family, review S4 of D-328: the
+    MCP server keeps the id it started with, the CLI follows the new one; the owner's words around a /clear
+    are in either transcript).
     ref picks one when several match. word: the quote is a decision id (exempt from the minimum length;
     matching is always on word boundaries: `D-12` is not in `D-123`). since: a message before this time
     doesn't count (an entry can't be confirmed before it existed). -> Evidence(ref, at, text); an OwnerWordsError when there is none or it is ambiguous."""
@@ -264,9 +270,10 @@ def find(conn: sqlite3.Connection, quotes: Sequence[str] | str, session: Optiona
         raise OwnerWordsError("no session id to look for the owner's message in (CLAUDE_CODE_SESSION_ID is "
                               "unset): an autonomous session records what the owner said only against a "
                               "message of its own session")
+    family = store.session_family(conn, session)
     if ref is not None:
-        check_ref(ref, session)
-    pool = inbox_messages(conn, session) + transcript_messages(session)
+        check_ref(ref, session, family)
+    pool = [m for s in family for m in inbox_messages(conn, s) + transcript_messages(s)]
     if since is not None:
         pool = [m for m in pool if m.at >= since]
     if ref is not None:

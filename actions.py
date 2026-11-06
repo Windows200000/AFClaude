@@ -1701,15 +1701,7 @@ def current_session(conn: sqlite3.Connection, sid: str) -> str:
     """D-328: the id the session `sid` goes on as after its /clears: the keepalive state's "cleared"
     links (keepalive.follow_clear; keepalive.current_session reads the same chain), `sid` itself
     when it was never cleared. A follow-up or a retry goes there, never to a pre-/clear id."""
-    links = state_unflatten("keepalive", store.state_rows(conn, "keepalive")).get("cleared") or {}
-    chain = [sid]
-    while len(chain) <= len(links):
-        link = links.get(chain[-1])
-        to = link.get("to") if isinstance(link, dict) else None
-        if not to or to in chain:
-            break
-        chain.append(str(to))
-    return chain[-1]
+    return store.session_family(conn, sid)[-1]
 
 
 CLEARED_INBOX = ("pending", "noted", "delivered")   # still on their way to (or answered by) the session
