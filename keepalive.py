@@ -3424,8 +3424,8 @@ def follow_by_hand(old, new):
     """The manual fix when follow_clear did not finish (or never ran, late_clear): both ids and the
     command that finishes the move (follow_clear_cli)."""
     return (f"the DB (driven row, project, inbox) still names {old}, the process goes on as {new}; finish the "
-            f"move with `python3 keepalive.py --follow-clear {old} {new}` (from {old[:8]} on, nothing drives "
-            "the old id), then resume automation")
+            f"move with `python3 keepalive.py --follow-clear {old} {new}` (it also stores the link that keeps "
+            "anything from driving the old id), then resume automation")
 
 
 def follow_clear_cli(old, new):
