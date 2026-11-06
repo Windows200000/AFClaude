@@ -486,7 +486,8 @@ def decide(now: datetime, state: Mapping[str, Any], *, run_using: bool, run_ende
 
 def mid_run_hold(s: Scan, now: datetime, threshold: int) -> Optional[str]:
     """D-307: why the session may not be compacted mid-run now, else None. The loop guards: not
-    within MID_RUN_GAP of its last compaction (the transcript's compact_boundary), and only once
+    within MID_RUN_GAP of its last reset (the transcript's compact_boundary, or the /clear entry a
+    cleared session's new transcript starts with, D-328: scan counts both), and only once
     the context has grown past the threshold anew (a request after that compaction was below it;
     a compaction that left it above would otherwise repeat); and not while the owner chats (their
     typed or dashboard message within MID_RUN_OWNER_QUIET: the owner holds the conversation)."""

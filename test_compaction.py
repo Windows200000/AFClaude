@@ -1081,7 +1081,28 @@ class MidRunWithSubagents(Env):
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
         self.assertEqual([m[:9] for _, m in self.sent], [SAVE[:9], "/clear", AFTER[:9]])
         self.assertIn("Summary: Brought up to date in the notification turn.", self.sent[-1][1])
+        self.assertNotIn("Not in this hand-off", self.sent[-1][1])              # nothing came after it
         self.assertEqual(rec["steps"]["save"]["handoff_id"], self.latest(unconsumed=False)["id"])
+
+    def test_input_between_the_last_check_and_the_clear_is_named_in_the_resume_text(self):
+        """Review note (turn race): a task notification lands after the hand-off check, before the
+        /clear: the hand-off can't hold it, so the resume text names it and the old transcript."""
+        old = self.path
+        fake = ka.fire
+
+        def fire(sid, cwd, message, plan, new=False, **kw):
+            if message == "/clear":
+                self.write([entry("user", datetime.now(UTC), origin={"kind": "task-notification"},
+                                  message={"role": "user", "content": "<task-notification>late</task-notification>"})],
+                           "a")
+            return fake(sid, cwd, message, plan, new, **kw)
+        ka.fire = fire
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        after = self.sent[-1][1]
+        self.assertIn("Not in this hand-off: a task notification reached the session after the hand-off", after)
+        self.assertIn(f"read it in the old transcript {old} (session {SID})", after)
+        self.assertEqual(rec["steps"]["lost_before_clear"][0][1], "a task notification")
 
     def test_a_subagent_hand_back_after_the_handoff_gets_it_asked_for_again(self):
         """A finished worker reports as a peer message ("Another Claude session sent a message",

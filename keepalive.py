@@ -3113,8 +3113,10 @@ def plan_fillup_test(sid, remaining, args):
 # during a run (D-307: "mid-run", D-328: also with /clear), at the first idle point once the context
 # passed that threshold, unless compact_timing.mid_run_hold says no (the owner's message within 10
 # min); (c) needs only the session itself idle at its prompt: background subagents may still be
-# working (the task-manager almost always waits on them), they survive the /clear (Claude Code keeps
-# running background agents across it) and the hand-off lists them as in flight. compaction_pass()
+# working (the task-manager almost always waits on them) and the hand-off lists them as in flight;
+# that they survive the /clear and notify the new session is NOT verified live yet (review of 05.11.:
+# check it before relying on it mid-run); their transcripts stay under the old id's directory, which
+# the busy checks and run_active read through the "cleared" chain. compaction_pass()
 # looks once a minute (run()) and holds while a run uses the session
 # (run_active; except for (c)), a turn (for (a)/(b) also a subagent) is running, the owner is typing (an attached terminal with recent keystrokes,
 # a draft in the input box, a dialog open), the owner holds the session elsewhere (preflight: Remote
@@ -3137,10 +3139,13 @@ def plan_fillup_test(sid, remaining, args):
 #      CLEAR_TIMEOUT) until Claude Code goes on under a new session id (clear_session): the same
 #      process's registry entry (~/.claude/sessions/<pid>.json) names a new sessionId AND that
 #      session's new transcript, in the same project directory, holds the `/clear` command entry
-#      written after the send. Then follow_clear moves the bookkeeping to the new id (the
-#      session.cleared action: the driven_sessions row with the tmux name, the project's
-#      manager_session, the inbox messages on their way; the keepalive state's "cleared" chain,
-#      which run_active / latest_run_fire / run_metrics follow so a mid-run reset keeps its run);
+#      written after the send. Then the new id's send lock is taken (D-262), and follow_clear
+#      first stores the link old -> new in the keepalive state's "cleared" chain (run_active /
+#      latest_run_fire / run_metrics follow it so a mid-run reset keeps its run; from then on
+#      cleared_refusal keeps anything from driving the old id) and then moves the bookkeeping to
+#      the new id (the session.cleared action: the driven_sessions row with the tmux name, the
+#      project's manager_session, the inbox messages on their way). A failed move is not rolled
+#      back: the alert names both ids and `keepalive.py --follow-clear OLD NEW` (follow_by_hand);
 #   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md) into the new
 #      session: it answers "READY" without starting work; the hand-off is consumed. After a mid-run
 #      reset it gets prompts/compact_after_run.md instead (mid_run_text: the run's budget now, the
@@ -3153,8 +3158,11 @@ def plan_fillup_test(sid, remaining, args):
 # error) is an error (D-234/D-235): the flow stops right there (no /clear after a failed save), the
 # attempt is recorded (the keepalive state's "compactions", one per activity: never retried),
 # alerted, and automation is paused until the owner has looked at it. An older hand-off is never
-# injected in place of a fresh one. The session lock (session_lock) keeps the flow and a start from
-# typing into the session at the same time (the new id's lock too, from the follow to the reply): a
+# injected in place of a fresh one; a failure past the /clear leaves the new session without it,
+# and the alert and the progress note say how to give it back (handoff_give_back). Input that
+# reached the session between the last hand-off check and the /clear is named in the resume text
+# (lost_text). The session lock (session_lock) keeps the flow and a start from typing into
+# the session at the same time (the new id's lock too, from before the follow to the reply): a
 # start (the cron's window-start) waits for a running flow up to COMPACT_LOCK_WAIT, then is aborted.
 
 CLEAR_TIMEOUT = timedelta(minutes=2)        # wait this long for the new session after /clear, then: error
@@ -3777,6 +3785,14 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, befor
     if comp["status"] != "cleared":
         raise failstop.Failed(f"no reset: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
+    try:   # review note (turn race): input after the last hand-off check, before the /clear
+        lost = inputs_since(path, save["saved_at"])
+    except Exception as e:   # noqa: BLE001 - the old transcript unreadable: an error (D-235)
+        raise failstop.Failed("the old transcript could not be checked for input before the /clear",
+                              f"{type(e).__name__}: {e}"[:300], rec) from None
+    if lost:
+        rec["lost_before_clear"] = [[t.isoformat(), w] for t, w in lost]
+        log(f"compaction: {lost_text(sid, path, lost)}")
     if before_follow is not None:
         try:
             before_follow(comp["new_session"])
@@ -3795,7 +3811,19 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, befor
     except failstop.Failed as e:
         raise failstop.Failed(e.why, e.detail, rec) from None
     rec["handoff_id"] = h["id"]
+    if lost:
+        insert = f"{insert} {lost_text(sid, path, lost)}"
     return insert, h, rec
+
+
+def lost_text(sid, path, lost):
+    """The line the resume text carries when input reached the old session after its last hand-off
+    check and before the /clear (inputs_since: a task notification, a subagent's or the owner's
+    message): the hand-off can't hold it and the new session would never see it otherwise."""
+    what = " and ".join(sorted({w for _, w in lost}))
+    return (f"Not in this hand-off: {what} reached the session after the hand-off was written and before the "
+            f"/clear ({', '.join(_hm(t) for t, _ in lost)}); read it in the old transcript {path} (session {sid}) "
+            "and act on it.")
 
 
 def consume_handoff(h, start_key):
