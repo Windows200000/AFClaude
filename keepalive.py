@@ -2116,9 +2116,17 @@ def pending_deferral(sid, now):
         return None
     key = schedule.start_key(now)
     ent = load_deferred().get(key)
-    if not ent or ent.get("session") != sid or key in load_state().get("handled", {}):
+    st = load_state()
+    if not ent or not deferral_of(ent, sid, st) or key in st.get("handled", {}):
         return None
     return parse_ts(ent.get("recheck_at"))
+
+
+def deferral_of(ent, sid, st=None):
+    """Review S3 (D-328): the postponed / planned start `ent` is the session `sid`'s when it names
+    `sid` or an id `sid` was cleared from (session_chain): an entry stored before a /clear keeps
+    its session, the task-manager goes on under the new id and still owns it."""
+    return isinstance(ent, dict) and ent.get("session") in session_chain(sid, st)
 
 
 def deferred_window_start_pass(sid, now, st, args):
@@ -2143,7 +2151,8 @@ def deferred_plan(sid, now, st):
     """The plan step of a postponed / planned session-window start: drops the entries that are
     over (an older start's, a handled one's) -> (key, entry, all entries) of the current start's
     entry (its recheck_at: when the act step decides again), else None. Another session's entry is
-    left alone (each task-manager of the registry plans its own, 3b S3/S4: not this one's to drop)."""
+    left alone (each task-manager of the registry plans its own, 3b S3/S4: not this one's to drop);
+    one stored under an id this session was cleared from is this one's (deferral_of)."""
     defs = load_deferred()
     if not defs:
         return None
@@ -2151,7 +2160,7 @@ def deferred_plan(sid, now, st):
     key = schedule.start_key(now) if schedule.in_window(now) else None
     ent = defs.get(key) if key else None
     stale = [k for k in defs if k != key]
-    if ent and ent.get("session") != sid:
+    if ent and not deferral_of(ent, sid, st):
         ent = None
     if ent and (key in st["handled"] or key in load_state().get("handled", {})):
         stale.append(key)

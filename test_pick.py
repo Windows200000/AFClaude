@@ -504,6 +504,21 @@ class Plumbing(Base):
             self.assertIn(key, ka.load_deferred())                  # beta's plan step does not drop alpha's
             self.assertEqual(ka.deferred_plan(SID_A, NOW, {"handled": {}})[0], key)
 
+    def test_a_deferred_entry_follows_a_clear(self):
+        # review S3 (D-328): an entry stored under the pre-/clear id is the new id's; another
+        # session's stays another's
+        key = "2026-10-29T22:00"
+        new = "aaaaaaaa-0000-4000-8000-0000000000ff"
+        st = {"handled": {}, "cleared": {SID_A: {"to": new, "at": NOW.isoformat()}}}
+        ka.save_state(st)
+        with mock.patch.object(ka.schedule, "in_window", lambda now: True), \
+                mock.patch.object(ka.schedule, "start_key", lambda now: key):
+            ka.defer_window_start(key, SID_A, NOW + timedelta(hours=1), "r")
+            self.assertEqual(ka.deferred_plan(new, NOW, st)[0], key)
+            self.assertEqual(ka.pending_deferral(new, NOW), NOW + timedelta(hours=1))
+            self.assertIsNone(ka.deferred_plan(SID_B, NOW, st))
+            self.assertIsNone(ka.pending_deferral(SID_B, NOW))
+
     def test_run_active_counts_only_its_own_sessions_fires(self):
         st = {"handled": {"k": {"at": NOW.isoformat(), "result": "continued-in-place", "session": SID_A}}}
         with mock.patch.object(ka, "transcript_path", lambda sid: None):
