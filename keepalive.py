@@ -2429,6 +2429,11 @@ def _start_session(sid, pre, stall, reason, st, args, key, night):
         if lock is None:
             raise failstop.Failed("the session is still busy with a compaction",
                                   f"its lock was held for {COMPACT_LOCK_WAIT} (keepalive_session_{sid[:8]}.lock)")
+        # a flow we waited for whose /clear timed out may have landed since (late_clear): the
+        # earlier preflight's plan would drive the old id (a run-now ignores the pause, D-282)
+        if report_late_clear(sid, datetime.now(UTC)):
+            raise failstop.Failed(f"{sid[:8]}'s timed-out /clear landed late; not started",
+                                  cleared_refusal(sid) or "the old id is not driven")
         # the compaction we waited for may have cleared the session (D-328): start its new id
         # instead (preflight, lock and all), and a failure it paused automation on holds the start
         cur = current_session(sid)
@@ -3140,12 +3145,13 @@ def plan_fillup_test(sid, remaining, args):
 #      CLEAR_TIMEOUT) until Claude Code goes on under a new session id (clear_session): the same
 #      process's registry entry (~/.claude/sessions/<pid>.json) names a new sessionId AND that
 #      session's new transcript, in the same project directory, holds the `/clear` command entry
-#      written after the send. Then the new id's send lock is taken (D-262), and follow_clear
-#      first stores the link old -> new in the keepalive state's "cleared" chain (run_active /
+#      written after the send. Right then the link old -> new goes into the keepalive state's
+#      "cleared" chain (store_clear_link, before anything else can fail; run_active /
 #      latest_run_fire / run_metrics follow it so a mid-run reset keeps its run; from then on
-#      cleared_refusal keeps anything from driving the old id) and then moves the bookkeeping to
-#      the new id (the session.cleared action: the driven_sessions row with the tmux name, the
-#      project's manager_session, the inbox messages on their way). A failed move is not rolled
+#      cleared_refusal keeps anything from driving the old id; links are never pruned). Then the
+#      new id's send lock is taken (D-262) and move_cleared moves the bookkeeping to the new id
+#      (the session.cleared action: the driven_sessions row with the tmux name, the project's
+#      manager_session, the inbox messages on their way). A failure from the link on is not rolled
 #      back: the alert names both ids and `keepalive.py --follow-clear OLD NEW` (follow_by_hand);
 #   3. sends prompts/compact_after.md with that hand-off (prompts/compact_resume.md) into the new
 #      session: it answers "READY" without starting work; the hand-off is consumed. After a mid-run
@@ -3168,7 +3174,6 @@ def plan_fillup_test(sid, remaining, args):
 
 CLEAR_TIMEOUT = timedelta(minutes=2)        # wait this long for the new session after /clear, then: error
 CLEAR_COMMAND = "/clear"
-CLEARS_KEPT = 50                            # st["cleared"]: the last old -> new session links
 COMPACT_IDLE_WAIT = timedelta(minutes=5)    # wait this long for a busy session to finish its turn, then: error
 COMPACT_TURN_WAIT = timedelta(minutes=10)   # after the save: wait this long for a turn (a task notification) to end before /clear, then: error
 HANDOFF_REFRESHES = 3                       # a hand-off made stale by new input is asked for again at most this often, then: error
@@ -3369,39 +3374,54 @@ def late_clear(sid, now, st=None):
 
 
 def report_late_clear(sid, now):
-    """compaction_plan's first check (before the pause holds it: the timeout paused automation):
-    a late /clear (late_clear) is alerted once with both ids and the attempt record notes it; the
-    bookkeeping is not moved (the owner decides: the session went on without its resume message).
-    -> True when one was found."""
+    """compaction_plan's first check (before the pause holds it: the timeout paused automation), and
+    a start's after the compaction lock: a late /clear (late_clear) is alerted once with both ids,
+    the attempt record notes it and the link old -> new is stored (store_clear_link: from then on
+    nothing drives `sid`, cleared_refusal; the new id has no driven row, so a start of it fails
+    safe at preflight); the DB's bookkeeping is not moved (the owner decides: the session went on
+    without its resume message). -> True when one was found."""
     found = late_clear(sid, now)
     for key, rec, hit in found:
         new = hit["session"]
+        try:
+            store_clear_link(sid, new, hit["at"] or now)
+            linked = "the link that refuses the old id is stored"
+        except Exception as e:   # noqa: BLE001 - named in the alert below (it pauses automation)
+            linked = f"the link that refuses the old id could NOT be stored ({type(e).__name__}: {str(e)[:200]})"
         rec = dict(rec, late_clear={"session": new, "at": hit["at"].isoformat() if hit["at"] else None})
         record_compaction(sid, key, rec)
         fail_stop(f"compaction of {sid[:8]}: its /clear landed late, pid {rec['clear_timeout'].get('pid')} goes on as "
                   f"{new[:8]}", f"{sid[:8]} timed out waiting for the /clear ({key}), then the process went on as "
-                  f"{new}; the DB and the keep-alive state still name {sid} (nothing moved, no resume message "
+                  f"{new}; {linked}; the DB still names {sid} (nothing moved, no resume message "
                   f"sent): {follow_by_hand(sid, new)}, or restart the task-manager")
     return bool(found)
 
 
 def follow_clear(old, new, at):
-    """D-328: after `/clear` the session `old` goes on as `new`: first the keepalive state's
-    "cleared" chain gets old -> new (one row per link, a split part: concurrent follows keep both;
-    run_active, latest_run_fire and run_metrics follow it: a mid-run reset keeps its run; the last
-    CLEARS_KEPT; from here on nothing drives `old`, cleared_refusal), then the DB's bookkeeping
-    moves in one transaction (the session.cleared action: the driven row with the tmux name, the
-    project's manager_session, the inbox messages on their way). A failure raises (the caller's
-    error, D-235)."""
-    import actions
-    import store
+    """D-328: after `/clear` the session `old` goes on as `new`: the link (store_clear_link), then
+    the bookkeeping (move_cleared). A failure raises (the caller's error, D-235)."""
+    store_clear_link(old, new, at)
+    return move_cleared(old, new)
+
+
+def store_clear_link(old, new, at):
+    """The keepalive state's "cleared" chain gets old -> new (one row per link, a split part:
+    concurrent follows keep both; run_active, latest_run_fire and run_metrics follow it: a mid-run
+    reset keeps its run; from here on nothing drives `old`, cleared_refusal). Links are never
+    pruned: a process keeps its first id (the MCP server's), and the whole chain must stay
+    reachable from it (store.session_family). A failure raises."""
     disk = load_state()
-    links = disk.setdefault("cleared", {})
-    links[old] = {"to": new, "at": at.isoformat() if isinstance(at, datetime) else at}
-    for k in sorted(links, key=lambda k: str((links[k] or {}).get("at")))[:-CLEARS_KEPT]:
-        links.pop(k, None)
+    disk.setdefault("cleared", {})[old] = {"to": new, "at": at.isoformat() if isinstance(at, datetime) else at}
     if not save_state(disk):
         raise RuntimeError(f"the link {old[:8]} -> {new[:8]} could not be stored in the keepalive state")
+
+
+def move_cleared(old, new):
+    """The DB's bookkeeping of `old` moves to `new` in one transaction (the session.cleared action:
+    the driven row with the tmux name, the project's manager_session, the inbox messages on their
+    way). A failure raises."""
+    import actions
+    import store
     conn = store.connect()
     try:
         res = actions.perform(conn, "session.cleared", {"old_session": old, "new_session": new},
@@ -3430,15 +3450,32 @@ def follow_by_hand(old, new):
 
 
 def follow_clear_cli(old, new):
-    """--follow-clear OLD NEW: the owner finishes a move follow_clear could not (follow_by_hand). Refused
-    when OLD is already linked to another id (the link names where it went: no second history)."""
+    """--follow-clear OLD NEW: the owner finishes a move follow_clear could not (follow_by_hand). Refused,
+    with nothing written, when OLD is already linked to another id (the link names where it went: no
+    second history), when OLD has no driven row, or when NEW's transcript (in OLD's project directory)
+    does not start with a /clear entry (clear_marker): a wrong NEW would join the session's family
+    (store.session_family) and its chat would count as the owner's words."""
+    import store
     link = (load_state().get("cleared") or {}).get(old)
     to = link.get("to") if isinstance(link, dict) else None
     if to and to != new:
         raise SystemExit(f"--follow-clear: {old} was cleared into {to}, not {new}")
     if old == new:
         raise SystemExit("--follow-clear: the old and the new id are the same")
-    return follow_clear(old, new, (link or {}).get("at") or datetime.now(UTC))
+    conn = store.connect()
+    try:
+        row = store.get_driven_session(conn, old)
+    finally:
+        conn.close()
+    if row is None:
+        raise SystemExit(f"--follow-clear: {old} has no driven row; nothing to move")
+    opath, npath = transcript_path(old), transcript_path(new)
+    if not npath or (opath and os.path.dirname(opath) != os.path.dirname(npath)):
+        raise SystemExit(f"--follow-clear: no transcript of {new} next to {old}'s")
+    marker = clear_marker(npath, datetime.min.replace(tzinfo=UTC) + timedelta(seconds=5))
+    if marker is None:
+        raise SystemExit(f"--follow-clear: {new}'s transcript has no /clear entry; it is not where {old} went")
+    return follow_clear(old, new, (link or {}).get("at") or _entry_ts(marker) or datetime.now(UTC))
 
 
 def session_chain(sid, st=None):
@@ -3447,7 +3484,7 @@ def session_chain(sid, st=None):
     st = st if st is not None else load_state()
     back = {v.get("to"): k for k, v in (st.get("cleared") or {}).items() if isinstance(v, dict)}
     out = [sid]
-    while out[-1] in back and back[out[-1]] not in out and len(out) <= CLEARS_KEPT:
+    while out[-1] in back and back[out[-1]] not in out:
         out.append(back[out[-1]])
     return out
 
@@ -3457,7 +3494,7 @@ def session_successors(sid, st=None):
     st = st if st is not None else load_state()
     links = {k: v.get("to") for k, v in (st.get("cleared") or {}).items() if isinstance(v, dict)}
     out = [sid]
-    while links.get(out[-1]) and links[out[-1]] not in out and len(out) <= CLEARS_KEPT:
+    while links.get(out[-1]) and links[out[-1]] not in out:
         out.append(links[out[-1]])
     return out
 
@@ -3743,7 +3780,8 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, befor
     detail, record) and stops right there: no /clear after a failed save, no hand-off after a
     failed /clear or follow (the caller records and reports it, compaction_pass). progress: the PROGRESS.md the hand-off text names (default: the session's
     project's, session_progress, looked up before anything is typed: no project, no save prompt).
-    before_follow(new id): called after the /clear, before follow_clear moves the bookkeeping (the
+    before_follow(new id): called after the /clear and its link (store_clear_link), before
+    move_cleared moves the bookkeeping (the
     caller takes the new id's send lock there, D-262; its failstop.Failed stops the flow).
     Also the live test (tools/test_compact_live.sh) runs exactly this."""
     import failstop
@@ -3786,26 +3824,31 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, befor
     if comp["status"] != "cleared":
         raise failstop.Failed(f"no reset: {COMPACT_WHY.get(comp['status'], comp['status'])}",
                               comp.get("error") or "", rec)
+    new = comp["new_session"]
+    unmoved = f"{sid[:8]} was cleared and goes on as {new[:8]}, but its bookkeeping could not be moved there"
+    try:   # the link first, before anything else can fail: from here on nothing drives the old id
+        store_clear_link(sid, new, comp["done_at"] or comp["sent_at"])
+    except Exception as e:   # noqa: BLE001 - cleared, the old id not refused yet: an error
+        raise failstop.Failed(unmoved, f"{type(e).__name__}: {str(e)[:300]}; " + follow_by_hand(sid, new),
+                              rec) from None
     try:   # review note (turn race): input after the last hand-off check, before the /clear
         lost = inputs_since(path, save["saved_at"])
     except Exception as e:   # noqa: BLE001 - the old transcript unreadable: an error (D-235)
         raise failstop.Failed("the old transcript could not be checked for input before the /clear",
-                              f"{type(e).__name__}: {e}"[:300], rec) from None
+                              f"{type(e).__name__}: {e}"[:300] + "; " + follow_by_hand(sid, new), rec) from None
     if lost:
         rec["lost_before_clear"] = [[t.isoformat(), w] for t, w in lost]
         log(f"compaction: {lost_text(sid, path, lost)}")
     if before_follow is not None:
         try:
-            before_follow(comp["new_session"])
+            before_follow(new)
         except failstop.Failed as e:
-            raise failstop.Failed(e.why, e.detail, rec) from None
+            raise failstop.Failed(e.why, f"{e.detail}; {follow_by_hand(sid, new)}", rec) from None
     try:
-        follow_clear(sid, comp["new_session"], comp["done_at"] or comp["sent_at"])
+        move_cleared(sid, new)
     except Exception as e:   # noqa: BLE001 - the session is cleared, its bookkeeping not moved: an error
         # not rolled back: the link (written first) already refuses the old id, the DB still names it
-        raise failstop.Failed(f"{sid[:8]} was cleared and goes on as {comp['new_session'][:8]}, but its "
-                              "bookkeeping could not be moved there",
-                              f"{type(e).__name__}: {str(e)[:300]}; " + follow_by_hand(sid, comp["new_session"]),
+        raise failstop.Failed(unmoved, f"{type(e).__name__}: {str(e)[:300]}; " + follow_by_hand(sid, new),
                               rec) from None
     try:
         insert, h = compact_resume_text(sid, save, trigger, progress, comp)

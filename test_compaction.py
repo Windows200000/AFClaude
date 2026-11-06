@@ -838,26 +838,100 @@ class CompactionFailures(Env):
         self.assertIn(f"its /clear landed late, pid {PID} goes on as {NEW[:8]}", self.alerts[0])
         self.assertEqual(ka.load_state()["compactions"][d.key]["late_clear"]["session"], NEW)
         self.assertEqual(store_driven(SID), SID)                           # the bookkeeping was not moved
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))         # fix round S-C: the link is stored
         ka.compaction_plan(SID, datetime.now(UTC), Armed())
         self.assertEqual(len(self.alerts), 1, self.alerts)                 # alerted once
 
+    def test_a_start_after_the_lock_sees_a_late_clear(self):
+        """Fix round S-C: a start (a run-now: the pause doesn't hold it) that waited for a flow whose
+        /clear timed out and landed since does not fire its earlier plan into the old id."""
+        self.clears = False
+        ka.CLEAR_TIMEOUT = timedelta(0)
+        self.compact()
+        self.clears = True
+        self.fake_fire(SID, "/w", "/clear", "send-keys", driver="auto", prompt="clear")   # it lands late
+        st = {"handled": {}}
+        with mock.patch.object(ka, "_fire_start") as fs, mock.patch.object(ka, "abort_start") as ab:
+            self.assertEqual(ka._start_session(SID, (True, [], "send-keys"), {"uuid": "k", "run_now": True}, "r",
+                                               st, None, "k", "n"), "failed")
+        fs.assert_not_called()
+        self.assertIn("landed late", ab.call_args.args[5])
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+
+    def test_follow_clear_by_hand_checks_first(self):
+        """Fix round S-D: --follow-clear writes nothing unless OLD has a driven row and NEW's
+        transcript starts with a /clear entry."""
+        self.clears = False
+        ka.CLEAR_TIMEOUT = timedelta(0)
+        self.compact()                                                     # timed out: no link, no new id yet
+        other = "00000000-0000-4000-8000-000000000000"
+        with open(os.path.join(os.path.dirname(self.path), other + ".jsonl"), "w") as fh:
+            fh.write(json.dumps({"type": "user", "timestamp": datetime.now(UTC).isoformat(),
+                                 "message": {"role": "user", "content": "hello"}}) + "\n")
+        with self.assertRaisesRegex(SystemExit, "no /clear entry"):
+            ka.follow_clear_cli(SID, other)
+        with self.assertRaisesRegex(SystemExit, "no transcript"):
+            ka.follow_clear_cli(SID, "11111111-1111-4111-8111-111111111111")
+        with self.assertRaisesRegex(SystemExit, "no driven row"):
+            ka.follow_clear_cli("22222222-2222-4222-8222-222222222222", other)
+        self.assertEqual(ka.load_state().get("cleared") or {}, {})          # nothing written
+        self.clears = True
+        self.fake_fire(SID, "/w", "/clear", "send-keys", driver="auto", prompt="clear")   # it lands late
+        ka.follow_clear_cli(SID, NEW)
+        self.assertEqual(store_driven(NEW), NEW)
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+
     def test_the_new_ids_lock_comes_before_the_db_move(self):
         """Review S1 (D-262): the new id's send lock is taken, and recorded as the flow's, before
-        follow_clear moves the bookkeeping (no owner message typed in before the hand-off)."""
-        order, lock, follow = [], ka.session_lock, ka.follow_clear
+        move_cleared moves the bookkeeping (no owner message typed in before the hand-off); the link
+        comes before both (fix round S-B)."""
+        order, lock, link, move = [], ka.session_lock, ka.store_clear_link, ka.move_cleared
 
         def locked(sid, *a):
             order.append(("lock", sid))
             return lock(sid, *a)
 
-        def followed(old, new, at):
+        def linked(old, new, at):
+            order.append(("link", new))
+            return link(old, new, at)
+
+        def moved(old, new):
             rec = [v for v in ka.load_state()["compactions"].values() if v.get("status") == "running"]
             order.append(("follow", new, rec[-1].get("new_session")))
-            return follow(old, new, at)
-        with mock.patch.object(ka, "session_lock", locked), mock.patch.object(ka, "follow_clear", followed):
+            return move(old, new)
+        with mock.patch.object(ka, "session_lock", locked), mock.patch.object(ka, "move_cleared", moved), \
+                mock.patch.object(ka, "store_clear_link", linked):
             d, rec = self.compact()
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
-        self.assertEqual(order[-2:], [("lock", NEW), ("follow", NEW, NEW)])
+        self.assertEqual(order[-3:], [("link", NEW), ("lock", NEW), ("follow", NEW, NEW)])
+
+    def test_a_failure_between_the_clear_and_the_move(self):
+        """Fix round S-B: the transcript check or the new id's lock failing after the /clear leaves
+        the link (the old id is refused) and the alert names the manual fix."""
+        bodies = []
+        ka.alert = lambda subject, body="": (self.alerts.append(subject), bodies.append(body))
+        since = ka.inputs_since
+
+        def check(path, at):   # the check after the /clear (the link is stored by then) fails
+            if (ka.load_state().get("cleared") or {}).get(SID):
+                raise OSError("unreadable")
+            return since(path, at)
+        with mock.patch.object(ka, "inputs_since", check):
+            d, rec = self.compact()
+        self.assert_failed(rec, "could not be checked for input before the /clear", [SAVE, "/clear"])
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+        self.assertIn(f"python3 keepalive.py --follow-clear {SID} {NEW}", "\n".join(bodies))
+        self.assertEqual(store_driven(SID), SID)                           # nothing moved
+
+    def test_the_new_ids_lock_held(self):
+        """Fix round S-B: the new id's send lock held after the /clear: refused old id, the manual fix named."""
+        bodies, lock = [], ka.session_lock
+        ka.alert = lambda subject, body="": (self.alerts.append(subject), bodies.append(body))
+        with mock.patch.object(ka, "session_lock", lambda sid, *a: None if sid == NEW else lock(sid, *a)):
+            d, rec = self.compact()
+        self.assert_failed(rec, f"the send lock of the new session {NEW[:8]} is held", [SAVE, "/clear"])
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+        self.assertIn(f"python3 keepalive.py --follow-clear {SID} {NEW}", "\n".join(bodies))
 
     def test_not_exactly_one_process(self):
         """D-328: no process (or two) holding the session: nothing typed after the save, an error."""
@@ -1863,6 +1937,18 @@ class ResetText(unittest.TestCase):
 
 
 class SessionChain(unittest.TestCase):
+    def test_links_are_never_pruned(self):
+        """Fix round S-A: a long chain stays whole (the MCP server keeps the first id)."""
+        st = {}
+        ids = [f"s{i:03d}" for i in range(80)]
+        with mock.patch.object(ka, "load_state", return_value=st), mock.patch.object(ka, "save_state", return_value=True):
+            for a, b in zip(ids, ids[1:]):
+                ka.store_clear_link(a, b, f"2026-11-0{1 + int(a[1:]) // 20}T00:00:{int(a[1:]) % 60:02d}Z")
+        self.assertEqual(len(st["cleared"]), 79)
+        self.assertEqual(ka.current_session(ids[0], st), ids[-1])
+        self.assertEqual(ka.session_chain(ids[-1], st), ids[::-1])
+        self.assertIn("was cleared into s079", ka.cleared_refusal(ids[0], st))
+
     def test_chain_and_successors(self):
         st = {"cleared": {"a": {"to": "b"}, "b": {"to": "c"}, "x": {"to": "x"}}}
         self.assertEqual(ka.session_chain("c", st), ["c", "b", "a"])
@@ -1904,6 +1990,15 @@ class SessionChain(unittest.TestCase):
                 mock.patch.object(ka, "_fire_start") as fs:
             self.assertEqual(ka._start_session("old", (True, [], "send-keys"), stall, "r", st, None, "k", "n"), "paused")
         fs.assert_not_called()
+        # a run-now fires although automation is paused (D-282), after the lock as before it
+        with mock.patch.object(ka, "session_lock", return_value="L"), mock.patch.object(ka, "release_lock"), \
+                mock.patch.object(ka, "load_state", return_value={}), \
+                mock.patch.object(ka, "automation_paused", return_value=True) as paused, \
+                mock.patch.object(ka, "_fire_start", return_value=None) as fs:
+            self.assertIsNone(ka._start_session("old", (True, [], "send-keys"), dict(stall, run_now=True), "r", st,
+                                                None, "k", "n"))
+        paused.assert_not_called()
+        self.assertEqual(fs.call_args.args[0], "old")
 
 
 if __name__ == "__main__":
