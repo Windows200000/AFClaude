@@ -1302,11 +1302,16 @@ class SessionCleared(Base):
     def test_it_moves_the_session_row_the_project_and_the_inbox(self):
         pending, noted, delivered, dismissed = (self.post("a"), self.post("b", "noted"), self.post("c", "delivered"),
                                                 self.post("d", "dismissed"))
+        store.upsert_driven_session(self.conn, SID, holder_kind="rc", rc_url="https://rc.example/x",
+                                    last_seen="2026-11-05T10:00:00.000Z")
+        self.conn.commit()
         r = self.do("session.cleared", actor="keepalive", via="runner", old_session=SID, new_session=self.NEW)
         old, new = store.get_driven_session(self.conn, SID), store.get_driven_session(self.conn, self.NEW)
         self.assertIsNotNone(old["ended_at"])
         self.assertEqual((new["kind"], new["tmux"], new["ended_at"]), ("task-manager", "afc-mgr", None))
         self.assertEqual(new["project_id"], store.get_project(self.conn, "P")["id"])
+        self.assertEqual((new["holder_kind"], new["rc_url"], new["last_seen"]),     # review note: copied too
+                         ("rc", "https://rc.example/x", "2026-11-05T10:00:00.000Z"))
         self.assertEqual(store.get_project(self.conn, "P")["manager_session"], self.NEW)
         status = {m: (self.conn.execute("SELECT session_id, status FROM inbox_messages WHERE id=?", (m,)).fetchone())
                   for m in (pending, noted, delivered, dismissed)}

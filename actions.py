@@ -1705,6 +1705,8 @@ def current_session(conn: sqlite3.Connection, sid: str) -> str:
 
 
 CLEARED_INBOX = ("pending", "noted", "delivered")   # still on their way to (or answered by) the session
+# the driven row's fields the new id takes over (the same process, tmux session and holder; started_at is the /clear's)
+CLEARED_COPY = ("kind", "tmux", "project_id", "task_id", "holder_kind", "rc_url", "last_seen")
 
 
 @action("session.cleared", "driven_session")
@@ -1712,7 +1714,7 @@ def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_se
     """D-328: the keep-alive cleared a driven session after its hand-off (`/clear`), and Claude Code
     went on in the same process under a new session id: everything that names the session moves
     to the new one in one transaction. The old row ends, a new live row takes its kind, tmux name,
-    project and task; the project whose task-manager it was points at the new id; the inbox
+    project, task, holder, Remote Control link and last-seen time (CLEARED_COPY); the project whose task-manager it was points at the new id; the inbox
     messages still on their way to it (CLEARED_INBOX) go to the new one. The old row must be a
     live driven row and the new id unknown (else ValueError: nothing moves). The keep-alive's step;
     not for MCP callers."""
@@ -1728,8 +1730,8 @@ def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_se
         raise ValueError(f"{new} has a driven row already: not a fresh session after a /clear")
     now = store.now_iso()
     store.upsert_driven_session(conn, old, ended_at=now)
-    after = store.upsert_driven_session(conn, new, **{k: before[k] for k in ("kind", "tmux", "project_id", "task_id")
-                                                      if before.get(k) is not None}, started_at=now)
+    after = store.upsert_driven_session(conn, new, **{k: before[k] for k in CLEARED_COPY if before.get(k) is not None},
+                                        started_at=now)
     projects = [str(r[0]) for r in conn.execute("SELECT name FROM projects WHERE manager_session=?", (old,))]
     for name in projects:
         store.update_project(conn, name, manager_session=new)
