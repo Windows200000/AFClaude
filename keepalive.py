@@ -2437,7 +2437,8 @@ def _start_session(sid, pre, stall, reason, st, args, key, night):
             release_lock(lock)
             lock = None
             return _start_session(cur, None, stall, reason, st, args, key, night)
-        if automation_paused(f"{sid[:8]} ({reason}, after the compaction lock)", sid):
+        # (run-now runs while automation is paused, D-282: it never checked the pause before the lock either)
+        if not stall.get("run_now") and automation_paused(f"{sid[:8]} ({reason}, after the compaction lock)", sid):
             return "paused"
         if stall.get("owner_check") and plan == "send-keys":   # D-259: never type into the owner's typing
             why = owner_typing(sid, datetime.now(UTC))           # (a failed tmux read raises: aborted)
