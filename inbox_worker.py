@@ -296,7 +296,7 @@ def manager_active(sid: str, now: datetime) -> str | None:
         return None
     sc = compact_timing.scan_cached(path)
     since = flow[1] if flow else None
-    busy = ka.compaction_busy_reason(path, now)
+    busy = ka.compaction_busy_reason(path, now, sid=sid, st=st)   # the chain's subagents too (D-328)
     if busy and (since is None or any(p.ts > since for p in sc.prompts)):
         return busy
     if since is None:

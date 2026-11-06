@@ -1360,10 +1360,7 @@ def run_active(session_id, now, st=None):
     path = transcript_path(session_id)
     if not path or stall_info(last_message(path)):
         return None
-    # the subagents of the ids this one was cleared from too: a worker started before a mid-run /clear
-    # goes on writing there (D-328)
-    files = [path] + [f for p in [path] + [transcript_path(s) for s in chain[1:]] if p
-                      for f in glob.glob(os.path.join(p[:-len(".jsonl")], "subagents", "*.jsonl"))]
+    files = [path] + chain_subagent_files(path, chain)
     try:
         last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
     except ValueError:
@@ -3407,6 +3404,14 @@ def follow_clear(old, new, at):
     return res
 
 
+def chain_subagent_files(path, chain):
+    """The subagent transcripts of the session at `path` and of the ids it was cleared from (`chain`
+    = session_chain, newest first; chain[0] is the session itself): a worker started before a /clear
+    goes on writing under the old id's directory (D-328)."""
+    paths = [path] + [transcript_path(s) for s in chain[1:]]
+    return [f for p in paths if p for f in glob.glob(os.path.join(p[:-len(".jsonl")], "subagents", "*.jsonl"))]
+
+
 def session_chain(sid, st=None):
     """The session and the ones it was cleared from, newest first (the keepalive state's "cleared"
     links, follow_clear): a run fired into an earlier id goes on in this one."""
@@ -3985,15 +3990,16 @@ def owner_typing(sid, now):
     return None
 
 
-def compaction_busy_reason(path, now, subagents=True):
+def compaction_busy_reason(path, now, subagents=True, sid=None, st=None):
     """Why the session can't take the save prompt now (a turn running, a subagent working), or None.
     subagents=False: only a running turn counts (D-307: a mid-run compaction goes on while background
-    subagents work; they survive the compaction, the hand-off lists them as in flight)."""
+    subagents work; they survive the compaction, the hand-off lists them as in flight). sid: the
+    session, so the subagents of the ids it was cleared from count too (review S5, D-328)."""
     if not session_idle(path, now):
         return "a turn is running"
     if not subagents:
         return None
-    subs = glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
+    subs = chain_subagent_files(path, session_chain(sid, st) if sid else [None])
     newest = max((os.path.getmtime(f) for f in subs if os.path.exists(f)), default=None)
     if newest is not None and now - datetime.fromtimestamp(newest, UTC) < SUBAGENT_QUIET:
         return "a subagent is working"
@@ -4148,7 +4154,7 @@ def compaction_plan(sid, now, args):
     using = run_active(sid, now, st) is not None
     mid = ct.mid_run_hold(sc, now, threshold) if using and state["above"] else ct.MID_RUN_UNCHECKED
     d = ct.decide(now, state, run_using=using, run_ended=not using and run_ended(sid, sc, st, now),
-                  busy=compaction_busy_reason(path, now, subagents=not using), mid_run_hold=mid)
+                  busy=compaction_busy_reason(path, now, subagents=not using, sid=sid, st=st), mid_run_hold=mid)
     if d.key and (d.key in (st.get("compactions") or {}) or d.key in _COMPACT_TRIED):
         return d, None
     if d.due:

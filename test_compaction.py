@@ -1005,6 +1005,10 @@ class MidRunWithSubagents(Env):
         old = os.path.join(self.proj, f"{SID}.jsonl")   # the subagent writes under the id it started in
         self.assertEqual(ka.compaction_busy_reason(old, datetime.now(UTC)), "a subagent is working")
         self.assertIsNone(ka.compaction_busy_reason(old, datetime.now(UTC), subagents=False))
+        # review S5: the new id's checks see it through the /clear chain
+        new = ka.transcript_path(NEW)
+        self.assertIsNone(ka.compaction_busy_reason(new, datetime.now(UTC)))
+        self.assertEqual(ka.compaction_busy_reason(new, datetime.now(UTC), sid=NEW), "a subagent is working")
 
     def test_the_save_prompt_asks_for_the_subagents_in_flight(self):
         text = ka.save_text(SID, "mid-run")

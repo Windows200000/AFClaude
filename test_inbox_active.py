@@ -107,6 +107,19 @@ class Active(tc.Env):
                     tc.assistant(self.now - timedelta(minutes=30), stop="tool_use", ctx=200_000)])
         self.assertEqual(iw.manager_active(SID, datetime.now(UTC)), "a turn is running")
 
+    def test_active_because_a_subagent_of_a_pre_clear_id_works(self):
+        # review S5 (D-328): a worker started before a /clear writes under the old id's directory
+        old = "0ld00000-0000-4000-8000-000000000001"
+        self.write([tc.owner(self.now - timedelta(minutes=40)), tc.assistant(self.now - timedelta(minutes=30))])
+        self.make_old()
+        sub = os.path.join(self.proj, old, "subagents")
+        os.makedirs(sub)
+        open(os.path.join(self.proj, f"{old}.jsonl"), "w").close()
+        open(os.path.join(sub, "agent-a1.jsonl"), "w").close()
+        self.assertIsNone(iw.manager_active(SID, datetime.now(UTC)))
+        ka.save_state({"handled": {}, "fires": {}, "cleared": {old: {"to": SID, "at": self.now.isoformat()}}})
+        self.assertEqual(iw.manager_active(SID, datetime.now(UTC)), "a subagent is working")
+
     def test_a_delivery_check_still_holds_an_untriaged_message(self):
         """No triage is no shortcut past the delivery's checks: the owner typing holds it."""
         self.run_going()
