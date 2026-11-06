@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Live end-to-end test of the compaction step (D-144/D-214, design §5.5; owner D-216) with the
-# hand-off saved directly before it (D-232/D-233): on a THROWAWAY Claude session, does the
-# keep-alive's own code get a fresh hand-off written, compact the session in place, and continue it
-# with that hand-off (not a stale one), and does the session read it?
+# Live end-to-end test of the reset step (D-328: hand-off + /clear instead of /compact; D-232/D-233
+# for the save before it): on a THROWAWAY Claude session, does the keep-alive's own code get a fresh
+# hand-off written, /clear the session, follow it to its new session id (one session.cleared
+# transaction, the "cleared" link in the keepalive state) and continue the new session with that
+# hand-off (not a stale one), and does the session, which now knows nothing else, read it?
+# (Named test_compact_live for history; it is not run by the suites: it drives a live claude.)
 #
 #   bash tools/test_compact_live.sh        (from the repo root; allowed by .claude/settings.json)
 #
@@ -13,7 +15,7 @@
 #      AFCLAUDE_DATA_DIR / DISPATCHER_DATA_DIR / KEEPALIVE_PROGRESS_FILE into it (like testenv.py),
 #      for this script's python and for the throwaway session (so its `tasks.py handoff write`
 #      lands in the temp DB);
-#   1. starts `claude --model haiku --session-id <new uuid> --permission-mode dontAsk` with cwd =
+#   1. gives the session a driven_sessions row in the temp DB (follow_clear moves it), then starts `claude --model haiku --session-id <new uuid> --permission-mode dontAsk` with cwd =
 #      the repo's data/ dir (must exist and be trusted already; nothing is created or trusted here),
 #      in the clean env ka_resume.sh uses, with no MCP servers (--strict-mcp-config: the afclaude
 #      MCP server would write the live DB), Edit/Write denied, and only
@@ -21,24 +23,27 @@
 #   2. sends two short prompts (a codeword task: remember the codeword, skip the commit/PROGRESS
 #      steps of a later save prompt, put the codeword into the hand-off) and waits for each reply
 #      in the transcript (~/.claude/projects/<encoded cwd>/<uuid>.jsonl);
-#   3. runs handle_fire's compaction step with the keep-alive's own code, in one python process:
+#   3. runs handle_fire's reset step with the keep-alive's own code, in one python process:
 #      keepalive.compact_with_handoff() (save prompt, wait for a NEW handoffs row of the session,
-#      SAVE_TIMEOUT; /compact, wait for the marker, COMPACT_TIMEOUT; the fresh hand-off's text; any
-#      failure raises, as it aborts a real start, D-234), then the continue message (that text + a
-#      one-line test question instead of the run's continue prompt) and
-#      keepalive.consume_handoff(). Only keepalive.fire is replaced: it types into
+#      SAVE_TIMEOUT; /clear, wait for the process's registry entry to name a new session whose new
+#      transcript starts with the /clear entry, CLEAR_TIMEOUT; follow_clear: the DB rows and the
+#      state link; the fresh hand-off's text; any failure raises, as it aborts a real start, D-234),
+#      then the continue message into the NEW session (that text + a one-line test question
+#      instead of the run's continue prompt) and keepalive.consume_handoff(). Only keepalive.fire is replaced: it types into
 #      `afc-compacttest` the keep-alive's way (tmux send-keys -l, 1 s, Enter; ka_resume.sh would
 #      target the row's afc- name) and saves pane captures; keepalive.log / progress_note / alert only print.
 #      No fire or run record is made, no real session is involved;
-#   4. checks: a new handoffs row of THIS session in the temp DB; the compaction marker and
-#      keepalive.compacted_since(); the continue text is the fresh template (compact_resume.md)
-#      with that row; the session's reply to it names the
-#      codeword and says FRESH (it read the inserted text); same transcript; the row consumed; the
-#      live DB has no row of this session;
+#   4. checks: a new handoffs row of THIS session in the temp DB; a new session id with a
+#      transcript starting with the /clear entry (keepalive.clear_marker), the old driven row ended
+#      and a live one for the new id, the "cleared" link old -> new in the state; the continue text
+#      is the fresh template (compact_resume.md) with that row; the new session's reply to it names
+#      the codeword (it knows nothing else) and says FRESH (it read the inserted text); the old
+#      transcript is untouched; the row consumed; the live DB has no row of this session;
 #   5. saves pane captures and the step result to run/test_compact_live-<time>.pane.txt, kills the
 #      tmux session, deletes the temp dir, prints a PASS/FAIL summary per step with durations;
 #      exit 0 = PASS, 1 = FAIL, 2 = could not run.
-# Costs a few Haiku turns; up to ~40 min worst case (5 + 10 min save, 5 + 10 min compaction).
+# Costs a few Haiku turns; up to ~25 min worst case (5 + 10 min save, 2 min /clear).
+# The keepalive state (where follow_clear stores the "cleared" link) lives in the DB (D-161): the temp one.
 # Needs tmux, claude and python3 on PATH.
 set -uo pipefail
 
@@ -92,8 +97,21 @@ if os.path.realpath(store.DB_PATH) != db or db == os.path.realpath(sys.argv[1]):
     sys.exit(f"store.DB_PATH is {store.DB_PATH}, not the temp DB")
 store.connect(db, create=True).close()
 PY
-transcript() {
-  py "$SID" <<'PY'
+py "$SID" "$T" <<'PY' || die "could not create the driven row in the temp DB"
+import sys
+import actions
+import store
+# follow_clear's session.cleared needs a live driven row of the old session (the live system has one
+# for every session the keep-alive drives); `review` needs no project
+conn = store.connect()
+try:
+    actions.perform(conn, "driven.set", {"session_id": sys.argv[1], "kind": "review", "tmux": sys.argv[2]},
+                    actor="keepalive", via="runner")
+finally:
+    conn.close()
+PY
+transcript() {   # transcript [session id]: the transcript path(s) of the session (default: the throwaway's first id)
+  py "${1:-$SID}" <<'PY'
 import glob, os, sys
 import keepalive as ka
 hits = glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sys.argv[1] + ".jsonl"))
@@ -131,11 +149,11 @@ send() {   # the keep-alive's way (ka_resume.sh): literal text, 1 s, Enter
   tmux send-keys -t "$T" Enter
 }
 capture() { { echo "===== $1 ($(now))"; tmux capture-pane -p -t "$T" 2>/dev/null; echo; } >>"$PANE"; }
-wait_reply() {   # wait_reply <iso time> -> sets REPLY, PATH_T
+wait_reply() {   # wait_reply <iso time> [session id] -> sets REPLY, PATH_T
   local since="$1" t0=$SECONDS
   REPLY=""
   while [ $((SECONDS - t0)) -lt $REPLY_TIMEOUT ]; do
-    PATH_T="$(transcript | head -1)"
+    PATH_T="$(transcript "${2:-}" | head -1)"
     if [ -n "$PATH_T" ]; then
       REPLY="$(reply_after "$PATH_T" "$since")"
       [ -n "$REPLY" ] && return 0
@@ -202,10 +220,10 @@ wait_reply "$S2" && R2="$REPLY" || { R2="(no reply)"; FAILS+=("no reply to promp
 RES[prompts]=$([ -n "$R1" ] && [ "$R1" != "(no reply)" ] && [ "$R2" != "(no reply)" ] && echo PASS || echo FAIL)
 DUR[prompts]=$((SECONDS - T_START))
 
-# ---- 3. handle_fire's compaction step with the keep-alive's own functions (fire -> this tmux session)
-capture "before the keep-alive's compaction step"
+# ---- 3. handle_fire's reset step with the keep-alive's own functions (fire -> this tmux session)
+capture "before the keep-alive's reset step"
 TS=$SECONDS
-echo "running keepalive.compact_with_handoff (save -> /compact -> the fresh hand-off) -> continue (up to ~40 min)"
+echo "running keepalive.compact_with_handoff (save -> /clear -> follow -> the fresh hand-off) -> continue (up to ~25 min)"
 py "$SID" "$CWD" "$P1" "$T" "$PANE" "$STEP" "$LIVE_DB" <<'PY'
 import json, os, subprocess, sys, time
 from datetime import datetime, timezone
@@ -238,9 +256,10 @@ def capture(label):
 sends = []
 
 
-def fire(session_id, cwd_, message, plan, new=False, name=None, model=None):
-    """keepalive.fire for the throwaway session: ka_resume.sh's send-keys branch, into tmux `tname`."""
-    if session_id != sid or plan != "send-keys" or new:
+def fire(session_id, cwd_, message, plan, new=False, name=None, model=None, **kw):
+    """keepalive.fire for the throwaway session: ka_resume.sh's send-keys branch, into tmux `tname`
+    (the session goes on under a new id after /clear: the same tmux session, so either id)."""
+    if session_id not in (sid, res.get("new_session")) or plan != "send-keys" or new:
         return 1, "", f"test fire: unexpected call ({session_id[:8]}, {plan}, new={new})"
     what = " ".join(message.split())[:40]
     capture(f"before typing {what!r}")
@@ -267,7 +286,7 @@ def flat(s):
 res = {"templates": {"compact_resume": flat(ka.load_prompt("compact_resume")).split("{")[0]}}
 try:
     res["before_id"] = ka.newest_handoff_id(sid)
-    # -- handle_fire's compaction step (keepalive.py): exactly keepalive.compact_with_handoff, minus
+    # -- handle_fire's reset step (keepalive.py): exactly keepalive.compact_with_handoff, minus
     #    the fire/run record; any failure raises failstop.Failed (D-234), as it aborts a real start
     import failstop
     t0 = datetime.now(UTC)
@@ -281,26 +300,31 @@ try:
     t1 = datetime.now(UTC)
     save = rec.get("save") or {}
     res["save"] = save
-    sent = ka.parse_ts(rec.get("sent_at")) if rec.get("sent_at") else None   # /compact typed
+    sent = ka.parse_ts(rec.get("sent_at")) if rec.get("sent_at") else None   # /clear typed
+    new = rec.get("new_session")
+    res["new_session"] = new
+    res["new_path"] = rec.get("new_path")
     res["save_s"] = round(((sent or t1) - t0).total_seconds())
     res["compact_s"] = round((t1 - sent).total_seconds()) if sent else 0
     res["comp"] = {k: v for k, v in rec.items() if k != "save"}
     res["comp"].setdefault("status", "not reached")
     conn = store.connect()
     try:
+        res["driven"] = {k: (store.get_driven_session(conn, k) or {}) for k in filter(None, (sid, new))}
         res["rows"] = [{"id": h["id"], "session_id": h["session_id"], "created_at": h["created_at"],
                         "summary": (h.get("body") or {}).get("summary")}
                        for h in store.list_handoffs(conn, sid, limit=5)]
     finally:
         conn.close()
+    res["link"] = (ka.load_state().get("cleared") or {}).get(sid)
     res["insert"] = flat(insert)
     res["handoff_id"] = handoff["id"] if handoff else None
     if insert:
         msg = flat(insert + " [compaction live test] Do not use any tool for this reply. Answer in one line: "
                    "the codeword from the hand-off above, then FRESH if that hand-off was introduced as the one "
-                   "you saved before the compaction, or STALE if it was labelled stale.")
+                   "you saved right before the /clear, or STALE if it was labelled stale.")
         sent_at = datetime.now(UTC)
-        rc, o, err = ka.fire(sid, cwd, msg, "send-keys", driver="auto", prompt="compact_live_test")
+        rc, o, err = ka.fire(new, cwd, msg, "send-keys", driver="auto", prompt="compact_live_test")   # the NEW session
         res["continue_sent_at"] = sent_at.isoformat().replace("+00:00", "Z")
         res["continue_rc"] = rc
         if handoff and rc == 0:
@@ -340,29 +364,15 @@ fi
 grep -qF "$CODE" <<<"$ROW_SUM" || NOTES+=("the hand-off summary does not hold the codeword")
 DUR[save]="$(field 'r.get("save_s")')"
 
-# ---- 4b. the compaction: keepalive.compact_session's status, the marker, compacted_since()
+# ---- 4b. the reset: clear_session's status, the new session and its /clear entry, the DB rows and the link
 COMP_ST="$(field 'r["comp"]["status"]')"
 SC="$(field 'r["comp"].get("sent_at")')"
 DONE_AT="$(field 'r["comp"].get("done_at")')"
+NEW_SID="$(field 'r.get("new_session")')"
+NEW_PATH="$(field 'r.get("new_path")')"
 CS="NOT checked"
-MARKS="none"
-if [ -n "$SC" ]; then
-  CS="$(cd "$REPO" && python3 -c "import sys, keepalive as ka; e = ka.compacted_since(sys.argv[1], ka.parse_ts(sys.argv[2])); print('found' if e else 'NOT found')" "$P1" "$SC")"
-  MARKS="$(py "$P1" "$SC" <<'PY'
-import sys
-import keepalive as ka
-since = ka.parse_ts(sys.argv[2])
-seen = set()
-for e in ka.iter_entries(sys.argv[1]):
-    ts = ka.parse_ts(e.get("timestamp")) if e.get("timestamp") else None
-    if ts and ts >= since:
-        if e.get("type") == "system" and e.get("subtype") == "compact_boundary":
-            seen.add("compact_boundary")
-        if e.get("isCompactSummary"):
-            seen.add("isCompactSummary")
-print(", ".join(sorted(seen)) or "none")
-PY
-)"
+if [ -n "$SC" ] && [ -n "$NEW_PATH" ]; then
+  CS="$(cd "$REPO" && python3 -c "import sys, keepalive as ka; e = ka.clear_marker(sys.argv[1], ka.parse_ts(sys.argv[2])); print('found' if e else 'NOT found')" "$NEW_PATH" "$SC")"
 fi
 LAT="$(python3 -c "
 import sys
@@ -370,8 +380,19 @@ from datetime import datetime
 a, b = sys.argv[1], sys.argv[2]
 p = lambda s: datetime.fromisoformat(s.replace('Z', '+00:00'))
 print(round((p(b) - p(a)).total_seconds()) if a and b else '')" "$SC" "$DONE_AT" 2>/dev/null)"
-if [ "$COMP_ST" = compacted ] && [ "$CS" = found ]; then RES[compact]=PASS
-else RES[compact]=FAIL; FAILS+=("compaction: status $COMP_ST, compacted_since() $CS"); fi
+OLD_ENDED="$(py "$STEP" "$SID" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+d = r.get("driven") or {}
+old, new = d.get(sys.argv[2]) or {}, d.get(r.get("new_session") or "") or {}
+link = r.get("link") or {}
+ok = bool(old.get("ended_at")) and bool(new) and not new.get("ended_at") and new.get("tmux") == old.get("tmux") \
+    and link.get("to") == r.get("new_session")
+print("yes" if ok else f"NO (old {old.get('ended_at')}, new {new.get('tmux')}/{new.get('ended_at')}, link {link})")
+PY
+)"
+if [ "$COMP_ST" = cleared ] && [ "$CS" = found ] && [ -n "$NEW_SID" ] && [ "$NEW_SID" != "$SID" ] && [ "$OLD_ENDED" = yes ]; then RES[compact]=PASS
+else RES[compact]=FAIL; FAILS+=("reset: status $COMP_ST, /clear entry $CS, new session ${NEW_SID:-none}, driven rows + link: $OLD_ENDED"); fi
 DUR[compact]="$(field 'r.get("compact_s")')"
 
 # ---- 4c. the continue text: the fresh template with that row
@@ -385,11 +406,11 @@ else
 fi
 grep -qF "$CODE" <<<"$INSERT" || NOTES+=("the continue text does not hold the codeword")
 
-# ---- 4d. the session's reply to the continue: it read the inserted hand-off
+# ---- 4d. the NEW session's reply to the continue: it read the inserted hand-off (it knows nothing else)
 CSENT="$(field 'r.get("continue_sent_at")')"
 TR=$SECONDS
 if [ -n "$CSENT" ] && [ "$(field 'r.get("continue_rc")')" = 0 ]; then
-  wait_reply "$CSENT" && R3="$REPLY" || R3="(no reply)"
+  wait_reply "$CSENT" "$NEW_SID" && R3="$REPLY" || R3="(no reply)"
 else
   R3="(no continue sent)"
 fi
@@ -397,10 +418,22 @@ DUR[reply]=$((SECONDS - TR))
 capture "after the reply to the continue"
 if grep -qF "$CODE" <<<"$R3" && grep -qw FRESH <<<"$R3" && ! grep -qw STALE <<<"$R3"; then RES[reply]=PASS
 else RES[reply]=FAIL; FAILS+=("reply to the continue: $R3"); fi
-FILES="$(transcript)"
-NFILES="$(grep -c . <<<"$FILES")"
+# the reply is in the new transcript; the old one got nothing after the /clear
 SAME="yes"
-{ [ "$NFILES" = 1 ] && [ "${PATH_T:-}" = "$P1" ]; } || { SAME="NO ($NFILES files: $FILES)"; FAILS+=("transcript changed"); }
+{ [ -n "$NEW_PATH" ] && [ "${PATH_T:-}" = "$NEW_PATH" ] && [ "$NEW_PATH" != "$P1" ]; } || { SAME="NO (reply read from ${PATH_T:-none}, new transcript ${NEW_PATH:-none})"; FAILS+=("the reply is not in the new session's transcript"); }
+GREW="$(py "$P1" "${SC:-}" <<'PY'
+import sys
+from datetime import timedelta
+import keepalive as ka
+if not sys.argv[2]:
+    print("no")
+    sys.exit()
+limit = ka.parse_ts(sys.argv[2]) + timedelta(seconds=30)
+print("yes" if any((ka.parse_ts(e.get("timestamp")) or limit) > limit
+                   for e in ka.iter_entries(sys.argv[1]) if e.get("timestamp")) else "no")
+PY
+)"
+[ "$GREW" = no ] || { SAME="NO (the old transcript grew after the /clear)"; FAILS+=("the old transcript grew after the /clear"); }
 
 # ---- 4e. consumed in the temp DB; the live DB untouched for this session (read-only)
 CONS="$(field 'r.get("consumed")') $(field 'r.get("consumed_at")')"
@@ -422,15 +455,15 @@ else RES[livedb]=FAIL; FAILS+=("the LIVE DB has $LIVE_ROWS hand-off row(s) of th
 
 # ---- 5. summary (the EXIT trap kills the tmux session and deletes the temp dir)
 echo
-echo "================ compaction live test ($STAMP) ================"
+echo "================ /clear live test ($STAMP) ================"
 echo "session       $SID (haiku, dontAsk, cwd $CWD, temp DB)"
 echo "transcript    $P1"
 echo "[${RES[prompts]}] prompts      ${DUR[prompts]}s  1: $R1 | 2: $R2"
 echo "[${RES[save]}] save         ${DUR[save]}s  save step: $SAVE_ST, row #${SAVE_ID:-none} (newest before: #$BEFORE_ID), session ${ROW_SID:0:8}"
 echo "               summary: ${ROW_SUM:0:160}"
-echo "[${RES[compact]}] compaction   ${DUR[compact]}s  compaction: $COMP_ST; markers: $MARKS; Enter->marker ${LAT:-?}s; compacted_since(): $CS"
+echo "[${RES[compact]}] /clear       ${DUR[compact]}s  clear: $COMP_ST; new session ${NEW_SID:0:8}; Enter->new session ${LAT:-?}s; /clear entry: $CS; driven rows + link: $OLD_ENDED"
 echo "[${RES[continue]}] continue     template $KIND, hand-off #${INS_ID:-none}: ${INSERT:0:200}"
-echo "[${RES[reply]}] reply        ${DUR[reply]}s  $R3 (same transcript: $SAME)"
+echo "[${RES[reply]}] reply        ${DUR[reply]}s  $R3 (in the new transcript, old one quiet: $SAME)"
 echo "[${RES[consume]}] consumed     $CONS"
 echo "[${RES[livedb]}] live DB      hand-off rows of $SID: $LIVE_ROWS"
 echo "keep-alive step ${DUR[step]}s in all; pane log + step result: $PANE"

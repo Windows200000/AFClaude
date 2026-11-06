@@ -310,11 +310,11 @@ def tick_min_timeout(job: str) -> timedelta:
 # A start (last_stretch, deferred_start, fillup) re-plans and then fires as a session-window start does
 # (handle_fire): its inner timeouts are the window start's (window_start_inner, the ping included: the
 # safe side). The compaction re-runs its check (the compaction_check tick's calls), then waits for the
-# turn to end twice (before the save prompt and before /compact), for the hand-off, the compaction marker
-# and the reply to the hand-off, and types three times (the save prompt, /compact, the hand-off).
+# turn to end twice (before the save prompt and before /clear), for the hand-off, the new session after
+# /clear and the reply to the hand-off, and types three times (the save prompt, /clear, the hand-off).
 START_ACTS = ("last_stretch", "deferred_start", "fillup")
 COMPACTION_CONSTANTS: tuple[tuple[str, int], ...] = (("COMPACT_IDLE_WAIT", 2), ("SAVE_TIMEOUT", 1),
-                                                     ("COMPACT_TIMEOUT", 1), ("VERIFY_TIMEOUT", 1))
+                                                     ("CLEAR_TIMEOUT", 1), ("VERIFY_TIMEOUT", 1))
 COMPACTION_HOST_CALLS: tuple[tuple[str, int, int], ...] = (("fire", 120, 3),)
 
 

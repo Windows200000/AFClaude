@@ -107,6 +107,19 @@ class Active(tc.Env):
                     tc.assistant(self.now - timedelta(minutes=30), stop="tool_use", ctx=200_000)])
         self.assertEqual(iw.manager_active(SID, datetime.now(UTC)), "a turn is running")
 
+    def test_active_because_a_subagent_of_a_pre_clear_id_works(self):
+        # review S5 (D-328): a worker started before a /clear writes under the old id's directory
+        old = "0ld00000-0000-4000-8000-000000000001"
+        self.write([tc.owner(self.now - timedelta(minutes=40)), tc.assistant(self.now - timedelta(minutes=30))])
+        self.make_old()
+        sub = os.path.join(self.proj, old, "subagents")
+        os.makedirs(sub)
+        open(os.path.join(self.proj, f"{old}.jsonl"), "w").close()
+        open(os.path.join(sub, "agent-a1.jsonl"), "w").close()
+        self.assertIsNone(iw.manager_active(SID, datetime.now(UTC)))
+        ka.save_state({"handled": {}, "fires": {}, "cleared": {old: {"to": SID, "at": self.now.isoformat()}}})
+        self.assertEqual(iw.manager_active(SID, datetime.now(UTC)), "a subagent is working")
+
     def test_a_delivery_check_still_holds_an_untriaged_message(self):
         """No triage is no shortcut past the delivery's checks: the owner typing holds it."""
         self.run_going()
@@ -206,7 +219,7 @@ class LoginExpired(Active):
 
 
 class DuringAndAfterCompaction(Active):
-    """D-262: the compaction flow (save prompt, hand-off, /compact, compact_after, READY) is no
+    """D-262: the compaction flow (save prompt, hand-off, /clear, compact_after, READY) is no
     activity; a "now" verdict made during it waits for the READY."""
 
     def setUp(self):
@@ -246,7 +259,7 @@ class DuringAndAfterCompaction(Active):
 
         def at_compact():
             seen.append(("compact", self.process(), self.row(msgs[0])["hold"]))
-        self.during = {tc.SAVE: at_save, "/compact ": at_compact}
+        self.during = {tc.SAVE: at_save, "/clear": at_compact}
         d, rec = self.compact()
         self.assertEqual((d.due, rec["status"]), (True, "compacted"))
         self.assertEqual(self.haiku, [ka.POKE_ARGV])                            # triaged, not "active"
@@ -254,7 +267,7 @@ class DuringAndAfterCompaction(Active):
         self.assertEqual((r["verdict"], r["verdict_reason"]), ("now", "a question"))
         self.assertEqual(seen, [("save", {"now": 1, "held": 1}, iw.HOLD_LOCKED),
                                 ("compact", {"held": 1}, iw.HOLD_LOCKED)])     # never typed in mid-flow
-        self.assertEqual([m[:20] for _, m in self.sent], [tc.SAVE[:20], "/compact Keep what t", tc.AFTER[:20]])
+        self.assertEqual([m[:20] for _, m in self.sent], [tc.SAVE[:20], "/clear", tc.AFTER[:20]])
         # READY is in: the next pass delivers it, through the usual checks
         self.assertEqual(self.process(), {"delivered": 1})
         self.assertEqual(self.row(msgs[0])["status"], "delivered")
@@ -278,7 +291,7 @@ class DuringAndAfterCompaction(Active):
         t = datetime.now(UTC) + timedelta(seconds=2)
         self.write([tc.owner(t), old(t + timedelta(seconds=1), ctx=160_000)], "a")
         self.make_old()
-        self.assertIn("its last request was", iw.manager_active(SID, t + timedelta(minutes=1)))
+        self.assertIn("its last request was", iw.manager_active(tc.NEW, t + timedelta(minutes=1)))
 
     def test_activity_before_the_flow_no_longer_counts_after_it(self):
         """The run's last request 8 min ago, then a 4-minute flow: triaged (D-262: after the
@@ -316,6 +329,16 @@ class DuringAndAfterCompaction(Active):
         self.assertTrue(r["hold"].startswith(iw.HOLD_COMPACTING), r["hold"])
         self.assertEqual(self.haiku, [ka.POKE_ARGV])                            # triaged: the run is over
         self.assertEqual(self.sent, [])
+
+    def test_a_flow_of_an_earlier_id_in_the_chain_counts(self):
+        """Review S1 (D-328): a record of the id this session was cleared from (its flow ended or still
+        going) is this session's flow."""
+        now = datetime.now(UTC)
+        st = {"cleared": {"0ld": {"to": "mid"}, "mid": {"to": SID}},
+              "compactions": {"k": {"session": "0ld", "status": "compacted", "at": (now - timedelta(minutes=5)).isoformat(),
+                                    "done_at": (now - timedelta(minutes=4)).isoformat()}}}
+        self.assertEqual(iw.compaction_flow(SID, st, now), (now - timedelta(minutes=5), now - timedelta(minutes=4)))
+        self.assertIsNone(iw.compaction_flow("other", st, now))
 
     def test_a_stale_running_record_is_over_and_alerted_once(self):
         now = datetime.now(UTC)

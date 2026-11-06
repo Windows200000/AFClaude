@@ -448,6 +448,37 @@ class Update(unittest.TestCase):
                          ("stopped", M(30).isoformat(), M(121).isoformat(), True))
         self.assertEqual(limit_ratio.combine_spans([r], [], M(300)), [(F, M(121))])
 
+    def test_a_run_goes_on_in_the_session_a_clear_made(self):
+        """D-328: a mid-run /clear moves the task-manager to a new session id (state "cleared": old ->
+        new); the run's activity, work end and stop mark follow the chain. Without the link the new
+        session's stop and transcript are not the run's."""
+        new = "11111111-2222-4333-8444-555555555555"
+        t = os.path.join(self.projects, "-proj", f"{new}.jsonl")
+        _write(t, [{"type": "user", "timestamp": M(31).isoformat(), "message": {"role": "user", "content": "go on"}},
+                   {"type": "assistant", "timestamp": M(45).isoformat(), "message": {"content": "x"}}])
+        os.utime(t, (M(46).timestamp(), M(46).timestamp()))
+        with open(self.state) as fh:
+            st = json.load(fh)
+        st["run_stops"] = {M(50).isoformat(): new}
+        with open(self.state, "w") as fh:
+            json.dump(st, fh)
+        r = self.up(M(200))[0]
+        self.assertNotEqual((r["end_reason"], r["end"]), ("stopped", M(50).isoformat()))   # not linked: another session's
+        os.remove(self.out)
+        st["cleared"] = {SID: {"to": new, "at": M(30).isoformat()}}
+        with open(self.state, "w") as fh:
+            json.dump(st, fh)
+        r = self.up(M(200))[0]
+        self.assertEqual((r["end_reason"], r["end"]), ("stopped", M(50).isoformat()))
+        acts, hits, work = rm._merge_activity(
+            rm.session_activity(SID, F - timedelta(minutes=1), M(300), self.projects),
+            rm.session_activity(new, F - timedelta(minutes=1), M(300), self.projects))
+        self.assertIn(M(45), acts)
+        self.assertIn(M(68), acts)
+        self.assertEqual(hits, [(M(70), "session")])
+        self.assertEqual(sorted(p[0] for p in work["prompts"]), [F, M(31)])
+        self.assertEqual(rm._merge_activity((None, [], None), (None, [], None)), (None, [], None))
+
     def test_a_transcript_read_failure_raises(self):
         """D-235: no run end from part of the session's writes; a transcript removed since the
         glob listed it is skipped."""

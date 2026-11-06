@@ -226,7 +226,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     <div id="ctx" class="grid"></div>
     <h3 class="sub">Per day (est. session %)</h3>
     <div id="ctx-days" class="tblwrap"></div>
-    <h3 class="sub">Compactions</h3>
+    <h3 class="sub">Resets (hand-off + /clear)</h3>
     <div id="ctx-comps"></div>
   </section>
 
@@ -596,7 +596,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     }
     var l = c.live || {}, m = c.model || {};
     out.push(tile("Context now", (l.estimated ? "~" : "") + kTok(l.context),
-      '<div class="mut">threshold ' + kTok(l.threshold) + (l.above ? ' · <span class="warn">compacts at the next idle point</span>' : " · no compaction needed") + "</div>"));
+      '<div class="mut">threshold ' + kTok(l.threshold) + (l.above ? ' · <span class="warn">hand-off + /clear at the next idle point</span>' : " · no reset needed") + "</div>"));
     out.push(tile("Prompt cache", l.warm ? '<span class="ok">warm</span>' : '<span class="warn">expired</span>',
       '<div class="mut">' + (l.warm ? "expires " + esc(l.cache_expires_at_berlin || "?") + " (in " + Math.round(l.minutes_left || 0) + " min)"
         : "expired " + esc(l.cache_expires_at_berlin || "?")) + "</div>"));
@@ -614,12 +614,15 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     $("ctx-comps").innerHTML = (c.compactions_error ? '<p class="mut">' + esc(c.compactions_error) + "</p>" : "") +
       (comps.length ? comps.map(function (x) {
         var cls = x.status === "compacted" ? "ok" : (x.status === "failed" ? "bad" : "warn");
-        return '<div class="sess"><span class="' + cls + '">' + esc(x.status) + "</span> " +
-          (x.project ? "<strong>" + esc(x.project) + "</strong> · " : "") + esc(x.at_berlin || "?") +
-          (x.trigger ? " · " + esc(x.trigger) : "") + " · context " + kTok(x.context) +
-          (x.est_cost_pct != null ? " · ~" + x.est_cost_pct + "% cost, saves ~" + x.saves_per_reread_pct + "% per re-read" : "") +
+        return '<div class="sess"><span class="' + cls + '">' + esc(x.status === "compacted" ? "cleared" : x.status) + "</span> " +
+          (x.project ? "<strong>" + esc(x.project) + "</strong> · " : "") +
+          (x.done_at_berlin && x.status !== "running" ? "done " + esc(x.done_at_berlin) : esc(x.at_berlin || "?")) +
+          (x.trigger ? " · " + esc(x.trigger) : "") +
+          (x.status === "compacted" && x.pre_tokens ? " · context " + kTok(x.pre_tokens) + " → " + kTok(x.post_tokens)
+            : " · context " + kTok(x.context)) +
+          (x.est_cost_pct != null ? " · ~" + x.est_cost_pct + "% cost (save + clear + first turn), saves ~" + x.saves_per_reread_pct + "% per re-read" : "") +
           '<div class="mut">' + esc(x.error || x.last_hold || x.reason || "") + "</div></div>";
-      }).join("") : '<p class="mut">No compaction attempts yet.</p>');
+      }).join("") : '<p class="mut">No resets yet.</p>');
   }
 
   function renderDecision(s) {

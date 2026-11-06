@@ -684,10 +684,12 @@ def context_block(now):
         comps = [dict(v, key=k) for k, v in (ka.load_state().get("compactions") or {}).items() if isinstance(v, dict)]
         comps.sort(key=lambda c: str(c.get("at")), reverse=True)
         out["compactions"] = [{"at_berlin": bstr(ka.parse_ts(c["at"])) if c.get("at") else None,
-                               "project": names.get(c.get("session") or SELF_SESSION),
+                               # D-328: the reset's end and the context before -> after it (the new session's first turn)
+                               "done_at_berlin": bstr(ka.parse_ts(c["done_at"])) if c.get("done_at") else None,
+                               "project": names.get(c.get("new_session")) or names.get(c.get("session") or SELF_SESSION),
                                **{k: c.get(k) for k in ("status", "trigger", "reason", "context", "threshold",
                                                         "break_even", "est_cost_pct", "saves_per_reread_pct", "error",
-                                                        "last_hold")}}
+                                                        "last_hold", "pre_tokens", "post_tokens", "new_session")}}
                               for c in comps[:COMPACTIONS_SHOWN]]
     except Exception as e:   # noqa: BLE001 - shown on the page
         out["compactions_error"] = f"{type(e).__name__}: {e}"[:300]

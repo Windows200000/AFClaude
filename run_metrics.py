@@ -568,6 +568,16 @@ def load_readings(lo, hi, samples_path=None, watch_path=None):
     return merge_readings(out)
 
 
+def _merge_activity(a, b):
+    """Two session_activity() results as one (a run in the sessions a /clear chained, D-328); None
+    parts (no transcript) are left out."""
+    acts = sorted((a[0] or []) + (b[0] or [])) if a[0] is not None or b[0] is not None else None
+    work = None
+    if a[2] is not None or b[2] is not None:
+        work = {k: (a[2] or {}).get(k, []) + (b[2] or {}).get(k, []) for k in ("tasks", "prompts")}
+    return acts, sorted(a[1] + b[1]), work
+
+
 def session_activity(session_id, lo, hi, projects_dir=None):
     """The session's transcript entry times in [lo, hi] (user/assistant entries of the main
     transcripts in every project dir plus its subagents), its limit notices [(time, kind)]
@@ -723,8 +733,9 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
     hi = min(max(runs[i]["at"] for i in todo) + SESSION_LENGTH + END_GRACE + timedelta(hours=1), now)
     readings = load_readings(lo, hi, samples_path, watch_path)
     activity_fn = activity_fn or (lambda sid, a, b: session_activity(sid, a, b, projects_dir))
-    hits_state, stops = [], []
+    hits_state, stops, links = [], [], {}
     for st in load_states(state_paths):
+        links.update(st.get("cleared") or {})
         for v in (st.get("limit_hits") or {}).values():
             t = ts(v)
             if t:
@@ -737,12 +748,17 @@ def update(now=None, out_path=None, state_paths=None, samples_path=None, watch_p
         run = runs[i]
         nxt = runs[i + 1]["at"] if i + 1 < len(runs) else None
         acts, hits, work = (None, [], None)
+        chain = []
         if run.get("session"):   # up to now: the run's work may go on past its window (D-310, work_end)
-            acts, hits, work = activity_fn(run["session"], run["at"] - timedelta(minutes=1),
-                                           max(run["at"] + SESSION_LENGTH + RUN_IDLE, min(now, nxt or now)))
+            import keepalive as ka   # D-328: a run goes on in the sessions a mid-run /clear made
+            chain = ka.session_successors(run["session"], {"cleared": links})
+            for sid in chain:
+                a, h, w = activity_fn(sid, run["at"] - timedelta(minutes=1),
+                                      max(run["at"] + SESSION_LENGTH + RUN_IDLE, min(now, nxt or now)))
+                acts, hits, work = _merge_activity((acts, hits, work), (a, h, w))
         if not hits:   # the watcher's detection times (its own session only)
             hits = [h for h in hits_state if run["at"] <= h[0] <= run["at"] + SESSION_LENGTH]
-        own = [t for t, sid in stops if not run.get("session") or sid in (None, run["session"])]
+        own = [t for t, sid in stops if not run.get("session") or sid is None or sid in chain]
         rows[run["run_id"]] = compute_run(run, readings, acts, hits, now=now, next_fire=nxt, stops=own, work=work)
     ordered = [rows[r["run_id"]] for r in runs if r["run_id"] in rows]
     ordered += [r for k, r in rows.items() if k not in {x["run_id"] for x in runs}]   # never drop a row

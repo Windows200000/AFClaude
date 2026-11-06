@@ -98,6 +98,28 @@ class Lookup(Env):
             with self.assertRaises(owner_words.OwnerWordsError):
                 self.find(q)
 
+    def test_the_session_chain_counts_both_ways(self):
+        # review S4 (D-328): the MCP server keeps the pre-/clear id, the CLI follows the new one; the
+        # owner's words on either side of a /clear count for both, an unrelated session's still don't
+        mid, new = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+        for old, to in ((SID, mid), (mid, new)):
+            store.state_set(self.conn, "keepalive", json.dumps(["cleared", old]),
+                            json.dumps({"to": to, "at": AT}), "runner:keepalive", "runner")
+        self.conn.commit()
+        self.transcript(entry("said before the clear", uuid="b1"))
+        self.transcript(entry("said after the clear", uuid="a1"), session=new)
+        self.inbox("an inbox line in the middle")
+        self.inbox("said in another session", session=OTHER)
+        self.assertEqual(store.session_family(self.conn, mid), [SID, mid, new])
+        self.assertEqual(self.find("said before the clear", session=new).ref, f"chat:{SID}:b1")
+        self.assertEqual(self.find("said after the clear").ref, f"chat:{new}:a1")
+        self.assertEqual(self.find("said after the clear", session=mid, ref=f"chat:{new}:a1").ref, f"chat:{new}:a1")
+        self.assertTrue(self.find("an inbox line in the middle", session=new).ref.startswith("inbox:"))
+        with self.assertRaises(owner_words.OwnerWordsError):
+            self.find("said in another session", session=new)
+        with self.assertRaisesRegex(owner_words.OwnerWordsError, "another session's chat"):
+            self.find("said after the clear", session=new, ref=f"chat:{OTHER}:a1")
+
     def test_a_transcript_owner_prompt_matches(self):
         self.transcript(entry("Recording questions, A", uuid="abc"))
         ev = self.find("Recording questions, A")
@@ -482,15 +504,17 @@ class Typed(unittest.TestCase):
             if not b.flat:
                 continue                                                  # hook context or a Haiku call: not typed
             if kind == "compact":
-                text = keepalive.compact_command()                        # /compact <instruction>
-            else:
-                system = {v: "x" for v in prompts.bundle_system(kind)}
-                text = prompts.bundle(kind, insert="an insert", **system)
+                continue                                                  # unused since D-328: no /compact is typed
+            system = {v: "x" for v in prompts.bundle_system(kind)}
+            text = prompts.bundle(kind, insert="an insert", **system)
             self.assertTrue(text.lstrip().startswith(owner_words.KEEPALIVE_PREFIXES), f"{kind}: {text[:60]!r}")
             self.assertIsNone(owner_words.owner_prompt(entry(text)), kind)
             self.assertIsNone(owner_words.owner_prompt(typed_entry(text)), kind)   # as a stored bracketed paste
             checked.append(kind)
         self.assertIn("continue", checked)
+        # D-328: the /clear the keep-alive types; Claude Code writes it as a command entry, never as the owner's words
+        clear = f"<command-name>{keepalive.CLEAR_COMMAND}</command-name>\n<command-message>clear</command-message>"
+        self.assertIsNone(owner_words.owner_prompt(entry(clear)))
         self.assertIn("inbox_now", checked)
         self.assertIn("session_end_save", checked)
 

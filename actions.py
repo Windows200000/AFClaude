@@ -1697,6 +1697,51 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
     return Result(after, sid, before, after)
 
 
+def current_session(conn: sqlite3.Connection, sid: str) -> str:
+    """D-328: the id the session `sid` goes on as after its /clears: the keepalive state's "cleared"
+    links (keepalive.follow_clear; keepalive.current_session reads the same chain), `sid` itself
+    when it was never cleared. A follow-up or a retry goes there, never to a pre-/clear id."""
+    return store.session_family(conn, sid)[-1]
+
+
+CLEARED_INBOX = ("pending", "noted", "delivered")   # still on their way to (or answered by) the session
+# the driven row's fields the new id takes over (the same process, tmux session and holder; started_at is the /clear's)
+CLEARED_COPY = ("kind", "tmux", "project_id", "task_id", "holder_kind", "rc_url", "last_seen")
+
+
+@action("session.cleared", "driven_session")
+def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_session: Any) -> Result:
+    """D-328: the keep-alive cleared a driven session after its hand-off (`/clear`), and Claude Code
+    went on in the same process under a new session id: everything that names the session moves
+    to the new one in one transaction. The old row ends, a new live row takes its kind, tmux name,
+    project, task, holder, Remote Control link and last-seen time (CLEARED_COPY); the project whose task-manager it was points at the new id; the inbox
+    messages still on their way to it (CLEARED_INBOX) go to the new one. The old row must be a
+    live driven row and the new id unknown (else ValueError: nothing moves). The keep-alive's step;
+    not for MCP callers."""
+    _runner_only(ctx, "session.cleared")
+    old, new = store._session_id(old_session), store._session_id(new_session)
+    if old == new:
+        raise ValueError("a cleared session has a new id: old_session and new_session are the same")
+    before = store.get_driven_session(conn, old)
+    if before is None or before["kind"] not in DRIVEN_KINDS or before.get("ended_at"):
+        raise ValueError(f"{old} has no live driven row ({'none' if before is None else before['kind']}"
+                         f"{', ended' if before and before.get('ended_at') else ''}): nothing to follow")
+    if store.get_driven_session(conn, new) is not None:
+        raise ValueError(f"{new} has a driven row already: not a fresh session after a /clear")
+    now = store.now_iso()
+    store.upsert_driven_session(conn, old, ended_at=now)
+    after = store.upsert_driven_session(conn, new, **{k: before[k] for k in CLEARED_COPY if before.get(k) is not None},
+                                        started_at=now)
+    projects = [str(r[0]) for r in conn.execute("SELECT name FROM projects WHERE manager_session=?", (old,))]
+    for name in projects:
+        store.update_project(conn, name, manager_session=new)
+    marks = ",".join("?" for _ in CLEARED_INBOX)
+    moved = conn.execute(f"UPDATE inbox_messages SET session_id=? WHERE session_id=? AND status IN ({marks})",
+                         (new, old) + CLEARED_INBOX).rowcount
+    out = dict(after or {}, cleared_from=old, projects=projects, inbox_moved=moved)
+    return Result(out, new, dict(before, projects=projects), out)
+
+
 # ---------------------------------------------------------------- compaction hand-offs (§5.5)
 
 @action("handoff.write", "handoff")
@@ -1802,7 +1847,7 @@ def inbox_post(conn: sqlite3.Connection, ctx: Ctx, text: Any, session_id: Any = 
         root = store.inbox_row(conn, p["parent_id"]) if p["parent_id"] is not None else p
         if root["status"] != "answered":
             raise store.InvalidTransition(f"inbox message #{root['id']} has no reply yet: nothing to follow up")
-        sid, root_id = root["session_id"], root["id"]
+        sid, root_id = current_session(conn, root["session_id"]), root["id"]
     else:
         sid = session_id if session_id is not None else _inbox_session(conn, project)
     m = store.add_inbox(conn, text, sid, ctx.actor, parent_id=root_id)
@@ -1919,9 +1964,13 @@ def inbox_fail(conn: sqlite3.Connection, ctx: Ctx, message_id: Any, error: Any) 
 @action("inbox.retry", "inbox", owner_only=True)
 def inbox_retry(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result:
     """The owner retries a failed message: pending again (triaged again if it has no verdict yet,
-    otherwise delivered or noted per its verdict). The old error stays in the audit row."""
+    otherwise delivered or noted per its verdict). The old error stays in the audit row. A message
+    to a session cleared since goes to the id it goes on as (current_session, D-328)."""
     before = store.inbox_row(conn, message_id)
     status = "noted" if before["verdict"] == "note" else "pending"
+    cur = current_session(conn, before["session_id"])
+    if cur != before["session_id"] and before["status"] == "error":
+        conn.execute("UPDATE inbox_messages SET session_id=? WHERE id=?", (cur, before["id"]))
     after = store.update_inbox(conn, before["id"], ("error",), status=status, error=None, error_at=None,
                                hold=None, hold_since=None, retry_after=None)
     return _inbox_change(before, after)
@@ -4238,7 +4287,7 @@ class StateComponent:
 
 STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
     StateComponent("keepalive", "runner:keepalive", ("handled", "fires", "limit_hits", "run_stops", "compactions",
-                                                      "window_pings", "window_starts")),
+                                                      "window_pings", "window_starts", "cleared")),
     StateComponent("keepalive.deferred", "runner:keepalive"),        # one row per postponed window start
     StateComponent("keepalive.fillup", "runner:keepalive"),          # plan, test
     # the watcher passes under the resident runner (phase 3a S6): acts = the act run each pass's plan

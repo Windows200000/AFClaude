@@ -110,10 +110,10 @@ HOLD_LOCKED = "a compaction or a start is typing into the session"
 # compact_after, READY) is no task-manager activity, and a "now" message waits until it is over.
 # Every step has a timeout, so a flow still recorded "running" this long after its start is over
 # (the save and its re-send; D-307: each hand-off asked for again, with the turn before it, and the
-# turns before and after the last one and before /compact)
+# turns before and after the last one and before /clear)
 COMPACT_FLOW_MAX = (ka.COMPACT_IDLE_WAIT + 2 * ka.SAVE_TIMEOUT
                     + ka.HANDOFF_REFRESHES * (ka.COMPACT_TURN_WAIT + ka.SAVE_TIMEOUT)
-                    + 2 * ka.COMPACT_TURN_WAIT + ka.COMPACT_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
+                    + 2 * ka.COMPACT_TURN_WAIT + ka.CLEAR_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
 HOLD_COMPACTING = "the keep-alive's compaction flow is running (it goes in after the READY, D-262)"
 
 
@@ -249,8 +249,11 @@ def compaction_flow(sid: str, st: Any, now: datetime) -> tuple[datetime, datetim
     running any more (every step has a timeout; the keep-alive died in it): it ended there, with an
     alert (once) so the owner sees it."""
     best: tuple[datetime, datetime | None, str] | None = None
+    chain = ka.session_chain(sid, st)   # D-328: a flow of an id this one was cleared from is this session's too
     for key, v in (st.get("compactions") or {}).items():
-        if not isinstance(v, dict) or v.get("session") not in (None, sid) or v.get("status") not in ka.COMPACT_STARTED:
+        if (not isinstance(v, dict) or (v.get("session") is not None and v.get("session") not in chain
+                                        and v.get("new_session") not in chain)
+                or v.get("status") not in ka.COMPACT_STARTED):   # ... and after the /clear it is the new id's flow
             continue
         save = (v.get("steps") or {}).get("save")
         if v.get("status") == "failed" and isinstance(save, dict) and not save.get("sent_at"):
@@ -293,7 +296,7 @@ def manager_active(sid: str, now: datetime) -> str | None:
         return None
     sc = compact_timing.scan_cached(path)
     since = flow[1] if flow else None
-    busy = ka.compaction_busy_reason(path, now)
+    busy = ka.compaction_busy_reason(path, now, sid=sid, st=st)   # the chain's subagents too (D-328)
     if busy and (since is None or any(p.ts > since for p in sc.prompts)):
         return busy
     if since is None:
@@ -332,7 +335,7 @@ def triage(conn: Any, m: dict[str, Any], now: datetime | None = None) -> str | N
     if retry is not None and now < retry + TRIAGE_RETRY_MARGIN:
         return "held"
     try:
-        active = manager_active(m["session_id"], now)
+        active = manager_active(ka.current_session(m["session_id"]), now)   # D-328: never a pre-/clear id
     except Exception as e:   # noqa: BLE001 - an error on the message (D-235/D-244), never a triage instead
         failed(conn, m, "inbox activity check failed", f"{type(e).__name__}: {e}")
         return None
@@ -436,8 +439,9 @@ def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[
 
 def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., Any] | None = None) -> str:
     """Try to type one "now" message into its session. -> "delivered" | "held" | "failed" |
-    "gone" (a start took it along meanwhile, or it changed: nothing to do)."""
-    sid = m["session_id"]
+    "gone" (a start took it along meanwhile, or it changed: nothing to do). A message to a session
+    cleared since goes to the id it goes on as (D-328; fire refuses a pre-/clear id)."""
+    sid = ka.current_session(m["session_id"])
     path = ka.transcript_path(sid)
     if not path:
         failed(conn, m, "inbox message not delivered", f"no transcript of the session {sid[:8]}")
