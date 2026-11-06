@@ -3372,7 +3372,7 @@ def report_late_clear(sid, now):
         fail_stop(f"compaction of {sid[:8]}: its /clear landed late, pid {rec['clear_timeout'].get('pid')} goes on as "
                   f"{new[:8]}", f"{sid[:8]} timed out waiting for the /clear ({key}), then the process went on as "
                   f"{new}; the DB and the keep-alive state still name {sid} (nothing moved, no resume message "
-                  "sent): follow it by hand or restart the task-manager")
+                  f"sent): {follow_by_hand(sid, new)}, or restart the task-manager")
     return bool(found)
 
 
@@ -3410,6 +3410,26 @@ def chain_subagent_files(path, chain):
     goes on writing under the old id's directory (D-328)."""
     paths = [path] + [transcript_path(s) for s in chain[1:]]
     return [f for p in paths if p for f in glob.glob(os.path.join(p[:-len(".jsonl")], "subagents", "*.jsonl"))]
+
+
+def follow_by_hand(old, new):
+    """The manual fix when follow_clear did not finish (or never ran, late_clear): both ids and the
+    command that finishes the move (follow_clear_cli)."""
+    return (f"the DB (driven row, project, inbox) still names {old}, the process goes on as {new}; finish the "
+            f"move with `python3 keepalive.py --follow-clear {old} {new}` (from {old[:8]} on, nothing drives "
+            "the old id), then resume automation")
+
+
+def follow_clear_cli(old, new):
+    """--follow-clear OLD NEW: the owner finishes a move follow_clear could not (follow_by_hand). Refused
+    when OLD is already linked to another id (the link names where it went: no second history)."""
+    link = (load_state().get("cleared") or {}).get(old)
+    to = link.get("to") if isinstance(link, dict) else None
+    if to and to != new:
+        raise SystemExit(f"--follow-clear: {old} was cleared into {to}, not {new}")
+    if old == new:
+        raise SystemExit("--follow-clear: the old and the new id are the same")
+    return follow_clear(old, new, (link or {}).get("at") or datetime.now(UTC))
 
 
 def session_chain(sid, st=None):
@@ -3765,8 +3785,11 @@ def compact_with_handoff(sid, cwd, path, trigger="run-end", progress=None, befor
     try:
         follow_clear(sid, comp["new_session"], comp["done_at"] or comp["sent_at"])
     except Exception as e:   # noqa: BLE001 - the session is cleared, its bookkeeping not moved: an error
+        # not rolled back: the link (written first) already refuses the old id, the DB still names it
         raise failstop.Failed(f"{sid[:8]} was cleared and goes on as {comp['new_session'][:8]}, but its "
-                              "bookkeeping could not be moved there", f"{type(e).__name__}: {e}"[:300], rec) from None
+                              "bookkeeping could not be moved there",
+                              f"{type(e).__name__}: {str(e)[:300]}; " + follow_by_hand(sid, comp["new_session"]),
+                              rec) from None
     try:
         insert, h = compact_resume_text(sid, save, trigger, progress, comp)
     except failstop.Failed as e:
@@ -4260,6 +4283,9 @@ def _compaction_failed(sid, key, rec, why, detail="", steps=None, repo=None):
         if steps.get("clear_timeout"):   # late_clear watches it
             rec["clear_timeout"] = steps["clear_timeout"]
     record_compaction(sid, key, rec)
+    give_back = handoff_give_back(sid, rec, steps)
+    if give_back:
+        detail = f"{detail}; {give_back}".lstrip("; ")
     if repo is None:
         try:
             repo = session_progress(sid)["repo"]
@@ -4267,9 +4293,24 @@ def _compaction_failed(sid, key, rec, why, detail="", steps=None, repo=None):
             repo, detail = None, f"{detail}; no progress note ({e.why})".lstrip("; ")
     if repo:
         progress_note(f"compaction of {sid[:8]} FAILED ({rec.get('trigger')}): {why}; automation paused until "
-                      "the owner clears it (D-234/D-235)", repo=repo)
+                      "the owner clears it (D-234/D-235)" + (f"; {give_back}" if give_back else ""), repo=repo)
     _compaction_logged(sid, key, "FAILED", f"{rec.get('trigger')}: {why}")
     fail_stop(f"compaction of {sid[:8]} failed: {why}", detail)
+
+
+def handoff_give_back(sid, rec, steps=None):
+    """Review S6 (D-328): a failure past the /clear leaves the new session empty and the saved
+    hand-off unconsumed (nothing gives it back by itself: a start doesn't inject one). -> the line
+    the alert and the progress note carry: which hand-off, and how to give it back; None when the
+    /clear wasn't reached or the hand-off already went out."""
+    steps = steps or rec.get("steps") or {}
+    new = rec.get("new_session") or steps.get("new_session")
+    if not new or rec.get("handoff_sent_at"):
+        return None
+    hid = (steps.get("save") or {}).get("handoff_id")
+    return (f"{new[:8]} (cleared from {sid[:8]}) goes on without its hand-off"
+            + (f" #{hid}" if hid else "") + f": give it back by typing into the session \"Read your hand-off: "
+            f"python3 tasks.py handoff show --session {sid}\" (it is still unconsumed)")
 
 
 def _compact_now(sid, path, d, rec, head):
@@ -4314,6 +4355,7 @@ def _compact_now(sid, path, d, rec, head):
         if rc != 0:
             return _compaction_failed(sid, d.key, rec, "the hand-off could not be sent after the /clear",
                                       f"rc={rc} {out.strip()[:200]} {err.strip()[:300]}".strip(), repo=proj["repo"])
+        rec["handoff_sent_at"] = sent_at   # handoff_give_back: from here on a failure needs no give-back
         if note_ids:
             rec["inbox_notes"] = note_ids
             if not inbox_included(note_ids, f"compaction {d.key}"):
@@ -4946,11 +4988,19 @@ def main():
     ap.add_argument("--name", default=LAUNCH["name"], help="Remote Control display name (default: the tmux name)")
     ap.add_argument("--rename-tmux", nargs=2, metavar=("OLD", "NEW"),
                     help="rename a live tmux session and its driven_sessions row (D-281: once, at a quiet moment)")
+    ap.add_argument("--follow-clear", nargs=2, metavar=("OLD", "NEW"),
+                    help="finish moving a session's bookkeeping after its /clear by hand (D-328: when the keep-alive "
+                         "could not, its alert names both ids)")
     args = ap.parse_args()
     if args.work_on or args.now:      # D-036's flags, superseded by D-153's run-now (3b S5)
         sys.exit(f"keepalive.py {'--work-on' if args.work_on else '--now'}: {RETIRED_NOW}")
     if args.session_rules:
         return print_session_rules(args.session_rules)
+    if args.follow_clear:
+        res = follow_clear_cli(*args.follow_clear)
+        print(f"{args.follow_clear[0][:8]} -> {args.follow_clear[1][:8]}: tmux {res.get('tmux')}, projects "
+              f"{res.get('projects')}, {res.get('inbox_moved')} inbox message(s) moved")
+        return
     if args.rename_tmux:
         sid = rename_tmux(*args.rename_tmux)
         print(f"renamed {args.rename_tmux[0]} to {args.rename_tmux[1]} (session {sid[:8]})")

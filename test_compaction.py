@@ -873,10 +873,28 @@ class CompactionFailures(Env):
                 conn.execute("DELETE FROM driven_sessions")
         finally:
             conn.close()
+        bodies = []
+        ka.alert = lambda subject, body="": (self.alerts.append(subject), bodies.append(body))
         d, rec = self.compact()
         self.assert_failed(rec, "bookkeeping could not be moved there", [SAVE, "/clear"])
         self.assertEqual(rec["new_session"], NEW)
         self.assertEqual(self.latest()["id"], rec["steps"]["save"]["handoff_id"])
+        # not rolled back: the old id stays refused; the alert names both ids and the manual fix (S6 too)
+        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+        body = next(b for b in bodies if "--follow-clear" in b)
+        self.assertIn(f"python3 keepalive.py --follow-clear {SID} {NEW}", body)
+        self.assertIn(f"handoff show --session {SID}", body)
+        self.assertIn(f"handoff show --session {SID}", self.progress())
+        # the manual fix: refused for another id, then it moves the bookkeeping
+        with self.assertRaises(SystemExit):
+            ka.follow_clear_cli(SID, "00000000-0000-4000-8000-000000000000")
+        self.drive(self.tmp.name)
+        ka.follow_clear_cli(SID, NEW)
+        conn = store.connect()
+        try:
+            self.assertEqual(store.get_driven_session(conn, NEW)["ended_at"], None)
+        finally:
+            conn.close()
 
     def test_a_busy_session_after_the_check(self):
         """Mid-turn when the save prompt is due (a race with the pass's own check): no save prompt."""
@@ -934,6 +952,10 @@ class CompactionFailures(Env):
         d, rec = self.compact()
         self.assert_failed(rec, "the hand-off could not be sent after the /clear", [SAVE, "/clear", AFTER])
         self.assertIsNotNone(self.latest())                                   # not consumed
+        # review S6: the progress note says how to give it back
+        self.assertIn(f"{NEW[:8]} (cleared from {SID[:8]}) goes on without its hand-off #{self.latest()['id']}",
+                      self.progress())
+        self.assertIn(f"handoff show --session {SID}", self.progress())
 
     def test_a_raising_step(self):
         def fire(sid, cwd, message, plan, new=False, **kw):
