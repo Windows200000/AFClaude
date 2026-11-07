@@ -1497,6 +1497,20 @@ class Handoffs(Base):
         with self.assertRaisesRegex(actions.Forbidden, "runner"):
             self.do("handoff.consume", actor="mcp:" + SID, via="mcp", handoff_id=h["id"], start_key="k")
 
+    def test_mcp_writes_for_any_id_of_its_cleared_chain(self):
+        """D-328 fix round 3: the MCP server's env keeps the pre-/clear id; the save prompt of a second
+        /clear names the current one. Every id of the session's chain is its own, nothing wider."""
+        new, newer = "00000000-0000-4000-8000-0000000000a1", "00000000-0000-4000-8000-0000000000a2"
+        for old, to in ((SID, new), (new, newer)):
+            store.state_set(self.conn, "keepalive", json.dumps(["cleared", old]), json.dumps({"to": to, "at": "t"}),
+                            "keepalive", "runner")
+        for who in (SID, newer):
+            for target in (SID, new, newer):
+                h = self.do("handoff.write", actor="mcp:" + who, via="mcp", session_id=target, body={"summary": "s"})
+                self.assertEqual(h["session_id"], target)
+            with self.assertRaisesRegex(actions.Forbidden, "only its own"):
+                self.do("handoff.write", actor="mcp:" + who, via="mcp", session_id=SID2, body={"summary": "x"})
+
     def test_d305_fields(self):
         """D-305: the owner's messages (verbatim, longer items allowed), in flight, lessons and
         working notes are stored and rendered; a hand-off without them (an older one) renders as before."""

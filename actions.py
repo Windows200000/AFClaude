@@ -1748,8 +1748,11 @@ def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_se
 def handoff_write(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, body: Any, project: Any = None) -> Result:
     """A session's hand-off for its compacted self (D-144/D-155): validated by store.handoff_body.
     Any session may write its own, an autonomous one included (D-185: an agent's direct write);
-    through MCP a session that names itself may not write another session's."""
-    if ctx.session is not None and isinstance(session_id, str) and session_id.strip() != ctx.session:
+    through MCP a session that names itself may not write another session's. Its own = any id of
+    its "cleared" chain (D-328: the MCP server keeps its process's first id across /clears, the save
+    prompt names the current one; store.session_family), nothing wider."""
+    if ctx.session is not None and isinstance(session_id, str) \
+            and session_id.strip() not in store.session_family(conn, ctx.session):
         raise Forbidden(f"a session writes only its own hand-off (this is {ctx.session}, not {session_id})")
     h = store.add_handoff(conn, session_id, body, project, created_by=ctx.actor)
     return Result(h, h["id"], None, h)

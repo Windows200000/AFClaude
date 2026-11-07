@@ -75,24 +75,36 @@ def parse_since(s):
 
 # ---------------------------------------------------------------- discovery
 
+def session_ids(session_id):
+    """D-328: the ids of one conversation across its /clears, oldest first: the ones `session_id`
+    was cleared from (keepalive.session_chain), itself and the ones it was cleared into
+    (keepalive.session_successors). A session that was never cleared: [session_id]."""
+    st = ka.load_state()
+    return ka.session_chain(session_id, st)[::-1] + ka.session_successors(session_id, st)[1:]
+
+
 def main_transcripts(session_id):
-    return sorted(glob.glob(os.path.join(ka.PROJECTS_DIR, "*", f"{session_id}.jsonl")))
+    return sorted(f for sid in session_ids(session_id)
+                  for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", f"{sid}.jsonl")))
 
 
 def subagent_files(session_id):
     """agentId -> list of agent-<id>.jsonl paths (usually one, but a session's
-    cwd can change mid-session, same as the main transcript)."""
+    cwd can change mid-session, same as the main transcript), over every id of the
+    session's "cleared" chain (session_ids)."""
     by_agent = {}
-    for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", session_id, "subagents", "agent-*.jsonl")):
-        base = os.path.basename(f)
-        agent_id = base[len("agent-"):-len(".jsonl")]
-        by_agent.setdefault(agent_id, []).append(f)
+    for sid in session_ids(session_id):
+        for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents", "agent-*.jsonl")):
+            base = os.path.basename(f)
+            agent_id = base[len("agent-"):-len(".jsonl")]
+            by_agent.setdefault(agent_id, []).append(f)
     return by_agent
 
 
 def load_meta(session_id, agent_id):
-    for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", session_id, "subagents",
-                                     f"agent-{agent_id}.meta.json")):
+    for f in (f for sid in session_ids(session_id)
+              for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents",
+                                              f"agent-{agent_id}.meta.json"))):
         try:
             with open(f) as fh:
                 return json.load(fh)
@@ -254,18 +266,20 @@ def record(session_id, rows, main_row, tot, usage):
 
 
 def last_recorded_ts(session_id):
-    """The time of the session's last recorded report (the DB)."""
+    """The time of the session's last recorded report (the DB), under any id of its "cleared"
+    chain (session_ids, D-328)."""
     try:
         src = telemetry.lines(REPORTS_FILE)
     except OSError:
         return None
+    ids = set(session_ids(session_id))
     last = None
     for line in src:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict) and row.get("session") == session_id and row.get("at"):
+        if isinstance(row, dict) and row.get("session") in ids and row.get("at"):
             last = row["at"]
     return parse_ts(last) if last else None
 

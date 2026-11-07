@@ -640,13 +640,13 @@ class FillupBlock(unittest.TestCase):
         from datetime import timezone
         self.json, self.UTC = json, timezone.utc
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = (qv.ka.FILLUP_FILE, qv.SELF_SESSION)
+        self.old = (qv.ka.FILLUP_FILE, qv.self_session)
         qv.ka.FILLUP_FILE = os.path.join(self.tmp.name, "fillup.json")
-        qv.SELF_SESSION = "s" * 36
+        qv.self_session = lambda: ("s" * 36, None)
         self.now = datetime(2026, 10, 9, 23, 0, tzinfo=self.UTC)
 
     def tearDown(self):
-        qv.ka.FILLUP_FILE, qv.SELF_SESSION = self.old
+        qv.ka.FILLUP_FILE, qv.self_session = self.old
         self.tmp.cleanup()
 
     def write(self, d):
@@ -919,8 +919,8 @@ class CompactionRows(unittest.TestCase):
     (a record without a session is the quickview's own task-manager's)."""
     def setUp(self):
         testenv.fresh_db(self)
-        self.addCleanup(setattr, qv, "SELF_SESSION", qv.SELF_SESSION)
-        qv.SELF_SESSION = testenv.SID
+        self.addCleanup(setattr, qv, "self_session", qv.self_session)
+        qv.self_session = lambda: (testenv.SID, None)
 
     def test_each_row_names_its_project(self):
         other = "b" * 36
@@ -950,8 +950,9 @@ class TmuxTile(unittest.TestCase):
         testenv.fresh_db(self)
         self.old = qv.ka.tmux_has
         self.addCleanup(setattr, qv.ka, "tmux_has", self.old)
-        self.addCleanup(setattr, qv, "SELF_SESSION", qv.SELF_SESSION)
-        qv.SELF_SESSION = testenv.SID
+        self.real_self_session = qv.self_session
+        self.addCleanup(setattr, qv, "self_session", qv.self_session)
+        qv.self_session = lambda: (testenv.SID, None)
 
     def test_self_session_comes_from_the_registry(self):
         """3b S3: the quickview's own session is the task-manager of the stages project (the registry)."""
@@ -967,10 +968,36 @@ class TmuxTile(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no project"):
             qv.registry_self_session("Nope")
 
+    def test_self_session_follows_a_clear(self):
+        """D-328 fix round 3: the resident runner imports this module once; after a /clear the own
+        session is the new id (read per call, through the "cleared" chain even before the registry
+        moved), so runner_state sees the run going on under it."""
+        old, new = testenv.SID, "bbbbbbbb-0000-4000-8000-000000000002"
+        qv.self_session = self.real_self_session                # the module's own, not setUp's stub
+        conn = store.connect()
+        try:
+            store.add_project(conn, qv.STAGES_PROJECT)
+            store.update_project(conn, qv.STAGES_PROJECT, manager_session=old)
+            self.assertEqual(qv.self_session(), (old, None))
+            store.state_set(conn, "keepalive", json.dumps(["cleared", old]), json.dumps({"to": new, "at": "t"}),
+                            "keepalive", "runner")
+            conn.commit()
+            self.assertEqual(qv.self_session(), (new, None))   # the link alone (the DB move not yet done)
+            store.update_project(conn, qv.STAGES_PROJECT, manager_session=new)    # session.cleared's effect
+        finally:
+            conn.close()
+        self.assertEqual(qv.self_session(), (new, None))
+        seen = []
+        with mock.patch.object(qv.ka, "run_active", lambda sid, now: seen.append(sid) or "fire"), \
+                mock.patch.object(qv.ka, "pending_deferral", lambda sid, now: seen.append(sid)), \
+                mock.patch.object(qv.ka, "last_mile_next_slot", lambda now: None):
+            self.assertEqual(qv.runner_state(datetime.now(timezone.utc))["active"], "fire")
+        self.assertEqual(seen, [new, new])
+
     def test_tile(self):
         self.assertEqual(qv.tmux_block(), {"tmux_name": None, "tmux_ka_exists": None,
                                            "tmux_error": "no stored tmux name (driven_sessions)"})
-        testenv.tmux_row(qv.SELF_SESSION, "afc-afclaude-task-manager")
+        testenv.tmux_row(testenv.SID, "afc-afclaude-task-manager")
         qv.ka.tmux_has = lambda name: name == "afc-afclaude-task-manager"
         self.assertEqual(qv.tmux_block(), {"tmux_name": "afc-afclaude-task-manager", "tmux_ka_exists": True})
 

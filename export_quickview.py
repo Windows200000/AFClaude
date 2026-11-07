@@ -66,32 +66,39 @@ DESIGN_DOC = os.environ.get("QUICKVIEW_DESIGN_DOC", os.path.expanduser(
 # The task-store project whose stages the Progress section shows as a phase strip.
 STAGES_PROJECT = os.environ.get("QUICKVIEW_STAGES_PROJECT", "AFClaude")
 # This manager's own session/tmux: the task-manager of the project STAGES_PROJECT in the registry
-# (projects.manager_session, phase 3b S3; the machine setting is not read). A display path (D-239): a
-# project without a task-manager session, or an unreadable registry, must not crash the export (no
-# page update, no alert, every 3 min); it is shown on the page instead (status.json self_session_error),
-# and every SELF_SESSION-dependent field below degrades to unknown rather than raising.
+# (projects.manager_session, phase 3b S3; the machine setting is not read), read per call through its
+# "cleared" chain (self_session(): D-328, the resident runner imports this module once and a /clear
+# changes the id). A display path (D-239): a project without a task-manager session, or an unreadable
+# registry, must not crash the export (no page update, no alert, every 3 min); it is shown on the page
+# instead (status.json self_session_error), and every self_session()-dependent field below degrades to
+# unknown rather than raising.
+
 
 
 def registry_self_session(project):
-    """The task-manager session of `project` (name or id) from the registry. Raises ValueError."""
+    """The task-manager session of `project` (name or id) from the registry, as it goes on now: the
+    newest id of its "cleared" chain (store.session_family, D-328). Raises ValueError."""
     conn = store.connect()
     try:
         p = store.get_project(conn, project)
+        if p is None:
+            raise ValueError(f"no project {project!r} in the registry")
+        if not p.get("manager_session"):
+            raise ValueError(f"project {p['name']!r} has no task-manager session yet")
+        return store.session_family(conn, p["manager_session"])[-1]
     finally:
         conn.close()
-    if p is None:
-        raise ValueError(f"no project {project!r} in the registry")
-    if not p.get("manager_session"):
-        raise ValueError(f"project {p['name']!r} has no task-manager session yet")
-    return p["manager_session"]
 
 
-try:
-    SELF_SESSION = registry_self_session(STAGES_PROJECT)
-    SELF_SESSION_ERROR = None
-except Exception as e:   # noqa: BLE001 - a display path: shown, never raised (D-239)
-    SELF_SESSION = None
-    SELF_SESSION_ERROR = f"{type(e).__name__}: {e}"[:300]
+def self_session():
+    """This manager's own session now (registry_self_session(STAGES_PROJECT), per call). A display
+    path (D-239): -> (session id, None), or (None, the error text) shown on the page."""
+    try:
+        return registry_self_session(STAGES_PROJECT), None
+    except Exception as e:   # noqa: BLE001 - a display path: shown, never raised (D-239)
+        return None, f"{type(e).__name__}: {e}"[:300]
+
+
 # D-211: the step key (as build_stages() keys steps, e.g. "6a") from which a non-blocking owner
 # preview build of the dashboard UI first becomes possible (docs/dashboard_design/10_deployment.md §10.9). A
 # constant for now; swap for a task-store marker if that step ever moves without a doc edit.
@@ -571,9 +578,10 @@ def context_block(now):
     state's "compactions"). The per-message list
     is dropped: the owner keeps only the daily split (owner, 25.10.). A display path: an error is
     shown, never paused (D-239)."""
+    own = self_session()[0]
     try:
         import compact_timing
-        out = compact_timing.context_block(ka.transcript_path(SELF_SESSION), now,
+        out = compact_timing.context_block(ka.transcript_path(own), now,
                                            threshold=int(ka._compaction_settings()["compaction_threshold_tokens"]))
         out.pop("messages", None)
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
@@ -590,7 +598,7 @@ def context_block(now):
         out["compactions"] = [{"at_berlin": bstr(ka.parse_ts(c["at"])) if c.get("at") else None,
                                # D-328: the reset's end and the context before -> after it (the new session's first turn)
                                "done_at_berlin": bstr(ka.parse_ts(c["done_at"])) if c.get("done_at") else None,
-                               "project": names.get(c.get("new_session")) or names.get(c.get("session") or SELF_SESSION),
+                               "project": names.get(c.get("new_session")) or names.get(c.get("session") or own),
                                **{k: c.get(k) for k in ("status", "trigger", "reason", "context", "threshold",
                                                         "break_even", "est_cost_pct", "saves_per_reread_pct", "error",
                                                         "last_hold", "pre_tokens", "post_tokens", "new_session")}}
@@ -782,12 +790,13 @@ def runner_state(now):
     pending postponed session-window start (its recheck) and, in the last stretch, whether the
     current slot already ran (keepalive.last_mile_next_slot(), D-204). Read-only; unknown -> None."""
     out = {"active": None, "deferred": None, "slot_next": None}
+    own = self_session()[0]
     try:
-        out["active"] = ka.run_active(SELF_SESSION, now)
+        out["active"] = ka.run_active(own, now)
     except Exception:   # noqa: BLE001 - advisory: the walk still shows the next start
         pass
     try:
-        p = ka.pending_deferral(SELF_SESSION, now)
+        p = ka.pending_deferral(own, now)
         out["deferred"] = p if p is not None else False      # False = known: none pending
     except Exception:   # noqa: BLE001 - None = unknown: inferred from the decision
         pass
@@ -823,10 +832,11 @@ def tmux_block():
     """The task-manager's tmux session: its stored name (driven_sessions, 3b S2) and whether it
     runs. Advisory (D-239): no manager session, no stored name or a failed check is shown as
     unknown (tmux_ka_exists None) with tmux_error, never as a computed name and never raised."""
-    if not SELF_SESSION:
+    own = self_session()[0]
+    if not own:
         return {"tmux_name": None, "tmux_ka_exists": None, "tmux_error": "no manager session configured"}
     try:
-        name = ka.tmux_name(SELF_SESSION)
+        name = ka.tmux_name(own)
     except ka.NoTmuxName:
         return {"tmux_name": None, "tmux_ka_exists": None, "tmux_error": "no stored tmux name (driven_sessions)"}
     except Exception as e:   # noqa: BLE001 - advisory: unknown, not raised (D-239)
@@ -895,10 +905,11 @@ def fillup_block(now):
     keepalive_fillup.json (fillup.decide, rewritten by the watcher every minute) or a --plan-fillup-test entry of this
     session: {"planned": True, "at_berlin", "remaining" (session %), "cost" (weekly %),
     "reset_berlin", "status", "reason", "test"} or {"planned": False, "reason"}. Read-only."""
+    own = self_session()[0]
     try:
         f = ka.load_fillup()
         t = f.get("test")
-        if isinstance(t, dict) and t.get("session") == SELF_SESSION:
+        if isinstance(t, dict) and t.get("session") == own:
             start, reset = _ts(t.get("start")), _ts(t.get("reset"))
             if start and reset and reset > now:
                 return {"planned": True, "test": True, "at_berlin": bstr(start), "remaining": _r1(t.get("remaining")),
@@ -909,7 +920,7 @@ def fillup_block(now):
     except Exception as e:   # noqa: BLE001 - the page shows the error instead
         return {"planned": False, "reason": f"{type(e).__name__}: {e}"}
     plans = f.get("plans")
-    p = plans.get(SELF_SESSION) if isinstance(plans, dict) else None   # each task-manager's own (3c S1)
+    p = plans.get(own) if isinstance(plans, dict) else None   # each task-manager's own (3c S1)
     if not isinstance(p, dict):
         return {"planned": False, "reason": "no plan yet (the watcher writes it every minute)"}
     reset, start = _ts(p.get("reset")), _ts(p.get("start"))
@@ -1103,7 +1114,7 @@ def main():
     status = {
         "generated_at": now.isoformat(),
         "generated_berlin": bstr(now),
-        "self_session_error": SELF_SESSION_ERROR,  # D-239: shown, never crashes the export
+        "self_session_error": self_session()[1],  # D-239: shown, never crashes the export
         "automation": automation_block(),
         "auth": auth_block(),   # D-320: an expired Claude login, prominent on the page
         "manager_launch": manager_launch_block(),

@@ -403,14 +403,23 @@ def _scan(st, baseline, problems, offsets, sessions, agg, seen_ids, typed):
                         gaps[:] = gaps[-3:]
         if a["last_ts"]:
             meta["last_activity"] = a["last_ts"]
-    own_extra = runner_state.own_sessions(OWN_LIST)   # the DB (driven_sessions kind 'own', D-161)
+    mark_own(sessions)
+    if baseline:
+        return None
+    return agg
+
+
+def mark_own(sessions):
+    """Each session's "own" flag: listed as AFClaude's own (driven_sessions kind 'own', D-161), any
+    session AFClaude drove (a stalled one it continues stays the user's) or one of its "cleared"
+    chain (D-328: after a /clear the new id's transcript may carry no title,
+    runner_state.driven_family_ids), an own working directory or an own title/agent name. A failed
+    DB read raises (driven_family_ids)."""
+    own_extra = runner_state.own_sessions(OWN_LIST) | runner_state.driven_family_ids()
     for sid, meta in sessions.items():
         meta["own"] = (sid in own_extra
                        or any(mk in (meta.get("cwd") or "") for mk in OWN_CWD_MARKERS)
                        or bool(OWN_NAME_RE.match(meta.get("title") or "")))
-    if baseline:
-        return None
-    return agg
 
 
 def summarize(agg, sessions):

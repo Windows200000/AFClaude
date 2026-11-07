@@ -851,12 +851,20 @@ class CompactionFailures(Env):
         self.clears = True
         self.fake_fire(SID, "/w", "/clear", "send-keys", driver="auto", prompt="clear")   # it lands late
         st = {"handled": {}}
-        with mock.patch.object(ka, "_fire_start") as fs, mock.patch.object(ka, "abort_start") as ab:
+        self.alerts.clear()
+        refusal, abort = [], ka.abort_start
+
+        def aborted(*a, **kw):          # the link is stored before the abort (the side-file state saves whole)
+            refusal.append(ka.cleared_refusal(SID))
+            return abort(*a, **kw)
+        with mock.patch.object(ka, "_fire_start") as fs, mock.patch.object(ka, "abort_start", aborted):
             self.assertEqual(ka._start_session(SID, (True, [], "send-keys"), {"uuid": "k", "run_now": True}, "r",
                                                st, None, "k", "n"), "failed")
         fs.assert_not_called()
-        self.assertIn("landed late", ab.call_args.args[5])
-        self.assertIn("was cleared into", ka.cleared_refusal(SID))
+        self.assertEqual(len(self.alerts), 1, self.alerts)                # fix round 3: abort_start's alert only
+        self.assertIn("landed late", self.alerts[0])
+        self.assertIn(NEW, st["handled"]["k"]["error"])                     # both ids in the one alert's detail
+        self.assertIn("was cleared into", refusal[0])
 
     def test_follow_clear_by_hand_checks_first(self):
         """Fix round S-D: --follow-clear writes nothing unless OLD has a driven row and NEW's
