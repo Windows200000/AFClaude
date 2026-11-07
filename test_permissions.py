@@ -19,6 +19,7 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import testenv  # noqa: E402,F401  (temp DB first)
 import actions  # noqa: E402
+import failstop  # noqa: E402
 import identity  # noqa: E402
 import permissions  # noqa: E402
 import roles  # noqa: E402
@@ -401,13 +403,49 @@ class Shadow(Base):
         self.assertEqual(len(lg.output), 1)
         self.assertEqual(len(self.shadow_rows()), 3)             # the table keeps every one
 
-    def test_a_failing_diagnostic_never_changes_the_write(self):
+    def test_a_failing_shadow_insert_is_an_error_and_an_alert_saying_the_write_went_through(self):
+        m = f"machine:{self.users['machine_ungranted']}"
         with mock.patch.object(actions, "roles_shadow_add", side_effect=RuntimeError("boom")), \
-                self.assertLogs("afclaude.roles", "ERROR") as lg:
-            r = actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 2.0},
-                                actor=f"machine:{self.users['machine_ungranted']}", via="mcp")
-        self.assertEqual(r["value"], 2.0)
-        self.assertIn("could not log", lg.output[0])
+                mock.patch.object(failstop, "fail") as fail:
+            with self.assertRaises(actions.RolesFailure) as e:
+                actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 2.0}, actor=m, via="mcp")
+        self.assertIn("WAS carried out", str(e.exception))
+        self.assertIn("boom", str(e.exception))
+        self.assertEqual(actions.get_setting(self.conn, "session_hours"), 2.0)      # the write is committed
+        fail.assert_called_once()
+        self.assertEqual(fail.call_args.args[:2], ("roles", "the shadow log could not be written"))
+        self.assertIn("WAS carried out and is committed", fail.call_args.args[2])
+
+    def test_a_failing_shadow_insert_after_a_refusal_says_the_action_was_not_carried_out(self):
+        actions._roles_logged.clear()
+        m = f"machine:{self.users['machine_ungranted']}"
+        with mock.patch.object(actions, "roles_shadow_add", side_effect=RuntimeError("boom")), \
+                mock.patch.object(failstop, "fail") as fail:
+            with self.assertRaises(actions.RolesFailure) as e:
+                actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": -5.0}, actor=m, via="mcp")
+        self.assertIsInstance(e.exception.__cause__, ValueError)                   # the old rule's own error, chained
+        self.assertIn("NOT carried out", fail.call_args.args[2])
+
+    def test_the_failure_alert_goes_through_failstop_once_per_cause(self):
+        """Real failstop: pause set (actor runner:roles), one alert, the same cause not alerted again."""
+        actions._roles_logged.clear()
+        m = f"machine:{self.users['machine_ungranted']}"
+        alerts = []
+        with mock.patch.object(actions, "roles_shadow_add", side_effect=RuntimeError("boom")), \
+                mock.patch.object(failstop, "_notify", side_effect=lambda s, b: alerts.append((s, b))), \
+                mock.patch.object(failstop, "_stderr_log"), \
+                mock.patch.object(failstop, "_current", return_value={"paused": False}), \
+                mock.patch.object(failstop, "_set_pause", return_value=None) as pause, \
+                self.assertLogs("afclaude.roles", "ERROR"):
+            for v in (3.0, 4.0, 5.0):
+                with self.assertRaises(actions.RolesFailure):
+                    actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": v}, actor=m, via="mcp")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("the shadow log could not be written", alerts[0][0])
+        self.assertIn("WAS carried out", alerts[0][1])
+        pause.assert_called_once()                                   # the install-wide pause, reason names the cause
+        self.assertEqual(pause.call_args.args[0], "roles")
+        self.assertIn("the shadow log could not be written", pause.call_args.args[1])
 
     def test_no_write_changes_outcome_with_the_matrix_patched_away(self):
         """The same scenarios with and without the matrix: equal results, errors and audit rows."""
@@ -541,44 +579,73 @@ class Guard(Base):
         with self.assertLogs("afclaude.identity", "WARNING"):
             identity.conflict("x again", self.conn)
 
-    def test_an_unknown_saved_value_does_not_enforce_and_is_reported(self):
-        store.put_setting(self.conn, "roles_enforce", "maybe", "test")
-        self.conn.commit()
-        actions._roles_logged.clear()
-        with self.assertLogs("afclaude.roles", "ERROR") as lg:
-            self.assertEqual(actions.roles_mode(self.conn), "shadow")
-            self.assertEqual(actions.roles_mode(self.conn), "shadow")
-        self.assertEqual(len(lg.output), 1)                          # once an hour
-        self.assertIn("maybe", lg.output[0])
-        self.assertIn("maybe", actions.roles_mode_problem(self.conn))
-        # a perform goes on under the old rule instead of failing
-        actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 3.0}, actor="cli", via="cli")
-
-    def test_an_on_whose_precondition_is_gone_behaves_as_shadow(self):
+    def bad_mode(self, how):
+        """An unusable saved roles_enforce: an unknown value, or `on` after the host's machine owner went away."""
+        if how == "unknown":
+            store.put_setting(self.conn, "roles_enforce", "maybe", "test")
+            self.conn.commit()
+            return "maybe"
         r = self.register_host_machine()
         self.cli("setting.set", key="roles_enforce", value="on")
-        self.assertEqual(actions.roles_mode(self.conn), "on")
-        self.cli("machine.revoke", user_id=r["user_id"])             # the host's machine owner goes away
-        actions._roles_logged.clear()
-        with self.assertLogs("afclaude.roles", "ERROR") as lg:
-            self.assertEqual(actions.roles_mode(self.conn), "shadow")
-        self.assertIn("D-330", lg.output[0])
-        # the write is not refused (it would be under `on`), and the shadow log records the would-be refusal
-        with self.assertLogs("afclaude.roles", "WARNING"):
+        self.cli("machine.revoke", user_id=r["user_id"])
+        return "D-330"
+
+    def test_an_unusable_saved_mode_raises_and_alerts_once_per_cause(self):
+        for how in ("unknown", "gone"):
+            with self.subTest(how):
+                self.setUp()
+                needle = self.bad_mode(how)
+                with mock.patch.object(failstop, "fail") as fail, self.assertRaises(actions.RolesFailure) as e:
+                    actions.roles_mode(self.conn)
+                self.assertIn(needle, str(e.exception))
+                with mock.patch.object(failstop, "fail") as fail2, self.assertRaises(actions.RolesFailure):
+                    actions.roles_mode(self.conn)                 # the same cause again: raised, not alerted again
+                fail.assert_called_once()
+                self.assertEqual(fail.call_args.args[:2], ("roles", "the saved roles_enforce setting can't be used"))
+                self.assertIn(needle, fail.call_args.args[2])
+                fail2.assert_not_called()
+                self.assertIn(needle, actions.roles_mode_problem(self.conn))
+
+    def test_a_write_the_matrix_would_not_allow_fails_while_the_mode_is_unusable(self):
+        self.bad_mode("unknown")
+        with mock.patch.object(failstop, "fail") as fail, self.assertRaises(actions.RolesFailure):
             actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 4.0},
                             actor=self.actor["machine_ungranted"], via="mcp")
-        self.assertEqual(actions.get_setting(self.conn, "session_hours"), 4.0)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            tasks.main(["--db", self.db, "roles", "mode"])
-        self.assertIn("PROBLEM", out.getvalue())
-        self.assertIn("roles_enforce: shadow", out.getvalue())
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            tasks.main(["--db", self.db, "roles", "mode", "--json"])
-        j = json.loads(out.getvalue())
-        self.assertEqual(j["roles_enforce"], "shadow")
-        self.assertIn("D-330", j["problem"])
+        fail.assert_called_once()                                  # reported after the transaction
+        self.assertNotEqual(actions.get_setting(self.conn, "session_hours"), 4.0)
+        self.cli("setting.set", key="session_hours", value=3.0)    # an allowed write does not consult the mode
+        self.assertEqual(actions.get_setting(self.conn, "session_hours"), 3.0)
+
+    def test_the_owner_can_repair_an_unusable_mode_but_only_as_the_matrix_allows(self):
+        for how in ("unknown", "gone"):
+            with self.subTest(how):
+                self.setUp()
+                self.bad_mode(how)
+                with mock.patch.object(failstop, "fail"):
+                    with self.assertRaises(actions.Forbidden):    # a machine user the matrix refuses: no repair
+                        actions.perform(self.conn, "setting.set", {"key": "roles_enforce", "value": "shadow"},
+                                        actor=self.actor["machine_ungranted"], via="mcp")
+                    self.cli("setting.set", key="roles_enforce", value="shadow")        # the owner repairs it
+                self.assertEqual(actions.roles_mode(self.conn), "shadow")
+                self.assertIsNone(actions.roles_mode_problem(self.conn))
+        self.setUp()
+        self.bad_mode("unknown")
+        with mock.patch.object(failstop, "fail"):
+            self.cli("setting.reset", key="roles_enforce")                              # reset repairs it too
+        self.assertEqual(actions.roles_mode(self.conn), "shadow")
+
+    def test_roles_mode_cli_shows_the_problem_and_repairs(self):
+        self.bad_mode("unknown")
+        def run(*a):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                tasks.main(["--db", self.db, "roles", "mode", *a])
+            return out.getvalue()
+        self.assertIn("UNUSABLE", run())
+        self.assertIn("maybe", run())
+        self.assertIsNone(json.loads(run("--json"))["roles_enforce"])
+        self.assertIn("roles_enforce: shadow", run("--set", "shadow"))
+        self.assertEqual(json.loads(run("--json")), {"roles_enforce": "shadow", "problem": None})
 
 
 class Reads(Base):
@@ -620,25 +687,43 @@ class Reads(Base):
                                       lambda x: x.get("project_id"), public_global=True)
         self.assertEqual([x["id"] for x in got], [d])
 
-    def test_a_failing_filter_never_breaks_a_shadow_listing(self):
+    def test_a_failing_filter_is_an_error_and_an_alert_not_an_unfiltered_listing(self):
         rows = self.rows()
-        with mock.patch.object(permissions, "visible_projects", side_effect=RuntimeError("boom")), \
-                self.assertLogs("afclaude.roles", "ERROR") as lg:
-            self.assertEqual(self.filtered("editor", rows), rows)
-            self.assertEqual(self.filtered("editor", rows), rows)
-        self.assertEqual(len(lg.output), 1)                          # once an hour
-        self.assertIn("boom", lg.output[0])
-        with mock.patch.object(actions, "roles_mode", return_value="on"), \
-                mock.patch.object(permissions, "visible_projects", side_effect=RuntimeError("boom")):
-            with self.assertRaises(RuntimeError):
+        actions._roles_logged.clear()
+        for mode in ("shadow", "on"):
+            with mock.patch.object(actions, "roles_mode", return_value=mode), \
+                    mock.patch.object(permissions, "visible_projects", side_effect=RuntimeError("boom")), \
+                    mock.patch.object(failstop, "fail") as fail:
+                with self.assertRaises(actions.RolesFailure) as e:
+                    self.filtered("editor", rows)
+                with self.assertRaises(actions.RolesFailure):
+                    self.filtered("editor", rows)
+            self.assertIn("boom", str(e.exception))
+            self.assertIn("not returned", str(e.exception))
+            self.assertEqual(fail.call_count, 1 if mode == "shadow" else 0)    # once an hour per cause
+        with mock.patch.object(permissions, "visible_projects", side_effect=sqlite3.OperationalError("locked")), \
+                mock.patch.object(failstop, "fail") as fail:
+            with self.assertRaises(sqlite3.OperationalError):             # the DB error path, not a roles failure
                 self.filtered("editor", rows)
+        fail.assert_not_called()
 
-    def test_a_bad_project_of_in_shadow_returns_the_rows(self):
+    def test_a_bad_project_of_raises_and_alerts(self):
         rows = self.rows()
-        with self.assertLogs("afclaude.roles", "ERROR"):
-            got = actions.read_filter(self.conn, self.actor["editor"], None, "mcp", "tasks", rows,
-                                      lambda t: t["nope"])
-        self.assertEqual(got, rows)
+        actions._roles_logged.clear()
+        with mock.patch.object(failstop, "fail") as fail, self.assertRaises(actions.RolesFailure):
+            actions.read_filter(self.conn, self.actor["editor"], None, "mcp", "tasks", rows, lambda t: t["nope"])
+        self.assertEqual(fail.call_args.args[:2], ("roles", "the read filter failed"))
+
+    def test_an_unusable_mode_fails_a_listing_that_would_hide_rows(self):
+        self.cli("task.add", title="b-task", project="beta")
+        rows = self.rows()
+        store.put_setting(self.conn, "roles_enforce", "maybe", "test")
+        self.conn.commit()
+        actions._roles_logged.clear()
+        with mock.patch.object(failstop, "fail") as fail, self.assertRaises(actions.RolesFailure):
+            self.filtered("editor", rows)
+        self.assertEqual(fail.call_args.args[:2], ("roles", "the saved roles_enforce setting can't be used"))
+        self.assertEqual(self.filtered("owner", rows), rows)           # nothing to hide: the mode isn't consulted
 
     def test_a_read_hit_writes_one_row_per_actor_listing_and_hour(self):
         self.cli("task.add", title="b-task", project="beta")
@@ -655,32 +740,26 @@ class Reads(Base):
         import time
         self.cli("task.add", title="b-task", project="beta")
         rows = self.rows()
+        actions._roles_logged.clear()
         other = store.connect(self.db)
         other.execute("BEGIN IMMEDIATE")                             # somebody holds the write lock
         try:
             with mock.patch.object(store, "retrying", side_effect=AssertionError("retried")), \
                     mock.patch.object(actions, "SHADOW_BUSY_MS", 50), \
-                    self.assertLogs("afclaude.roles", "ERROR") as lg:
+                    mock.patch.object(failstop, "fail") as fail:
                 t0 = time.monotonic()
-                got = self.filtered("editor", rows)
-                self.filtered("editor", rows)
+                with self.assertRaises(actions.RolesFailure) as e:
+                    self.filtered("editor", rows)
                 took = time.monotonic() - t0
         finally:
             other.rollback()
             other.close()
-        self.assertEqual(got, rows)
         self.assertLess(took, 3)
-        self.assertEqual(len([m for m in lg.output if "could not log" in m]), 1)    # dropped, said once an hour
+        self.assertIn("locked", str(e.exception))
+        self.assertIn("not returned", str(e.exception))
+        fail.assert_called_once()
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM roles_shadow").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("PRAGMA busy_timeout").fetchone()[0], store.BUSY_TIMEOUT * 1000)
-
-    def test_a_failing_shadow_insert_on_a_write_path_logs_once_an_hour(self):
-        m = f"machine:{self.users['machine_ungranted']}"
-        with mock.patch.object(actions, "roles_shadow_add", side_effect=RuntimeError("boom")), \
-                self.assertLogs("afclaude.roles", "ERROR") as lg:
-            for v in (3.0, 4.0, 5.0):
-                actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": v}, actor=m, via="mcp")
-        self.assertEqual(len([x for x in lg.output if "could not log" in x]), 1)
 
     def test_a_revoked_user_sees_nothing(self):
         self.cli("user.revoke", user_id=self.users["editor"])

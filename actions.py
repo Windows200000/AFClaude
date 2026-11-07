@@ -81,6 +81,7 @@ import owner_words  # noqa: E402  (the owner's stored messages as evidence, phas
 import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
 import roles  # noqa: E402  (pure: grants, effective roles, the last owner, credentials, phase 5a A1)
 import permissions  # noqa: E402  (the permission matrix and its check, phase 5a A3)
+import failstop  # noqa: E402  (stdlib only at import: the owner alert + pause for a failing roles diagnostic, D-235)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -240,13 +241,20 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
              request_sha: str) -> Any:
     """One try of perform(): the action, its audit row and idempotency key in one transaction. A verdict of the
     permission matrix that is not `allowed` is logged in shadow mode once the transaction is over (committed or
-    rolled back: the shadow row must outlive the old rule's refusal); it never changes the outcome."""
+    rolled back: the shadow row must outlive the old rule's refusal). A diagnostic that fails is an error the
+    caller gets and the owner is alerted to (D-235), saying whether the action itself went through."""
     seen: list[permissions.Verdict] = []
     try:
-        return _perform_tx(conn, spec, name, params, ctx, request_sha, seen)
-    finally:
+        res = _perform_tx(conn, spec, name, params, ctx, request_sha, seen)
+    except BaseException as e:
+        if isinstance(e, RolesFailure):
+            roles_report(e)           # the roles setting was unusable inside the transaction: nothing was written
         if seen:
-            roles_shadow_log(conn, ctx, name, seen[0])
+            _shadow_after(conn, ctx, name, seen[0], f"the action was NOT carried out ({type(e).__name__}: {e})", e)
+        raise
+    if seen:
+        _shadow_after(conn, ctx, name, seen[0], "the action itself WAS carried out and is committed", None)
+    return res
 
 
 def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[str, Any], ctx: Ctx,
@@ -267,7 +275,13 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
         except Exception as e:        # noqa: BLE001 - a crashing check is a refusal with its reason, never silent
             verdict = permissions.Verdict("refused", f"the permission check itself failed ({type(e).__name__}: {e})")
         if verdict.outcome != "allowed":
-            if roles_mode(conn) == "on":
+            try:
+                mode = roles_mode(conn, report=False)     # reported after the transaction (the pause needs the lock)
+            except RolesFailure:
+                if not _repairs_roles_setting(name, params):
+                    raise
+                mode = "on"           # the owner's repair of the setting itself: only what the matrix allows
+            if mode == "on":
                 raise Forbidden(f"{name} refused for {actor}: {verdict.reason}" if verdict.outcome == "refused"
                                 else f"{name} by {actor} would be a proposal for the task-manager ({verdict.reason}); "
                                      "proposals are not built yet (phase 5a A4)")
@@ -291,17 +305,47 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
 roles_log = logging.getLogger("afclaude.roles")
 _roles_logged: dict[tuple[str, str, str], str] = {}      # (actor, action, outcome) -> the hour last logged
 SHADOW_BUSY_MS = 200       # how long a shadow insert may wait for the write lock: a diagnostic never waits longer
+ROLES_COMPONENT = "roles"  # failstop's component for the roles failures (actor runner:roles)
 
 
-def _roles_once(key: tuple[str, str, str], level: int, msg: str, *args: Any) -> bool:
-    """One roles log line per key and hour (a looping caller, a failing diagnostic, a bad saved mode must not
-    flood the log). -> whether the line was written."""
+class RolesFailure(ValueError):
+    """The roles machinery can't do its job: an unusable saved roles_enforce, a shadow row that could not be
+    written, a read filter that crashed (D-235: abort and tell the owner, no degraded fallback). `subject` is
+    stable (failstop's dedupe key), `detail` the specifics, `note` what became of the call itself."""
+    def __init__(self, subject: str, detail: str, note: str = "") -> None:
+        super().__init__(f"{subject}: {detail}" + (f" ({note})" if note else ""))
+        self.subject, self.detail, self.note = subject, detail, note
+        self.reported = False
+
+
+def _hour_gate(key: tuple[str, str, str]) -> bool:
+    """True the first time per key and hour in this process."""
     hour = store.now_iso()[:13]
     if _roles_logged.get(key) == hour:
         return False
     _roles_logged[key] = hour
+    return True
+
+
+def _roles_once(key: tuple[str, str, str], level: int, msg: str, *args: Any) -> bool:
+    """One roles log line per key and hour (a looping caller must not flood the log). -> whether it was written."""
+    if not _hour_gate(key):
+        return False
     roles_log.log(level, msg, *args)
     return True
+
+
+def roles_report(err: RolesFailure) -> None:
+    """Tell the owner (failstop.fail: error log line, automation pause, alert; failstop itself alerts once per
+    pause and subject) at most once per cause and hour in this process, so a looping caller doesn't hit the
+    pause check on every call. Run outside any transaction: the pause is written on its own connection."""
+    if err.reported:
+        return
+    err.reported = True
+    if not _hour_gate(("", "roles_fail", err.subject)):
+        return
+    failstop.fail(ROLES_COMPONENT, err.subject, err.detail + (f"\n{err.note}" if err.note else ""),
+                  log=lambda line: roles_log.error("%s", line))
 
 
 def roles_mode_problem(conn: sqlite3.Connection) -> str | None:
@@ -314,25 +358,32 @@ def roles_mode_problem(conn: sqlite3.Connection) -> str | None:
     return None
 
 
-def roles_mode(conn: sqlite3.Connection) -> str:
+def roles_mode(conn: sqlite3.Connection, *, report: bool = True) -> str:
     """The roles_enforce setting in effect: `shadow` (the default) or `on` (refuses). The saved value is checked
-    again on every call: an unknown value, or an `on` whose precondition no longer holds (D-330), does not
-    enforce; it is reported once an hour (error line) and behaves as shadow, because refusing writes on a bad
-    setting would lock the owner out during the shadow phase (availability first; `tasks.py roles mode` shows
-    the problem)."""
+    again on every call: an unknown value, or an `on` whose precondition no longer holds (D-330), raises
+    RolesFailure (D-235: no fallback to shadow), reported to the owner (alert + automation pause, once per cause)
+    unless report=False (the caller reports after its transaction). The owner repairs it by writing a valid
+    value (setting.set / setting.reset of roles_enforce, `tasks.py roles mode --set`), which perform lets
+    through while this fails, for an actor the matrix allows."""
     problem = roles_mode_problem(conn)
     if problem is not None:
-        _roles_once(("", "roles_mode", problem[:100]), logging.ERROR,
-                    "roles (shadow): the saved roles_enforce can't be used, behaving as shadow: %s", problem)
-        return "shadow"
+        err = RolesFailure("the saved roles_enforce setting can't be used", problem,
+                           "fix: `python3 tasks.py roles mode --set shadow`")
+        if report:
+            roles_report(err)
+        raise err
     return str(get_setting(conn, "roles_enforce"))
+
+
+def _repairs_roles_setting(name: str, params: Mapping[str, Any]) -> bool:
+    return name in ("setting.set", "setting.reset") and params.get("key") == "roles_enforce"
 
 
 def roles_shadow_add(conn: sqlite3.Connection, *, actor: str, session: str | None, via: str, action: str,
                      outcome: str, reason: str, project_id: int | None = None) -> None:
     """One shadow-log row (the list `tasks.py roles shadow` prints; no audit row, like app_log). A single try
     under a short busy timeout, no retry and no DB-error escalation: a diagnostic never waits for the write
-    lock; a failure raises to roles_shadow_log, which drops the row and says so."""
+    lock; a failure raises to roles_shadow_log."""
     day = store._utcnow().astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
     old = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
     conn.execute(f"PRAGMA busy_timeout={SHADOW_BUSY_MS}")
@@ -344,25 +395,36 @@ def roles_shadow_add(conn: sqlite3.Connection, *, actor: str, session: str | Non
 
 
 def roles_shadow_log(conn: sqlite3.Connection, ctx: Ctx, name: str, v: permissions.Verdict, *,
-                     project_id: int | None = None) -> None:
+                     project_id: int | None = None, note: str = "") -> None:
     """Shadow mode: a would-be refusal or proposal goes to the shadow table and a warning in the process log
     (once per actor, action and outcome and hour, so a looping caller doesn't flood it; a `read:*` hit also
     writes one row per key and hour only, the first, so listings don't take the write lock on every call).
-    Never raises and never waits for the lock: a failed diagnostic is dropped and reported on the log (once an
-    hour), and the call it describes goes on as the old rule decides."""
+    Never waits for the lock; a row that can't be written raises RolesFailure (D-235), `note` says what became
+    of the call it describes."""
     k = (ctx.actor, name, v.outcome)
     if name.startswith("read:") and _roles_logged.get(k) == store.now_iso()[:13]:
         return
+    pid = project_id if project_id is not None else next((p for p in v.projects if p is not None), None)
+    _roles_once(k, logging.WARNING, "roles (shadow): %s by %s would be %s: %s", name, ctx.actor, v.outcome,
+                v.reason)
     try:
-        pid = project_id if project_id is not None else next((p for p in v.projects if p is not None), None)
-        _roles_once(k, logging.WARNING, "roles (shadow): %s by %s would be %s: %s", name, ctx.actor, v.outcome,
-                    v.reason)
         roles_shadow_add(conn, actor=ctx.actor, session=ctx.actor_session, via=ctx.via, action=name,
                          outcome=v.outcome, reason=v.reason, project_id=pid)
-    except Exception as e:   # noqa: BLE001 - reported, never changes the call's outcome (shadow refuses nothing)
-        _roles_once((ctx.actor, name, "log failed"), logging.ERROR,
-                    "roles (shadow): could not log the verdict for %s by %s, dropped (%s: %s)", name, ctx.actor,
-                    type(e).__name__, e)
+    except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure: the caller gets an error, the owner an alert
+        raise RolesFailure("the shadow log could not be written",
+                           f"{name} by {ctx.actor}: {type(e).__name__}: {e}", note) from e
+
+
+def _shadow_after(conn: sqlite3.Connection, ctx: Ctx, name: str, v: permissions.Verdict, note: str,
+                  cause: BaseException | None) -> None:
+    """The shadow row of a write, after its transaction (it must outlive the old rule's refusal). If it can't be
+    written the owner is alerted (the alert says what became of the action) and the caller gets the error,
+    instead of the action's outcome: the action has been committed (or refused) already, which `note` states."""
+    try:
+        roles_shadow_log(conn, ctx, name, v, note=note)
+    except RolesFailure as f:
+        roles_report(f)
+        raise f from cause
 
 
 def read_filter(conn: sqlite3.Connection, actor: str, session: str | None, via: str, what: str,
@@ -370,9 +432,9 @@ def read_filter(conn: sqlite3.Connection, actor: str, session: str | None, via: 
     """A listing narrowed to what the caller may see (plan §3.4: a machine user sees its projects only, an agent
     its project, a viewer reads questions). Shadow mode returns every row and logs what it would have hidden
     (one shadow row per actor, listing and hour); `on` returns the narrowed list. `project_of(row)`: the row's
-    project, None = global (owner only, or public with public_global: install-wide decisions). In shadow
-    nothing in here may break a listing: an error is logged (once an hour) and the rows come back unchanged;
-    with `on` it raises (D-235)."""
+    project, None = global (owner only, or public with public_global: install-wide decisions). A filter that
+    fails (a crash, an unusable setting, a shadow row that can't be written) raises RolesFailure and alerts the
+    owner (D-235): the listing is not returned unfiltered; database errors take the DB error path."""
     rows = list(rows)
     try:
         visible = permissions.visible_projects(conn, actor, session)
@@ -382,26 +444,25 @@ def read_filter(conn: sqlite3.Connection, actor: str, session: str | None, via: 
         keep = [r for r, ok in zip(rows, shown) if ok]
         if len(keep) == len(rows):
             return rows
-        if roles_mode(conn) == "on":
+        if roles_mode(conn, report=False) == "on":
             return keep
         hidden = sorted({p for r, ok in zip(rows, shown) if not ok for p in [project_of(r)] if p is not None})
         verdict = permissions.Verdict(
             "filtered", f"would hide {len(rows) - len(keep)} of {len(rows)} rows" +
             (f" (projects {hidden})" if hidden else " (global rows)"))
         roles_shadow_log(conn, Ctx(actor, via, None, False, session), f"read:{what}", verdict,
-                         project_id=hidden[0] if hidden else None)
+                         project_id=hidden[0] if hidden else None, note="the listing was not returned")
         return rows
-    except Exception as e:   # noqa: BLE001 - shadow: a listing never breaks on the diagnostic; `on` raises (D-235)
-        try:
-            enforcing = roles_mode(conn) == "on"
-        except Exception:    # noqa: BLE001 - the mode itself unreadable: not enforcing
-            enforcing = False
-        if enforcing:
-            raise
-        _roles_once((actor, f"read:{what}", "filter failed"), logging.ERROR,
-                    "roles (shadow): the read filter for %s by %s failed, rows unchanged (%s: %s)", what, actor,
-                    type(e).__name__, e)
-        return rows
+    except RolesFailure as f:
+        roles_report(f)
+        raise
+    except (sqlite3.Error, store.DBError):
+        raise
+    except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure (D-235)
+        failure = RolesFailure("the read filter failed", f"{what} by {actor}: {type(e).__name__}: {e}",
+                               "the listing was not returned")
+        roles_report(failure)
+        raise failure from e
 
 
 def _check_params(spec: Spec, params: Mapping[str, Any]) -> None:

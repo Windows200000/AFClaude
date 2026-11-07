@@ -342,11 +342,16 @@ def run_roles(conn, args):
     """Phase 5a A3: the shadow log of the permission matrix (setting roles_enforce): what it would have refused,
     turned into a proposal or hidden from a listing, grouped for the daily list the task-manager reviews."""
     if args.roles_cmd == "mode":
-        mode, problem = actions.roles_mode(conn), actions.roles_mode_problem(conn)
+        if args.set_mode:
+            act(conn, "setting.set", key="roles_enforce", value=args.set_mode)   # perform lets this repair through
+        problem = actions.roles_mode_problem(conn)
+        mode = None if problem else actions.roles_mode(conn)
         if args.json:
             return print(json.dumps({"roles_enforce": mode, "problem": problem}))
-        return print(f"roles_enforce: {mode}" + (f"\nPROBLEM: the saved value can't be used, behaving as shadow: "
-                                                f"{problem}" if problem else ""))
+        return print(f"roles_enforce: {mode}" if mode else
+                     f"roles_enforce: UNUSABLE\nPROBLEM: the saved value can't be used (every write the matrix "
+                     f"would not allow fails until it is repaired: `python3 tasks.py roles mode --set shadow`): "
+                     f"{problem}")
     day = args.day or (None if args.since else datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d"))
     rows = store.roles_shadow_list(conn, day, args.since)
     if args.json:
@@ -1451,7 +1456,9 @@ def parser():
                       "hidden (today's list; --day, --since for others)")
     q.add_argument("--day", help="YYYY-MM-DD (Berlin), default today")
     q.add_argument("--since", help="every day from YYYY-MM-DD on")
-    rs.add_parser("mode", parents=[js], help="the roles_enforce setting")
+    q = rs.add_parser("mode", parents=[js], help="the roles_enforce setting (--set: write it, the repair of an "
+                      "unusable saved value)")
+    q.add_argument("--set", dest="set_mode", choices=("shadow", "on"), help="save this value (setting.set)")
     return ap
 
 
