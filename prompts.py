@@ -711,10 +711,11 @@ def _project(conn: sqlite3.Connection, ref: str) -> store.Row:
 
 def _perform(name: str, params: dict[str, Any], deploy: bool = False) -> Any:
     import actions
+    import identity
     import store
     conn = store.connect()
     try:
-        return actions.perform(conn, name, params, actor="runner:deploy" if deploy else "cli",
+        return actions.perform(conn, name, params, actor="runner:deploy" if deploy else identity.cli_identity(conn).actor,
                                via="runner" if deploy else "cli")
     finally:
         conn.close()

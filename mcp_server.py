@@ -10,8 +10,8 @@ added here is the same as one added in the UI/CLI: no approval step.
     .venv/bin/python mcp_server.py        (Claude Code starts it; see mcp_register.md)
 
 Reads through store.py (schema v4, same DB as tasks.py: $AFCLAUDE_DB or data/afclaude.db);
-every write goes through actions.py (validation, one transaction, an audit row as
-actor mcp:<session>; an autonomous AFClaude session, CLAUDE_GUARD_DISABLE=1 or a
+every write goes through actions.py (validation, one transaction, an audit row as the
+caller's principal, identity.py: machine:<id>, task-manager:<session>, agent:<session>[:<subagent>]; an autonomous AFClaude session, CLAUDE_GUARD_DISABLE=1 or a
 session AFClaude drives, may not decide sessions or change rules)
 and the official MCP Python SDK (mcp 2.x, MCPServer), installed in .venv/
 (Python 3.12; the system python3 is 3.9, too old for the SDK).
@@ -31,8 +31,10 @@ value) come back as tool errors with a one-line message; a database error
 (docs/dashboard_design/07_data_model.md §7.8) as a tool error holding a JSON object
 {"error": {error_class, kind, message, not_saved, escalation, next_step}}.
 """
+import contextvars
 import functools
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -44,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write)
+import identity  # noqa: E402  (who is calling: machine user, task-manager or agent, phase 5a A2)
 import prompts  # noqa: E402  (the prompt registry: read-only view, phase 4a P4)
 import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
 
@@ -69,7 +72,28 @@ INSTRUCTIONS = (
     "works it on its own in its next run (runs begin at the nightly session-window starts). Tasks are stages of ranked projects; execution order is all "
     "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin.")
 
-server = MCPServer(
+# The identity hook's stamp on the call being served (identity_hook.py adds `_afc` to the arguments of every
+# afclaude call; the SDK would drop the unknown argument before a tool runs, so call_tool takes it out first).
+STAMP: contextvars.ContextVar[Mapping[str, Any] | None] = contextvars.ContextVar("afclaude_stamp", default=None)
+log = logging.getLogger("afclaude.mcp")
+UNSTAMPED_NOTE = ("an afclaude call arrived without the identity hook's stamp (the hooks in .claude/settings.json "
+                  "are missing or failed): the server's own env names the session, so a subagent counts as "
+                  "its parent")
+unstamped_noted = False
+
+
+class AFClaudeServer(MCPServer[Any]):
+    """MCPServer that moves the hook's `_afc` stamp out of the arguments into STAMP for the tool run."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
+        token = STAMP.set(arguments.pop(identity.STAMP_KEY, None))
+        try:
+            return await super().call_tool(name, arguments, context)
+        finally:
+            STAMP.reset(token)
+
+
+server = AFClaudeServer(
     name="afclaude",
     instructions=INSTRUCTIONS,
     log_level="WARNING",
@@ -136,26 +160,39 @@ def session_id_env() -> str | None:
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
+def who(conn: sqlite3.Connection) -> identity.Identity:
+    """The caller as identity.py resolves it: the hook's stamp (the session id Claude Code says now and the
+    subagent id) against the server's own env (the id it started with; a /clear goes on in the same process)."""
+    global unstamped_noted
+    stamp = STAMP.get()
+    if stamp is None and not unstamped_noted:
+        unstamped_noted = True
+        log.warning(UNSTAMPED_NOTE)
+    return identity.resolve(conn, os.environ, stamp=stamp, transport="mcp")
+
+
 def current_session_id(conn: sqlite3.Connection | None = None) -> str | None:
     """The calling session's id as it is now (D-328): $CLAUDE_CODE_SESSION_ID is fixed when the
     process starts, and a /clear goes on in the same process (this server included) under a new
-    id; with a connection, the "cleared" chain is followed to its newest id (actions.current_session)."""
-    sid = session_id_env()
-    return actions.current_session(conn, sid) if sid and conn is not None else sid
+    id; with a connection, the hook's stamp and the "cleared" chain give its newest id (identity.resolve_session)."""
+    return who(conn).session if conn is not None else session_id_env()
 
 
 def actor(conn: sqlite3.Connection | None = None) -> str:
-    """mcp:<calling session> for the audit log (plain mcp if the client didn't pass its id); with a
-    connection, the session's current id after its /clears (current_session_id)."""
-    sid = current_session_id(conn)
+    """The audit actor of the caller (identity.py: machine:<id>, task-manager:<session>, agent:<session>[:<id>]).
+    Without a connection (the DB error path, where no classification is possible) the old mcp[:<session>]."""
+    if conn is not None:
+        return who(conn).actor
+    sid = session_id_env()
     return f"mcp:{sid}" if sid and actions.ACTOR_RE.match(f"mcp:{sid}") else "mcp"
 
 
 def act(conn: sqlite3.Connection, action: str, /, **params: Any) -> Any:
-    """One write through the shared write path. The guard-hook bypass marks a session
-    AFClaude launched (autonomous), whatever its id."""
-    return actions.perform(conn, action, params, actor=actor(conn), via="mcp",
-                           autonomous=os.environ.get("CLAUDE_GUARD_DISABLE") == "1")
+    """One write through the shared write path, as the caller's principal. `autonomous` marks a session
+    AFClaude launched or drives (the guard-hook bypass, whatever its id)."""
+    w = who(conn)
+    return actions.perform(conn, action, params, actor=w.actor, via="mcp", autonomous=w.autonomous,
+                           session=w.session)
 
 
 def _no_project_dir(path: str) -> bool:

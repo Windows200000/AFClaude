@@ -87,6 +87,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import afclaude_config
+import identity  # phase 5a A2: the actor of a hand-run path is the calling session, never a runner
 import claude_auth  # D-320: an expired login, told apart from other failures
 import runner_state  # phase 2d: the state lives in the DB only (D-161); the log is dual-written
 import schedule
@@ -845,7 +846,7 @@ def _live_holder(conn, name, session_id):
     return (str(r[0]), str(r[1])) if r else None
 
 
-def claim_tmux(session_id, kind, project=None, title=None, arm=True, actor="keepalive", conn=None):
+def claim_tmux(session_id, kind, project=None, title=None, arm=True, actor=None, conn=None):
     """The tmux name a launcher starts or continues `session_id` under, stored in its
     driven_sessions row before ka_resume.sh runs (phase 3b S2, D-147; names.py). A live row keeps
     its name; a task-manager's row is never made here (3b S1). Otherwise names.tmux_name(kind, ...)
@@ -857,6 +858,7 @@ def claim_tmux(session_id, kind, project=None, title=None, arm=True, actor="keep
     import actions
     import names
     import store
+    actor = actor or identity.runner_actor("keepalive")
     own = conn is None
     conn = store.connect() if own else conn
     try:
@@ -906,13 +908,14 @@ def _free_tmux(conn, session_id, kind, project, title, arm, actor):
         taken.add(name)
 
 
-def rename_tmux(old, new, actor="cli", via="cli"):
+def rename_tmux(old, new, actor=None, via="cli"):
     """Rename the live tmux session `old` to `new` and its driven_sessions row with it (D-281: the
     task-manager's ka-<id8> once, after 3b S2; docs/phase3b_plan.md §3.3, rollback §3.4). Only
     at a quiet moment: refused while a terminal is attached to it or a start, compaction or inbox
     delivery holds the session's lock. The row update failing renames the tmux session back.
     -> the session id. Any problem raises."""
     import actions
+    import identity
     import names
     import store
     for n in (old, new):
@@ -923,6 +926,7 @@ def rename_tmux(old, new, actor="cli", via="cli"):
     conn = store.connect()
     lock = None
     try:
+        actor = actor or identity.cli_identity(conn).actor
         rows = [r for r in store.driven_sessions(conn, include_ended=False) if r["tmux"] == old]
         if len(rows) != 1:
             raise ValueError(f"{len(rows)} live driven_sessions rows are named {old} (need exactly one)")
@@ -1229,7 +1233,7 @@ def record_typed(session_id, message, driver, category, prompt, actor):
 
 
 def fire(session_id, cwd, message, plan, new=False, name=None, model=None, category=remote_control.TASK_MANAGER,
-         *, driver, prompt, actor="keepalive"):
+         *, driver, prompt, actor=None):
     """The one state-changing action: hand over to ka_resume.sh (tmux, no --bg) under the
     session's stored tmux name (tmux_name: its launcher stored it first, claim_tmux; none is an
     error). name (the Remote Control display name, default the tmux name) / model override
@@ -1240,6 +1244,7 @@ def fire(session_id, cwd, message, plan, new=False, name=None, model=None, categ
     (record_typed, usage split S2). All are resolved first, so a failure there (the record
     included: D-235, no untracked message) changes nothing. A session cleared into another id
     raises (cleared_refusal, D-328)."""
+    actor = actor or identity.runner_actor("keepalive")
     if driver not in TYPED_DRIVERS:
         raise ValueError(f"fire: driver must be one of {'|'.join(TYPED_DRIVERS)}, got {driver!r}")
     why = cleared_refusal(session_id)
@@ -2513,9 +2518,10 @@ def _picked(stall):
     return {"project": p["name"], "why": p["why"]} if p else {}
 
 
-def _run_log(decision, reason, sid=None, once=None, component="keepalive", actor="keepalive"):
+def _run_log(decision, reason, sid=None, once=None, component="keepalive", actor=None):
     import actions
     import store
+    actor = actor or identity.runner_actor("keepalive")
     conn = store.connect()
     try:
         return actions.run_log_add(conn, component, decision, reason, session_id=sid, actor=actor, via="runner",
@@ -2636,7 +2642,7 @@ def _fillup_logged(key, sid, reason, st):
         fail_stop(f"start {key}: its FILLUP row could not be written to run_log", f"{type(e).__name__}: {e}")
 
 
-def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
+def create_task_manager(project, arm=True, insert=None, actor=None):
     """The shared "create this project's task-manager session" helper (phase 3b S1/S4/S5, D-281: a
     project's session is created at its first start, or by work_on_now): a new session id, its
     project's manager_session (project.edit) and its driven_sessions task-manager row (driven.set,
@@ -2650,6 +2656,7 @@ def create_task_manager(project, arm=True, insert=None, actor="keepalive"):
     kept (it may be starting) and raised as an error too, as is a failed tmux check. arm False: the
     name only, nothing written or started. -> {session, tmux, message, rc, out, err, sent_at, reply}
     (reply None: no reply within VERIFY_TIMEOUT, the caller's error)."""
+    actor = actor or identity.runner_actor("keepalive")
     import actions
     import store
     if not project.get("path"):
@@ -3435,7 +3442,7 @@ def move_cleared(old, new):
     conn = store.connect()
     try:
         res = actions.perform(conn, "session.cleared", {"old_session": old, "new_session": new},
-                              actor="keepalive", via="runner")
+                              actor=identity.runner_actor("keepalive", conn), via="runner")
     finally:
         conn.close()
     log(f"compaction: {old[:8]} goes on as {new[:8]} (tmux {res.get('tmux')}, projects {res.get('projects')}, "
@@ -3889,7 +3896,7 @@ def consume_handoff(h, start_key):
         conn = store.connect()
         try:
             actions.perform(conn, "handoff.consume", {"handoff_id": h["id"], "start_key": start_key},
-                            actor="keepalive", via="runner")
+                            actor=identity.runner_actor("keepalive", conn), via="runner")
         finally:
             conn.close()
         return True
@@ -3944,7 +3951,7 @@ def _inbox_act(name, ids, **params):
         conn = store.connect()
         try:
             for i in ids:
-                actions.perform(conn, name, dict(params, message_id=i), actor="keepalive", via="runner")
+                actions.perform(conn, name, dict(params, message_id=i), actor=identity.runner_actor("keepalive", conn), via="runner")
         finally:
             conn.close()
         return True
@@ -3975,7 +3982,7 @@ def inbox_included(ids, by):
     try:
         conn = store.connect()
         try:
-            actions.perform(conn, "inbox.include", {"message_ids": list(ids), "by": by}, actor="keepalive",
+            actions.perform(conn, "inbox.include", {"message_ids": list(ids), "by": by}, actor=identity.runner_actor("keepalive", conn),
                             via="runner")
         finally:
             conn.close()
@@ -4807,7 +4814,7 @@ def _end_stale(r, arm):
     conn = store.connect()
     try:
         actions.perform(conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
-                        actor="keepalive", via="runner")
+                        actor=identity.runner_actor("keepalive", conn), via="runner")
     finally:
         conn.close()
     log(line)

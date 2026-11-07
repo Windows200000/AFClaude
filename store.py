@@ -95,6 +95,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                machine_registrations (one-time codes, hashes only), agent_proposals and agent_runs
                (empty until A4); `users` and `grants` carry the trigger-bumped `version`
                (actions.py's grant.*, user.* and machine.* write them; roles.py holds the rules).
+               Phase 5a A2 (COLUMNS): audit_log.session, the Claude session behind a machine,
+               task-manager or agent actor (identity.py).
 
 Schema guard (docs/dashboard_design/07_data_model.md §7.1, review A1): this code writes only to a
 database whose schema_version it knows. A newer one (written by newer code) is left
@@ -1092,6 +1094,9 @@ COLUMNS = {
               # question to the human inbox (A4 uses them; NULL everywhere until then)
               ("blocked_by", "TEXT"), ("forwarded_at", "TEXT")],
     "task_events": [],
+    # phase 5a A2 (§3.1): the Claude session behind a machine, task-manager or agent actor (NULL for the host,
+    # runners, people and every row before this column). `origin` (A4's proposal link) comes with its step.
+    "audit_log": [("session", "TEXT")],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
     # D-227: base_sha256 vs the current prompt_defaults.sha256, refreshed by prompt.defaults_sync
@@ -2952,12 +2957,13 @@ def put_prompt_var(conn: sqlite3.Connection, project_id: int, name: str, value: 
 
 def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,
               target_id: object = None, before: object = None, after: object = None,
-              request_id: str | None = None, ts: str | None = None) -> int:
+              request_id: str | None = None, ts: str | None = None, session: str | None = None) -> int:
+    """`session`: the Claude session behind a machine, task-manager or agent actor (phase 5a A2)."""
     cur = conn.execute(
-        "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id, session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts or now_iso(), actor, via, action, target_type, None if target_id is None else str(target_id),
-         _json_or_none(before), _json_or_none(after), request_id))
+         _json_or_none(before), _json_or_none(after), request_id, session))
     return _rowid(cur)
 
 

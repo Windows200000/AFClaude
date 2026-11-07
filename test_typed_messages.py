@@ -116,7 +116,7 @@ class Fire(DB):
         self.assertEqual(len(self.seen_at_send), 1)
         r = self.seen_at_send[0]
         self.assertEqual((r["session_id"], r["driver"], r["prompt"], r["category"], r["actor"]),
-                         (SID, "auto", "continue", "task_manager", "keepalive"))
+                         (SID, "auto", "continue", "task_manager", "runner:keepalive"))
         self.assertEqual(r["text_sha256"], us.text_hash("[keep-alive] A new run starts"))
         ka.fire(SID, "/tmp", "[AFClaude inbox #3] hi", "send-keys", category=ka.remote_control.CONTINUE,
                 driver="owner", prompt="inbox", actor="runner:inbox")

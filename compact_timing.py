@@ -179,11 +179,13 @@ def load(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
     return validate(json.loads(row[0]))
 
 
-def store_model(doc: Mapping[str, Any], actor: str = "cli", via: str = "cli") -> dict[str, Any]:
+def store_model(doc: Mapping[str, Any], actor: str | None = None, via: str = "cli") -> dict[str, Any]:
     """Replace the stored model (the audited action cost_model.set). Raises store.DBError / ValueError."""
     import actions
+    import identity
     conn = store.connect()
     try:
+        actor = actor or identity.cli_identity(conn).actor
         out: dict[str, Any] = actions.perform(conn, "cost_model.set", {"doc": dict(doc)}, actor=actor, via=via)
         return out
     finally:

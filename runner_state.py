@@ -420,11 +420,13 @@ def driven_family_ids() -> set[str]:
     return ids
 
 
-def own_session_add(session_id: str, actor: str = "cli", via: str = "cli") -> bool:
+def own_session_add(session_id: str, actor: str | None = None, via: str = "cli") -> bool:
     """Add an own session (driven_sessions kind 'own', audited). -> added (False: known)."""
     import actions
+    import identity
     conn = store.connect()
     try:
+        actor = actor or identity.cli_identity(conn).actor
         legacy = os.path.join(data_dir(), OWN_FILE)
         if os.path.isfile(legacy) and store.get_meta(conn, MARK + "own_sessions") is None:
             import_own_sessions(conn, legacy)          # the legacy list first, then it is retired

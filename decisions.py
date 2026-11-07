@@ -624,6 +624,7 @@ def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Opt
     backs the database up (<db>.preseed-<utc>.bak, store._backup_copy) and runs it in one transaction.
     -> the action's result (counts per class against the file's)."""
     import actions
+    import identity
     if not topics_path or not merges_path:
         raise SeedRefused("seed needs --topics FILE and --merges FILE")
     topics, merges, keep = load_seed_files(topics_path, merges_path)
@@ -631,7 +632,7 @@ def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Opt
                               "merges": merges, "keep": keep}
     conn = store.connect(db_path)
     try:
-        report: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
+        report: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor=identity.cli_identity(conn).actor, via="cli")
         if dry_run:
             return report
         params["dry_run"] = False
@@ -639,7 +640,7 @@ def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Opt
         if db_file is None:
             raise SeedRefused("the database is not a file: no backup can be made")
         params["backup"] = store._backup_copy(conn, db_file, "preseed")
-        result: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
+        result: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor=identity.cli_identity(conn).actor, via="cli")
         return result
     finally:
         conn.close()
@@ -651,10 +652,11 @@ def activate_own(owner_entries: Optional[list[str]] = None, *, db_path: Optional
     database is backed up (<db>.pred322-<utc>.bak, store._backup_copy) and the action runs in one transaction.
     -> the action's result (which entries go active, which questions close, which stay proposed)."""
     import actions
+    import identity
     params: dict[str, Any] = {"dry_run": True, "owner_entries": owner_entries or []}
     conn = store.connect(db_path)
     try:
-        report: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor="cli", via="cli")
+        report: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor=identity.cli_identity(conn).actor, via="cli")
         if dry_run or not (report["active"] or report["active_as_owners"]):
             return dict(report, dry_run=dry_run)
         db_file = store._db_file(conn)
@@ -662,7 +664,7 @@ def activate_own(owner_entries: Optional[list[str]] = None, *, db_path: Optional
             raise SeedRefused("the database is not a file: no backup can be made")
         params["dry_run"] = False
         report["backup"] = store._backup_copy(conn, db_file, "pred322")
-        result: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor="cli", via="cli")
+        result: dict[str, Any] = actions.perform(conn, "decision.activate_own", params, actor=identity.cli_identity(conn).actor, via="cli")
         return dict(result, backup=report["backup"])
     finally:
         conn.close()
@@ -838,7 +840,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                              indent=1, ensure_ascii=False))
             return 0
         if args.cmd == "import":
-            print(json.dumps(import_file(args.file, args.db, actor="cli", via="cli", force=args.force),
+            import identity
+            print(json.dumps(import_file(args.file, args.db, actor=identity.cli_actor(args.db), via="cli", force=args.force),
                              indent=1, ensure_ascii=False))
             return 0
         conn = store.connect(args.db)

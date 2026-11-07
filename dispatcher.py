@@ -64,6 +64,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (detection, window, budget, preflight, fire, alert)
+import identity  # noqa: E402  (the runner actor runner:dispatcher, phase 5a A2)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import stalled  # noqa: E402  (scan, own markers, own list)
 import store  # noqa: E402
@@ -408,7 +409,8 @@ class Pass:
             self.skip(label, "no existing working directory recorded; not resumable")
             return "refused", "no existing working directory recorded; not resumable"
         try:   # its readable tmux name (3b S2), stored before the launch (armed)
-            tmux = ka.claim_tmux(sid, "stall", title=r.get("title"), arm=self.arm, actor="dispatcher",
+            tmux = ka.claim_tmux(sid, "stall", title=r.get("title"), arm=self.arm,
+                                 actor=identity.DISPATCHER,
                                  conn=self.conn)
         except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
             if self.arm:
@@ -458,7 +460,8 @@ class Pass:
         try:
             rc, out, err = ka.fire(sid, cwd, msg, plan, name=name, model=model,
                                    category=ka.remote_control.CONTINUE,   # D-269
-                                   driver="auto", prompt="continue" if af else "continue_foreign", actor="dispatcher")
+                                   driver="auto", prompt="continue" if af else "continue_foreign",
+                                   actor=identity.DISPATCHER)
         except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): recorded, alerted, paused
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": plan, "result": "launch-error",
                                        "error": f"{type(e).__name__}: {e}"[:300]}
@@ -509,7 +512,7 @@ class Pass:
             # (the stall is handled; the mark is an error the next pass alerts on, Pass.run)
             # The typed_messages row first (usage split S2: rc_continue.send has no fire): a failed record
             # raises out of send() before anything is sent, into the error handler below (D-235).
-            ka.record_typed(sid, msg, "auto", ka.remote_control.CONTINUE, "continue_foreign", "dispatcher")
+            ka.record_typed(sid, msg, "auto", ka.remote_control.CONTINUE, "continue_foreign", identity.DISPATCHER)
             self.st["handled"][key] = {"at": store.iso(self.now), "plan": "rc-send", "result": "rc-sending",
                                        "thread": name}
             save_state(self.st)
@@ -639,7 +642,7 @@ class Pass:
             return
         import actions
         actions.perform(self.conn, "driven.set", {"session_id": sid, "ended_at": store.now_iso()},
-                        actor="dispatcher", via="runner")
+                        actor=identity.DISPATCHER, via="runner")
 
     def check_rc_sending(self):
         """An rc continue left at "rc-sending": its pass was killed (or the state lost) between the

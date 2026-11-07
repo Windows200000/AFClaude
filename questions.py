@@ -220,10 +220,11 @@ def import_questions(db_path: Optional[str] = None, path: Optional[str] = None, 
     """The CLI's import: the checks and counts as a dry run (always, first), then the backup
     (<db>.preqimport-<utc>.bak) and the action question.import in one transaction. -> the action's result."""
     import actions
+    import identity
     params: dict[str, Any] = {"dry_run": True, "path": os.path.abspath(path or DEFAULT_SOURCE), "project": project}
     conn = store.connect(db_path)
     try:
-        report: dict[str, Any] = actions.perform(conn, "question.import", params, actor="cli", via=IMPORT_VIA)
+        report: dict[str, Any] = actions.perform(conn, "question.import", params, actor=identity.cli_identity(conn).actor, via=IMPORT_VIA)
         if dry_run:
             return report
         params["dry_run"] = False
@@ -231,7 +232,7 @@ def import_questions(db_path: Optional[str] = None, path: Optional[str] = None, 
         if db_file is None:
             raise ImportRefused("the database is not a file: no backup can be made")
         params["backup"] = store._backup_copy(conn, db_file, "preqimport")
-        result: dict[str, Any] = actions.perform(conn, "question.import", params, actor="cli", via=IMPORT_VIA)
+        result: dict[str, Any] = actions.perform(conn, "question.import", params, actor=identity.cli_identity(conn).actor, via=IMPORT_VIA)
         return result
     finally:
         conn.close()

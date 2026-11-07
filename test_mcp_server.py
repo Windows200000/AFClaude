@@ -391,7 +391,7 @@ class DBErrors(Env):
         self.assertEqual(len(self.alerts), 1)
         recs = store.fallback_events(store.fallback_path(self.db))
         self.assertEqual([(r["actor"], r["action"], r["params"]["title"]) for r in recs if r["event"] == "failed"],
-                         [(f"mcp:{CALLER}", "task.add", "lost?")] * 2)
+                         [(f"agent:{CALLER}", "task.add", "lost?")] * 2)
 
     def test_corrupted_db(self):
         with open(self.db, "wb") as fh:
@@ -421,7 +421,7 @@ class Handoff(Env):
         self.assertEqual(h["body"]["next_steps"], ["b", "c"])
         self.assertEqual([h["body"][k] for k in ("owner_messages", "in_flight", "lessons", "working_notes")],
                          [["do X, verbatim"], ["branch b1"], ["retry first"], ["run it under .venv"]])   # D-305
-        self.assertEqual((audit["actor"], audit["via"]), (f"mcp:{CALLER}", "mcp"))
+        self.assertEqual((audit["actor"], audit["via"]), (f"agent:{CALLER}", "mcp"))
         self.assertEqual(r["working_notes"], 1)
         c = self.conn()
         try:
@@ -466,7 +466,7 @@ class Handoff(Env):
         c = self.conn()
         try:
             self.assertEqual(store.get_task(c, t["id"])["created_by_session"], new)
-            self.assertEqual({a["actor"] for a in store.audit_log(c, target_type="handoff")}, {f"mcp:{new}"})
+            self.assertEqual({a["actor"] for a in store.audit_log(c, target_type="handoff")}, {f"agent:{new}"})
         finally:
             c.close()
 
@@ -503,7 +503,7 @@ class Docs(Env):
             c.close()
         self.assertEqual(text, "- 10:00 first\n- 10:05 second\n")
         self.assertEqual({(a["actor"], a["action"]) for a in audit},
-                         {(f"mcp:{CALLER}", "doc.append"), (f"mcp:{CALLER}", "doc.set")})
+                         {(f"agent:{CALLER}", "doc.append"), (f"agent:{CALLER}", "doc.set")})
 
 
 
@@ -530,7 +530,7 @@ class Notices(Env):
             self.assertEqual([(t["id"], len(t["rows"]), t["needs_input"]) for t in v["threads"]],
                              [(m["id"], 2, True)])
             audit = store.audit_log(c, 5, "inbox")
-            self.assertEqual(audit[0]["actor"], f"mcp:{CALLER}")
+            self.assertEqual(audit[0]["actor"], f"agent:{CALLER}")
             with self.assertRaisesRegex(ToolError, "no inbox message #999"):
                 asyncio.run(ms.afclaude_reply(999, "x"))
             with self.assertRaisesRegex(ToolError, "answer must not be empty"):
@@ -547,7 +547,7 @@ class Notices(Env):
             c.close()
         r = run(ms.afclaude_notice("post", title="Review ready", text="Line 1\nLine 2", project="."))
         self.assertEqual((r["title"], r["text"], r["project"], r["by"]), ("Review ready", "Line 1\nLine 2", "Proj",
-                                                                           f"mcp:{CALLER}"))
+                                                                           f"agent:{CALLER}"))
         run(ms.afclaude_notice("post", title="Not about a project", text="x"))
         r = run(ms.afclaude_notice("list"))
         self.assertEqual([(n["title"], n.get("project")) for n in r["notices"]],
@@ -561,7 +561,7 @@ class Notices(Env):
             audit = store.audit_log(c, 5, "notice")
         finally:
             c.close()
-        self.assertEqual({(a["actor"], a["action"]) for a in audit}, {(f"mcp:{CALLER}", "notice.post")})
+        self.assertEqual({(a["actor"], a["action"]) for a in audit}, {(f"agent:{CALLER}", "notice.post")})
 
 
 DECISIONS_SRC = """## Budget
@@ -620,7 +620,7 @@ class Decisions(Env):
         try:
             self.assertEqual(store.get_decision_entry(conn, "D-001")["author"], "task-manager")
             a = store.audit_log(conn, 5, target_type="decision")[0]
-            self.assertEqual((a["action"], a["actor"].split(":")[0], a["via"]), ("decision.add", "mcp", "mcp"))
+            self.assertEqual((a["action"], a["actor"].split(":")[0], a["via"]), ("decision.add", "agent", "mcp"))
             actions.perform(conn, "decision.confirm", {"decision": "D-001"}, actor="cli", via="cli")
             actions.perform(conn, "decision.add", {"title": "Other", "topics": ["x"], "words": "w", "author": "owner"},
                             actor="cli", via="cli")
@@ -835,6 +835,30 @@ class Stdio(unittest.TestCase):
                 return json.loads(r.content[0].text)
         a = asyncio.run(go())
         self.assertEqual((a["project"], a["project_source"]), ("RootsProj", "roots"))
+
+    def test_the_identity_stamp_reaches_the_tool_and_names_the_caller(self):
+        """Phase 5a A2: the hook's `_afc` stamp survives the SDK (call_tool takes it out of the arguments
+        before they are validated) and decides the audit actor and its session column; a call without it
+        falls back to the server's own env."""
+        now = "99999999-2222-4333-8444-555555555555"      # the id after a /clear the server never saw
+
+        async def go():
+            async with Client(self.params, mode="legacy", read_timeout_seconds=30) as client:
+                call = lambda a: client.call_tool("afclaude_add_task", a)  # noqa: E731
+                return [json.loads((await call(a)).content[0].text) for a in (
+                    {"title": "env", "project": "P"},
+                    {"title": "stamped", "project": "P", "_afc": {"session": now}},
+                    {"title": "sub", "project": "P", "_afc": {"session": now, "agent": "a1b2", "agent_type": "w"}})]
+        tasks_ = asyncio.run(go())
+        c = store.connect(self.db)
+        try:
+            rows = {r["target_id"]: (r["actor"], r["session"])
+                    for r in store.audit_log(c, limit=20) if r["action"] == "task.add"}
+        finally:
+            c.close()
+        self.assertEqual([rows[str(t["id"])] for t in tasks_],
+                         [(f"agent:{CALLER}", CALLER), (f"agent:{now}", now), (f"agent:{now}:a1b2", now)])
+        self.assertEqual(tasks_[1]["title"], "stamped")
 
 
 if __name__ == "__main__":

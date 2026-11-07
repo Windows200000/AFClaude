@@ -527,12 +527,14 @@ def status(db_path: Optional[str] = None) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- CLI
 
-def set_user_model(doc: Any, actor: str = "cli", via: str = "cli") -> dict[str, Any]:
+def set_user_model(doc: Any, actor: str | None = None, via: str = "cli") -> dict[str, Any]:
     """Replace the user model in the DB (the audited action user_model.set; its legacy file is
     imported first if the kind never was). Raises store.DBError / ValueError."""
     import actions
+    import identity
     conn = store.connect()
     try:
+        actor = actor or identity.cli_identity(conn).actor
         store.retrying(lambda: _ensure_owned(conn, "usage.user_model"), conn)
         out: dict[str, Any] = actions.perform(conn, "user_model.set", {"doc": doc}, actor=actor, via=via)
         return out
