@@ -2292,8 +2292,9 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     one is refused (decisions.IdCollision) before anything is written, D-235. The result's "no_status" names every
     entry with no Status line (decisions.state_of defaults those to "active", or infers a state
     from a title marker like "SUPERSEDED" -- the list still names them all, so the plain ones stay
-    visible without editing DECISIONS.md). After the seeding (decision.seed) it imports nothing and reports whether the
-    file still has the seeded sha (decisions.import_file alerts on a change). Refused (decisions.SourceError): a file without entries
+    visible without editing DECISIONS.md). It is the seeding's first step (phase 4b Q2); once the seeding ran
+    the file is retired and the action is refused (decisions.SourceError, Q5: no reader of the file is left but
+    the seeding). Refused (decisions.SourceError): a file without entries
     or with a duplicate id, and one that would remove more than half of the stored entries
     (force=True allows that). An entry whose text is byte-for-byte the same as what's stored but
     whose derived fields (e.g. state) now come out different -- the derivation logic changed, not
@@ -2301,14 +2302,9 @@ def decision_import(conn: sqlite3.Connection, ctx: Ctx, path: Any, force: Any = 
     truly unchanged entry still writes nothing."""
     import decisions as dec
     src = os.path.abspath(store._text(path, "path", required=True))
-    if dec.source_of(conn) == "db":     # after the seeding (Q2) the DB is the only source: nothing is imported
-        try:
-            fsha: str | None = dec.read_source(src)[1]
-        except (OSError, UnicodeDecodeError):
-            fsha = None
-        seed_sha = store.get_meta(conn, dec.SEED_SHA_META)
-        return Result({"retired": True, "file": src, "sha256": fsha, "seed_sha256": seed_sha,
-                       "differs": fsha is not None and fsha != seed_sha}, os.path.basename(src), changed=False)
+    if dec.source_of(conn) == "db":     # after the seeding (Q2) the DB is the only source (D-242): D-235, no quiet no-op
+        raise dec.SourceError("the decisions are seeded: the DB is the only source and DECISIONS.md is not read "
+                              "any more (record a decision with `python3 tasks.py decision add`)")
     try:
         text, sha = dec.read_source(src)
     except (OSError, UnicodeDecodeError) as err:
@@ -2378,7 +2374,7 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
                       version: Any = None) -> Result:
     """Add or remove keywords of one decision (D-242: the task-manager keeps them current, e.g.
     when a lookup missed or a topic was renamed). Stored apart from the source's Keywords line
-    (store.decision_keywords), so a re-import keeps them. Removing a keyword the decision doesn't
+    (store.decision_keywords), so the imported line is never changed. Removing a keyword the decision doesn't
     have is an error; adding one it has is a no-op."""
     store._enum(op, ("add", "remove"), "op")
     words = [_keyword(k) for k in (keywords if isinstance(keywords, list) else [keywords])]
@@ -2416,9 +2412,9 @@ def decision_keywords(conn: sqlite3.Connection, ctx: Ctx, decision: Any, op: Any
 
 # ---- native decisions (phase 4b Q1; D-104, D-158, D-176, D-284, D-285, D-286)
 #
-# decision.add writes an entry into the DB itself (origin 'db'); until the seeding step the DECISIONS.md
-# import owns the other rows (origin 'file'), so edit / expire / delete / confirm refuse those: change the
-# file (the import follows within 10 minutes). Topics, keywords and links work on every row.
+# decision.add writes an entry into the DB itself (origin 'db'). Since the seeding every row is the DB's own
+# (origin 'db'; the column goes in a later bundled schema step, phase 4b Q5), so the old refusal of the
+# DECISIONS.md mirror rows (origin 'file') on edit / expire / delete / confirm is gone.
 # Who may do what: the owner's words recorded by the task-manager are active at once (D-285), through the
 # CLI or MCP record (author owner, `words` required; an autonomous session's words must occur in a stored
 # owner message of its own session, owner_words.py, Q2); the task-manager's own entries are active at once
@@ -2448,13 +2444,10 @@ def _decision_view(d: Mapping[str, Any]) -> dict[str, Any]:
             "version": d["version"]}
 
 
-def _decision_row(conn: sqlite3.Connection, decision: Any, native: bool = False) -> store.Row:
+def _decision_row(conn: sqlite3.Connection, decision: Any) -> store.Row:
     cur = store.get_decision_entry(conn, decision)
     if cur is None:
         raise store.NotFound(f"no decision {decision}")
-    if native and cur["origin"] != "db":
-        raise ValueError(f"{cur['id']} mirrors DECISIONS.md until the seeding step: change it there (the import "
-                         "follows within 10 minutes); topics, keywords and links can be changed here")
     return cur
 
 
@@ -2665,7 +2658,7 @@ def decision_add(conn: sqlite3.Connection, ctx: Ctx, title: Any, topics: Any, au
         if p is None:
             raise store.NotFound(f"no project {project!r}")
         pid = p["id"]
-    sup = [_decision_row(conn, i, native=True)["id"] for i in _ids(supersedes)]
+    sup = [_decision_row(conn, i)["id"] for i in _ids(supersedes)]
     if sup and author != "task-manager":
         raise ValueError("supersedes belongs to a task-manager proposal (confirming it replaces the originals); "
                          "an owner's entry that replaces another is the owner's to delete it")
@@ -2721,7 +2714,7 @@ def decision_edit(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version: An
     empty). An owner's decision can't be edited by an autonomous session (D-104), and nobody edits its
     words or summary (a rewording is a proposal, D-285); the state changes through decision.confirm /
     expire / delete."""
-    cur = _decision_row(conn, decision, native=True)
+    cur = _decision_row(conn, decision)
     _check_version(cur, version, f"decision {cur['id']}")
     _decision_owner_guard(conn, ctx, cur, "edit")
     if not fields:
@@ -2763,7 +2756,7 @@ def decision_delete(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
     """Delete a native decision that no longer applies (replaced, withdrawn) with its topics and links; the
     whole old entry and the reason stay in the audit row (D-158: the change history). An owner's decision:
     not for an autonomous session (D-104)."""
-    cur = _decision_row(conn, decision, native=True)
+    cur = _decision_row(conn, decision)
     _decision_owner_guard(conn, ctx, cur, "delete")
     return _decision_remove(conn, cur, version, store._text(reason, "reason", required=True))
 
@@ -2774,7 +2767,7 @@ def decision_expire(conn: sqlite3.Connection, ctx: Ctx, decision: Any, reason: A
     """An expired one-off leaves the list for the change history (D-286): deleted with the reason "expired"
     (plus `reason`) in the audit row. An autonomous session may do this only to an entry whose Status says
     "active until <date>" with that date past (D-278); any other owner's entry is the owner's to remove."""
-    cur = _decision_row(conn, decision, native=True)
+    cur = _decision_row(conn, decision)
     if _protected(cur) and decision_autonomous(conn, ctx):
         until = decisions.until_of(cur["status"] or "")
         if until is None or datetime.now(decisions.BERLIN) < until:
@@ -2794,7 +2787,7 @@ def decision_confirm(conn: sqlite3.Connection, ctx: Ctx, decision: Any, version:
     that names the id (owner_words.find; `ref` picks one when several do; D-104, D-198). The entries a
     proposal `supersedes` are deleted in the same transaction, each audited "replaced by D-NNN"; the confirm
     is refused (nothing written) if one of them no longer exists."""
-    cur = _decision_row(conn, decision, native=True)
+    cur = _decision_row(conn, decision)
     autonomous = decision_autonomous(conn, ctx)
     if ref is not None and not autonomous:
         raise ValueError("from (ref) names the owner's message an autonomous session confirms against; "
@@ -2822,7 +2815,7 @@ def _apply_confirm(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any],
         if old is None:
             raise store.NotFound(f"{cur['id']} replaces {i}, which no longer exists: nothing was confirmed; edit "
                                  f"the proposal's replaced list or propose it again (decision.delete {cur['id']})")
-        olds.append(_decision_row(conn, i, native=True))
+        olds.append(_decision_row(conn, i))
     status = "active" if (cur["status"] or "").startswith(decisions.PROPOSED_PREFIX) else cur["status"]
     body = decisions.render_body(cur["id"], cur["title"], type=cur["type"], date=cur["date"], status=status,
                                  summary=cur["summary"], words=cur["words"], source=cur["source"],
@@ -2862,7 +2855,7 @@ def decision_activate_own(conn: sqlite3.Connection, ctx: Ctx, dry_run: Any = Fal
         raise ValueError("dry_run must be true or false")
     owners = _ids(owner_entries)
     for i in owners:
-        d = _decision_row(conn, i, native=True)
+        d = _decision_row(conn, i)
         if d["author"] != "task-manager" or not d["words"] or decisions.replaced_ids(d["supersedes"]):
             raise ValueError(f"{i} is not a task-manager entry that records the owner's words and replaces nothing")
     activate: list[str] = []
@@ -2870,7 +2863,7 @@ def decision_activate_own(conn: sqlite3.Connection, ctx: Ctx, dry_run: Any = Fal
     stay: dict[str, list[str]] = {}
     close: list[int] = []
     for d in store.list_decision_entries(conn, ("proposed", "active")):
-        if d["origin"] != "db" or d["author"] != "task-manager":
+        if d["author"] != "task-manager":
             continue
         q = store.open_decision_question(conn, d["id"])
         if d["state"] == "active" and q is None:
@@ -2889,7 +2882,7 @@ def decision_activate_own(conn: sqlite3.Connection, ctx: Ctx, dry_run: Any = Fal
     if dry_run or not (activate or as_owner):
         return Result(report, "activate_own", changed=False)
     for did in activate + as_owner:
-        cur = _decision_row(conn, did, native=True)
+        cur = _decision_row(conn, did)
         status = "active" if (cur["status"] or "").startswith(decisions.PROPOSED_PREFIX) else cur["status"]
         body = decisions.render_body(did, cur["title"], type=cur["type"], date=cur["date"], status=status,
                                      summary=cur["summary"], words=cur["words"], source=cur["source"],
@@ -3098,23 +3091,19 @@ def question_close(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, reason: Any
 
 @action("question.import", "task")
 def question_import(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, project: Any = None,
-                    dry_run: Any = False, undo: Any = False, backup: Any = None) -> Result:
+                    dry_run: Any = False, backup: Any = None) -> Result:
     """The one-time cut-over (CLI only: refused for MCP and the dashboard). Each item of OPEN_QUESTIONS.md
     becomes a question for the project (title = the heading without its Q-...: label, D-263; text = the
     item verbatim, D-279), asked the way task.ask asks one; then every proposal
     without an open question gets its decision question (ensure_decision_questions).
-    Meta questions_source=db, questions_file_sha and questions_imported (every question id the import made,
-    for undo). dry_run: the checks and the counts, nothing written. undo: refused, every reason listed, if an
-    imported question was answered, decided or closed; else the imported questions (the decision questions
-    too) are cancelled ("import undone") and the source is the file again. The preconditions are in
-    questions.plan_import; any failure writes nothing."""
+    Meta questions_source=db, questions_file_sha and questions_imported (every question id the import made, a
+    record). dry_run: the checks and the counts, nothing written. There is no undo (phase 4b Q5 retired the
+    file; the preqimport backup is the way back). The preconditions are in questions.plan_import; any failure
+    writes nothing."""
     if ctx.via != questions.IMPORT_VIA:
         raise Forbidden(f"question.import is for the CLI only (questions.py import), not {ctx.via}")
-    for k, v in (("dry_run", dry_run), ("undo", undo)):
-        if not isinstance(v, bool):
-            raise ValueError(f"{k} must be true or false")
-    if undo:
-        return _question_import_undo(conn, dry_run)
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be true or false")
     plan = questions.plan_import(conn, os.path.abspath(store._text(path, "path", required=True)),
                                  store._text(project, "project"))
     pending = pending_decision_questions(conn)
@@ -3133,7 +3122,6 @@ def question_import(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, projec
     every = ids + [int(a["question"]) for a in asked]
     store.set_meta(conn, questions.SOURCE_META, "db")
     store.set_meta(conn, questions.FILE_SHA_META, plan.sha)
-    store.set_meta(conn, questions.CHANGED_MARK, "")
     store.set_meta(conn, questions.IMPORTED_META, json.dumps(
         {"at": store.now_iso(), "backup": backup, "sha256": plan.sha, "items": ids,
          "decisions": {a["decision"]: a["question"] for a in asked}}, ensure_ascii=False))
@@ -3141,39 +3129,6 @@ def question_import(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, projec
     return Result(out, "import", {"source": "file"},
                   {"source": "db", "sha256": plan.sha, "counts": report["counts"], "backup": backup,
                    "questions": every})
-
-
-def _question_import_undo(conn: sqlite3.Connection, dry_run: bool) -> Result:
-    """question.import with undo: see the action."""
-    if questions.source_of(conn) != "db":
-        raise questions.ImportRefused("nothing to undo: the questions are not imported (questions_source is not db)")
-    try:
-        rec = json.loads(store.get_meta(conn, questions.IMPORTED_META) or "")
-        ids = [int(i) for i in rec["items"]] + [int(i) for i in rec["decisions"].values()]
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
-        raise questions.ImportRefused(f"the import's record (meta questions_imported) is unreadable: {e}") from e
-    problems: list[str] = []
-    for qid in ids:
-        t = store.get_task(conn, qid)
-        if t is None:
-            problems.append(f"question #{qid} is gone")
-        elif t["status"] != "blocked":
-            what = "answered or decided" if t["status"] == "done" else t["status"]
-            problems.append(f"question #{qid} ({t['title'][:50]}) was {what}: it is not open any more")
-    if problems:
-        raise questions.ImportRefused("the undo is refused, nothing was changed (stay on the DB and fix forward; "
-                                      "restoring the preqimport backup loses every write since and needs the "
-                                      "owner's OK):\n  - " + "\n  - ".join(problems))
-    report = {"undo": True, "cancelled": ids, "dry_run": dry_run}
-    if dry_run:
-        return Result(report, "import", changed=False)
-    for qid in ids:
-        store.cancel_task(conn, qid, "import undone")
-    store.set_meta(conn, questions.SOURCE_META, "file")
-    for k in (questions.FILE_SHA_META, questions.IMPORTED_META, questions.CHANGED_MARK):
-        store.set_meta(conn, k, "")
-    return Result(report, "import", {"source": "db"},
-                  {"source": "file", "cancelled": ids, "reason": "import undone"})
 
 
 # ---- the seeding (phase 4b Q2, §3.3): the DB becomes the only decision source; decisions.py checks and
@@ -3184,7 +3139,7 @@ SEED_ACTOR_VIA = "cli"
 
 @action("decision.seed", "decision")
 def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: Any = None, merges: Any = None,
-                  keep: Any = None, dry_run: Any = False, undo: Any = False, backup: Any = None) -> Result:
+                  keep: Any = None, dry_run: Any = False, backup: Any = None) -> Result:
     """The one-time cut-over (CLI only: refused for MCP and the dashboard). The rows the DECISIONS.md import
     holds (origin file) become the DB's own (origin db): active and partly superseded entries unchanged, with
     their topics (1-3 each, D-284); superseded, done and expired ones are deleted with the full text in the audit
@@ -3192,20 +3147,15 @@ def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: 
     content is in the DB; each merge becomes a proposed task-manager entry carrying the originals' owner
     words with their dates and listing them under `supersedes` (the originals stay in force until the owner
     confirms it, D-104, D-285). Meta decisions_source=db, decisions_seed_sha, decision_id_floor (the file's
-    highest id) and decisions_seeded (ids and versions, for undo). dry_run: the checks and the counts, nothing
-    written. undo: back to the file as the source, refused if a seeded row changed since (its version) or a seeded
-    proposal was confirmed; it deletes the seed's proposals (audited) and the next import re-adds the deleted
-    entries from the untouched file. Preconditions are in decisions.seed_plan; any failure writes nothing."""
+    highest id) and decisions_seeded (ids and versions, a record). dry_run: the checks and the counts, nothing
+    written. There is no undo (phase 4b Q5 retired the file; the preseed backup is the way back). Preconditions
+    are in decisions.seed_plan; any failure writes nothing."""
     if ctx.via != SEED_ACTOR_VIA:
         raise Forbidden(f"decision.seed is for the CLI only (decisions.py seed), not {ctx.via}")
-    for k, v in (("dry_run", dry_run), ("undo", undo)):
-        if not isinstance(v, bool):
-            raise ValueError(f"{k} must be true or false")
-    if undo:
-        return _seed_undo(conn, ctx, dry_run)
+    if not isinstance(dry_run, bool):
+        raise ValueError("dry_run must be true or false")
     if decisions.source_of(conn) == "db":
-        raise decisions.SeedRefused("the decisions are seeded already (meta decisions_source = db); "
-                                    "`decisions.py seed --undo` goes back")
+        raise decisions.SeedRefused("the decisions are seeded already (meta decisions_source = db)")
     plan = decisions.seed_plan(conn, os.path.abspath(store._text(path, "path", required=True)), topics,
                                merges if merges is not None else [], keep if keep is not None else [])
     report: dict[str, Any] = {"file": plan.file, "sha256": plan.sha, "counts": plan.counts(),
@@ -3257,7 +3207,6 @@ def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: 
                            "nothing was written")
     store.set_meta(conn, decisions.SOURCE_META, "db")
     store.set_meta(conn, decisions.SEED_SHA_META, plan.sha)
-    store.set_meta(conn, decisions.CHANGED_MARK, "")
     store.set_meta(conn, decisions.SEEDED_META, json.dumps(
         {"at": store.now_iso(), "backup": backup, "sha256": plan.sha, "rows": rows, "proposals": props,
          "deleted": {i: plan.classes[i] for i in plan.delete}}, ensure_ascii=False))
@@ -3265,46 +3214,6 @@ def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: 
                proposal_ids=list(props))
     return Result(out, "seed", {"source": "file"}, {"source": "db", "sha256": plan.sha, "counts": report["counts"],
                                                     "backup": backup, "rows": len(rows), "proposals": list(props)})
-
-
-def _seed_undo(conn: sqlite3.Connection, ctx: Ctx, dry_run: bool) -> Result:
-    """decision.seed with undo: see the action."""
-    if decisions.source_of(conn) != "db":
-        raise decisions.SeedRefused("nothing to undo: the decisions are not seeded (decisions_source is not db)")
-    try:
-        seeded = json.loads(store.get_meta(conn, decisions.SEEDED_META) or "")
-        rows: dict[str, int] = dict(seeded["rows"])
-        props: dict[str, int] = dict(seeded["proposals"])
-    except (ValueError, KeyError, TypeError) as e:
-        raise decisions.SeedRefused(f"the seeding's record (meta decisions_seeded) is unreadable: {e}") from e
-    problems: list[str] = []
-    for did, ver in {**rows, **props}.items():
-        cur = store.get_decision_entry(conn, did)
-        if cur is None:
-            problems.append(f"{did} is gone (deleted or replaced since)")
-        elif cur["version"] != ver:
-            problems.append(f"{did} changed since the seeding (version {cur['version']}, seeded {ver})")
-        elif did in props and cur["state"] != "proposed":
-            problems.append(f"{did} was confirmed")
-    if problems:
-        raise decisions.SeedRefused("the undo is refused, nothing was changed (restore the preseed backup only "
-                                    "with the owner's OK):\n  - " + "\n  - ".join(problems))
-    report = {"undo": True, "restored": len(rows), "deleted_proposals": list(props), "dry_run": dry_run}
-    if dry_run:
-        return Result(report, "seed", changed=False)
-    for did in rows:
-        conn.execute("UPDATE decisions SET origin = 'file' WHERE id = ?", (did,))
-        _close_decision_question(conn, did, "seeding undone")
-    for did in props:
-        row = store.delete_decision_entry(conn, did)
-        store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", did, _decision_view(row),
-                        {"deleted": True, "reason": "seeding undone"})
-        _close_decision_question(conn, did, "seeding undone")
-    store.set_meta(conn, decisions.SOURCE_META, "file")
-    for k in (decisions.SEED_SHA_META, decisions.SEEDED_META, decisions.CHANGED_MARK):
-        store.set_meta(conn, k, "")
-    return Result(report, "seed", {"source": "db"}, {"source": "file", "restored": len(rows),
-                                                     "deleted_proposals": list(props)})
 
 
 # ---------------------------------------------------------------- dashboard browser sessions (phase 6a W5)

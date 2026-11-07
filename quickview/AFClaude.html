@@ -641,9 +641,6 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   function renderInput(s) {
     var n = s.needs_input || {}, out = [];
     authHtml = authItem(s.auth || {});
-    (n.open_questions || []).forEach(function (q) {
-      out.push('<div class="item">' + md(q) + "</div>");   // one markdown string per question, in full (D-279)
-    });
     (n.blocked_tasks || []).forEach(function (t) {
       out.push('<div class="item"><div class="src">blocked task' + (t.project ? " · " + esc(t.project) : "") +
         '</div><strong>' + esc(t.title || "(untitled)") + "</strong>" +

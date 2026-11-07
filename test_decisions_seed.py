@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the decision seeding (phase 4b Q2, docs/phase4_plan.md; D-104, D-158, D-235, D-242, D-284, D-285,
 D-286): `decisions.py seed` (action decision.seed) on a synthetic DECISIONS.md: the classes and their counts
-against the file's, the preconditions that refuse before any write, the dry run, the backup, `--undo` and its
-refusals, and what follows the seeding (the import retired, the changed-file alert, the hook from the DB only,
-edit / expire / delete on seeded rows). Synthetic data only.
+against the file's, the preconditions that refuse before any write, the dry run, the backup, and what follows the seeding (the import refused, the hook from the DB only,
+edit / expire / delete on seeded rows; there is no undo and no changed-file alert since Q5). Synthetic data only.
 
     python3 -m unittest test_decisions_seed
 """
@@ -56,9 +55,6 @@ class Seed(Env):
     def seed(self, topics=None, merges=None, **kw):
         t, m = self.files(topics, merges)
         return dec.seed(t, m, db_path=self.db, path=self.src, **kw)
-
-    def undo(self, **kw):
-        return dec.seed(None, None, db_path=self.db, path=self.src, undo=True, **kw)
 
     def backups(self):
         return glob.glob(self.db + ".preseed-*.bak")
@@ -247,7 +243,7 @@ class Refusals(Seed):
 
     def test_file_not_imported_refuses(self):
         self.write((SOURCE + EXTRA).replace("### D-004", "### D-008 Brand new\n- **Keywords:** new\n\n### D-004"))
-        self.assertIn("run `python3 tasks.py decision import` first", self.refused())
+        self.assertIn("run `python3 decisions.py import` first", self.refused())
         self.write((SOURCE + EXTRA).replace("Nights carry the week.", "Nights carry the week, changed."))
         self.assertIn("differing: D-001", self.refused())
         self.assertEqual(self.backups(), [])
@@ -263,99 +259,7 @@ class Refusals(Seed):
             with self.subTest(via):
                 with self.assertRaises(actions.Forbidden):
                     self.perform("decision.seed", params, via=via, actor="mcp:abc" if via == "mcp" else "user:1")
-        with self.assertRaises(actions.Forbidden):
-            self.perform("decision.seed", {"undo": True, "dry_run": True}, via="mcp", actor="mcp:abc")
         self.assertEqual(self.meta(dec.SOURCE_META), None)
-
-
-class Undo(Seed):
-    def test_undo_restores(self):
-        r = self.seed(merges={"merges": [self.MERGE], "keep": ["D-005"]})
-        pid = r["proposal_ids"][0]
-        out = self.undo()
-        self.assertEqual((out["restored"], out["deleted_proposals"]), (4, [pid]))
-        self.assertIsNone(self.row(pid))
-        self.assertEqual(self.meta(dec.SOURCE_META), "file")
-        self.assertEqual({d["origin"] for d in self.all_rows()}, {"file"})
-        self.assertEqual([a["after"]["reason"] for a in self.audit("decision.delete") if a["target_id"] == pid],
-                         ["seeding undone"])
-        res = self.imp()                                                 # the next import re-adds what was deleted
-        self.assertEqual(sorted(res["added"]), ["D-002", "D-004", "D-006"])
-        self.assertEqual(len(self.all_rows()), 7)
-        self.assertFalse(res.get("retired"))
-        self.seed()                                                      # and it can run again
-        self.assertEqual(self.meta(dec.SOURCE_META), "db")
-
-    def test_undo_closes_the_questions_of_what_it_deletes_or_resets(self):
-        """F5 (phase 4b Q3): a question about a seeded proposal (or entry) is closed with the seeding."""
-        r = self.seed(merges={"merges": [self.MERGE], "keep": ["D-005"]})
-        pid = r["proposal_ids"][0]
-        c = self.conn()
-        try:
-            with store.transaction(c):
-                q = actions.ask_decision_question(c, actions.Ctx("cli", "cli"), store.get_decision_entry(c, pid))
-        finally:
-            c.close()
-        self.undo()
-        c = self.conn()
-        try:
-            t = store.get_task(c, q["id"])
-            self.assertEqual(t["status"], "cancelled")
-            self.assertIn("seeding undone", store.task_events(c, q["id"])[-1]["detail"]["reason"])
-            self.assertIsNone(store.open_decision_question(c, pid))
-        finally:
-            c.close()
-
-    def all_rows(self):
-        c = self.conn()
-        try:
-            return store.list_decision_entries(c)
-        finally:
-            c.close()
-
-    def test_native_rows_written_since_stay(self):
-        self.seed()
-        out = self.perform("decision.add", {"title": "Written after", "topics": ["x"], "author": "task-manager"})
-        self.assertEqual(out["id"], "D-007")
-        self.undo()
-        self.assertEqual(self.row("D-007")["origin"], "db")
-        self.imp()
-        self.assertEqual(self.row("D-007")["state"], "active")                  # its own entry, D-322
-
-    def test_refused_after_an_edit(self):
-        self.seed()
-        self.perform("decision.edit", {"decision": "D-001", "title": "Night runs fill the week, edited"})
-        before = self.dump()
-        with self.assertRaises(dec.SeedRefused) as cm:
-            self.undo()
-        self.assertIn("D-001 changed since the seeding", str(cm.exception))
-        self.assertEqual(self.dump(), before)
-        self.assertEqual(self.meta(dec.SOURCE_META), "db")
-
-    def test_refused_after_a_topic_change(self):
-        self.seed()
-        self.perform("decision.topics", {"decision": "D-001", "op": "add", "topics": ["extra"]})
-        with self.assertRaises(dec.SeedRefused):
-            self.undo()
-
-    def test_refused_after_a_confirm(self):
-        r = self.seed(merges={"merges": [self.MERGE], "keep": ["D-005"]})
-        self.perform("decision.confirm", {"decision": r["proposal_ids"][0]})
-        with self.assertRaises(dec.SeedRefused) as cm:
-            self.undo()
-        msg = str(cm.exception)
-        self.assertIn("D-003 is gone", msg)
-        self.assertIn(f"{r['proposal_ids'][0]} changed since the seeding", msg)
-
-    def test_refused_when_not_seeded_and_dry_run(self):
-        with self.assertRaises(dec.SeedRefused) as cm:
-            self.undo()
-        self.assertIn("not seeded", str(cm.exception))
-        self.seed()
-        before = self.dump()
-        r = self.undo(dry_run=True)
-        self.assertTrue(r["dry_run"])
-        self.assertEqual(self.dump(), before)
 
 
 class After(Seed):
@@ -363,21 +267,16 @@ class After(Seed):
         super().setUp()
         self.seed()
 
-    def cron(self):
-        return dec.cron_import(self.db, self.tmp, alert=lambda s, b: self.alerts.append((s, b)))
-
-    def test_import_is_a_no_op(self):
+    def test_import_is_refused(self):
         ids, audited = [d["id"] for d in self.all_rows()], len(self.audit("decision.import"))
         self.write(SOURCE + EXTRA + "\n### D-099 Added to the file\n- **Keywords:** x\n")
-        with mock.patch.object(dec, "_alert") as alert:                  # (the real alert goes to the owner)
-            r = self.imp()
-        self.assertTrue(r["retired"])
-        self.assertTrue(r["differs"])
-        self.assertEqual(alert.call_count, 1)
+        with self.assertRaisesRegex(dec.SourceError, "seeded: the DB is the only source"):
+            self.imp()
+        with self.assertRaises(dec.SourceError):
+            self.perform("decision.import", {"path": self.src})
         self.assertEqual([d["id"] for d in self.all_rows()], ids)        # nothing added, nothing re-added
         self.assertIsNone(self.row("D-099"))
         self.assertIsNone(self.row("D-002"))
-        self.assertEqual(self.perform("decision.import", {"path": self.src})["retired"], True)
         self.assertEqual(len(self.audit("decision.import")), audited)    # no audit row either
 
     def all_rows(self):
@@ -387,41 +286,21 @@ class After(Seed):
         finally:
             c.close()
 
-    def test_changed_file_alerts_once_per_episode(self):
-        self.assertEqual(self.cron(), (0, ""))                           # the seeded file: quiet
-        self.assertEqual(self.alerts, [])
-        self.write(SOURCE + EXTRA + "\n### D-099 Added to the file\n- **Keywords:** x\n")
-        self.assertEqual(self.cron(), (0, ""))
-        self.cron()
-        self.assertEqual([a[0] for a in self.alerts], ["DECISIONS.md changed after the cut-over"])
-        self.assertIn("tasks.py decision add", self.alerts[0][1])
-        self.write(SOURCE + EXTRA + "\n### D-098 Again\n- **Keywords:** x\n")           # still the same episode
-        self.cron()
-        self.assertEqual(len(self.alerts), 1)
-        self.write(SOURCE + EXTRA)                                       # the seeded file again: the episode ends
-        self.cron()
-        self.write("# changed again\n")
-        self.cron()
-        self.assertEqual(len(self.alerts), 2)                            # a new episode
-        self.assertIsNone(self.row("D-099"))
-
     def test_hook_reads_the_db_only(self):
         self.write("# no entries at all\n")                              # an unparseable file does not matter
-        out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
+        out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.db)
         text = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("D-001 Night runs fill the week", text)
         self.assertIn("D-003 Session cap 95% at night [partly superseded]", text)
         self.assertNotIn("D-002", text)
         self.assertNotIn("NOTE", text)
         os.remove(self.src)
-        self.assertIn("D-001", dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src,
-                                               self.db)["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("D-001", dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.db)["hookSpecificOutput"]["additionalContext"])
 
     def test_hook_failure_names_find_not_the_file(self):
         with mock.patch.object(dec, "tldr_lines", side_effect=RuntimeError("boom")), \
                 contextlib.redirect_stderr(io.StringIO()):
-            text = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src,
-                                   self.db)["hookSpecificOutput"]["additionalContext"]
+            text = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.db)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("could NOT be built", text)
         self.assertIn("python3 tasks.py decision find", text)
         self.assertNotIn(self.src, text)
@@ -447,7 +326,7 @@ class Cli(Seed):
             code = dec.main(["--db", self.db, *argv])
         return code, out.getvalue(), err.getvalue()
 
-    def test_seed_dry_run_then_real_then_undo(self):
+    def test_seed_dry_run_then_real(self):
         t, m = self.files()
         code, out, _ = self.run_cli("seed", "--topics", t, "--merges", m, "--file", self.src, "--dry-run")
         self.assertEqual(code, 0)
@@ -459,22 +338,11 @@ class Cli(Seed):
         code, _, err = self.run_cli("seed", "--topics", t, "--merges", m, "--file", self.src)
         self.assertEqual(code, 1)
         self.assertIn("seeded already", err)
-        code, out, _ = self.run_cli("seed", "--undo")
-        self.assertEqual(code, 0)
-        self.assertEqual(self.meta(dec.SOURCE_META), "file")
 
     def test_refusal_is_an_error_exit(self):
         code, out, err = self.run_cli("seed")
         self.assertEqual(code, 1)
         self.assertIn("--topics", err)
-
-    def test_tasks_import_says_it_is_retired(self):
-        self.seed()
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            tasks.main(["--db", self.db, "decision", "import", "--file", self.src])
-        self.assertIn("nothing imported", out.getvalue())
-        self.assertIn("The file is the seeded one", out.getvalue())
 
 
 class Blocks(unittest.TestCase):

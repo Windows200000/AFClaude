@@ -962,11 +962,12 @@ CREATE INDEX IF NOT EXISTS agent_proposals_open ON agent_proposals(project_id, s
 """
 
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
-# owner / task-manager decision. Until the seeding step (Q2) it is still mirrored from DECISIONS.md
-# (origin 'file': actions.decision_import, audited) with the full entry text and its fields; from Q1
-# on entries can also be written natively (origin 'db': actions.decision_add|edit|expire|delete|
-# confirm, the body rendered from the fields) and the import leaves those alone (it neither
-# overwrites nor removes them). keywords is the source's Keywords line; keywords_added /
+# owner / task-manager decision. It was mirrored from DECISIONS.md until the seeding step (Q2) (origin
+# 'file': actions.decision_import, audited) with the full entry text and its fields; from Q1
+# on entries are also written natively (origin 'db': actions.decision_add|edit|expire|delete|
+# confirm, the body rendered from the fields). Since the seeding every row is 'db' and nothing reads the
+# file (Q5); the `origin` column stays until a later schema step that bundles its removal with another one
+# (a migration for this column alone is not worth it, docs/phase4_plan.md Q5). keywords is the source's Keywords line; keywords_added /
 # keywords_removed are the task-manager's own changes (actions.decision_keywords, D-242), kept apart
 # so a re-import never undoes them (the effective set: decision_keywords()). topics
 # (decision_topics, D-284) are the free keywords written with an entry, 'all' allowed; they are
@@ -1051,7 +1052,7 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
     """v4 -> v5 (phase 4b Q1): rebuild `decisions` for the wider state CHECK ('proposed') and the new
     columns (slug, project_id, author, origin), keeping every row and its version as it was. author is
     derived from the Type written in the source (owner -> owner, anything else -> task-manager); every
-    existing row is origin 'file' (it mirrors DECISIONS.md until the seeding step). The version trigger
+    existing row is origin 'file' (it mirrored DECISIONS.md until the seeding step). The version trigger
     and the ord index go with the old table and are recreated by init(), which the migrate step runs
     after this. The topics and links tables are created by init() too (empty)."""
     old = [r[1] for r in conn.execute("PRAGMA table_info(decisions)")]

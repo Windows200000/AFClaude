@@ -71,132 +71,15 @@ class BuildStages(unittest.TestCase):
                 store.DB_PATH, qv.STAGES_PROJECT = old_path, old_proj
 
 
-class OpenQuestions(unittest.TestCase):
-    """D-279: an open question must reach the UI whole, not cut to its first line, and an item
-    that is mainly a pointer to a .md file gets a visible warning instead of passing silently."""
+class NeedsInput(unittest.TestCase):
+    """Phase 4b Q3/Q5: the quickview no longer reads OPEN_QUESTIONS.md: the questions are the DB's (the page
+    lists them live from the inbox API, so a blocked question is not a blocked task); needs_input() carries
+    the blocked tasks and the error only."""
 
     def setUp(self):
-        # needs_input() also counts the DB's blocked tasks and runs stalled.scan over the
-        # transcripts: a DB of its own (no blocked task another test module left in the shared
-        # one) and an empty projects dir (not the real ~/.claude/projects), so its count is
-        # only the OPEN_QUESTIONS.md items written here
-        from unittest import mock
-        testenv.fresh_db(self)
-        projects = tempfile.TemporaryDirectory()
-        self.addCleanup(projects.cleanup)
-        patcher = mock.patch.object(qv.ka, "PROJECTS_DIR", projects.name)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_split_keeps_continuation_and_nested_items_with_one_item(self):
-        md = ("# Open questions\n\n"
-              "- **3b open questions:** see docs/phase3b_plan.md for details.\n"
-              "  1. question one?\n"
-              "  2. question two?\n"
-              "- A plain single-line question?\n")
-        items = qv._split_open_questions(md)
-        self.assertEqual(len(items), 2)
-        text0 = qv._open_question_text(items[0])
-        self.assertIn("question one?", text0)
-        self.assertIn("question two?", text0)
-        self.assertEqual(qv._open_question_text(items[1]), "A plain single-line question?")
-
-    def test_nested_item_with_real_content_gets_no_warning(self):
-        md = ("- **3b:** see docs/phase3b_plan.md for details.\n"
-              "  1. question one?\n"
-              "  2. question two?\n")
-        items = qv._split_open_questions(md)
-        self.assertIsNone(qv._open_question_warning(items[0]))
-
-    def test_md_pointer_only_item_gets_a_warning(self):
-        md = "- See docs/phase3b_plan.md for details.\n"
-        items = qv._split_open_questions(md)
-        self.assertEqual(len(items), 1)
-        self.assertIsNotNone(qv._open_question_warning(items[0]))
-
-    def test_md_mentioned_alongside_real_question_gets_no_warning(self):
-        md = ("- Should the design doc at docs/dashboard_design.md move into phase 4? "
-              "Recommended: yes, once phase 3b ships.\n")
-        items = qv._split_open_questions(md)
-        self.assertIsNone(qv._open_question_warning(items[0]))
-
-    def test_needs_input_reads_full_item_through_the_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            old_here = qv.HERE
-            qv.HERE = d
-            try:
-                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
-                    fh.write("- **3b open questions:** see docs/phase3b_plan.md for details.\n"
-                              "  1. question one?\n  2. question two?\n")
-                out = qv.needs_input()
-                self.assertEqual(len(out["open_questions"]), 1)
-                q = out["open_questions"][0]
-                self.assertIsInstance(q, str)
-                self.assertIn("question one?", q)
-                self.assertIn("question two?", q)
-                self.assertNotIn("⚠", q)
-                self.assertIsNone(out["error"])
-                self.assertEqual(out["count"], 1)
-            finally:
-                qv.HERE = old_here
-
-    def test_needs_input_flags_a_pointer_only_item(self):
-        with tempfile.TemporaryDirectory() as d:
-            old_here = qv.HERE
-            qv.HERE = d
-            try:
-                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
-                    fh.write("- See docs/phase3b_plan.md for details.\n")
-                out = qv.needs_input()
-                self.assertEqual(len(out["open_questions"]), 1)
-                self.assertIn("⚠ points mainly to a file", out["open_questions"][0])
-            finally:
-                qv.HERE = old_here
-
-    def test_bold_title_items_are_whole_strings(self):
-        """The '[object Object]' report: every item is one markdown string (a page that renders the
-        item as text shows it), with its bold title, text and options in full."""
-        long = "word " * 120
-        md = ("# Open questions\n\n"
-              "- **Decision list, what each line shows (phase 4b):** " + long + "(a) the title only; "
-              "(b) the title plus the rule; (c) the rule only. Recommended: (b).\n"
-              "- **A second way in (phase 6b)** You can add a code. (a) yes; (b) no. Recommended: (a).\n")
-        with tempfile.TemporaryDirectory() as d:
-            old_here = qv.HERE
-            qv.HERE = d
-            try:
-                with open(os.path.join(d, "OPEN_QUESTIONS.md"), "w") as fh:
-                    fh.write(md)
-                out = qv.needs_input()
-            finally:
-                qv.HERE = old_here
-        qs = out["open_questions"]
-        self.assertEqual(len(qs), 2)
-        self.assertTrue(all(isinstance(q, str) for q in qs))
-        self.assertEqual(qs[0], "**Decision list, what each line shows (phase 4b):** " + long +
-                         "(a) the title only; (b) the title plus the rule; (c) the rule only. Recommended: (b).")
-        self.assertIn("**A second way in (phase 6b)** You can add a code.", qs[1])
-        self.assertTrue(qs[1].endswith("Recommended: (a)."))
-        json.dumps(out)   # what status.json carries
-
-    def test_page_renders_each_question_as_markdown_text(self):
-        with open(PAGE_FILE, encoding="utf-8") as fh:
-            page = fh.read()
-        body = page[page.index("function renderInput(s)"):page.index("(n.blocked_tasks")]
-        self.assertIn("md(q)", body)
-        self.assertNotIn(".text", body)
-
-
-class QuestionsSource(unittest.TestCase):
-    """Phase 4b Q3 W2: both file formats parse; the file's items show only while meta questions_source is
-    "file"; the DB's questions are the page's own live list (so a blocked question is not a blocked task)."""
-    FILE = ("# Open questions\n\nsome text before the first item is no question\n\n"
-            "## Q-1: First, in the section format\n"
-            "Plain text of the first.\n"
-            "- option a\n- option b\n\n"
-            "## Q-2: Second\nOnly a body line.\n")
-
-    def setUp(self):
+        # needs_input() counts the DB's blocked tasks and runs stalled.scan over the transcripts: a DB of its
+        # own (no blocked task another test module left in the shared one) and an empty projects dir (not the
+        # real ~/.claude/projects)
         testenv.fresh_db(self)
         projects = tempfile.TemporaryDirectory()
         self.addCleanup(projects.cleanup)
@@ -209,75 +92,33 @@ class QuestionsSource(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def write(self, text):
+    def test_the_question_file_is_not_read(self):
         with open(os.path.join(self.dir.name, "OPEN_QUESTIONS.md"), "w") as fh:
-            fh.write(text)
-
-    def source(self, value):
-        conn = store.connect()
-        try:
-            store.set_meta(conn, "questions_source", value)
-            conn.commit()
-        finally:
-            conn.close()
-
-    def test_both_formats_parse_whole(self):
-        items = qv.parse_open_questions(self.FILE)
-        self.assertEqual([s for s, _ in items], ["##", "##"])
-        self.assertEqual(items[0][1][0], "Q-1: First, in the section format")
-        self.assertIn("- option b", items[0][1])                 # a section's own '- ' lines are its body
-        mixed = "- a dash item\n  with a continuation\n## Q-3: then a section\nbody\n"
-        self.assertEqual([(s, l[0]) for s, l in qv.parse_open_questions(mixed)],
-                         [("-", "a dash item"), ("##", "Q-3: then a section")])
-        self.assertEqual(qv.parse_open_questions("# Title only\n\nno item here\n"), [])
-        self.assertEqual(qv._split_open_questions(mixed)[0], ["a dash item", "  with a continuation"])
-
-    def test_section_items_show_whole_with_a_bold_heading(self):
-        self.write(self.FILE)
+            fh.write("- A question in the old file?\n")
         out = qv.needs_input()
-        self.assertEqual(out["source"], "file")
-        self.assertEqual(len(out["open_questions"]), 2)
-        q1 = out["open_questions"][0]
-        self.assertTrue(q1.startswith("**Q-1: First, in the section format**"))
-        for part in ("Plain text of the first.", "- option a", "- option b"):
-            self.assertIn(part, q1)
-        self.assertNotIn("some text before", " ".join(out["open_questions"]))
-        self.assertEqual(out["count"], 2)
+        self.assertEqual(out, {"blocked_tasks": [], "error": None, "count": 0})
+        json.dumps(out)   # what status.json carries
 
-    def test_the_file_is_not_shown_once_the_source_is_db(self):
-        self.write(self.FILE)
-        self.source("db")
-        out = qv.needs_input()
-        self.assertEqual((out["source"], out["open_questions"], out["count"], out["error"]), ("db", [], 0, None))
-
-    def test_an_unknown_source_or_a_db_error_shows_the_error_and_no_file_items(self):
-        self.write(self.FILE)
-        self.source("both")
-        out = qv.needs_input()
-        self.assertIn("questions_source", out["error"])
-        self.assertEqual((out["source"], out["open_questions"]), (None, []))
+    def test_a_db_error_shows_the_error(self):
         with mock.patch.object(qv.store, "connect", side_effect=RuntimeError("db is gone")):
             out = qv.needs_input()
-        self.assertEqual((out["source"], out["open_questions"], out["error"]), (None, [], "db is gone"))
+        self.assertEqual((out["blocked_tasks"], out["error"], out["count"]), ([], "db is gone", 0))
 
-    def test_fenced_code_starts_no_item(self):
-        md = ("## Q-1: With a code block\n"
-              "Run this:\n"
-              "```\n## not a heading\n- not an item\n```\n"
-              "and then\n"
-              "~~~sh\n- nor this\n## nor this\n~~~\n"
-              "- inside the section's body\n"
-              "- A dash item after fences\n")
-        items = qv.parse_open_questions(md)
-        self.assertEqual([s for s, _ in items], ["##"])
-        self.assertIn("## not a heading", items[0][1])
-        self.assertIn("- nor this", items[0][1])
-        self.assertIn("- A dash item after fences", items[0][1])         # in a ## section a '- ' line is body
-        dash = qv.parse_open_questions("- First\n```\n- fenced\n## fenced\n```\n- Second\n")
-        self.assertEqual([(s, l[0]) for s, l in dash], [("-", "First"), ("-", "Second")])
-        self.assertEqual(dash[0][1][1:], ["```", "- fenced", "## fenced", "```"])
-        unclosed = qv.parse_open_questions("- One\n```\n- never closed\n- Two\n")
-        self.assertEqual(len(unclosed), 1)                              # an unclosed fence runs to the end
+    def test_the_retired_files_are_not_published(self):
+        for name in ("OPEN_QUESTIONS.md", "DECISIONS.md"):
+            with open(os.path.join(self.dir.name, name), "w") as fh:
+                fh.write("# retired\n")
+        with open(os.path.join(self.dir.name, "NOTES.md"), "w") as fh:
+            fh.write("# notes\n")
+        names = [n for n, _src, _title in qv.all_docs()]
+        self.assertIn("NOTES.md", names)
+        self.assertNotIn("OPEN_QUESTIONS.md", names)
+        self.assertNotIn("DECISIONS.md", names)
+
+    def test_page_no_longer_renders_file_questions(self):
+        with open(PAGE_FILE, encoding="utf-8") as fh:
+            page = fh.read()
+        self.assertNotIn("open_questions", page)
 
     def test_blocked_tasks_stay_but_a_question_is_not_one(self):
         conn = store.connect()
@@ -288,11 +129,9 @@ class QuestionsSource(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        for src in ("file", "db"):
-            self.source(src)
-            out = qv.needs_input()
-            self.assertEqual([(b["title"], b["question"]) for b in out["blocked_tasks"]],
-                             [("A blocked task", "which way?")])
+        out = qv.needs_input()
+        self.assertEqual([(b["title"], b["question"]) for b in out["blocked_tasks"]],
+                         [("A blocked task", "which way?")])
 
     def test_page_has_the_question_controls_on_the_new_endpoints(self):
         with open(PAGE_FILE, encoding="utf-8") as fh:
