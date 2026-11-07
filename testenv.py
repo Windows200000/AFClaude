@@ -28,6 +28,8 @@ for _v in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "AFCLAUDE_AGENT_ID", "AFCLAUD
     os.environ.pop(_v, None)   # a session running the tests is not "the caller" in them: identity.py reads these
 os.environ["AFCLAUDE_MACHINE_FILE"] = os.path.join(DIR, "no-machine.json")   # no token file: the host's own is never read
 os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (health, the quickview read it)
+os.environ.pop("KEEPALIVE_STATE_DIR", None)   # the container's live data/keepalive never: the keep-alive's state
+                                              # names default to the temp DB's dir (keepalive.STATE_DIR)
 
 SID = "00000000-0000-4000-8000-000000000001"   # synthetic task-manager session (not a real session anywhere)
 with open(os.environ["AFCLAUDE_CONFIG"], "w") as _fh:

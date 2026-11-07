@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -15,8 +16,12 @@ import keepalive as ka  # noqa: E402
 import schedule  # noqa: E402
 import actions  # noqa: E402
 import store  # noqa: E402
+import runner_state  # noqa: E402
 
 UTC = timezone.utc
+# the state names as the module set them at import, before setUpModule / a test points them at side files
+IMPORT_STATE = {"keepalive": ka.STATE_FILE, "keepalive.deferred": ka.DEFER_FILE,
+                "keepalive.fillup": ka.FILLUP_FILE, "keepalive.usage_refresh": ka.USAGE_STATE_FILE}
 
 
 def Z(s):
@@ -1554,6 +1559,88 @@ class RunEnd(unittest.TestCase):
             self.assertEqual(sorted(st["run_stops"].values()), sorted([SID, "s2"]))
             self.assertFalse(os.path.exists(os.path.join(d, "keepalive_state.json")))       # no file
             self.assertFalse(os.path.exists(os.path.join(d, "db", "keepalive", "keepalive_state.json")))
+
+
+class LiveStateDefault(unittest.TestCase):
+    """Without KEEPALIVE_STATE_DIR (a host shell: usage_report, run_now, --follow-clear) the state
+    names are the live state, the DB next to $AFCLAUDE_DB, never a side file in the repo dir (D-235);
+    a test that would resolve them without testenv is refused (runner_state.guard_tests)."""
+    OLD, NEW, OTHER = ("cccccccc-0000-4000-8000-00000000000%d" % i for i in (1, 2, 3))
+
+    def env(self, db):
+        env = {k: v for k, v in os.environ.items() if k not in ("KEEPALIVE_STATE_DIR", "KEEPALIVE_SESSION")}
+        env.update(AFCLAUDE_DB=db)
+        return env
+
+    def test_default_names_the_live_state(self):
+        self.assertNotIn("KEEPALIVE_STATE_DIR", os.environ)                    # testenv drops a container's
+        self.assertEqual(ka.STATE_DIR, os.path.join(os.path.dirname(testenv.DB), "keepalive"))
+        for comp, path in IMPORT_STATE.items():
+            self.assertTrue(runner_state.is_live(comp, path), (comp, path))
+
+    def test_state_and_chain_in_the_db(self):
+        """load_state / save_state on the default name use the DB: a stored /clear link is in its rows
+        (store.cleared_links, what MCP and actions read) and session_chain follows it."""
+        with mock.patch.object(ka, "STATE_FILE", IMPORT_STATE["keepalive"]):
+            def unlink():
+                st = ka.load_state()
+                (st.get("cleared") or {}).pop(self.OLD, None)
+                self.assertTrue(ka.save_state(st))
+            self.addCleanup(unlink)
+            self.assertIsInstance(ka.load_state(), runner_state.StateDoc)
+            ka.store_clear_link(self.OLD, self.NEW, datetime.now(UTC))
+            self.assertEqual(ka.session_chain(self.NEW), [self.NEW, self.OLD])
+            conn = store.connect()
+            try:
+                self.assertEqual(store.cleared_links(conn).get(self.OLD), self.NEW)
+            finally:
+                conn.close()
+        self.assertFalse(os.path.exists(IMPORT_STATE["keepalive"]))           # no side file
+
+    def test_cli_follow_clear_uses_the_db(self):
+        """`keepalive.py --follow-clear OLD NEW` in a plain shell (no KEEPALIVE_STATE_DIR) stores the
+        link in the DB, and a second call reads it from there (refused: OLD went to NEW)."""
+        with tempfile.TemporaryDirectory() as d:
+            db, proj = os.path.join(d, "afclaude.db"), os.path.join(d, "projects", "-w")
+            os.makedirs(proj)
+            conn = store.connect(db, create=True)
+            try:
+                with store.transaction(conn):
+                    store.upsert_driven_session(conn, self.OLD, kind="task-manager", tmux="afc-cccccccc")
+            finally:
+                conn.close()
+            at = datetime.now(UTC).isoformat()
+            with open(os.path.join(proj, self.OLD + ".jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "user", "timestamp": at, "message": {"role": "user", "content": "hi"}}) + "\n")
+            with open(os.path.join(proj, self.NEW + ".jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "user", "timestamp": at, "message": {
+                    "role": "user", "content": f"<command-name>{ka.CLEAR_COMMAND}</command-name>"}}) + "\n")
+            env = dict(self.env(db), KEEPALIVE_PROJECTS_DIR=os.path.join(d, "projects"))
+            cmd = [sys.executable, os.path.join(os.path.dirname(ka.__file__), "keepalive.py"), "--follow-clear"]
+            r = subprocess.run(cmd + [self.OLD, self.NEW], env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            conn = store.connect(db)
+            try:
+                self.assertEqual(store.cleared_links(conn), {self.OLD: self.NEW})
+                self.assertIsNotNone(store.get_driven_session(conn, self.NEW))
+            finally:
+                conn.close()
+            r = subprocess.run(cmd + [self.OLD, self.OTHER], env=env, capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(f"was cleared into {self.NEW}", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(d, "keepalive", "keepalive_state.json")))   # no file
+
+    def test_a_test_without_testenv_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self.env(os.path.join(d, "afclaude.db"))
+            here = os.path.dirname(ka.__file__)
+            r = subprocess.run([sys.executable, "-c", "import unittest, keepalive"], cwd=here, env=env,
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("without testenv", r.stderr)
+            r = subprocess.run([sys.executable, "-c", "import unittest, testenv, keepalive"], cwd=here, env=env,
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class DryRunLoop(unittest.TestCase):

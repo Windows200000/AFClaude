@@ -63,9 +63,8 @@ DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
 RUNS_FILE = os.path.join(DATA_DIR, "afclaude_runs.jsonl")
 SAMPLES_FILE = os.path.join(DATA_DIR, "samples.jsonl")
 RUN_USAGE_FILE = os.path.join(DATA_DIR, "run_usage.jsonl")     # watcher readings during runs, never pruned
-STATE_FILES = [   # the keepalive state (container: data/keepalive; host: the repo dir), as pacing.FIRE_FILES
+STATE_FILES = [   # the keepalive state, the DB (data/keepalive names it, as keepalive.STATE_FILE), as pacing.FIRE_FILES
     os.path.join(DATA_DIR, "keepalive", "keepalive_state.json"),
-    os.path.join(os.environ.get("KEEPALIVE_STATE_DIR", HERE), "keepalive_state.json"),
 ]
 
 ROW_VERSION = 1

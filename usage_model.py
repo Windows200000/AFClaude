@@ -42,8 +42,7 @@ USER_MODEL_FILE = os.path.join(DATA_DIR, "user_model.json")
 SAMPLES_FILE = os.path.join(DATA_DIR, "samples.jsonl")
 # where AFClaude's own fires are recorded (their typed-in prompts are not user activity)
 FIRE_STATE_FILES = [
-    os.path.join(os.environ.get("KEEPALIVE_STATE_DIR", HERE), "keepalive_state.json"),
-    os.path.join(DATA_DIR, "keepalive", "keepalive_state.json"),
+    os.path.join(DATA_DIR, "keepalive", "keepalive_state.json"),   # the DB (no repo-dir side file)
     os.path.join(DATA_DIR, "dispatcher_state.json"),
 ]
 
