@@ -444,16 +444,20 @@ class Literals(unittest.TestCase):
         """A CLI path that keeps a literal "cli" would write as the host owner whoever runs it."""
         rx = re.compile(r"""\bactor\s*(?::\s*[\w\[\] |.]+)?=\s*['"](cli|keepalive|dispatcher)['"]""")
         bad = []
-        for dirpath, dirs, files in os.walk(HERE):
-            dirs[:] = [d for d in dirs if d not in (".venv", ".git", "__pycache__", "node_modules", "testdata")]
-            for f in files:
-                if not f.endswith(".py") or f.startswith("test_") or f in ("testenv.py", "identity.py"):
-                    continue
-                path = os.path.join(dirpath, f)
-                with open(path) as fh:
-                    for n, line in enumerate(fh, 1):
-                        if rx.search(line) and not line.lstrip().startswith("#"):
-                            bad.append(f"{os.path.relpath(path, HERE)}:{n}: {line.strip()}")
+        # git's own file list (tracked + new, not ignored): a walk would also read the copies of the repo in
+        # the ignored .claude/worktrees/agent-* dirs
+        listed = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+                                cwd=HERE, capture_output=True, text=True, check=True).stdout
+        for rel in filter(None, listed.split("\0")):
+            f = os.path.basename(rel)
+            if f.startswith("test_") or f in ("testenv.py", "identity.py") or "testdata" in rel.split("/"):
+                continue
+            if not os.path.exists(os.path.join(HERE, rel)):
+                continue                                                      # tracked but deleted in the work tree
+            with open(os.path.join(HERE, rel)) as fh:
+                for n, line in enumerate(fh, 1):
+                    if rx.search(line) and not line.lstrip().startswith("#"):
+                        bad.append(f"{rel}:{n}: {line.strip()}")
         self.assertEqual(bad, [])
 
 
