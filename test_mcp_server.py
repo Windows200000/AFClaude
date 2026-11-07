@@ -10,6 +10,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +20,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import testenv  # noqa: E402,F401  (before any AFClaude module: runner_state.guard_tests)
 import actions  # noqa: E402
 import afclaude_config  # noqa: E402
 import store  # noqa: E402
@@ -769,6 +771,19 @@ class Stdio(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_server_process_never_loads_unittest(self):
+        """runner_state.guard_tests refuses keepalive's default state while unittest is loaded and testenv
+        is not: the real server process (SDK, event loop, the owner-words path that imports keepalive) must
+        never have unittest loaded, or the guard would stop it in production."""
+        code = ("import sys, asyncio, mcp_server, owner_words, keepalive\n"
+                "asyncio.run(mcp_server.server.list_tools())\n"
+                "owner_words._transcript_path('x')\n"
+                "print('unittest' in sys.modules)")
+        env = dict(self.params.env, PYTHONPATH=HERE)
+        out = subprocess.run([sys.executable, "-c", code], env=env, cwd=self.work, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "False"), out.stderr[-500:])
 
     def test_round_trip(self):
         async def go():
