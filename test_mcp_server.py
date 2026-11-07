@@ -393,7 +393,7 @@ class DBErrors(Env):
         self.assertEqual(len(self.alerts), 1)
         recs = store.fallback_events(store.fallback_path(self.db))
         self.assertEqual([(r["actor"], r["action"], r["params"]["title"]) for r in recs if r["event"] == "failed"],
-                         [(f"agent:{CALLER}", "task.add", "lost?")] * 2)
+                         [("cli", "task.add", "lost?")] * 2)       # no token, no stamp: the host owner (D-330)
 
     def test_corrupted_db(self):
         with open(self.db, "wb") as fh:
