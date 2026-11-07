@@ -263,18 +263,17 @@ class Migration(V4Env):
         self.assertEqual(store.migrate(self.path)["to"], 5)
 
     def test_the_tldr_is_built_read_only_while_the_database_cant_be_written(self):
-        src = os.path.join(self.tmp, "DECISIONS.md")
         for version, kind in (("4", "MigrationNeeded"), ("6", "SchemaTooNew")):
             raw = sqlite3.connect(self.path)
             raw.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (version,))
             raw.commit()
             raw.close()
             for part in (1, 2):
-                out = dec.hook_output(part, 2, {"source": "compact", "cwd": dec.HERE}, src, self.path)
+                out = dec.hook_output(part, 2, {"source": "compact", "cwd": dec.HERE}, self.path)
                 text = out["hookSpecificOutput"]["additionalContext"] if out else ""
                 if part == 1:
                     self.assertIn("D-001 Night runs fill the week", text, kind)
-                    self.assertIn(f"was not imported, the database's schema doesn't fit this code ({kind})", text)
+                    self.assertNotIn("not imported", text)         # the hook never imports (Q5)
                     self.assertNotIn("could NOT be built", text)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(dec.main(["--db", self.path, "tldr"]), 0)
@@ -563,11 +562,7 @@ class Edit(Env):
             self.do("decision.edit", decision="D-001", title="C", version=0)
         self.do("decision.edit", decision="D-001", title="C", version=1)
 
-    def test_only_native_entries_and_the_owners_stay_with_the_owner(self):
-        self.drop_from_source("D-001")                                          # D-002.. come from the file
-        self.imp()
-        with self.assertRaisesRegex(ValueError, "mirrors DECISIONS.md"):
-            self.do("decision.edit", decision="D-003", title="x")
+    def test_the_owners_entries_stay_with_the_owner(self):
         with self.assertRaises(actions.Forbidden):                              # D-104
             self.do("decision.edit", decision="D-001", title="x", actor="mcp:abc", via="mcp", autonomous=True)
         own = self.do("decision.add", title="Own", topics=["t"], author="task-manager")
@@ -616,13 +611,6 @@ class Remove(Env):
         with self.assertRaises(actions.Forbidden):
             self.do("decision.expire", decision="D-003", **kw)                      # its date isn't past
         self.do("decision.expire", decision="D-001", **kw)                          # lapsed (2001)
-
-    def test_file_entries_are_removed_in_the_file(self):
-        self.drop_from_source("D-001", "D-002")
-        self.imp()
-        with self.assertRaisesRegex(ValueError, "mirrors DECISIONS.md"):
-            self.do("decision.expire", decision="D-004")
-
 
 class Confirm(Env):
     def prop(self, title="Prop", **kw):
@@ -725,38 +713,6 @@ class Import(Env):
             self.imp()
         self.assertIsNone(store.get_decision_entry(self.conn, "D-051"))             # nothing was written
         self.assertEqual(store.get_decision_entry(self.conn, "D-050")["title"], "Native")
-        # the 10-minute import: an error line, exit 1, and an alert once per episode
-        repo = os.path.join(self.tmp, "repo")
-        os.makedirs(repo)
-        shutil.copy(self.src, os.path.join(repo, "DECISIONS.md"))
-        alerts = []
-        for _ in range(2):
-            code, line = dec.cron_import(self.db, repo, alert=lambda subject, body: alerts.append((subject, body)))
-            self.assertEqual(code, 1)
-            self.assertIn("IdCollision", line)
-        self.assertEqual(len(alerts), 1)
-        self.assertIn("D-050", alerts[0][1])
-        # fixed in the file: the import goes on and the episode ends
-        self.drop_from_source("D-050")
-        shutil.copy(self.src, os.path.join(repo, "DECISIONS.md"))
-        self.assertEqual(dec.cron_import(self.db, repo, alert=lambda *a: alerts.append(a))[0], 0)
-        self.assertEqual(store.get_meta(self.conn, dec.CRON_MARK), "")
-
-    def test_the_hook_alerts_on_a_collision_and_still_builds_the_tldr(self):
-        self.imp()
-        self.floor(49)
-        self.add(title="Native")
-        with open(self.src, "a", encoding="utf-8") as fh:
-            fh.write("\n### D-050 From the file\n- **Keywords:** k\n")
-        alerts = []
-        with mock.patch.object(dec, "_alert", lambda subject, body: alerts.append(subject)):
-            out = dec.hook_output(1, 1, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
-            dec.hook_output(1, 1, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
-        text = out["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("NOT imported, the owner was alerted", text)
-        self.assertIn("D-050 Native", text)
-        self.assertIn("D-001 Night runs fill the week", text)
-        self.assertEqual(alerts, ["decisions import failed"])                      # once for both hook runs
 
     def test_ids_come_from_the_db_alone_and_an_import_raises_the_floor(self):
         self.assertEqual(self.imp()["id_floor_raised"], True)                      # the file's highest is D-004
@@ -830,7 +786,7 @@ class Tldr(Env):
     def test_hook_output_still_works_with_native_entries(self):
         self.imp()
         self.add(title="Native one")
-        out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.src, self.db)
+        out = dec.hook_output(1, 3, {"source": "compact", "cwd": dec.HERE}, self.db)
         text = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("D-005 Native one", text)
         self.assertIn("D-001 Night runs fill the week", text)               # the import ran too

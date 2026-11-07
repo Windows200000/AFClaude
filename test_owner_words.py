@@ -439,9 +439,6 @@ class Write(Env):
             self.propose(supersedes=["D-099"])
         with self.assertRaisesRegex(ValueError, "belongs to a task-manager proposal"):
             self.do("decision.add", title="x", topics=["t"], author="owner", words="w", supersedes=[a])
-        self.conn.execute("UPDATE decisions SET origin = 'file' WHERE id = ?", (a,))
-        with self.assertRaisesRegex(ValueError, "mirrors DECISIONS.md"):
-            self.propose(supersedes=[a])
 
     def test_a_confirmed_proposal_edit_keeps_its_supersedes_line(self):
         a = self.do("decision.add", title="Original", topics=["t"], author="owner", words="w")["id"]

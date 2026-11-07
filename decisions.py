@@ -3,29 +3,19 @@
 decisions.py: the owner's decision store in the DB (D-242; phase 4b of docs/dashboard_design/07_data_model.md
 §7.6, D-107/D-151/D-158/D-176). The table is in store.py (DECISIONS_SCHEMA: `decisions`, plus the
 FTS5 index `decisions_fts` when the SQLite build has FTS5, else lookups use LIKE), the writes in
-actions.py (decision.import, decision.keywords, audited). This module parses the Markdown source,
-imports it, and builds what the task-manager reads:
+actions.py (decision.import for the seeding, decision.keywords, ..., audited). This module parses the Markdown source
+for the seeding, and builds what the task-manager reads:
 
   - DECISIONS.md (local only, gitignored) was the source until the seeding below (phase 4b Q2); since then the
-    DB is the only source and the file is neither read nor written (`import` below reports "retired"; a file
-    whose sha differs from the seeded one alerts once per episode). Until then the importer read it (never
-    wrote it) and mirrored it into the table: one row per "### D-NNN" or
-    "### M-NNN" entry (the drift log's DR-NN entries and other headings are not decisions), with
-    the fields of its "**Name:** value" lines (Type, Date, Status, Supersedes, Summary, Keywords,
-    Owner's words, Source, Scope, Interpretation) and the full entry text. An entry with no Status
-    line defaults to "active" (state_of), unless its title itself names the fate ("... (SUPERSEDED
-    by D-NNN: ...)", e.g. the early M-003) -- import_file's "no_status" always lists every entry
-    with no Status line, title marker or not, so the rest (plain, no marker) stay visible too, since
-    DECISIONS.md is never edited here to add one. Idempotent: an unchanged entry writes nothing, so
-    an unchanged file is a no-op (no audit row) -- but an entry whose text is unchanged while a
-    derived field (e.g. state) now comes out different, because the derivation logic itself
-    changed, is still updated ("restated": store.put_decision_entry / DECISION_DERIVED_FIELDS).
-    It ran every 10 min with the docs import
-    (project_docs.py import --cron), at every SessionStart hook below, and by hand:
-        python3 decisions.py import [--file PATH]        (= python3 tasks.py decision import)
+    DB is the only source and the file is neither read nor written (phase 4b Q5 removed the 10-min import, the
+    hook's import and `tasks.py decision import`; the file stays on disk for the owner to archive). What is left
+    of it is the one-time cut-over: the parser (parse, below: "### D-NNN" / "### M-NNN" entries with the fields of
+    their "**Name:** value" lines: Type, Date, Status, Supersedes, Summary, Keywords, Owner's words, Source,
+    Scope, Interpretation), `import` (mirrors the file into the table, the seeding's first step; refused once the
+    seeding ran) and the seeding itself:
+        python3 decisions.py import [--file PATH]
   - the seeding (Q2, the cut-over, run once by the task-manager; it re-keys what the import already holds):
         python3 decisions.py seed --topics F --merges F [--file PATH] [--dry-run]     action decision.seed
-        python3 decisions.py seed --undo
   - the D-322 migration (one-off, idempotent; backs the DB up first):
         python3 decisions.py activate-own [--owner-entry ID ...] [--dry-run]         action decision.activate_own (D-322)
     F = two JSON files (see seed_plan): topics {"D-001": ["topic", ...]} for every surviving entry (1-3 each,
@@ -38,14 +28,14 @@ imports it, and builds what the task-manager reads:
     a surviving entry without 1-3 topics, a done entry whose Status names a part that stays and that is in no
     merge or `keep`. A backup <db>.preseed-<utc>.bak first, one transaction, the counts per class against the
     file's in the result; meta decisions_source=db, decisions_seed_sha, decision_id_floor, decisions_seeded.
-    --undo is refused if a seeded row changed since or a seeded proposal was confirmed.
+    No undo (Q5: the file is retired; the backup is the way back).
   - keywords: the file's Keywords line, plus the task-manager's own additions and removals
     (`tasks.py decision keywords D-NNN add|remove KW...`, action decision.keywords, D-242). Those are
-    kept apart from the file's list, so a re-import never undoes them.
+    kept apart from the file's list.
   - the TLDR (D-242): every current decision (not done, expired or superseded) as one line, id + title
     (+ the status when it isn't plain "active"). The repo's SessionStart hook injects it after a
     compaction and in a brand-new conversation (sources compact, startup, clear; not resume, and so
-    not a run's continue), from the DB only (before the seeding it imported the file first):
+    not a run's continue), from the DB only:
         python3 decisions.py hook --part N --of M        (.claude/settings.json)
     Claude Code caps a hook's additionalContext at 10,000 characters, so the TLDR is split over M
     hook commands (parts); a TLDR that outgrows them says so in its last part (add a part).
@@ -57,13 +47,14 @@ imports it, and builds what the task-manager reads:
     in the DB itself (origin 'db'), their text rendered here (render_body) from the fields; an
     owner's words are active at once (D-285), and so are the task-manager's own entries (D-322); only
     a task-manager entry that replaces, rewords or merges an owner's entry (its `supersedes` names one) is
-    'proposed' (not in the TLDR) until the owner confirms it. The import above leaves them alone.
+    'proposed' (not in the TLDR) until the owner confirms it.
   - decision questions (phase 4b Q3): an open proposal has one question for the owner
     (actions.ask_decision_question); question_kind / question_text render it in plain words and in full
     (D-263, D-279); owner's and confirmed entries are protected (D-104).
 
     python3 decisions.py tldr | import [--file PATH] | seed ... | hook --part N --of M
-(the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords|import`)
+(import and seed are the one-time cut-over)
+(the lookups and keyword changes are in tasks.py: `tasks.py decision tldr|find|show|keywords`)
 """
 from __future__ import annotations
 
@@ -74,7 +65,6 @@ import os
 import re
 import sqlite3
 import sys
-from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -84,9 +74,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 
-DEFAULT_SOURCE = os.environ.get("AFCLAUDE_DECISIONS_FILE") or os.path.join(HERE, "DECISIONS.md")
+DEFAULT_SOURCE = os.environ.get("AFCLAUDE_DECISIONS_FILE") or os.path.join(HERE, "DECISIONS.md")   # the seeding only
 IMPORT_ACTOR = "runner:import"
-HOOK_ACTOR = "runner:session-start"
 HOOK_SOURCES = ("startup", "compact", "clear")        # D-242: not resume (nor a run's continue)
 HOOK_CONTEXT_CAP = 10000                             # Claude Code's cap per hook's additionalContext
 HOOK_MARGIN = 200                                    # room for the part header's numbers
@@ -109,8 +98,7 @@ BERLIN = ZoneInfo("Europe/Berlin")                   # D-031: a Status's "active
 
 SOURCE_META = "decisions_source"                     # 'db' once the seeding ran (Q2); absent = the file
 SEED_SHA_META = "decisions_seed_sha"                 # the file's sha256 at the seeding
-SEEDED_META = "decisions_seeded"                     # JSON: what the seeding turned into db rows (for --undo)
-CHANGED_MARK = "decisions_file_changed_alerted"      # meta: the file-changed alert's episode (the file's sha)
+SEEDED_META = "decisions_seeded"                     # JSON: what the seeding turned into db rows (a record)
 TOPICS_MAX = 3                                       # a seeded entry's topics: 1-3 (D-284: a low number)
 
 
@@ -343,10 +331,7 @@ QUESTION_TITLE_MAX = 120
 def question_kind(d: dict[str, Any]) -> Optional[str]:
     """What the owner is asked about entry `d`: "proposal" (state proposed: a task-manager entry that changes
     an owner's decision), None (nothing: an owner's entry, an active task-manager entry, which needs no
-    confirmation since D-322, any other state). An entry that mirrors the file (origin 'file') is never
-    asked."""
-    if d.get("origin") != "db":
-        return None
+    confirmation since D-322, any other state)."""
     return "proposal" if d["state"] == "proposed" else None
 
 
@@ -547,7 +532,7 @@ def seed_plan(conn: sqlite3.Connection, path: str, topics: Any, merges: list[Any
         rows[i]["body_sha256"] != store.sha256_text(e.body) or rows[i]["state"] != e.row()["state"]
         or rows[i]["keywords"] != e.keywords)]
     if new or gone or stale:
-        raise SeedRefused("the DB does not mirror the file: run `python3 tasks.py decision import` first "
+        raise SeedRefused("the DB does not mirror the file: run `python3 decisions.py import` first "
                           f"(in the file only: {', '.join(new[:10]) or '-'}; in the DB only: "
                           f"{', '.join(gone[:10]) or '-'}; differing: {', '.join(stale[:10]) or '-'})")
     problems: list[str] = []
@@ -634,30 +619,26 @@ def source_of(conn: sqlite3.Connection) -> str:
 
 
 def seed(topics_path: Optional[str], merges_path: Optional[str], *, db_path: Optional[str] = None,
-         path: Optional[str] = None, dry_run: bool = False, undo: bool = False) -> dict[str, Any]:
+         path: Optional[str] = None, dry_run: bool = False) -> dict[str, Any]:
     """The seeding (action decision.seed, CLI only): checks everything first (a dry run of the action), then
     backs the database up (<db>.preseed-<utc>.bak, store._backup_copy) and runs it in one transaction.
-    undo: restores (decision.seed with undo). -> the action's result (counts per class against the file's)."""
+    -> the action's result (counts per class against the file's)."""
     import actions
-    params: dict[str, Any] = {"dry_run": True}
-    if undo:
-        params["undo"] = True
-    else:
-        if not topics_path or not merges_path:
-            raise SeedRefused("seed needs --topics FILE and --merges FILE")
-        topics, merges, keep = load_seed_files(topics_path, merges_path)
-        params.update(path=os.path.abspath(path or DEFAULT_SOURCE), topics=topics, merges=merges, keep=keep)
+    if not topics_path or not merges_path:
+        raise SeedRefused("seed needs --topics FILE and --merges FILE")
+    topics, merges, keep = load_seed_files(topics_path, merges_path)
+    params: dict[str, Any] = {"dry_run": True, "path": os.path.abspath(path or DEFAULT_SOURCE), "topics": topics,
+                              "merges": merges, "keep": keep}
     conn = store.connect(db_path)
     try:
         report: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
         if dry_run:
             return report
         params["dry_run"] = False
-        if not undo:
-            db_file = store._db_file(conn)
-            if db_file is None:
-                raise SeedRefused("the database is not a file: no backup can be made")
-            params["backup"] = store._backup_copy(conn, db_file, "preseed")
+        db_file = store._db_file(conn)
+        if db_file is None:
+            raise SeedRefused("the database is not a file: no backup can be made")
+        params["backup"] = store._backup_copy(conn, db_file, "preseed")
         result: dict[str, Any] = actions.perform(conn, "decision.seed", params, actor="cli", via="cli")
         return result
     finally:
@@ -690,12 +671,11 @@ def activate_own(owner_entries: Optional[list[str]] = None, *, db_path: Optional
 # ---------------------------------------------------------------- import
 
 def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor: str = IMPORT_ACTOR,
-                via: str = "runner", force: bool = False, conn: Optional[sqlite3.Connection] = None,
-                alert: Optional[Callable[[str, str], None]] = None) -> dict[str, Any]:
-    """Mirror the source file into the decisions table (actions.decision_import, audited).
-    -> {"file", "sha256", "entries", "added", "changed", "removed", "unchanged"}. After the seeding (Q2) it
-    imports nothing: -> {"retired": True, "file", "sha256", "seed_sha256", "differs"}, and a file that is not the
-    one the DB was seeded from alerts the owner once per episode (_file_changed)."""
+                via: str = "runner", force: bool = False,
+                conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
+    """The seeding's first step: mirror the source file into the decisions table (actions.decision_import,
+    audited). -> {"file", "sha256", "entries", "added", "changed", "removed", "unchanged"}. Once the seeding
+    ran (Q2) the file is retired and this is refused (decisions.SourceError, Q5)."""
     import actions
     own = conn is None
     c = conn if conn is not None else store.connect(db_path)
@@ -703,31 +683,10 @@ def import_file(path: Optional[str] = None, db_path: Optional[str] = None, actor
         r: dict[str, Any] = actions.perform(c, "decision.import",
                                             {"path": os.path.abspath(path or DEFAULT_SOURCE), "force": force},
                                             actor=actor, via=via)
-        if r.get("retired"):
-            _file_changed(c, r, alert)
         return r
     finally:
         if own:
             c.close()
-
-
-def _file_changed(conn: sqlite3.Connection, r: dict[str, Any], alert: Optional[Callable[[str, str], None]]) -> None:
-    """After the cut-over the file is not read any more; one whose sha differs from the seeding's means
-    somebody wrote a decision into it. Alert once per episode (CHANGED_MARK; it ends when the file is the
-    seeded one again): the DB has the decisions, record it with `tasks.py decision add`."""
-    mark = store.get_meta(conn, CHANGED_MARK)
-    if not r["differs"]:
-        if mark:
-            with store.transaction(conn):
-                store.set_meta(conn, CHANGED_MARK, "")
-        return
-    if not mark:
-        (alert or _alert)("DECISIONS.md changed after the cut-over",
-                          f"{r['file']} is not the file the decision store was seeded from (the DB is the only "
-                          "source now, the file is not imported any more). DECISIONS.md changed after the "
-                          "cut-over; record it with `python3 tasks.py decision add`.")
-        with store.transaction(conn):
-            store.set_meta(conn, CHANGED_MARK, r["sha256"])
 
 
 # ---------------------------------------------------------------- output
@@ -782,10 +741,9 @@ def split_parts(lines: list[str], parts: int, cap: int = HOOK_CONTEXT_CAP) -> li
     return out
 
 
-def tldr_text(lines: list[str], part: Optional[int] = None, of: Optional[int] = None,
-              note: Optional[str] = None) -> str:
+def tldr_text(lines: list[str], part: Optional[int] = None, of: Optional[int] = None) -> str:
     head = TLDR_HEAD.format(part=f", part {part} of {of}" if part is not None else "")
-    return "\n".join([head] + ([note] if note else []) + lines)
+    return "\n".join([head] + lines)
 
 
 # ---------------------------------------------------------------- the SessionStart hook
@@ -798,33 +756,12 @@ def rules_hooked(cwd: str) -> bool:
         return False
 
 
-def _hook_import(conn: sqlite3.Connection, source_path: Optional[str], db_path: Optional[str]) -> Optional[str]:
-    """The hook's import. A database this code can't write to (a migration still to run, D-235's
-    schema guard) or a file that can't be imported because of an id collision doesn't stop the TLDR:
-    it is built from what the DB holds, read-only, and the returned note (shown at the top of part 1)
-    says what is stale. A collision also alerts the owner (once per episode, as the 10-min import).
-    Any other failure raises: the hook then says it could not build the TLDR."""
-    if source_of(conn) == "db":
-        return None                                  # after the seeding the DB is the only source (Q2)
-    problem = store.schema_problem(conn)
-    if problem is not None:
-        return (f"[NOTE: DECISIONS.md was not imported, the database's schema doesn't fit this code "
-                f"({type(problem).__name__}); this list is what the database held and may lack the newest "
-                f"entries. Tell the owner: `python3 store.py migrate`, or update the code.]")
-    try:
-        import_file(source_path, db_path, actor=HOOK_ACTOR, conn=conn)
-    except IdCollision as e:
-        _import_failed(db_path, source_path or DEFAULT_SOURCE, f"{type(e).__name__}: {e}")
-        return f"[NOTE: DECISIONS.md was NOT imported, the owner was alerted: {e}]"
-    return None
-
-
-def hook_output(part: int, of: int, hook_input: dict[str, Any], source_path: Optional[str] = None,
-                db_path: Optional[str] = None, project_dir: Optional[str] = None) -> Optional[dict[str, Any]]:
+def hook_output(part: int, of: int, hook_input: dict[str, Any], db_path: Optional[str] = None,
+                project_dir: Optional[str] = None) -> Optional[dict[str, Any]]:
     """The SessionStart hook's JSON for part `part` of `of`, or None (nothing injected): another
-    source (resume), a session outside this repo's root, or an empty part. The import runs first,
-    in every part (they run in parallel; each sees the file's current state after its own import).
-    A failure never fails the session start: the context then says what failed and what to do."""
+    source (resume), a session outside this repo's root, or an empty part. The TLDR is built from the DB
+    only (no import, Q5). A failure never fails the session start: the context then says what failed and
+    what to do."""
     if hook_input.get("source") not in HOOK_SOURCES:
         return None
     cwd = hook_input.get("cwd") or project_dir or os.getcwd()
@@ -833,125 +770,34 @@ def hook_output(part: int, of: int, hook_input: dict[str, Any], source_path: Opt
     try:
         conn = store.connect(db_path)
         try:
-            note = _hook_import(conn, source_path, db_path)
-            chunk = split_parts(tldr_lines(conn), of, HOOK_CONTEXT_CAP - len(note or ""))[part - 1]
+            chunk = split_parts(tldr_lines(conn), of, HOOK_CONTEXT_CAP)[part - 1]
         finally:
             conn.close()
         if not chunk:
             return None
-        text = tldr_text(chunk, part, of, note if part == 1 else None)
+        text = tldr_text(chunk, part, of)
     except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
         if part != 1:
             return None          # part 1 reports it (once, not per part)
         what = f"[AFClaude decisions TLDR (D-242): could NOT be built ({type(e).__name__}: {e}). Tell the owner. "
-        if _source_kind(db_path) == "file":
-            text = what + (f"Until it is fixed, read {source_path or DEFAULT_SOURCE} directly before design or "
-                           "planning work.]")
-        else:        # the DB is the only source (after the seeding; or it can't even be read): no file to read
-            text = what + ("Until it is fixed, look decisions up with `python3 tasks.py decision find "
-                           "KEYWORD...` before design or planning work (the DB holds them; DECISIONS.md is not "
-                           "read any more).]")
+        text = what + ("Until it is fixed, look decisions up with `python3 tasks.py decision find "
+                       "KEYWORD...` before design or planning work (the DB holds them).]")
         sys.stderr.write(f"decisions hook: {type(e).__name__}: {e}\n")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
 
 
-def _source_kind(db_path: Optional[str]) -> Optional[str]:
-    """The decision source ('file' | 'db'), or None when the DB can't be read (the hook's failure text)."""
-    try:
-        conn = store.connect(db_path)
-        try:
-            return source_of(conn)
-        finally:
-            conn.close()
-    except (store.DBError, sqlite3.Error, OSError):
-        return None
-
-
-def print_hook(part: int, of: int, source_path: Optional[str] = None) -> int:
+def print_hook(part: int, of: int) -> int:
     """The hook command: reads the hook input (stdin JSON), prints the hook JSON, always exits 0."""
     try:
         raw = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
         hook_input = json.loads(raw) if raw.strip() else {}
     except (OSError, ValueError):
         hook_input = {}
-    out = hook_output(part, of, hook_input if isinstance(hook_input, dict) else {}, source_path,
+    out = hook_output(part, of, hook_input if isinstance(hook_input, dict) else {},
                       project_dir=os.environ.get("CLAUDE_PROJECT_DIR"))
     if out is not None:
         print(json.dumps(out))
     return 0
-
-
-# ---------------------------------------------------------------- the cron import
-
-CRON_MARK = "decisions_import_alerted"      # meta key: the --cron alert's episode
-
-
-def cron_import(db_path: Optional[str] = None, repo: Optional[str] = None,
-                alert: Optional[Callable[[str, str], None]] = None) -> tuple[int, str]:
-    """The scheduled import (project_docs.py import --cron, every 10 min): the repo's DECISIONS.md
-    into the DB. No file = nothing to do (an install without one). A failure alerts the owner once
-    per episode (it ends when the file imports again) and exits 1. -> (exit code, line or "")."""
-    path = os.path.join(os.path.abspath(repo or HERE), "DECISIONS.md")
-    if not os.path.exists(path):
-        return 0, ""
-    mismatch = False
-    try:
-        conn = store.connect(db_path)
-        try:
-            problem = store.schema_problem(conn)       # no doomed write: the failure is the alert
-        finally:
-            conn.close()
-        if problem is not None:
-            raise problem
-        r = import_file(path, db_path, alert=alert)
-        err = None
-    except (OSError, ValueError, LookupError, store.DBError, sqlite3.Error) as e:
-        r, err, mismatch = {}, f"{type(e).__name__}: {e}", isinstance(e, store.SchemaMismatch)
-    if err and mismatch:      # the episode's mark can't be written either: the out-of-DB alert, once
-        store.alert_once(store.fallback_path(db_path), "AFClaude decisions import failed: the schema",
-                         f"{path}: {err}\nNo write to the database until it is migrated "
-                         "(python3 store.py migrate) or the code is updated.", "decisions-import")
-    elif err:
-        _import_failed(db_path, path, err, alert)
-    else:
-        _import_ok(db_path)
-    if err:
-        return 1, f"{store.now_iso()} decisions import: {err}"
-    if r.get("added") or r.get("changed") or r.get("removed"):
-        parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r.get(k)]
-        return 0, f"{store.now_iso()} decisions import: " + "; ".join(parts)
-    return 0, ""
-
-
-def _import_failed(db_path: Optional[str], path: str, err: str,
-                   alert: Optional[Callable[[str, str], None]] = None) -> None:
-    """Alert the owner that the import failed, once per episode (CRON_MARK, shared by the 10-min
-    import and the hook; the episode ends when an import succeeds, _import_ok)."""
-    conn = store.connect(db_path)
-    try:
-        if not store.get_meta(conn, CRON_MARK):
-            (alert or _alert)("decisions import failed",
-                              f"{path}: {err}\nThe decision store in the DB stays as it was until the file "
-                              "imports again (python3 tasks.py decision import).")
-            with store.transaction(conn):
-                store.set_meta(conn, CRON_MARK, store.now_iso())
-    finally:
-        conn.close()
-
-
-def _import_ok(db_path: Optional[str]) -> None:
-    conn = store.connect(db_path)
-    try:
-        if store.get_meta(conn, CRON_MARK):
-            with store.transaction(conn):
-                store.set_meta(conn, CRON_MARK, "")
-    finally:
-        conn.close()
-
-
-def _alert(subject: str, body: str) -> None:
-    import project_docs
-    project_docs._alert(subject, body)
 
 
 # ---------------------------------------------------------------- CLI
@@ -960,20 +806,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="AFClaude decision store (D-242).")
     ap.add_argument("--db", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    i = sub.add_parser("import", help="import DECISIONS.md into the DB (idempotent; the file is not changed)")
+    i = sub.add_parser("import", help="the seeding's first step: mirror DECISIONS.md into the DB (refused after the seeding; the file is not changed)")
     i.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     i.add_argument("--force", action="store_true", help="allow removing more than half of the entries")
     h = sub.add_parser("hook", help="the SessionStart hook: one part of the TLDR as hook JSON (stdin: hook input)")
     h.add_argument("--part", type=int, required=True)
     h.add_argument("--of", type=int, required=True)
-    h.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     sub.add_parser("tldr", help="the TLDR as the hook shows it (no import)")
     sd = sub.add_parser("seed", help="the one-time cut-over: the DB becomes the only source (Q2); see docs/phase4_plan.md")
     sd.add_argument("--topics", default=None, help="JSON file: {\"D-001\": [\"topic\", ...], ...} for every surviving entry")
     sd.add_argument("--merges", default=None, help="JSON file: {\"merges\": [...], \"keep\": [...]}")
     sd.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     sd.add_argument("--dry-run", action="store_true", help="check and count, write nothing")
-    sd.add_argument("--undo", action="store_true", help="restore the file as the source (refused after an edit)")
     ao = sub.add_parser("activate-own", help="the D-322 migration: the task-manager's entries that change no "
                         "owner's decision become active, their questions close; --dry-run first")
     ao.add_argument("--owner-entry", action="append", default=[], metavar="ID",
@@ -983,11 +827,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "hook":
         if not 1 <= args.part <= args.of:
             ap.error("--part must be 1..--of")
-        return print_hook(args.part, args.of, args.file)
+        return print_hook(args.part, args.of)
     try:
         if args.cmd == "seed":
             print(json.dumps(seed(args.topics, args.merges, db_path=args.db, path=args.file,
-                                  dry_run=args.dry_run, undo=args.undo), indent=1, ensure_ascii=False))
+                                  dry_run=args.dry_run), indent=1, ensure_ascii=False))
             return 0
         if args.cmd == "activate-own":
             print(json.dumps(activate_own(args.owner_entry, db_path=args.db, dry_run=args.dry_run),

@@ -16,8 +16,8 @@ serves at /afclaude/:
                 logs one prediction per day (the DB, stage_eta_log) for the
                 rare review), latest keep-alive
                 decision, the newest progress log entries (the progress doc's appends
-                in the DB, progress_log), needs-your-input (OPEN_QUESTIONS.md, each item
-                one markdown string, + task-store inbox), page_version (the published
+                in the DB, progress_log), needs-your-input (the blocked tasks; the questions come
+                live from the inbox API, D-300), page_version (the published
                 page's stamp: a page that doesn't match is an old copy and says so),
                 the owner's message box to the task-manager (counts only:
                 the page reads the messages from the inbox API, D-241), what is scheduled (the AFClaude cron lines, plus the resident
@@ -27,7 +27,7 @@ serves at /afclaude/:
                 task-manager model / effort (D-260, manager_launch.py; data only, the page
                 has no settings area yet), the Remote Control setting of each session
                 category (D-269, remote_control.py; data only too)
-  docs/*.md     PROGRESS, GOALS, OPEN_QUESTIONS, ALERTS, EXCEPTIONS, BACKLOG,
+  docs/*.md     PROGRESS, GOALS, ALERTS, EXCEPTIONS, BACKLOG,
                 README, design doc, prompts/*.md; PROGRESS, GOALS, ALERTS and EXCEPTIONS
                 (and the goal list) come from the project docs in the DB (design §7.7:
                 the runners' notes and alerts are only there), the file if the DB has none
@@ -107,7 +107,6 @@ RUNS_FILE = os.path.join(HERE, "data", "afclaude_runs.jsonl")   # names run_metr
 DOCS = [  # (published name, source, title)
     ("PROGRESS.md", os.path.join(HERE, "PROGRESS.md"), "Progress log"),
     ("GOALS.md", os.path.join(HERE, "GOALS.md"), "Goals"),
-    ("OPEN_QUESTIONS.md", os.path.join(HERE, "OPEN_QUESTIONS.md"), "Open questions"),
     ("ALERTS.md", os.path.join(HERE, "ALERTS.md"), "Alerts"),
     ("EXCEPTIONS.md", os.path.join(HERE, "EXCEPTIONS.md"), "Rule exceptions"),
     ("BACKLOG.md", os.path.join(HERE, "BACKLOG.md"), "Future projects (backlog)"),
@@ -116,6 +115,7 @@ DOCS = [  # (published name, source, title)
 ]
 # published name -> the project doc it shows (the DB's text; the file only if the DB has none)
 DB_DOCS = {"PROGRESS.md": "progress", "GOALS.md": "goals", "ALERTS.md": "alerts", "EXCEPTIONS.md": "exceptions"}
+RETIRED_DOCS = ("OPEN_QUESTIONS.md", "DECISIONS.md")   # in the DB since phase 4b: never published (Q5), even though they stay on disk
 EXCLUDE_DIRS = ("data", "run", "probe", ".git", ".venv", "prompts", "node_modules", "__pycache__")
 
 
@@ -127,7 +127,7 @@ def all_docs():
     known = {os.path.realpath(src) for _, src, _ in DOCS}
     for src in sorted(glob.glob(os.path.join(HERE, "**", "*.md"), recursive=True)):
         rel = os.path.relpath(src, HERE)
-        if rel.split(os.sep)[0] in EXCLUDE_DIRS or os.path.realpath(src) in known:
+        if rel.split(os.sep)[0] in EXCLUDE_DIRS or os.path.realpath(src) in known or rel in RETIRED_DOCS:
             continue
         name = rel.replace(os.sep, "__")
         title = rel[:-3].replace("_", " ").replace("/", ": ")
@@ -388,106 +388,15 @@ def eta_summary(eta):
 
 # ---------------------------------------------------------------- other sources
 
-_MD_FILE_RE = re.compile(r"\b[\w./-]*\.md\b")
-_MD_POINTER_WORDS_RE = re.compile(r"\b(see|cf\.?|details?( in)?|refer to|in)\b", re.IGNORECASE)
-
-
-def parse_open_questions(oq_md):
-    """The items of OPEN_QUESTIONS.md as (style, lines): style "-" for a top-level '- ' item, "##" for a
-    '## ' section (today's format; the heading is the first line). `lines` is the list of raw lines, the first
-    with its '- ' / '## ' stripped. A line is part of the current item unless it starts a new one: a '-'
-    with no leading indentation (not inside a '## ' section, whose own '- ' lines are its body) or a '## '
-    heading. Indented continuation lines and nested numbered/bulleted sub-items (D-279: a multi-line item
-    must not collapse to its first line) stay with the item, and so does a fenced code block (``` or ~~~).
-    Text before the first item (title, blank, comments) is no question."""
-    items, cur, style, fence = [], None, None, None
-    for line in oq_md.splitlines():
-        m = re.match(r"^\s*(`{3,}|~{3,})", line)
-        if fence is not None or m:     # a fenced code block is body text: its '## ' and '- ' lines start no item
-            if fence is None:
-                fence = m.group(1)[0] * 3
-            elif re.match(r"^\s*" + re.escape(fence[0]) + "{3,}\\s*$", line):
-                fence = None
-            if cur is not None:
-                cur.append(line.rstrip())
-            continue
-        if re.match(r"^##\s+\S", line):
-            if cur is not None:
-                items.append((style, cur))
-            cur, style = [re.sub(r"^##\s+", "", line).rstrip()], "##"
-        elif style != "##" and re.match(r"^-\s+\S", line):
-            if cur is not None:
-                items.append((style, cur))
-            cur, style = [re.sub(r"^-\s+", "", line).rstrip()], "-"
-        elif cur is not None:
-            cur.append(line.rstrip())
-    if cur is not None:
-        items.append((style, cur))
-    return items
-
-
-def _split_open_questions(oq_md):
-    """parse_open_questions' items as their lists of raw lines."""
-    return [lines for _style, lines in parse_open_questions(oq_md)]
-
-
-def _open_question_text(lines):
-    """lines (as from _split_open_questions) joined into markdown: the header line, then - if
-    there are continuation lines - a blank line and the continuation dedented to its own
-    shallowest indent, so a nested list under it still parses as a list rather than being eaten
-    as lazy paragraph continuation."""
-    head, rest = lines[0], lines[1:]
-    while rest and rest[-1].strip() == "":
-        rest.pop()
-    if not rest:
-        return head
-    indents = [len(l) - len(l.lstrip()) for l in rest if l.strip()]
-    cut = min(indents) if indents else 0
-    rest = ["" if not l.strip() else l[cut:] for l in rest]
-    return head + "\n\n" + "\n".join(rest)
-
-
-def _open_question_warning(lines):
-    """D-279 safety net: flag an item whose only real content is a pointer to a .md file (the
-    original bug - a header naming a doc with the actual questions left out of OPEN_QUESTIONS.md
-    entirely) so it's caught instead of silently showing an empty-looking item."""
-    full = " ".join(l.strip() for l in lines if l.strip())
-    if not _MD_FILE_RE.search(full):
-        return None
-    rest = _MD_FILE_RE.sub("", full)
-    rest = _MD_POINTER_WORDS_RE.sub("", rest)
-    rest = re.sub(r"[\s:.,()*_\-]+", "", rest)
-    if len(rest) < 20:
-        return "points mainly to a file instead of stating the question here"
-    return None
-
-
-def _open_question_md(lines, style="-"):
-    """One open question as one markdown string (D-279: in full); a warning goes into the text. A '## '
-    section's heading is bold (a '- ' item's first line is the item's own text)."""
-    text = _open_question_text(["**" + lines[0] + "**"] + lines[1:] if style == "##" else lines)
-
-    warning = _open_question_warning(lines)
-    return text + "\n\n**⚠ " + warning + "**" if warning else text
-
-
-QUESTIONS_SOURCES = ("file", "db")
-
-
 def needs_input():
-    """What waits for the owner. Questions: while meta questions_source is "file" (until Q3's import) the
-    items of OPEN_QUESTIONS.md, both formats; the DB's open questions (decision questions, asked ones) are
-    shown by the page live from the inbox API, with their answer controls (D-300), in both states. Blocked
-    tasks (kind task) as before; a blocked question is not one of them. The file's items show only when the
-    DB said "file": a DB error or an unknown source gives `source` None, no items and the error (D-235: no
-    old list passed off as current)."""
-    source, err = None, None
+    """What waits for the owner: blocked tasks (kind task; a blocked question is not one of them). The
+    questions themselves (decision questions, asked ones) are the DB's: the page shows them live from the
+    inbox API, with their answer controls (D-300). OPEN_QUESTIONS.md is not read any more (phase 4b Q5). A DB
+    error gives no tasks and the error (D-235: no old list passed off as current)."""
+    err = None
     try:
         conn = store.connect()
         try:
-            source = store.get_meta(conn, "questions_source", "file")
-            if source not in QUESTIONS_SOURCES:
-                err, source = "questions_source is %r (want file|db)" % source, None
             import stalled  # incremental transcript scan (~0.06 s) so stalled sessions + own flags are current
             stalled.scan(conn)
             inbox = store.pending_user_input(conn)
@@ -497,15 +406,10 @@ def needs_input():
                     "question": t.get("blocked_question")}
                    for t in inbox["blocked_tasks"] if t.get("kind") != "question"]
     except Exception as e:  # noqa: BLE001 - never let a DB hiccup break the export
-        blocked, err, source = [], str(e)[:300], None
-    open_questions = []
-    if source == "file":
-        oq_md = read(os.path.join(HERE, "OPEN_QUESTIONS.md")) or ""
-        open_questions = [_open_question_md(lines, style) for style, lines in parse_open_questions(oq_md)]
-    return {"open_questions": open_questions, "blocked_tasks": blocked, "source": source,
-            "error": err,
+        blocked, err = [], str(e)[:300]
+    return {"blocked_tasks": blocked, "error": err,
             # user rule 29.09.: only real questions + blocked tasks; stalled sessions are not shown here
-            "count": len(open_questions) + len(blocked)}
+            "count": len(blocked)}
 
 
 PROGRESS_ENTRIES = 8   # the newest progress log entries the page shows

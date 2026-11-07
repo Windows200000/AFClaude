@@ -81,7 +81,7 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            (keyword matches first, then full-text hits; default 10)
     tasks.py decision show ID              one decision's full entry (D-NNN / M-NNN)
     tasks.py decision keywords ID add|remove KW...   keep a decision's keywords current (audited;
-                                           kept apart from DECISIONS.md's Keywords line)
+                                           kept apart from the imported Keywords line)
     tasks.py decision topics [ID add|remove T...]   an entry's topics (D-284: free keywords, "all" allowed,
                                            keep few); without ID: every topic in use, with counts
     tasks.py decision add --title T --topic T... --author owner|task-manager [--words W ...]
@@ -98,11 +98,8 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py decision edit|expire|delete|confirm ID ...   overwrite fields (not the words or summary of an
                                            owner's entry), remove an expired one-off or one that no longer
                                            applies (audited with the old text), the owner's confirmation of a
-                                           proposal (native entries; the DECISIONS.md ones are changed in the
-                                           file until the seeding step)
+                                           proposal
     tasks.py decision link ID refines|requires|conflicts TO [--remove]   relate two decisions
-    tasks.py decision import [--file F] [--force]   DECISIONS.md into the DB now (also every 10 min
-                                           and at each compaction; the file is never written)
     tasks.py notice post --title T --text TEXT|- [--project P]   a notice for the owner on the
                                            dashboard (D-306), shown until the owner dismisses it
     tasks.py notice list [--all]           the notices still shown (--all: the dismissed ones too)
@@ -628,24 +625,6 @@ def decision_write(conn, args):
 def run_decision(conn, args):
     import decisions
     dc = args.decision_cmd
-    if dc == "import":
-        r = decisions.import_file(args.file, actor="cli", via="cli", force=args.force, conn=conn)
-        if args.json:
-            return dump(r)
-        if r.get("retired"):
-            print("nothing imported: the DB is the only decision source since the cut-over (the file is not read). "
-                  + ("The file differs from the seeded one: record what it holds with `tasks.py decision add`."
-                     if r["differs"] else "The file is the seeded one."))
-            return None
-        parts = [f"{k} {', '.join(r[k])}" for k in ("added", "changed", "removed") if r[k]]
-        print(f"{r['entries']} decisions from {r['file']}: " + ("; ".join(parts) or "unchanged")
-              + (f" ({r['moved']} moved)" if r["moved"] else ""))
-        if r["detached"]:
-            print(f"native in the DB, so the file's version is ignored: {', '.join(r['detached'])}")
-        if r["no_status"]:
-            print(f"no Status line ({len(r['no_status'])}, counted as active unless the title names a "
-                  f"state): {', '.join(r['no_status'])}")
-        return None
     if dc == "tldr":
         rows = store.list_decision_entries(conn, None if args.all else decisions.CURRENT)
         if args.json:
@@ -1353,10 +1332,6 @@ def parser():
     q.add_argument("kind", choices=store.DECISION_LINK_KINDS)
     q.add_argument("to")
     q.add_argument("--remove", action="store_true")
-    q = dcs.add_parser("import", parents=[js], help="import DECISIONS.md now (also every 10 min and at "
-                                                    "each compaction; the file is not changed)")
-    q.add_argument("--file", help="the source (default: DECISIONS.md next to tasks.py)")
-    q.add_argument("--force", action="store_true", help="allow removing more than half of the decisions")
     p = sub.add_parser("question", help="questions for the owner (phase 4b Q3): ask | list | answer | close")
     qs = p.add_subparsers(dest="question_cmd", required=True)
     q = qs.add_parser("ask", parents=[js], help="ask the owner: plain words, the whole question in the text")

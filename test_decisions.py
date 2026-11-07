@@ -3,7 +3,7 @@
 the import (decision.import: idempotent, audited, the refusals), the task-manager's keywords
 (decision.keywords, kept across re-imports), the lookup (keywords first, then FTS5 or LIKE), the
 TLDR and its split into hook parts, the SessionStart hook (which sources, which directory, the
-failure text), the 10-min cron import and the CLI (tasks.py decision). Synthetic sources only
+failure text; it reads the DB only, Q5) and the CLI (tasks.py decision). Synthetic sources only
 (the real DECISIONS.md is local and never read here).
 
     python3 -m unittest test_decisions
@@ -499,9 +499,13 @@ class Tldr(Env):
 
 
 class Hook(Env):
+    def setUp(self):
+        super().setUp()
+        self.imp()               # the hook reads the DB only (Q5): the entries are in it before it runs
+
     def hook(self, part=1, of=3, **inp):
         inp.setdefault("cwd", dec.HERE)
-        return dec.hook_output(part, of, inp, self.src, self.db)
+        return dec.hook_output(part, of, inp, self.db)
 
     def test_sources_and_directory(self):
         for source in ("compact", "startup", "clear"):
@@ -515,33 +519,34 @@ class Hook(Env):
         self.assertIsNone(self.hook(source="compact", cwd=self.tmp))                # another directory
         self.assertIsNone(self.hook(part=2, source="compact"))                      # an empty part
 
-    def test_imports_first(self):
-        self.hook(source="compact")
+    def test_does_not_read_or_import_the_file(self):
+        """Q5: a changed file is not imported; the TLDR is the DB's."""
         self.write(SOURCE.replace("### D-004 A one-off that was carried out", "### D-005 Brand new\n"
                                   "- **Keywords:** new\n\n### D-004 A one-off that was carried out"))
         text = self.hook(source="compact")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("D-005 Brand new", text)
+        self.assertNotIn("D-005", text)
+        self.assertNotIn("NOTE", text)
         c = self.conn()
         try:
-            self.assertEqual(store.get_decision_entry(c, "D-005")["updated_by"], dec.HOOK_ACTOR)
+            self.assertIsNone(store.get_decision_entry(c, "D-005"))
         finally:
             c.close()
 
     def test_failure_is_said_in_part_one(self):
-        self.write("# no entries\n")
-        with contextlib.redirect_stderr(io.StringIO()) as err:
+        with mock.patch.object(dec, "tldr_lines", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
             text = self.hook(source="compact")["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("decisions hook: SourceError", err.getvalue())
+            self.assertIsNone(self.hook(part=2, source="compact"))
+        self.assertIn("decisions hook: OperationalError", err.getvalue())
         self.assertIn("could NOT be built", text)
-        self.assertIn("SourceError", text)
-        self.assertIn(self.src, text)
-        self.assertIsNone(self.hook(part=2, source="compact"))
+        self.assertIn("OperationalError", text)
+        self.assertIn("tasks.py decision find", text)                               # no file to read any more
+        self.assertNotIn("DECISIONS.md", text)
 
     def test_cli(self):
         """The hook command itself: valid JSON in the repo, exit 0 even for unreadable input."""
         env = dict(os.environ, AFCLAUDE_DB=self.db)
-        cmd = [sys.executable, os.path.join(HERE, "decisions.py"), "hook", "--part", "1", "--of", "3",
-               "--file", self.src]
+        cmd = [sys.executable, os.path.join(HERE, "decisions.py"), "hook", "--part", "1", "--of", "3"]
         r = subprocess.run(cmd, input=json.dumps({"cwd": dec.HERE, "source": "compact"}), capture_output=True,
                            text=True, env=env, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -562,37 +567,6 @@ class Hook(Env):
                                 for i in range(1, of + 1)])
 
 
-class Cron(Env):
-    def setUp(self):
-        super().setUp()
-        self.alerts = []
-
-    def cron(self):
-        return dec.cron_import(self.db, self.tmp, alert=lambda s, b: self.alerts.append(s))
-
-    def test_import_alert_once_and_recover(self):
-        code, line = self.cron()
-        self.assertEqual(code, 0)
-        self.assertIn("decisions import: added D-001, D-002", line)
-        self.assertEqual(self.cron(), (0, ""))                                      # unchanged: quiet
-        self.write("# broken\n")
-        code, line = self.cron()
-        self.assertEqual(code, 1)
-        self.assertIn("SourceError", line)
-        self.assertEqual(self.cron()[0], 1)
-        self.assertEqual(self.alerts, ["decisions import failed"])                  # once per episode
-        self.write(SOURCE)
-        self.assertEqual(self.cron(), (0, ""))
-        self.write("# broken again\n")
-        self.cron()
-        self.assertEqual(len(self.alerts), 2)                                       # a new episode
-
-    def test_no_file_is_nothing_to_do(self):
-        os.remove(self.src)
-        self.assertEqual(self.cron(), (0, ""))
-        self.assertEqual(self.alerts, [])
-
-
 class Cli(Env):
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -601,11 +575,9 @@ class Cli(Env):
         return code, out.getvalue(), err.getvalue()
 
     def test_commands(self):
-        code, out, _ = self.cli("import", "--file", self.src)
-        self.assertEqual(code, 0)
-        self.assertIn("5 decisions from", out)
-        self.assertIn("no Status line (1, counted as active unless the title names a state): M-001", out)
-        self.assertIn("unchanged", self.cli("import", "--file", self.src)[1])
+        self.imp()                              # the seeding's step, not a tasks.py command any more (Q5)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.cli("import")                  # argparse: no such command
         out = self.cli("tldr")[1]
         self.assertIn("D-003 Session cap 95% at night [partly superseded]", out)
         self.assertNotIn("D-004", out)

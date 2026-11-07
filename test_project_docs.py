@@ -454,18 +454,24 @@ class CronImport(Env):
                                       "--reviews-dir", self.reviews]), 0)
         self.assertIn("goals: imported", out.getvalue())
 
-    def test_a_failing_question_check_does_not_hide_the_docs_import(self):
+    def test_the_cron_pass_does_not_touch_the_retired_files(self):
+        """Q5: the 10-min pass imports the project docs only: a DECISIONS.md or OPEN_QUESTIONS.md in the repo is
+        neither read nor imported nor alerted about."""
+        import decisions
         import questions
         self.write("GOALS.md", "# G\n")
+        self.write("DECISIONS.md", "### D-001 Something\n- **Keywords:** x\n")
+        self.write("OPEN_QUESTIONS.md", "- A question?\n")
         out = io.StringIO()
-        with mock.patch.object(questions, "cron_check", side_effect=RuntimeError("check broke")), \
+        with mock.patch.object(decisions, "import_file", side_effect=AssertionError("read the file")), \
+                mock.patch.object(questions, "read_source", side_effect=AssertionError("read the file")), \
                 contextlib.redirect_stdout(out):
-            with self.assertRaises(RuntimeError):
-                pd.main(["import", "--cron", "--db", self.db, "--repo", self.repo,
-                         "--reviews-dir", self.reviews])
-        self.assertIn("goals: imported", out.getvalue())               # the docs import ran before the check
+            self.assertEqual(pd.main(["import", "--cron", "--db", self.db, "--repo", self.repo,
+                                      "--reviews-dir", self.reviews]), 0)
+        self.assertIn("goals: imported", out.getvalue())
         with self.conn() as c:
-            self.assertEqual(c.execute("SELECT COUNT(*) FROM docs WHERE name = 'goals'").fetchone()[0], 1)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
+        self.assertEqual(self.alerts, [])
 
     def test_a_failed_alert_is_logged_raised_and_the_episode_stays_unmarked(self):
         self.write("PROGRESS.md", "- 1\n")

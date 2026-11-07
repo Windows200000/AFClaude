@@ -11,8 +11,8 @@ module maps the files onto them, imports them and writes the public build log ba
   EXCEPTIONS.md                        exceptions             log
   ALERTS.md                            alerts                 log
   data/reviews/<name>.md               review:<name>          body
-  (BACKLOG.md stays a file until gate 8d, D-065/D-173; OPEN_QUESTIONS.md and DECISIONS.md move in
-  phase 4b, D-151/D-158.)
+  (BACKLOG.md stays a file until gate 8d, D-065/D-173; OPEN_QUESTIONS.md and DECISIONS.md moved into the DB
+  in phase 4b, D-151/D-158, and are neither read nor written since, Q5.)
 
 The DB is the source (the §7.7 switch, built): the writers go through actions.py, audited:
   - the task-manager and the review sessions: `python3 tasks.py doc append progress "…"`,
@@ -23,7 +23,6 @@ Hand edits of PROGRESS.md / GOALS.md / EXCEPTIONS.md stay possible (the owner an
 edit them directly): the importer takes them in, on a schedule (the runner's docs_import job, every 10 min,
 `import --cron`) and as the first step of every export:
     python3 project_docs.py import [--cron]     (= python3 store.py import-docs; idempotent, files untouched)
-(--cron also imports the repo's DECISIONS.md into the decision store first: decisions.cron_import, D-242.)
 It reads every file and runs doc.sync for it (actor runner:import): an unchanged file is a no-op
 (or "DB ahead" when the DB moved on), an appended one adds its new entries, an in-place edit is
 one 'replace' entry keeping the unchanged entries; when the file and the DB both changed since
@@ -381,27 +380,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
     try:
         if args.cmd == "import" and args.cron:
-            import decisions          # the repo's DECISIONS.md too (D-242), in the same 10-min pass
-            import questions          # after the cut-over OPEN_QUESTIONS.md must be the imported file (Q3)
-            # One failing stage (e.g. an alert that cannot go out) must not hide the others: run them all,
-            # print every line, then raise the first error (D-235); the docs import runs before the question
-            # check so that a failure of the latter cannot hide it.
-            stages: tuple[Callable[[], tuple[int, str]], ...] = (
-                lambda: decisions.cron_import(args.db, args.repo),
-                lambda: cron_import(args.db, args.repo, args.reviews_dir, args.project),
-                lambda: questions.cron_check(args.db, args.repo))
-            code, first_error = 0, None
-            for stage in stages:
-                try:
-                    scode, sline = stage()
-                except Exception as err:   # noqa: BLE001 - re-raised below, after the other stages ran
-                    first_error = first_error or err
-                    continue
-                if sline:
-                    print(sline)
-                code = max(code, scode)
-            if first_error is not None:
-                raise first_error
+            code, line = cron_import(args.db, args.repo, args.reviews_dir, args.project)
+            if line:
+                print(line)
             return code
         if args.cmd == "import":
             r = import_all(args.db, args.repo, args.reviews_dir, args.project, force=args.force)

@@ -3,17 +3,15 @@
 proposals"; D-102, D-151, D-181, D-235, D-263, D-279), mypy --strict.
 
     python3 questions.py import [--file P] [--dry-run] [--project NAME]
-    python3 questions.py import --undo
 
 After it the DB is the only question list (meta questions_source = db): each item of the file is a question
 for the checkout's project (title = the heading without its `Q-...:` label, text = the item verbatim), and
 every proposal and every unconfirmed task-manager entry has its decision question (actions.
-ensure_decision_questions). The file is read, never written (D-181). This module parses and checks (plan_import)
-and drives the CLI (backup, dry run, undo); the writes are the action `question.import` (actions.py: CLI only,
-audited, one transaction). The item parser is export_quickview.parse_open_questions (the quickview's own: `## `
-sections and top-level `- ` items, fence-aware). cron_check is the runner's 10-min check after the cut-over:
-OPEN_QUESTIONS.md must still be the file that was imported, else the owner is alerted once per episode (as
-decisions.py does for DECISIONS.md)."""
+ensure_decision_questions). The file is read, never written (D-181), and only here: since phase 4b Q5 nothing
+else reads it (the quickview, the 10-min file check and the undo are gone; the file stays on disk for the owner
+to archive). This module parses and checks (plan_import) and drives the CLI (backup, dry run); the writes are
+the action `question.import` (actions.py: CLI only, audited, one transaction). The item parser
+(parse_open_questions) is here: `## ` sections and top-level `- ` items, fence-aware."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +22,7 @@ import re
 import sqlite3
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -33,14 +31,13 @@ import store  # noqa: E402
 SOURCE_META = "questions_source"                       # 'db' once the import ran; absent or 'file' before
 FILE_SHA_META = "questions_file_sha"                   # the file's sha256 at the import
 IMPORTED_META = "questions_imported"                   # JSON: the question ids the import created
-CHANGED_MARK = "questions_file_changed_alerted"        # meta: the file-changed alert's episode (the file's sha)
 DEFAULT_SOURCE = os.path.join(HERE, "OPEN_QUESTIONS.md")
 IMPORT_VIA = "cli"
 TITLE_MAX = 120                                        # as store.ask_question cuts a title it makes itself
 
 
 class ImportRefused(ValueError):
-    """The import (or its undo) can't be done; nothing was written. The message lists every reason."""
+    """The import can't be done; nothing was written. The message lists every reason."""
 
 
 @dataclass
@@ -107,19 +104,69 @@ def _preamble_problems(lines: list[str]) -> list[str]:
     return out
 
 
-def _quickview() -> Any:
-    """export_quickview, imported on first use. Importing it loads keepalive and the settings, which read
-    the DB on their own connection: never inside a write transaction (the write lock would make that read
-    wait out its busy timeout), so import_questions loads it before it connects."""
-    import export_quickview
-    return export_quickview
+# the item parser (moved here from export_quickview, which no longer reads the file, phase 4b Q5)
+
+_MD_FILE_RE = re.compile(r"\b[\w./-]*\.md\b")
+_MD_POINTER_WORDS_RE = re.compile(r"\b(see|cf\.?|details?( in)?|refer to|in)\b", re.IGNORECASE)
+
+
+def parse_open_questions(oq_md: str) -> list[tuple[str, list[str]]]:
+    """The items of OPEN_QUESTIONS.md as (style, lines): style "-" for a top-level '- ' item, "##" for a
+    '## ' section (today's format; the heading is the first line). `lines` is the list of raw lines, the first
+    with its '- ' / '## ' stripped. A line is part of the current item unless it starts a new one: a '-'
+    with no leading indentation (not inside a '## ' section, whose own '- ' lines are its body) or a '## '
+    heading. Indented continuation lines and nested numbered/bulleted sub-items (D-279: a multi-line item
+    must not collapse to its first line) stay with the item, and so does a fenced code block (``` or ~~~).
+    Text before the first item (title, blank, comments) is no question."""
+    items: list[tuple[str, list[str]]] = []
+    cur: Optional[list[str]] = None
+    style = ""
+    fence: Optional[str] = None
+    for line in oq_md.splitlines():
+        m = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence is not None or m:     # a fenced code block is body text: its '## ' and '- ' lines start no item
+            if fence is None:
+                assert m is not None
+                fence = m.group(1)[0] * 3
+            elif re.match(r"^\s*" + re.escape(fence[0]) + "{3,}\\s*$", line):
+                fence = None
+            if cur is not None:
+                cur.append(line.rstrip())
+            continue
+        if re.match(r"^##\s+\S", line):
+            if cur is not None:
+                items.append((style, cur))
+            cur, style = [re.sub(r"^##\s+", "", line).rstrip()], "##"
+        elif style != "##" and re.match(r"^-\s+\S", line):
+            if cur is not None:
+                items.append((style, cur))
+            cur, style = [re.sub(r"^-\s+", "", line).rstrip()], "-"
+        elif cur is not None:
+            cur.append(line.rstrip())
+    if cur is not None:
+        items.append((style, cur))
+    return items
+
+
+def _open_question_warning(lines: list[str]) -> Optional[str]:
+    """D-279 safety net: flag an item whose only real content is a pointer to a .md file (the
+    original bug - a header naming a doc with the actual questions left out of OPEN_QUESTIONS.md
+    entirely) so it's caught instead of an empty-looking question being imported."""
+    full = " ".join(l.strip() for l in lines if l.strip())
+    if not _MD_FILE_RE.search(full):
+        return None
+    rest = _MD_FILE_RE.sub("", full)
+    rest = _MD_POINTER_WORDS_RE.sub("", rest)
+    rest = re.sub(r"[\s:.,()*_\-]+", "", rest)
+    if len(rest) < 20:
+        return "points mainly to a file instead of stating the question here"
+    return None
 
 
 def parse_items(text: str) -> tuple[list[Item], list[str]]:
     """(items, problems) of the file's text. problems: text before the first item, an item without a
     title, and an item that only points to a .md file (D-279). No item at all is a problem too."""
-    qv = _quickview()
-    raw = qv.parse_open_questions(text)
+    raw = parse_open_questions(text)
     lines = text.splitlines()
     kept = sum(len(part) for _style, part in raw)
     problems = _preamble_problems(lines[:len(lines) - kept])
@@ -131,7 +178,7 @@ def parse_items(text: str) -> tuple[list[Item], list[str]]:
         item = Item(style, item_title(body[0]), "\n".join(body))
         if not item.title:
             problems.append(f"item {n} ({body[0][:40]!r}) has no title after its label")
-        warn = qv._open_question_warning(part)         # D-279's pointer check
+        warn = _open_question_warning(part)         # D-279's pointer check
         if warn:
             problems.append(f"item {n} ({item.title[:40]!r}) {warn}")
         items.append(item)
@@ -147,8 +194,7 @@ def plan_import(conn: sqlite3.Connection, path: str, project: Optional[str] = No
     import actions
     problems: list[str] = []
     if source_of(conn) == "db":
-        raise ImportRefused("the questions are imported already (meta questions_source = db); "
-                            "`questions.py import --undo` goes back")
+        raise ImportRefused("the questions are imported already (meta questions_source = db)")
     p = store.get_project(conn, project, nearest=False) if project is not None \
         else store.get_project(conn, actions.HERE, nearest=False)
     if p is None:
@@ -170,74 +216,23 @@ def plan_import(conn: sqlite3.Connection, path: str, project: Optional[str] = No
 
 
 def import_questions(db_path: Optional[str] = None, path: Optional[str] = None, dry_run: bool = False,
-                     undo: bool = False, project: Optional[str] = None) -> dict[str, Any]:
+                     project: Optional[str] = None) -> dict[str, Any]:
     """The CLI's import: the checks and counts as a dry run (always, first), then the backup
-    (<db>.preqimport-<utc>.bak) and the action question.import in one transaction. undo: the action's undo
-    (no backup: it only cancels the imported questions). -> the action's result."""
+    (<db>.preqimport-<utc>.bak) and the action question.import in one transaction. -> the action's result."""
     import actions
-    _quickview()                  # before the connection: see _quickview
-    params: dict[str, Any] = {"dry_run": True}
-    if undo:
-        params["undo"] = True
-    else:
-        params.update(path=os.path.abspath(path or DEFAULT_SOURCE), project=project)
+    params: dict[str, Any] = {"dry_run": True, "path": os.path.abspath(path or DEFAULT_SOURCE), "project": project}
     conn = store.connect(db_path)
     try:
         report: dict[str, Any] = actions.perform(conn, "question.import", params, actor="cli", via=IMPORT_VIA)
         if dry_run:
             return report
         params["dry_run"] = False
-        if not undo:
-            db_file = store._db_file(conn)
-            if db_file is None:
-                raise ImportRefused("the database is not a file: no backup can be made")
-            params["backup"] = store._backup_copy(conn, db_file, "preqimport")
+        db_file = store._db_file(conn)
+        if db_file is None:
+            raise ImportRefused("the database is not a file: no backup can be made")
+        params["backup"] = store._backup_copy(conn, db_file, "preqimport")
         result: dict[str, Any] = actions.perform(conn, "question.import", params, actor="cli", via=IMPORT_VIA)
         return result
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------- the file check after the cut-over
-
-def cron_check(db_path: Optional[str] = None, repo: Optional[str] = None,
-               alert: Optional[Callable[[str, str], None]] = None) -> tuple[int, str]:
-    """The runner's 10-min check (project_docs.py import --cron): once the questions are imported, the
-    repo's OPEN_QUESTIONS.md must be the imported file; one whose sha differs means somebody wrote a question
-    into it. Alert the owner once per episode (CHANGED_MARK; it ends when the file is the imported one again).
-    Before the import, or without a file, nothing happens. -> (exit code, line or "")."""
-    path = os.path.join(os.path.abspath(repo or HERE), "OPEN_QUESTIONS.md")
-    conn = store.connect(db_path)
-    try:
-        if source_of(conn) != "db":
-            return 0, ""
-        try:
-            with open(path, "rb") as fh:          # the raw bytes: a save that is not UTF-8 is a change too
-                sha: Optional[str] = hashlib.sha256(fh.read()).hexdigest()
-        except FileNotFoundError:
-            sha = None
-        except OSError as err:                    # unreadable (a directory, permissions): changed, once
-            sha = f"unreadable:{type(err).__name__}"
-        imported = store.get_meta(conn, FILE_SHA_META)
-        mark = store.get_meta(conn, CHANGED_MARK)
-        if sha is None or sha == imported:
-            if mark:
-                with store.transaction(conn):
-                    store.set_meta(conn, CHANGED_MARK, "")
-            return 0, ""
-        if mark:
-            return 0, ""
-        subject = "OPEN_QUESTIONS.md changed after the cut-over"
-        body = (f"{path} is not the file the questions were imported from (the DB is the only question list "
-                "now, the file is not read any more). OPEN_QUESTIONS.md changed after the cut-over; ask with "
-                "`python3 tasks.py question ask`.")
-        if alert is None:
-            import project_docs
-            alert = project_docs._alert
-        alert(subject, body)                      # raises when it cannot go out: no mark, the next run retries
-        with store.transaction(conn):
-            store.set_meta(conn, CHANGED_MARK, sha)
-        return 0, f"{store.now_iso()} questions: {subject}"
     finally:
         conn.close()
 
@@ -252,11 +247,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     i.add_argument("--file", default=None, help=f"the source (default {DEFAULT_SOURCE})")
     i.add_argument("--project", default=None, help="the project the questions belong to (default: this checkout's)")
     i.add_argument("--dry-run", action="store_true", help="check and count, write nothing")
-    i.add_argument("--undo", action="store_true",
-                   help="cancel the imported questions and go back to the file (refused after an answer)")
     args = ap.parse_args(argv)
     try:
-        print(json.dumps(import_questions(args.db, args.file, args.dry_run, args.undo, args.project),
+        print(json.dumps(import_questions(args.db, args.file, args.dry_run, args.project),
                          indent=1, ensure_ascii=False))
         return 0
     except (store.DBError, sqlite3.Error) as err:

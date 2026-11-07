@@ -2,8 +2,7 @@
 """Tests for the question import (phase 4b Q3 W3, docs/phase4_plan.md; D-102, D-151, D-181, D-235, D-263, D-279):
 `questions.py import` (action question.import) on synthetic OPEN_QUESTIONS.md files in both formats: one question
 per item with the text verbatim and the counts, the decision questions added once, the preconditions that refuse
-before any write, the dry run, the backup, `--undo` and its refusals, the changed-file alert after the cut-over,
-and the refusal through MCP. Synthetic data only.
+before any write, the dry run, the backup, and the refusal through MCP (no undo and no file check since Q5). Synthetic data only.
 
     python3 -m unittest test_question_import
 """
@@ -78,9 +77,6 @@ class Env(unittest.TestCase):
     def run_import(self, **kw):
         kw.setdefault("project", "Mgr")
         return qs.import_questions(self.db, self.src, **kw)
-
-    def undo(self, **kw):
-        return qs.import_questions(self.db, undo=True, **kw)
 
     def refused(self, **kw):
         with self.assertRaises(qs.ImportRefused) as cm:
@@ -314,152 +310,70 @@ class Refusals(Env):
                 with self.assertRaises(actions.Forbidden):
                     self.perform("question.import", params, via=via,
                                  actor="mcp:abc" if via == "mcp" else "user:1" if via == "dashboard" else "runner")
-        with self.assertRaises(actions.Forbidden):
-            self.perform("question.import", {"undo": True, "dry_run": True}, via="mcp", actor="mcp:abc")
         self.assertIsNone(self.meta(qs.SOURCE_META))
         self.assertEqual(self.questions(), [])
 
 
-class Undo(Env):
-    def test_undo_restores(self):
-        pid = self.add_entry()
-        before_tasks = len(self.questions())
-        r = self.run_import()
-        ids = r["question_ids"]
-        self.assertEqual(len(ids), 3)
-        out = self.undo()
-        self.assertEqual(sorted(out["cancelled"]), sorted(ids))
-        self.assertEqual({t["status"] for t in self.questions()}, {"cancelled"})
-        self.assertEqual(len(self.questions()), before_tasks + 3)
-        for k in (qs.FILE_SHA_META, qs.IMPORTED_META):
-            self.assertFalse(self.meta(k))
-        c = self.conn()
-        try:
-            self.assertEqual(qs.source_of(c), "file")
-            self.assertIsNone(store.open_decision_question(c, pid))
-            ev = [e for i in ids for e in store.task_events(c, i) if e["event"] == "cancelled"]
-            audit = [a for a in store.audit_log(c, 50) if a["action"] == "question.import"]
-        finally:
-            c.close()
-        self.assertEqual(len(ev), 3)
-        self.assertEqual(len(audit), 2)                       # the import and its undo
-        self.assertIn("import undone", json.dumps(audit[0]["after"]))
-        again = self.run_import()                              # the cut-over can be done again
-        self.assertEqual(len(again["question_ids"]), 3)
-        self.assertEqual(self.meta(qs.SOURCE_META), "db")
+class Parser(unittest.TestCase):
+    """The item parser (moved here from the quickview in Q5): both file formats parse whole, a fenced code
+    block starts no item, and D-279's pointer check flags an item that only points to a .md file."""
+    FILE = ("# Open questions\n\nsome text before the first item is no question\n\n"
+            "## Q-1: First, in the section format\n"
+            "Plain text of the first.\n"
+            "- option a\n- option b\n\n"
+            "## Q-2: Second\nOnly a body line.\n")
 
-    def test_undo_dry_run_writes_nothing(self):
-        self.run_import()
-        before = self.dump()
-        out = self.undo(dry_run=True)
-        self.assertTrue(out["dry_run"])
-        self.assertEqual(self.dump(), before)
+    def test_both_formats_parse_whole(self):
+        items = qs.parse_open_questions(self.FILE)
+        self.assertEqual([s for s, _ in items], ["##", "##"])
+        self.assertEqual(items[0][1][0], "Q-1: First, in the section format")
+        self.assertIn("- option b", items[0][1])                 # a section's own '- ' lines are its body
+        mixed = "- a dash item\n  with a continuation\n## Q-3: then a section\nbody\n"
+        parsed = qs.parse_open_questions(mixed)
+        self.assertEqual([(s, l[0]) for s, l in parsed], [("-", "a dash item"), ("##", "Q-3: then a section")])
+        self.assertEqual(parsed[0][1], ["a dash item", "  with a continuation"])
+        self.assertEqual(qs.parse_open_questions("# Title only\n\nno item here\n"), [])
 
-    def test_undo_without_import_refused(self):
-        with self.assertRaisesRegex(qs.ImportRefused, "nothing to undo"):
-            self.undo()
+    def test_continuation_and_nested_items_stay_with_one_item(self):
+        md = ("# Open questions\n\n"
+              "- **3b open questions:** see docs/phase3b_plan.md for details.\n"
+              "  1. question one?\n"
+              "  2. question two?\n"
+              "- A plain single-line question?\n")
+        items = qs.parse_open_questions(md)
+        self.assertEqual(len(items), 2)
+        self.assertIn("  2. question two?", items[0][1])
+        self.assertEqual(items[1][1], ["A plain single-line question?"])
 
-    def test_refused_after_an_answer_a_decision_or_a_close_every_reason_listed(self):
-        pid = self.add_entry()
-        r = self.run_import()
-        plain, other = r["question_ids"][0], r["question_ids"][1]
-        dq = next(t for t in self.questions() if t["decision_id"] == pid)
-        c = self.conn()
-        try:
-            version = store.get_decision_entry(c, pid)["version"]
-        finally:
-            c.close()
-        self.perform("question.answer", {"task_id": plain, "answer": "yes, do it"}, via="dashboard", actor="owner")
-        self.perform("question.close", {"task_id": other, "reason": "settled elsewhere"})
-        self.perform("question.decide", {"task_id": dq["id"], "choice": "approve", "decision_version": version},
-                     via="dashboard", actor="owner")
-        before = self.dump()
-        with self.assertRaises(qs.ImportRefused) as cm:
-            self.undo()
-        msg = str(cm.exception)
-        for qid in (plain, other, dq["id"]):
-            self.assertIn(f"question #{qid}", msg)
-        self.assertEqual(self.dump(), before)                  # nothing changed
-        self.assertEqual(self.meta(qs.SOURCE_META), "db")
+    def test_fenced_code_starts_no_item(self):
+        md = ("## Q-1: With a code block\n"
+              "Run this:\n"
+              "```\n## not a heading\n- not an item\n```\n"
+              "and then\n"
+              "~~~sh\n- nor this\n## nor this\n~~~\n"
+              "- inside the section's body\n"
+              "- A dash item after fences\n")
+        items = qs.parse_open_questions(md)
+        self.assertEqual([s for s, _ in items], ["##"])
+        self.assertIn("## not a heading", items[0][1])
+        self.assertIn("- nor this", items[0][1])
+        self.assertIn("- A dash item after fences", items[0][1])         # in a ## section a '- ' line is body
+        dash = qs.parse_open_questions("- First\n```\n- fenced\n## fenced\n```\n- Second\n")
+        self.assertEqual([(s, l[0]) for s, l in dash], [("-", "First"), ("-", "Second")])
+        self.assertEqual(dash[0][1][1:], ["```", "- fenced", "## fenced", "```"])
+        unclosed = qs.parse_open_questions("- One\n```\n- never closed\n- Two\n")
+        self.assertEqual(len(unclosed), 1)                              # an unclosed fence runs to the end
 
-
-class FileCheck(Env):
-    def alert(self, subject, body):
-        self.alerts.append((subject, body))
-
-    def check(self):
-        return qs.cron_check(self.db, self.tmp, alert=self.alert)
-
-    def test_before_the_import_nothing(self):
-        self.assertEqual(self.check(), (0, ""))
-        self.write(DASH + "\n- a new item\n")
-        self.assertEqual(self.check(), (0, ""))
-        self.assertEqual(self.alerts, [])
-
-    def test_unchanged_file_is_quiet(self):
-        self.run_import()
-        self.assertEqual(self.check(), (0, ""))
-        self.assertEqual(self.alerts, [])
-
-    def test_a_changed_file_alerts_once_per_episode(self):
-        self.run_import()
-        self.write(DASH + "\n- **Q-new: written after the cut-over?**\n")
-        code, line = self.check()
-        self.assertEqual(code, 0)
-        self.assertIn("OPEN_QUESTIONS.md changed after the cut-over", line)
-        self.assertEqual(len(self.alerts), 1)
-        self.assertIn("ask with `python3 tasks.py question ask`", self.alerts[0][1])
-        self.assertEqual(self.check(), (0, ""))                # same episode: quiet
-        self.write(DASH + "\n- **Q-new: and again, changed more**\n")
-        self.assertEqual(self.check(), (0, ""))
-        self.assertEqual(len(self.alerts), 1)
-        self.write(DASH)                                       # the imported file again: the episode ends
-        self.assertEqual(self.check(), (0, ""))
-        self.assertFalse(self.meta(qs.CHANGED_MARK))
-        self.write(DASH + "\n- x\n")                           # a new episode alerts again
-        self.check()
-        self.assertEqual(len(self.alerts), 2)
-
-    def test_a_missing_file_is_no_alert(self):
-        self.run_import()
-        os.remove(self.src)
-        self.assertEqual(self.check(), (0, ""))
-        self.assertEqual(self.alerts, [])
-
-    def test_a_non_utf8_save_is_a_change_not_a_traceback(self):
-        self.run_import()
-        with open(self.src, "wb") as fh:
-            fh.write(DASH.encode("utf-8") + b"\n- caf\xe9\n")        # latin-1 save
-        code, line = self.check()
-        self.assertEqual(code, 0)
-        self.assertIn("changed after the cut-over", line)
-        self.assertEqual(len(self.alerts), 1)
-
-    def test_an_unreadable_file_alerts_once(self):
-        self.run_import()
-        os.remove(self.src)
-        os.mkdir(self.src)                                     # reading it raises IsADirectoryError
-        code, line = self.check()
-        self.assertEqual(code, 0)
-        self.assertIn("changed after the cut-over", line)
-        self.assertEqual(self.check(), (0, ""))
-        self.assertEqual(len(self.alerts), 1)
-
-    def test_a_failed_alert_sets_no_mark_and_is_retried(self):
-        self.run_import()
-        self.write(DASH + "\n- x\n")
-        calls = []
-
-        def broken(subject, body):
-            calls.append(subject)
-            raise RuntimeError("push down")
-        with self.assertRaises(RuntimeError):
-            qs.cron_check(self.db, self.tmp, alert=broken)
-        self.assertFalse(self.meta(qs.CHANGED_MARK))
-        code, line = self.check()                              # the next run alerts again
-        self.assertIn("changed after the cut-over", line)
-        self.assertEqual(len(self.alerts), 1)
-        self.assertTrue(self.meta(qs.CHANGED_MARK))
+    def test_pointer_warning(self):
+        nested = qs.parse_open_questions("- **3b:** see docs/phase3b_plan.md for details.\n"
+                                         "  1. question one?\n  2. question two?\n")
+        self.assertIsNone(qs._open_question_warning(nested[0][1]))
+        pointer = qs.parse_open_questions("- See docs/phase3b_plan.md for details.\n")
+        self.assertEqual(len(pointer), 1)
+        self.assertIsNotNone(qs._open_question_warning(pointer[0][1]))
+        real = qs.parse_open_questions("- Should the design doc at docs/dashboard_design.md move into phase 4? "
+                                       "Recommended: yes, once phase 3b ships.\n")
+        self.assertIsNone(qs._open_question_warning(real[0][1]))
 
 
 if __name__ == "__main__":
