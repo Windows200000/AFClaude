@@ -192,8 +192,10 @@ def _r_task(conn: sqlite3.Connection, p: Params) -> Scope:
 
 
 def _r_decision(conn: sqlite3.Connection, p: Params) -> Scope:
-    """A decision's project; an install-wide one (project NULL) belongs to AFClaude's own project, where the
-    owner's decisions live: its managers and editors, the task-manager of AFClaude and the owner write them."""
+    """A decision's project; an install-wide one (project NULL) is global: owner only for humans (D-184 keeps
+    global configuration out of project roles, plan §0). check() maps it to AFClaude's own project for a
+    task-manager and an agent (`_afclaude_scope`): AFClaude's own task-manager writes install-wide decisions
+    and agents propose to it."""
     if "decision" in p:
         d = store.get_decision_entry(conn, p["decision"])
         if d is None:
@@ -201,7 +203,16 @@ def _r_decision(conn: sqlite3.Connection, p: Params) -> Scope:
         pid = d.get("project_id")
     else:
         pid = _project_ref(conn, p.get("project"))
-    return (afclaude_project_id(conn) if pid is None else int(pid),)
+    return SCOPE_GLOBAL if pid is None else (int(pid),)
+
+
+def _afclaude_scope(conn: sqlite3.Connection, perm: Perm, scope: Scope) -> Scope:
+    """What a task-manager or agent is held to: an install-wide decision (scope NULL) counts as a thing of
+    AFClaude's own project, so only a task-manager that manages it (or an agent working in it) qualifies."""
+    if perm.scope != "decision" or None not in scope:
+        return scope
+    own = afclaude_project_id(conn)
+    return tuple(own if p is None else p for p in scope)
 
 
 def _session_project(conn: sqlite3.Connection, sid: Any) -> Optional[int]:
@@ -526,9 +537,9 @@ def check(conn: sqlite3.Connection, name: str, params: Params, actor: str,
     if who.kind in ("user", "machine"):
         return _human(perm, who, name, scope)
     if who.kind == "task-manager":
-        return _task_manager(conn, perm, who, name, params, scope)
+        return _task_manager(conn, perm, who, name, params, _afclaude_scope(conn, perm, scope))
     if who.kind == "agent":
-        return _agent(conn, perm, who, name, params, scope)
+        return _agent(conn, perm, who, name, params, _afclaude_scope(conn, perm, scope))
     return _refuse(f"{who.actor} is not a principal with a role", scope)
 
 

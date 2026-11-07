@@ -342,8 +342,11 @@ def run_roles(conn, args):
     """Phase 5a A3: the shadow log of the permission matrix (setting roles_enforce): what it would have refused,
     turned into a proposal or hidden from a listing, grouped for the daily list the task-manager reviews."""
     if args.roles_cmd == "mode":
-        mode = actions.roles_mode(conn)
-        return print(json.dumps({"roles_enforce": mode}) if args.json else f"roles_enforce: {mode}")
+        mode, problem = actions.roles_mode(conn), actions.roles_mode_problem(conn)
+        if args.json:
+            return print(json.dumps({"roles_enforce": mode, "problem": problem}))
+        return print(f"roles_enforce: {mode}" + (f"\nPROBLEM: the saved value can't be used, behaving as shadow: "
+                                                f"{problem}" if problem else ""))
     day = args.day or (None if args.since else datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d"))
     rows = store.roles_shadow_list(conn, day, args.since)
     if args.json:

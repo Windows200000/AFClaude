@@ -257,6 +257,31 @@ class Rules(Base):
         self.assertEqual(self.outcome("decision.edit", "tm_own", decision=d), "refused")
         self.assertEqual(self.outcome("decision.edit", "editor", decision=d), "refused")
         self.assertEqual(self.outcome("decision.add", "tm_afclaude", project=None), "allowed")
+        self.assertEqual(self.outcome("decision.edit", "owner", decision=d), "allowed")
+        self.assertEqual(self.outcome("decision.edit", "tm_other", decision=d), "refused")
+
+    def test_install_wide_decisions_are_owner_only_for_humans(self):
+        """D-184 / plan §0 "Global = owner only": a manager or editor of AFClaude's own project doesn't write
+        install-wide decisions; AFClaude's task-manager does, and an agent of that project proposes."""
+        mgr = store.add_user(self.conn, "person", "afc-manager", "test")["id"]
+        self.cli("grant.set", user_id=mgr, scope="project", project=self.OWN, level="manager")
+        ed = store.add_user(self.conn, "person", "afc-editor", "test")["id"]
+        self.cli("grant.set", user_id=ed, scope="project", project=self.OWN, level="editor")
+        d = self.cli("decision.add", title="wide", topics=["x"], author="task-manager")["id"]
+        for who in (f"user:{mgr}", f"user:{ed}"):
+            for act, over in (("decision.edit", {"decision": d}), ("decision.add", {"project": None})):
+                v = permissions.check(self.conn, act, dict(self.params[act], **over), who)
+                self.assertEqual(v.outcome, "refused", (who, act))
+                self.assertIn("owner only", v.reason)
+            # the same user still writes the project's own decisions
+            own = self.cli("decision.add", title="own", topics=["x"], author="task-manager", project=self.OWN)["id"]
+            self.assertEqual(permissions.check(self.conn, "decision.edit", {"decision": own}, who).outcome, "allowed")
+        self.conn.execute("INSERT INTO driven_sessions(session_id, kind, started_at, project_id) "
+                          "VALUES (?, 'request', '2026-11-01T00:00:00.000Z', ?)", (self.sess["REV"], self.OWN))
+        self.conn.commit()
+        self.assertEqual(permissions.check(self.conn, "decision.edit", {"decision": d},
+                                           f"agent:{self.sess['REV']}").outcome, "proposal")
+        self.assertEqual(self.outcome("decision.edit", "agent", decision=d), "refused")       # works in alpha
 
     def test_pause_clear_is_the_task_managers_one_owner_only_exception(self):
         self.assertEqual(self.outcome("automation.set", "tm_afclaude", paused=True), "refused")   # only a clear
@@ -516,11 +541,44 @@ class Guard(Base):
         with self.assertLogs("afclaude.identity", "WARNING"):
             identity.conflict("x again", self.conn)
 
-    def test_an_unknown_saved_value_is_an_error(self):
+    def test_an_unknown_saved_value_does_not_enforce_and_is_reported(self):
         store.put_setting(self.conn, "roles_enforce", "maybe", "test")
         self.conn.commit()
-        with self.assertRaises(ValueError):
-            actions.roles_mode(self.conn)
+        actions._roles_logged.clear()
+        with self.assertLogs("afclaude.roles", "ERROR") as lg:
+            self.assertEqual(actions.roles_mode(self.conn), "shadow")
+            self.assertEqual(actions.roles_mode(self.conn), "shadow")
+        self.assertEqual(len(lg.output), 1)                          # once an hour
+        self.assertIn("maybe", lg.output[0])
+        self.assertIn("maybe", actions.roles_mode_problem(self.conn))
+        # a perform goes on under the old rule instead of failing
+        actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 3.0}, actor="cli", via="cli")
+
+    def test_an_on_whose_precondition_is_gone_behaves_as_shadow(self):
+        r = self.register_host_machine()
+        self.cli("setting.set", key="roles_enforce", value="on")
+        self.assertEqual(actions.roles_mode(self.conn), "on")
+        self.cli("machine.revoke", user_id=r["user_id"])             # the host's machine owner goes away
+        actions._roles_logged.clear()
+        with self.assertLogs("afclaude.roles", "ERROR") as lg:
+            self.assertEqual(actions.roles_mode(self.conn), "shadow")
+        self.assertIn("D-330", lg.output[0])
+        # the write is not refused (it would be under `on`), and the shadow log records the would-be refusal
+        with self.assertLogs("afclaude.roles", "WARNING"):
+            actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 4.0},
+                            actor=self.actor["machine_ungranted"], via="mcp")
+        self.assertEqual(actions.get_setting(self.conn, "session_hours"), 4.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tasks.main(["--db", self.db, "roles", "mode"])
+        self.assertIn("PROBLEM", out.getvalue())
+        self.assertIn("roles_enforce: shadow", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tasks.main(["--db", self.db, "roles", "mode", "--json"])
+        j = json.loads(out.getvalue())
+        self.assertEqual(j["roles_enforce"], "shadow")
+        self.assertIn("D-330", j["problem"])
 
 
 class Reads(Base):
@@ -561,6 +619,68 @@ class Reads(Base):
             got = actions.read_filter(self.conn, self.actor["machine_ungranted"], None, "mcp", "decisions", rows,
                                       lambda x: x.get("project_id"), public_global=True)
         self.assertEqual([x["id"] for x in got], [d])
+
+    def test_a_failing_filter_never_breaks_a_shadow_listing(self):
+        rows = self.rows()
+        with mock.patch.object(permissions, "visible_projects", side_effect=RuntimeError("boom")), \
+                self.assertLogs("afclaude.roles", "ERROR") as lg:
+            self.assertEqual(self.filtered("editor", rows), rows)
+            self.assertEqual(self.filtered("editor", rows), rows)
+        self.assertEqual(len(lg.output), 1)                          # once an hour
+        self.assertIn("boom", lg.output[0])
+        with mock.patch.object(actions, "roles_mode", return_value="on"), \
+                mock.patch.object(permissions, "visible_projects", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.filtered("editor", rows)
+
+    def test_a_bad_project_of_in_shadow_returns_the_rows(self):
+        rows = self.rows()
+        with self.assertLogs("afclaude.roles", "ERROR"):
+            got = actions.read_filter(self.conn, self.actor["editor"], None, "mcp", "tasks", rows,
+                                      lambda t: t["nope"])
+        self.assertEqual(got, rows)
+
+    def test_a_read_hit_writes_one_row_per_actor_listing_and_hour(self):
+        self.cli("task.add", title="b-task", project="beta")
+        rows = self.rows()
+        for _ in range(3):
+            self.filtered("editor", rows)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM roles_shadow").fetchone()[0], 1)
+        self.filtered("viewer", rows)                                # another actor: its own first hit
+        with mock.patch.object(store, "now_iso", return_value="2999-01-01T00:00:00.000Z"):
+            self.filtered("editor", rows)                            # the next hour
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM roles_shadow").fetchone()[0], 3)
+
+    def test_a_read_hit_never_retries_or_waits_for_the_write_lock(self):
+        import time
+        self.cli("task.add", title="b-task", project="beta")
+        rows = self.rows()
+        other = store.connect(self.db)
+        other.execute("BEGIN IMMEDIATE")                             # somebody holds the write lock
+        try:
+            with mock.patch.object(store, "retrying", side_effect=AssertionError("retried")), \
+                    mock.patch.object(actions, "SHADOW_BUSY_MS", 50), \
+                    self.assertLogs("afclaude.roles", "ERROR") as lg:
+                t0 = time.monotonic()
+                got = self.filtered("editor", rows)
+                self.filtered("editor", rows)
+                took = time.monotonic() - t0
+        finally:
+            other.rollback()
+            other.close()
+        self.assertEqual(got, rows)
+        self.assertLess(took, 3)
+        self.assertEqual(len([m for m in lg.output if "could not log" in m]), 1)    # dropped, said once an hour
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM roles_shadow").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("PRAGMA busy_timeout").fetchone()[0], store.BUSY_TIMEOUT * 1000)
+
+    def test_a_failing_shadow_insert_on_a_write_path_logs_once_an_hour(self):
+        m = f"machine:{self.users['machine_ungranted']}"
+        with mock.patch.object(actions, "roles_shadow_add", side_effect=RuntimeError("boom")), \
+                self.assertLogs("afclaude.roles", "ERROR") as lg:
+            for v in (3.0, 4.0, 5.0):
+                actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": v}, actor=m, via="mcp")
+        self.assertEqual(len([x for x in lg.output if "could not log" in x]), 1)
 
     def test_a_revoked_user_sees_nothing(self):
         self.cli("user.revoke", user_id=self.users["editor"])
