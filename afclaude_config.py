@@ -386,8 +386,9 @@ def _write_source(path: str, d: dict) -> None:
     """The stripped document back: the user model into the DB (user_model.set, audited), a file
     as the file."""
     if path == USER_MODEL_FILE and _user_model_live(path):
+        import identity
         import telemetry
-        telemetry.set_user_model(d, actor="runner:import", via="runner")
+        telemetry.set_user_model(d, actor=identity.runner_actor("import"), via="runner")
     else:
         _write_json(path, d)
 
@@ -433,8 +434,9 @@ def _import_one(path: str, label: str, mapper: Callable, strip: Callable) -> dic
             values, notes, consumed = mapper(d, actions.get_setting(conn, "session_hours"))
             if not consumed:
                 return {"source": label, "imported": {}, "kept": {}, "default": [], "notes": {}}
+            import identity
             res = actions.perform(conn, "setting.import", {"source": label, "values": values, "notes": notes},
-                                  actor="runner:import", via="runner")
+                                  actor=identity.runner_actor("import", conn), via="runner")
         finally:
             conn.close()
         strip(d, consumed)

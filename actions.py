@@ -5,7 +5,7 @@ actions.py: the ONE write path into the AFClaude store (dashboard design §3, §
 tasks.py (CLI), mcp_server.py and, later, the dashboard call
 
     actions.perform(conn, "task.answer", {"task_id": 7, "answer": "yes"},
-                    actor="cli", via="cli", key=None)
+                    actor=<who acts>, via="cli", key=None)
 
 and never write through store.py directly. One call is one action:
 
@@ -83,8 +83,11 @@ VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
 # setup: an anonymous browser spending a one-time setup/reset code (phase 6a W7) -- the one write a
 # pre-session makes, before there is a user_id to act as.
+# machine:<id>, task-manager:<session>, agent:<session>[:<agent id>] (phase 5a A2, identity.py): who an
+# AFClaude session or a machine user is; the audit row's session column holds the session behind them.
 ACTOR_RE = re.compile(r"^(owner|cli|dispatcher|keepalive|setup|runner(:[a-z0-9_-]{1,32})?"
-                      r"|mcp(:[A-Za-z0-9._-]{1,64})?|user:[1-9][0-9]{0,17})$")
+                      r"|mcp(:[A-Za-z0-9._-]{1,64})?|user:[1-9][0-9]{0,17}|machine:[1-9][0-9]{0,17}"
+                      r"|task-manager:[A-Za-z0-9._-]{1,64}|agent:[A-Za-z0-9._-]{1,64}(:[A-Za-z0-9._-]{1,64})?)$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 IDEMPOTENCY_TTL = timedelta(days=7)
 OWN_LIST = os.environ.get("AFCLAUDE_OWN_LIST", os.path.join(HERE, "data", "own_sessions.txt"))
@@ -109,15 +112,29 @@ class Forbidden(ValueError):
 
 
 class Ctx:
-    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive | runner[:<job>] | user:<id>), via
-    (cli | mcp | dashboard | runner), the idempotency key, and whether the caller
-    knows it is an autonomous AFClaude session."""
-    def __init__(self, actor: str, via: str, key: str | None = None, autonomous: bool = False) -> None:
+    """Who acts: actor (owner | cli | mcp[:<session>] | dispatcher | keepalive | runner[:<job>] | user:<id> |
+    machine:<id> | task-manager:<session> | agent:<session>[:<agent id>]), via (cli | mcp | dashboard | runner),
+    the idempotency key, and whether the caller knows it is an autonomous AFClaude session. `actor_session`:
+    the Claude session behind the actor (the audit row's `session`): given by the caller or read from the
+    actor; `session` is the part the old per-session rules use, through MCP only (as before the A2 actors)."""
+    def __init__(self, actor: str, via: str, key: str | None = None, autonomous: bool = False,
+                 session: str | None = None) -> None:
         self.actor, self.via, self.key, self.autonomous = actor, via, key, bool(autonomous)
+        self.actor_session = session or _actor_session(actor)
 
     @property
     def session(self) -> str | None:
-        return self.actor.split(":", 1)[1] if self.actor.startswith("mcp:") else None
+        return self.actor_session if self.via == "mcp" or self.actor.startswith("mcp:") else None
+
+
+def _actor_session(actor: str) -> str | None:
+    """The session an actor string names (mcp:<s>, task-manager:<s>, agent:<s>[:<id>]); `agent:unknown`
+    names none."""
+    kind, _, rest = actor.partition(":")
+    if kind not in ("mcp", "task-manager", "agent") or not rest:
+        return None
+    sid = rest.split(":", 1)[0] if kind == "agent" else rest
+    return None if kind == "agent" and sid == "unknown" else sid
 
 
 class Result:
@@ -179,8 +196,9 @@ def action(name: str, target_type: str, owner_only: bool = False,
 # ---------------------------------------------------------------- the write path
 
 def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | None = None, *, actor: str,
-            via: str, key: str | None = None, autonomous: bool = False) -> Any:
-    """Run action `name` with `params` (a dict) as one transaction; see the module doc.
+            via: str, key: str | None = None, autonomous: bool = False, session: str | None = None) -> Any:
+    """Run action `name` with `params` (a dict) as one transaction; see the module doc. `session`: the Claude
+    session behind a machine / task-manager / agent actor, recorded in the audit row (identity.py).
     -> the action's result (a JSON-compatible value; a replayed key returns the stored one)."""
     spec = ACTIONS.get(name)
     if spec is None:
@@ -195,7 +213,7 @@ def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | Non
     _check_params(spec, params)
     if via == "dashboard":
         _check_limits(params)
-    ctx = Ctx(actor, via, key, autonomous)
+    ctx = Ctx(actor, via, key, autonomous, session)
     request_sha = hashlib.sha256(json.dumps({"action": name, "params": params}, sort_keys=True,
                                             ensure_ascii=False, default=str).encode()).hexdigest()
     req: Mapping[str, Any] = params
@@ -233,7 +251,8 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
         res = spec.fn(conn, ctx, **params)
         if not res.is_noop():
             before, after = res.audit_pair()
-            store.add_audit(conn, actor, via, name, spec.target_type, res.target_id, before, after, key)
+            store.add_audit(conn, actor, via, name, spec.target_type, res.target_id, before, after, key,
+                            session=ctx.actor_session)
         if key is not None:
             store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
             store.put_idempotency(conn, key, actor, name, request_sha, res.result)
@@ -2089,13 +2108,13 @@ def review_notice(conn: sqlite3.Connection, ctx: Ctx, project: store.Row, name: 
     before = store.notice_by_source(conn, source)
     if before is None:
         n = store.add_notice(conn, title, summary, project["id"], ctx.actor, source=source)
-        store.add_audit(conn, ctx.actor, ctx.via, "notice.post", "notice", n["id"], None, n, None)
+        store.add_audit(conn, ctx.actor, ctx.via, "notice.post", "notice", n["id"], None, n, None, session=ctx.actor_session)
         return
     if before["dismissed_at"] is not None or (before["title"], before["text"]) == (title, summary):
         return
     after = store.update_notice(conn, before["id"], title=title, text=summary, updated_at=store.now_iso())
     b, a = Result(None, None, before, after).audit_pair()
-    store.add_audit(conn, ctx.actor, ctx.via, "notice.update", "notice", after["id"], b, a, None)
+    store.add_audit(conn, ctx.actor, ctx.via, "notice.update", "notice", after["id"], b, a, None, session=ctx.actor_session)
 
 
 # ---------------------------------------------------------------- project docs (phase 2d part 2, §7.2, §7.7)
@@ -2475,7 +2494,7 @@ def _decision_owner_guard(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, 
 def _audit_row(conn: sqlite3.Connection, ctx: Ctx, name: str, target_type: str, target: object, before: Any,
                after: Any) -> None:
     """An audit row for a change an action makes besides its own (question.decide's entry changes)."""
-    store.add_audit(conn, ctx.actor, ctx.via, name, target_type, target, before, after)
+    store.add_audit(conn, ctx.actor, ctx.via, name, target_type, target, before, after, session=ctx.actor_session)
 
 
 def _decision_replaced(conn: sqlite3.Connection, d: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2828,7 +2847,7 @@ def _apply_confirm(conn: sqlite3.Connection, ctx: Ctx, cur: Mapping[str, Any],
     for old in olds:
         store.delete_decision_entry(conn, old["id"])
         store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", old["id"], _decision_view(old),
-                        {"deleted": True, "reason": f"replaced by {cur['id']}"})
+                        {"deleted": True, "reason": f"replaced by {cur['id']}"}, session=ctx.actor_session)
         _close_decision_question(conn, old["id"], f"was replaced by {cur['id']}")
     extra: dict[str, Any] = {}
     qid = _close_decision_question(conn, cur["id"], "was confirmed")
@@ -3172,7 +3191,7 @@ def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: 
     for did in plan.delete:
         row = store.delete_decision_entry(conn, did)
         store.add_audit(conn, ctx.actor, ctx.via, "decision.delete", "decision", did, _decision_view(row),
-                        {"deleted": True, "reason": f"seeding: {plan.classes[did]}"})
+                        {"deleted": True, "reason": f"seeding: {plan.classes[did]}"}, session=ctx.actor_session)
     rows: dict[str, int] = {}
     for did in plan.survive:
         for t in plan.topics[did]:
@@ -3195,13 +3214,13 @@ def decision_seed(conn: sqlite3.Connection, ctx: Ctx, path: Any = None, topics: 
             "interpretation": m.interpretation, "body": body, "slug": _auto_slug(conn, m.title, None, did),
             "keywords": [], "topics": m.topics, "supersedes": sup}, ctx.actor)
         props[did] = row["version"]
-        store.add_audit(conn, ctx.actor, ctx.via, "decision.add", "decision", did, None, _decision_view(row))
+        store.add_audit(conn, ctx.actor, ctx.via, "decision.add", "decision", did, None, _decision_view(row), session=ctx.actor_session)
     for b in plan.blocks:
         if not b.empty:
             store.add_audit(conn, ctx.actor, ctx.via, "decision.archive", "decision",
                             b.id if b.kind == "drift" else f"section: {b.id}"[:80],
                             {"kind": b.kind, "text": b.text},
-                            {"archived": True, "reason": "seeding: not a decision entry; its text is kept here"})
+                            {"archived": True, "reason": "seeding: not a decision entry; its text is kept here"}, session=ctx.actor_session)
     after_native = conn.execute("SELECT COUNT(*) FROM decisions WHERE origin = 'db'").fetchone()[0]
     left = conn.execute("SELECT COUNT(*) FROM decisions WHERE origin = 'file'").fetchone()[0]
     if left or after_native != native + len(plan.survive) + len(props) or len(plan.survive) + len(plan.delete) != len(plan.entries):
@@ -3852,12 +3871,13 @@ TOUCH_MIN_INTERVAL = TOUCH_EVERY                 # a token's use is recorded at 
 
 
 def authenticate_machine(conn: sqlite3.Connection, token: str, hostname: str | None = None,
-                         transport: str | None = None, *, actor: str = "cli", via: str = "cli",
+                         transport: str | None = None, *, actor: str | None = None, via: str = "cli",
                          notify: Callable[[str, str], Any] | None = None) -> dict[str, Any] | None:
     """The token check the MCP server and 5b's transport use: a well-formed, unrevoked token of an
     unrevoked machine user -> {user_id, token_id, label}; anything else None (no machine identity). Records the use
     (machine.seen, at most once a minute unless the hostname changed) and delivers the clone alert, if
-    any, after the write. Constant-time on the secret; the token never reaches a log."""
+    any, after the write (as `actor`, default the machine user itself: machine:<id>). Constant-time on the
+    secret; the token never reaches a log."""
     try:
         token_id, secret = roles.parse_token(token)
     except ValueError:
@@ -3873,7 +3893,7 @@ def authenticate_machine(conn: sqlite3.Connection, token: str, hostname: str | N
     same_host = hostname is None or (row["last_hostname"] or "").casefold() == hostname.casefold()
     if last is None or not same_host or store._utcnow() - last >= TOUCH_MIN_INTERVAL:
         r = perform(conn, "machine.seen", {"token_id": token_id, "hostname": hostname, "transport": transport},
-                    actor=actor, via=via)
+                    actor=actor or f"machine:{user['id']}", via=via)
         deliver_alerts(r, notify)
     return {"user_id": user["id"], "token_id": token_id, "label": user["label"]}
 

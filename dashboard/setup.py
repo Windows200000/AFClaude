@@ -46,6 +46,7 @@ from typing import Protocol
 from starlette.concurrency import run_in_threadpool
 
 import actions
+import identity
 import store
 from dashboard.auth import passwords, recovery, totp
 from dashboard.routes import Session
@@ -194,7 +195,7 @@ def mint_first_owner_code(conn: sqlite3.Connection, *, ttl_hours: float = CODE_T
     code = generate_code()
     actions.perform(conn, "setup.mint_code",
                     {"kind": "first_owner", "code_hash": hash_code(code), "ttl_hours": ttl_hours},
-                    actor="cli", via="cli")
+                    actor=identity.cli_identity(conn).actor, via="cli")
     return code
 
 
@@ -206,11 +207,11 @@ def reset_auth(conn: sqlite3.Connection, user_id: int, owners: OwnerRegistry = n
     back in). -> the raw code (print it; never stored or logged elsewhere)."""
     code = generate_code()
     with store.transaction(conn):
-        actions.perform(conn, "auth.session_revoke", {"user_id": user_id}, actor="cli", via="cli")
+        actions.perform(conn, "auth.session_revoke", {"user_id": user_id}, actor=identity.cli_identity(conn).actor, via="cli")
         owners.clear_factors(conn, user_id)
         actions.perform(conn, "setup.mint_code",
                         {"kind": "reset", "user_id": user_id, "code_hash": hash_code(code),
-                         "ttl_hours": ttl_hours}, actor="cli", via="cli")
+                         "ttl_hours": ttl_hours}, actor=identity.cli_identity(conn).actor, via="cli")
     return code
 
 

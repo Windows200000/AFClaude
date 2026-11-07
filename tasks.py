@@ -147,6 +147,7 @@ sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write: validation, one transaction, audit row)
 import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
+import identity  # noqa: E402  (phase 5a A2: who is acting)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -309,21 +310,24 @@ def resolve_session(conn: sqlite3.Connection, prefix: str) -> str:
     raise store.NotFound(f"no session matches {prefix!r}")
 
 
-def autonomous_caller(conn):
-    """True when this process runs inside a session AFClaude launched (unattended): the guard-hook
-    bypass every such session carries (CLAUDE_GUARD_DISABLE=1, also in its Bash tool and subagents),
-    or a session id the registry knows as driven. The CLI is the owner's otherwise (actions.is_autonomous),
-    but the decision commands refuse an autonomous caller what MCP refuses it (confirm, the owner's
-    entries, author owner: actions.decision_autonomous)."""
-    if os.environ.get("CLAUDE_GUARD_DISABLE") == "1":
-        return True
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    return bool(sid) and sid in actions.autonomous_sessions(conn)
+_WHO: tuple[Any, identity.Identity] | None = None
+
+
+def who(conn):
+    """This process's principal (identity.py: cli for a shell; a Claude session's machine user,
+    task-manager or agent), resolved once per connection. `autonomous` (CLAUDE_GUARD_DISABLE=1, which every
+    session AFClaude launches carries, or a session id the registry knows) is what the decision commands
+    refuse what MCP refuses it (confirm, the owner's entries, author owner: actions.decision_autonomous)."""
+    global _WHO
+    if _WHO is None or _WHO[0] is not conn:
+        _WHO = (conn, identity.cli_identity(conn))
+    return _WHO[1]
 
 
 def act(conn, action, /, **params):
-    """One write through the shared write path (actions.py), as the CLI."""
-    return actions.perform(conn, action, params, actor="cli", via="cli", autonomous=autonomous_caller(conn))
+    """One write through the shared write path (actions.py), as this process's principal."""
+    w = who(conn)
+    return actions.perform(conn, action, params, actor=w.actor, via="cli", autonomous=w.autonomous, session=w.session)
 
 
 def deliver(result):
@@ -386,7 +390,7 @@ def run_machine(conn, args):
         path = args.file or MACHINE_FILE
         if not args.print:
             machine_file_free(path, args.force)
-        r = actions.register_machine(conn, args.code, host, actor="cli", via="cli", label=args.label)
+        r = actions.register_machine(conn, args.code, host, actor=who(conn).actor, via="cli", label=args.label)
         out = {k: v for k, v in r.items() if k != "token"}
         if args.print:
             out["token"] = r["token"]
@@ -684,7 +688,8 @@ def run_doc(conn, args):
     if dc in ("import", "export"):
         repo = os.path.abspath(args.repo) if args.repo else None
         if dc == "import":
-            r = project_docs.import_all(args.db, repo, None, args.project, actor="cli", via="cli", force=args.force)
+            r = project_docs.import_all(args.db, repo, None, args.project, actor=who(conn).actor, via="cli",
+                                         force=args.force)
             ok = not (r["totals"]["conflict"] or r["totals"]["unverified"])
             if args.json:
                 dump(r)
@@ -693,7 +698,7 @@ def run_doc(conn, args):
                     extra = f"  +{d['appended']}" if d.get("appended") else ""
                     print(f"{name:<12} {d['outcome']}{extra}" + (f"  {d['error']}" if d.get("error") else ""))
         else:
-            r = project_docs.export(args.db, repo, args.project, check=args.check, actor="cli", via="cli")
+            r = project_docs.export(args.db, repo, args.project, check=args.check, actor=who(conn).actor, via="cli")
             ok = r["ok"]
             if args.json:
                 dump(r)
@@ -757,6 +762,12 @@ def run(conn, args):
         dump(rows) if args.json else print_tasks(rows, numbered=True)
     elif c == "project":
         run_project(conn, args)
+    elif c == "whoami":
+        w = who(conn)
+        dump(w.as_dict()) if args.json else print(
+            f"{w.actor}  ({w.kind}" + (f", session {w.session}" if w.session else "")
+            + (f", agent {w.agent_id}" if w.agent_id else "") + (f", token {w.token}" if w.token != "none" else "")
+            + (", autonomous" if w.autonomous else "") + ")")
     elif c == "move":
         task_out(args, act(conn, "task.move", task_id=args.id, stage=args.stage))
     elif c == "show":
@@ -1117,6 +1128,8 @@ def parser():
     p = sub.add_parser("move", parents=[js], help="move a task to stage N of its project")
     p.add_argument("id", type=int)
     p.add_argument("stage", type=int)
+    sub.add_parser("whoami", parents=[js], help="who this process acts as in the audit log (identity.py: cli, "
+                   "machine:<id>, task-manager:<session>, agent:<session>)")
     p = sub.add_parser("project", help="the ranked project list")
     ps = p.add_subparsers(dest="project_cmd", required=True)
     q = ps.add_parser("add", parents=[js], help="new project (bottom of the list unless --rank)")
@@ -1405,7 +1418,7 @@ def db_error(e, args):
     is reported here."""
     err = store.as_db_error(e)
     if err.escalation is None:
-        store.report_db_error(err, actor="cli", action=f"cli:{args.cmd}", write=False,
+        store.report_db_error(err, actor=identity.fallback_actor(), action=f"cli:{args.cmd}", write=False,
                               params={k: v for k, v in vars(args).items() if k not in ("db", "func")},
                               db_path=args.db)
     print(store.handback_text(err), file=sys.stderr)

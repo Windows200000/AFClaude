@@ -117,7 +117,7 @@ class Detector(unittest.TestCase):
         conn = store.connect()
         try:
             return conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='driven.set' AND target_id=? "
-                                "AND actor='keepalive' AND via='runner'", (sid,)).fetchone()[0]
+                                "AND actor='runner:keepalive' AND via='runner'", (sid,)).fetchone()[0]
         finally:
             conn.close()
 

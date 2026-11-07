@@ -45,6 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import actions  # noqa: E402
+import identity  # noqa: E402  (the default actor: who runs this)
 import store  # noqa: E402
 
 FORMAT = "afclaude-backup"
@@ -281,13 +282,14 @@ def verify(bundle: str) -> dict[str, Any]:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def restore(bundle: str, into: str, actor: str = "cli", via: str = "cli") -> dict[str, Any]:
+def restore(bundle: str, into: str, actor: Optional[str] = None, via: str = "cli") -> dict[str, Any]:
     """Restore the bundle as into/afclaude.db (design §11.3): refuses when into already holds a
     database; checks everything (_read); refuses a schema newer than this code and migrates an older
     one (store.migrate); then install.restored (audited: install_epoch + 1, restored_from, paused when
     restore_starts_paused is on) and only then moves the file into place.
-    -> {db, manifest, install_epoch, paused, reason}."""
+    -> {db, manifest, install_epoch, paused, reason}. `actor`: default this process's principal (identity.py)."""
     bundle, into = os.path.abspath(bundle), os.path.abspath(into)
+    actor = actor or identity.cli_actor()
     os.makedirs(into, exist_ok=True)
     target = os.path.join(into, DB_NAME)
     taken = [p for p in (target, target + "-wal", target + "-shm", target + "-journal") if os.path.lexists(p)]
@@ -321,10 +323,11 @@ def restore(bundle: str, into: str, actor: str = "cli", via: str = "cli") -> dic
         shutil.rmtree(work, ignore_errors=True)
 
 
-def stamp(db: str | None = None, actor: str = "cli", via: str = "cli") -> dict[str, Any]:
+def stamp(db: str | None = None, actor: Optional[str] = None, via: str = "cli") -> dict[str, Any]:
     """install.stamp on the database at db (default store.DB_PATH): its one-off install_id."""
     conn = store.connect(db)
     try:
+        actor = actor or identity.cli_actor(db)
         out: dict[str, Any] = actions.perform(conn, "install.stamp", {}, actor=actor, via=via)
         return out
     finally:

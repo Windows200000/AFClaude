@@ -48,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache, PROJECTS_DIR, berlin/parse_ts helpers)
 import telemetry  # noqa: E402  (phase 2c: --record also writes the DB table usage_reports)
+import identity  # noqa: E402  (the actor of its records: who runs it)
 
 UTC = timezone.utc
 BERLIN = ka.BERLIN
@@ -261,7 +262,8 @@ def record(session_id, rows, main_row, tot, usage):
         "total": {"turns": tot["turns"], "tokens": tot["tokens"]},
         "usage": serialize_usage(usage),
     }
-    telemetry.record("usage.report", json.dumps(row), REPORTS_FILE, actor="cli", via="cli")   # the DB (D-161)
+    telemetry.record("usage.report", json.dumps(row), REPORTS_FILE, actor=identity.cli_actor(),
+                     via="cli")   # the DB (D-161)
     return row
 
 

@@ -71,6 +71,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import usage_stale  # noqa: E402  (stale rows: their meters are ignored)
 import telemetry  # noqa: E402  (phase 2c: the telemetry is in the DB only, D-161)
+import identity  # noqa: E402  (the actor of its records: who runs it)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
@@ -577,7 +578,7 @@ def backfill_windows(samples_path=SAMPLES, out_path=SESSION_WINDOWS, now=None):
     have = {json.dumps(w, sort_keys=True) for w in stored}
     telemetry.record("usage.session_window",
                      [json.dumps(w) for w in allw if json.dumps(w, sort_keys=True) not in have],
-                     out_path, actor="cli", via="cli")
+                     out_path, actor=identity.cli_actor(), via="cli")
     return allw
 
 

@@ -24,6 +24,9 @@ os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=
 os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no file: the repo's own is never read
 os.environ["AFCLAUDE_DIR"] = HERE   # docker/at_shim.py imports from it: a worktree run never loads the live checkout
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
+for _v in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "AFCLAUDE_AGENT_ID", "AFCLAUDE_MACHINE_TOKEN"):
+    os.environ.pop(_v, None)   # a session running the tests is not "the caller" in them: identity.py reads these
+os.environ["AFCLAUDE_MACHINE_FILE"] = os.path.join(DIR, "no-machine.json")   # no token file: the host's own is never read
 os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (health, the quickview read it)
 os.environ.pop("KEEPALIVE_STATE_DIR", None)   # the container's live data/keepalive never: the keep-alive's state
                                               # names default to the temp DB's dir (keepalive.STATE_DIR)

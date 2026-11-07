@@ -130,6 +130,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import actions  # noqa: E402
 import failstop  # noqa: E402
+import identity  # noqa: E402  (the drain commands act as this process's principal)
 import runner_jobs  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
@@ -1313,7 +1314,8 @@ def drain(conn: Any, max_wait: Optional[timedelta] = None, *, poll: float = DRAI
     longest = max((float(actions.get_setting(conn, actions.RUNNER_TIMEOUT + j.name)) for j in held), default=0.0)
     span = timedelta(minutes=longest) + DRAIN_MARGIN
     until = now + span
-    actions.runner_state_put(conn, {"drain": {"until": _iso(until), "at": _iso(now)}}, actor="cli", via="cli")
+    actions.runner_state_put(conn, {"drain": {"until": _iso(until), "at": _iso(now)}},
+                             actor=identity.cli_identity(conn).actor, via="cli")
     wake()
     deadline = now + (max_wait if max_wait is not None else span)
     while True:
@@ -1329,7 +1331,7 @@ def drain(conn: Any, max_wait: Optional[timedelta] = None, *, poll: float = DRAI
 
 
 def undrain(conn: Any) -> None:
-    actions.runner_state_put(conn, {"drain": None}, actor="cli", via="cli")
+    actions.runner_state_put(conn, {"drain": None}, actor=identity.cli_identity(conn).actor, via="cli")
     wake()
 
 

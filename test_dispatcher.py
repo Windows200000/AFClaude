@@ -233,7 +233,7 @@ class Stalled(Base):
         self.assertEqual(call[call.index("--model") + 1], "claude-sonnet-test")   # its own model
         typed = self.conn.execute("SELECT driver, prompt, category, actor, text_sha256 FROM typed_messages "
                                   "WHERE session_id=?", (sid(1),)).fetchall()                # usage split S2
-        self.assertEqual([tuple(r)[:4] for r in typed], [("auto", "continue_foreign", "continue", "dispatcher")])
+        self.assertEqual([tuple(r)[:4] for r in typed], [("auto", "continue_foreign", "continue", "runner:dispatcher")])
         sent = " ".join(call[call.index("--message") + 1:call.index("--cwd")])   # (the fake log splits on spaces)
         self.assertEqual(typed[0][4], usage_split.text_hash(sent))
         skips = "\n".join(rep["skip"])
@@ -265,7 +265,7 @@ class Stalled(Base):
                                                                        None))
         self.assertEqual(self.st["sessions"][sid(1)]["tmux"], row["tmux"])
         audit = self.conn.execute("SELECT actor, action FROM audit_log WHERE target_id=?", (sid(1),)).fetchall()
-        self.assertIn(("dispatcher", "driven.set"), [tuple(a) for a in audit])
+        self.assertIn(("runner:dispatcher", "driven.set"), [tuple(a) for a in audit])
         self.assertEqual(ka.claim_tmux(sid(1), "stall", title="another title", conn=self.conn), row["tmux"])
 
     def test_a_taken_name_gets_a_suffix(self):
@@ -1041,7 +1041,7 @@ class RcThreads(HolderBase):
             self.run_pass()
         rows = self.conn.execute("SELECT driver, prompt, category, actor, text_sha256 FROM typed_messages "
                                  "WHERE session_id=?", (sid(1),)).fetchall()
-        self.assertEqual([tuple(r)[:4] for r in rows], [("auto", "continue_foreign", "continue", "dispatcher")])
+        self.assertEqual([tuple(r)[:4] for r in rows], [("auto", "continue_foreign", "continue", "runner:dispatcher")])
         self.assertEqual(rows[0][4], usage_split.text_hash(self.sent[0][1]))
 
     def test_a_failed_record_means_no_send(self):
