@@ -304,7 +304,7 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
 
 roles_log = logging.getLogger("afclaude.roles")
 _roles_logged: dict[tuple[str, str, str], str] = {}      # (actor, action, outcome) -> the hour last logged
-SHADOW_BUSY_MS = 200       # how long a shadow insert may wait for the write lock: a diagnostic never waits longer
+SHADOW_BUSY_MS = int(store.BUSY_TIMEOUT * 1000)  # a shadow insert waits for the write lock like any store write (one try, D-235)
 ROLES_COMPONENT = "roles"  # failstop's component for the roles failures (actor runner:roles)
 
 
