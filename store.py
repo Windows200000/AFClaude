@@ -961,6 +961,24 @@ CREATE TABLE IF NOT EXISTS agent_proposals (
     decided_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_proposals_open ON agent_proposals(project_id, status);
+-- A3's shadow log (permissions.py): one row per write or read the matrix would have refused, turned into a
+-- proposal or filtered while roles_enforce is `shadow`; the list `tasks.py roles shadow` prints. Append-only;
+-- A8 removes it with the setting.
+CREATE TABLE IF NOT EXISTS roles_shadow (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    day         TEXT NOT NULL,                     -- the Berlin calendar day of ts (the daily list)
+    actor       TEXT NOT NULL,
+    session     TEXT,
+    via         TEXT NOT NULL,
+    action      TEXT NOT NULL,                     -- an action name, or read:<what>
+    outcome     TEXT NOT NULL CHECK (outcome IN ('proposal', 'refused', 'filtered')),
+    reason      TEXT NOT NULL,
+    project_id  INTEGER
+);
+CREATE INDEX IF NOT EXISTS roles_shadow_day ON roles_shadow(day, actor, action);
+CREATE TRIGGER IF NOT EXISTS roles_shadow_no_update BEFORE UPDATE ON roles_shadow
+BEGIN SELECT RAISE(ABORT, 'roles_shadow is append-only'); END;
 """
 
 # ---- the decision store (D-242; phase 4b of §7.6, D-107/D-151/D-158/D-176; decisions.py): one row per
@@ -3183,6 +3201,39 @@ def list_grants(conn: sqlite3.Connection, user_id: int | None = None, project_id
         args.append(project_id)
     rows = conn.execute("SELECT * FROM grants" + (" WHERE " + " AND ".join(where) if where else "")
                         + " ORDER BY user_id, scope DESC, project_id, source", args)
+    return [dict(r) for r in rows]
+
+
+def host_owner_machine(conn: sqlite3.Connection, hostname: str) -> bool:
+    """Is there an unrevoked machine user holding a token issued on `hostname` and an owner grant? A7's
+    precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`."""
+    return conn.execute(
+        "SELECT 1 FROM users u JOIN grants g ON g.user_id=u.id AND g.scope='owner' "
+        "JOIN machine_tokens t ON t.user_id=u.id AND t.revoked_at IS NULL AND t.hostname_at_issue=? "
+        "WHERE u.kind='machine' AND u.revoked_at IS NULL LIMIT 1", (hostname,)).fetchone() is not None
+
+
+def add_roles_shadow(conn: sqlite3.Connection, day: str, actor: str, session: str | None, via: str, action: str,
+                     outcome: str, reason: str, project_id: int | None) -> None:
+    conn.execute("INSERT INTO roles_shadow(ts, day, actor, session, via, action, outcome, reason, project_id) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (now_iso(), day, actor, session, via, action, outcome, reason, project_id))
+
+
+def roles_shadow_list(conn: sqlite3.Connection, day: str | None = None, since: str | None = None) -> list[Row]:
+    """The shadow log grouped for the daily list: one row per (day, actor, action, outcome, reason) with its
+    count and first / last time; one `day`, or every day from `since` on (YYYY-MM-DD), else all."""
+    where, args = [], []
+    if day is not None:
+        where.append("day=?")
+        args.append(day)
+    if since is not None:
+        where.append("day>=?")
+        args.append(since)
+    rows = conn.execute(
+        "SELECT day, actor, action, outcome, reason, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts, "
+        "MIN(project_id) AS project_id FROM roles_shadow" + (" WHERE " + " AND ".join(where) if where else "")
+        + " GROUP BY day, actor, action, outcome, reason ORDER BY day DESC, n DESC, actor, action", args)
     return [dict(r) for r in rows]
 
 

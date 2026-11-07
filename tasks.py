@@ -139,6 +139,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -330,6 +331,38 @@ def act(conn, action, /, **params):
     return actions.perform(conn, action, params, actor=w.actor, via="cli", autonomous=w.autonomous, session=w.session)
 
 
+def visible(conn, what, rows, project_of, public_global=False):
+    """A listing as this process's principal may see it (actions.read_filter: shadow mode logs what it would
+    hide and shows everything, phase 5a A3)."""
+    w = who(conn)
+    return actions.read_filter(conn, w.actor, w.session, "cli", what, rows, project_of, public_global=public_global)
+
+
+def run_roles(conn, args):
+    """Phase 5a A3: the shadow log of the permission matrix (setting roles_enforce): what it would have refused,
+    turned into a proposal or hidden from a listing, grouped for the daily list the task-manager reviews."""
+    if args.roles_cmd == "mode":
+        if args.set_mode:
+            act(conn, "setting.set", key="roles_enforce", value=args.set_mode)   # perform lets this repair through
+        problem = actions.roles_mode_problem(conn)
+        mode = None if problem else actions.roles_mode(conn)
+        if args.json:
+            return print(json.dumps({"roles_enforce": mode, "problem": problem}))
+        return print(f"roles_enforce: {mode}" if mode else
+                     f"roles_enforce: UNUSABLE\nPROBLEM: the saved value can't be used (every write the matrix "
+                     f"would not allow fails until it is repaired: `python3 tasks.py roles mode --set shadow`): "
+                     f"{problem}")
+    day = args.day or (None if args.since else datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d"))
+    rows = store.roles_shadow_list(conn, day, args.since)
+    if args.json:
+        return dump(rows)
+    if not rows:
+        return print("nothing the matrix would have refused" + (f" on {day}" if day else ""))
+    for r in rows:
+        print(f"{r['day']}  {r['n']:>4}x  {r['outcome']:<8} {r['action']:<24} {r['actor']}  {r['reason']}")
+    return None
+
+
 def deliver(result):
     """The alerts an action returned (a new owner, a token seen from two hosts), pushed after its
     transaction (actions.deliver_alerts); a failure is an error the caller sees (D-235), the write stays."""
@@ -499,7 +532,7 @@ def project_ref(p):
 def run_project(conn, args):
     pc = args.project_cmd
     if pc == "list":
-        rows = store.list_projects(conn)
+        rows = visible(conn, "projects", store.list_projects(conn), lambda p: p["id"])
         return dump(rows) if args.json else print_projects(rows)
     if pc == "add":
         p = act(conn, "project.add", name=args.name, description=args.description, path=project_ref(args.path),
@@ -755,10 +788,12 @@ def run(conn, args):
                            created_by_session=args.by))
     elif c == "list":
         status = None if args.all else (args.status or list(store.OPEN_STATUSES))
-        rows = store.list_tasks(conn, status=status, project=project_ref(args.project), kind=args.kind)
+        rows = visible(conn, "tasks", store.list_tasks(conn, status=status, project=project_ref(args.project),
+                                                       kind=args.kind), lambda t: t["project_id"])
         dump(rows) if args.json else print_tasks(rows)
     elif c == "order":
-        rows = store.execution_order(conn, project=project_ref(args.project), kind=args.kind)
+        rows = visible(conn, "tasks", store.execution_order(conn, project=project_ref(args.project), kind=args.kind),
+                       lambda t: t["project_id"])
         dump(rows) if args.json else print_tasks(rows, numbered=True)
     elif c == "project":
         run_project(conn, args)
@@ -773,6 +808,8 @@ def run(conn, args):
     elif c == "show":
         t = store.get_task(conn, args.id)
         if t is None:
+            raise store.NotFound(f"no task #{args.id}")
+        if not visible(conn, "task", [t], lambda t: t["project_id"]):
             raise store.NotFound(f"no task #{args.id}")
         ev = store.task_events(conn, args.id)
         dump(dict(t, events=ev)) if args.json else print_task(t, ev)
@@ -812,7 +849,7 @@ def run(conn, args):
             print(f"{sid[:8]}: {dec or 'undecided'}" + (f" ({src})" if src else ""))
     elif c == "rule":
         if args.rule_cmd == "list":
-            rules = store.list_rules(conn)
+            rules = visible(conn, "rules", store.list_rules(conn), lambda r: None)
             dump(rules) if args.json else print_rules(rules)
         elif args.rule_cmd == "rm":
             act(conn, "rule.remove", rule_id=args.id)
@@ -843,6 +880,8 @@ def run(conn, args):
         return run_machine(conn, args) or 0
     elif c == "grant":
         return run_grant(conn, args) or 0
+    elif c == "roles":
+        return run_roles(conn, args) or 0
     elif c == "question":
         run_question(conn, args)
     elif c == "inbox" and args.inbox_cmd:
@@ -850,6 +889,8 @@ def run(conn, args):
     elif c == "inbox":
         maybe_scan(conn, args)
         box = store.pending_user_input(conn)
+        box = dict(box, blocked_tasks=visible(conn, "inbox", box["blocked_tasks"], lambda t: t["project_id"]),
+                   undecided_sessions=visible(conn, "stalled", box["undecided_sessions"], lambda s: None))
         if args.json:
             dump({"blocked_tasks": box["blocked_tasks"],
                   "undecided_sessions": [session_json(s) for s in box["undecided_sessions"]]})
@@ -1408,6 +1449,16 @@ def parser():
             q.add_argument("--level", choices=("viewer", "editor", "manager"), help="for --project")
     q = gs.add_parser("list", parents=[js], help="the grants")
     q.add_argument("--user", type=int, help="only this user's")
+
+    p = sub.add_parser("roles", help="the permission matrix in shadow mode (phase 5a A3): shadow | mode")
+    rs = p.add_subparsers(dest="roles_cmd", required=True)
+    q = rs.add_parser("shadow", parents=[js], help="what the matrix would have refused, made a proposal or "
+                      "hidden (today's list; --day, --since for others)")
+    q.add_argument("--day", help="YYYY-MM-DD (Berlin), default today")
+    q.add_argument("--since", help="every day from YYYY-MM-DD on")
+    q = rs.add_parser("mode", parents=[js], help="the roles_enforce setting (--set: write it, the repair of an "
+                      "unusable saved value)")
+    q.add_argument("--set", dest="set_mode", choices=("shadow", "on"), help="save this value (setting.set)")
     return ap
 
 
