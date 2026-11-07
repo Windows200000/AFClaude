@@ -15,7 +15,7 @@ CLIs, the MCP server, hand-run runner paths) call it instead of writing a litera
                                          owner-equivalent for the old rule, which only reads `autonomous`)
   runner        runner:<component>       a runner process (no Claude session in its env)
 
-A2 only records who acts: nothing here refuses (the old owner_only rule stays in force, `autonomous` feeds it).
+A2 only records who acts: nothing here refuses (the old owner_only rule stays in force, `autonomous` feeds it; A3 adds the shadow-mode permission matrix, permissions.py).
 The result is advisory, not authentication: every input is an env variable or a stamp the caller can set or
 unset (A3's enforcement must not treat it as proof; machine tokens are the credential).
 
@@ -51,7 +51,7 @@ TOKEN_FILE_VAR = "AFCLAUDE_MACHINE_FILE"
 DEFAULT_TOKEN_FILE = "~/.config/afclaude/machine.json"
 STAMP_KEY = "_afc"                        # the hook's field in an MCP call's arguments (plan §3.3)
 
-ENFORCE_CONFLICTS = False                 # A3's roles_enforce=on turns a conflicting claim into a refusal
+ENFORCE_CONFLICTS = False                 # a test switch; the roles_enforce setting `on` (A3) also refuses a conflict
 log = logging.getLogger("afclaude.identity")
 _noted: set[str] = set()                  # the messages already logged by this process
 
@@ -77,10 +77,11 @@ def note_once(msg: str) -> None:
         log.warning("%s", msg)
 
 
-def conflict(msg: str) -> None:
-    """A claim that contradicts the process's own chain: refused once roles are enforced, one log line
-    while they are in shadow (the caller goes on under the process's own id, A2 refuses nothing new)."""
-    if ENFORCE_CONFLICTS:
+def conflict(msg: str, conn: sqlite3.Connection) -> None:
+    """A claim that contradicts the process's own chain: refused once roles are enforced (the roles_enforce
+    setting is `on`, A3), one log line while they are in shadow (the caller goes on under the process's own id,
+    A2 refuses nothing new)."""
+    if ENFORCE_CONFLICTS or actions.roles_mode(conn) == "on":
         raise IdentityConflict(msg)
     note_once(f"identity: {msg} (shadow mode: the process's own session id is used)")
 
@@ -160,7 +161,7 @@ def resolve_session(conn: sqlite3.Connection, env_sid: str | None,
             return None, "none"
         other = family(conn, stamp_sid)
         if _known(conn, other):
-            conflict("the call's stamp names an AFClaude session but the server's env names none")
+            conflict("the call's stamp names an AFClaude session but the server's env names none", conn)
             return None, "none"
         return other[-1], "stamp"
     fam = family(conn, env_sid)
@@ -172,7 +173,7 @@ def resolve_session(conn: sqlite3.Connection, env_sid: str | None,
         return fam[-1], "env"
     other = family(conn, stamp_sid)
     if _known(conn, other):
-        conflict("the call names an AFClaude session outside the caller's own session chain")
+        conflict("the call names an AFClaude session outside the caller's own session chain", conn)
         return fam[-1], "env"
     return other[-1], "stamp"
 
@@ -240,11 +241,11 @@ def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
     try:
         stamp_sid, stamp_agent = clean_stamp(stamp)
     except IdentityConflict as err:
-        conflict(str(err))                # shadow mode: the malformed stamp is dropped
+        conflict(str(err), conn)          # shadow mode: the malformed stamp is dropped
         stamp_sid = stamp_agent = None
     agent_id = stamp_agent if transport == "mcp" else (e.get(AGENT_VAR) or None)
     if agent_id is not None and not ID_RE.match(agent_id):
-        conflict(f"{AGENT_VAR} is not an agent id")
+        conflict(f"{AGENT_VAR} is not an agent id", conn)
         agent_id = None
     sid, source = resolve_session(conn, e.get(SESSION_VAR) or None, stamp_sid if transport == "mcp" else None)
     fam = family(conn, sid) if sid else []

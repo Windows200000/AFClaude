@@ -187,6 +187,14 @@ def actor(conn: sqlite3.Connection | None = None) -> str:
     return f"mcp:{sid}" if sid and actions.ACTOR_RE.match(f"mcp:{sid}") else "mcp"
 
 
+def visible(conn: sqlite3.Connection, what: str, rows: Iterable[Any], project_of: Callable[[Any], int | None],
+            public_global: bool = False) -> list[Any]:
+    """A listing as the caller's principal may see it (actions.read_filter: while roles_enforce is `shadow` it
+    shows everything and logs what it would hide, phase 5a A3)."""
+    w = who(conn)
+    return actions.read_filter(conn, w.actor, w.session, "mcp", what, rows, project_of, public_global=public_global)
+
+
 def act(conn: sqlite3.Connection, action: str, /, **params: Any) -> Any:
     """One write through the shared write path, as the caller's principal. `autonomous` marks a session
     AFClaude launched or drives (the guard-hook bypass, whatever its id)."""
@@ -326,7 +334,7 @@ async def afclaude_list_tasks(status: str = "open", project: Optional[str] = Non
     project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
-        rows = store.list_tasks(conn, status=st, project=project)
+        rows = visible(conn, "tasks", store.list_tasks(conn, status=st, project=project), lambda t: t["project_id"])
     finally:
         conn.close()
     limit = max(1, min(int(limit), 200))
@@ -339,6 +347,8 @@ async def afclaude_get_task(id: int) -> str:
     try:
         t = store.get_task(conn, id)
         if t is None:
+            raise store.NotFound(f"no task #{id}")
+        if not visible(conn, "task", [t], lambda x: x["project_id"]):
             raise store.NotFound(f"no task #{id}")
         return out(task_full(t, store.task_events(conn, id)))
     finally:
@@ -420,7 +430,8 @@ async def afclaude_project(action: Literal["list", "add", "move", "prio", "edit"
     conn = db()
     try:
         if action == "list":
-            return out({"projects": [project_brief(p) for p in store.list_projects(conn)]})
+            return out({"projects": [project_brief(p) for p in
+                                     visible(conn, "projects", store.list_projects(conn), lambda p: p["id"])]})
         if not name or not name.strip():
             raise ValueError(f"{action} needs name")
         path = await resolve_dir_arg(ctx, path)
@@ -480,6 +491,8 @@ async def afclaude_inbox() -> str:
     conn = db()
     try:
         box = store.pending_user_input(conn)
+        box = dict(box, blocked_tasks=visible(conn, "inbox", box["blocked_tasks"], lambda t: t["project_id"]),
+                   undecided_sessions=visible(conn, "stalled", box["undecided_sessions"], lambda s: None))
     finally:
         conn.close()
     res: dict[str, Any] = {"blocked_tasks": [dict(task_brief(t), asked=bt(t["blocked_at"]))
@@ -530,7 +543,8 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
     conn = db()
     try:
         if action == "list":
-            return out({"rules": [compact(dict(r, created_at=bt(r["created_at"]))) for r in store.list_rules(conn)]})
+            return out({"rules": [compact(dict(r, created_at=bt(r["created_at"])))
+                                  for r in visible(conn, "rules", store.list_rules(conn), lambda r: None)]})
         if action == "rm":
             if id is None:
                 raise ValueError("rm needs id")
@@ -605,7 +619,7 @@ async def afclaude_doc(action: Literal["list", "show", "append", "set"], name: O
     conn = db()
     try:
         p = store.get_project(conn, project)
-        if p is None:
+        if p is None or (action in ("list", "show") and not visible(conn, "docs", [p], lambda x: x["id"])):
             raise store.NotFound(f"no project {project!r}")
         if action == "list":
             return out({"project": p["name"], "docs": [
@@ -695,11 +709,12 @@ async def afclaude_decisions(action: Literal["find", "show", "propose", "record"
             if not id:
                 raise ValueError("show needs id")
             d = store.get_decision_entry(conn, id)
-            if d is None:
+            if d is None or not visible(conn, "decisions", [d], lambda x: x.get("project_id"), public_global=True):
                 raise store.NotFound(f"no decision {id}")
             return out(dict(decision_full(d), note=FULL_NOTICE))
-        hits = store.find_decision_entries(conn, keywords or [],
-                                           None if all else ("active", "partial"))
+        hits = visible(conn, "decisions", store.find_decision_entries(conn, keywords or [],
+                                                                      None if all else ("active", "partial")),
+                       lambda x: x.get("project_id"), public_global=True)
         shown = hits[:DECISION_HITS]
         res: dict[str, Any] = {"hits": [decision_full(d) if full else decision_line(d) for d in shown]}
         if len(hits) > len(shown):
@@ -784,7 +799,8 @@ async def afclaude_notice(action: Literal["post", "list"], title: Optional[str] 
     conn = db()
     try:
         if action == "list":
-            return out({"notices": [notice_brief(n) for n in store.list_notices(conn, include_dismissed=all)]})
+            return out({"notices": [notice_brief(n) for n in visible(
+                conn, "notices", store.list_notices(conn, include_dismissed=all), lambda n: n["project_id"])]})
         params: dict[str, Any] = {"title": title, "text": text}
         if project is not None and project.strip():
             ref = await resolve_dir_arg(ctx, project)

@@ -90,7 +90,8 @@ class Base(unittest.TestCase):
         return actions.register_machine(self.conn, code, hostname, actor="cli", via="cli", label=label)
 
     def dump_all(self):
-        return "\n".join(self.conn.iterdump())
+        # roles_shadow is A3's log of what the matrix would have refused: a refusal adds a row there by design
+        return "\n".join(l for l in self.conn.iterdump() if "roles_shadow" not in l)
 
 
 class Schema(Base):

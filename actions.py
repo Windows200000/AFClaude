@@ -54,8 +54,10 @@ import difflib
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -78,6 +80,7 @@ import decisions  # noqa: E402  (pure: the parser and the entry text, phase 4b)
 import owner_words  # noqa: E402  (the owner's stored messages as evidence, phase 4b Q2)
 import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
 import roles  # noqa: E402  (pure: grants, effective roles, the last owner, credentials, phase 5a A1)
+import permissions  # noqa: E402  (the permission matrix and its check, phase 5a A3)
 
 VIAS = ("cli", "mcp", "dashboard", "runner")
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
@@ -235,7 +238,19 @@ def _db_path(conn: sqlite3.Connection) -> str | None:
 
 def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[str, Any], ctx: Ctx,
              request_sha: str) -> Any:
-    """One try of perform(): the action, its audit row and idempotency key in one transaction."""
+    """One try of perform(): the action, its audit row and idempotency key in one transaction. A verdict of the
+    permission matrix that is not `allowed` is logged in shadow mode once the transaction is over (committed or
+    rolled back: the shadow row must outlive the old rule's refusal); it never changes the outcome."""
+    seen: list[permissions.Verdict] = []
+    try:
+        return _perform_tx(conn, spec, name, params, ctx, request_sha, seen)
+    finally:
+        if seen:
+            roles_shadow_log(conn, ctx, name, seen[0])
+
+
+def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[str, Any], ctx: Ctx,
+                request_sha: str, seen: list[permissions.Verdict]) -> Any:
     actor, via, key = ctx.actor, ctx.via, ctx.key
     with store.transaction(conn, store.DECISION_TABLES if spec.target_type == "decision" else ()):
         if key is not None:
@@ -245,6 +260,18 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
                     raise Conflict(f"idempotency key {key!r} was already used for a different request "
                                    f"({hit['action']} by {hit['actor']})")
                 return json.loads(hit["response"]) if hit["response"] is not None else None
+        try:
+            verdict = permissions.check(conn, name, params, actor, ctx.actor_session)
+        except (sqlite3.Error, store.DBError):
+            raise                     # the DB error path (retry / escalate), not a verdict
+        except Exception as e:        # noqa: BLE001 - a crashing check is a refusal with its reason, never silent
+            verdict = permissions.Verdict("refused", f"the permission check itself failed ({type(e).__name__}: {e})")
+        if verdict.outcome != "allowed":
+            if roles_mode(conn) == "on":
+                raise Forbidden(f"{name} refused for {actor}: {verdict.reason}" if verdict.outcome == "refused"
+                                else f"{name} by {actor} would be a proposal for the task-manager ({verdict.reason}); "
+                                     "proposals are not built yet (phase 5a A4)")
+            seen.append(verdict)
         if spec.owner_only and is_autonomous(conn, ctx):
             raise Forbidden(f"{name} is not allowed for an autonomous AFClaude session via {via} "
                             "(the owner decides sessions, rules, settings and prompts)")
@@ -257,6 +284,75 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
             store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
             store.put_idempotency(conn, key, actor, name, request_sha, res.result)
         return res.result
+
+
+# ---------------------------------------------------------------- roles in shadow (phase 5a A3)
+
+roles_log = logging.getLogger("afclaude.roles")
+_roles_logged: dict[tuple[str, str, str], str] = {}      # (actor, action, outcome) -> the hour last logged
+
+
+def roles_mode(conn: sqlite3.Connection) -> str:
+    """The roles_enforce setting as saved: `shadow` (the default) or `on` (refuses; only reachable once the
+    host's machine user holds an owner grant). An unknown saved value is an error, not a guess (D-235)."""
+    mode = get_setting(conn, "roles_enforce")
+    if mode not in ROLES_ENFORCE:
+        raise ValueError(f"roles_enforce is {mode!r}: must be one of {'|'.join(ROLES_ENFORCE)}")
+    return str(mode)
+
+
+def roles_shadow_add(conn: sqlite3.Connection, *, actor: str, session: str | None, via: str, action: str,
+                     outcome: str, reason: str, project_id: int | None = None) -> None:
+    """One shadow-log row (the list `tasks.py roles shadow` prints; no audit row, like app_log)."""
+    day = store._utcnow().astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d")
+
+    def run() -> None:
+        with store.transaction(conn):
+            store.add_roles_shadow(conn, day, actor, session, via, action, outcome, reason[:500], project_id)
+    store.retrying(run, conn)
+
+
+def roles_shadow_log(conn: sqlite3.Connection, ctx: Ctx, name: str, v: permissions.Verdict, *,
+                     project_id: int | None = None) -> None:
+    """Shadow mode: a would-be refusal or proposal goes to the shadow table and a warning in the process log
+    (once per actor, action and outcome and hour, so a looping caller doesn't flood it). Never raises: a failed
+    diagnostic is reported loudly on the log, and the write it describes goes on as the old rule decides."""
+    try:
+        pid = project_id if project_id is not None else next((p for p in v.projects if p is not None), None)
+        roles_shadow_add(conn, actor=ctx.actor, session=ctx.actor_session, via=ctx.via, action=name,
+                         outcome=v.outcome, reason=v.reason, project_id=pid)
+        hour = store.now_iso()[:13]
+        k = (ctx.actor, name, v.outcome)
+        if _roles_logged.get(k) != hour:
+            _roles_logged[k] = hour
+            roles_log.warning("roles (shadow): %s by %s would be %s: %s", name, ctx.actor, v.outcome, v.reason)
+    except Exception as e:   # noqa: BLE001 - reported, never changes the write's outcome (shadow refuses nothing)
+        roles_log.error("roles (shadow): could not log the verdict for %s by %s (%s: %s)", name, ctx.actor,
+                        type(e).__name__, e)
+
+
+def read_filter(conn: sqlite3.Connection, actor: str, session: str | None, via: str, what: str,
+                rows: Iterable[_T], project_of: Callable[[_T], int | None], *, public_global: bool = False) -> list[_T]:
+    """A listing narrowed to what the caller may see (plan §3.4: a machine user sees its projects only, an agent
+    its project, a viewer reads questions). Shadow mode returns every row and logs what it would have hidden
+    (one shadow row per call); `on` returns the narrowed list. `project_of(row)`: the row's project, None =
+    global (owner only, or public with public_global: install-wide decisions)."""
+    rows = list(rows)
+    visible = permissions.visible_projects(conn, actor, session)
+    if visible is None:
+        return rows
+    shown = [(public_global and project_of(r) is None) or project_of(r) in visible for r in rows]
+    keep = [r for r, ok in zip(rows, shown) if ok]
+    if len(keep) == len(rows):
+        return rows
+    if roles_mode(conn) == "on":
+        return keep
+    ctx = Ctx(actor, via, None, False, session)
+    hidden = sorted({p for r, ok in zip(rows, shown) if not ok for p in [project_of(r)] if p is not None})
+    roles_shadow_log(conn, ctx, f"read:{what}", permissions.Verdict(
+        "filtered", f"would hide {len(rows) - len(keep)} of {len(rows)} rows" +
+        (f" (projects {hidden})" if hidden else " (global rows)")), project_id=hidden[0] if hidden else None)
+    return rows
 
 
 def _check_params(spec: Spec, params: Mapping[str, Any]) -> None:
@@ -731,6 +827,19 @@ def _whole(lo: int, hi: int) -> Callable[[Any, Optional[sqlite3.Connection]], in
     return check
 
 
+ROLES_ENFORCE = ("shadow", "on")
+
+
+def _roles_enforce(v: Any, conn: sqlite3.Connection | None = None) -> str:
+    """roles_enforce: shadow | on; `on` only once this host's own machine user holds an owner grant (D-330:
+    until then the owner's sessions act as `cli`, so enforcing would lock them out or rest on advisory identity)."""
+    mode = _choice(ROLES_ENFORCE)(v, conn)
+    if mode == "on" and (conn is None or not store.host_owner_machine(conn, socket.gethostname())):
+        raise ValueError("roles_enforce can't be `on` yet: register this host's machine user and grant it the "
+                         "owner role first (D-330, phase 5a A7)")
+    return mode
+
+
 class Setting:
     """One registry entry (§7.4): the code default (D-169: shipped with the code, never read
     from a file), the check (validates and normalizes a value; a ValueError says why), a
@@ -1000,6 +1109,11 @@ SETTINGS: dict[str, Setting] = {
                                section="auth", kind="login_rate"),
     # --- host (phase 6a W7 / 5d; design §10.4, D-229). 5d's X3 (not built) adds working_root and the
     # rest of this section's settings; it reuses this key rather than redefining it.
+    "roles_enforce": Setting("shadow", _roles_enforce,
+                             "Roles (phase 5a): \"shadow\" logs what the permission matrix would refuse or turn "
+                             "into a proposal and changes nothing; \"on\" enforces it. \"on\" is refused until "
+                             "this host has a machine user with an owner grant (D-330); removed with 5a's cut-over",
+                             section="auth", kind="enum", choices=ROLES_ENFORCE),
     "claude_plan": Setting(CLAUDE_PLAN_UNSET, _choice(CLAUDE_PLANS),
                            "The owner's Claude subscription plan, asked once at first startup (D-229); "
                            "\"unset\" until the wizard's step is done (it must get a real choice, never "
