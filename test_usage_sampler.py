@@ -298,6 +298,34 @@ class Main(unittest.TestCase):
         self.assertEqual(self.alerts, ["AFClaude STOPPED: `claude agents` snapshot failed"])
 
 
+
+class MarkOwn(unittest.TestCase):
+    """D-328 fix round 3: after a /clear a task-manager goes on under a new id whose transcript may
+    carry no title: any driven session (any kind, ended too) and its "cleared" chain count as own."""
+    def test_driven_and_cleared_sessions_are_own(self):
+        import json
+        import store
+        testenv.fresh_db(self)
+        old, new, newer = ("eeeeeeee-0000-4000-8000-00000000000%d" % i for i in (1, 2, 3))
+        other, review = "ffffffff-0000-4000-8000-000000000001", "ffffffff-0000-4000-8000-000000000002"
+        stall = "ffffffff-0000-4000-8000-000000000003"
+        testenv.tmux_row(review, kind="review")
+        testenv.tmux_row(stall, kind="stall")                 # the user's session, continued: stays theirs
+        testenv.tmux_row(old)
+        conn = store.connect()
+        try:
+            with store.transaction(conn):
+                store.upsert_driven_session(conn, old, ended_at=store.now_iso())     # ended at its /clear
+                for a, b in ((old, new), (new, newer)):
+                    store.state_set(conn, "keepalive", json.dumps(["cleared", a]), json.dumps({"to": b, "at": "t"}),
+                                    "keepalive", "runner")
+        finally:
+            conn.close()
+        sessions = {s: {"cwd": "/srv/elsewhere", "title": None} for s in (old, new, newer, other, review, stall)}
+        us.mark_own(sessions)
+        self.assertEqual({s for s, m in sessions.items() if m["own"]}, {old, new, newer, review})
+
+
 Main.real_agents = staticmethod(us.agents_snapshot)
 
 

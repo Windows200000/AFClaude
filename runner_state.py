@@ -394,6 +394,32 @@ def own_sessions(path: Optional[str] = None) -> set[str]:
     return _side_ids(live) if got is None else got
 
 
+def driven_family_ids() -> set[str]:
+    """D-328: every session id AFClaude drove (driven_sessions, ended rows too, any kind but
+    'stall': a stalled session AFClaude continues is the user's own session) and every id linked to
+    one through the keepalive state's "cleared" chain (store.cleared_links): a session after its
+    /clear goes on under a new id whose transcript may carry no title or agent name.
+    Raises store.DBError / sqlite3.Error (D-235: the caller reports it)."""
+    def run() -> tuple[set[str], dict[str, str]]:
+        conn = _read_conn()
+        if conn is None:
+            raise store.DBUnavailable(f"no database at {store.DB_PATH}", "missing")
+        try:
+            return ({str(r[0]) for r in conn.execute("SELECT session_id FROM driven_sessions WHERE kind<>'stall'")},
+                    store.cleared_links(conn))
+        finally:
+            conn.close()
+    ids, links = store.retrying(run)
+    grown = True
+    while grown:                      # a chain both ways, from any of its ids
+        grown = False
+        for old, new in links.items():
+            if (old in ids) != (new in ids):
+                ids.update((old, new))
+                grown = True
+    return ids
+
+
 def own_session_add(session_id: str, actor: str = "cli", via: str = "cli") -> bool:
     """Add an own session (driven_sessions kind 'own', audited). -> added (False: known)."""
     import actions

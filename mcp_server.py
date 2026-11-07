@@ -136,16 +136,25 @@ def session_id_env() -> str | None:
     return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
-def actor() -> str:
-    """mcp:<calling session> for the audit log (plain mcp if the client didn't pass its id)."""
+def current_session_id(conn: sqlite3.Connection | None = None) -> str | None:
+    """The calling session's id as it is now (D-328): $CLAUDE_CODE_SESSION_ID is fixed when the
+    process starts, and a /clear goes on in the same process (this server included) under a new
+    id; with a connection, the "cleared" chain is followed to its newest id (actions.current_session)."""
     sid = session_id_env()
+    return actions.current_session(conn, sid) if sid and conn is not None else sid
+
+
+def actor(conn: sqlite3.Connection | None = None) -> str:
+    """mcp:<calling session> for the audit log (plain mcp if the client didn't pass its id); with a
+    connection, the session's current id after its /clears (current_session_id)."""
+    sid = current_session_id(conn)
     return f"mcp:{sid}" if sid and actions.ACTOR_RE.match(f"mcp:{sid}") else "mcp"
 
 
 def act(conn: sqlite3.Connection, action: str, /, **params: Any) -> Any:
     """One write through the shared write path. The guard-hook bypass marks a session
     AFClaude launched (autonomous), whatever its id."""
-    return actions.perform(conn, action, params, actor=actor(), via="mcp",
+    return actions.perform(conn, action, params, actor=actor(conn), via="mcp",
                            autonomous=os.environ.get("CLAUDE_GUARD_DISABLE") == "1")
 
 
@@ -266,7 +275,7 @@ async def afclaude_add_task(title: str, description: str = "", priority: Priorit
     conn = db()
     try:
         t = act(conn, "task.add", title=title, description=description or None, project=project,
-                priority=priority, created_by_session=session_id_env())
+                priority=priority, created_by_session=current_session_id(conn))
     finally:
         conn.close()
     return out(dict(task_brief(t), project_source=source))
@@ -322,7 +331,7 @@ async def afclaude_update_task(id: int, title: Optional[str] = None, description
     conn = db()
     try:
         t = act(conn, "task.update", task_id=id, fields=fields or None, stage=stage, status=status, note=note,
-                session=session_id_env())
+                session=current_session_id(conn))
         return out(task_brief(t))
     finally:
         conn.close()
@@ -352,7 +361,7 @@ async def afclaude_ask(question: str, project: Optional[str] = None, options: Op
     conn = db()
     try:
         t = act(conn, "task.ask", question=question, project=project, options=options,
-                created_by_session=session_id_env())
+                created_by_session=current_session_id(conn))
     finally:
         conn.close()
     return out(task_brief(t))
@@ -527,7 +536,7 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
     project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
-        sid = (session or "").strip() or session_id_env()
+        sid = (session or "").strip() or current_session_id(conn)
         if not sid:
             raise ValueError("session is unknown here: pass your full session id as session")
         if len(sid) != 36:

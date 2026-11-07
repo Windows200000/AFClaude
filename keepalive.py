@@ -2431,9 +2431,10 @@ def _start_session(sid, pre, stall, reason, st, args, key, night):
                                   f"its lock was held for {COMPACT_LOCK_WAIT} (keepalive_session_{sid[:8]}.lock)")
         # a flow we waited for whose /clear timed out may have landed since (late_clear): the
         # earlier preflight's plan would drive the old id (a run-now ignores the pause, D-282)
-        if report_late_clear(sid, datetime.now(UTC)):
+        late = note_late_clear(sid, datetime.now(UTC))     # one alert: abort_start's (fix round 3)
+        if late:
             raise failstop.Failed(f"{sid[:8]}'s timed-out /clear landed late; not started",
-                                  cleared_refusal(sid) or "the old id is not driven")
+                                  "; ".join([d for _, d in late] + [cleared_refusal(sid) or "the old id is not driven"]))
         # the compaction we waited for may have cleared the session (D-328): start its new id
         # instead (preflight, lock and all), and a failure it paused automation on holds the start
         cur = current_session(sid)
@@ -3374,14 +3375,23 @@ def late_clear(sid, now, st=None):
 
 
 def report_late_clear(sid, now):
-    """compaction_plan's first check (before the pause holds it: the timeout paused automation), and
-    a start's after the compaction lock: a late /clear (late_clear) is alerted once with both ids,
-    the attempt record notes it and the link old -> new is stored (store_clear_link: from then on
-    nothing drives `sid`, cleared_refusal; the new id has no driven row, so a start of it fails
-    safe at preflight); the DB's bookkeeping is not moved (the owner decides: the session went on
-    without its resume message). -> True when one was found."""
-    found = late_clear(sid, now)
-    for key, rec, hit in found:
+    """compaction_plan's first check (before the pause holds it: the timeout paused automation): a
+    late /clear is noted (note_late_clear) and alerted once with both ids. -> True when one was found."""
+    found = note_late_clear(sid, now)
+    for subject, detail in found:
+        fail_stop(subject, detail)
+    return bool(found)
+
+
+def note_late_clear(sid, now):
+    """A late /clear (late_clear): the attempt record notes it and the link old -> new is stored
+    (store_clear_link: from then on nothing drives `sid`, cleared_refusal; the new id has no driven
+    row, so a start of it fails safe at preflight); the DB's bookkeeping is not moved (the owner
+    decides: the session went on without its resume message). Nothing is alerted here: the caller
+    alerts once (report_late_clear; a start after the compaction lock aborts with it, abort_start).
+    -> [(alert subject, detail)], one per late /clear."""
+    out = []
+    for key, rec, hit in late_clear(sid, now):
         new = hit["session"]
         try:
             store_clear_link(sid, new, hit["at"] or now)
@@ -3390,11 +3400,11 @@ def report_late_clear(sid, now):
             linked = f"the link that refuses the old id could NOT be stored ({type(e).__name__}: {str(e)[:200]})"
         rec = dict(rec, late_clear={"session": new, "at": hit["at"].isoformat() if hit["at"] else None})
         record_compaction(sid, key, rec)
-        fail_stop(f"compaction of {sid[:8]}: its /clear landed late, pid {rec['clear_timeout'].get('pid')} goes on as "
-                  f"{new[:8]}", f"{sid[:8]} timed out waiting for the /clear ({key}), then the process went on as "
-                  f"{new}; {linked}; the DB still names {sid} (nothing moved, no resume message "
-                  f"sent): {follow_by_hand(sid, new)}, or restart the task-manager")
-    return bool(found)
+        out.append((f"compaction of {sid[:8]}: its /clear landed late, pid {rec['clear_timeout'].get('pid')} goes on "
+                    f"as {new[:8]}", f"{sid[:8]} timed out waiting for the /clear ({key}), then the process went on as "
+                    f"{new}; {linked}; the DB still names {sid} (nothing moved, no resume message "
+                    f"sent): {follow_by_hand(sid, new)}, or restart the task-manager"))
+    return out
 
 
 def follow_clear(old, new, at):

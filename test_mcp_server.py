@@ -444,6 +444,32 @@ class Handoff(Env):
         r = run(ms.afclaude_handoff("explicit", session=SID))                # ... then it names itself
         self.assertEqual(r["session_id"], SID)
 
+    def test_after_a_clear_the_current_id(self):
+        """D-328 fix round 3: a /clear goes on in the same process, so this server's env still names the
+        pre-/clear id (CALLER). The hand-off defaults to the current id, the save prompt's id is
+        accepted (the second /clear in one process), the old one too; the audit actor and
+        created_by_session name the current id; another session's id is still refused."""
+        new = "99999999-2222-4333-8444-555555555555"
+        c = self.conn()
+        try:
+            store.state_set(c, "keepalive", json.dumps(["cleared", CALLER]), json.dumps({"to": new, "at": "t"}),
+                            "keepalive", "runner")
+            c.commit()
+        finally:
+            c.close()
+        self.assertEqual(run(ms.afclaude_handoff("s", working_notes=["tests: none"]))["session_id"], new)
+        self.assertEqual(run(ms.afclaude_handoff("s", session=new))["session_id"], new)
+        self.assertEqual(run(ms.afclaude_handoff("s", session=CALLER))["session_id"], CALLER)
+        with self.assertRaisesRegex(ToolError, "only its own"):
+            asyncio.run(ms.afclaude_handoff("x", session=SID))
+        t = run(ms.afclaude_add_task("after the clear"))
+        c = self.conn()
+        try:
+            self.assertEqual(store.get_task(c, t["id"])["created_by_session"], new)
+            self.assertEqual({a["actor"] for a in store.audit_log(c, target_type="handoff")}, {f"mcp:{new}"})
+        finally:
+            c.close()
+
 
 class Docs(Env):
     def test_doc_tool(self):
