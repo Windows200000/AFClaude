@@ -93,8 +93,7 @@ DATA_DIR = os.environ.get("AFCLAUDE_DATA_DIR", os.path.join(HERE, "data"))
 SAMPLES_FILE = os.path.join(DATA_DIR, "samples.jsonl")
 FORECAST_LOG = os.path.join(DATA_DIR, "forecast_log.jsonl")
 FIRE_FILES = [  # (path, group, time field): AFClaude's own fires (start of an autonomous run)
-    (os.path.join(DATA_DIR, "keepalive", "keepalive_state.json"), "handled", "at"),
-    (os.path.join(os.environ.get("KEEPALIVE_STATE_DIR", HERE), "keepalive_state.json"), "handled", "at"),
+    (os.path.join(DATA_DIR, "keepalive", "keepalive_state.json"), "handled", "at"),   # the DB (no repo-dir side file)
     (os.path.join(DATA_DIR, "dispatcher_state.json"), "sessions", "sent_at"),
     (os.path.join(DATA_DIR, "usage_review_state.json"), "runs", "at"),
 ]

@@ -54,5 +54,24 @@ class SessionChain(unittest.TestCase):
             self.assertEqual(ur.last_recorded_ts(NEWER).isoformat(), "2026-11-01T00:00:00+00:00")
 
 
+class SessionChainInTheDb(unittest.TestCase):
+    """Without KEEPALIVE_STATE_DIR (the CLI in a host shell) session_ids reads the links from the
+    DB (keepalive.STATE_FILE's default is the live state), not from a side file in the repo dir."""
+    A, B = ("dddddddd-0000-4000-8000-00000000000%d" % i for i in (1, 2))
+
+    def test_follows_a_db_link(self):
+        self.assertNotIn("KEEPALIVE_STATE_DIR", os.environ)
+        self.assertTrue(ur.ka.runner_state.is_live("keepalive", ur.ka.STATE_FILE))
+
+        def unlink():
+            st = ur.ka.load_state()
+            (st.get("cleared") or {}).pop(self.A, None)
+            ur.ka.save_state(st)
+        self.addCleanup(unlink)
+        ur.ka.store_clear_link(self.A, self.B, "2026-11-01T00:00:00+00:00")
+        self.assertEqual(ur.session_ids(self.B), [self.A, self.B])
+        self.assertEqual(ur.session_ids(self.A), [self.A, self.B])
+
+
 if __name__ == "__main__":
     unittest.main()

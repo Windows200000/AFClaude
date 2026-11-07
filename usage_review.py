@@ -319,7 +319,7 @@ def spool(when, args, rerun=False):
     when a restart cut it off (a chain step: its state is in st["chain"] and it runs under lock());
     else that is an error (a review start cut off mid-way, D-257). -> dict(ok, at_utc, rc, out)."""
     when = when.astimezone(UTC)
-    log_file = os.path.join(os.environ.get("KEEPALIVE_STATE_DIR", HERE), "keepalive.log")
+    log_file = os.path.join(ka.STATE_DIR, "keepalive.log")   # the live log (data/keepalive), as the runner's
     cmd = f"cd {HERE} && python3 usage_review.py {args} >> {log_file} 2>&1\n"
     r = subprocess.run(["at", "--on-interrupt", "rerun" if rerun else "fail", "-t", when.strftime("%Y%m%d%H%M")],
                        input=cmd, text=True, capture_output=True, env=dict(ka.SCRUBBED_ENV, TZ="UTC"))

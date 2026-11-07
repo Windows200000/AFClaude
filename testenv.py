@@ -25,6 +25,8 @@ os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no
 os.environ["AFCLAUDE_DIR"] = HERE   # docker/at_shim.py imports from it: a worktree run never loads the live checkout
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
 os.environ.pop("AFCLAUDE_SCHEDULER", None)   # a container's mode never leaks in (health, the quickview read it)
+os.environ.pop("KEEPALIVE_STATE_DIR", None)   # the container's live data/keepalive never: the keep-alive's state
+                                              # names default to the temp DB's dir (keepalive.STATE_DIR)
 
 SID = "00000000-0000-4000-8000-000000000001"   # synthetic task-manager session (not a real session anywhere)
 with open(os.environ["AFCLAUDE_CONFIG"], "w") as _fh:

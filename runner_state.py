@@ -121,6 +121,15 @@ def live_path(component: str, files: Optional[dict[str, str]] = None) -> str:
     return os.path.join(data_dir(), (files or STATE_FILES)[component])
 
 
+def guard_tests(what: str) -> None:
+    """A unittest process that resolves a live state path by default (`what`) without testenv's
+    temp DB and data dir would read and write the owner's live state: refused (RuntimeError).
+    Import testenv before any AFClaude module. A runner never imports unittest."""
+    if "unittest" in sys.modules and "testenv" not in sys.modules:
+        raise RuntimeError(f"{what}: a test resolved the live state ({live_path('keepalive')}) without testenv; "
+                           "import testenv before any AFClaude module")
+
+
 def _same(a: str, b: str) -> bool:
     return os.path.realpath(os.path.abspath(a)) == os.path.realpath(os.path.abspath(b))
 
