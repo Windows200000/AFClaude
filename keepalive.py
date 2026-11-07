@@ -107,7 +107,13 @@ JOBS_DIR = os.path.expanduser("~/.claude/jobs")
 SESSIONS_DIR = os.environ.get("KEEPALIVE_SESSIONS_DIR", os.path.expanduser("~/.claude/sessions"))
 PROC_DIR = os.environ.get("KEEPALIVE_PROC_DIR", "/proc")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
-STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR", HERE)
+# The live state dir, data/keepalive next to the DB (the container sets the same path): the names
+# below are THE live state, i.e. the DB (runner_state.is_live). A process without
+# KEEPALIVE_STATE_DIR (a host shell: usage_report, run_now, --follow-clear) must read the DB too,
+# never a side file in the repo dir (D-235); a test gets testenv's temp dir (runner_state.guard_tests).
+STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR") or os.path.dirname(runner_state.live_path("keepalive"))
+if not os.environ.get("KEEPALIVE_STATE_DIR"):
+    runner_state.guard_tests("keepalive.STATE_DIR")
 STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")   # names the state; the DB holds it (D-161)
 PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
@@ -5093,8 +5099,7 @@ def main():
     TAKE_OVER_IDLE = args.take_over_idle
     IGNORE_WINDOW = args.now
     if args.run_stopped:
-        # the task-manager runs this on the host, where STATE_DIR is the pre-container repo dir:
-        # the stop always goes into the live state, i.e. the DB (D-161), never a file there
+        # the stop always goes into the live state, i.e. the DB (D-161), whatever KEEPALIVE_STATE_DIR says
         sid = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
         if not sid:       # its own session, never a guessed one (phase 3b S3, D-235)
             sys.exit("--run-stopped needs the session whose run is over: --session, or run it inside that Claude Code "

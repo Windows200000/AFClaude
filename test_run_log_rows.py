@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (hermetic: a temp DB and data dir; before the AFClaude imports)
 import actions  # noqa: E402
 import keepalive as ka  # noqa: E402
 import store  # noqa: E402
