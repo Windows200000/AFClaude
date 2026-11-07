@@ -48,6 +48,7 @@ def env(sid=None, **kw):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        identity._noted.clear()           # the once-per-process log lines
         host = mock.patch("socket.gethostname", return_value="host-a")   # the host the tokens are issued on
         host.start()
         self.addCleanup(host.stop)
@@ -96,7 +97,7 @@ class Table(Base):
             self.resolve({}, claim="keepalive")
 
     def test_a_runner_claimed_inside_a_session_is_the_sessions_principal(self):
-        for sid, want in ((TM, f"task-manager:{TM}"), (DRV, f"agent:{DRV}"), (OWN, f"agent:{OWN}")):
+        for sid, want in ((TM, f"task-manager:{TM}"), (DRV, f"agent:{DRV}"), (OWN, "cli")):
             w = self.resolve(env(sid), claim="runner:keepalive")
             self.assertEqual(w.actor, want, sid)
             self.assertNotIn("runner", w.actor)
@@ -126,11 +127,17 @@ class Table(Base):
     def test_the_guard_bypass_does_not_demote_a_task_manager(self):
         self.assertEqual(self.resolve(env(TM, CLAUDE_GUARD_DISABLE="1")).actor, f"task-manager:{TM}")
 
-    def test_nothing_identifies_it(self):
-        self.assertEqual(self.resolve(env()).actor, "agent:unknown")                      # CLAUDECODE, no id
-        self.assertEqual(self.resolve({}, transport="mcp").actor, "agent:unknown")        # the server's env is empty
+    def test_an_interactive_session_without_a_token_is_the_host_owner(self):
+        """D-330: an interactive session of this host with no valid token is the host owner (cli), its session id
+        recorded; a subagent of it stays an agent under its own id (owner-equivalent for the old rule)."""
         w = self.resolve(env(OWN))                                                         # an unknown session, no token
-        self.assertEqual((w.actor, w.kind, w.autonomous, w.token), (f"agent:{OWN}", "agent", False, "none"))
+        self.assertEqual((w.actor, w.kind, w.session, w.autonomous, w.token), ("cli", "host", OWN, False, "none"))
+        w = self.resolve(env(OWN, AFCLAUDE_AGENT_ID="a7"))
+        self.assertEqual((w.actor, w.kind, w.agent_id, w.autonomous), (f"agent:{OWN}:a7", "agent", "a7", False))
+        w = self.resolve(env(OWN), transport="mcp", stamp={"session": OWN, "agent": "a7"})
+        self.assertEqual(w.actor, f"agent:{OWN}:a7")
+        self.assertEqual(self.resolve(env()).actor, "cli")                                 # CLAUDECODE, no id
+        self.assertEqual(self.resolve({}, transport="mcp").actor, "cli")                   # the server's env is empty
 
     def test_an_interactive_session_with_a_valid_token_is_the_machine_user(self):
         uid, token = self.machine()
@@ -148,8 +155,12 @@ class Table(Base):
         os.chmod(path, 0o600)
         self.assertEqual(self.resolve(env(OWN), token_file=path).actor, f"machine:{uid}")
         os.chmod(path, 0o644)
-        w = self.resolve(env(OWN), token_file=path)
-        self.assertEqual((w.actor, w.token), (f"agent:{OWN}", "insecure-file"))
+        with self.assertLogs("afclaude.identity", "WARNING") as logs:
+            w = self.resolve(env(OWN), token_file=path)
+            self.resolve(env(OWN), token_file=path)
+        self.assertEqual((w.actor, w.token), ("cli", "insecure-file"))     # D-330; the session is the host's own
+        self.assertEqual(len(logs.output), 1)                              # D-235: visible, once
+        self.assertIn("mode 0600", logs.output[0])
 
     def test_a_revoked_or_unknown_token_is_no_machine_identity(self):
         uid, token = self.machine()
@@ -157,8 +168,11 @@ class Table(Base):
         actions.perform(self.conn, "machine.revoke", {"user_id": uid}, actor="cli", via="cli")
         bad.append(("revoked", token))
         for what, tok in bad:
-            w = self.resolve(env(OWN, AFCLAUDE_MACHINE_TOKEN=tok))
-            self.assertEqual((w.actor, w.kind, w.token), (f"agent:{OWN}", "agent", "invalid"), what)
+            with self.assertLogs("afclaude.identity", "WARNING") as logs:
+                w = self.resolve(env(OWN, AFCLAUDE_MACHINE_TOKEN=tok))
+            self.assertEqual((w.actor, w.kind, w.token), ("cli", "host", "invalid"), what)   # D-330
+            self.assertIn("unknown, revoked or malformed", logs.output[0])
+            identity._noted.clear()
 
     def test_a_driven_session_with_a_machine_token_stays_task_manager_or_agent(self):
         """D-198: a session AFClaude started is task-manager / agent whatever token it carries."""
@@ -193,25 +207,50 @@ class Clear(Base):
         # a stamp outside the chain of a session AFClaude drives is ignored: the process's own chain wins
         w = self.resolve(env(TM), transport="mcp", stamp={"session": OTHER})
         self.assertEqual((w.actor, w.source), (f"task-manager:{NEW}", "env"))
-        # one naming another AFClaude session is refused
+        # one naming another AFClaude session: A2's shadow mode logs it once and goes on under the env id
         for other in (TM2, DRV):
-            with self.assertRaises(identity.IdentityConflict):
-                self.resolve(env(OWN), transport="mcp", stamp={"session": other})
+            identity._noted.clear()
+            with self.assertLogs("afclaude.identity", "WARNING") as logs:
+                w = self.resolve(env(OWN), transport="mcp", stamp={"session": other})
+            self.assertEqual((w.actor, w.session, w.source), ("cli", OWN, "env"))
+            self.assertIn("shadow mode", logs.output[0])
+        # roles enforced (A3): the same claim is an error
+        with mock.patch.object(identity, "ENFORCE_CONFLICTS", True):
+            for other in (TM2, DRV):
+                with self.assertRaises(identity.IdentityConflict):
+                    self.resolve(env(OWN), transport="mcp", stamp={"session": other})
 
     def test_an_interactive_sessions_clear_is_taken_from_the_stamp(self):
         """The store follows only driven sessions' /clears: here neither id is known."""
         w = self.resolve(env(OWN), transport="mcp", stamp={"session": NEW})
-        self.assertEqual((w.actor, w.session, w.source), (f"agent:{NEW}", NEW, "stamp"))
+        self.assertEqual((w.actor, w.session, w.source), ("cli", NEW, "stamp"))
         uid, token = self.machine()
         w = self.resolve(env(OWN, AFCLAUDE_MACHINE_TOKEN=token), transport="mcp", stamp={"session": NEW})
         self.assertEqual((w.actor, w.session), (f"machine:{uid}", NEW))
 
-    def test_a_stamp_without_an_env_id(self):
-        self.assertEqual(self.resolve({}, transport="mcp", stamp={"session": TM}).actor, f"task-manager:{TM}")
+    def test_a_stamp_alone_never_elevates(self):
+        """No session id in the server's env: a stamp naming a task-manager / a driven session is ignored
+        (logged once), so a self-written stamp cannot make a caller one."""
+        for sid in (TM, DRV):
+            identity._noted.clear()
+            with self.assertLogs("afclaude.identity", "WARNING") as logs:
+                w = self.resolve({}, transport="mcp", stamp={"session": sid})
+            self.assertEqual((w.actor, w.autonomous, w.session, w.source), ("cli", False, None, "none"), sid)
+            self.assertIn("names none", logs.output[0])
+        with mock.patch.object(identity, "ENFORCE_CONFLICTS", True), self.assertRaises(identity.IdentityConflict):
+            self.resolve({}, transport="mcp", stamp={"session": TM})
+        # a session AFClaude does not know is taken (an interactive session's own id)
+        w = self.resolve({}, transport="mcp", stamp={"session": OWN})
+        self.assertEqual((w.actor, w.session, w.source), ("cli", OWN, "stamp"))
 
-    def test_a_malformed_stamp_is_refused(self):
-        for stamp in ("x", {"session": "a b"}, {"session": 5}, {"session": OWN, "agent": "a;b"}):
-            with self.assertRaises(identity.IdentityConflict):
+    def test_a_malformed_stamp_is_dropped_in_shadow_and_refused_when_enforced(self):
+        stamps = ("x", {"session": "a b"}, {"session": 5}, {"session": OWN, "agent": "a;b"})
+        for stamp in stamps:
+            identity._noted.clear()
+            with self.assertLogs("afclaude.identity", "WARNING"):
+                w = self.resolve(env(OWN), transport="mcp", stamp=stamp)
+            self.assertEqual((w.actor, w.session, w.source), ("cli", OWN, "env"), stamp)
+            with mock.patch.object(identity, "ENFORCE_CONFLICTS", True), self.assertRaises(identity.IdentityConflict):
                 self.resolve(env(OWN), transport="mcp", stamp=stamp)
 
     def test_an_old_id_of_a_driven_chain_resolves_to_its_newest(self):
@@ -289,12 +328,17 @@ class Cli(Base):
         self.assertEqual(self.audit_of("task.add"),
                          [("cli", None), (f"task-manager:{TM}", TM), (f"agent:{TM}:a1", TM)])
 
-    def test_a_conflicting_claim_is_an_error_the_caller_sees(self):
+    def test_a_conflicting_claim_is_logged_in_shadow_and_an_error_when_enforced(self):
         with mock.patch.dict(os.environ, {"AFCLAUDE_AGENT_ID": "a b", "CLAUDECODE": "1",
                                           "CLAUDE_CODE_SESSION_ID": TM}):
             tasks._WHO = None
+            with self.assertLogs("afclaude.identity", "WARNING") as logs:     # shadow: the call goes on, as its session
+                self.assertEqual(tasks.main(["--db", self.db, "add", "x", "--project", "P"]), 0)
+            self.assertIn("not an agent id", logs.output[0])
+            self.assertEqual(self.audit_of("task.add"), [(f"task-manager:{TM}", TM)])
+            tasks._WHO = None
             err = io.StringIO()
-            with contextlib.redirect_stderr(err):
+            with mock.patch.object(identity, "ENFORCE_CONFLICTS", True), contextlib.redirect_stderr(err):
                 self.assertEqual(tasks.main(["--db", self.db, "add", "x"]), 1)
             self.assertIn("not an agent id", err.getvalue())
 
@@ -323,9 +367,20 @@ class Hook(unittest.TestCase):
         pay = {"session_id": OWN, "tool_input": {"title": "t", "_afc": {"session": TM}}}
         self.assertEqual(self.call("mcp", pay)[1]["hookSpecificOutput"]["updatedInput"]["_afc"], {"session": OWN})
 
+    def test_a_model_written_stamp_never_reaches_the_server(self):
+        """Every path that stamps nothing still strips `_afc` from the arguments."""
+        forged = {"title": "t", "_afc": {"session": TM}}
+        for pay in ({"tool_input": dict(forged)},                                    # no session id
+                    {"session_id": "a b", "tool_input": dict(forged)},               # an odd session id
+                    {"session_id": OWN, "agent_id": "a;b", "tool_input": dict(forged)}):   # an odd agent id
+            rc, out, _ = self.call("mcp", pay)
+            self.assertEqual((rc, out["hookSpecificOutput"]["updatedInput"]), (0, {"title": "t"}), pay)
+        self.assertEqual(self.call("mcp", {"session_id": OWN, "tool_input": {"title": "t"}})[1]["hookSpecificOutput"]
+                         ["updatedInput"], {"title": "t", "_afc": {"session": OWN}})
+
     def test_the_bash_export_only_in_a_subagent_and_only_for_our_clis(self):
         cmd = "cd /x && python3 tasks.py add t"
-        pay = {"session_id": OWN, "tool_input": {"command": cmd, "description": "d"}}
+        pay = {"session_id": OWN, "permission_mode": "auto", "tool_input": {"command": cmd, "description": "d"}}
         self.assertEqual(self.call("bash", pay), (0, None, ""))                    # the main thread: not rewritten
         rc, out, _ = self.call("bash", dict(pay, agent_id="a1b2"))
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"],
@@ -334,6 +389,17 @@ class Hook(unittest.TestCase):
         self.assertEqual(self.call("bash", other), (0, None, ""))                  # not one of our CLIs
         odd = dict(pay, agent_id="a;rm -rf")
         self.assertEqual(self.call("bash", odd), (0, None, ""))                    # an odd id never reaches the shell
+        for mode in ("bypassPermissions",):
+            self.assertIsNotNone(self.call("bash", dict(pay, agent_id="a1b2", permission_mode=mode))[1], mode)
+        # in any other mode the rewritten command would miss a prefix allow rule (refused / asks): untouched
+        for mode in ("default", "dontAsk", "acceptEdits", "plan", None):
+            p = dict(pay, agent_id="a1b2", permission_mode=mode)
+            if mode is None:
+                del p["permission_mode"]
+            self.assertEqual(self.call("bash", p), (0, None, ""), mode)
+        for name in ("questions.py check", "dashboard/setup.py x", "runner_state.py y"):   # entry points of identity.py
+            rc, out, _ = self.call("bash", dict(pay, agent_id="a1b2", tool_input={"command": "python3 " + name}))
+            self.assertIsNotNone(out, name)
 
     def test_it_fails_open(self):
         rc, out, err = self.call("mcp", None, raw="not json")
@@ -354,6 +420,23 @@ class Hook(unittest.TestCase):
         got = {h["matcher"]: h["hooks"][0]["command"] for h in pre}
         self.assertIn("identity_hook.py\" mcp", got["mcp__afclaude__.*"])
         self.assertIn("identity_hook.py\" bash", got["Bash"])
+
+    def test_a_missing_hook_script_does_not_block_the_call(self):
+        """python3 exits 2 for a missing script, and exit 2 from a hook BLOCKS the tool call: the settings'
+        commands end in `|| exit 1` (a non-blocking error)."""
+        with open(os.path.join(HERE, ".claude", "settings.json")) as fh:
+            pre = json.load(fh)["hooks"]["PreToolUse"]
+        with tempfile.TemporaryDirectory() as empty:
+            for h in pre:
+                cmd = h["hooks"][0]["command"]
+                self.assertTrue(cmd.endswith("|| exit 1"), cmd)
+                p = subprocess.run(["sh", "-c", cmd], env=dict(os.environ, CLAUDE_PROJECT_DIR=empty),
+                                   input="{}", capture_output=True, text=True, timeout=30)
+                self.assertEqual(p.returncode, 1, cmd)
+                bare = subprocess.run(["sh", "-c", cmd.removesuffix(" || exit 1")],
+                                      env=dict(os.environ, CLAUDE_PROJECT_DIR=empty), input="{}",
+                                      capture_output=True, text=True, timeout=30)
+                self.assertEqual(bare.returncode, 2)                              # what the suffix prevents
 
 
 class Literals(unittest.TestCase):

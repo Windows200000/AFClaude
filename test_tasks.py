@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (before any AFClaude module: the session running the tests is not "the caller")
 import actions  # noqa: E402
 import store  # noqa: E402
 import tasks  # noqa: E402

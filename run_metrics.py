@@ -789,7 +789,7 @@ def watch_sample(session_id, now, st=None, path=None):
            "session_pct": s.get("percent"), "session_resets_at": iso(s.get("resets_at")),
            "weekly_pct": w.get("percent"), "weekly_resets_at": iso(w.get("resets_at")),
            "stale": usage_stale.is_stale(u.get("fetched_at"), now)}
-    telemetry.record("usage.run_reading", json.dumps(row), path or RUN_USAGE_FILE, actor=identity.KEEPALIVE)   # the DB
+    telemetry.record("usage.run_reading", json.dumps(row), path or RUN_USAGE_FILE, actor=identity.runner_actor("keepalive"))   # the DB
     return row
 
 

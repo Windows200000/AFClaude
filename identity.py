@@ -4,24 +4,32 @@
 one `Identity`: the actor string the audit log records, plus the session behind it. The entry points (the
 CLIs, the MCP server, hand-run runner paths) call it instead of writing a literal actor.
 
-  host owner    cli                      no Claude session in the env (a shell)
+  host owner    cli                      no Claude session in the env (a shell), or an interactive session of
+                                         this host that is none of the rows below and has no valid machine
+                                         token (D-330: until A7 registers the host's machine user; its session
+                                         id goes in audit_log.session)
   machine user  machine:<id>             a valid machine token and no AFClaude-driven session
   task-manager  task-manager:<session>   the session is a project's manager_session, no subagent id
   agent         agent:<session>[:<id>]   a driven session, a task-manager's subagent, CLAUDE_GUARD_DISABLE=1,
-                                         or nothing identifies the caller (the safe side)
+                                         or a subagent of an interactive session (recorded under its own id;
+                                         owner-equivalent for the old rule, which only reads `autonomous`)
   runner        runner:<component>       a runner process (no Claude session in its env)
 
 A2 only records who acts: nothing here refuses (the old owner_only rule stays in force, `autonomous` feeds it).
+The result is advisory, not authentication: every input is an env variable or a stamp the caller can set or
+unset (A3's enforcement must not treat it as proof; machine tokens are the credential).
 
 Session ids follow the /clear chain (D-328/D-329): a pre-/clear id of a known chain is never "unknown"
 (store.session_family), the id a session goes on as is the chain's newest (actions.current_session), and an
 id from outside the chain is never accepted: a hook stamp naming another session than the process's own
 chain is ignored when the process's session is AFClaude's, and refused (IdentityConflict) when it names
-another AFClaude-driven session.
+another AFClaude-driven session (while roles are in shadow mode, ENFORCE_CONFLICTS = False: one log line
+and the process's own id instead of the refusal).
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
@@ -43,6 +51,10 @@ TOKEN_FILE_VAR = "AFCLAUDE_MACHINE_FILE"
 DEFAULT_TOKEN_FILE = "~/.config/afclaude/machine.json"
 STAMP_KEY = "_afc"                        # the hook's field in an MCP call's arguments (plan §3.3)
 
+ENFORCE_CONFLICTS = False                 # A3's roles_enforce=on turns a conflicting claim into a refusal
+log = logging.getLogger("afclaude.identity")
+_noted: set[str] = set()                  # the messages already logged by this process
+
 CLI = "cli"
 KEEPALIVE = "runner:keepalive"
 DISPATCHER = "runner:dispatcher"
@@ -56,6 +68,21 @@ TokenState = Literal["none", "valid", "invalid", "insecure-file"]
 
 class IdentityConflict(ValueError):
     """The caller's claim contradicts the process's own chain (a stamp naming another AFClaude session)."""
+
+
+def note_once(msg: str) -> None:
+    """One log line per process and message (D-235: a failure is visible, without a line per call)."""
+    if msg not in _noted:
+        _noted.add(msg)
+        log.warning("%s", msg)
+
+
+def conflict(msg: str) -> None:
+    """A claim that contradicts the process's own chain: refused once roles are enforced, one log line
+    while they are in shadow (the caller goes on under the process's own id, A2 refuses nothing new)."""
+    if ENFORCE_CONFLICTS:
+        raise IdentityConflict(msg)
+    note_once(f"identity: {msg} (shadow mode: the process's own session id is used)")
 
 
 @dataclass(frozen=True)
@@ -125,9 +152,17 @@ def resolve_session(conn: sqlite3.Connection, env_sid: str | None,
     counts when it is in the env id's chain (-> the chain's newest id) or when neither side is a session
     AFClaude knows (an interactive session's /clear, which the store does not follow). A stamp outside the
     chain of a session AFClaude drives is ignored (the process's own chain wins); a stamp naming another
-    driven session than the process's own is refused."""
+    driven session than the process's own is a conflict (`conflict()`: refused, or logged in shadow mode and
+    the env id used). Without an env id a stamp naming a session AFClaude knows is ignored too: a stamp
+    alone never makes a caller a driven session or a task-manager."""
     if env_sid is None:
-        return (None, "none") if stamp_sid is None else (family(conn, stamp_sid)[-1], "stamp")
+        if stamp_sid is None:
+            return None, "none"
+        other = family(conn, stamp_sid)
+        if _known(conn, other):
+            conflict("the call's stamp names an AFClaude session but the server's env names none")
+            return None, "none"
+        return other[-1], "stamp"
     fam = family(conn, env_sid)
     if stamp_sid is None:
         return fam[-1], "env"
@@ -137,7 +172,8 @@ def resolve_session(conn: sqlite3.Connection, env_sid: str | None,
         return fam[-1], "env"
     other = family(conn, stamp_sid)
     if _known(conn, other):
-        raise IdentityConflict("the call names an AFClaude session outside the caller's own session chain")
+        conflict("the call names an AFClaude session outside the caller's own session chain")
+        return fam[-1], "env"
     return other[-1], "stamp"
 
 
@@ -154,6 +190,8 @@ def read_token(env: Mapping[str, str], path: str | None = None) -> tuple[Optiona
     except FileNotFoundError:
         return None, "none"
     if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+        note_once(f"identity: the machine token file {p} is not a regular file of this user with mode 0600: "
+                  "its token is not used")
         return None, "insecure-file"
     with open(p) as fh:
         doc = json.load(fh)
@@ -171,6 +209,8 @@ def machine_identity(conn: sqlite3.Connection, env: Mapping[str, str], via: str,
     if token is None:
         return None, state
     who = actions.authenticate_machine(conn, token, socket.gethostname(), transport, via=via)
+    if not who:
+        note_once("identity: the machine token is unknown, revoked or malformed: no machine identity")
     return who, ("valid" if who else "invalid")
 
 
@@ -197,10 +237,15 @@ def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
     e = os.environ if env is None else env
     if transport == "cli" and not in_claude_session(e):
         return Identity(resolve_plain(claim), "host" if claim is None else "runner")
-    stamp_sid, stamp_agent = clean_stamp(stamp)
+    try:
+        stamp_sid, stamp_agent = clean_stamp(stamp)
+    except IdentityConflict as err:
+        conflict(str(err))                # shadow mode: the malformed stamp is dropped
+        stamp_sid = stamp_agent = None
     agent_id = stamp_agent if transport == "mcp" else (e.get(AGENT_VAR) or None)
     if agent_id is not None and not ID_RE.match(agent_id):
-        raise IdentityConflict(f"{AGENT_VAR} is not an agent id")
+        conflict(f"{AGENT_VAR} is not an agent id")
+        agent_id = None
     sid, source = resolve_session(conn, e.get(SESSION_VAR) or None, stamp_sid if transport == "mcp" else None)
     fam = family(conn, sid) if sid else []
     manager = bool(fam) and _is_manager(conn, fam)
@@ -213,6 +258,8 @@ def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
     if who is not None:
         return Identity(f"machine:{who['user_id']}", "machine", sid, agent_id, int(who["user_id"]), False,
                         token, source)
+    if agent_id is None:                  # D-330: the host's own interactive session, owner until A7
+        return Identity(CLI, "host", sid, None, None, False, token, source)
     return Identity(_agent_actor(sid, agent_id), "agent", sid, agent_id, None, False, token, source)
 
 

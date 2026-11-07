@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/identity_hook.py\" mcp",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/identity_hook.py\" mcp || exit 1",
             "timeout": 10
           }
         ]
@@ -73,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/identity_hook.py\" bash",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/identity_hook.py\" bash || exit 1",
             "timeout": 10
           }
         ]
