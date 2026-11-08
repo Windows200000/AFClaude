@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402
 
 SOURCE_META = "questions_source"                       # 'db' once the import ran; absent or 'file' before
@@ -196,7 +197,7 @@ def plan_import(conn: sqlite3.Connection, path: str, project: Optional[str] = No
     if source_of(conn) == "db":
         raise ImportRefused("the questions are imported already (meta questions_source = db)")
     p = store.get_project(conn, project, nearest=False) if project is not None \
-        else store.get_project(conn, actions.HERE, nearest=False)
+        else store.get_project(conn, host.repo_dir(), nearest=False)
     if p is None:
         problems.append(f"no project {project!r}" if project is not None else
                         "this checkout is no project (`tasks.py project add`, or name one with --project)")

@@ -10,7 +10,7 @@
 #                              `docker exec` works (tests, the MCP server, manual runs)
 # (phase 3a S9 removed the rollback mode `legacy`, supercronic and its crontabs, and the alias `on`)
 set -eu
-D="${AFCLAUDE_DIR:?}"
+D="${AFCLAUDE_APP:-/app}"   # where the image keeps the code (the override is for the tests)
 # The mode first, before migrate: an unknown one (e.g. a stale `on` after phase 3a S9) must not exit,
 # or `restart: unless-stopped` loops silently through migrate/import-prompts. It alerts the owner out of
 # the DB (the fallback file + a push, as a failed migrate does) and idles, unhealthy (`runner.py health`).

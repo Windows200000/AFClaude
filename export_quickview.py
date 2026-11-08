@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (pure helpers only: cache read, budget evaluation, window)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402  (read-only: pending_user_input)
 import limit_ratio  # noqa: E402  (reads the per-sample ratio snapshot; never recomputes here)
 import afclaude_config  # noqa: E402  (local machine-specific values)
@@ -160,7 +161,7 @@ def db_doc(name):
     try:
         conn = store.connect()
         try:
-            p = store.get_project(conn, HERE)
+            p = store.get_project(conn, host.repo_dir())
             d = store.get_doc(conn, p["id"], name) if p is not None else None
             if d is None:
                 return None, None
@@ -430,7 +431,7 @@ def progress_log():
     try:
         conn = store.connect()
         try:
-            p = store.get_project(conn, HERE)
+            p = store.get_project(conn, host.repo_dir())
             d = store.get_doc(conn, p["id"], "progress") if p is not None else None
             rows = store.doc_entries(conn, d["id"], 4 * PROGRESS_ENTRIES) if d is not None else []
         finally:

@@ -91,6 +91,9 @@ class NeedsInput(unittest.TestCase):
         patcher = mock.patch.object(qv, "HERE", self.dir.name)
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(qv.host, "repo_dir", lambda: self.dir.name)   # the project of "this checkout"
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_the_question_file_is_not_read(self):
         with open(os.path.join(self.dir.name, "OPEN_QUESTIONS.md"), "w") as fh:
@@ -148,6 +151,9 @@ class DocsFromTheDb(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             old_here = qv.HERE
             qv.HERE = d
+            patcher = mock.patch.object(qv.host, "repo_dir", lambda: d)
+            patcher.start()
+            self.addCleanup(patcher.stop)
             try:
                 testenv.notes_project(d)
                 src = os.path.join(d, "PROGRESS.md")
@@ -178,6 +184,9 @@ class ProgressLog(unittest.TestCase):
         old = qv.HERE
         self.addCleanup(lambda: setattr(qv, "HERE", old))
         qv.HERE = self.tmp.name
+        patcher = mock.patch.object(qv.host, "repo_dir", lambda: self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         testenv.notes_project(self.tmp.name)
         self.project = "notes-" + os.path.basename(self.tmp.name)
 

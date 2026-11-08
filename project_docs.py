@@ -62,6 +62,7 @@ from typing import Any, Callable, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write)
 
@@ -97,8 +98,12 @@ def doc_files(repo: str, reviews_dir: Optional[str]) -> list[tuple[str, str]]:
     return out
 
 
-def resolve_project(conn: sqlite3.Connection, project: Optional[str], repo: str) -> store.Row:
-    """The named project, else the project of `repo` (its path or the closest parent's)."""
+def resolve_project(conn: sqlite3.Connection, project: Optional[str], repo: str,
+                    lookup: Optional[str] = None) -> store.Row:
+    """The named project, else the project of `repo` (its path or the closest parent's). `lookup`: the
+    host path to look the project up by, when the files are read from another place (this checkout's
+    docs are read at the code directory, but its project's path is the host repo)."""
+    repo = lookup or repo
     p = store.get_project(conn, project if project else os.path.abspath(repo))
     if p is None:
         raise store.NotFound(f"no project {project!r}" if project else
@@ -127,11 +132,12 @@ def import_all(db_path: Optional[str] = None, repo: Optional[str] = None, review
                force: bool = False) -> dict[str, Any]:
     """Import (sync) every doc file of the project; idempotent, never changes a file. After each
     import the DB's text is compared with the file (verified). -> a report per doc + totals."""
+    lookup = repo or host.repo_dir()
     repo = repo or HERE
     rdir = reviews_dir if reviews_dir is not None else reviews_dir_default(db_path)
     conn = store.connect(db_path)
     try:
-        p = resolve_project(conn, project, repo)
+        p = resolve_project(conn, project, repo, lookup)
         docs: dict[str, Any] = {}
         totals = {"files": 0, "imported": 0, "merged": 0, "in_sync": 0, "db_ahead": 0, "conflict": 0,
                   "missing": 0, "entries_added": 0, "unverified": 0}
@@ -176,7 +182,7 @@ def append_note(name: str, text: str, actor: str, repo: Optional[str] = None,
     takes the §7.8 path (actions.perform / store.report_db_error: recorded in
     data/ALERTS.fallback.md for a replay, escalated when it fails again), a project the DB
     doesn't know is recorded there too. -> stored."""
-    where = os.path.abspath(repo or HERE)
+    where = os.path.abspath(repo or host.repo_dir())
     try:
         conn = store.connect(db_path)
         try:
@@ -208,7 +214,7 @@ def doc_text(name: str, repo: Optional[str] = None, db_path: Optional[str] = Non
     None if there is no such project or doc. Database errors raise (the caller decides)."""
     conn = store.connect(db_path)
     try:
-        p = store.get_project(conn, os.path.abspath(repo or HERE))
+        p = store.get_project(conn, os.path.abspath(repo or host.repo_dir()))
         return _current(conn, p["id"], name) if p is not None else None
     finally:
         conn.close()
@@ -302,10 +308,11 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
     this file), render the DB's text, run the public-repo check on it, and write it if it differs
     (then mark it synced). check=True: report only, write nothing. -> report; ok=False if any file
     had a conflict or a public-check finding, or has no doc."""
+    lookup = repo or host.repo_dir()
     repo = repo or HERE
     conn = store.connect(db_path)
     try:
-        p = resolve_project(conn, project, repo)
+        p = resolve_project(conn, project, repo, lookup)
         files: dict[str, Any] = {}
         ok = True
         for name, fname in FILES:

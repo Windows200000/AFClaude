@@ -389,15 +389,16 @@ class Notes(Env):
     def test_notify_and_keepalive_notes(self):
         import notify
         import keepalive as ka
-        saved = (notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE)
+        saved = (notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE, pd.host.repo_dir)
         notify.push = lambda text: "test push"
         pd.HERE, store.DB_PATH = self.repo, self.db
+        pd.host.repo_dir = lambda: self.repo     # the project of "this checkout" is found by the host path
         ka.PROGRESS_FILE = os.path.join(self.repo, "PROGRESS.md")
         try:
             self.assertEqual(notify.notify("disk full", "details"), "test push")
             ka.progress_note("window-start: not resumed")
         finally:
-            notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE = saved
+            notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE, pd.host.repo_dir = saved
         self.assertRegex(self.render("alerts"), r"^- \*\*\d{4}-\d\d-\d\d \d\d:\d\d\*\* disk full\n  details\n  _\(push: test push\)_\n$")
         prog = self.render("progress")
         self.assertIn("[ALERT] disk full (details in the alerts doc)\n", prog)
