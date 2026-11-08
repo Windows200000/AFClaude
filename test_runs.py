@@ -59,12 +59,13 @@ class Summary(Runs):
         self.assertEqual(s["write_count"], 3)
         self.assertEqual([w["action"] for w in s["writes"]["tasks"]], ["task.start", "task.finish"])
         self.assertEqual([w["action"] for w in s["writes"]["alerts"]], ["doc.append"])
-        self.assertEqual([(p["id"], p["status"]) for p in s["pending"]], [(pid, "proposed")])
-        self.assertEqual(s["pending"][0]["payload"], {"task_id": self.task, "title": "other"})
+        # a separate session's proposal reached the task-manager as an inbox notice (A5): named, not pending
+        self.assertEqual((s["pending"], [(p["id"], p["status"]) for p in s["noticed"]]), ([], [(pid, "proposed")]))
+        self.assertEqual(store.get_proposal(self.conn, pid)["payload"], {"task_id": self.task, "title": "other"})
         self.assertEqual((s["shadow"], s["end_reason"], s["run"]), ([], "session ended", run["id"]))
         self.assertEqual(store.get_proposal(self.conn, pid)["run_id"], run["id"])
         self.assertEqual(self.run_of(run["id"])["summary"], s)
-        self.assertIn(f"pending P-{pid}", proposals.summary_text(s))
+        self.assertIn(f"sent as a notice P-{pid}", proposals.summary_text(s))
 
     def test_a_write_after_the_close_or_before_the_open_is_not_in_it(self):
         before = self.hook("run.open", session=self.ag, kind="session")
@@ -91,7 +92,7 @@ class Summary(Runs):
         self.assertEqual(store.get_proposal(self.conn, e.exception.proposal_id)["run_id"], run["id"])
         self.as_agent("doc.append", project=self.A, name="alerts", text="the main agent's\n")   # not the subagent's
         s = self.hook("run.close", session=self.ag, agent_id="sub1", reason="SubagentStop")["summary"]
-        self.assertEqual((s["write_count"], len(s["pending"])), (0, 1))
+        self.assertEqual((s["write_count"], len(s["pending"]), len(s["noticed"])), (0, 0, 1))
 
 
 class RunRows(Runs):

@@ -4422,6 +4422,18 @@ def add_proposal_notice(conn: sqlite3.Connection, session_id: str, text: object,
     return m
 
 
+def proposal_notices(conn: sqlite3.Connection, proposal_ids: Sequence[int]) -> set[int]:
+    """Which of these proposals have an inbox notice (add_proposal_notice; its text starts "P-<id> by ")."""
+    if not proposal_ids:
+        return set()
+    ids = sorted({int(i) for i in proposal_ids})
+    rows = conn.execute("SELECT text FROM inbox_messages WHERE origin=? AND ("
+                        + " OR ".join("text LIKE ?" for _ in ids) + ")",
+                        (PROPOSAL_ORIGIN, *(f"P-{i} by %" for i in ids))).fetchall()
+    found = {int(str(r["text"]).split(" ", 1)[0][2:]) for r in rows}
+    return found & set(ids)
+
+
 def list_inbox(conn: sqlite3.Connection, status: str | Iterable[str] | None = None, session_id: str | None = None,
                limit: int = 50) -> list[Row]:
     """Newest first."""

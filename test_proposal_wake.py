@@ -10,7 +10,8 @@ D-186). Temp DBs only; no session, tmux or signal is touched (keepalive's send a
   deliver   a run of the task-manager going: the notice is typed in through the inbox's own send path
   continue  a start's continue names the project's postponed proposals (part 1's insert, wired in
             keepalive._fire_start); none: no line; a DB failure aborts the start (D-235)
-  together  a separate session's subagent run is not delivered again through part 1's run notice; a notice
+  together  a separate session's subagent run is delivered with its direct writes, its proposals named by id
+            only (the inbox notices had them); a notice
             whose proposal was reviewed meanwhile carries only its marker (named once, by the postponed insert)
   wake      no run going: one proposal_review request (no window or budget gate, the preflight applies), the
             notice held until the wake's start takes it along; a second proposal while it is open adds no
@@ -21,6 +22,7 @@ D-186). Temp DBs only; no session, tmux or signal is touched (keepalive's send a
 """
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -35,6 +37,7 @@ import failstop  # noqa: E402
 import inbox  # noqa: E402
 import inbox_worker  # noqa: E402
 import keepalive as ka  # noqa: E402
+import proposals  # noqa: E402
 import run_now  # noqa: E402
 import runner  # noqa: E402
 import store  # noqa: E402
@@ -306,21 +309,52 @@ class PostponedInStarts(tc.Env):
 
 
 class Together(test_proposals.Proposals):
-    def test_a_separate_sessions_subagent_run_is_not_delivered_again(self):
+    def separate_run(self, direct):
+        """A subagent run of the driven session AG: one proposal (a notice for the task-manager), and with
+        `direct` a direct write (a hand-off) too. -> (run, proposal id)."""
         self.go_on()
         sub = f"agent:{self.sess['AG']}:s1"
         run = actions.perform(self.conn, "run.open", {"session": self.sess["AG"], "agent_id": "s1", "project": self.A},
                               actor="runner:hook", via="runner")
-        with mock.patch.object(runner, "wake"), self.assertRaises(actions.Proposed):
+        with mock.patch.object(runner, "wake"), self.assertRaises(actions.Proposed) as cm:
             actions.perform(self.conn, "task.edit", {"task_id": self.task, "title": "x"}, actor=sub, via="mcp",
                             autonomous=True)
+        if direct:
+            actions.perform(self.conn, "handoff.write", {"session_id": self.sess["AG"], "project": self.A,
+                                                         "body": {"summary": "next: step 2", "working_notes": ["tests: none"]}}, actor=sub, via="mcp", autonomous=True)
         actions.perform(self.conn, "run.close", {"session": self.sess["AG"], "agent_id": "s1", "reason": "SubagentStop"},
                         actor="runner:hook", via="runner")
-        self.assertIsNotNone(store.get_agent_run(self.conn, run["id"])["delivered_at"])   # closed as delivered
-        import delivery
-        self.assertEqual(delivery.notice_for_session(self.conn, self.sess["A"]), "")      # the inbox notice has it
+        return store.get_agent_run(self.conn, run["id"]), cm.exception.proposal_id
+
+    def test_a_separate_sessions_run_summary_names_its_noticed_proposals_by_id_only(self):
+        run, pid = self.separate_run(direct=True)
+        self.assertIsNone(run["delivered_at"])                                            # delivered as usual
+        self.assertEqual(run["summary"]["pending"], [])
+        self.assertEqual([p["id"] for p in run["summary"]["noticed"]], [pid])
+        note = delivery_notice(self.conn, self.sess["A"])
+        self.assertIn(f"proposals P-{pid}: sent as notices", note)
+        self.assertIn("1 write(s)", note)                                                 # the direct write stays
+        self.assertNotIn("pending", note)
+        text = proposals.delivery_text(run["summary"])
+        self.assertIn("handoff.write", text)
+        self.assertNotIn("title='x'", text)                                               # the notice had it
         self.assertEqual(len([m for m in store.list_inbox(self.conn, limit=50)
                               if m["origin"] == store.PROPOSAL_ORIGIN]), 1)
+
+    def test_a_separate_run_with_only_noticed_proposals_has_nothing_new_to_deliver(self):
+        run, _ = self.separate_run(direct=False)
+        self.assertIsNotNone(run["delivered_at"])
+        self.assertEqual(delivery_notice(self.conn, self.sess["A"]), "")
+
+    def test_a_failing_notice_lookup_fails_the_close(self):
+        self.go_on()
+        actions.perform(self.conn, "run.open", {"session": self.sess["AG"], "agent_id": "s1", "project": self.A},
+                        actor="runner:hook", via="runner")
+        with mock.patch.object(store, "proposal_notices", side_effect=sqlite3.OperationalError("db gone")), \
+                self.assertRaises(store.DBUnavailable):
+            actions.perform(self.conn, "run.close", {"session": self.sess["AG"], "agent_id": "s1",
+                                                     "reason": "SubagentStop"}, actor="runner:hook", via="runner")
+        self.assertIsNotNone(store.open_run(self.conn, self.sess["AG"], "s1"))           # still open, not closed
 
     def test_the_task_managers_own_subagent_run_is_still_delivered(self):
         self.go_on()
