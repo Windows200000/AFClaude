@@ -1123,6 +1123,9 @@ COLUMNS = {
     # the old rule (status 'approved', reviewer 'shadow'), the row is the record the run summary lists
     # A4 part 2: alerted_at = when the proposal_alert tick told the owner it waited past proposal_alert_hours
     "agent_proposals": [("shadow", "INTEGER NOT NULL DEFAULT 0"), ("alerted_at", "TEXT")],
+    # phase 5a A5 part 1: when a closed run's summary reached its task-manager (the PostToolUse hook, a result's
+    # notice or the UserPromptSubmit hook); set at close for a run with nothing to report. NULL = not delivered
+    "agent_runs": [("delivered_at", "TEXT")],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
     # D-227: base_sha256 vs the current prompt_defaults.sha256, refreshed by prompt.defaults_sync
@@ -3358,13 +3361,58 @@ def start_agent_run(conn: sqlite3.Connection, project_id: int | None, session: s
     return row
 
 
-def end_agent_run(conn: sqlite3.Connection, run_id: int, reason: str, summary: object, ended_at: str) -> Row:
-    """Close a run: end time, why, and its summary (proposals.summary)."""
-    conn.execute("UPDATE agent_runs SET ended_at=?, end_reason=?, summary=? WHERE id=?",
-                 (ended_at, reason, json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str), run_id))
+def end_agent_run(conn: sqlite3.Connection, run_id: int, reason: str, summary: object, ended_at: str,
+                  delivered: bool = False) -> Row:
+    """Close a run: end time, why, and its summary (proposals.summary). `delivered`: there is nothing in it to
+    deliver (A5), so it counts as delivered at once."""
+    conn.execute("UPDATE agent_runs SET ended_at=?, end_reason=?, summary=?, delivered_at=? WHERE id=?",
+                 (ended_at, reason, json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
+                  ended_at if delivered else None, run_id))
     row = get_agent_run(conn, run_id)
     assert row is not None
     return row
+
+
+def any_undelivered_run(conn: sqlite3.Connection) -> bool:
+    """The cheap test (one LIMIT 1 query): is any closed subagent run waiting to be delivered?"""
+    return conn.execute("SELECT 1 FROM agent_runs WHERE delivered_at IS NULL AND ended_at IS NOT NULL "
+                        "AND kind='subagent' LIMIT 1").fetchone() is not None
+
+
+def undelivered_runs(conn: sqlite3.Connection, project_id: int) -> list[Row]:
+    """The project's closed subagent runs whose summary was not delivered yet, oldest first."""
+    rows = conn.execute("SELECT * FROM agent_runs WHERE project_id=? AND delivered_at IS NULL AND ended_at IS NOT NULL "
+                        "AND kind='subagent' ORDER BY id", (project_id,))
+    return [_run_dict(r) for r in rows]
+
+
+def mark_runs_delivered(conn: sqlite3.Connection, ids: Sequence[int]) -> list[int]:
+    """Claim these runs as delivered: -> the ids this call changed (a run another caller delivered first is not
+    among them, so a summary is shown once however many paths race for it)."""
+    claimed = []
+    for i in ids:
+        if conn.execute("UPDATE agent_runs SET delivered_at=? WHERE id=? AND delivered_at IS NULL "
+                        "AND ended_at IS NOT NULL", (now_iso(), i)).rowcount:
+            claimed.append(i)
+    return claimed
+
+
+def subagent_run(conn: sqlite3.Connection, session: str, agent_id: str) -> Row | None:
+    """The newest run of this subagent under the session's /clear chain, or None."""
+    fam = tuple(session_family(conn, session))
+    marks = ",".join("?" * len(fam))
+    r = conn.execute(f"SELECT * FROM agent_runs WHERE agent_id=? AND session_id IN ({marks}) ORDER BY id DESC LIMIT 1",
+                     (agent_id, *fam)).fetchone()
+    return _run_dict(r) if r else None
+
+
+def manager_project(conn: sqlite3.Connection, session: str) -> int | None:
+    """The project this session (or a session of its /clear chain) is the task-manager of, else None."""
+    fam = tuple(session_family(conn, session))
+    marks = ",".join("?" * len(fam))
+    r = conn.execute(f"SELECT id FROM projects WHERE manager_session IN ({marks}) ORDER BY id LIMIT 1",
+                     fam).fetchone()
+    return None if r is None else int(r["id"])
 
 
 def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:

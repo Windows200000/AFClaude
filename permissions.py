@@ -457,6 +457,7 @@ MATRIX: dict[str, Perm] = {
     # --- the task-manager's review of agents' proposals (§3.7; owners, managers and editors from 7a, D-190)
     "run.open": INTERNAL,
     "run.close": INTERNAL,
+    "run.deliver": INTERNAL,
     "proposal.alert": INTERNAL,
     "task.forward": _proj("task", agent="refuse"),
     "proposal.review": Perm(scope="proposal", human="editor", task_manager="own_project"),

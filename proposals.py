@@ -119,3 +119,59 @@ def alert_text(rows: Sequence[Mapping[str, Any]], hours: float) -> tuple[str, st
     body = "\n".join(f"P-{r['id']} ({r['status']}, since {r['created_at']}, {r['actor']}): {r['summary']}"
                      for r in rows)
     return subject, body + "\nThe project's task-manager decides them: tasks.py proposals / tasks.py review."
+
+
+# ---- delivery to the task-manager (A5, §3.8, D-188, D-225): short forms, nothing for an empty run
+
+DELIVERY_LINES = 10      # writes named in a delivered summary; the rest is a pointer to `tasks.py runs --show`
+POSTPONED_LINES = 5      # postponed proposals named in the continue prompt
+
+
+def nothing_to_deliver(s: Mapping[str, Any]) -> bool:
+    """An empty run: no write and no pending proposal (an applied shadow proposal is a write too)."""
+    return not s["write_count"] and not s["pending"]
+
+
+def delivery_text(s: Mapping[str, Any]) -> str:
+    """A closed run for the task-manager's context, in the compact form of the PostToolUse hook: pending proposals
+    first (they need a decision), then the direct writes, no code (D-243: `change_manifest.py` on the branch) and
+    no report (the parent has the subagent's own). At most DELIVERY_LINES writes."""
+    head = f"Run {s['run']}: {s['write_count']} write(s)"
+    if s["pending"]:
+        head += f", {len(s['pending'])} proposal(s) pending (tasks.py review ID approve|edit|reject|postpone)"
+    lines = [head]
+    lines += [f"  P-{p['id']} ({p['status']}): {p['summary']}" for p in s["pending"]]
+    writes = [r["line"] for rows in s["writes"].values() for r in rows]
+    lines += [f"  {w}" for w in writes[:DELIVERY_LINES]]
+    if len(writes) > DELIVERY_LINES:
+        lines.append(f"  ... {len(writes) - DELIVERY_LINES} more: tasks.py runs --show {s['run']}")
+    return "\n".join(lines)
+
+
+def pending_text(n: int) -> str:
+    """What the PostToolUse hook says at a background launch (the new run has nothing yet): the proposals already
+    waiting from earlier runs; empty for none."""
+    return f"{n} proposal(s) pending from earlier runs: tasks.py proposals" if n else ""
+
+
+def notice_text(summaries: Sequence[Mapping[str, Any]]) -> str:
+    """One line for finished runs not delivered yet (a background subagent, or a foreground one whose hook did not
+    fire): how many, the writes, the proposals pending and where to look. Empty for no summary."""
+    if not summaries:
+        return ""
+    ids = ", ".join(str(s["run"]) for s in summaries)
+    writes = sum(int(s["write_count"]) for s in summaries)
+    pending = sum(len(s["pending"]) for s in summaries)
+    line = f"AFClaude: {len(summaries)} subagent run(s) finished ({ids}): {writes} write(s)"
+    if pending:
+        line += f", {pending} proposal(s) pending, run `tasks.py proposals` then `tasks.py review`"
+    return line + f"; details: `tasks.py runs --show {summaries[0]['run']}`"
+
+
+def postponed_text(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The postponed proposals named for the continue prompt (the oldest POSTPONED_LINES), empty for none."""
+    if not rows:
+        return ""
+    named = "; ".join(f"P-{r['id']} {r['summary']}" for r in rows[:POSTPONED_LINES])
+    more = len(rows) - POSTPONED_LINES
+    return f"{len(rows)} postponed ({named}" + (f"; and {more} more" if more > 0 else "") + ")"

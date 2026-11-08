@@ -1258,6 +1258,7 @@ class EveryAction(Base):
             # phase 5a A4 part 2: a subagent's run, the owner alert's mark, an agent-blocked task forwarded
             ("run.open", {"session": SID, "agent_id": "sub1", "project": "P"}),
             ("run.close", {"session": SID, "agent_id": "sub1", "reason": "SubagentStop"}),
+            ("run.deliver", {"ids": [3]}),
             ("proposal.alert", {"ids": [1]}),
             ("task.forward", {"task_id": 3}),
         ]
@@ -1276,6 +1277,9 @@ class EveryAction(Base):
             if name == "proposal.review":       # what perform stores for an agent's write when roles are enforced
                 store.add_proposal(self.conn, 1, None, "agent:" + SID, "task.edit", {"task_id": 3, "title": "x"},
                                    None, "task.edit #3: title='x'")
+                self.conn.commit()
+            if name == "run.deliver":           # a closed run with something to report (an empty one is delivered at close)
+                self.conn.execute("UPDATE agent_runs SET delivered_at=NULL WHERE kind='subagent'")
                 self.conn.commit()
             if name == "task.forward":          # a task an agent blocked (perform sets blocked_by when enforced)
                 store.block_task(self.conn, 3, "q?", blocked_by="agent:" + SID)
