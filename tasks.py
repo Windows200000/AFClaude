@@ -430,6 +430,17 @@ def run_proposals(conn, args):
 HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
+def hook_is_inert(args) -> bool:
+    """True when `run-hook` runs somewhere that isn't the live install: this checkout is not the live repo (its .git
+    is no directory: a linked worktree, or a copy) and the DB it would use doesn't exist. The harness fires the hook
+    of the checked-in settings in every session started inside such a checkout; there it is a no-op (the checkout
+    has no runs to record). The live checkout with a missing DB is NOT inert: a lost or mis-mounted data
+    volume stays an error and an alert (D-235, D-171/D-187), as does a DB that exists but can't be opened. A
+    non-live checkout pointed at an existing DB (--db / AFCLAUDE_DB) records as usual."""
+    live = os.path.isdir(os.path.join(HERE, ".git"))
+    return not live and not os.path.isfile(args.db or store.DB_PATH)
+
+
 def run_hook(conn, args):
     """Phase 5a A4 (§3.3, §3.8): the SubagentStart / SubagentStop hook. The payload (stdin JSON) names the parent
     session, the subagent and its type. A subagent with no type (a helper agent of an interactive session) and a
@@ -442,13 +453,15 @@ def run_hook(conn, args):
         payload = json.loads(sys.stdin.read())
     except ValueError as e:
         raise ValueError(f"the hook payload is not JSON: {e}") from e
+    if not isinstance(payload, dict):
+        raise ValueError("the hook payload needs session_id and agent_id")
     session, agent = payload.get("session_id"), payload.get("agent_id")
-    if not isinstance(payload, dict) or not isinstance(session, str) or not HOOK_ID_RE.match(session) \
+    if not isinstance(session, str) or not HOOK_ID_RE.match(session) \
             or not isinstance(agent, str) or not HOOK_ID_RE.match(agent):
         raise ValueError("the hook payload needs session_id and agent_id")
     if not payload.get("agent_type"):
         return print("no run: a subagent with no type is a helper agent")
-    if args.hook == "start" and store.run_project(conn, session) is None:
+    if store.run_project(conn, session) is None:       # start and stop alike: no write transaction for a stranger
         return print(f"no run: {session} is neither a task-manager nor a driven session of a project")
     params = {"session": session, "agent_id": agent}
     if args.hook == "stop":
@@ -1633,6 +1646,8 @@ def db_error(e, args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.cmd == "run-hook" and hook_is_inert(args):
+        return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
     try:
         conn = store.connect(args.db)
     except (store.DBError, sqlite3.Error) as e:

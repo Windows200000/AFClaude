@@ -329,6 +329,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     request_id  TEXT                    -- the idempotency key, if any
 );
 CREATE INDEX IF NOT EXISTS audit_log_target ON audit_log(target_type, target_id, id);
+CREATE INDEX IF NOT EXISTS audit_log_actor ON audit_log(actor, ts);
 CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
