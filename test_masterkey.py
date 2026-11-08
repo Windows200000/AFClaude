@@ -96,6 +96,7 @@ class MasterKeyTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.keyfile()))
         with open(self.keyfile(), "w") as fh:
             fh.write(base64.urlsafe_b64encode(raw).decode() + "\n")   # same key, other alphabet
+        os.chmod(self.keyfile(), 0o600)
         self.assertEqual(masterkey.ensure(self.data, self.conn), kid)
 
     def test_empty_env_counts_as_unset(self):
@@ -119,6 +120,7 @@ class MasterKeyTest(unittest.TestCase):
         os.environ.pop(masterkey.ENV)
         with open(self.keyfile(), "w") as fh:
             fh.write("")   # a torn file
+        os.chmod(self.keyfile(), 0o600)
         with self.assertRaises(masterkey.MasterKeyError):
             masterkey.ensure(self.data, self.conn)
         with open(self.keyfile()) as fh:
@@ -140,14 +142,84 @@ class MasterKeyTest(unittest.TestCase):
         with self.assertRaises(masterkey.MasterKeyError):   # and nothing was loaded
             masterkey.seal("x", b"y")
 
-    def test_lost_key_file_with_a_check_is_an_error(self):
-        masterkey.ensure(self.data, self.conn)
+    def test_lost_key_file_with_a_check_makes_no_new_key(self):
+        kid = masterkey.ensure(self.data, self.conn)
+        saved = self.read_key()
         os.remove(self.keyfile())
         masterkey.forget()
-        # the file is gone: ensure would generate a new key, which the check refuses (and the new file
-        # it made stays, but the process holds no key)
-        with self.assertRaisesRegex(masterkey.MasterKeyError, "does not match"):
+        with self.assertRaisesRegex(masterkey.MasterKeyError, "no key is available"):
             masterkey.ensure(self.data, self.conn)
+        self.assertFalse(os.path.exists(self.keyfile()))   # nothing was generated
+        with self.assertRaises(masterkey.MasterKeyError):
+            masterkey.seal("x", b"y")
+        with open(self.keyfile(), "w") as fh:   # the key put back (here: as a file) starts fine
+            fh.write(saved)
+        os.chmod(self.keyfile(), 0o600)
+        self.assertEqual(masterkey.ensure(self.data, self.conn), kid)
+
+    def test_lost_key_file_then_env_key_put_back(self):
+        raw = os.urandom(32)
+        os.environ[masterkey.ENV] = b64(raw)
+        kid = masterkey.ensure(self.data, self.conn)
+        os.environ.pop(masterkey.ENV)
+        masterkey.forget()
+        with self.assertRaises(masterkey.MasterKeyError):
+            masterkey.ensure(self.data, self.conn)
+        self.assertFalse(os.path.exists(self.keyfile()))
+        os.environ[masterkey.ENV] = b64(raw)   # no "differ" error: no wrong file was left behind
+        self.assertEqual(masterkey.ensure(self.data, self.conn), kid)
+
+    def test_key_file_accessible_to_others_is_refused(self):
+        masterkey.ensure(self.data, self.conn)
+        masterkey.forget()
+        for mode in (0o640, 0o604, 0o666):
+            os.chmod(self.keyfile(), mode)
+            with self.assertRaisesRegex(masterkey.MasterKeyError, "accessible to others"):
+                masterkey.ensure(self.data, self.conn)
+
+    def test_unusable_files_raise_masterkey_error(self):
+        os.mkdir(self.keyfile())   # a directory where the key file should be
+        with self.assertRaises(masterkey.MasterKeyError):
+            masterkey.ensure(self.data, self.conn)
+        os.rmdir(self.keyfile())
+        lock = os.path.join(self.data, masterkey.LOCK_FILE)
+        os.remove(lock)
+        os.mkdir(lock)   # and as the lock file
+        with self.assertRaisesRegex(masterkey.MasterKeyError, "lock file"):
+            masterkey.ensure(self.data, self.conn)
+        os.rmdir(lock)
+        with mock.patch.object(masterkey.os, "fsync", side_effect=OSError("disk")):
+            with self.assertRaisesRegex(masterkey.MasterKeyError, "cannot write"):
+                masterkey.ensure(self.data, self.conn)
+
+    def test_context_binds_a_blob_to_its_record(self):
+        masterkey.ensure(self.data, self.conn)
+        blob = masterkey.seal("totp", b"seed", "user:7")
+        self.assertEqual(masterkey.open("totp", blob, "user:7"), b"seed")
+        for ctx in ("user:8", None, ""):   # swapped to another record, or no context
+            with self.assertRaises(masterkey.MasterKeyError, msg=repr(ctx)):
+                masterkey.open("totp", blob, ctx)
+        plain = masterkey.seal("totp", b"seed")   # sealed without one: opens only without one
+        self.assertEqual(masterkey.open("totp", plain), b"seed")
+        with self.assertRaises(masterkey.MasterKeyError):
+            masterkey.open("totp", plain, "user:7")
+        empty = masterkey.seal("totp", b"seed", "")
+        self.assertEqual(masterkey.open("totp", empty, ""), b"seed")
+        with self.assertRaises(masterkey.MasterKeyError):
+            masterkey.open("totp", empty)
+
+    def test_blob_base64_is_strict_and_purpose_fullmatch(self):
+        masterkey.ensure(self.data, self.conn)
+        blob = masterkey.seal("totp", b"secret")
+        v, kid, nonce, ct = blob.split(":")
+        for bad in (f"{v}:{kid}:{nonce}:{ct}\n", f"{v}:{kid}:{nonce}:{ct[:4]}!{ct[4:]}",
+                    f"{v}:{kid}:{nonce}:{ct.rstrip('=')}", f"{v}:{kid}:{nonce}\n:{ct}", f"{v}:{kid}:{nonce}:{ct}é"):
+            with self.assertRaises(masterkey.MasterKeyError, msg=repr(bad)):
+                masterkey.open("totp", bad)
+        for bad in ("totp\n", "", "Totp", "a b"):
+            with self.assertRaises(masterkey.MasterKeyError, msg=repr(bad)):
+                masterkey.seal(bad, b"x")
+        self.assertEqual(masterkey.open("totp", blob), b"secret")
 
     def test_seal_open_round_trip(self):
         masterkey.ensure(self.data, self.conn)
