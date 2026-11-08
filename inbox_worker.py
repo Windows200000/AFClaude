@@ -436,7 +436,8 @@ def hold(conn: Any, m: dict[str, Any], why: str, now: datetime) -> str:
 # automation: a failed wake pauses, D-235/D-282, so a wake loop can't follow): the notice is held. One wake per
 # notice: once woken (WAKE_HOLD) it waits for that request; refused or failed, it is held until the next start
 # takes it along, like any held message (inbox.hold_deadline: after that an error). A notice that arrives while
-# another one's request is open shares that request.
+# another one's request is open shares that request; if that request's start had built its message before the
+# notice came (the request is older than the notice) and its run is over, the notice gets one wake of its own.
 
 def woken(m: dict[str, Any]) -> bool:
     """A wake was made for this proposal notice (its hold says so)."""
@@ -462,9 +463,12 @@ def proposal_wake(conn: Any, m: dict[str, Any], sid: str, now: datetime) -> str 
         last = store.latest_request(conn, "proposal_review", str(pid))
         if last is None:
             raise RuntimeError(f"the notice says it was woken, but project #{pid} has no proposal_review request")
-        why = json.loads(last["result"]).get("reason") if last["result"] else None
-        return hold(conn, m, f"{WAKE_HOLD} #{last['id']}, which was {last['status']}"
-                             + (f" ({why})" if why else "") + ": the next start takes it along", now)
+        if not (last["status"] == "started" and str(last["ts"]) < str(m["created_at"])):
+            why = json.loads(last["result"]).get("reason") if last["result"] else None
+            return hold(conn, m, f"{WAKE_HOLD} #{last['id']}, which was {last['status']}"
+                                 + (f" ({why})" if why else "") + ": the next start takes it along", now)
+        # it shared a request made before it, whose start had built its message already (the notice was not in
+        # it) and whose run is over: one new wake. The new request is younger than the notice: no second one.
     if req is None:
         req = _act(conn, "request.wake", project=pid)
         log(f"inbox #{m['id']}: the task-manager {sid[:8]} is not in a run: woken by request #{req['id']} (D-194)")

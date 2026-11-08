@@ -6,6 +6,9 @@ task-manager's own session. Temp DBs only.
             empty run nothing; a stranger, a subagent's own call and a payload without agentId deliver nothing
   notice    the one-line notice on a tasks.py / MCP result and in the UserPromptSubmit hook, once, to the
             project's task-manager only
+  bounded   the hooks' DB waits are short and tried once (a lock: a short note, the reminder still goes); the
+            claim comes after the text; a driven session's own run is noticed too; runs closed before the
+            delivered_at column are backfilled as delivered
   postponed the continue prompt's insert, only when a proposal is postponed
 
     python3 -m unittest test_delivery
@@ -15,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import sys
 import unittest
 from unittest import mock
@@ -245,6 +249,108 @@ class Notice(Delivery):
         with mock.patch.dict(os.environ, {"AFCLAUDE_DB": self.db}), \
                 mock.patch.object(store, "connect", side_effect=AssertionError("connected")):
             self.assertEqual(reminder.run_notice(self.tm_session), "")
+
+
+class Bounded(Delivery):
+    """The A5 review round: short DB waits in the hooks, the claim last, driven sessions' own runs, the backfill."""
+
+    def test_the_prompt_hook_fast_path_is_this_sessions_project_only(self):
+        self.finished_run()
+        with mock.patch.dict(os.environ, {"AFCLAUDE_DB": self.db}), \
+                mock.patch.object(store, "connect", side_effect=AssertionError("connected")):
+            self.assertEqual(reminder.run_notice(self.sess["B"]), "")                    # another task-manager
+            self.assertEqual(reminder.run_notice(self.sess["AG"]), "")                   # a driven session
+
+    def test_the_prompt_hook_waits_briefly_and_once(self):
+        self.finished_run()
+        seen = []
+
+        def notice(conn, session):
+            seen.append(store._QUICK.get())
+            return ""
+        with mock.patch.dict(os.environ, {"AFCLAUDE_DB": self.db}), \
+                mock.patch.object(delivery, "notice_for_session", side_effect=notice):
+            reminder.run_notice(self.tm_session)
+        self.assertEqual(seen, [reminder.BUSY])
+        calls = []
+
+        def locked():
+            calls.append(1)
+            raise sqlite3.OperationalError("database is locked")
+        with store.quick_waits(1.0), mock.patch.object(store, "_sleep") as sleep, \
+                self.assertRaises(store.DBUnavailable):
+            store.retrying(locked)
+        self.assertEqual((len(calls), sleep.call_count), (1, 0))                         # one try, no backoff
+
+    def test_a_locked_db_is_a_short_note_and_the_reminder_still_goes(self):
+        payload = json.dumps({"session_id": self.tm_session, "cwd": HERE})
+        out = io.StringIO()
+        locked = store.DBUnavailable("database locked: database is locked", "locked", "transient")
+        with mock.patch.dict(os.environ, {"AFCLAUDE_DB": self.db, "CLAUDE_GUARD_DISABLE": "1"}), \
+                mock.patch.object(reminder, "run_notice", side_effect=locked), \
+                mock.patch.object(sys, "stdin", io.StringIO(payload)), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(reminder.main(), 0)
+        ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(ctx, reminder.REMINDER + "\n" + reminder.BUSY_NOTE)
+
+    def test_the_post_tool_use_hook_waits_briefly_and_once(self):
+        seen = []
+
+        def hook(conn, payload):
+            seen.append(store._QUICK.get())
+            return "", "no delivery"
+        with mock.patch.object(delivery, "agent_hook", side_effect=hook), \
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": self.tm_session}))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(tasks.main(["--db", self.db, "run-hook", "deliver"]), 0)
+        self.assertEqual(seen, [tasks.HOOK_BUSY])
+        self.assertIsNone(store._QUICK.get())                                            # only inside
+
+    def test_a_text_that_cant_be_built_leaves_the_run_unclaimed(self):
+        run = self.finished_run()
+        with mock.patch.object(proposals, "notice_text", side_effect=RuntimeError("boom")), \
+                self.assertRaises(RuntimeError):
+            delivery.notice(self.conn, self.tm_id)
+        self.assertIsNone(self.delivered(run["id"]))
+        with mock.patch.object(proposals, "delivery_text", side_effect=RuntimeError("boom")), \
+                self.assertRaises(RuntimeError):
+            self.agent_hook(self.payload("sub1"))
+        self.assertIsNone(self.delivered(run["id"]))
+        self.assertIn(f"({run['id']})", delivery.notice(self.conn, self.tm_id))
+
+    def test_a_driven_sessions_own_run_reaches_the_task_manager(self):
+        run = self.hook("run.open", session=self.sess["AG"], kind="session")
+        self.as_agent("doc.append", project=self.A, name="alerts", text="the DB failed\n")
+        closed = self.hook("run.close", session=self.sess["AG"], reason="session ended")
+        self.assertIsNone(closed["delivered_at"])
+        line = delivery.notice(self.conn, self.tm_id)
+        self.assertIn(f"1 agent run(s) finished ({run['id']}): 1 write(s)", line)
+        self.assertEqual(delivery.notice(self.conn, self.tm_id), "")
+        empty = self.hook("run.open", session=self.sess["AG"], kind="session")
+        self.assertIsNotNone(self.hook("run.close", session=self.sess["AG"])["delivered_at"])    # nothing to say
+        self.assertIsNotNone(self.delivered(empty["id"]))
+
+    def test_runs_closed_before_delivery_existed_are_marked_delivered_once(self):
+        path = os.path.join(os.path.dirname(self.db), "old.db")
+        c = store.connect(path, create=True)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(agent_runs)") if r[1] != "delivered_at"]
+        c.execute("PRAGMA foreign_keys=OFF")
+        c.executescript(f"CREATE TABLE old AS SELECT {', '.join(cols)} FROM agent_runs; DROP TABLE agent_runs; "
+                        "ALTER TABLE old RENAME TO agent_runs;")
+        c.execute("INSERT INTO agent_runs(project_id, session_id, agent_id, kind, started_at, ended_at) "
+                  "VALUES (NULL, 's', 'a', 'subagent', '2026-11-01T00:00:00.000Z', '2026-11-01T01:00:00.000Z')")
+        c.execute("INSERT INTO agent_runs(project_id, session_id, agent_id, kind, started_at) "
+                  "VALUES (NULL, 's', 'b', 'subagent', '2026-11-01T00:00:00.000Z')")
+        c.commit()
+        c.close()
+        c = store.connect(path)                                          # adds the column, with the backfill
+        try:
+            rows = c.execute("SELECT agent_id, delivered_at FROM agent_runs ORDER BY id").fetchall()
+            self.assertEqual([tuple(r) for r in rows], [("a", "2026-11-01T01:00:00.000Z"), ("b", None)])
+            self.assertFalse(store.any_undelivered_run(c))
+        finally:
+            c.close()
 
 
 class Postponed(Delivery):

@@ -1676,6 +1676,17 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.cmd == "run-hook" and hook_is_inert(args):
         return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
+    if args.cmd == "run-hook" and args.hook == "deliver":
+        # the PostToolUse hook has 30 s: every DB wait is short and tried once (a lock is an error it shows)
+        with store.quick_waits(HOOK_BUSY):
+            return _main(args)
+    return _main(args)
+
+
+HOOK_BUSY = 2.0     # seconds a DB lock is waited for in `run-hook deliver` (store.quick_waits)
+
+
+def _main(args):
     try:
         conn = store.connect(args.db)
     except (store.DBError, sqlite3.Error) as e:

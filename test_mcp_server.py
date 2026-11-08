@@ -588,6 +588,9 @@ class Notices(Env):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "bbbbbbbb-0000-4000-8000-00000000000b"}):
             other = asyncio.run(ms.afclaude_list_tasks())
         self.assertNotIn("subagent run(s)", other)                      # not the project's task-manager
+        self.assertNotIn("subagent run(s)", asyncio.run(ms.afclaude_list_tasks()))   # unstamped: no notice
+        token = ms.STAMP.set({"session": CALLER})                       # the identity hook's stamp
+        self.addCleanup(ms.STAMP.reset, token)
         raw = asyncio.run(ms.afclaude_list_tasks())
         body, _, line = raw.rpartition("\n")
         json.loads(body)                                                # the tool's own result is untouched

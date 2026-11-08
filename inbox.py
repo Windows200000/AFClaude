@@ -69,6 +69,7 @@ BERLIN = ZoneInfo("Europe/Berlin")
 NOTE_ITEM_MAX = 1500        # characters of one noted message in a message into the session ...
 NOTES_MAX = 3000            # ... and of the whole list (the rest waits for the next message, D-225)
 HELD_MAX = 3000             # characters of the held "now" messages in a start's message (the rest: id only)
+NOTICE_MARKERS = 20         # proposal notices past HELD_MAX named by marker; the rest: a count (held_insert)
 MESSAGE_MAX_BYTES = 12000   # a message typed with tmux send-keys (its command limit is 16 KB)
 VIEW_MAX = 10               # messages on the dashboard (the current thread, D-178)
 RATE_MAX = 20               # messages per hour the endpoint takes (each costs a Haiku call)
@@ -218,23 +219,20 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
     message (inbox_held.md), oldest first, each with its marker and how to answer. All of them go
     (each one owes an answer): a text is cut at NOTE_ITEM_MAX, and past HELD_MAX characters only the
     marker and a pointer to `tasks.py inbox show` remain. Phase 5a A5: the waiting proposal notices
-    follow as their own sentence (proposal_held.md; a proposal_review wake's start brings them, D-194).
+    follow as their own sentence (proposal_held.md; a proposal_review wake's start brings them, D-194), in the
+    same HELD_MAX budget after the owner's messages: a text cut at NOTE_ITEM_MAX, past the budget only the
+    marker and P-number, past NOTICE_MARKERS of those one count with a pointer to `tasks.py proposals` (all of
+    them still go: the start's message never grows past MESSAGE_MAX_BYTES because of notices).
     -> (text, ids: mark them delivered once the message went out), or (None, [])."""
     items: list[str] = []
     ids: list[int] = []
-    notices: list[str] = []
+    held: list[store.Row] = []
     size = 0
     for m in reversed(store.list_inbox(conn, "pending", session_id, limit=200)):
         if m["verdict"] != "now":
             continue
         if m["origin"] == store.PROPOSAL_ORIGIN:
-            # reviewed meanwhile (`tasks.py proposals`): only its marker, so a postponed one is named once, in the
-            # continue's postponed insert (delivery.postponed_insert)
-            pid = proposals.notice_proposal(str(m["text"]))
-            prop = store.get_proposal(conn, pid) if pid is not None else None
-            notices.append(f"{marker(m['id'])} (P-{pid} is {prop['status']} already)" if prop and prop["status"] != "proposed"
-                           else f"{marker(m['id'])} ({_stamp(m, None)}): {one_line(m['text'])}")
-            ids.append(m["id"])
+            held.append(m)
             continue
         text = one_line(m["text"])
         if len(text) > NOTE_ITEM_MAX:
@@ -246,6 +244,30 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
         items.append(item)
         ids.append(m["id"])
         size += len(item)
+    notices: list[str] = []
+    short = 0
+    for m in held:
+        pid = proposals.notice_proposal(str(m["text"]))
+        prop = store.get_proposal(conn, pid) if pid is not None else None
+        ids.append(m["id"])
+        if prop and prop["status"] != "proposed":
+            # reviewed meanwhile (`tasks.py proposals`): only its marker, so a postponed one is named once, in the
+            # continue's postponed insert (delivery.postponed_insert)
+            item = f"{marker(m['id'])} (P-{pid} is {prop['status']} already)"
+        else:
+            text = one_line(m["text"])
+            if len(text) > NOTE_ITEM_MAX:
+                text = text[:NOTE_ITEM_MAX] + "... (cut; the full proposal: python3 tasks.py proposals)"
+            item = f"{marker(m['id'])} ({_stamp(m, None)}): {text}"
+        if size + len(item) > HELD_MAX:
+            short += 1
+            if short > NOTICE_MARKERS:
+                continue
+            item = f"{marker(m['id'])} (P-{pid}: python3 tasks.py proposals)"
+        notices.append(item)
+        size += len(item)
+    if short > NOTICE_MARKERS:
+        notices.append(f"and {short - NOTICE_MARKERS} more: python3 tasks.py proposals")
     parts = ([prompt("inbox_held").format(held=" ".join(items)).strip()] if items else []) + \
         ([prompt("proposal_held").format(notices=" ".join(notices)).strip()] if notices else [])
     return (" ".join(parts), ids) if parts else (None, [])

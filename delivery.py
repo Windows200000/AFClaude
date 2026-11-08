@@ -65,22 +65,31 @@ def agent_hook(conn: sqlite3.Connection, payload: object) -> tuple[str, str]:
         return "", f"no delivery: no run for subagent {agent}"
     if run["ended_at"] is None or run["summary"] is None:
         return "", f"no delivery: run {run['id']} is still open"
-    if run["delivered_at"] is not None or run["id"] not in _claim(conn, [run["id"]]):
+    if run["delivered_at"] is not None:
         return "", f"no delivery: run {run['id']} has nothing to deliver or was delivered"
-    return proposals.delivery_text(run["summary"]), ""
+    text = proposals.delivery_text(run["summary"])      # built before the claim: a claimed run is shown
+    if run["id"] not in _claim(conn, [run["id"]]):
+        return "", f"no delivery: run {run['id']} was delivered meanwhile"
+    return text, ""
 
 
 def notice_for_session(conn: sqlite3.Connection, session: str | None) -> str:
-    """The one-line notice for the finished runs of this task-manager's project that were not delivered, and
-    those runs marked delivered; "" for none (one cheap query when no run waits anywhere)."""
+    """The one-line notice for the finished runs of this task-manager's project that were not delivered (its
+    subagents' and its driven sessions' own), and those runs marked delivered, last; "" for none (one cheap
+    query when no run waits anywhere)."""
     if not session or not store.any_undelivered_run(conn):
         return ""
     pid = store.manager_project(conn, session)
     if pid is None:
         return ""
-    runs = store.undelivered_runs(conn, pid)
-    claimed = set(_claim(conn, [int(r["id"]) for r in runs])) if runs else set()
-    return proposals.notice_text([r["summary"] for r in runs if r["id"] in claimed and r["summary"] is not None])
+    runs = [r for r in store.undelivered_runs(conn, pid) if r["summary"] is not None]
+    if not runs:
+        return ""
+    text = proposals.notice_text([r["summary"] for r in runs])      # built before the claim, which comes last
+    claimed = set(_claim(conn, [int(r["id"]) for r in runs]))
+    if len(claimed) == len(runs):
+        return text
+    return proposals.notice_text([r["summary"] for r in runs if r["id"] in claimed])   # another path took some
 
 
 def notice(conn: sqlite3.Connection, who: identity.Identity) -> str:

@@ -278,7 +278,10 @@ def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> Too
 def run_notice() -> str:
     """Phase 5a A5 (§3.8): "\n" + the one-line notice of finished subagent runs not delivered yet, when the caller is
     the project's task-manager (each run is delivered once); "" for none (one query when no run waits). A failure
-    is the notice text itself, never swallowed (D-235), and does not fail the call that already ran."""
+    is the notice text itself, never swallowed (D-235), and does not fail the call that already ran. An unstamped
+    call (no identity hook: it could be a subagent's) gets none, so no subagent claims its task-manager's notice."""
+    if STAMP.get() is None:
+        return ""
     try:
         conn = db()
         try:

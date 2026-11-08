@@ -1333,7 +1333,7 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
         raise DBUnavailable(f"the database directory of {db} can't be created ({e})", "missing") from e
 
     def open_() -> sqlite3.Connection:
-        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT, factory=TimedConnection)
+        conn = sqlite3.connect(db, timeout=_QUICK.get() or BUSY_TIMEOUT, factory=TimedConnection)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -1394,6 +1394,10 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
             for name, decl in cols:
                 if name not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    if (table, name) == ("agent_runs", "delivered_at"):
+                        # phase 5a A5: the runs closed before delivery existed are not announced all at once
+                        # (they were reported by the A4 way); once, in the step that adds the column
+                        conn.execute("UPDATE agent_runs SET delivered_at=ended_at WHERE ended_at IS NOT NULL")
         for ddl in AFTER_COLUMNS + VERSION_TRIGGERS:
             conn.execute(ddl)
         if before is not None and before < 4 and get_meta(conn, "migrated_v4_at") is None:
@@ -3374,15 +3378,17 @@ def end_agent_run(conn: sqlite3.Connection, run_id: int, reason: str, summary: o
 
 
 def any_undelivered_run(conn: sqlite3.Connection) -> bool:
-    """The cheap test (one LIMIT 1 query): is any closed subagent run waiting to be delivered?"""
+    """The cheap test (one LIMIT 1 query): is any closed run (a subagent's or a driven session's own) waiting to
+    be delivered?"""
     return conn.execute("SELECT 1 FROM agent_runs WHERE delivered_at IS NULL AND ended_at IS NOT NULL "
-                        "AND kind='subagent' LIMIT 1").fetchone() is not None
+                        "LIMIT 1").fetchone() is not None
 
 
 def undelivered_runs(conn: sqlite3.Connection, project_id: int) -> list[Row]:
-    """The project's closed subagent runs whose summary was not delivered yet, oldest first."""
+    """The project's closed runs (subagents' and driven sessions' own) whose summary was not delivered yet, oldest
+    first."""
     rows = conn.execute("SELECT * FROM agent_runs WHERE project_id=? AND delivered_at IS NULL AND ended_at IS NOT NULL "
-                        "AND kind='subagent' ORDER BY id", (project_id,))
+                        "ORDER BY id", (project_id,))
     return [_run_dict(r) for r in rows]
 
 
@@ -5248,6 +5254,20 @@ def find_decision_entries(conn: sqlite3.Connection, terms: Sequence[str],
 # its origin (TimedConnection).
 BUSY_TIMEOUT = 5.0
 RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+# phase 5a A5: a hook with a short harness timeout (UserPromptSubmit 5 s, PostToolUse 30 s) must not be killed in
+# the middle of a delivery: inside quick_waits() a connect waits `busy` s for a lock and nothing is retried
+_QUICK: contextvars.ContextVar[float | None] = contextvars.ContextVar("afclaude_quick_waits", default=None)
+
+
+@contextmanager
+def quick_waits(busy: float) -> Iterator[None]:
+    """Connections opened inside wait at most `busy` seconds for a lock, and retrying() makes one try only: a
+    locked DB is a DBUnavailable within about `busy` s per statement instead of ~30 s (the caller shows it)."""
+    token = _QUICK.set(busy)
+    try:
+        yield
+    finally:
+        _QUICK.reset(token)
 MIN_FREE_BYTES = 4 * 1024 * 1024                         # less free space = disk full (health())
 MISSING_RECHECK_DELAY = 0.2   # health(): one re-check after this short wait before reporting
                               # kind "missing"/"unable to open" (owner D-171 addendum: escalate
@@ -5318,7 +5338,7 @@ def retrying(fn: Callable[[], _T], conn: sqlite3.Connection | None = None) -> _T
     persistent; a caller error raises at once (an IntegrityError as a ValueError); a
     persistent one is a DBError (DBUnavailable). Inside a caller's open transaction there
     is one try only (the caller's transaction is the unit to repeat). -> fn()'s result."""
-    tries = 1 if conn is not None and conn.in_transaction else len(RETRY_DELAYS) + 1
+    tries = 1 if (conn is not None and conn.in_transaction) or _QUICK.get() is not None else len(RETRY_DELAYS) + 1
     attempt, waited = 0, 0.0
     while True:
         try:

@@ -455,9 +455,10 @@ def _close_run(conn: sqlite3.Connection, run_id: int, reason: str) -> store.Row:
     noticed = store.proposal_notices(conn, [int(p["id"]) for p in props])
     summary = proposals.summary(dict(run, ended_at=until, end_reason=reason),
                                 store.audit_of_actors(conn, actors, run["started_at"], until), props, noticed)
-    # a subagent run with nothing to report is delivered at close (A5): no hook has anything to say about it
+    # a run with nothing to report (a subagent's or a driven session's own) is delivered at close (A5): no hook or
+    # notice has anything to say about it; the rest reaches the task-manager through the hook or the run notice
     return store.end_agent_run(conn, run_id, reason, summary, until,
-                               delivered=run["kind"] == "subagent" and proposals.nothing_to_deliver(summary))
+                               delivered=proposals.nothing_to_deliver(summary))
 
 
 @action("run.open", "agent_run")

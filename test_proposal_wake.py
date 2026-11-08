@@ -15,8 +15,9 @@ D-186). Temp DBs only; no session, tmux or signal is touched (keepalive's send a
             whose proposal was reviewed meanwhile carries only its marker (named once, by the postponed insert)
   wake      no run going: one proposal_review request (no window or budget gate, the preflight applies), the
             notice held until the wake's start takes it along; a second proposal while it is open adds no
-            request; a refused wake is not repeated for the same notice; paused: no wake; a failed wake alerts
-            and pauses (D-235/D-282)
+            request; a refused wake is not repeated for the same notice; a notice that shared a request whose
+            start had already been built gets one wake of its own; paused: no wake; a failed wake alerts and
+            pauses (D-235/D-282)
 
     python3 -m unittest test_proposal_wake
 """
@@ -206,6 +207,29 @@ class Wake(test_run_now.Base):
         self.process()
         self.assertEqual(len(self.wakes()), 2)
 
+    def test_a_notice_that_shared_a_started_request_gets_one_wake_of_its_own(self):
+        first = self.notice(1)
+        self.process()
+        (req,) = self.wakes()
+        late = self.notice(2)                                        # shares the open request ...
+        self.process()
+        self.assertTrue(inbox_worker.woken(self.msg(late)))
+        self.conn.execute("UPDATE action_requests SET ts=? WHERE id=?", ("2000-01-01T00:00:00.000Z", req["id"]))
+        self.conn.execute("UPDATE inbox_messages SET created_at=? WHERE id=?", ("1999-01-01T00:00:00.000Z", first))
+        self.conn.commit()                                           # ... and came after it was made
+        row, _ = self.decide(req)                                    # its start (a fake) took neither along
+        self.assertEqual(row["status"], "started")
+        self.process()                                               # no run going: one new wake, for `late`
+        self.assertEqual(len(self.wakes()), 2)
+        self.assertIn(f"#{req['id']}, which was started", self.msg(first)["hold"])
+        new = self.wakes()[0]
+        self.assertEqual(new["status"], "open")
+        self.assertIn(f"#{new['id']}", self.msg(late)["hold"])
+        self.decide(new)
+        for _ in range(3):                                           # the loop guard: no third
+            self.process()
+        self.assertEqual(len(self.wakes()), 2)
+
     def test_paused_automation_wakes_no_one(self):
         actions.perform(self.conn, "automation.set_project", {"project": "alpha", "paused": True, "reason": "x"},
                         actor="cli", via="cli")
@@ -366,6 +390,18 @@ class Together(test_proposals.Proposals):
         actions.perform(self.conn, "run.close", {"session": self.sess["A"], "agent_id": "s2", "reason": "SubagentStop"},
                         actor="runner:hook", via="runner")
         self.assertIn("pending", delivery_notice(self.conn, self.sess["A"]))
+
+    def test_notices_stay_inside_the_held_budget(self):
+        long = "y" * (inbox.NOTE_ITEM_MAX + 500)
+        for n in range(1, 151):
+            store.add_proposal_notice(self.conn, self.sess["A"], f"P-{1000 + n} by agent:x (task.edit): {long}", "agent:x")
+        self.conn.commit()
+        text, ids = inbox.held_insert(self.conn, self.sess["A"])
+        self.assertEqual(len(ids), 150)                                                  # all of them go
+        self.assertLess(len(text.encode()), inbox.MESSAGE_MAX_BYTES // 2)
+        self.assertIn("... (cut; the full proposal: python3 tasks.py proposals)", text)
+        self.assertIn("(P-1003: python3 tasks.py proposals)", text)                      # past the budget: marker
+        self.assertIn(f"and {150 - 1 - inbox.NOTICE_MARKERS} more: python3 tasks.py proposals", text)
 
     def test_a_reviewed_notice_carries_only_its_marker(self):
         self.go_on()

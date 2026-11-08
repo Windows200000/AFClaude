@@ -184,14 +184,15 @@ def pending_text(n: int) -> str:
 
 
 def notice_text(summaries: Sequence[Mapping[str, Any]]) -> str:
-    """One line for finished runs not delivered yet (a background subagent, or a foreground one whose hook did not
-    fire): how many, the writes, the proposals pending and where to look. Empty for no summary."""
+    """One line for finished runs not delivered yet (a background subagent, a foreground one whose hook did not
+    fire, or a driven session's own run): how many, the writes, the proposals pending and where to look. Empty for no summary."""
     if not summaries:
         return ""
     ids = ", ".join(str(s["run"]) for s in summaries)
     writes = sum(int(s["write_count"]) for s in summaries)
     pending = sum(len(s["pending"]) for s in summaries)
-    line = f"AFClaude: {len(summaries)} subagent run(s) finished ({ids}): {writes} write(s)"
+    what = "subagent" if all(s.get("kind") == "subagent" for s in summaries) else "agent"
+    line = f"AFClaude: {len(summaries)} {what} run(s) finished ({ids}): {writes} write(s)"
     if pending:
         line += f", {pending} proposal(s) pending, run `tasks.py proposals` then `tasks.py review`"
     sent = [p for s in summaries for p in s.get("noticed", [])]
