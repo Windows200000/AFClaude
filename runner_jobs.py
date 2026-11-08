@@ -135,8 +135,9 @@ FUNCTIONS["status_snapshot"] = ("status_snapshot.log", status_snapshot_tick)
 
 def proposal_alert_tick() -> str:
     """Phase 5a A4 (§3.7, D-188): tell the owner once about the open agent proposals older than
-    proposal_alert_hours, then mark them (proposal.alert) so the next tick stays quiet. A failing alert fails
-    the run (D-235: alert + pause); the proposals stay unmarked, so the next tick tries again."""
+    proposal_alert_hours, marking them (proposal.alert) first so the next tick stays quiet: at most once, even
+    if the tick dies between the two steps. A failing alert fails the run (D-235: alert + pause) and the error
+    names the proposals, which stay marked: the failure is the owner's notice, not a retry."""
     import actions
     import notify
     import store
@@ -146,8 +147,11 @@ def proposal_alert_tick() -> str:
         if found is None:
             return "no open proposal is overdue"
         subject, body, ids = found
-        notify.notify(subject, body)
         actions.perform(conn, "proposal.alert", {"ids": ids}, actor="runner:proposal_alert", via="runner")
+        try:
+            notify.notify(subject, body)
+        except Exception as e:
+            raise RuntimeError(f"the alert for proposals {ids} was marked sent but notify failed: {e}") from e
     finally:
         conn.close()
     line = f"alerted: {subject}"

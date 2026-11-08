@@ -131,6 +131,42 @@ class RunRows(Runs):
         with mock.patch.dict(os.environ, {"AFCLAUDE_AGENT_ID": "x"}), self.assertRaisesRegex(ValueError, "harness"):
             self.run_hook("start", p)
 
+    def test_the_hook_takes_a_non_dict_payload_as_an_error_and_a_strangers_stop_writes_nothing(self):
+        for bad in ([], "x", 3, None):
+            with self.assertRaisesRegex(ValueError, "needs session_id"):
+                self.run_hook("stop", bad)
+        stranger = {"session_id": "eeeeeeee-0000-4000-8000-000000000001", "agent_id": "s1", "agent_type": "w"}
+        with mock.patch.object(actions, "perform", side_effect=AssertionError("no transaction")):
+            self.assertIn("neither", self.run_hook("stop", stranger))
+
+    def test_the_hook_is_inert_in_a_non_live_checkout_without_a_db_only(self):
+        missing = os.path.join(testenv.DIR, "no", "afclaude.db")
+        args = tasks.parser().parse_args(["--db", missing, "run-hook", "start"])
+        with mock.patch.object(os.path, "isdir", return_value=False):            # a worktree: .git is a file
+            self.assertTrue(tasks.hook_is_inert(args))
+            args.db = self.db
+            self.assertFalse(tasks.hook_is_inert(args))                          # a DB it can reach: records as usual
+        args.db = missing
+        with mock.patch.object(os.path, "isdir", return_value=True):             # the live repo: D-235 stays
+            self.assertFalse(tasks.hook_is_inert(args))
+        out = io.StringIO()                                                      # main(): exit 0, no DB touched
+        with mock.patch.object(os.path, "isdir", return_value=False), \
+                mock.patch.object(store, "connect", side_effect=AssertionError("connected")), \
+                mock.patch.object(store, "report_db_error", side_effect=AssertionError("alerted")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(tasks.main(["--db", missing, "run-hook", "start"]), 0)
+        self.assertIn("not the live install", out.getvalue())
+        with mock.patch.object(os.path, "isdir", return_value=True), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(tasks.main(["--db", missing, "run-hook", "start"]), 1)   # live + missing: error
+
+    def test_the_audit_log_has_an_actor_ts_index(self):
+        rows = self.conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='audit_log'")
+        self.assertIn("audit_log_actor", {r[0] for r in rows})
+        plan = " ".join(r[3] for r in self.conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM audit_log WHERE actor IN (?) AND ts>=? AND ts<=? ORDER BY id",
+            ("a", "x", "y")))
+        self.assertIn("audit_log_actor", plan)
+
     def test_driven_set_opens_and_closes_a_driven_agent_sessions_run(self):
         new = "bbbbbbbb-0000-4000-8000-0000000000b1"
         kw = {"actor": "keepalive", "via": "runner"}
@@ -180,6 +216,19 @@ class Alert(Runs):
         self.conn.commit()
         self.assertEqual(self.rows(open_only=True)[0]["alerted_at"] is not None, True)
         self.assertEqual(self.title(), "t")                      # the alert changes nothing: no timeout applies
+
+    def test_a_failed_notify_leaves_the_proposals_marked_and_raises(self):
+        self.go_on()
+        now = store._utcnow()
+        self.propose("task.edit", task_id=self.task, title="late")
+        real_connect = store.connect
+        with mock.patch("notify.notify", side_effect=OSError("mail down")) as notify, \
+                mock.patch.object(store, "connect", side_effect=lambda *a, **k: real_connect(self.db)), \
+                mock.patch.object(store, "_utcnow", return_value=now + timedelta(hours=25)):
+            with self.assertRaisesRegex(RuntimeError, "marked sent but notify failed: mail down"):
+                runner_jobs.proposal_alert_tick()          # D-235: the run fails, the owner is told
+            self.assertEqual(runner_jobs.proposal_alert_tick(), "no open proposal is overdue")   # at most once
+        self.assertEqual(notify.call_count, 1)
 
     def test_a_decided_or_shadow_proposal_never_alerts_and_the_hours_are_a_setting(self):
         self.go_on()
