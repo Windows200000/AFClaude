@@ -64,7 +64,7 @@ CLASSES = [
       "decision.import decision.seed decision.activate_own").split(), DEPLOY),
     (("request.start request.finish driven.set session.cleared handoff.consume inbox.triage inbox.triage_hold "
       "inbox.hold inbox.deliver inbox.include inbox.fail typed.record log.prune runner.prune run.open run.close "
-      "run.deliver proposal.alert request.wake").split(), INTERNAL),
+      "run.deliver proposal.alert request.wake masterkey.check").split(), INTERNAL),
     (("task.add task.ask task.edit task.priority task.move task.cancel task.reopen task.block task.finish "
       "task.update question.close project.priority prompt_var.set prompt_var.reset notice.post doc.set "
       "decision.add decision.edit decision.delete decision.expire decision.keywords decision.topics "

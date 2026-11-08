@@ -421,6 +421,7 @@ MATRIX: dict[str, Perm] = {
                                    runner=True, note="D-283: a task-manager clears its own project's pause"),
     "install.stamp": DEPLOY,
     "install.restored": DEPLOY,
+    "masterkey.check": INTERNAL,
     "prompt.set": OWNER,
     "prompt.reset": OWNER,
     "prompt.defaults_sync": DEPLOY,
