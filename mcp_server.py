@@ -283,6 +283,8 @@ def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
             return await fn(*a, **kw)
         except ToolError:
             raise
+        except actions.Proposed as e:                    # an agent's write stored as a proposal: an answer, not an error
+            return out(e.to_json())
         except LookupError as e:                         # store.NotFound
             raise ToolError(e.args[0] if e.args else str(e)) from None
         except store.InvalidTransition as e:
@@ -812,6 +814,56 @@ async def afclaude_notice(action: Literal["post", "list"], title: Optional[str] 
     finally:
         conn.close()
 
+
+
+def proposal_brief(p: Mapping[str, Any], names: Mapping[int, str], full: bool = False) -> dict[str, Any]:
+    d = compact({"id": p["id"], "project": names.get(p["project_id"]), "agent": p["actor"], "action": p["action"],
+                 "summary": p["summary"], "status": p["status"], "proposed": bt(p["created_at"]),
+                 "decided": bt(p["decided_at"]), "reviewer": p["reviewer"], "note": p["note"],
+                 "version_seen": p["version_seen"], "run": p["run_id"],
+                 "shadow": "applied under roles_enforce=shadow" if p["shadow"] else None})
+    if full:
+        d["payload"] = p["payload"]
+    return d
+
+
+@tool("Agents' proposals for the task-manager. status: open (default), all, or one status; id: one with its full "
+      "payload. Decide with afclaude_review.", read_only=True)
+async def afclaude_proposals(status: str = "open", project: Optional[str] = None, id: Optional[int] = None,
+                             ctx: Optional[Context] = None) -> str:
+    project = await resolve_dir_arg(ctx, project)
+    conn = db()
+    try:
+        names = {int(p["id"]): str(p["name"]) for p in store.list_projects(conn)}
+        if id is not None:
+            p = store.get_proposal(conn, id)
+            if p is None or not visible(conn, "proposals", [p], lambda r: r["project_id"]):
+                raise store.NotFound(f"no proposal P-{id}")
+            return out(proposal_brief(p, names, full=True))
+        pr = None
+        if project:
+            proj = store.get_project(conn, project)
+            if proj is None:
+                raise store.NotFound(f"no project {project!r}")
+            pr = int(proj["id"])
+        rows = store.list_proposals(conn, project_id=pr, status=None if status in ("open", "all") else status,
+                                    open_only=status == "open", include_shadow=status != "open")
+        rows = visible(conn, "proposals", rows, lambda r: r["project_id"])
+    finally:
+        conn.close()
+    return out({"proposals": [proposal_brief(r, names) for r in rows]})
+
+
+@tool("Review an agent's proposal (id from afclaude_proposals): approve (applies it as you), edit (with `payload`: "
+      "fields laid over the proposed ones), reject (needs a note) or postpone.")
+async def afclaude_review(id: int, decision: Literal["approve", "edit", "reject", "postpone"],
+                          note: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> str:
+    conn = db()
+    try:
+        r = act(conn, "proposal.review", proposal_id=id, decision=decision, note=note, payload=payload)
+    finally:
+        conn.close()
+    return out(r)
 
 
 @tool("Run now, no window/budget gate: work (target: project), continue (target: stalled session) or review "

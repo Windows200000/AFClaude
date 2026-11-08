@@ -244,6 +244,10 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # paused (the pause is part of it); 30 s off the minute, between the other ticks' offsets
     Job("status_snapshot", 2, every=MIN, offset=30 * SEC, what="status snapshot (status_snapshot.py): the DB rows "
                                                                "the dashboard reads"),
+    # phase 5a A4 (§3.7): one alert for the agent proposals the task-manager left undecided past
+    # proposal_alert_hours (each proposal once); reads the DB, runs while paused (it is only a reminder)
+    Job("proposal_alert", 2, every=30 * MIN, offset=20 * SEC,
+        what="proposal alert (proposal_alert_hours): open agent proposals nobody reviewed"),
     Job("usage_review", 30, every=60 * MIN, paused="handler", what="usage-model review"),
     Job("window_start", 90, window_start=True, paused="handler", on_interrupt="fail", session=True,
         what="window-start"),
@@ -302,6 +306,7 @@ SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve")
 # their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
                                          "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
+                                         "proposal_alert",
                                          "inbox", "inbox_verify", "request"}
                                         | WATCHER_PASSES)
 

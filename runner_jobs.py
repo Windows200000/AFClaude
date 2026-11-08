@@ -133,6 +133,30 @@ def status_snapshot_tick() -> str:
 
 FUNCTIONS["status_snapshot"] = ("status_snapshot.log", status_snapshot_tick)
 
+def proposal_alert_tick() -> str:
+    """Phase 5a A4 (§3.7, D-188): tell the owner once about the open agent proposals older than
+    proposal_alert_hours, then mark them (proposal.alert) so the next tick stays quiet. A failing alert fails
+    the run (D-235: alert + pause); the proposals stay unmarked, so the next tick tries again."""
+    import actions
+    import notify
+    import store
+    conn = store.connect()
+    try:
+        found = actions.overdue_proposal_alert(conn, store._utcnow())
+        if found is None:
+            return "no open proposal is overdue"
+        subject, body, ids = found
+        notify.notify(subject, body)
+        actions.perform(conn, "proposal.alert", {"ids": ids}, actor="runner:proposal_alert", via="runner")
+    finally:
+        conn.close()
+    line = f"alerted: {subject}"
+    print(line)
+    return line
+
+
+FUNCTIONS["proposal_alert"] = ("proposal_alert.log", proposal_alert_tick)
+
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
 # legacy mode's worker thread (gone since S9).
 INBOX_LOG = "inbox_worker.log"

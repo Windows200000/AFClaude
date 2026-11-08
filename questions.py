@@ -262,4 +262,5 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import actions
+    sys.exit(actions.proposed_exit(main))

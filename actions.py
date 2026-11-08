@@ -81,9 +81,12 @@ import owner_words  # noqa: E402  (the owner's stored messages as evidence, phas
 import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
 import roles  # noqa: E402  (pure: grants, effective roles, the last owner, credentials, phase 5a A1)
 import permissions  # noqa: E402  (the permission matrix and its check, phase 5a A3)
+import proposals  # noqa: E402  (pure: a proposal's summary line and vocabulary, phase 5a A4)
 import failstop  # noqa: E402  (stdlib only at import: the owner alert + pause for a failing roles diagnostic, D-235)
 
-VIAS = ("cli", "mcp", "dashboard", "runner")
+# `proposal` (A4): a write applied from an approved proposal; only proposal.review sets it, no caller passes it.
+VIAS = ("cli", "mcp", "dashboard", "runner", "proposal")
+CALLER_VIAS = VIAS[:-1]
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
 # setup: an anonymous browser spending a one-time setup/reset code (phase 6a W7) -- the one write a
 # pre-session makes, before there is a user_id to act as.
@@ -113,6 +116,32 @@ class Conflict(store.InvalidTransition):
 
 class Forbidden(ValueError):
     """The actor may not do this (an autonomous session writing rules/decisions via MCP)."""
+
+
+class Proposed(Exception):
+    """An agent's write was stored as a proposal instead of applied (`roles_enforce=on`, phase 5a A4): nothing
+    was changed. Raised by perform() once its transaction has committed; the entry points (MCP tools, tasks.py)
+    show `message` as the call's answer, not as a failure. Not a ValueError: the error handlers don't take it."""
+    MARK = "__proposed__"
+
+    def __init__(self, proposal_id: int, project_id: int | None, summary: str) -> None:
+        self.proposal_id, self.project_id, self.summary = proposal_id, project_id, summary
+        self.message = proposals.proposed_message(proposal_id, summary)
+        super().__init__(self.message)
+
+    def stored(self) -> dict[str, Any]:
+        """What the idempotency table keeps, so a replayed key raises the same Proposed."""
+        return {self.MARK: self.proposal_id, "project_id": self.project_id, "summary": self.summary}
+
+    def to_json(self) -> dict[str, Any]:
+        return {"proposed": True, "proposal_id": self.proposal_id, "project_id": self.project_id,
+                "status": "proposed", "message": self.message}
+
+    @classmethod
+    def replay(cls, stored: Any) -> "Proposed | None":
+        if isinstance(stored, dict) and cls.MARK in stored:
+            return cls(int(stored[cls.MARK]), stored.get("project_id"), str(stored.get("summary", "")))
+        return None
 
 
 class Ctx:
@@ -166,6 +195,16 @@ class Result:
         return bool(b == a)
 
 
+def proposed_exit(main: Callable[[], int]) -> int:
+    """The entry-point wrapper of the CLIs an agent can write through (tasks.py has its own): an agent's write that
+    was stored as a proposal (`Proposed`, nothing changed) is the call's answer, exit 0, not a traceback."""
+    try:
+        return main()
+    except Proposed as e:
+        print(e.message)
+        return 0
+
+
 ActionFn = Callable[..., Result]          # fn(conn, ctx, **params) -> Result
 _A = TypeVar("_A", bound=ActionFn)
 _T = TypeVar("_T")
@@ -207,8 +246,8 @@ def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | Non
     spec = ACTIONS.get(name)
     if spec is None:
         raise ValueError(f"unknown action {name!r}")
-    if via not in VIAS:
-        raise ValueError(f"via must be one of {'|'.join(VIAS)}, got {via!r}")
+    if via not in CALLER_VIAS:
+        raise ValueError(f"via must be one of {'|'.join(CALLER_VIAS)}, got {via!r}")
     if not isinstance(actor, str) or not ACTOR_RE.match(actor):
         raise ValueError(f"bad actor {actor!r}")
     if key is not None and (not isinstance(key, str) or not KEY_RE.match(key)):
@@ -254,6 +293,8 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
         raise
     if seen:
         _shadow_after(conn, ctx, name, seen[0], "the action itself WAS carried out and is committed", None)
+    if isinstance(res, Proposed):
+        raise res
     return res
 
 
@@ -267,7 +308,8 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                 if (hit["action"], hit["actor"], hit["request_sha256"]) != (name, actor, request_sha):
                     raise Conflict(f"idempotency key {key!r} was already used for a different request "
                                    f"({hit['action']} by {hit['actor']})")
-                return json.loads(hit["response"]) if hit["response"] is not None else None
+                stored = json.loads(hit["response"]) if hit["response"] is not None else None
+                return Proposed.replay(stored) or stored
         try:
             verdict = permissions.check(conn, name, params, actor, ctx.actor_session)
         except (sqlite3.Error, store.DBError):
@@ -282,9 +324,16 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                     raise
                 mode = "on"           # the owner's repair of the setting itself: only what the matrix allows
             if mode == "on":
-                raise Forbidden(f"{name} refused for {actor}: {verdict.reason}" if verdict.outcome == "refused"
-                                else f"{name} by {actor} would be a proposal for the task-manager ({verdict.reason}); "
-                                     "proposals are not built yet (phase 5a A4)")
+                if verdict.outcome != "proposal":
+                    raise Forbidden(f"{name} refused for {actor}: {verdict.reason}")
+                # An agent's write in its project: stored for the task-manager, nothing applied (D-182, D-188).
+                # Proposals need no one to be up: the row waits (nothing is applied by timeout, §3.7).
+                prop = _capture_proposal(conn, ctx, name, params, verdict, shadow=False)
+                done = Proposed(prop["id"], prop["project_id"], prop["summary"])
+                if key is not None:
+                    store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
+                    store.put_idempotency(conn, key, actor, name, request_sha, done.stored())
+                return done
             seen.append(verdict)
         if spec.owner_only and is_autonomous(conn, ctx):
             raise Forbidden(f"{name} is not allowed for an autonomous AFClaude session via {via} "
@@ -294,10 +343,178 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
             before, after = res.audit_pair()
             store.add_audit(conn, actor, via, name, spec.target_type, res.target_id, before, after, key,
                             session=ctx.actor_session)
+            if seen and seen[0].outcome == "proposal":
+                # Shadow: the write went on under the old rule; the record is what the run summary lists (§3.8).
+                _capture_proposal(conn, ctx, name, params, seen[0], shadow=True)
         if key is not None:
             store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
             store.put_idempotency(conn, key, actor, name, request_sha, res.result)
         return res.result
+
+
+# ---------------------------------------------------------------- proposals (phase 5a A4)
+
+def _capture_proposal(conn: sqlite3.Connection, ctx: Ctx, name: str, params: Mapping[str, Any],
+                      verdict: permissions.Verdict, *, shadow: bool) -> store.Row:
+    """Store an agent's write as a proposal (inside perform's transaction). `shadow`: the write was applied
+    already under the old rule (roles_enforce=shadow): the row is recorded as decided, reviewer `shadow`, so it
+    never waits for a review; the run summary lists it as applied. Linked to the agent's open run, if any."""
+    pid = next((p for p in verdict.projects if p is not None), None)
+    sid = ctx.actor_session
+    agent_id = ctx.actor.split(":", 2)[2] if ctx.actor.startswith("agent:") and ctx.actor.count(":") == 2 else None
+    return store.add_proposal(conn, pid, store.open_run(conn, sid, agent_id), ctx.actor, name, dict(params),
+                              proposals.version_seen(params), proposals.summarize(name, params), shadow=shadow)
+
+
+@action("proposal.review", "proposal")
+def proposal_review(conn: sqlite3.Connection, ctx: Ctx, proposal_id: Any, decision: Any, note: Any = None,
+                    payload: Any = None) -> Result:
+    """The task-manager's decision on an agent's proposal (§3.7, D-182, D-188). approve: the write is applied as
+    the reviewer (via `proposal`, the audit row's origin names the proposal and the agent); edit: the same with
+    `payload` (a dict of fields) laid over the proposed params, e.g. the current `version`; reject (a note
+    says why); postpone: it stays open for the next continue prompt. A stale `version` is the action's usual
+    Conflict (nothing changes: edit onto the current state or reject); a proposal already decided is a
+    Conflict too. The write is checked against the reviewer's rights as any write is, and its failure
+    leaves the proposal as it was."""
+    if ctx.actor.startswith("agent:"):
+        raise Forbidden("an agent doesn't review proposals (its own included): the project's task-manager decides")
+    if decision not in proposals.REVIEW_DECISIONS:
+        raise ValueError(f"decision must be one of {'|'.join(proposals.REVIEW_DECISIONS)}, got {decision!r}")
+    if isinstance(proposal_id, bool) or not isinstance(proposal_id, int):
+        raise ValueError(f"proposal_id must be an integer, got {proposal_id!r}")
+    if note is not None and not isinstance(note, str):
+        raise ValueError("note must be text")
+    row = store.get_proposal(conn, proposal_id)
+    if row is None:
+        raise store.NotFound(f"no proposal P-{proposal_id}")
+    if row["status"] not in store.PROPOSAL_OPEN:
+        raise Conflict(f"P-{proposal_id} is already {row['status']}"
+                       + (" (applied under roles_enforce=shadow)" if row["shadow"] else ""), current=row)
+    if decision in ("approve", "reject", "postpone") and payload is not None:
+        raise ValueError("payload is for `edit` only")
+    if decision == "edit" and (not isinstance(payload, dict) or not payload):
+        raise ValueError("edit needs a payload: the fields to change, as an object")
+    if decision == "reject" and not (note or "").strip():
+        raise ValueError("reject needs a note: the agent's task-manager says why")
+    before = {"status": row["status"], "payload": row["payload"], "note": row["note"]}
+    if decision in ("reject", "postpone"):
+        new = store.decide_proposal(conn, proposal_id, "rejected" if decision == "reject" else "postponed",
+                                    ctx.actor, note)
+        return Result({"proposal_id": proposal_id, "status": new["status"], "applied": None}, proposal_id, before,
+                      {"status": new["status"], "payload": new["payload"], "note": new["note"]})
+    params = dict(row["payload"])
+    if decision == "edit":
+        params.update(payload)
+    applied = _apply_proposed(conn, ctx, row, params)
+    new = store.decide_proposal(conn, proposal_id, "edited" if decision == "edit" else "approved", ctx.actor, note,
+                                params if decision == "edit" else None)
+    return Result({"proposal_id": proposal_id, "status": new["status"], "applied": applied}, proposal_id, before,
+                  {"status": new["status"], "payload": new["payload"], "note": new["note"]})
+
+
+# ---- agent runs and the proposal alert (phase 5a A4 part 2, §3.8)
+
+def _close_run(conn: sqlite3.Connection, run_id: int, reason: str) -> store.Row:
+    """Close a run and store its summary: every audit row the agent wrote during it (direct writes too, D-182) and
+    its proposals (proposals.summary). A driven session's actor is agent:<session>, a subagent's
+    agent:<session>:<agent_id>, over the session's /clear chain."""
+    run = store.get_agent_run(conn, run_id)
+    assert run is not None
+    until = store.now_iso()
+    fam = store.session_family(conn, run["session_id"])
+    actors = [f"agent:{sid}:{run['agent_id']}" if run["agent_id"] else f"agent:{sid}" for sid in fam]
+    summary = proposals.summary(dict(run, ended_at=until, end_reason=reason),
+                                store.audit_of_actors(conn, actors, run["started_at"], until),
+                                store.run_proposals(conn, run_id))
+    return store.end_agent_run(conn, run_id, reason, summary, until)
+
+
+@action("run.open", "agent_run")
+def run_open(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = None, kind: Any = "subagent",
+             project: Any = None, task_id: Any = None) -> Result:
+    """Open the run of a subagent (SubagentStart: `session` is its parent's, `agent_id` its own) or of a driven
+    session. The project is the session's own unless given. An open run of the same agent is returned as it is
+    (a repeated hook). The runner and the hook CLI's step (tasks.py run hook), not for MCP callers."""
+    _runner_only(ctx, "run.open")
+    sid = store._session_id(session)
+    aid = store._text(agent_id, "agent_id")
+    existing = store.open_run(conn, sid, aid)
+    if existing is not None:
+        run = store.get_agent_run(conn, existing)
+        return Result(run, existing, run, run, changed=False)
+    pid = int(store._project_row(conn, project)["id"]) if project is not None else store.run_project(conn, sid)
+    if pid is None:
+        raise ValueError(f"{sid} is neither a task-manager nor a driven session of a project: no run to open")
+    run = store.start_agent_run(conn, pid, sid, aid, store._enum(kind, ("subagent", "session"), "kind"),
+                                None if task_id is None else int(_task(conn, task_id)["id"]))
+    return Result(run, run["id"], None, {k: run[k] for k in ("project_id", "session_id", "agent_id", "kind")})
+
+
+@action("run.close", "agent_run")
+def run_close(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = None, reason: Any = "stopped") -> Result:
+    """Close the open run of that agent with its summary (SubagentStop). No open run (a stop with no start: the
+    hook tolerates it) is a no-op that returns None. Not for MCP callers."""
+    _runner_only(ctx, "run.close")
+    sid = store._session_id(session)
+    run_id = store.open_run(conn, sid, store._text(agent_id, "agent_id"))
+    if run_id is None:
+        return Result(None, None, None, None, changed=False)
+    after = _close_run(conn, run_id, store._text(reason, "reason", required=True) or "stopped")
+    return Result(after, run_id, {"ended_at": None, "end_reason": None},
+                  {"ended_at": after["ended_at"], "end_reason": after["end_reason"],
+                   "writes": after["summary"]["write_count"], "pending": len(after["summary"]["pending"])})
+
+
+@action("proposal.alert", "proposal")
+def proposal_alert(conn: sqlite3.Connection, ctx: Ctx, ids: Any) -> Result:
+    """The proposal_alert tick told the owner these open proposals waited too long: mark them so the alert
+    is sent once, not at every tick. A runner's step."""
+    _runner_only(ctx, "proposal.alert")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        raise ValueError("ids must be a non-empty list of proposal ids")
+    store.mark_proposals_alerted(conn, ids)
+    return Result({"alerted": ids}, None, {"alerted": []}, {"alerted": ids})
+
+
+def overdue_proposal_alert(conn: sqlite3.Connection, now: datetime) -> tuple[str, str, list[int]] | None:
+    """What the proposal_alert tick has to say now: (subject, body, proposal ids) for the open proposals older
+    than the setting proposal_alert_hours that were not alerted yet, else None."""
+    hours = float(get_setting(conn, "proposal_alert_hours"))
+    rows = store.overdue_proposals(conn, store.iso_ms(now - timedelta(hours=hours)))
+    if not rows:
+        return None
+    subject, body = proposals.alert_text(rows, hours)
+    return subject, body, [int(r["id"]) for r in rows]
+
+
+def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], params: dict[str, Any]) -> Any:
+    """Run a proposal's action as the reviewer with via `proposal` and an audit origin (inside the review's
+    transaction: any failure, a stale version included, rolls the whole review back). The reviewer's rights are
+    checked by the matrix, and the old owner_only rule applies to an autonomous reviewer as it does to its
+    direct write (the autonomous task-manager can't get prompt_var.set through approving a proposal either).
+    Every audit row the action writes carries the origin, secondary ones included."""
+    name = str(row["action"])
+    spec = ACTIONS.get(name)
+    if spec is None:
+        raise ValueError(f"P-{row['id']}: the action {name!r} no longer exists")
+    if name == "proposal.review":
+        raise ValueError(f"P-{row['id']}: a proposal can't apply a review")
+    _check_params(spec, params)
+    v = permissions.check(conn, name, params, ctx.actor, ctx.actor_session)
+    if v.outcome != "allowed":
+        raise Forbidden(f"P-{row['id']}: {name} refused for {ctx.actor} as the reviewer: {v.reason}")
+    if spec.owner_only and is_autonomous(conn, ctx):
+        raise Forbidden(f"P-{row['id']}: {name} is not allowed for an autonomous AFClaude session, as a reviewer "
+                        "neither (the owner decides sessions, rules, settings and prompts)")
+    inner = Ctx(ctx.actor, "proposal", None, ctx.autonomous, ctx.actor_session)
+    origin = {"proposal": row["id"], "agent": row["actor"]}
+    with store.applying_proposal(origin):      # the action's own secondary audit rows name the proposal too
+        res = spec.fn(conn, inner, **params)
+        if not res.is_noop():
+            before, after = res.audit_pair()
+            store.add_audit(conn, ctx.actor, "proposal", name, spec.target_type, res.target_id, before, after, None,
+                            session=ctx.actor_session)
+    return res.result
 
 
 # ---------------------------------------------------------------- roles in shadow (phase 5a A3)
@@ -577,7 +794,17 @@ def task_move(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, stage: Any, vers
 
 @action("task.block", "task")
 def task_block(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, question: Any, version: Any = None) -> Result:
-    return _task_change(conn, task_id, version, lambda: store.block_task(conn, task_id, question))
+    """With roles enforced, an agent's block is held back from the human inbox until its task-manager forwards it
+    (task.forward, §3.7); in shadow it goes to the inbox as before (the old rule's behaviour)."""
+    by = ctx.actor if ctx.actor.startswith("agent:") and roles_mode(conn, report=False) == "on" else None
+    return _task_change(conn, task_id, version, lambda: store.block_task(conn, task_id, question, by))
+
+
+@action("task.forward", "task")
+def task_forward(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, version: Any = None) -> Result:
+    """The task-manager passes the question of a task an agent blocked on to the human inbox (sets
+    forwarded_at); before that the task is blocked but not in pending_user_input. Not for an agent."""
+    return _task_change(conn, task_id, version, lambda: store.forward_task(conn, task_id))
 
 
 @action("task.answer", "task")
@@ -1145,6 +1372,8 @@ SETTINGS: dict[str, Setting] = {
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_prune_runs": _num(10, 0.5, 720, "Runner: minutes the daily prune of its run records may "
                                       "take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_proposal_alert": _num(2, 0.5, 720, "Runner: minutes a proposal-alert run may take before it "
+                                          "is killed and fails (D-234)", "automation"),
     "runner_timeout_status_snapshot": _num(2, 0.5, 720, "Runner: minutes a status-snapshot run may take before it "
                                            "is killed and fails (D-234)", "automation"),
     "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
@@ -1219,6 +1448,10 @@ SETTINGS: dict[str, Setting] = {
                                section="auth", kind="login_rate"),
     # --- host (phase 6a W7 / 5d; design §10.4, D-229). 5d's X3 (not built) adds working_root and the
     # rest of this section's settings; it reuses this key rather than redefining it.
+    # phase 5a A4 (§3.7): the proposal_alert tick tells the owner once about a proposal the task-manager has not
+    # decided after this many hours
+    "proposal_alert_hours": _num(24, 1, 720, "Hours an agent proposal may wait for the task-manager's review "
+                                             "before the owner is alerted (once per proposal)", "automation"),
     "roles_enforce": Setting("shadow", _roles_enforce,
                              "Roles (phase 5a): \"shadow\" logs what the permission matrix would refuse or turn "
                              "into a proposal and changes nothing; \"on\" enforces it. \"on\" is refused until "
@@ -1881,7 +2114,7 @@ def _tmux_name(value: Any) -> str:
 @action("driven.set", "driven_session")
 def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = None, tmux: Any = None,
                project: Any = None, task_id: Any = None, started_at: Any = None, ended_at: Any = None,
-               live: Any = None) -> Result:
+               live: Any = None, end_reason: Any = None) -> Result:
     """Add or change a driven session's row: kind (DRIVEN_KINDS), tmux (its name), project (name
     or id; required for a task-manager), task_id, started_at, ended_at (ISO times; a set ended_at
     frees the name), live (true: an ended row is live again, ended_at cleared; S2's launchers when
@@ -1937,7 +2170,25 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
     if before is not None and all(before.get(k) == v for k, v in fields.items()):
         return Result(before, sid, before, before, changed=False)
     after = store.upsert_driven_session(conn, sid, **fields)
+    _driven_run(conn, before, after, None if end_reason is None else store._text(end_reason, "end_reason"))
     return Result(after, sid, before, after)
+
+
+def _driven_run(conn: sqlite3.Connection, before: store.Row | None, after: store.Row | None,
+                end_reason: str | None) -> None:
+    """The run of a driven agent session (§3.8): opened when its row goes live, closed when it ends. The
+    task-manager's own session is the reviewer, not a run."""
+    if after is None or after["kind"] == "task-manager":
+        return
+    sid = after["session_id"]
+    was_live = before is not None and before.get("ended_at") is None
+    if after.get("ended_at") is None and not was_live:
+        if store.open_run(conn, sid, None) is None:
+            store.start_agent_run(conn, after.get("project_id"), sid, None, "session", after.get("task_id"))
+    elif after.get("ended_at") is not None and was_live:
+        run_id = store.open_run(conn, sid, None)
+        if run_id is not None:
+            _close_run(conn, run_id, end_reason or "ended")
 
 
 def current_session(conn: sqlite3.Connection, sid: str) -> str:
@@ -1981,7 +2232,10 @@ def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_se
     marks = ",".join("?" for _ in CLEARED_INBOX)
     moved = conn.execute(f"UPDATE inbox_messages SET session_id=? WHERE session_id=? AND status IN ({marks})",
                          (new, old) + CLEARED_INBOX).rowcount
+    runs_moved = store.move_run_session(conn, old, new)     # the agent run goes on in the same process (A4)
     out = dict(after or {}, cleared_from=old, projects=projects, inbox_moved=moved)
+    if runs_moved:
+        out["runs_moved"] = runs_moved
     return Result(out, new, dict(before, projects=projects), out)
 
 
@@ -4279,8 +4533,8 @@ def _appender(kind: object, record: bool) -> Appender:
 
 
 def _check_writer(actor: object, via: object, account_id: object) -> None:
-    if via not in VIAS:
-        raise ValueError(f"via must be one of {'|'.join(VIAS)}, got {via!r}")
+    if via not in CALLER_VIAS:
+        raise ValueError(f"via must be one of {'|'.join(CALLER_VIAS)}, got {via!r}")
     if not isinstance(actor, str) or not ACTOR_RE.match(actor):
         raise ValueError(f"bad actor {actor!r}")
     if not isinstance(account_id, str) or not account_id:

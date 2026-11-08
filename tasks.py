@@ -52,6 +52,21 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            drop_working_notes, open_question_ids, notes}
                                            ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
+    tasks.py proposals [--project P] [--all | --status S] [--shadow] [--show ID]   agents' proposals for the
+                                           task-manager (phase 5a A4, D-182): the open ones (proposed +
+                                           postponed); --all: every one incl. the decided; --shadow: also the
+                                           ones recorded while roles_enforce=shadow (already applied)
+    tasks.py runs [--project P] [--open] [--show ID]   agent runs (subagents, driven sessions) with their summaries
+                                           (phase 5a A4, §3.8: every write of the run, direct ones too)
+    tasks.py run-hook start|stop           the SubagentStart / SubagentStop hook (JSON payload on stdin): opens
+                                           / closes the subagent's run as runner:hook
+    tasks.py forward ID                    the task-manager passes an agent-blocked task's question on to the
+                                           human inbox (until then the task is blocked but not in the inbox)
+    tasks.py review ID approve|edit|reject|postpone [--note N] [--set KEY=VALUE ... | --payload JSON]
+                                           decide a proposal: approve applies the write as the reviewer; edit
+                                           lays the fields over the proposed ones (KEY=VALUE is JSON when it
+                                           parses, else text); reject needs a note; a stale version is a
+                                           conflict (edit onto the current state or reject)
     tasks.py automation [status]           is automation paused (D-234/D-235), why, since when: the
                                            install-wide pause and every paused project (D-244)
     tasks.py automation resume [--project P | --all]   clear the install-wide pause (after looking
@@ -135,6 +150,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -149,6 +165,7 @@ import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write: validation, one transaction, audit row)
 import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 import identity  # noqa: E402  (phase 5a A2: who is acting)
+import proposals  # noqa: E402  (phase 5a A4: the run summary text)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -360,6 +377,111 @@ def run_roles(conn, args):
         return print("nothing the matrix would have refused" + (f" on {day}" if day else ""))
     for r in rows:
         print(f"{r['day']}  {r['n']:>4}x  {r['outcome']:<8} {r['action']:<24} {r['actor']}  {r['reason']}")
+    return None
+
+
+def print_proposal(p, names, full=False):
+    """One proposal: a line, and with `full` its payload (the exact params the approval would apply)."""
+    mark = " [applied under shadow]" if p["shadow"] else ""
+    print(f"P-{p['id']:<4} {p['status']:<9} {names.get(p['project_id'], '-'):<14} {p['actor']}  {p['summary']}{mark}")
+    if full:
+        print(f"       proposed {berlin(p['created_at'])}" + (f", {p['status']} by {p['reviewer']}: {p['note'] or ''}"
+                                                              if p["decided_at"] else ""))
+        print("       payload: " + json.dumps(p["payload"], ensure_ascii=False))
+
+
+def run_proposals(conn, args):
+    """Phase 5a A4 (D-182, D-188): the agents' proposals waiting for the task-manager, and its decision on them."""
+    names = {p["id"]: p["name"] for p in store.list_projects(conn)}
+    if args.cmd == "review":
+        payload = json.loads(args.payload) if args.payload else None
+        if args.set:
+            payload = dict(payload or {})
+            for kv in args.set:
+                k, sep, v = kv.partition("=")
+                if not sep or not k:
+                    raise ValueError(f"--set wants KEY=VALUE, got {kv!r}")
+                try:
+                    payload[k] = json.loads(v)
+                except ValueError:
+                    payload[k] = v
+        r = act(conn, "proposal.review", proposal_id=args.id, decision=args.decision, note=args.note, payload=payload)
+        return dump(r) if args.json else print(f"P-{r['proposal_id']}: {r['status']}")
+    if args.show is not None:
+        p = store.get_proposal(conn, args.show)
+        if p is None or not visible(conn, "proposals", [p], lambda r: r["project_id"]):
+            raise store.NotFound(f"no proposal P-{args.show}")
+        return dump(p) if args.json else print_proposal(p, names, full=True)
+    pid = None
+    if args.project:
+        pid = doc_project(conn, args.project)["id"]
+    rows = store.list_proposals(conn, project_id=pid, status=args.status, open_only=not (args.all or args.status),
+                                include_shadow=args.shadow or bool(args.all or args.status))
+    rows = visible(conn, "proposals", rows, lambda r: r["project_id"])
+    if args.json:
+        return dump(rows)
+    if not rows:
+        return print("no open proposals" if not (args.all or args.status) else "no proposals")
+    for p in rows:
+        print_proposal(p, names)
+    return None
+
+
+HOOK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def run_hook(conn, args):
+    """Phase 5a A4 (§3.3, §3.8): the SubagentStart / SubagentStop hook. The payload (stdin JSON) names the parent
+    session, the subagent and its type. A subagent with no type (a helper agent of an interactive session) and a
+    session that is no AFClaude task-manager or driven session are not runs: nothing is written. A payload
+    that doesn't parse, or a call from inside a subagent (it would be an agent opening runs), is an error
+    (D-235). Acts as runner:hook (the hook is the harness, not the agent)."""
+    if os.environ.get("AFCLAUDE_AGENT_ID"):
+        raise ValueError("run-hook is the harness's hook, not for an agent to call")
+    try:
+        payload = json.loads(sys.stdin.read())
+    except ValueError as e:
+        raise ValueError(f"the hook payload is not JSON: {e}") from e
+    session, agent = payload.get("session_id"), payload.get("agent_id")
+    if not isinstance(payload, dict) or not isinstance(session, str) or not HOOK_ID_RE.match(session) \
+            or not isinstance(agent, str) or not HOOK_ID_RE.match(agent):
+        raise ValueError("the hook payload needs session_id and agent_id")
+    if not payload.get("agent_type"):
+        return print("no run: a subagent with no type is a helper agent")
+    if args.hook == "start" and store.run_project(conn, session) is None:
+        return print(f"no run: {session} is neither a task-manager nor a driven session of a project")
+    params = {"session": session, "agent_id": agent}
+    if args.hook == "stop":
+        r = actions.perform(conn, "run.close", params | {"reason": "SubagentStop"}, actor="runner:hook", via="runner")
+        return print(f"run {r['id']} closed" if r else "no open run for this subagent (a stop with no start)")
+    r = actions.perform(conn, "run.open", params, actor="runner:hook", via="runner")
+    return print(f"run {r['id']} open")
+
+
+def run_runs(conn, args):
+    """Phase 5a A4 (§3.8): the agent runs and their summaries."""
+    names = {p["id"]: p["name"] for p in store.list_projects(conn)}
+    if args.show is not None:
+        r = store.get_agent_run(conn, args.show)
+        if r is None or not visible(conn, "runs", [r], lambda x: x["project_id"]):
+            raise store.NotFound(f"no run {args.show}")
+        if args.json:
+            return dump(r)
+        if r["summary"] is None:
+            return print(f"run {r['id']} ({r['kind']} {r['session_id']}) is still open since {berlin(r['started_at'])}")
+        return print(proposals.summary_text(r["summary"]))
+    pid = doc_project(conn, args.project)["id"] if args.project else None
+    rows = visible(conn, "runs", store.list_agent_runs(conn, project_id=pid, open_only=args.open),
+                   lambda x: x["project_id"])
+    if args.json:
+        return dump(rows)
+    if not rows:
+        return print("no runs")
+    for r in rows:
+        who_ = r["session_id"] + (f"/{r['agent_id']}" if r["agent_id"] else "")
+        n = f"{r['summary']['write_count']} write(s)" if r["summary"] else "open"
+        print(f"run {r['id']:<5} {r['kind']:<8} {names.get(r['project_id'], '-'):<14} {who_}  "
+              f"{berlin(r['started_at'])}  {n}  {r['end_reason'] or ''}")
     return None
 
 
@@ -882,6 +1004,14 @@ def run(conn, args):
         return run_grant(conn, args) or 0
     elif c == "roles":
         return run_roles(conn, args) or 0
+    elif c in ("proposals", "review"):
+        return run_proposals(conn, args) or 0
+    elif c == "runs":
+        return run_runs(conn, args) or 0
+    elif c == "run-hook":
+        return run_hook(conn, args) or 0
+    elif c == "forward":
+        task_out(args, act(conn, "task.forward", task_id=args.id))
     elif c == "question":
         run_question(conn, args)
     elif c == "inbox" and args.inbox_cmd:
@@ -1450,6 +1580,31 @@ def parser():
     q = gs.add_parser("list", parents=[js], help="the grants")
     q.add_argument("--user", type=int, help="only this user's")
 
+    p = sub.add_parser("proposals", parents=[js], help="agents' proposals for the task-manager (phase 5a A4, D-182)")
+    p.add_argument("--project", help="name or directory (default: every project you may see)")
+    p.add_argument("--all", action="store_true", help="every proposal, the decided ones too")
+    p.add_argument("--status", choices=("proposed", "approved", "edited", "rejected", "postponed"))
+    p.add_argument("--shadow", action="store_true", help="also those recorded while roles_enforce=shadow")
+    p.add_argument("--show", type=int, metavar="ID", help="one proposal with its payload")
+    p = sub.add_parser("review", parents=[js], help="decide an agent's proposal (D-188): approve | edit | reject | "
+                                                    "postpone")
+    p.add_argument("id", type=int)
+    p.add_argument("decision", choices=("approve", "edit", "reject", "postpone"))
+    p.add_argument("--note", help="why (needed for reject)")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE", help="edit: a field to change (repeatable)")
+    p.add_argument("--payload", metavar="JSON", help="edit: the fields to change, as a JSON object")
+
+    p = sub.add_parser("runs", parents=[js], help="agent runs and their summaries (phase 5a A4, §3.8)")
+    p.add_argument("--project", help="name or directory (default: every project you may see)")
+    p.add_argument("--open", action="store_true", help="only the runs still going")
+    p.add_argument("--show", type=int, metavar="ID", help="one run's summary")
+    p = sub.add_parser("run-hook", help="SubagentStart / SubagentStop hook: opens / closes a subagent's run "
+                                        "(JSON payload on stdin)")
+    p.add_argument("hook", choices=("start", "stop"))
+    p = sub.add_parser("forward", parents=[js], help="pass an agent-blocked task's question on to the human inbox "
+                                                     "(the task-manager's step)")
+    p.add_argument("id", type=int)
+
     p = sub.add_parser("roles", help="the permission matrix in shadow mode (phase 5a A3): shadow | mode")
     rs = p.add_subparsers(dest="roles_cmd", required=True)
     q = rs.add_parser("shadow", parents=[js], help="what the matrix would have refused, made a proposal or "
@@ -1484,6 +1639,9 @@ def main(argv=None):
         return db_error(e, args)
     try:
         return run(conn, args)
+    except actions.Proposed as e:                   # an agent's write stored as a proposal: nothing was changed
+        print(json.dumps(e.to_json(), ensure_ascii=False) if getattr(args, "json", False) else e.message)
+        return 0
     except (ValueError, LookupError) as e:          # validation, bad transition, not found
         msg = e.args[0] if isinstance(e, LookupError) and e.args else str(e)
         print(f"error: {msg}", file=sys.stderr)
