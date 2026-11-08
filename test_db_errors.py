@@ -157,6 +157,38 @@ class Transient(Base):
         self.assertEqual(self.alerts, [])                                # one failure: no alert yet
 
 
+class QuickWaits(Base):
+    """store.quick_waits (a hook's short lock wait, A5): a transient miss is only the hand-back, never a fallback
+    record or an owner alert, however often it repeats; anything else takes the full path (D-171, D-235)."""
+    def test_a_lock_missed_in_quick_mode_is_not_escalated(self):
+        with store.quick_waits(0.05):
+            conn = store.connect(self.db)
+        holder = sqlite3.connect(self.db, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            with store.quick_waits(0.05):
+                try:
+                    for _ in range(3):
+                        with self.assertRaises(store.DBUnavailable) as cm:
+                            self.add(conn)
+                        self.assertEqual(cm.exception.error_class, "transient")
+                        self.assertIn("short lock wait", cm.exception.escalation)
+                finally:
+                    conn.close()
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+        self.assertEqual((self.events(), self.alerts, self.sleeps), ([], [], []))
+
+    def test_a_persistent_error_in_quick_mode_takes_the_full_path(self):
+        with store.quick_waits(0.05):
+            for _ in range(2):
+                store.report_db_error(store.DBUnavailable("database error: disk I/O error", "io_error"),
+                                      actor="cli", action="task.add", params={"title": "x"})
+        self.assertEqual(len(self.events("failed")), 2)
+        self.assertEqual(len(self.alerts), 1)                       # failed again: the owner is alerted
+
+
 class _FakeCursor:
     def fetchone(self):
         return None            # no "meta" table: schema_problem() reads this as a fresh/healthy DB
