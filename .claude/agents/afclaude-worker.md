@@ -22,6 +22,11 @@ You are a worker subagent of the AFClaude task-manager. The brief you get names 
 - Unit tests must never signal real processes (no kill/killpg of a fake or small pid; patch the signal helper): the host is shared and `kill(-1)` ends every session. Run suites under `unshare -Urpf --mount-proc` so a missed path stays in a private PID namespace.
 - Turn budget: fit the task in ~60–80 turns (D-307 #8). Around turn 60, wrap up: commit what you have, and write a hand-off note in your report (done / left / where) so the next worker can continue without re-discovering your state.
 
+## What you write (D-182, D-185)
+- Direct: your own task's status and notes (when the brief names a task, claim it first: `python3 tasks.py start N --session "$CLAUDE_CODE_SESSION_ID"`; without `--session` it is not yours; finish it only if the brief says so), a failure alert (`tasks.py doc append alerts`), and your own branch or worktree. Your hand-off note for the next worker goes in your report.
+- Anything else in the project (docs, goals, progress, new or other tasks, questions, decisions, prompt variables) becomes a proposal: the tool says `proposed as P-n, waiting for the task-manager's review (nothing was changed)`. That is the answer, not an error: don't repeat or work around it, put what you wanted in your report. Global or owner-only actions are refused and alerted.
+- Roles are in shadow mode for now: such a write may still apply at once, and your run summary to the task-manager lists it. Write only what is yours either way.
+
 ## Code
 - Match the surrounding code: comment density, naming, idiom. Keep the README's file table current when you add or change a module's role.
 - Tests: run every suite your change can affect (`python3 -m unittest <module>`; the MCP ones with `.venv/bin/python -m unittest test_mcp_server`) and the type gate `.venv/bin/python -m unittest test_typing` (mypy --strict over the files in mypy.ini; files on that list stay passing). Add tests for new behaviour. The pre-commit hook runs the same gate.

@@ -71,7 +71,13 @@ INSTRUCTIONS = (
     "you to report through them. Never on your own initiative, e.g. not as your own todo list. A task added here "
     "counts exactly like one the user added in the UI: there is no approval step, and the project's task-manager "
     "works it on its own in its next run (runs begin at the nightly session-window starts). Tasks are stages of ranked projects; execution order is all "
-    "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin.")
+    "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin. "
+    "The server resolves who calls (D-195, D-330): a machine user (one per machine, granted by an owner), a "
+    "task-manager or an agent session; until this host's machine user is registered, its interactive sessions "
+    "count as the owner. An agent's write beyond its own task, hand-off and alerts is stored as a proposal for "
+    "its project's task-manager and answers {\"proposed\": true, \"proposal_id\": N, \"status\": \"proposed\", "
+    "\"message\": \"proposed as P-N, waiting for the task-manager's review (nothing was changed): ...\"}: not an "
+    "error (with roles in shadow mode the write still applies).")
 
 # The identity hook's stamp on the call being served (identity_hook.py adds `_afc` to the arguments of every
 # afclaude call; the SDK would drop the unknown argument before a tool runs, so call_tool takes it out first).
@@ -847,8 +853,9 @@ def proposal_brief(p: Mapping[str, Any], names: Mapping[int, str], full: bool = 
     return d
 
 
-@tool("Agents' proposals for the task-manager. status: open (default), all, or one status; id: one with its full "
-      "payload. Decide with afclaude_review.", read_only=True)
+@tool("Agents' proposals for the task-manager. status: open (default: proposed + postponed), all (incl. decided and "
+      "shadow-mode ones, already applied), or one status; id: one with its full payload. Decide with afclaude_review.",
+      read_only=True)
 async def afclaude_proposals(status: str = "open", project: Optional[str] = None, id: Optional[int] = None,
                              ctx: Optional[Context] = None) -> str:
     project = await resolve_dir_arg(ctx, project)
@@ -875,7 +882,8 @@ async def afclaude_proposals(status: str = "open", project: Optional[str] = None
 
 
 @tool("Review an agent's proposal (id from afclaude_proposals): approve (applies it as you), edit (with `payload`: "
-      "fields laid over the proposed ones), reject (needs a note) or postpone.")
+      "fields laid over the proposed ones), reject (needs a note) or postpone (stays open for your next start). "
+      "A stale version is a conflict: edit or reject.")
 async def afclaude_review(id: int, decision: Literal["approve", "edit", "reject", "postpone"],
                           note: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> str:
     conn = db()
