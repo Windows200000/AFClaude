@@ -1728,6 +1728,19 @@ def install_stamp(conn: sqlite3.Connection, ctx: Ctx) -> Result:
     return Result({"install_id": iid}, iid, {"install_id": None}, {"install_id": iid})
 
 
+@action("masterkey.check", "install")
+def masterkey_check(conn: sqlite3.Connection, ctx: Ctx, value: str, key_id: str) -> Result:
+    """Write meta.master_key_check on the first use of a master key (masterkey.py, phase 5b K3; the
+    check is an HMAC, no secret). A stored check that differs is a ValueError (masterkey.ensure
+    verifies first; this guards a race); the same value is a no-op. -> {key_id}."""
+    have = store.get_meta(conn, "master_key_check")
+    if have is not None and have != value:
+        raise ValueError("meta.master_key_check belongs to another master key: refusing to replace it")
+    if have is None:
+        store.set_meta(conn, "master_key_check", value)
+    return Result({"key_id": key_id}, key_id, {"check": have}, {"check": value}, changed=have is None)
+
+
 @action("install.restored", "install", owner_only=True)
 def install_restored(conn: sqlite3.Connection, ctx: Ctx, source: Any) -> Result:
     """Mark this (just restored) database as a restore of `source` (backup.py restore, design

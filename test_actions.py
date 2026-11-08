@@ -1229,6 +1229,7 @@ class EveryAction(Base):
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
                                              "bundle_sha256": "0" * 64, "kind": "backup"}}),
             ("install.stamp", {}),
+            ("masterkey.check", {"value": "ab" * 32, "key_id": "abcdef012345"}),
             ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
             ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
             ("typed.record", {"session_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "driver": "auto",
