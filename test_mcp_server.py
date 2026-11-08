@@ -849,9 +849,9 @@ class Stdio(unittest.TestCase):
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
         # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
         # then afclaude_ask's options (phase 4b Q3 W1: 17800), 18500 for the hand-off's drop_working_notes (was 17987),
-        # 19000 for afclaude_reply (phase 4b Q4: about 400 bytes), 21000 for afclaude_proposals / afclaude_review
-        # (phase 5a A4)
-        self.assertLess(size, 21000, f"tool list is {size} bytes")
+        # 19000 for afclaude_reply (phase 4b Q4: about 400 bytes), 20400 for afclaude_proposals / afclaude_review
+        # (phase 5a A4: 20373, after shortening their descriptions; 19000 would need other tools cut)
+        self.assertLess(size, 20400, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

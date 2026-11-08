@@ -195,6 +195,16 @@ class Result:
         return bool(b == a)
 
 
+def proposed_exit(main: Callable[[], int]) -> int:
+    """The entry-point wrapper of the CLIs an agent can write through (tasks.py has its own): an agent's write that
+    was stored as a proposal (`Proposed`, nothing changed) is the call's answer, exit 0, not a traceback."""
+    try:
+        return main()
+    except Proposed as e:
+        print(e.message)
+        return 0
+
+
 ActionFn = Callable[..., Result]          # fn(conn, ctx, **params) -> Result
 _A = TypeVar("_A", bound=ActionFn)
 _T = TypeVar("_T")
@@ -366,6 +376,8 @@ def proposal_review(conn: sqlite3.Connection, ctx: Ctx, proposal_id: Any, decisi
     Conflict (nothing changes: edit onto the current state or reject); a proposal already decided is a
     Conflict too. The write is checked against the reviewer's rights as any write is, and its failure
     leaves the proposal as it was."""
+    if ctx.actor.startswith("agent:"):
+        raise Forbidden("an agent doesn't review proposals (its own included): the project's task-manager decides")
     if decision not in proposals.REVIEW_DECISIONS:
         raise ValueError(f"decision must be one of {'|'.join(proposals.REVIEW_DECISIONS)}, got {decision!r}")
     if isinstance(proposal_id, bool) or not isinstance(proposal_id, int):
@@ -434,7 +446,7 @@ def run_open(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = N
     if pid is None:
         raise ValueError(f"{sid} is neither a task-manager nor a driven session of a project: no run to open")
     run = store.start_agent_run(conn, pid, sid, aid, store._enum(kind, ("subagent", "session"), "kind"),
-                          None if task_id is None else int(_task(conn, task_id)["id"]))
+                                None if task_id is None else int(_task(conn, task_id)["id"]))
     return Result(run, run["id"], None, {k: run[k] for k in ("project_id", "session_id", "agent_id", "kind")})
 
 
@@ -447,7 +459,6 @@ def run_close(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = 
     run_id = store.open_run(conn, sid, store._text(agent_id, "agent_id"))
     if run_id is None:
         return Result(None, None, None, None, changed=False)
-    before = store.get_agent_run(conn, run_id)
     after = _close_run(conn, run_id, store._text(reason, "reason", required=True) or "stopped")
     return Result(after, run_id, {"ended_at": None, "end_reason": None},
                   {"ended_at": after["ended_at"], "end_reason": after["end_reason"],
@@ -479,8 +490,9 @@ def overdue_proposal_alert(conn: sqlite3.Connection, now: datetime) -> tuple[str
 def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], params: dict[str, Any]) -> Any:
     """Run a proposal's action as the reviewer with via `proposal` and an audit origin (inside the review's
     transaction: any failure, a stale version included, rolls the whole review back). The reviewer's rights are
-    checked by the matrix (the old owner_only rule is not applied here: it would refuse the task-manager the
-    approvals this path exists for)."""
+    checked by the matrix, and the old owner_only rule applies to an autonomous reviewer as it does to its
+    direct write (the autonomous task-manager can't get prompt_var.set through approving a proposal either).
+    Every audit row the action writes carries the origin, secondary ones included."""
     name = str(row["action"])
     spec = ACTIONS.get(name)
     if spec is None:
@@ -491,12 +503,17 @@ def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], 
     v = permissions.check(conn, name, params, ctx.actor, ctx.actor_session)
     if v.outcome != "allowed":
         raise Forbidden(f"P-{row['id']}: {name} refused for {ctx.actor} as the reviewer: {v.reason}")
+    if spec.owner_only and is_autonomous(conn, ctx):
+        raise Forbidden(f"P-{row['id']}: {name} is not allowed for an autonomous AFClaude session, as a reviewer "
+                        "neither (the owner decides sessions, rules, settings and prompts)")
     inner = Ctx(ctx.actor, "proposal", None, ctx.autonomous, ctx.actor_session)
-    res = spec.fn(conn, inner, **params)
-    if not res.is_noop():
-        before, after = res.audit_pair()
-        store.add_audit(conn, ctx.actor, "proposal", name, spec.target_type, res.target_id, before, after, None,
-                        session=ctx.actor_session, origin={"proposal": row["id"], "agent": row["actor"]})
+    origin = {"proposal": row["id"], "agent": row["actor"]}
+    with store.applying_proposal(origin):      # the action's own secondary audit rows name the proposal too
+        res = spec.fn(conn, inner, **params)
+        if not res.is_noop():
+            before, after = res.audit_pair()
+            store.add_audit(conn, ctx.actor, "proposal", name, spec.target_type, res.target_id, before, after, None,
+                            session=ctx.actor_session)
     return res.result
 
 

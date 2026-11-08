@@ -1640,7 +1640,7 @@ def main(argv=None):
     try:
         return run(conn, args)
     except actions.Proposed as e:                   # an agent's write stored as a proposal: nothing was changed
-        print(e.message)
+        print(json.dumps(e.to_json(), ensure_ascii=False) if getattr(args, "json", False) else e.message)
         return 0
     except (ValueError, LookupError) as e:          # validation, bad transition, not found
         msg = e.args[0] if isinstance(e, LookupError) and e.args else str(e)

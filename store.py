@@ -130,6 +130,7 @@ the caller commits.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import glob
 import hashlib
 import json
@@ -944,6 +945,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     reviewed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_project ON agent_runs(project_id, started_at);
+CREATE INDEX IF NOT EXISTS agent_runs_session ON agent_runs(session_id, ended_at);
 CREATE TABLE IF NOT EXISTS agent_proposals (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id   INTEGER REFERENCES projects(id),
@@ -3003,12 +3005,28 @@ def put_prompt_var(conn: sqlite3.Connection, project_id: int, name: str, value: 
     return row
 
 
+# The proposal being applied (actions._apply_proposed sets it): every audit row written meanwhile, the
+# action's own secondary ones included, carries it as its origin (the table is append-only: no later fix-up).
+_applying: contextvars.ContextVar[object] = contextvars.ContextVar("afclaude_applying_proposal", default=None)
+
+
+@contextmanager
+def applying_proposal(origin: object) -> Iterator[None]:
+    token = _applying.set(origin)
+    try:
+        yield
+    finally:
+        _applying.reset(token)
+
+
 def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,
               target_id: object = None, before: object = None, after: object = None,
               request_id: str | None = None, ts: str | None = None, session: str | None = None,
               origin: object = None) -> int:
     """`session`: the Claude session behind a machine, task-manager or agent actor (phase 5a A2). `origin`: the
-    proposal a write was applied from (A4)."""
+    proposal a write was applied from (A4; while one is being applied, every row has it)."""
+    if origin is None:
+        origin = _applying.get()
     cur = conn.execute(
         "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id, session, "
         "origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

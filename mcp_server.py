@@ -827,12 +827,10 @@ def proposal_brief(p: Mapping[str, Any], names: Mapping[int, str], full: bool = 
     return d
 
 
-@tool("Agents' proposals for the task-manager (D-182: an agent's writes beyond its own task, notes and hand-off "
-      "are proposed, not applied). status: open (proposed + postponed, default), all, or one status; id: one "
-      "proposal with its full payload; project: name, directory or '.'. Decide with afclaude_review.",
-      read_only=True)
+@tool("Agents' proposals for the task-manager. status: open (default), all, or one status; id: one with its full "
+      "payload. Decide with afclaude_review.", read_only=True)
 async def afclaude_proposals(status: str = "open", project: Optional[str] = None, id: Optional[int] = None,
-                             limit: int = 50, ctx: Optional[Context] = None) -> str:
+                             ctx: Optional[Context] = None) -> str:
     project = await resolve_dir_arg(ctx, project)
     conn = db()
     try:
@@ -849,17 +847,15 @@ async def afclaude_proposals(status: str = "open", project: Optional[str] = None
                 raise store.NotFound(f"no project {project!r}")
             pr = int(proj["id"])
         rows = store.list_proposals(conn, project_id=pr, status=None if status in ("open", "all") else status,
-                                    open_only=status == "open", include_shadow=status != "open", limit=limit)
+                                    open_only=status == "open", include_shadow=status != "open")
         rows = visible(conn, "proposals", rows, lambda r: r["project_id"])
     finally:
         conn.close()
     return out({"proposals": [proposal_brief(r, names) for r in rows]})
 
 
-@tool("Review an agent's proposal (id from afclaude_proposals). decision: approve (applies the write as you), edit "
-      "(applies it with `payload`, an object of fields laid over the proposed ones, e.g. the current version), "
-      "reject (needs a note) or postpone (stays open for the next continue). A stale version is a conflict: edit "
-      "onto the current state or reject.")
+@tool("Review an agent's proposal (id from afclaude_proposals): approve (applies it as you), edit (with `payload`: "
+      "fields laid over the proposed ones), reject (needs a note) or postpone.")
 async def afclaude_review(id: int, decision: Literal["approve", "edit", "reject", "postpone"],
                           note: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> str:
     conn = db()

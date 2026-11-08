@@ -324,6 +324,65 @@ class Entries(Proposals):
         self.assertEqual((rc, err), (0, ""))
         self.assertIn("proposed as P-7", out)
 
+    def test_a_proposed_write_is_json_with_json_and_the_other_clis_exit_cleanly(self):
+        err = actions.Proposed(7, self.A, "task.edit #1: title='x'")
+        with mock.patch.object(actions, "perform", side_effect=err):
+            rc, out, _ = self.run_cli("prio", str(self.task), "low", "--json")
+        self.assertEqual((rc, json.loads(out)["proposal_id"], json.loads(out)["proposed"]), (0, 7, True))
+        buf = io.StringIO()
+
+        def main():
+            raise err
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(actions.proposed_exit(main), 0)       # prompts.py, decisions.py, ... end this way
+        self.assertIn("proposed as P-7", buf.getvalue())
+
+
+class ReviewGuards(Proposals):
+    """Opus review of part 1: owner_only holds on the approval path, an agent never reviews, every audit row
+    of an applied proposal names it."""
+
+    def test_approving_cannot_get_an_owner_only_write_through_for_an_autonomous_reviewer(self):
+        self.go_on()
+        params = {"project": self.A, "name": "project_notes", "value": "from the agent"}
+        with self.assertRaises(actions.Forbidden):                  # the autonomous task-manager is refused directly
+            self.as_tm("prompt_var.set", **params)
+        pid = self.propose("prompt_var.set", **params)
+        with self.assertRaisesRegex(actions.Forbidden, "autonomous"):
+            self.as_tm("proposal.review", proposal_id=pid, decision="approve")
+        self.assertEqual(store.get_proposal(self.conn, pid)["status"], "proposed")      # rolled back, still open
+        # the owner (a human, not autonomous) may approve it
+        actions.perform(self.conn, "proposal.review", {"proposal_id": pid, "decision": "approve"}, actor="cli",
+                        via="cli")
+        self.assertEqual(store.get_proposal(self.conn, pid)["status"], "approved")
+
+    def test_an_agent_cannot_review_even_in_shadow(self):
+        pid = store.add_proposal(self.conn, self.A, None, self.agent, "task.edit", {"task_id": self.task}, None, "x").get("id")
+        self.conn.commit()
+        for decision, kw in (("reject", {"note": "mine"}), ("postpone", {})):
+            with self.assertRaisesRegex(actions.Forbidden, "agent doesn't review"):
+                self.as_agent("proposal.review", proposal_id=pid, decision=decision, **kw)
+        self.assertEqual(store.get_proposal(self.conn, pid)["status"], "proposed")
+
+    def test_every_audit_row_of_an_applied_proposal_carries_the_origin(self):
+        self.go_on()
+        pid = self.propose("task.edit", task_id=self.task, title="via proposal")
+        last = self.conn.execute("SELECT MAX(id) FROM audit_log").fetchone()[0]
+        self.as_tm("proposal.review", proposal_id=pid, decision="approve")
+        rows = self.conn.execute("SELECT action, via, origin FROM audit_log WHERE id>? ORDER BY id", (last,)).fetchall()
+        self.assertEqual([r["action"] for r in rows], ["task.edit", "proposal.review"])
+        self.assertEqual(json.loads(rows[0]["origin"]), {"agent": self.agent, "proposal": pid})
+        # a secondary row (the action's own extra write) gets it too
+
+        def twice(conn, ctx, task_id, title):
+            store.add_audit(conn, ctx.actor, ctx.via, "extra.row", "task", 1, None, {"x": 1}, session=ctx.actor_session)
+            return actions.Result({}, 1, None, None, changed=False)
+        pid2 = self.propose("task.edit", task_id=self.task, title="again")
+        with mock.patch.dict(actions.ACTIONS, {"task.edit": actions.Spec("task.edit", twice, "task", False)}):
+            self.as_tm("proposal.review", proposal_id=pid2, decision="approve")
+        extra = self.conn.execute("SELECT origin FROM audit_log WHERE action='extra.row'").fetchone()
+        self.assertEqual(json.loads(extra["origin"]), {"proposal": pid2, "agent": self.agent})
+
 
 if __name__ == "__main__":
     unittest.main()
