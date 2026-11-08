@@ -655,6 +655,7 @@ class SettingActions(Base):
                           "runner_timeout_dispatcher": 25.0, "runner_timeout_quickview": 2.0,
                           "runner_timeout_docs_import": 5.0, "runner_timeout_prune_logs": 10.0,
                           "runner_timeout_prune_runs": 10.0, "runner_timeout_status_snapshot": 2.0,
+                          "runner_timeout_proposal_alert": 2.0, "proposal_alert_hours": 24.0,
                           "runner_timeout_usage_review": 30.0, "runner_timeout_at": 30.0,
                           "runner_timeout_window_start": 90.0,
                           "runner_timeout_watch": 12.0, "runner_timeout_run_readings": 10.0,
@@ -1254,6 +1255,11 @@ class EveryAction(Base):
             ("machine.revoke", {"user_id": 1}),
             # phase 5a A4: a proposal an agent made (stored by perform in enforcing mode; here by hand), rejected
             ("proposal.review", {"proposal_id": 1, "decision": "reject", "note": "not now"}),
+            # phase 5a A4 part 2: a subagent's run, the owner alert's mark, an agent-blocked task forwarded
+            ("run.open", {"session": SID, "agent_id": "sub1", "project": "P"}),
+            ("run.close", {"session": SID, "agent_id": "sub1", "reason": "SubagentStop"}),
+            ("proposal.alert", {"ids": [1]}),
+            ("task.forward", {"task_id": 3}),
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
@@ -1270,6 +1276,9 @@ class EveryAction(Base):
             if name == "proposal.review":       # what perform stores for an agent's write when roles are enforced
                 store.add_proposal(self.conn, 1, None, "agent:" + SID, "task.edit", {"task_id": 3, "title": "x"},
                                    None, "task.edit #3: title='x'")
+                self.conn.commit()
+            if name == "task.forward":          # a task an agent blocked (perform sets blocked_by when enforced)
+                store.block_task(self.conn, 3, "q?", blocked_by="agent:" + SID)
                 self.conn.commit()
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")

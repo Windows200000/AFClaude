@@ -400,6 +400,82 @@ def proposal_review(conn: sqlite3.Connection, ctx: Ctx, proposal_id: Any, decisi
                   {"status": new["status"], "payload": new["payload"], "note": new["note"]})
 
 
+# ---- agent runs and the proposal alert (phase 5a A4 part 2, §3.8)
+
+def _close_run(conn: sqlite3.Connection, run_id: int, reason: str) -> store.Row:
+    """Close a run and store its summary: every audit row the agent wrote during it (direct writes too, D-182) and
+    its proposals (proposals.summary). A driven session's actor is agent:<session>, a subagent's
+    agent:<session>:<agent_id>, over the session's /clear chain."""
+    run = store.get_agent_run(conn, run_id)
+    assert run is not None
+    until = store.now_iso()
+    fam = store.session_family(conn, run["session_id"])
+    actors = [f"agent:{sid}:{run['agent_id']}" if run["agent_id"] else f"agent:{sid}" for sid in fam]
+    summary = proposals.summary(dict(run, ended_at=until, end_reason=reason),
+                                store.audit_of_actors(conn, actors, run["started_at"], until),
+                                store.run_proposals(conn, run_id))
+    return store.end_agent_run(conn, run_id, reason, summary, until)
+
+
+@action("run.open", "agent_run")
+def run_open(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = None, kind: Any = "subagent",
+             project: Any = None, task_id: Any = None) -> Result:
+    """Open the run of a subagent (SubagentStart: `session` is its parent's, `agent_id` its own) or of a driven
+    session. The project is the session's own unless given. An open run of the same agent is returned as it is
+    (a repeated hook). The runner and the hook CLI's step (tasks.py run hook), not for MCP callers."""
+    _runner_only(ctx, "run.open")
+    sid = store._session_id(session)
+    aid = store._text(agent_id, "agent_id")
+    existing = store.open_run(conn, sid, aid)
+    if existing is not None:
+        run = store.get_agent_run(conn, existing)
+        return Result(run, existing, run, run, changed=False)
+    pid = int(store._project_row(conn, project)["id"]) if project is not None else store.run_project(conn, sid)
+    if pid is None:
+        raise ValueError(f"{sid} is neither a task-manager nor a driven session of a project: no run to open")
+    run = store.start_agent_run(conn, pid, sid, aid, store._enum(kind, ("subagent", "session"), "kind"),
+                          None if task_id is None else int(_task(conn, task_id)["id"]))
+    return Result(run, run["id"], None, {k: run[k] for k in ("project_id", "session_id", "agent_id", "kind")})
+
+
+@action("run.close", "agent_run")
+def run_close(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = None, reason: Any = "stopped") -> Result:
+    """Close the open run of that agent with its summary (SubagentStop). No open run (a stop with no start: the
+    hook tolerates it) is a no-op that returns None. Not for MCP callers."""
+    _runner_only(ctx, "run.close")
+    sid = store._session_id(session)
+    run_id = store.open_run(conn, sid, store._text(agent_id, "agent_id"))
+    if run_id is None:
+        return Result(None, None, None, None, changed=False)
+    before = store.get_agent_run(conn, run_id)
+    after = _close_run(conn, run_id, store._text(reason, "reason", required=True) or "stopped")
+    return Result(after, run_id, {"ended_at": None, "end_reason": None},
+                  {"ended_at": after["ended_at"], "end_reason": after["end_reason"],
+                   "writes": after["summary"]["write_count"], "pending": len(after["summary"]["pending"])})
+
+
+@action("proposal.alert", "proposal")
+def proposal_alert(conn: sqlite3.Connection, ctx: Ctx, ids: Any) -> Result:
+    """The proposal_alert tick told the owner these open proposals waited too long: mark them so the alert
+    is sent once, not at every tick. A runner's step."""
+    _runner_only(ctx, "proposal.alert")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        raise ValueError("ids must be a non-empty list of proposal ids")
+    store.mark_proposals_alerted(conn, ids)
+    return Result({"alerted": ids}, None, {"alerted": []}, {"alerted": ids})
+
+
+def overdue_proposal_alert(conn: sqlite3.Connection, now: datetime) -> tuple[str, str, list[int]] | None:
+    """What the proposal_alert tick has to say now: (subject, body, proposal ids) for the open proposals older
+    than the setting proposal_alert_hours that were not alerted yet, else None."""
+    hours = float(get_setting(conn, "proposal_alert_hours"))
+    rows = store.overdue_proposals(conn, store.iso_ms(now - timedelta(hours=hours)))
+    if not rows:
+        return None
+    subject, body = proposals.alert_text(rows, hours)
+    return subject, body, [int(r["id"]) for r in rows]
+
+
 def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], params: dict[str, Any]) -> Any:
     """Run a proposal's action as the reviewer with via `proposal` and an audit origin (inside the review's
     transaction: any failure, a stale version included, rolls the whole review back). The reviewer's rights are
@@ -701,7 +777,17 @@ def task_move(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, stage: Any, vers
 
 @action("task.block", "task")
 def task_block(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, question: Any, version: Any = None) -> Result:
-    return _task_change(conn, task_id, version, lambda: store.block_task(conn, task_id, question))
+    """With roles enforced, an agent's block is held back from the human inbox until its task-manager forwards it
+    (task.forward, §3.7); in shadow it goes to the inbox as before (the old rule's behaviour)."""
+    by = ctx.actor if ctx.actor.startswith("agent:") and roles_mode(conn, report=False) == "on" else None
+    return _task_change(conn, task_id, version, lambda: store.block_task(conn, task_id, question, by))
+
+
+@action("task.forward", "task")
+def task_forward(conn: sqlite3.Connection, ctx: Ctx, task_id: Any, version: Any = None) -> Result:
+    """The task-manager passes the question of a task an agent blocked on to the human inbox (sets
+    forwarded_at); before that the task is blocked but not in pending_user_input. Not for an agent."""
+    return _task_change(conn, task_id, version, lambda: store.forward_task(conn, task_id))
 
 
 @action("task.answer", "task")
@@ -1269,6 +1355,8 @@ SETTINGS: dict[str, Setting] = {
                                       "killed and fails (D-234)", "automation"),
     "runner_timeout_prune_runs": _num(10, 0.5, 720, "Runner: minutes the daily prune of its run records may "
                                       "take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_proposal_alert": _num(2, 0.5, 720, "Runner: minutes a proposal-alert run may take before it "
+                                          "is killed and fails (D-234)", "automation"),
     "runner_timeout_status_snapshot": _num(2, 0.5, 720, "Runner: minutes a status-snapshot run may take before it "
                                            "is killed and fails (D-234)", "automation"),
     "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
@@ -1343,6 +1431,10 @@ SETTINGS: dict[str, Setting] = {
                                section="auth", kind="login_rate"),
     # --- host (phase 6a W7 / 5d; design §10.4, D-229). 5d's X3 (not built) adds working_root and the
     # rest of this section's settings; it reuses this key rather than redefining it.
+    # phase 5a A4 (§3.7): the proposal_alert tick tells the owner once about a proposal the task-manager has not
+    # decided after this many hours
+    "proposal_alert_hours": _num(24, 1, 720, "Hours an agent proposal may wait for the task-manager's review "
+                                             "before the owner is alerted (once per proposal)", "automation"),
     "roles_enforce": Setting("shadow", _roles_enforce,
                              "Roles (phase 5a): \"shadow\" logs what the permission matrix would refuse or turn "
                              "into a proposal and changes nothing; \"on\" enforces it. \"on\" is refused until "
@@ -2005,7 +2097,7 @@ def _tmux_name(value: Any) -> str:
 @action("driven.set", "driven_session")
 def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = None, tmux: Any = None,
                project: Any = None, task_id: Any = None, started_at: Any = None, ended_at: Any = None,
-               live: Any = None) -> Result:
+               live: Any = None, end_reason: Any = None) -> Result:
     """Add or change a driven session's row: kind (DRIVEN_KINDS), tmux (its name), project (name
     or id; required for a task-manager), task_id, started_at, ended_at (ISO times; a set ended_at
     frees the name), live (true: an ended row is live again, ended_at cleared; S2's launchers when
@@ -2061,7 +2153,25 @@ def driven_set(conn: sqlite3.Connection, ctx: Ctx, session_id: Any, kind: Any = 
     if before is not None and all(before.get(k) == v for k, v in fields.items()):
         return Result(before, sid, before, before, changed=False)
     after = store.upsert_driven_session(conn, sid, **fields)
+    _driven_run(conn, before, after, None if end_reason is None else store._text(end_reason, "end_reason"))
     return Result(after, sid, before, after)
+
+
+def _driven_run(conn: sqlite3.Connection, before: store.Row | None, after: store.Row | None,
+                end_reason: str | None) -> None:
+    """The run of a driven agent session (§3.8): opened when its row goes live, closed when it ends. The
+    task-manager's own session is the reviewer, not a run."""
+    if after is None or after["kind"] == "task-manager":
+        return
+    sid = after["session_id"]
+    was_live = before is not None and before.get("ended_at") is None
+    if after.get("ended_at") is None and not was_live:
+        if store.open_run(conn, sid, None) is None:
+            store.start_agent_run(conn, after.get("project_id"), sid, None, "session", after.get("task_id"))
+    elif after.get("ended_at") is not None and was_live:
+        run_id = store.open_run(conn, sid, None)
+        if run_id is not None:
+            _close_run(conn, run_id, end_reason or "ended")
 
 
 def current_session(conn: sqlite3.Connection, sid: str) -> str:
@@ -2105,7 +2215,10 @@ def session_cleared(conn: sqlite3.Connection, ctx: Ctx, old_session: Any, new_se
     marks = ",".join("?" for _ in CLEARED_INBOX)
     moved = conn.execute(f"UPDATE inbox_messages SET session_id=? WHERE session_id=? AND status IN ({marks})",
                          (new, old) + CLEARED_INBOX).rowcount
+    runs_moved = store.move_run_session(conn, old, new)     # the agent run goes on in the same process (A4)
     out = dict(after or {}, cleared_from=old, projects=projects, inbox_moved=moved)
+    if runs_moved:
+        out["runs_moved"] = runs_moved
     return Result(out, new, dict(before, projects=projects), out)
 
 

@@ -968,7 +968,8 @@ class SimpleTicks(Base):
 
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
-                                                         "inbox", "inbox_verify", "status_snapshot", "request"}
+                                                         "inbox", "inbox_verify", "status_snapshot", "request",
+                                                         "proposal_alert"}
                                                        | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4-S7, S9b, 3b S5
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
