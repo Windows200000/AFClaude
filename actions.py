@@ -126,6 +126,7 @@ class Proposed(Exception):
 
     def __init__(self, proposal_id: int, project_id: int | None, summary: str) -> None:
         self.proposal_id, self.project_id, self.summary = proposal_id, project_id, summary
+        self.notice: int | None = None      # A5: the inbox notice it left for the task-manager (wake the runner)
         self.message = proposals.proposed_message(proposal_id, summary)
         super().__init__(self.message)
 
@@ -294,6 +295,9 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
     if seen:
         _shadow_after(conn, ctx, name, seen[0], "the action itself WAS carried out and is committed", None)
     if isinstance(res, Proposed):
+        if res.notice is not None:
+            import runner     # A5: the inbox job delivers the notice (or wakes the task-manager) at once
+            runner.wake()     # never blocks or raises; the job's own tick is the backstop
         raise res
     return res
 
@@ -330,6 +334,8 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                 # Proposals need no one to be up: the row waits (nothing is applied by timeout, §3.7).
                 prop = _capture_proposal(conn, ctx, name, params, verdict, shadow=False)
                 done = Proposed(prop["id"], prop["project_id"], prop["summary"])
+                notice = _proposal_notice(conn, ctx, prop)      # A5: a separate session's proposal (§3.8)
+                done.notice = None if notice is None else int(notice["id"])
                 if key is not None:
                     store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
                     store.put_idempotency(conn, key, actor, name, request_sha, done.stored())
@@ -364,6 +370,26 @@ def _capture_proposal(conn: sqlite3.Connection, ctx: Ctx, name: str, params: Map
     agent_id = ctx.actor.split(":", 2)[2] if ctx.actor.startswith("agent:") and ctx.actor.count(":") == 2 else None
     return store.add_proposal(conn, pid, store.open_run(conn, sid, agent_id), ctx.actor, name, dict(params),
                               proposals.version_seen(params), proposals.summarize(name, params), shadow=shadow)
+
+
+def _proposal_notice(conn: sqlite3.Connection, ctx: Ctx, prop: store.Row) -> store.Row | None:
+    """Phase 5a A5 (§3.8, D-188/D-194): a proposal from a separate session (a driven agent session or one of its
+    subagents) leaves a short notice for the project's task-manager in the inbox, in the proposal's own
+    transaction (no audit row: like the proposal row, the notice is part of the capture). The runner's inbox
+    job delivers it at the task-manager's next idle point, or, when no run of it is going, wakes it with a
+    `proposal_review` request (inbox_worker.proposal_wake). Never for a shadow row (the caller is the `on` path)
+    nor for a subagent of the task-manager itself (A0's hooks bring that run's summary into its context).
+    None: no notice (that subagent case, a proposal without a project, or a project whose task-manager session
+    does not exist yet: it starts the driven sessions, so none can propose before it; the proposal_alert tick
+    still reminds the owner)."""
+    if prop["shadow"] or prop["project_id"] is None:
+        return None
+    tm = store._project_row(conn, prop["project_id"])["manager_session"]
+    if not tm:
+        return None
+    if ctx.actor_session is not None and tm in store.session_family(conn, ctx.actor_session):
+        return None
+    return store.add_proposal_notice(conn, tm, proposals.notice_text(prop), ctx.actor)
 
 
 @action("proposal.review", "proposal")
@@ -2001,7 +2027,9 @@ def prompt_var_migrate(conn: sqlite3.Connection, ctx: Ctx) -> Result:
 # (S5) records that through request.start / request.finish, audited: that is what the requester
 # sees, unlike the run row itself (D-256). The runner's job "request" consumes them (S5, run_now.py).
 
-REQUEST_KINDS = ("continue_now", "review_now", "work_on_now")
+REQUEST_KINDS = ("continue_now", "review_now", "work_on_now", "proposal_review")
+# phase 5a A5 (D-194): proposal_review (target = a project) wakes a task-manager for an agent's proposal; only
+# the runner files it (request.wake, from the inbox job), at most one open per project
 REQUEST_STATUSES = ("open", "started", "refused", "failed", "done", "cancelled")   # done, cancelled: legacy
 REQUEST_FINISH = {"refused": ("open",), "failed": ("open", "started")}   # outcome -> from
 
@@ -2022,6 +2050,9 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
     is a valid target: its first start creates it (D-281). The caller wakes the runner after the
     commit (runner.wake; phase 3b S5: it runs the request at once, run_now.py)."""
     store._enum(kind, REQUEST_KINDS, "kind")
+    if kind == "proposal_review":
+        raise ValueError("proposal_review is filed by the runner for an agent's proposal (request.wake), "
+                         "not asked for: use work_on_now")
     if kind == "continue_now":
         target = store._text(target, "target", required=True)
         if store.get_session(conn, target) is None:
@@ -2037,6 +2068,22 @@ def request_add(conn: sqlite3.Connection, ctx: Ctx, kind: Any, target: Any = Non
     if open_:
         return Result(open_, open_["id"], open_, open_, changed=False)
     r = store.add_request(conn, ctx.actor, kind, target)
+    return Result(r, r["id"], None, r)
+
+
+@action("request.wake", "request")
+def request_wake(conn: sqlite3.Connection, ctx: Ctx, project: Any) -> Result:
+    """Phase 5a A5 (D-194): wake the task-manager of `project` (name or id) for an agent's proposal: a
+    `proposal_review` request, which the runner's request job runs at once like a run-now (run_now.py: no
+    window or budget gate, the preflight applies, D-186). At most one open per project (the wake-loop guard):
+    asking again returns the open one, unchanged. The inbox job's step (inbox_worker.proposal_wake), not for
+    MCP callers; the caller wakes the runner after the commit."""
+    _runner_only(ctx, "request.wake")
+    target = str(store._project_row(conn, project)["id"])
+    open_ = store.open_request(conn, "proposal_review", target)
+    if open_:
+        return Result(open_, open_["id"], open_, open_, changed=False)
+    r = store.add_request(conn, ctx.actor, "proposal_review", target)
     return Result(r, r["id"], None, r)
 
 

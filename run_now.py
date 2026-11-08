@@ -17,6 +17,11 @@ requester sees, D-154/D-256):
   continue_now  one stalled session through the dispatcher's continue path (dispatcher.continue_now:
                 the D-206 preflight, its reset), no decision row needed.
   review_now    a one-off full usage review without the quota gate (usage_review.review_now).
+  proposal_review  phase 5a A5 (D-194): the runner's own request (request.wake, from the inbox job) to wake a
+                task-manager for an agent's proposal: as work_on_now (the rules of a waking owner message,
+                D-186: no window or budget gate, the preflight applies), its start's message bringing the
+                waiting proposal notices (inbox.held_insert); refused while automation is paused (install-wide
+                or the project's: the wake is automation, and a failed one pauses, so no wake loop follows).
 Refused (it can't run now) is not a failure. A failure alerts AND pauses automation (D-282, for now:
 a pre-release step makes it alert-only, design §13): the handler's own paths report it (fail_stop),
 and one that did not is reported here. A crash records the request failed, then raises (the runner
@@ -55,15 +60,16 @@ def state_key(request_id):
     return f"request:{request_id}"
 
 
-def work_on_now(conn, req, now):
-    """-> (outcome, detail, session id). See the module doc."""
+def work_on_now(conn, req, now, why=None, rule="D-153"):
+    """-> (outcome, detail, session id). See the module doc. why / rule: what the start says it is
+    (proposal_review's own words)."""
     pid = int(req["target"])
     tm = next((t for t in store.task_managers(conn) if int(t["project_id"]) == pid), None)
     if tm is None:
         return "refused", f"unknown target: project #{pid} does not exist", None
     key = state_key(req["id"])
-    why = f"run-now request #{req['id']}"
-    reason = f"{why} by {req['actor']} (D-153: no window, budget or timing gate)"
+    why = why or f"run-now request #{req['id']}"
+    reason = f"{why} by {req['actor']} ({rule}: no window, budget or timing gate)"
     stall = {"uuid": key, "timestamp": now, "run_now": True, "prompt": "continue",
              "budget": "run-now: no budget gate (D-153)",
              "project": {"project_id": pid, "name": tm["name"], "why": why}}
@@ -111,7 +117,17 @@ def review_now(conn, req, now):
     return ("started", tmux, sid) if ok else ("failed", "the review's launch failed", sid)
 
 
-HANDLERS = {"work_on_now": work_on_now, "continue_now": continue_now, "review_now": review_now}
+def proposal_review(conn, req, now):
+    """Phase 5a A5: wake the project's task-manager for an agent's proposal (see the module doc)."""
+    p = failstop.paused(project=int(req["target"]))
+    if p.get("paused"):
+        return "refused", f"automation is paused ({p.get('reason') or 'no reason given'}): no wake", None
+    return work_on_now(conn, req, now, why=f"proposal review request #{req['id']} (an agent's proposal)",
+                       rule="D-194/D-186")
+
+
+HANDLERS = {"work_on_now": work_on_now, "continue_now": continue_now, "review_now": review_now,
+            "proposal_review": proposal_review}
 
 
 @contextlib.contextmanager

@@ -23,6 +23,7 @@ import usage_review as ur
 UTC = timezone.utc
 HERE = os.path.dirname(os.path.abspath(__file__))
 SID = "11111111-2222-3333-4444-555555555555"
+SID_P = "11111111-2222-3333-4444-666666666666"     # a task-manager with a waiting proposal notice (phase 5a A5)
 
 
 def files():
@@ -372,6 +373,8 @@ class SameTextTest(unittest.TestCase):
                                     via="dashboard")
                 actions.perform(conn, "inbox.triage", {"message_id": m["id"], "verdict": verdict, "reason": "r"},
                                 actor="runner:inbox", via="runner")
+            store.add_proposal_notice(conn, SID_P, "P-1 by agent:x (task.edit): task.edit #3: title='x'", "agent:x")
+            conn.commit()
             seed_checkout(conn)
         finally:
             conn.close()
@@ -412,10 +415,13 @@ class SameTextTest(unittest.TestCase):
         try:
             out["inbox notes"] = inbox.notes_insert(conn, SID)[0]
             out["inbox held"] = inbox.held_insert(conn, SID)[0]
+            out["proposal held"] = inbox.held_insert(conn, SID_P)[0]     # phase 5a A5
         finally:
             conn.close()
         out["inbox triage"] = inbox.triage_prompt("a {message}")
         out["inbox now"] = inbox.now_message({"id": 7, "created_at": "2026-10-21T08:00:00Z", "text": "x\ny"}, "N")
+        out["proposal now"] = inbox.now_message({"id": 8, "created_at": "2026-10-21T08:00:00Z", "text": "P-1",
+                                                 "origin": store.PROPOSAL_ORIGIN}, None)
         task = {"name": "t1", "title": "T", "report": "review:t1", "fields": {"date": "2026-10-23", "since": "x",
                                                                               "report": "review:t1"}}
         for ps in (list(ur.MONTHLY_PROMPTS), ["stage_eta_review_once", "stage_eta_review_rerun"],

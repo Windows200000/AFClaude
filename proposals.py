@@ -46,6 +46,12 @@ def proposed_message(proposal_id: int, summary: str) -> str:
     return (f"proposed as P-{proposal_id}, waiting for the task-manager's review (nothing was changed): {summary}")
 
 
+def notice_text(prop: Mapping[str, Any]) -> str:
+    """Phase 5a A5: the inbox notice of a separate session's proposal for its task-manager (store.add_proposal_notice;
+    proposal_notice.md frames it): which proposal, whose, what it would do."""
+    return f"P-{prop['id']} by {prop['actor']} ({prop['action']}): {prop['summary']}"
+
+
 # ---- the run summary (§3.8, D-182, D-243): everything an agent did in one run, for its task-manager
 
 WRITE_KINDS = (("task.", "tasks"), ("handoff.", "handoffs"), ("doc.append", "alerts"))   # the rest: "other"

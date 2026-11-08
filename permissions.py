@@ -431,6 +431,7 @@ MATRIX: dict[str, Perm] = {
     "request.add": Perm(scope="request", human="manager", force=True),
     "request.start": INTERNAL,
     "request.finish": INTERNAL,
+    "request.wake": INTERNAL,             # A5: the inbox job wakes a task-manager for a proposal (D-194)
     # --- the runner's own bookkeeping
     "driven.set": INTERNAL,
     "session.cleared": INTERNAL,

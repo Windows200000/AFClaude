@@ -1260,6 +1260,8 @@ class EveryAction(Base):
             ("run.close", {"session": SID, "agent_id": "sub1", "reason": "SubagentStop"}),
             ("proposal.alert", {"ids": [1]}),
             ("task.forward", {"task_id": 3}),
+            # phase 5a A5: the inbox job wakes a task-manager for a separate session's proposal
+            ("request.wake", {"project": "P"}),
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row

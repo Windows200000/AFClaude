@@ -491,7 +491,7 @@ def requests_block():
                 continue
             res = json.loads(r["result"]) if r.get("result") else {}
             target = r["target"]
-            if r["kind"] == "work_on_now" and target is not None:
+            if r["kind"] in ("work_on_now", "proposal_review") and target is not None:
                 target = names.get(str(target), f"project #{target}")
             out.append({"id": r["id"], "kind": r["kind"], "target": target, "status": r["status"], "by": r["actor"],
                         "at_berlin": bstr(at), "handled_berlin": bstr(store.parse_iso(r["handled_at"]))

@@ -3625,6 +3625,13 @@ def set_request_state(conn: sqlite3.Connection, request_id: int, status: str, re
     return r
 
 
+def latest_request(conn: sqlite3.Connection, kind: str, target: str | None = None) -> Row | None:
+    """The newest request of `kind` for `target`, whatever its status (phase 5a A5: the proposal wake)."""
+    r = conn.execute("SELECT * FROM action_requests WHERE kind=? AND COALESCE(target, '')=? ORDER BY id DESC LIMIT 1",
+                     (kind, target or "")).fetchone()
+    return dict(r) if r else None
+
+
 def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: int = 50) -> list[Row]:
     if status is None:
         rows = conn.execute(f"SELECT * FROM action_requests ORDER BY id DESC LIMIT {int(limit)}")
@@ -4325,6 +4332,9 @@ def inbox_row(conn: sqlite3.Connection, msg_id: object) -> Row:
 
 
 INBOX_ORIGINS = ("typed", "option", "edit")
+# phase 5a A5: a notice of an agent's proposal for the task-manager (add_proposal_notice), no owner text: born
+# "now" (no triage), kept out of the owner's views (inbox.thread / summary), delivered like a "now" message
+PROPOSAL_ORIGIN = "proposal"
 
 
 def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str,
@@ -4346,6 +4356,20 @@ def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, create
             conn.execute("UPDATE inbox_messages SET status='noted', verdict='note', verdict_reason=?, triaged_at=? "
                          "WHERE id=?", (noted, ts, _rowid(cur)))
         m = get_inbox(conn, _rowid(cur))
+    assert m is not None
+    return m
+
+
+def add_proposal_notice(conn: sqlite3.Connection, session_id: str, text: object, created_by: str) -> Row:
+    """Phase 5a A5 (D-188): the notice of an agent's proposal for the task-manager session `session_id`,
+    written inside the proposal's own transaction (actions._proposal_notice): pending with the verdict "now"
+    at once (a notice needs no triage), origin PROPOSAL_ORIGIN."""
+    ts = now_iso()
+    cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, origin, verdict, "
+                       "verdict_reason, triaged_at) VALUES (?, ?, ?, ?, ?, 'now', ?, ?)",
+                       (ts, created_by, _session_id(session_id), inbox_text(text), PROPOSAL_ORIGIN,
+                        "an agent's proposal: a notice, no triage (D-188)", ts))
+    m = get_inbox(conn, _rowid(cur))
     assert m is not None
     return m
 

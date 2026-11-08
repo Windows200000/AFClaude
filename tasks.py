@@ -1068,6 +1068,8 @@ def run_inbox_messages(conn, args):
     ic = args.inbox_cmd
     if ic == "list":
         rows = store.list_inbox(conn, None if args.all else INBOX_OPEN, limit=50)
+        if not args.all:      # A5: a delivered proposal notice needs no answer (`tasks.py proposals` has the proposal)
+            rows = [m for m in rows if not (m["origin"] == store.PROPOSAL_ORIGIN and m["status"] == "delivered")]
         if args.json:
             return dump(rows)
         if not rows:

@@ -115,6 +115,9 @@ COMPACT_FLOW_MAX = (ka.COMPACT_IDLE_WAIT + 2 * ka.SAVE_TIMEOUT
                     + ka.HANDOFF_REFRESHES * (ka.COMPACT_TURN_WAIT + ka.SAVE_TIMEOUT)
                     + 2 * ka.COMPACT_TURN_WAIT + ka.CLEAR_TIMEOUT + ka.VERIFY_TIMEOUT + timedelta(minutes=5))
 HOLD_COMPACTING = "the keep-alive's compaction flow is running (it goes in after the READY, D-262)"
+# phase 5a A5: the hold of a proposal notice whose task-manager was woken (proposal_wake); the prefix says a
+# wake was made for it, so it is not made again (an owner's retry clears the hold: a fresh wake)
+WAKE_HOLD = "no run of the task-manager is going: woken by run-now request"
 
 
 def log(msg: str) -> None:
@@ -420,10 +423,62 @@ def hold(conn: Any, m: dict[str, Any], why: str, now: datetime) -> str:
     return "held"
 
 
+# ---------------------------------------------------------------- proposal notices (phase 5a A5)
+#
+# A proposal from a separate session (a driven agent session, not a subagent of the task-manager) leaves a
+# notice in the inbox (actions._proposal_notice, origin "proposal", verdict "now" at once, never for a shadow
+# row). While a keep-alive run of the task-manager is going it is delivered like an owner's "now" message (the
+# same checks: lock, compaction flow, usage limit, preflight, owner typing; typed in, Claude Code takes it at
+# its next stop). Otherwise the task-manager is woken through the run-now path (D-194): a `proposal_review`
+# request (request.wake, at most one open per project), run at once by the runner's request job with the
+# rules of a waking owner message (D-186: no window or budget gate, the preflight applies; run_now.py), whose
+# start's message takes the notice along (inbox.held_insert). Not while automation is paused (the wake is
+# automation: a failed wake pauses, D-235/D-282, so a wake loop can't follow): the notice is held. One wake per
+# notice: once woken (WAKE_HOLD) it waits for that request; refused or failed, it is held until the next start
+# takes it along, like any held message (inbox.hold_deadline: after that an error). A notice that arrives while
+# another one's request is open shares that request.
+
+def woken(m: dict[str, Any]) -> bool:
+    """A wake was made for this proposal notice (its hold says so)."""
+    return bool(m.get("hold")) and str(m["hold"]).startswith(WAKE_HOLD)
+
+
+def proposal_wake(conn: Any, m: dict[str, Any], sid: str, now: datetime) -> str | None:
+    """The task-manager `sid` of proposal notice `m` is not in a run: wake it (or wait for the wake already
+    made) and hold the notice -> "held" | "failed"; None: a run of it is going, deliver the notice now. A
+    check that can't be made raises (the caller: an error on the notice, alert + pause)."""
+    if ka.run_active(sid, now, load_state()) is not None:
+        return None
+    fam = store.session_family(conn, sid)
+    pid = next((int(t["project_id"]) for t in store.task_managers(conn) if t["session"] in fam), None)
+    if pid is None:
+        raise RuntimeError(f"the session {sid[:8]} is no project's task-manager")
+    p = failstop.paused(project=pid)
+    if p.get("paused"):
+        return hold(conn, m, f"automation is paused ({p.get('reason') or 'no reason given'}): no wake for an "
+                             "agent's proposal until it is resumed", now)
+    req = store.open_request(conn, "proposal_review", str(pid))
+    if req is None and woken(m):
+        last = store.latest_request(conn, "proposal_review", str(pid))
+        if last is None:
+            raise RuntimeError(f"the notice says it was woken, but project #{pid} has no proposal_review request")
+        why = json.loads(last["result"]).get("reason") if last["result"] else None
+        return hold(conn, m, f"{WAKE_HOLD} #{last['id']}, which was {last['status']}"
+                             + (f" ({why})" if why else "") + ": the next start takes it along", now)
+    if req is None:
+        req = _act(conn, "request.wake", project=pid)
+        log(f"inbox #{m['id']}: the task-manager {sid[:8]} is not in a run: woken by request #{req['id']} (D-194)")
+        import runner      # late, as store_verify does
+        runner.wake()
+    return hold(conn, m, f"{WAKE_HOLD} #{req['id']} (D-194)", now)
+
+
 def build(conn: Any, m: dict[str, Any], plan: str, cwd: str) -> tuple[str, list[int]]:
     """The message to type in and the noted messages going along with it (left out if the message
     would get too long for one send). A live session gets inbox_now.md alone; a resumed one also
     the standing rules (or the hook's pointer), like every message that starts a session."""
+    if m["origin"] == store.PROPOSAL_ORIGIN and plan != "send-keys":   # proposal_wake: only during a run
+        raise RuntimeError(f"a proposal notice goes into the running task-manager only, but the plan is {plan}")
     notes, ids = inbox.notes_insert(conn, m["session_id"])
     about = inbox.question_about(conn, m)       # a plain answer to a question names it
     for n, i in ((notes, ids), (None, [])):
@@ -447,14 +502,22 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
         failed(conn, m, "inbox message not delivered", f"no transcript of the session {sid[:8]}")
         return "failed"
     lock = ka.session_lock(sid)
-    if lock is None:
-        return hold(conn, m, HOLD_LOCKED, now)
+    if lock is None:     # a woken proposal notice keeps its reason (proposal_wake reads it): its wake is typing
+        return hold(conn, m, m["hold"] if woken(m) else HOLD_LOCKED, now)
     try:
         cur = store.get_inbox(conn, m["id"])     # under the lock: a start may have taken it along (D-244)
         if cur is None or cur["status"] != "pending":
             log(f"inbox #{m['id']}: no longer pending ({cur['status'] if cur else 'gone'}), not sent")
             return "gone"
         m = cur
+        if m["origin"] == store.PROPOSAL_ORIGIN:
+            try:
+                waits = proposal_wake(conn, m, sid, now)
+            except Exception as e:   # noqa: BLE001 - an error on the notice, alert + pause (D-235)
+                failed(conn, m, "proposal wake failed", f"{type(e).__name__}: {e}")
+                return "failed"
+            if waits is not None:
+                return waits
         try:
             why, plan = delivery_hold(sid, path, now)
         except Exception as e:   # noqa: BLE001 - an error on the message (D-235)
