@@ -42,7 +42,8 @@ CALLER = "11111111-2222-4333-8444-555555555555"
 EXPECTED_TOOLS = {"afclaude_add_task", "afclaude_list_tasks", "afclaude_get_task", "afclaude_update_task",
                   "afclaude_answer_task", "afclaude_project", "afclaude_inbox", "afclaude_decide_session",
                   "afclaude_rule", "afclaude_ask", "afclaude_handoff", "afclaude_doc", "afclaude_decisions",
-                  "afclaude_notice", "afclaude_request", "afclaude_prompts", "afclaude_reply"}
+                  "afclaude_notice", "afclaude_request", "afclaude_prompts", "afclaude_reply",
+                  "afclaude_proposals", "afclaude_review"}
 
 
 def run(coro):
@@ -540,6 +541,35 @@ class Notices(Env):
         finally:
             c.close()
 
+    def test_proposal_tools(self):
+        """afclaude_proposals lists and shows agents' proposals, afclaude_review decides them (phase 5a A4); a write
+        that became a proposal is an answer ("proposed as P-n"), not a tool error."""
+        c = self.conn()
+        try:
+            p = store.add_project(c, "Proj", None, self.work)
+            tid = run(ms.afclaude_add_task("t1", project="."))["id"]
+            row = store.add_proposal(c, p["id"], None, "agent:s1", "task.edit", {"task_id": tid, "title": "better"},
+                                     None, "task.edit #%d: title='better'" % tid)
+            c.commit()
+        finally:
+            c.close()
+        r = run(ms.afclaude_proposals())
+        self.assertEqual([(x["id"], x["project"], x["status"]) for x in r["proposals"]], [(row["id"], "Proj", "proposed")])
+        self.assertEqual(run(ms.afclaude_proposals(id=row["id"]))["payload"], {"task_id": tid, "title": "better"})
+        self.assertEqual(run(ms.afclaude_proposals(project="."))["proposals"][0]["id"], row["id"])
+        with self.assertRaisesRegex(ToolError, "needs a note"):
+            asyncio.run(ms.afclaude_review(row["id"], "reject"))
+        r = run(ms.afclaude_review(row["id"], "edit", payload={"title": "best"}))
+        self.assertEqual((r["status"], r["applied"]["title"]), ("edited", "best"))
+        self.assertEqual(run(ms.afclaude_proposals())["proposals"], [])
+        self.assertEqual(run(ms.afclaude_proposals(status="all"))["proposals"][0]["status"], "edited")
+        with self.assertRaisesRegex(ToolError, "no proposal"):
+            asyncio.run(ms.afclaude_proposals(id=999))
+        with mock.patch.object(ms, "act", side_effect=actions.Proposed(5, p["id"], "task.edit #1: title='x'")):
+            r = run(ms.afclaude_update_task(tid, title="x"))
+        self.assertEqual((r["proposed"], r["proposal_id"]), (True, 5))
+        self.assertIn("proposed as P-5", r["message"])
+
     def test_notice_tool(self):
         """afclaude_notice (D-306): post (audited as the calling session) and list the owner's notices."""
         c = self.conn()
@@ -819,8 +849,9 @@ class Stdio(unittest.TestCase):
         # 15000 until afclaude_prompts (phase 4a P4), 17500 for afclaude_decisions' propose (phase 4b Q1: the write
         # action's parameters, about 800 bytes), 18000 for record, supersedes and ref (phase 4b Q2 W1: 17535),
         # then afclaude_ask's options (phase 4b Q3 W1: 17800), 18500 for the hand-off's drop_working_notes (was 17987),
-        # 19000 for afclaude_reply (phase 4b Q4: about 400 bytes)
-        self.assertLess(size, 19000, f"tool list is {size} bytes")
+        # 19000 for afclaude_reply (phase 4b Q4: about 400 bytes), 21000 for afclaude_proposals / afclaude_review
+        # (phase 5a A4)
+        self.assertLess(size, 21000, f"tool list is {size} bytes")
         a = json.loads(added.content[0].text)
         self.assertFalse(added.is_error)
         self.assertEqual((a["project"], a["project_source"], a["title"]), ("StdioProj", "cwd", "via stdio"))

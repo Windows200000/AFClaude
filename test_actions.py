@@ -1252,6 +1252,8 @@ class EveryAction(Base):
                                    "group_map": [{"group": "eng", "grant": "project:P:viewer"}]}),
             ("user.revoke", {"user_id": 2}),
             ("machine.revoke", {"user_id": 1}),
+            # phase 5a A4: a proposal an agent made (stored by perform in enforcing mode; here by hand), rejected
+            ("proposal.review", {"proposal_id": 1, "decision": "reject", "note": "not now"}),
         ]
         # a new action needs a line here; decision.seed is CLI-only (refused for the dashboard), its audit rows
         # are in test_decisions_seed; question.decide writes the entry's rows too and question.answer an inbox row
@@ -1264,6 +1266,10 @@ class EveryAction(Base):
         for i, (name, params) in enumerate(script, 1):
             if name == "grant.sync_groups":     # a person user, as phase 6a will create them
                 store.add_user(self.conn, "person", "someone", "owner")
+                self.conn.commit()
+            if name == "proposal.review":       # what perform stores for an agent's write when roles are enforced
+                store.add_proposal(self.conn, 1, None, "agent:" + SID, "task.edit", {"task_id": 3, "title": "x"},
+                                   None, "task.edit #3: title='x'")
                 self.conn.commit()
             if name == "install.stamp":         # a one-off for a database that predates the marker
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")

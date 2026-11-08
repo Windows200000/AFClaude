@@ -2,7 +2,7 @@
 
 One table (`MATRIX`) holds a `Perm` per action; `check()` resolves the caller's principal (roles.parse_actor,
 its grants, the project it manages or works in) and the target's project(s) and returns a `Verdict`:
-allowed, proposal (an agent's write that becomes a proposal for the task-manager, built in A4) or refused.
+allowed, proposal (an agent's write that becomes a proposal for the task-manager, actions.perform A4) or refused.
 `check()` only reads. actions.perform() acts on the verdict according to the `roles_enforce` setting: in
 shadow mode (the default, all of A3) it logs a non-allowed verdict (actions.roles_shadow_add, the
 `roles_shadow` table, the list `tasks.py roles shadow` prints) and the write goes on under the old
@@ -279,6 +279,17 @@ def _r_grant(conn: sqlite3.Connection, p: Params) -> Scope:
     return SCOPE_GLOBAL
 
 
+def _r_proposal(conn: sqlite3.Connection, p: Params) -> Scope:
+    """A proposal belongs to the project it was proposed in (A4); one that can't be found is the action's NotFound."""
+    pid = p.get("proposal_id")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise Unresolved("proposal id is not a number")
+    row = store.get_proposal(conn, pid)
+    if row is None:
+        raise Unresolved(f"no proposal P-{pid}")
+    return (row["project_id"],)
+
+
 SCOPES: dict[str, Resolver] = {
     "global": lambda conn, p: SCOPE_GLOBAL,
     "project": _r_project,
@@ -292,6 +303,7 @@ SCOPES: dict[str, Resolver] = {
     "notice": _r_notice,
     "request": _r_request,
     "grant": _r_grant,
+    "proposal": _r_proposal,
 }
 
 
@@ -442,6 +454,8 @@ MATRIX: dict[str, Perm] = {
     "inbox.dismiss": Perm(scope="inbox_message", human="editor"),
     "notice.post": _proj("notice"),
     "notice.dismiss": Perm(scope="notice", human="editor"),
+    # --- the task-manager's review of agents' proposals (§3.7; owners, managers and editors from 7a, D-190)
+    "proposal.review": Perm(scope="proposal", human="editor", task_manager="own_project"),
     # --- docs
     "doc.append": _proj("doc", agent="direct_if", agent_if="alerts_doc", runner=True),
     "doc.set": _proj("doc"),

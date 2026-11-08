@@ -73,6 +73,7 @@ CLASSES = [
     (["question.answer", "question.decide", "inbox.post", "inbox.retry", "inbox.dismiss", "notice.dismiss"],
      NO_AGENT_NO_TM),
     (["inbox.reply"], exp("AAAARRARARRRR")),
+    (["proposal.review"], exp("AAAARRARARRRR")),                      # editors up and the project's task-manager
     (["project.edit"], exp("AAARRRRRARRRA")),
     (["request.add"], exp("AAARRRRRRRRRR")),                          # work_on_now: a forced run
     (["grant.set", "grant.remove"], exp("AAARRRRRRRRRR")),
@@ -123,6 +124,9 @@ class Base(unittest.TestCase):
         self.dec = self.cli("decision.add", title="d", topics=["x"], author="task-manager", project="alpha")["id"]
         self.notice = self.cli("notice.post", title="n", text="x", project=self.A)["id"]
         self.msg = self.cli("inbox.post", text="hi", project="alpha")["id"]
+        self.prop = store.add_proposal(self.conn, self.A, None, self.actor["agent"], "doc.set", {"name": "x"}, None,
+                                       "doc.set x")["id"]
+        self.conn.commit()
         self.params = self.make_params()
 
     def tearDown(self):
@@ -143,7 +147,7 @@ class Base(unittest.TestCase):
             p[n] = {"task": {"task_id": self.task}, "question": {"task_id": self.task},
                     "doc": {"project": "alpha", "name": "progress"}, "decision": {"decision": self.dec},
                     "project": {"project": "alpha"}, "grant": {"scope": "project", "project": "alpha"},
-                    "prompt_var": {"project": "alpha"}}.get(fam, {})
+                    "prompt_var": {"project": "alpha"}, "proposal": {"proposal_id": self.prop}}.get(fam, {})
         p["task.add"] = p["task.ask"] = {"project": "alpha"}
         p["decision.add"] = {"project": "alpha"}
         p["notice.post"] = {"project": self.A}
@@ -563,10 +567,10 @@ class Guard(Base):
             actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 4.0},
                             actor=self.actor["machine_ungranted"], via="mcp")
         self.assertIn("refused", str(e.exception))
-        with self.assertRaises(actions.Forbidden) as e:
+        with self.assertRaises(actions.Proposed) as e:                     # A4: stored, not refused
             actions.perform(self.conn, "task.add", {"title": "x", "project": "alpha"}, actor=self.actor["agent"],
                             via="mcp", autonomous=True)
-        self.assertIn("proposal", str(e.exception))
+        self.assertIn("proposed as P-", str(e.exception))
         actions.perform(self.conn, "setting.set", {"key": "session_hours", "value": 4.0},
                         actor=f"machine:{r['user_id']}", via="mcp")                       # the owner machine: fine
         self.assertEqual(actions.get_setting(self.conn, "session_hours"), 4.0)

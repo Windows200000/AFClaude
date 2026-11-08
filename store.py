@@ -1113,8 +1113,12 @@ COLUMNS = {
               ("blocked_by", "TEXT"), ("forwarded_at", "TEXT")],
     "task_events": [],
     # phase 5a A2 (§3.1): the Claude session behind a machine, task-manager or agent actor (NULL for the host,
-    # runners, people and every row before this column). `origin` (A4's proposal link) comes with its step.
-    "audit_log": [("session", "TEXT")],
+    # runners, people and every row before this column). `origin` (A4): JSON {"proposal": id, "agent": actor}
+    # on a write applied from an approved proposal (via 'proposal', actor = the reviewer).
+    "audit_log": [("session", "TEXT"), ("origin", "TEXT")],
+    # phase 5a A4: 1 = a proposal recorded while roles_enforce was `shadow`: the write was already applied under
+    # the old rule (status 'approved', reviewer 'shadow'), the row is the record the run summary lists
+    "agent_proposals": [("shadow", "INTEGER NOT NULL DEFAULT 0")],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
     # D-227: base_sha256 vs the current prompt_defaults.sha256, refreshed by prompt.defaults_sync
@@ -2975,13 +2979,15 @@ def put_prompt_var(conn: sqlite3.Connection, project_id: int, name: str, value: 
 
 def add_audit(conn: sqlite3.Connection, actor: str, via: str, action: str, target_type: str | None = None,
               target_id: object = None, before: object = None, after: object = None,
-              request_id: str | None = None, ts: str | None = None, session: str | None = None) -> int:
-    """`session`: the Claude session behind a machine, task-manager or agent actor (phase 5a A2)."""
+              request_id: str | None = None, ts: str | None = None, session: str | None = None,
+              origin: object = None) -> int:
+    """`session`: the Claude session behind a machine, task-manager or agent actor (phase 5a A2). `origin`: the
+    proposal a write was applied from (A4)."""
     cur = conn.execute(
-        "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id, session) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit_log(ts, actor, via, action, target_type, target_id, before, after, request_id, session, "
+        "origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (ts or now_iso(), actor, via, action, target_type, None if target_id is None else str(target_id),
-         _json_or_none(before), _json_or_none(after), request_id, session))
+         _json_or_none(before), _json_or_none(after), request_id, session, _json_or_none(origin)))
     return _rowid(cur)
 
 
@@ -2998,7 +3004,8 @@ def audit_log(conn: sqlite3.Connection, limit: int = 50, target_type: str | None
         args.append(str(target_id))
     sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
     sql += f" ORDER BY id DESC LIMIT {int(limit)}"
-    return [dict(r, before=_loads(r["before"]), after=_loads(r["after"])) for r in conn.execute(sql, args)]
+    return [dict(r, before=_loads(r["before"]), after=_loads(r["after"]), origin=_loads(r["origin"]))
+            for r in conn.execute(sql, args)]
 
 
 def get_idempotency(conn: sqlite3.Connection, key: str) -> Row | None:
@@ -3235,6 +3242,84 @@ def roles_shadow_list(conn: sqlite3.Connection, day: str | None = None, since: s
         "MIN(project_id) AS project_id FROM roles_shadow" + (" WHERE " + " AND ".join(where) if where else "")
         + " GROUP BY day, actor, action, outcome, reason ORDER BY day DESC, n DESC, actor, action", args)
     return [dict(r) for r in rows]
+
+
+# ---- agent proposals (phase 5a A4, §3.7): written only through actions.py (perform's capture, proposal.review)
+
+PROPOSAL_OPEN = ("proposed", "postponed")      # waiting for the task-manager's review
+
+
+def _proposal_dict(r: sqlite3.Row) -> Row:
+    return dict(r, payload=json.loads(r["payload"]), shadow=bool(r["shadow"]))
+
+
+def open_run(conn: sqlite3.Connection, session: str | None, agent_id: str | None) -> int | None:
+    """The still-open agent_runs row of this agent (a subagent by its id, else the session's own run), or None.
+    The runs are opened by A4's second part; until then nothing is open and a proposal has no run."""
+    if not session:
+        return None
+    if agent_id:
+        r = conn.execute("SELECT id FROM agent_runs WHERE session_id=? AND agent_id=? AND ended_at IS NULL "
+                         "ORDER BY id DESC LIMIT 1", (session, agent_id)).fetchone()
+    else:
+        r = conn.execute("SELECT id FROM agent_runs WHERE session_id=? AND agent_id IS NULL AND ended_at IS NULL "
+                         "ORDER BY id DESC LIMIT 1", (session,)).fetchone()
+    return None if r is None else int(r["id"])
+
+
+def add_proposal(conn: sqlite3.Connection, project_id: int | None, run_id: int | None, actor: str, action: str,
+                 payload: object, version_seen: int | None, summary: str, shadow: bool = False) -> Row:
+    """One proposal. `shadow`: the write was applied already (roles_enforce was `shadow`): the row is born
+    decided ('approved' by the reviewer 'shadow') so it never counts as pending."""
+    now = now_iso()
+    cur = conn.execute(
+        "INSERT INTO agent_proposals(project_id, run_id, actor, action, payload, version_seen, summary, status, "
+        "reviewer, note, created_at, decided_at, shadow) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (project_id, run_id, actor, action, json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+         version_seen, summary, "approved" if shadow else "proposed", "shadow" if shadow else None,
+         "applied under roles_enforce=shadow" if shadow else None, now, now if shadow else None, int(shadow)))
+    row = get_proposal(conn, _rowid(cur))
+    assert row is not None     # just written, in the same connection
+    return row
+
+
+def get_proposal(conn: sqlite3.Connection, proposal_id: object) -> Row | None:
+    r = conn.execute("SELECT * FROM agent_proposals WHERE id=?", (proposal_id,)).fetchone()
+    return _proposal_dict(r) if r else None
+
+
+def list_proposals(conn: sqlite3.Connection, project_id: int | None = None, status: str | None = None,
+                   open_only: bool = False, include_shadow: bool = False, limit: int = 100) -> list[Row]:
+    """Oldest first (the review order). open_only: proposed + postponed; shadow rows only with include_shadow."""
+    where: list[str] = []
+    args: list[Any] = []
+    if project_id is not None:
+        where.append("project_id=?")
+        args.append(project_id)
+    if status is not None:
+        where.append("status=?")
+        args.append(status)
+    if open_only:
+        where.append("status IN ('proposed', 'postponed')")
+    if not include_shadow:
+        where.append("shadow=0")
+    sql = "SELECT * FROM agent_proposals" + (" WHERE " + " AND ".join(where) if where else "")
+    return [_proposal_dict(r) for r in conn.execute(sql + f" ORDER BY id LIMIT {int(limit)}", args)]
+
+
+def decide_proposal(conn: sqlite3.Connection, proposal_id: int, status: str, reviewer: str, note: str | None,
+                    payload: object = None) -> Row:
+    """Set a proposal's review state (and, for an edit, the payload it applies); `postponed` keeps it open."""
+    _enum(status, ("approved", "edited", "rejected", "postponed"), "status")
+    args: list[Any] = [status, reviewer, note, now_iso()]
+    sets = "status=?, reviewer=?, note=?, decided_at=?"
+    if payload is not None:
+        sets += ", payload=?"
+        args.append(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+    conn.execute(f"UPDATE agent_proposals SET {sets} WHERE id=?", (*args, proposal_id))
+    row = get_proposal(conn, proposal_id)
+    assert row is not None
+    return row
 
 
 def add_machine_token(conn: sqlite3.Connection, user_id: int, token_sha256: str, label: str | None,

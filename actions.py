@@ -81,9 +81,12 @@ import owner_words  # noqa: E402  (the owner's stored messages as evidence, phas
 import questions  # noqa: E402  (pure: the question import's parser and checks, phase 4b Q3 W3)
 import roles  # noqa: E402  (pure: grants, effective roles, the last owner, credentials, phase 5a A1)
 import permissions  # noqa: E402  (the permission matrix and its check, phase 5a A3)
+import proposals  # noqa: E402  (pure: a proposal's summary line and vocabulary, phase 5a A4)
 import failstop  # noqa: E402  (stdlib only at import: the owner alert + pause for a failing roles diagnostic, D-235)
 
-VIAS = ("cli", "mcp", "dashboard", "runner")
+# `proposal` (A4): a write applied from an approved proposal; only proposal.review sets it, no caller passes it.
+VIAS = ("cli", "mcp", "dashboard", "runner", "proposal")
+CALLER_VIAS = VIAS[:-1]
 # user:<id>: a person signed in to the dashboard (5a's users.id; phase 6a W5's sessions write as it).
 # setup: an anonymous browser spending a one-time setup/reset code (phase 6a W7) -- the one write a
 # pre-session makes, before there is a user_id to act as.
@@ -113,6 +116,32 @@ class Conflict(store.InvalidTransition):
 
 class Forbidden(ValueError):
     """The actor may not do this (an autonomous session writing rules/decisions via MCP)."""
+
+
+class Proposed(Exception):
+    """An agent's write was stored as a proposal instead of applied (`roles_enforce=on`, phase 5a A4): nothing
+    was changed. Raised by perform() once its transaction has committed; the entry points (MCP tools, tasks.py)
+    show `message` as the call's answer, not as a failure. Not a ValueError: the error handlers don't take it."""
+    MARK = "__proposed__"
+
+    def __init__(self, proposal_id: int, project_id: int | None, summary: str) -> None:
+        self.proposal_id, self.project_id, self.summary = proposal_id, project_id, summary
+        self.message = proposals.proposed_message(proposal_id, summary)
+        super().__init__(self.message)
+
+    def stored(self) -> dict[str, Any]:
+        """What the idempotency table keeps, so a replayed key raises the same Proposed."""
+        return {self.MARK: self.proposal_id, "project_id": self.project_id, "summary": self.summary}
+
+    def to_json(self) -> dict[str, Any]:
+        return {"proposed": True, "proposal_id": self.proposal_id, "project_id": self.project_id,
+                "status": "proposed", "message": self.message}
+
+    @classmethod
+    def replay(cls, stored: Any) -> "Proposed | None":
+        if isinstance(stored, dict) and cls.MARK in stored:
+            return cls(int(stored[cls.MARK]), stored.get("project_id"), str(stored.get("summary", "")))
+        return None
 
 
 class Ctx:
@@ -207,8 +236,8 @@ def perform(conn: sqlite3.Connection, name: str, params: Mapping[str, Any] | Non
     spec = ACTIONS.get(name)
     if spec is None:
         raise ValueError(f"unknown action {name!r}")
-    if via not in VIAS:
-        raise ValueError(f"via must be one of {'|'.join(VIAS)}, got {via!r}")
+    if via not in CALLER_VIAS:
+        raise ValueError(f"via must be one of {'|'.join(CALLER_VIAS)}, got {via!r}")
     if not isinstance(actor, str) or not ACTOR_RE.match(actor):
         raise ValueError(f"bad actor {actor!r}")
     if key is not None and (not isinstance(key, str) or not KEY_RE.match(key)):
@@ -254,6 +283,8 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
         raise
     if seen:
         _shadow_after(conn, ctx, name, seen[0], "the action itself WAS carried out and is committed", None)
+    if isinstance(res, Proposed):
+        raise res
     return res
 
 
@@ -267,7 +298,8 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                 if (hit["action"], hit["actor"], hit["request_sha256"]) != (name, actor, request_sha):
                     raise Conflict(f"idempotency key {key!r} was already used for a different request "
                                    f"({hit['action']} by {hit['actor']})")
-                return json.loads(hit["response"]) if hit["response"] is not None else None
+                stored = json.loads(hit["response"]) if hit["response"] is not None else None
+                return Proposed.replay(stored) or stored
         try:
             verdict = permissions.check(conn, name, params, actor, ctx.actor_session)
         except (sqlite3.Error, store.DBError):
@@ -282,9 +314,16 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                     raise
                 mode = "on"           # the owner's repair of the setting itself: only what the matrix allows
             if mode == "on":
-                raise Forbidden(f"{name} refused for {actor}: {verdict.reason}" if verdict.outcome == "refused"
-                                else f"{name} by {actor} would be a proposal for the task-manager ({verdict.reason}); "
-                                     "proposals are not built yet (phase 5a A4)")
+                if verdict.outcome != "proposal":
+                    raise Forbidden(f"{name} refused for {actor}: {verdict.reason}")
+                # An agent's write in its project: stored for the task-manager, nothing applied (D-182, D-188).
+                # Proposals need no one to be up: the row waits (nothing is applied by timeout, §3.7).
+                prop = _capture_proposal(conn, ctx, name, params, verdict, shadow=False)
+                done = Proposed(prop["id"], prop["project_id"], prop["summary"])
+                if key is not None:
+                    store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
+                    store.put_idempotency(conn, key, actor, name, request_sha, done.stored())
+                return done
             seen.append(verdict)
         if spec.owner_only and is_autonomous(conn, ctx):
             raise Forbidden(f"{name} is not allowed for an autonomous AFClaude session via {via} "
@@ -294,10 +333,95 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
             before, after = res.audit_pair()
             store.add_audit(conn, actor, via, name, spec.target_type, res.target_id, before, after, key,
                             session=ctx.actor_session)
+            if seen and seen[0].outcome == "proposal":
+                # Shadow: the write went on under the old rule; the record is what the run summary lists (§3.8).
+                _capture_proposal(conn, ctx, name, params, seen[0], shadow=True)
         if key is not None:
             store.prune_idempotency(conn, store._utcnow() - IDEMPOTENCY_TTL)
             store.put_idempotency(conn, key, actor, name, request_sha, res.result)
         return res.result
+
+
+# ---------------------------------------------------------------- proposals (phase 5a A4)
+
+def _capture_proposal(conn: sqlite3.Connection, ctx: Ctx, name: str, params: Mapping[str, Any],
+                      verdict: permissions.Verdict, *, shadow: bool) -> store.Row:
+    """Store an agent's write as a proposal (inside perform's transaction). `shadow`: the write was applied
+    already under the old rule (roles_enforce=shadow): the row is recorded as decided, reviewer `shadow`, so it
+    never waits for a review; the run summary lists it as applied. Linked to the agent's open run, if any."""
+    pid = next((p for p in verdict.projects if p is not None), None)
+    sid = ctx.actor_session
+    agent_id = ctx.actor.split(":", 2)[2] if ctx.actor.startswith("agent:") and ctx.actor.count(":") == 2 else None
+    return store.add_proposal(conn, pid, store.open_run(conn, sid, agent_id), ctx.actor, name, dict(params),
+                              proposals.version_seen(params), proposals.summarize(name, params), shadow=shadow)
+
+
+@action("proposal.review", "proposal")
+def proposal_review(conn: sqlite3.Connection, ctx: Ctx, proposal_id: Any, decision: Any, note: Any = None,
+                    payload: Any = None) -> Result:
+    """The task-manager's decision on an agent's proposal (§3.7, D-182, D-188). approve: the write is applied as
+    the reviewer (via `proposal`, the audit row's origin names the proposal and the agent); edit: the same with
+    `payload` (a dict of fields) laid over the proposed params, e.g. the current `version`; reject (a note
+    says why); postpone: it stays open for the next continue prompt. A stale `version` is the action's usual
+    Conflict (nothing changes: edit onto the current state or reject); a proposal already decided is a
+    Conflict too. The write is checked against the reviewer's rights as any write is, and its failure
+    leaves the proposal as it was."""
+    if decision not in proposals.REVIEW_DECISIONS:
+        raise ValueError(f"decision must be one of {'|'.join(proposals.REVIEW_DECISIONS)}, got {decision!r}")
+    if isinstance(proposal_id, bool) or not isinstance(proposal_id, int):
+        raise ValueError(f"proposal_id must be an integer, got {proposal_id!r}")
+    if note is not None and not isinstance(note, str):
+        raise ValueError("note must be text")
+    row = store.get_proposal(conn, proposal_id)
+    if row is None:
+        raise store.NotFound(f"no proposal P-{proposal_id}")
+    if row["status"] not in store.PROPOSAL_OPEN:
+        raise Conflict(f"P-{proposal_id} is already {row['status']}"
+                       + (" (applied under roles_enforce=shadow)" if row["shadow"] else ""), current=row)
+    if decision in ("approve", "reject", "postpone") and payload is not None:
+        raise ValueError("payload is for `edit` only")
+    if decision == "edit" and (not isinstance(payload, dict) or not payload):
+        raise ValueError("edit needs a payload: the fields to change, as an object")
+    if decision == "reject" and not (note or "").strip():
+        raise ValueError("reject needs a note: the agent's task-manager says why")
+    before = {"status": row["status"], "payload": row["payload"], "note": row["note"]}
+    if decision in ("reject", "postpone"):
+        new = store.decide_proposal(conn, proposal_id, "rejected" if decision == "reject" else "postponed",
+                                    ctx.actor, note)
+        return Result({"proposal_id": proposal_id, "status": new["status"], "applied": None}, proposal_id, before,
+                      {"status": new["status"], "payload": new["payload"], "note": new["note"]})
+    params = dict(row["payload"])
+    if decision == "edit":
+        params.update(payload)
+    applied = _apply_proposed(conn, ctx, row, params)
+    new = store.decide_proposal(conn, proposal_id, "edited" if decision == "edit" else "approved", ctx.actor, note,
+                                params if decision == "edit" else None)
+    return Result({"proposal_id": proposal_id, "status": new["status"], "applied": applied}, proposal_id, before,
+                  {"status": new["status"], "payload": new["payload"], "note": new["note"]})
+
+
+def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], params: dict[str, Any]) -> Any:
+    """Run a proposal's action as the reviewer with via `proposal` and an audit origin (inside the review's
+    transaction: any failure, a stale version included, rolls the whole review back). The reviewer's rights are
+    checked by the matrix (the old owner_only rule is not applied here: it would refuse the task-manager the
+    approvals this path exists for)."""
+    name = str(row["action"])
+    spec = ACTIONS.get(name)
+    if spec is None:
+        raise ValueError(f"P-{row['id']}: the action {name!r} no longer exists")
+    if name == "proposal.review":
+        raise ValueError(f"P-{row['id']}: a proposal can't apply a review")
+    _check_params(spec, params)
+    v = permissions.check(conn, name, params, ctx.actor, ctx.actor_session)
+    if v.outcome != "allowed":
+        raise Forbidden(f"P-{row['id']}: {name} refused for {ctx.actor} as the reviewer: {v.reason}")
+    inner = Ctx(ctx.actor, "proposal", None, ctx.autonomous, ctx.actor_session)
+    res = spec.fn(conn, inner, **params)
+    if not res.is_noop():
+        before, after = res.audit_pair()
+        store.add_audit(conn, ctx.actor, "proposal", name, spec.target_type, res.target_id, before, after, None,
+                        session=ctx.actor_session, origin={"proposal": row["id"], "agent": row["actor"]})
+    return res.result
 
 
 # ---------------------------------------------------------------- roles in shadow (phase 5a A3)
@@ -4279,8 +4403,8 @@ def _appender(kind: object, record: bool) -> Appender:
 
 
 def _check_writer(actor: object, via: object, account_id: object) -> None:
-    if via not in VIAS:
-        raise ValueError(f"via must be one of {'|'.join(VIAS)}, got {via!r}")
+    if via not in CALLER_VIAS:
+        raise ValueError(f"via must be one of {'|'.join(CALLER_VIAS)}, got {via!r}")
     if not isinstance(actor, str) or not ACTOR_RE.match(actor):
         raise ValueError(f"bad actor {actor!r}")
     if not isinstance(account_id, str) or not account_id:
