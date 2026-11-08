@@ -570,6 +570,36 @@ class Notices(Env):
         self.assertEqual((r["proposed"], r["proposal_id"]), (True, 5))
         self.assertIn("proposed as P-5", r["message"])
 
+    def test_a_task_managers_result_carries_the_run_notice_once(self):
+        """Phase 5a A5: a finished subagent run nobody was told about is one line after the task-manager's next
+        result, once; any other caller's results stay as they were."""
+        c = self.conn()
+        try:
+            p = store.add_project(c, "Proj", None, self.work)
+            actions.perform(c, "project.edit", {"project": p["id"], "manager_session": CALLER}, actor="cli", via="cli")
+            tid = store.add_task(c, "t1", None, "Proj", "high")["id"]
+            hook = {"actor": "runner:hook", "via": "runner"}
+            actions.perform(c, "run.open", {"session": CALLER, "agent_id": "sub1"}, **hook)
+            actions.perform(c, "task.edit", {"task_id": tid, "title": "by a subagent"}, actor=f"agent:{CALLER}:sub1",
+                            via="mcp", autonomous=True, session=CALLER)
+            actions.perform(c, "run.close", {"session": CALLER, "agent_id": "sub1"}, **hook)
+        finally:
+            c.close()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "bbbbbbbb-0000-4000-8000-00000000000b"}):
+            other = asyncio.run(ms.afclaude_list_tasks())
+        self.assertNotIn("subagent run(s)", other)                      # not the project's task-manager
+        self.assertNotIn("subagent run(s)", asyncio.run(ms.afclaude_list_tasks()))   # unstamped: no notice
+        token = ms.STAMP.set({"session": CALLER})                       # the identity hook's stamp
+        self.addCleanup(ms.STAMP.reset, token)
+        raw = asyncio.run(ms.afclaude_list_tasks())
+        body, _, line = raw.rpartition("\n")
+        json.loads(body)                                                # the tool's own result is untouched
+        self.assertIn("1 subagent run(s) finished", line)
+        self.assertNotIn("subagent run(s)", asyncio.run(ms.afclaude_list_tasks()))      # once
+        with mock.patch.object(ms.delivery, "notice", side_effect=OSError("disk")), \
+                mock.patch.object(store, "any_undelivered_run", return_value=True):
+            self.assertIn("the run-summary notice failed: OSError: disk", ms.run_notice())   # shown, not swallowed
+
     def test_notice_tool(self):
         """afclaude_notice (D-306): post (audited as the calling session) and list the owner's notices."""
         c = self.conn()
@@ -744,7 +774,7 @@ class Prompts(Env):
         self.assertEqual((compact["override"]["version"], compact["override"]["fits"], compact["override"]["base_outdated"]),
                          (1, True, False))
         b = run(ms.afclaude_prompts("bundle", "continue", project="Other"))
-        self.assertEqual(b["parts"], ["continue", "insert: the run-pace line, held inbox messages, inbox notes, due nightly tasks", "rules"])
+        self.assertEqual(b["parts"], ["continue", "insert: the run-pace line, held inbox messages, inbox notes, due nightly tasks, postponed proposals", "rules"])
         self.assertIn("NOTE-OTHER", b["text"])
         self.assertIn("<reason>", b["text"])                                  # a variable nobody gave
         b = run(ms.afclaude_prompts("bundle", "continue", project="Other", values={"reason": "R"}))

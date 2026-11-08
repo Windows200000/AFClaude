@@ -1123,6 +1123,9 @@ COLUMNS = {
     # the old rule (status 'approved', reviewer 'shadow'), the row is the record the run summary lists
     # A4 part 2: alerted_at = when the proposal_alert tick told the owner it waited past proposal_alert_hours
     "agent_proposals": [("shadow", "INTEGER NOT NULL DEFAULT 0"), ("alerted_at", "TEXT")],
+    # phase 5a A5 part 1: when a closed run's summary reached its task-manager (the PostToolUse hook, a result's
+    # notice or the UserPromptSubmit hook); set at close for a run with nothing to report. NULL = not delivered
+    "agent_runs": [("delivered_at", "TEXT")],
     "session_decisions": [VERSION_COL],
     "standing_rules": [VERSION_COL],
     # D-227: base_sha256 vs the current prompt_defaults.sha256, refreshed by prompt.defaults_sync
@@ -1330,7 +1333,7 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
         raise DBUnavailable(f"the database directory of {db} can't be created ({e})", "missing") from e
 
     def open_() -> sqlite3.Connection:
-        conn = sqlite3.connect(db, timeout=BUSY_TIMEOUT, factory=TimedConnection)
+        conn = sqlite3.connect(db, timeout=_QUICK.get() or BUSY_TIMEOUT, factory=TimedConnection)
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -1391,6 +1394,10 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
             for name, decl in cols:
                 if name not in have:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    if (table, name) == ("agent_runs", "delivered_at"):
+                        # phase 5a A5: the runs closed before delivery existed are not announced all at once
+                        # (they were reported by the A4 way); once, in the step that adds the column
+                        conn.execute("UPDATE agent_runs SET delivered_at=ended_at WHERE ended_at IS NOT NULL")
         for ddl in AFTER_COLUMNS + VERSION_TRIGGERS:
             conn.execute(ddl)
         if before is not None and before < 4 and get_meta(conn, "migrated_v4_at") is None:
@@ -3358,13 +3365,60 @@ def start_agent_run(conn: sqlite3.Connection, project_id: int | None, session: s
     return row
 
 
-def end_agent_run(conn: sqlite3.Connection, run_id: int, reason: str, summary: object, ended_at: str) -> Row:
-    """Close a run: end time, why, and its summary (proposals.summary)."""
-    conn.execute("UPDATE agent_runs SET ended_at=?, end_reason=?, summary=? WHERE id=?",
-                 (ended_at, reason, json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str), run_id))
+def end_agent_run(conn: sqlite3.Connection, run_id: int, reason: str, summary: object, ended_at: str,
+                  delivered: bool = False) -> Row:
+    """Close a run: end time, why, and its summary (proposals.summary). `delivered`: there is nothing in it to
+    deliver (A5), so it counts as delivered at once."""
+    conn.execute("UPDATE agent_runs SET ended_at=?, end_reason=?, summary=?, delivered_at=? WHERE id=?",
+                 (ended_at, reason, json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
+                  ended_at if delivered else None, run_id))
     row = get_agent_run(conn, run_id)
     assert row is not None
     return row
+
+
+def any_undelivered_run(conn: sqlite3.Connection) -> bool:
+    """The cheap test (one LIMIT 1 query): is any closed run (a subagent's or a driven session's own) waiting to
+    be delivered?"""
+    return conn.execute("SELECT 1 FROM agent_runs WHERE delivered_at IS NULL AND ended_at IS NOT NULL "
+                        "LIMIT 1").fetchone() is not None
+
+
+def undelivered_runs(conn: sqlite3.Connection, project_id: int) -> list[Row]:
+    """The project's closed runs (subagents' and driven sessions' own) whose summary was not delivered yet, oldest
+    first."""
+    rows = conn.execute("SELECT * FROM agent_runs WHERE project_id=? AND delivered_at IS NULL AND ended_at IS NOT NULL "
+                        "ORDER BY id", (project_id,))
+    return [_run_dict(r) for r in rows]
+
+
+def mark_runs_delivered(conn: sqlite3.Connection, ids: Sequence[int]) -> list[int]:
+    """Claim these runs as delivered: -> the ids this call changed (a run another caller delivered first is not
+    among them, so a summary is shown once however many paths race for it)."""
+    claimed = []
+    for i in ids:
+        if conn.execute("UPDATE agent_runs SET delivered_at=? WHERE id=? AND delivered_at IS NULL "
+                        "AND ended_at IS NOT NULL", (now_iso(), i)).rowcount:
+            claimed.append(i)
+    return claimed
+
+
+def subagent_run(conn: sqlite3.Connection, session: str, agent_id: str) -> Row | None:
+    """The newest run of this subagent under the session's /clear chain, or None."""
+    fam = tuple(session_family(conn, session))
+    marks = ",".join("?" * len(fam))
+    r = conn.execute(f"SELECT * FROM agent_runs WHERE agent_id=? AND session_id IN ({marks}) ORDER BY id DESC LIMIT 1",
+                     (agent_id, *fam)).fetchone()
+    return _run_dict(r) if r else None
+
+
+def manager_project(conn: sqlite3.Connection, session: str) -> int | None:
+    """The project this session (or a session of its /clear chain) is the task-manager of, else None."""
+    fam = tuple(session_family(conn, session))
+    marks = ",".join("?" * len(fam))
+    r = conn.execute(f"SELECT id FROM projects WHERE manager_session IN ({marks}) ORDER BY id LIMIT 1",
+                     fam).fetchone()
+    return None if r is None else int(r["id"])
 
 
 def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:
@@ -3623,6 +3677,13 @@ def set_request_state(conn: sqlite3.Connection, request_id: int, status: str, re
     if r is None:
         raise NotFound(f"no request #{request_id}")
     return r
+
+
+def latest_request(conn: sqlite3.Connection, kind: str, target: str | None = None) -> Row | None:
+    """The newest request of `kind` for `target`, whatever its status (phase 5a A5: the proposal wake)."""
+    r = conn.execute("SELECT * FROM action_requests WHERE kind=? AND COALESCE(target, '')=? ORDER BY id DESC LIMIT 1",
+                     (kind, target or "")).fetchone()
+    return dict(r) if r else None
 
 
 def list_requests(conn: sqlite3.Connection, status: str | None = None, limit: int = 50) -> list[Row]:
@@ -4325,6 +4386,9 @@ def inbox_row(conn: sqlite3.Connection, msg_id: object) -> Row:
 
 
 INBOX_ORIGINS = ("typed", "option", "edit")
+# phase 5a A5: a notice of an agent's proposal for the task-manager (add_proposal_notice), no owner text: born
+# "now" (no triage), kept out of the owner's views (inbox.thread / summary), delivered like a "now" message
+PROPOSAL_ORIGIN = "proposal"
 
 
 def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, created_by: str,
@@ -4348,6 +4412,32 @@ def add_inbox(conn: sqlite3.Connection, text: object, session_id: object, create
         m = get_inbox(conn, _rowid(cur))
     assert m is not None
     return m
+
+
+def add_proposal_notice(conn: sqlite3.Connection, session_id: str, text: object, created_by: str) -> Row:
+    """Phase 5a A5 (D-188): the notice of an agent's proposal for the task-manager session `session_id`,
+    written inside the proposal's own transaction (actions._proposal_notice): pending with the verdict "now"
+    at once (a notice needs no triage), origin PROPOSAL_ORIGIN."""
+    ts = now_iso()
+    cur = conn.execute("INSERT INTO inbox_messages(created_at, created_by, session_id, text, origin, verdict, "
+                       "verdict_reason, triaged_at) VALUES (?, ?, ?, ?, ?, 'now', ?, ?)",
+                       (ts, created_by, _session_id(session_id), inbox_text(text), PROPOSAL_ORIGIN,
+                        "an agent's proposal: a notice, no triage (D-188)", ts))
+    m = get_inbox(conn, _rowid(cur))
+    assert m is not None
+    return m
+
+
+def proposal_notices(conn: sqlite3.Connection, proposal_ids: Sequence[int]) -> set[int]:
+    """Which of these proposals have an inbox notice (add_proposal_notice; its text starts "P-<id> by ")."""
+    if not proposal_ids:
+        return set()
+    ids = sorted({int(i) for i in proposal_ids})
+    rows = conn.execute("SELECT text FROM inbox_messages WHERE origin=? AND ("
+                        + " OR ".join("text LIKE ?" for _ in ids) + ")",
+                        (PROPOSAL_ORIGIN, *(f"P-{i} by %" for i in ids))).fetchall()
+    found = {int(str(r["text"]).split(" ", 1)[0][2:]) for r in rows}
+    return found & set(ids)
 
 
 def list_inbox(conn: sqlite3.Connection, status: str | Iterable[str] | None = None, session_id: str | None = None,
@@ -5164,6 +5254,20 @@ def find_decision_entries(conn: sqlite3.Connection, terms: Sequence[str],
 # its origin (TimedConnection).
 BUSY_TIMEOUT = 5.0
 RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+# phase 5a A5: a hook with a short harness timeout (UserPromptSubmit 5 s, PostToolUse 30 s) must not be killed in
+# the middle of a delivery: inside quick_waits() a connect waits `busy` s for a lock and nothing is retried
+_QUICK: contextvars.ContextVar[float | None] = contextvars.ContextVar("afclaude_quick_waits", default=None)
+
+
+@contextmanager
+def quick_waits(busy: float) -> Iterator[None]:
+    """Connections opened inside wait at most `busy` seconds for a lock, and retrying() makes one try only: a
+    locked DB is a DBUnavailable within about `busy` s per statement instead of ~30 s (the caller shows it)."""
+    token = _QUICK.set(busy)
+    try:
+        yield
+    finally:
+        _QUICK.reset(token)
 MIN_FREE_BYTES = 4 * 1024 * 1024                         # less free space = disk full (health())
 MISSING_RECHECK_DELAY = 0.2   # health(): one re-check after this short wait before reporting
                               # kind "missing"/"unable to open" (owner D-171 addendum: escalate
@@ -5234,7 +5338,7 @@ def retrying(fn: Callable[[], _T], conn: sqlite3.Connection | None = None) -> _T
     persistent; a caller error raises at once (an IntegrityError as a ValueError); a
     persistent one is a DBError (DBUnavailable). Inside a caller's open transaction there
     is one try only (the caller's transaction is the unit to repeat). -> fn()'s result."""
-    tries = 1 if conn is not None and conn.in_transaction else len(RETRY_DELAYS) + 1
+    tries = 1 if (conn is not None and conn.in_transaction) or _QUICK.get() is not None else len(RETRY_DELAYS) + 1
     attempt, waited = 0, 0.0
     while True:
         try:

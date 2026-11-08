@@ -59,6 +59,7 @@ import actions  # noqa: E402
 import claude_auth  # noqa: E402
 import decisions  # noqa: E402
 import prompts  # noqa: E402
+import proposals  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
@@ -68,6 +69,7 @@ BERLIN = ZoneInfo("Europe/Berlin")
 NOTE_ITEM_MAX = 1500        # characters of one noted message in a message into the session ...
 NOTES_MAX = 3000            # ... and of the whole list (the rest waits for the next message, D-225)
 HELD_MAX = 3000             # characters of the held "now" messages in a start's message (the rest: id only)
+NOTICE_MARKERS = 20         # proposal notices past HELD_MAX named by marker; the rest: a count (held_insert)
 MESSAGE_MAX_BYTES = 12000   # a message typed with tmux send-keys (its command limit is 16 KB)
 VIEW_MAX = 10               # messages on the dashboard (the current thread, D-178)
 RATE_MAX = 20               # messages per hour the endpoint takes (each costs a Haiku call)
@@ -216,13 +218,21 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
     the session or types, a compaction, a usage limit; or not tried yet), as one line for a start's
     message (inbox_held.md), oldest first, each with its marker and how to answer. All of them go
     (each one owes an answer): a text is cut at NOTE_ITEM_MAX, and past HELD_MAX characters only the
-    marker and a pointer to `tasks.py inbox show` remain. -> (text, ids: mark them delivered once
-    the message went out), or (None, [])."""
+    marker and a pointer to `tasks.py inbox show` remain. Phase 5a A5: the waiting proposal notices
+    follow as their own sentence (proposal_held.md; a proposal_review wake's start brings them, D-194), in the
+    same HELD_MAX budget after the owner's messages: a text cut at NOTE_ITEM_MAX, past the budget only the
+    marker and P-number, past NOTICE_MARKERS of those one count with a pointer to `tasks.py proposals` (all of
+    them still go: the start's message never grows past MESSAGE_MAX_BYTES because of notices).
+    -> (text, ids: mark them delivered once the message went out), or (None, [])."""
     items: list[str] = []
     ids: list[int] = []
+    held: list[store.Row] = []
     size = 0
     for m in reversed(store.list_inbox(conn, "pending", session_id, limit=200)):
         if m["verdict"] != "now":
+            continue
+        if m["origin"] == store.PROPOSAL_ORIGIN:
+            held.append(m)
             continue
         text = one_line(m["text"])
         if len(text) > NOTE_ITEM_MAX:
@@ -234,9 +244,33 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
         items.append(item)
         ids.append(m["id"])
         size += len(item)
-    if not items:
-        return None, []
-    return prompt("inbox_held").format(held=" ".join(items)).strip(), ids
+    notices: list[str] = []
+    short = 0
+    for m in held:
+        pid = proposals.notice_proposal(str(m["text"]))
+        prop = store.get_proposal(conn, pid) if pid is not None else None
+        ids.append(m["id"])
+        if prop and prop["status"] != "proposed":
+            # reviewed meanwhile (`tasks.py proposals`): only its marker, so a postponed one is named once, in the
+            # continue's postponed insert (delivery.postponed_insert)
+            item = f"{marker(m['id'])} (P-{pid} is {prop['status']} already)"
+        else:
+            text = one_line(m["text"])
+            if len(text) > NOTE_ITEM_MAX:
+                text = text[:NOTE_ITEM_MAX] + "... (cut; the full proposal: python3 tasks.py proposals)"
+            item = f"{marker(m['id'])} ({_stamp(m, None)}): {text}"
+        if size + len(item) > HELD_MAX:
+            short += 1
+            if short > NOTICE_MARKERS:
+                continue
+            item = f"{marker(m['id'])} (P-{pid}: python3 tasks.py proposals)"
+        notices.append(item)
+        size += len(item)
+    if short > NOTICE_MARKERS:
+        notices.append(f"and {short - NOTICE_MARKERS} more: python3 tasks.py proposals")
+    parts = ([prompt("inbox_held").format(held=" ".join(items)).strip()] if items else []) + \
+        ([prompt("proposal_held").format(notices=" ".join(notices)).strip()] if notices else [])
+    return (" ".join(parts), ids) if parts else (None, [])
 
 
 def hold_deadline(since: datetime, cfg: schedule.Config | None = None) -> datetime | None:
@@ -287,8 +321,16 @@ def now_fields(m: dict[str, Any], notes: str | None, about: str | None = None) -
 
 
 def now_message(m: dict[str, Any], notes: str | None, about: str | None = None) -> str:
-    """The "now" message as typed into a live session: inbox_now.md on one line."""
-    return " ".join(prompt("inbox_now").format(**now_fields(m, notes, about)).split())
+    """The "now" message as typed into a live session: inbox_now.md on one line (a proposal notice:
+    proposal_notice.md, phase 5a A5)."""
+    name = "proposal_notice" if m.get("origin") == store.PROPOSAL_ORIGIN else "inbox_now"
+    return " ".join(prompt(name).format(**now_fields(m, notes, about)).split())
+
+
+def owner_facing(m: dict[str, Any]) -> bool:
+    """Whether the owner's views show the message: not a proposal notice (phase 5a A5: the agent's proposal is
+    the task-manager's, `tasks.py proposals`), unless it failed (its error shows, with the retry)."""
+    return m.get("origin") != store.PROPOSAL_ORIGIN or m["status"] == "error"
 
 
 def fits(message: str) -> bool:
@@ -327,7 +369,7 @@ def thread(conn: sqlite3.Connection, now: datetime | None = None) -> list[dict[s
     stays in view. Walked by last activity, not id."""
     now = now or datetime.now(UTC)
     reset = timedelta(hours=float(actions.get_setting(conn, "ui_chat_reset_hours")))
-    rows = [m for m in store.list_inbox(conn, CHAT_STATUSES, limit=200) if m["parent_id"] is None]
+    rows = [m for m in store.list_inbox(conn, CHAT_STATUSES, limit=200) if m["parent_id"] is None and owner_facing(m)]
     out: list[dict[str, Any]] = []
     edge = now
     for m in sorted(rows, key=activity, reverse=True):
@@ -489,7 +531,8 @@ def view(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any
 def summary(conn: sqlite3.Connection) -> dict[str, Any]:
     """The counts for status.json (export_quickview.py; no texts: they stay in the DB, D-241)."""
     counts = {s: 0 for s in store.INBOX_STATUSES}
-    for r in conn.execute("SELECT status, COUNT(*) FROM inbox_messages GROUP BY status"):
+    for r in conn.execute("SELECT status, COUNT(*) FROM inbox_messages WHERE origin != ? OR status = 'error' "
+                          "GROUP BY status", (store.PROPOSAL_ORIGIN,)):
         counts[r[0]] = int(r[1])
     return {"counts": counts, "errors": counts["error"], "waiting": counts["pending"],
             "unanswered": counts["delivered"]}

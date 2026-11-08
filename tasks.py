@@ -58,8 +58,10 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            ones recorded while roles_enforce=shadow (already applied)
     tasks.py runs [--project P] [--open] [--show ID]   agent runs (subagents, driven sessions) with their summaries
                                            (phase 5a A4, §3.8: every write of the run, direct ones too)
-    tasks.py run-hook start|stop           the SubagentStart / SubagentStop hook (JSON payload on stdin): opens
-                                           / closes the subagent's run as runner:hook
+    tasks.py run-hook start|stop|deliver   the SubagentStart / SubagentStop hook (JSON payload on stdin): opens
+                                           / closes the subagent's run as runner:hook; deliver: the PostToolUse
+                                           hook on Agent (a foreground run's summary as additionalContext, a
+                                           background launch's pending-proposals count; A5)
     tasks.py forward ID                    the task-manager passes an agent-blocked task's question on to the
                                            human inbox (until then the task is blocked but not in the inbox)
     tasks.py review ID approve|edit|reject|postpone [--note N] [--set KEY=VALUE ... | --payload JSON]
@@ -166,6 +168,7 @@ import actions  # noqa: E402  (every write: validation, one transaction, audit r
 import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 import identity  # noqa: E402  (phase 5a A2: who is acting)
 import proposals  # noqa: E402  (phase 5a A4: the run summary text)
+import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -455,6 +458,12 @@ def run_hook(conn, args):
         raise ValueError(f"the hook payload is not JSON: {e}") from e
     if not isinstance(payload, dict):
         raise ValueError("the hook payload needs session_id and agent_id")
+    if args.hook == "deliver":                         # PostToolUse on Agent: the run's summary into the context
+        context, note = delivery.agent_hook(conn, payload)
+        if context:
+            return print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                                            "additionalContext": context}}, ensure_ascii=False))
+        return print(note)
     session, agent = payload.get("session_id"), payload.get("agent_id")
     if not isinstance(session, str) or not HOOK_ID_RE.match(session) \
             or not isinstance(agent, str) or not HOOK_ID_RE.match(agent):
@@ -1068,6 +1077,8 @@ def run_inbox_messages(conn, args):
     ic = args.inbox_cmd
     if ic == "list":
         rows = store.list_inbox(conn, None if args.all else INBOX_OPEN, limit=50)
+        if not args.all:      # A5: a delivered proposal notice needs no answer (`tasks.py proposals` has the proposal)
+            rows = [m for m in rows if not (m["origin"] == store.PROPOSAL_ORIGIN and m["status"] == "delivered")]
         if args.json:
             return dump(rows)
         if not rows:
@@ -1611,9 +1622,10 @@ def parser():
     p.add_argument("--project", help="name or directory (default: every project you may see)")
     p.add_argument("--open", action="store_true", help="only the runs still going")
     p.add_argument("--show", type=int, metavar="ID", help="one run's summary")
-    p = sub.add_parser("run-hook", help="SubagentStart / SubagentStop hook: opens / closes a subagent's run "
-                                        "(JSON payload on stdin)")
-    p.add_argument("hook", choices=("start", "stop"))
+    p = sub.add_parser("run-hook", help="SubagentStart / SubagentStop hook: opens / closes a subagent's run; "
+                                        "deliver: the PostToolUse hook on Agent, a run's summary into the "
+                                        "task-manager's context (JSON payload on stdin)")
+    p.add_argument("hook", choices=("start", "stop", "deliver"))
     p = sub.add_parser("forward", parents=[js], help="pass an agent-blocked task's question on to the human inbox "
                                                      "(the task-manager's step)")
     p.add_argument("id", type=int)
@@ -1644,16 +1656,46 @@ def db_error(e, args):
     return 1
 
 
+def delivery_notice(conn, args):
+    """Phase 5a A5 (§3.8): when the caller is a project's task-manager and a subagent run of its project finished
+    without its summary being delivered (a background subagent), say so once on stderr (stdout may be JSON) and
+    mark it delivered. One query when no run waits. A failure here is shown, never swallowed (D-235), but does not
+    turn a command that already ran into a failed one."""
+    if args.cmd == "run-hook":
+        return
+    try:
+        if store.any_undelivered_run(conn):
+            line = delivery.notice(conn, who(conn))
+            if line:
+                print(line, file=sys.stderr)
+    except Exception as e:      # noqa: BLE001 - reported on stderr: the command itself succeeded
+        print(f"error: the run-summary notice failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if args.cmd == "run-hook" and hook_is_inert(args):
         return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
+    if args.cmd == "run-hook" and args.hook == "deliver":
+        # the PostToolUse hook has 30 s: every DB wait is short and tried once (a lock is an error it shows)
+        with store.quick_waits(HOOK_BUSY):
+            return _main(args)
+    return _main(args)
+
+
+HOOK_BUSY = 2.0     # seconds a DB lock is waited for in `run-hook deliver` (store.quick_waits)
+
+
+def _main(args):
     try:
         conn = store.connect(args.db)
     except (store.DBError, sqlite3.Error) as e:
         return db_error(e, args)
     try:
-        return run(conn, args)
+        rc = run(conn, args)
+        if not rc:
+            delivery_notice(conn, args)
+        return rc
     except actions.Proposed as e:                   # an agent's write stored as a proposal: nothing was changed
         print(json.dumps(e.to_json(), ensure_ascii=False) if getattr(args, "json", False) else e.message)
         return 0

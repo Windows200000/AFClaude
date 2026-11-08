@@ -1,0 +1,1 @@
+[AFClaude inbox #{id}] An agent's proposal is waiting for your review ({at}; nothing was changed until you decide): {text} Look at it with `python3 tasks.py proposals --show N` (N: its P-number) and decide now, or postpone it when it needs more work first (D-188): `python3 tasks.py review N approve|edit|reject|postpone` (reject needs --note). It needs no inbox reply. {notes}

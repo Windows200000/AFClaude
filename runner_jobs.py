@@ -374,7 +374,7 @@ def act_min_timeout(job: str) -> timedelta:
 # review_now is one review start (the usage_review tick's calls and its lock wait).
 def request_inner(kind: str) -> dict[str, timedelta]:
     """{what: worst-case time} of one run-now request of `kind`."""
-    if kind == "work_on_now":
+    if kind in ("work_on_now", "proposal_review"):      # proposal_review (5a A5): a work_on_now start
         return window_start_inner()
     if kind == "continue_now":
         out = dict(tick_inner("dispatcher"))
@@ -388,7 +388,7 @@ def request_inner(kind: str) -> dict[str, timedelta]:
 def request_min_timeout() -> timedelta:
     """The least outer timeout of a request run: its slowest kind's inner timeouts + OUTER_MARGIN."""
     return max(sum(request_inner(k).values(), timedelta(0))
-               for k in ("work_on_now", "continue_now", "review_now")) + OUTER_MARGIN
+               for k in ("work_on_now", "continue_now", "review_now", "proposal_review")) + OUTER_MARGIN
 
 
 # ---- an at-job (phase 3a S4)
