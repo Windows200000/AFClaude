@@ -15,7 +15,12 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import testenv  # noqa: E402  (hermetic: a temp DB, config and data dir; before the AFClaude imports)
-import masterkey  # noqa: E402
+try:
+    import masterkey  # noqa: E402
+except ModuleNotFoundError as e:                           # the host python3 lacks cryptography; the venv and the image have it
+    if e.name is None or not e.name.startswith("cryptography"):
+        raise
+    masterkey = None
 import store  # noqa: E402
 
 
@@ -23,6 +28,8 @@ def b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode()
 
 
+@unittest.skipIf(masterkey is None, "the cryptography package is not installed under this interpreter "
+                                    "(run with the venv python: .venv/bin/python -m unittest test_masterkey)")
 class MasterKeyTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
