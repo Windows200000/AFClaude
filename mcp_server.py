@@ -46,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write)
+import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
 import identity  # noqa: E402  (who is calling: machine user, task-manager or agent, phase 5a A2)
 import prompts  # noqa: E402  (the prompt registry: read-only view, phase 4a P4)
 import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
@@ -274,13 +275,29 @@ def db_error(e: BaseException, tool_name: str, params: Mapping[str, Any]) -> Too
     return ToolError(json.dumps({"error": h}, ensure_ascii=False))
 
 
+def run_notice() -> str:
+    """Phase 5a A5 (§3.8): "\n" + the one-line notice of finished subagent runs not delivered yet, when the caller is
+    the project's task-manager (each run is delivered once); "" for none (one query when no run waits). A failure
+    is the notice text itself, never swallowed (D-235), and does not fail the call that already ran."""
+    try:
+        conn = db()
+        try:
+            line = delivery.notice(conn, who(conn)) if store.any_undelivered_run(conn) else ""
+        finally:
+            conn.close()
+    except Exception as e:      # noqa: BLE001 - reported in the result: the tool call itself succeeded
+        line = f"error: the run-summary notice failed: {type(e).__name__}: {e}"
+        log.error(line)
+    return "\n" + line if line else ""
+
+
 def tool_errors(fn: Callable[P, Awaitable[str]]) -> Callable[P, Awaitable[str]]:
     """Caller errors -> ToolError with a one-line message (no traceback); database errors ->
     the structured hand-back (db_error)."""
     @functools.wraps(fn)
     async def wrapper(*a: P.args, **kw: P.kwargs) -> str:
         try:
-            return await fn(*a, **kw)
+            return await fn(*a, **kw) + run_notice()
         except ToolError:
             raise
         except actions.Proposed as e:                    # an agent's write stored as a proposal: an answer, not an error

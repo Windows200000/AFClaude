@@ -150,6 +150,8 @@ PROMPTS: dict[str, Prompt] = {
                               used_by="inbox_worker: an agent's proposal notice to a running task-manager (5a A5)"),
     "proposal_held": Prompt(("notices",), used_by="waiting proposal notices inserted in a start (5a A5, D-194)"),
     "nightly_tasks_due": Prompt(("tasks",), used_by="a night start's continue (nightly_tasks.start_insert)"),
+    "proposals_postponed": Prompt(("postponed", "tools"), used_by="a continue's insert naming the postponed "
+                                  "agent proposals (delivery.postponed_insert, phase 5a A5)"),
     "nightly_task": Prompt(("name", "report", "title"), used_by="head of a nightly task brief"),
     "usage_haiku": Prompt(("gaps", "n", "name", "prompts", "totals"), used_by="usage_sampler Haiku judge"),
 }
@@ -270,7 +272,7 @@ class Bundle:
 BUNDLES: dict[str, Bundle] = {
     # task-manager continue / stall continue (session_message, keepalive._fire_start, D-274/D-275)
     "continue": Bundle((Part(prompt="continue"),
-                        Part(insert="the run-pace line, held inbox messages, inbox notes, due nightly tasks"),
+                        Part(insert="the run-pace line, held inbox messages, inbox notes, due nightly tasks, postponed proposals"),
                         Part(rules=True)),
                        used_by="keepalive _fire_start: a session-window start, a postponed one, or a "
                                "last-stretch slot's continue"),

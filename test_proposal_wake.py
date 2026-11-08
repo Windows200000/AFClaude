@@ -8,6 +8,10 @@ D-186). Temp DBs only; no session, tmux or signal is touched (keepalive's send a
             leaves none (its summary comes through the hooks); a shadow row never leaves one; a replayed key
             leaves no second
   deliver   a run of the task-manager going: the notice is typed in through the inbox's own send path
+  continue  a start's continue names the project's postponed proposals (part 1's insert, wired in
+            keepalive._fire_start); none: no line; a DB failure aborts the start (D-235)
+  together  a separate session's subagent run is not delivered again through part 1's run notice; a notice
+            whose proposal was reviewed meanwhile carries only its marker (named once, by the postponed insert)
   wake      no run going: one proposal_review request (no window or budget gate, the preflight applies), the
             notice held until the wake's start takes it along; a second proposal while it is open adds no
             request; a refused wake is not repeated for the same notice; paused: no wake; a failed wake alerts
@@ -34,6 +38,7 @@ import keepalive as ka  # noqa: E402
 import run_now  # noqa: E402
 import runner  # noqa: E402
 import store  # noqa: E402
+import test_compaction as tc  # noqa: E402  (its Env: a fake tmux session and transcript, for a start)
 import test_proposals  # noqa: E402
 import test_run_now  # noqa: E402
 from test_run_now import NOW, SID_A  # noqa: E402
@@ -251,6 +256,101 @@ class Wake(test_run_now.Base):
             self.assertEqual(self.process(), {"failed": 1})
         self.assertIn("running task-manager only", self.msg(mid)["error"])
         self.assertEqual(self.sent, [])
+
+
+# ---------------------------------------------------------------- A5 parts 1 + 2 together
+
+class PostponedInStarts(tc.Env):
+    """keepalive._fire_start: the continue carries delivery.postponed_insert for the task-manager's project."""
+
+    def project_id(self):
+        conn = store.connect()
+        try:
+            return next(int(t["project_id"]) for t in store.task_managers(conn) if t["session"] == tc.SID)
+        finally:
+            conn.close()
+
+    def postpone(self, title="x"):
+        conn = store.connect()
+        try:
+            p = store.add_proposal(conn, self.project_id(), None, "agent:" + tc.SID + ":s1", "task.edit",
+                                   {"task_id": 1, "title": title}, None, f"task.edit #1: title='{title}'")
+            conn.execute("UPDATE agent_proposals SET status='postponed' WHERE id=?", (p["id"],))
+            conn.commit()
+            return p["id"]
+        finally:
+            conn.close()
+
+    def start(self, key):
+        at = tc.NIGHT + timedelta(days=1)
+        ka.handle_fire(tc.SID, {"uuid": key, "timestamp": at, "budget": "b", "headroom": 14.0, "start_at": at},
+                       "test start", ka.load_state(), tc.Armed())
+        return ka.load_state()["handled"][key]
+
+    def test_the_continue_names_the_postponed_proposals(self):
+        self.assertEqual(self.start("window-start-p0")["result"], "continued-in-place")
+        self.assertNotIn("postponed", self.sent[-1][1])                  # none: no line
+        pid = self.postpone()
+        self.assertEqual(self.start("window-start-p1")["result"], "continued-in-place")
+        self.assertIn(f"P-{pid} task.edit #1: title='x'", self.sent[-1][1])
+        self.assertIn("tasks.py review ID", self.sent[-1][1])
+
+    def test_a_failing_insert_aborts_the_start(self):
+        import delivery
+        n = len(self.sent)
+        with mock.patch.object(delivery, "postponed_insert", side_effect=RuntimeError("db gone")):
+            rec = self.start("window-start-p2")
+        self.assertEqual(rec["result"], "start-failed")
+        self.assertIn("db gone", rec["error"])
+        self.assertEqual(len(self.sent), n)                              # nothing typed
+
+
+class Together(test_proposals.Proposals):
+    def test_a_separate_sessions_subagent_run_is_not_delivered_again(self):
+        self.go_on()
+        sub = f"agent:{self.sess['AG']}:s1"
+        run = actions.perform(self.conn, "run.open", {"session": self.sess["AG"], "agent_id": "s1", "project": self.A},
+                              actor="runner:hook", via="runner")
+        with mock.patch.object(runner, "wake"), self.assertRaises(actions.Proposed):
+            actions.perform(self.conn, "task.edit", {"task_id": self.task, "title": "x"}, actor=sub, via="mcp",
+                            autonomous=True)
+        actions.perform(self.conn, "run.close", {"session": self.sess["AG"], "agent_id": "s1", "reason": "SubagentStop"},
+                        actor="runner:hook", via="runner")
+        self.assertIsNotNone(store.get_agent_run(self.conn, run["id"])["delivered_at"])   # closed as delivered
+        import delivery
+        self.assertEqual(delivery.notice_for_session(self.conn, self.sess["A"]), "")      # the inbox notice has it
+        self.assertEqual(len([m for m in store.list_inbox(self.conn, limit=50)
+                              if m["origin"] == store.PROPOSAL_ORIGIN]), 1)
+
+    def test_the_task_managers_own_subagent_run_is_still_delivered(self):
+        self.go_on()
+        actions.perform(self.conn, "run.open", {"session": self.sess["A"], "agent_id": "s2", "project": self.A},
+                        actor="runner:hook", via="runner")
+        with self.assertRaises(actions.Proposed):
+            actions.perform(self.conn, "task.edit", {"task_id": self.task, "title": "y"},
+                            actor=f"agent:{self.sess['A']}:s2", via="mcp", autonomous=True)
+        actions.perform(self.conn, "run.close", {"session": self.sess["A"], "agent_id": "s2", "reason": "SubagentStop"},
+                        actor="runner:hook", via="runner")
+        self.assertIn("pending", delivery_notice(self.conn, self.sess["A"]))
+
+    def test_a_reviewed_notice_carries_only_its_marker(self):
+        self.go_on()
+        with mock.patch.object(runner, "wake"):
+            pid = self.propose("task.edit", task_id=self.task, title="z")
+        actions.perform(self.conn, "proposal.review", {"proposal_id": pid, "decision": "postpone"},
+                        actor=self.tm, via="mcp", autonomous=True)
+        (m,) = [m for m in store.list_inbox(self.conn, limit=50) if m["origin"] == store.PROPOSAL_ORIGIN]
+        text, ids = inbox.held_insert(self.conn, self.sess["A"])
+        self.assertEqual(ids, [m["id"]])
+        self.assertIn(f"{inbox.marker(m['id'])} (P-{pid} is postponed already)", text)
+        self.assertNotIn("title='z'", text)                              # named once: in the postponed insert
+        import delivery
+        self.assertIn(f"P-{pid} ", delivery.postponed_insert(self.conn, self.A))
+
+
+def delivery_notice(conn, session):
+    import delivery
+    return delivery.notice_for_session(conn, session)
 
 
 if __name__ == "__main__":

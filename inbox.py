@@ -59,6 +59,7 @@ import actions  # noqa: E402
 import claude_auth  # noqa: E402
 import decisions  # noqa: E402
 import prompts  # noqa: E402
+import proposals  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
@@ -227,7 +228,12 @@ def held_insert(conn: sqlite3.Connection, session_id: str) -> tuple[str | None, 
         if m["verdict"] != "now":
             continue
         if m["origin"] == store.PROPOSAL_ORIGIN:
-            notices.append(f"{marker(m['id'])} ({_stamp(m, None)}): {one_line(m['text'])}")
+            # reviewed meanwhile (`tasks.py proposals`): only its marker, so a postponed one is named once, in the
+            # continue's postponed insert (delivery.postponed_insert)
+            pid = proposals.notice_proposal(str(m["text"]))
+            prop = store.get_proposal(conn, pid) if pid is not None else None
+            notices.append(f"{marker(m['id'])} (P-{pid} is {prop['status']} already)" if prop and prop["status"] != "proposed"
+                           else f"{marker(m['id'])} ({_stamp(m, None)}): {one_line(m['text'])}")
             ids.append(m["id"])
             continue
         text = one_line(m["text"])

@@ -2816,7 +2816,10 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
     # (not a run-now, 3b S5: it is no night start)
     tasks, task_names = (nightly_tasks_due(cwd) if stall.get("prompt", "continue") == "continue"
                          and not stall.get("run_now") else (None, []))
-    msg = build(with_notes(with_notes(with_notes(with_notes(stall.get("insert"), pace), held), notes), tasks))
+    # 5a A5 (D-188): the project's postponed proposals come back at its next continue; a failure raises (abort)
+    postponed = proposals_postponed(project["project_id"], cwd) if project else None
+    msg = build(with_notes(with_notes(with_notes(with_notes(with_notes(stall.get("insert"), pace), held), postponed),
+                                      notes), tasks))
     # no compaction at a start any more (D-238): the watcher compacts when a run ends or the session
     # goes idle, while the cache is warm (compaction_pass); a start only waits for a running one
     if not args.arm:
@@ -3944,6 +3947,19 @@ def inbox_held(sid):
     conn = store.connect()
     try:
         return inbox.held_insert(conn, sid)
+    finally:
+        conn.close()
+
+
+def proposals_postponed(project_id, cwd):
+    """5a A5 (D-188): the project's postponed proposals as one line for a start's continue
+    (delivery.postponed_insert), or None when it has none. A DB failure raises: the caller aborts
+    the start (D-235), as for inbox_held."""
+    import delivery
+    import store
+    conn = store.connect()
+    try:
+        return delivery.postponed_insert(conn, int(project_id), cwd or None)
     finally:
         conn.close()
 

@@ -14,6 +14,7 @@ from unittest import mock
 
 import actions
 import inbox
+import delivery  # noqa: E402
 import keepalive as ka
 import nightly_tasks
 import prompts
@@ -416,6 +417,9 @@ class SameTextTest(unittest.TestCase):
             out["inbox notes"] = inbox.notes_insert(conn, SID)[0]
             out["inbox held"] = inbox.held_insert(conn, SID)[0]
             out["proposal held"] = inbox.held_insert(conn, SID_P)[0]     # phase 5a A5
+            with mock.patch.object(store, "list_proposals",
+                                   return_value=[{"id": 4, "summary": "task.edit #1: title='x'"}]):
+                out["postponed insert"] = delivery.postponed_insert(conn, 1)    # phase 5a A5
         finally:
             conn.close()
         out["inbox triage"] = inbox.triage_prompt("a {message}")

@@ -389,7 +389,7 @@ def _proposal_notice(conn: sqlite3.Connection, ctx: Ctx, prop: store.Row) -> sto
         return None
     if ctx.actor_session is not None and tm in store.session_family(conn, ctx.actor_session):
         return None
-    return store.add_proposal_notice(conn, tm, proposals.notice_text(prop), ctx.actor)
+    return store.add_proposal_notice(conn, tm, proposals.inbox_notice_text(prop), ctx.actor)
 
 
 @action("proposal.review", "proposal")
@@ -452,7 +452,12 @@ def _close_run(conn: sqlite3.Connection, run_id: int, reason: str) -> store.Row:
     summary = proposals.summary(dict(run, ended_at=until, end_reason=reason),
                                 store.audit_of_actors(conn, actors, run["started_at"], until),
                                 store.run_proposals(conn, run_id))
-    return store.end_agent_run(conn, run_id, reason, summary, until)
+    # a subagent run with nothing to report is delivered at close (A5): no hook has anything to say about it; so is
+    # a subagent of a separate session (not the task-manager's: its proposals reach the task-manager as inbox
+    # notices, A5 part 2, and a second delivery through the run notice would repeat them)
+    separate = store.manager_project(conn, run["session_id"]) is None
+    return store.end_agent_run(conn, run_id, reason, summary, until,
+                               delivered=run["kind"] == "subagent" and (separate or proposals.nothing_to_deliver(summary)))
 
 
 @action("run.open", "agent_run")
@@ -489,6 +494,20 @@ def run_close(conn: sqlite3.Connection, ctx: Ctx, session: Any, agent_id: Any = 
     return Result(after, run_id, {"ended_at": None, "end_reason": None},
                   {"ended_at": after["ended_at"], "end_reason": after["end_reason"],
                    "writes": after["summary"]["write_count"], "pending": len(after["summary"]["pending"])})
+
+
+@action("run.deliver", "agent_run")
+def run_deliver(conn: sqlite3.Connection, ctx: Ctx, ids: Any) -> Result:
+    """The summaries of these closed runs reached their task-manager (delivery.py: the PostToolUse hook, the
+    notice on a result, the UserPromptSubmit hook): mark them so each is delivered once. -> the ids this call
+    marked (a run another path delivered first is left out and says nothing). Not for MCP callers."""
+    _runner_only(ctx, "run.deliver")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        raise ValueError("ids must be a non-empty list of run ids")
+    claimed = store.mark_runs_delivered(conn, ids)
+    if not claimed:
+        return Result({"delivered": []}, None, None, None, changed=False)
+    return Result({"delivered": claimed}, claimed[0], {"delivered": []}, {"delivered": claimed})
 
 
 @action("proposal.alert", "proposal")
