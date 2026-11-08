@@ -5645,7 +5645,15 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
     saves keep more: the DB is their only copy). runner: a runner's own write (telemetry rows,
     state saves, jobs; their payloads differ every time): "the same request" is the same action
     by the same actor, and no alert while db_gate's pause episode is open (it alerted already).
-    Sets err.not_saved and err.escalation (the hand-back). Never raises. -> err"""
+    Sets err.not_saved and err.escalation (the hand-back). Never raises. -> err
+    Inside quick_waits() (a hook's 1-2 s lock wait, one try) a transient error is only the hand-back: no fallback
+    record and no alert, so two short lock misses never read as a DB that needs the owner (D-331: the hook
+    shows a short note); any other error takes the full path (D-171, D-235)."""
+    if _QUICK.get() is not None and err.error_class == "transient":
+        err.not_saved = (f"{action} was not applied (a hook's short lock wait)" if write else
+                         "nothing was changed by this call")
+        err.escalation = "none: a hook's short lock wait, the next call tries again"
+        return err
     try:
         path = fallback_path(db_path)
         payload = json.dumps({"action": action, "params": dict(params or {})}, sort_keys=True,
