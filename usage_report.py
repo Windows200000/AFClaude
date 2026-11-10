@@ -70,7 +70,7 @@ def parse_ts(s):
 
 
 def parse_since(s):
-    dt = datetime.fromisoformat(s)
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))   # python 3.9 rejects the Z suffix
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 

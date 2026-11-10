@@ -278,7 +278,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add", help="schedule a task for the nightly runs from --due on")
     a.add_argument("name")
-    a.add_argument("--due", type=parse_due, required=True, help=f'"{DUE_FMT}", Europe/Berlin')
+    a.add_argument("--due", type=parse_due, required=True, help=f'"{DUE_FMT}", Europe/Berlin'.replace("%", "%%"))  # argparse %-formats help
     a.add_argument("--title", required=True)
     a.add_argument("--report", required=True, help="the doc whose writing marks it done, e.g. review:<name>")
     a.add_argument("--prompt", action="append", required=True, help="prompts/<P>.md, in order (repeatable)")
