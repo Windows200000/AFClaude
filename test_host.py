@@ -123,6 +123,21 @@ class RepoPaths(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_the_install_wide_own_project_flag_follows_the_host_path(self):
+        """permissions.afclaude_project_id compares with repo_dir(), not with the code directory (/app)."""
+        import permissions
+        import store
+        testenv.fresh_db(self)
+        conn = store.connect()
+        try:
+            pid = int(store.add_project(conn, "k1-own", path=self.HOST_REPO)["id"])
+            with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO):
+                self.assertEqual(permissions.afclaude_project_id(conn), pid)
+            with Env(AFCLAUDE_IN_CONTAINER=None, AFCLAUDE_HOST_REPO=None):
+                self.assertIsNone(permissions.afclaude_project_id(conn))
+        finally:
+            conn.close()
+
 
 class BridgeArgv(unittest.TestCase):
     def test_claude_and_ka_resume(self):

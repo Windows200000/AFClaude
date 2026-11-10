@@ -348,6 +348,15 @@ class Rules(Base):
     def test_afclaude_project_is_the_one_at_this_repository(self):
         self.assertEqual(permissions.afclaude_project_id(self.conn), self.OWN)
 
+    def test_afclaude_project_in_the_container_is_the_host_checkout(self):
+        """K1: the code runs from /app, projects.path holds the host path (AFCLAUDE_HOST_REPO)."""
+        host_repo = os.path.join(self.tmp.name, "host-checkout", "AFClaude")
+        pid = self.project("afclaude-host", host_repo)
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": host_repo}):
+            self.assertEqual(permissions.afclaude_project_id(self.conn), pid)
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": host_repo + "-other"}):
+            self.assertIsNone(permissions.afclaude_project_id(self.conn))
+
 
 class Shadow(Base):
     def shadow_rows(self):
