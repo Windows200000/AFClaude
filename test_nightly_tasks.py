@@ -174,6 +174,12 @@ class Tasks(Base):
 
 
 class Cli(Base):
+    def test_add_help_exits_0(self):
+        for argv in (["add", "--help"], ["--help"]):
+            with self.assertRaises(SystemExit) as cm:
+                cli(*argv)
+            self.assertEqual(cm.exception.code, 0)
+
     def test_the_eta_review_command(self):
         rc, out, err = cli(*ETA_CMD)
         self.assertEqual((rc, err), (0, ""))
