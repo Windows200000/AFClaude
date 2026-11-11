@@ -921,7 +921,7 @@ class Entrypoint(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write("#!/bin/sh\n" + body)
             os.chmod(path, 0o755)
-        env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], AFCLAUDE_DIR=tmp,
+        env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], AFCLAUDE_APP=tmp,
                    KEEPALIVE_STATE_DIR=os.path.join(tmp, "ka"), AFCLAUDE_BRIDGE_KNOWN_HOSTS=os.path.join(tmp, "kh"),
                    AFCLAUDE_SCHEDULER=mode)
         r = subprocess.run(["sh", self.SCRIPT], env=env, capture_output=True, text=True, timeout=60)

@@ -54,6 +54,14 @@ class SessionChain(unittest.TestCase):
             self.assertEqual(ur.last_recorded_ts(NEWER).isoformat(), "2026-11-01T00:00:00+00:00")
 
 
+class ParseSince(unittest.TestCase):
+    def test_z_suffix_offset_and_naive(self):
+        want = ur.parse_since("2026-11-07T23:00:00+00:00")
+        self.assertEqual(ur.parse_since("2026-11-07T23:00:00Z"), want)
+        self.assertEqual(ur.parse_since("2026-11-07T23:00:00"), want)         # naive means UTC
+        self.assertEqual(ur.parse_since("2026-11-08T00:00:00+01:00"), want)
+
+
 class SessionChainInTheDb(unittest.TestCase):
     """Without KEEPALIVE_STATE_DIR (the CLI in a host shell) session_ids reads the links from the
     DB (keepalive.STATE_FILE's default is the live state), not from a side file in the repo dir."""

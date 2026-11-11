@@ -49,6 +49,7 @@ from typing import Any, Callable, Optional, TextIO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import host  # noqa: E402  (to_local: a stored command that names the host repo)
 import runner_state  # noqa: E402
 
 EXIT_OK = 0
@@ -407,14 +408,16 @@ def at_job(key: str) -> int:
         print(f"runner_jobs: scheduled job {key} is " + ("unknown" if row is None else
               f"{row['status']}, not claimed by this run"), file=sys.stderr)
         return 1
-    cwd = row["cwd"] if os.path.isdir(row["cwd"] or "") else "/"
+    # a job scheduled before the code moved to /app still names the host repo path (host.to_local)
+    cwd = host.to_local(row["cwd"] or "")
+    cwd = cwd if os.path.isdir(cwd) else "/"
     run_dir = os.path.join(runner_state.data_dir(), "run")
     os.makedirs(run_dir, exist_ok=True)
     fd, marks = tempfile.mkstemp(prefix=f".at-{key}-", suffix=".reports", dir=run_dir)
     os.close(fd)
     try:
         sys.stdout.flush()
-        code = subprocess.call(["/bin/sh", "-c", str(row["cmd"])], cwd=cwd, stdin=subprocess.DEVNULL,
+        code = subprocess.call(["/bin/sh", "-c", host.to_local(str(row["cmd"]))], cwd=cwd, stdin=subprocess.DEVNULL,
                                env=dict(os.environ, **{failstop.REPORTS_ENV: marks}))
         with open(marks, encoding="utf-8") as fh:
             reported = [ln for ln in fh.read().splitlines() if ln.strip()]

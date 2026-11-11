@@ -78,6 +78,67 @@ class InContainer(unittest.TestCase):
                 self.assertEqual(host.in_container(), want, v)
 
 
+class RepoPaths(unittest.TestCase):
+    """K1: the code runs from /app in the image, so what the host must understand comes from
+    repo_dir() (AFCLAUDE_HOST_REPO in the container), never from the code's own directory."""
+    HOST_REPO = "/srv/host-checkout/AFClaude"
+
+    def test_on_the_host_it_is_the_code_directory(self):
+        with Env(AFCLAUDE_IN_CONTAINER=None, AFCLAUDE_HOST_REPO="/ignored"):
+            self.assertEqual(host.repo_dir(), host.HERE)
+            self.assertEqual(host.local_path("/anywhere/x"), "/anywhere/x")
+            self.assertEqual(host.to_local("cd /anywhere && x"), "cd /anywhere && x")
+
+    def test_in_the_container_it_is_the_env_and_a_missing_one_raises(self):
+        with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO + "/"):
+            self.assertEqual(host.repo_dir(), self.HOST_REPO)
+        for bad in (None, "", "relative/path"):
+            with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=bad):
+                with self.assertRaises(host.HostRepoError):
+                    host.repo_dir()
+
+    def test_local_path_maps_only_the_repo_and_below(self):
+        with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO):
+            self.assertEqual(host.local_path(self.HOST_REPO), host.HERE)
+            self.assertEqual(host.local_path(self.HOST_REPO + "/PROGRESS.md"), host.HERE + "/PROGRESS.md")
+            for other in (self.HOST_REPO + "-wt-x", self.HOST_REPO + "-wt-x/PROGRESS.md", "/srv/host-checkout", ""):
+                self.assertEqual(host.local_path(other), other)
+
+    def test_to_local_rewrites_a_stored_command_by_whole_prefix(self):
+        with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO):
+            self.assertEqual(host.to_local(f"cd {self.HOST_REPO} && python3 usage_review.py --chain >> {self.HOST_REPO}/data/x.log"),
+                             f"cd {host.HERE} && python3 usage_review.py --chain >> {host.HERE}/data/x.log")
+            self.assertEqual(host.to_local(f"python3 {self.HOST_REPO}-wt-k1/x.py"), f"python3 {self.HOST_REPO}-wt-k1/x.py")
+
+    def test_the_own_project_is_found_by_the_host_path(self):
+        """A DB whose AFClaude project has the host path is found from a /app-style install."""
+        import store
+        testenv.fresh_db(self)
+        conn = store.connect()
+        try:
+            store.add_project(conn, "k1-own", path=self.HOST_REPO)
+            with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO):
+                self.assertEqual(store.get_project(conn, host.repo_dir(), nearest=False)["name"], "k1-own")
+                self.assertIsNone(store.get_project(conn, host.HERE, nearest=False))
+        finally:
+            conn.close()
+
+    def test_the_install_wide_own_project_flag_follows_the_host_path(self):
+        """permissions.afclaude_project_id compares with repo_dir(), not with the code directory (/app)."""
+        import permissions
+        import store
+        testenv.fresh_db(self)
+        conn = store.connect()
+        try:
+            pid = int(store.add_project(conn, "k1-own", path=self.HOST_REPO)["id"])
+            with Env(AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=self.HOST_REPO):
+                self.assertEqual(permissions.afclaude_project_id(conn), pid)
+            with Env(AFCLAUDE_IN_CONTAINER=None, AFCLAUDE_HOST_REPO=None):
+                self.assertIsNone(permissions.afclaude_project_id(conn))
+        finally:
+            conn.close()
+
+
 class BridgeArgv(unittest.TestCase):
     def test_claude_and_ka_resume(self):
         self.assertEqual(host.bridge_argv(["claude", "agents", "--json", "--all"]), ["claude", "agents", "--json", "--all"])

@@ -4,5 +4,5 @@
 services:
   afclaude:
     volumes:
-      - ${AFCLAUDE_DEV_SRC:-..}:${AFCLAUDE_DIR}:ro
-      - ${AFCLAUDE_HOST_REPO}/data:${AFCLAUDE_DIR}/data
+      - ${AFCLAUDE_DEV_SRC:-..}:/app:ro
+      - ${AFCLAUDE_HOST_REPO}/data:/app/data

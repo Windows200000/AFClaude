@@ -31,6 +31,12 @@ whitelist. So every host call is mapped onto one of those shapes here:
 Anything else raises ValueError instead of being sent: it would be denied anyway.
 Settings (env, set by docker/compose.yml): AFCLAUDE_BRIDGE_HOST, AFCLAUDE_BRIDGE_USER,
 AFCLAUDE_BRIDGE_KEY, AFCLAUDE_BRIDGE_KNOWN_HOSTS.
+
+The code runs from /app in the image, so a path the HOST must understand (the project of "this
+checkout", the cwd of a launch, a path in a message to a session) is never the code's own directory:
+repo_dir() is the host path of the repo (the container gets it as AFCLAUDE_HOST_REPO from
+docker/.env until K4/K2 move it to the host kit's host.json); local_path() / to_local() map it back
+to the code directory for the places that read a file or run a stored command inside the container.
 """
 import json
 import os
@@ -58,12 +64,54 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
                   "not reachable, do not try any other name or agent and do not retry. Do nothing else. "
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
+HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
 
 
 def in_container():
     return os.environ.get("AFCLAUDE_IN_CONTAINER", "").strip() not in ("", "0")
+
+
+class HostRepoError(RuntimeError):
+    """In a container, the host path of the repo is missing or not an absolute path (D-235)."""
+
+
+def repo_dir() -> str:
+    """The host path of the AFClaude repo (what projects.path holds for this checkout). On the host it
+    is the code's own directory; in the container (code at /app) it is AFCLAUDE_HOST_REPO, and an
+    unset or relative value raises (no guess, no fallback to the container's /app)."""
+    if not in_container():
+        return HERE
+    v = os.environ.get("AFCLAUDE_HOST_REPO", "").strip()
+    if not v.startswith("/"):
+        raise HostRepoError("AFCLAUDE_HOST_REPO (the host path of the repo, docker/.env) is not set to "
+                            f"an absolute path: {v!r}")
+    return os.path.normpath(v)
+
+
+def local_path(path: str) -> str:
+    """The path inside this process for a host path: in a container a path at or under repo_dir()
+    becomes the same path under the code directory (the repo's local-only files are linked there);
+    anything else, and everything on the host, is returned unchanged."""
+    if not in_container() or not path:
+        return path
+    root = repo_dir()
+    if root == HERE:
+        return path
+    p = os.path.normpath(path)
+    if p == root or p.startswith(root + os.sep):
+        return HERE + p[len(root):]
+    return path
+
+
+def to_local(text: str) -> str:
+    """`text` (a stored command line, a cwd) with every occurrence of the host repo path replaced
+    by the code directory: at-jobs scheduled before the code moved to /app still name the host
+    path. Only whole path prefixes are replaced (AFClaude-wt-x is not AFClaude)."""
+    if not text or not in_container() or repo_dir() == HERE:
+        return text
+    return re.sub(re.escape(repo_dir()) + r"(?![\w.-])", lambda m: HERE, text)
 
 
 def ssh_argv(remote):

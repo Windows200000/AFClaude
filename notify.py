@@ -27,7 +27,7 @@ import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside
 import project_docs  # noqa: E402  (the alert into the DB: doc.append)
 ACTOR = "runner:notify"
 BERLIN = ZoneInfo("Europe/Berlin")
-ENV = {"HOME": os.path.expanduser("~"), "USER": "opc", "PATH": "/home/opc/.local/bin:/usr/bin:/bin",
+ENV = {"HOME": os.path.expanduser("~"), "USER": "opc", "PATH": os.path.expanduser("~/.local/bin") + ":/usr/bin:/bin",
        "LANG": "C.UTF-8"}
 
 
@@ -37,7 +37,7 @@ def push(text):
         r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",
                               "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
                               "--tools=PushNotification", "--allowedTools=PushNotification",
-                              "--strict-mcp-config"], input=prompt, cwd=os.path.join(HERE, "data"),
+                              "--strict-mcp-config"], input=prompt, cwd=os.path.join(host.repo_dir(), "data"),
                              env=ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"push failed: {e}"

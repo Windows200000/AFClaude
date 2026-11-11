@@ -26,8 +26,9 @@ import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-AFCLAUDE_DIR = os.environ.get("AFCLAUDE_DIR", "/mnt/BlockVolume/Claude/work/AFClaude")
-sys.path.insert(0, AFCLAUDE_DIR)
+# the code directory is the one this file sits in (/app in the image; /usr/local/bin/at is a symlink
+# to it, so the link is followed): no env, no host path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import runner_state  # noqa: E402
 import store  # noqa: E402
 

@@ -49,6 +49,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import runner_state  # noqa: E402
 import failstop  # noqa: E402
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
 import prompts as prompt_registry  # noqa: E402  (add() has a parameter named prompts)
@@ -212,7 +213,7 @@ def report_written_since(report: str, since: datetime, repo: Optional[str] = Non
     try:
         conn = store.connect()
         try:
-            proj = store.get_project(conn, os.path.abspath(repo or HERE))
+            proj = store.get_project(conn, os.path.abspath(repo or host.repo_dir()))
             doc = store.get_doc(conn, proj["id"], report) if proj is not None else None
         finally:
             conn.close()
@@ -277,7 +278,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add", help="schedule a task for the nightly runs from --due on")
     a.add_argument("name")
-    a.add_argument("--due", type=parse_due, required=True, help=f'"{DUE_FMT}", Europe/Berlin')
+    a.add_argument("--due", type=parse_due, required=True, help=f'"{DUE_FMT}", Europe/Berlin'.replace("%", "%%"))  # argparse %-formats help
     a.add_argument("--title", required=True)
     a.add_argument("--report", required=True, help="the doc whose writing marks it done, e.g. review:<name>")
     a.add_argument("--prompt", action="append", required=True, help="prompts/<P>.md, in order (repeatable)")
