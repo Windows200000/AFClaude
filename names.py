@@ -21,6 +21,7 @@ from typing import Collection, Optional
 
 PREFIX = "afc-"
 MAX_LEN = 40
+RESERVED = ("afc-check",)   # the host check's tmux session (docker/host-kit/host_exec.py CHECK_SESSION): never a session's name
 TMUX_RE = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # \Z: no trailing newline
 KINDS = ("task-manager", "review", "stall", "request")
 MAX_SUFFIX = 99
@@ -69,6 +70,6 @@ def tmux_name(kind: str, project: Optional[str] = None, title: Optional[str] = N
         name = _join(head, slug(source, room) if source else "", tail, suffix)
         if not TMUX_RE.match(name):
             raise ValueError(f"tmux name {name!r} is not [a-z0-9-] of at most {MAX_LEN} characters")
-        if name not in taken:
+        if name not in taken and name not in RESERVED:
             return name
     raise ValueError(f"no free tmux name for {kind} {project or title or ''!r}: up to -{MAX_SUFFIX} all taken")

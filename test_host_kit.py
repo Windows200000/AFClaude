@@ -26,9 +26,11 @@ import host  # noqa: E402
 
 HOST_EXEC = os.path.join(HERE, "docker", "host-kit", "host_exec.py")
 INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
-# every kit version and its whitelist hash: a command added without a version bump fails
-# test_whitelist_hash_matches_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS)
-KIT_VERSIONS = {"1": "19f410841fbc971d", "2": "2d289ec6ac9ab583"}
+# the current kit version with its whitelist hash and the sha256 of each kit file: a command added, or a change of
+# host_exec.py or ka_resume.sh, without a version bump fails test_whitelist_hash_matches_the_version and
+# test_kit_files_are_pinned_with_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS; M5)
+KIT_VERSIONS = {"3": {"whitelist": "2d289ec6ac9ab583", "host_exec.py": "74f4c84c4a915b9456591a7d422af3f706b361e43565fa845b80ea4415c932d7",  # public-check: allow (sha256 pin)
+                        "ka_resume.sh": "ce76821ea7a99fd5d14f26c3a228267d262e0193f0d88bd5f143cb0fe8ec257a"}}  # public-check: allow (sha256 pin)
 SID = "abcdef01-0000-4000-8000-000000000001"
 
 
@@ -41,8 +43,8 @@ def write_json(path, obj, mode=0o600):
     os.chmod(path, mode)
 
 
-def good_config(root, **kw):
-    cfg = {"format": 1, "roots": [root], "repo": HERE, "claude": "/usr/bin/true"}
+def good_config(root, data, **kw):
+    cfg = {"format": 2, "roots": [root], "repo": HERE, "claude": "/usr/bin/true", "data": data}
     cfg.update(kw)
     return cfg
 
@@ -52,7 +54,8 @@ def load_he(host_json, home=None, log=os.devnull):
     env = {"AFCLAUDE_HOST_JSON": host_json, "AFCLAUDE_HOST_EXEC_LOG": log}
     if home:
         env["HOME"] = home
-    with mock.patch.dict(os.environ, env):
+    with mock.patch.dict(os.environ, env), mock.patch.dict(os.environ):
+        os.environ.pop("SSH_ORIGINAL_COMMAND", None)
         spec = importlib.util.spec_from_file_location("host_exec_kit", HOST_EXEC)
         he = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(he)
@@ -60,10 +63,13 @@ def load_he(host_json, home=None, log=os.devnull):
 
 
 def run_exec(command, host_json, stdin=b"", home=None, log=os.devnull):
-    env = dict(os.environ, SSH_ORIGINAL_COMMAND=command, AFCLAUDE_HOST_JSON=host_json, AFCLAUDE_HOST_EXEC_LOG=log)
+    """The kit as sshd runs it, except the command comes as `--run <command>` and the env overrides are honoured:
+    under sshd (SSH_ORIGINAL_COMMAND set) they are not (L2; test_the_env_overrides_are_ignored_under_sshd)."""
+    env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+    env.update(AFCLAUDE_HOST_JSON=host_json, AFCLAUDE_HOST_EXEC_LOG=log)
     if home:
         env["HOME"] = home
-    return subprocess.run([sys.executable, HOST_EXEC], input=stdin, env=env, capture_output=True, timeout=60)
+    return subprocess.run([sys.executable, HOST_EXEC, "--run", command], input=stdin, env=env, capture_output=True, timeout=60)
 
 
 class TempDir(unittest.TestCase):
@@ -71,9 +77,14 @@ class TempDir(unittest.TestCase):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="kit-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.root = os.path.join(self.tmp, "root")
+        self.data = os.path.join(self.tmp, "data")          # the container-writable directory
         os.mkdir(self.root)
+        os.mkdir(self.data)
         self.hj = os.path.join(self.tmp, "host.json")
-        write_json(self.hj, good_config(self.root))
+        write_json(self.hj, self.config())
+
+    def config(self, **kw):
+        return good_config(self.root, self.data, **kw)
 
 
 class HostJson(TempDir):
@@ -97,14 +108,16 @@ class HostJson(TempDir):
         self.assert_refused("missing")
 
     def test_malformed(self):
-        good = good_config(self.root)
+        good = self.config()
         bad = {
             "not json": "{nope",
             "a list": "[]",
             "empty": "",
             "missing key": {k: v for k, v in good.items() if k != "repo"},
+            "no data key": {k: v for k, v in good.items() if k != "data"},
+            "data relative": dict(good, data="data"),
             "unknown key": dict(good, extra=1),
-            "format 2": dict(good, format=2),
+            "format 1": dict(good, format=1),
             "format true": dict(good, format=True),
             "roots empty": dict(good, roots=[]),
             "roots not a list": dict(good, roots=self.root),
@@ -131,38 +144,104 @@ class HostJson(TempDir):
         os.symlink(real, self.hj)
         self.assert_refused("symlink")
 
-    def test_log_beside_the_missing_config(self):
-        """With no usable config the refusal is logged next to where host.json should be."""
-        os.unlink(self.hj)
-        with mock.patch.dict(os.environ, {"AFCLAUDE_HOST_EXEC_LOG": ""}):
-            env = dict(os.environ, SSH_ORIGINAL_COMMAND="kit-version", AFCLAUDE_HOST_JSON=self.hj)
-            env.pop("AFCLAUDE_HOST_EXEC_LOG")
-            r = subprocess.run([sys.executable, HOST_EXEC], env=env, capture_output=True, timeout=60)
+    def share(self):
+        """host.json's own directory, as <share>/afclaude: a kit file path below it, so KIT_DIR/../.. is it."""
+        share = os.path.join(self.tmp, "share")
+        kit = os.path.join(share, "host-kit", "3")
+        os.makedirs(kit)
+        for name in ("host_exec.py", "ka_resume.sh"):
+            shutil.copy(os.path.join(os.path.dirname(HOST_EXEC) if name == "host_exec.py" else HERE, name), kit)
+        write_json(os.path.join(share, "host.json"), self.config())
+        return share, os.path.join(kit, "host_exec.py")
+
+    def test_log_is_beside_host_json_not_in_the_data_dir(self):
+        """H2: <share>/afclaude/host_exec.log, with or without a usable config; nothing is written under the
+        repo's data dir or the container-writable data directory."""
+        share, kit = self.share()
+        env = {"PATH": os.environ["PATH"], "SSH_ORIGINAL_COMMAND": "kit-version", "HOME": self.tmp}
+        r = subprocess.run([sys.executable, kit], env=env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = os.path.join(share, "host_exec.log")
+        with open(log) as fh:
+            self.assertIn("OK kit-version", fh.read())
+        self.assertEqual(os.stat(log).st_mode & 0o777, 0o600)
+        self.assertEqual(os.listdir(self.data), [])
+        os.unlink(os.path.join(share, "host.json"))
+        r = subprocess.run([sys.executable, kit], env=env, capture_output=True, timeout=60)
         self.assertEqual(r.returncode, 126)
-        with open(os.path.join(self.tmp, "host_exec.log")) as fh:
+        with open(log) as fh:
             self.assertIn("DENY host config", fh.read())
 
-    def test_log_goes_under_the_repo_once_the_config_is_read(self):
-        repo = os.path.join(self.tmp, "repo")
-        os.mkdir(repo)
-        write_json(self.hj, good_config(self.root, repo=repo))
-        env = dict(os.environ, SSH_ORIGINAL_COMMAND="kit-version", AFCLAUDE_HOST_JSON=self.hj)
-        env.pop("AFCLAUDE_HOST_EXEC_LOG", None)
-        self.assertEqual(subprocess.run([sys.executable, HOST_EXEC], env=env, capture_output=True, timeout=60).returncode, 0)
-        with open(os.path.join(repo, "data", "host_exec.log")) as fh:
-            self.assertIn("OK kit-version", fh.read())
+    def test_log_symlink_is_refused_not_followed(self):
+        """H2: a symlink at the log path (to authorized_keys, say) is not written through."""
+        share, kit = self.share()
+        target = os.path.join(self.tmp, "authorized_keys")
+        write_json(target, "ssh-ed25519 AAAA owner\n")
+        os.symlink(target, os.path.join(share, "host_exec.log"))
+        env = {"PATH": os.environ["PATH"], "SSH_ORIGINAL_COMMAND": "kit-version", "HOME": self.tmp}
+        r = subprocess.run([sys.executable, kit], env=env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)                    # the command itself still runs
+        self.assertIn(b"log not written", r.stderr)                    # and the failure is said, not swallowed
+        with open(target) as fh:
+            self.assertEqual(fh.read(), "ssh-ed25519 AAAA owner\n")
+
+    def test_caller_text_is_escaped_in_the_log(self):
+        """H2: a newline (or any control or non-ASCII character) in an argument can't start a new log line."""
+        share, kit = self.share()
+        evil = "ka_resume.sh --message 'x\nssh-ed25519 AAAAevil k\n\t\r\x1b[31m \u00e4' --session nope"
+        env = {"PATH": os.environ["PATH"], "SSH_ORIGINAL_COMMAND": evil, "HOME": self.tmp}
+        r = subprocess.run([sys.executable, kit], env=env, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 126)
+        with open(os.path.join(share, "host_exec.log")) as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("\\n", lines[0])
+        self.assertIn("ssh-ed25519 AAAAevil", lines[0])               # present, but inside the escaped line
+        self.assertTrue(all(32 <= ord(c) < 127 for c in lines[0]))
+        he = load_he(self.hj)
+        self.assertEqual(he.printable("a\nb\x00c\u00e4\u20ac"), "a\\x0ab\\x00c\\xe4\\u20ac")
+
+    def test_the_env_overrides_are_ignored_under_sshd(self):
+        """L2: with SSH_ORIGINAL_COMMAND set (sshd) AFCLAUDE_HOST_JSON / _HOST_EXEC_LOG / _SESSIONS and a changed
+        HOME do not take effect; without it (the tests, the install) they do."""
+        share, kit = self.share()
+        other = os.path.join(self.tmp, "other.json")
+        write_json(other, self.config(roots=[self.tmp]))
+        env = {"PATH": os.environ["PATH"], "SSH_ORIGINAL_COMMAND": "host-config get", "HOME": self.tmp,
+               "AFCLAUDE_HOST_JSON": other, "AFCLAUDE_HOST_EXEC_LOG": os.path.join(self.tmp, "mine.log")}
+        r = subprocess.run([sys.executable, kit], env=env, capture_output=True, timeout=60)
+        self.assertEqual(json.loads(r.stdout)["roots"], [self.root])      # the file next to the kit, not `other`
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "mine.log")))
+        self.assertTrue(os.path.exists(os.path.join(share, "host_exec.log")))
+        r = run_exec("host-config get", other)                            # the test entry honours it
+        self.assertEqual(json.loads(r.stdout)["roots"], [self.tmp])
+        for argv in (["--run", "clock"], ["--print-version"]):             # install-only modes: not under sshd
+            r = subprocess.run([sys.executable, kit, *argv], env=env, capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 126, argv)
 
 
 class KitVersion(TempDir):
     def test_the_image_and_the_kit_agree(self):
         he = load_he(self.hj)
         self.assertEqual(host.HOST_KIT_VERSION, he.HOST_KIT_VERSION)
-        self.assertEqual(host.HOST_CONFIG_KEYS, he.SET_KEYS)
+        self.assertEqual([n for n, _ in host.KIT_FILES], list(he.KIT_FILES))
 
     def test_whitelist_hash_matches_the_version(self):
         he = load_he(self.hj)
-        self.assertEqual(KIT_VERSIONS.get(he.HOST_KIT_VERSION), he.whitelist_hash(),
+        self.assertEqual(KIT_VERSIONS.get(he.HOST_KIT_VERSION, {}).get("whitelist"), he.whitelist_hash(),
                          "the command list changed: bump HOST_KIT_VERSION and add the pair to KIT_VERSIONS")
+
+    def test_kit_files_are_pinned_with_the_version(self):
+        """M5: a change of host_exec.py or ka_resume.sh (which changes on main without the command list
+        changing) fails here until HOST_KIT_VERSION is bumped and the new hashes are pinned."""
+        he = load_he(self.hj)
+        pinned = KIT_VERSIONS.get(he.HOST_KIT_VERSION, {})
+        for name, rel in host.KIT_FILES:
+            with open(os.path.join(HERE, rel), "rb") as fh:
+                self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), pinned.get(name),
+                                 f"{rel} changed under kit version {he.HOST_KIT_VERSION}: bump HOST_KIT_VERSION in "
+                                 "docker/host-kit/host_exec.py and host.py, pin the new hashes in KIT_VERSIONS")
+        self.assertEqual(host.kit_source_hashes(), {n: pinned[n] for n, _ in host.KIT_FILES})
 
     def test_commands_are_the_heads_main_dispatches(self):
         """COMMANDS (what kit-version lists and hashes) is exactly the set of heads main()'s chain tests."""
@@ -176,7 +255,8 @@ class KitVersion(TempDir):
         info = json.loads(r.stdout)
         he = load_he(self.hj)
         self.assertEqual(info, {"kit_version": he.HOST_KIT_VERSION, "whitelist_hash": he.whitelist_hash(),
-                                "commands": sorted(he.COMMANDS), "config_format": 1})
+                                "commands": sorted(he.COMMANDS), "config_format": he.CONFIG_FORMAT,
+                                "files": host.kit_source_hashes()})     # run from the checkout: the files are the image's
 
     def test_every_bridge_shape_the_image_builds_for_the_kit_is_accepted(self):
         for argv in (["kit-version"], ["host-config", "get"]):
@@ -188,7 +268,8 @@ class KitVersion(TempDir):
                     "host-config set roots", "host-config set bogus /x", "host-config del roots", "host-config get x",
                     "host-config get roots", "host-config set format 2"):
             self.assertEqual(run_exec(cmd, self.hj).returncode, 126, cmd)
-        for argv in (["kit-version", "x"], ["host-config"], ["host-config", "set", "bogus", "x"], ["host-config", "set", "roots"]):
+        for argv in (["kit-version", "x"], ["host-config"], ["host-config", "set", "bogus", "x"], ["host-config", "set", "roots"],
+                     ["host-config", "set", "repo", "/x"]):
             with self.assertRaises(ValueError, msg=argv):
                 host.bridge_argv(argv)
 
@@ -199,8 +280,44 @@ class ImageSide(unittest.TestCase):
     def answer(self, rc=0, out="", err=""):
         return mock.patch.object(host.subprocess, "run", return_value=subprocess.CompletedProcess([], rc, out, err))
 
-    def info(self, version):
-        return json.dumps({"kit_version": version, "whitelist_hash": "x", "commands": [], "config_format": 1})
+    def info(self, version, files=None):
+        return json.dumps({"kit_version": version, "whitelist_hash": "x", "commands": [], "config_format": 2,
+                           "files": files if files is not None else host.kit_source_hashes()})
+
+    def serve(self, info, conf):
+        """kit-version answers `info`, host-config get answers `conf` (a dict), over a fake ssh."""
+        def fake(argv, **kw):
+            out = info if argv[-1] == "kit-version" else json.dumps(conf)
+            return subprocess.CompletedProcess(argv, 0, out, "")
+        return mock.patch.object(host.subprocess, "run", fake)
+
+    def test_check_host_compares_files_and_repo(self):
+        """M5, M3: the host check (never import or a request) compares the kit's file hashes with the image's own
+        copies and host.json's repo with AFCLAUDE_HOST_REPO; any difference is a HostKitError."""
+        env = {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/repo"}
+        with mock.patch.dict(os.environ, env):
+            with self.serve(self.info(host.HOST_KIT_VERSION), {"repo": "/srv/repo/"}):
+                self.assertEqual(host.check_host()["kit_version"], host.HOST_KIT_VERSION)
+            bad = dict(host.kit_source_hashes(), **{"ka_resume.sh": "0" * 64})
+            with self.serve(self.info(host.HOST_KIT_VERSION, bad), {"repo": "/srv/repo"}), \
+                    self.assertRaises(host.HostKitError) as cm:
+                host.check_host()
+            self.assertIn("other files", str(cm.exception))
+            for files in ({}, None):
+                with self.serve(json.dumps({"kit_version": host.HOST_KIT_VERSION, "commands": [], "files": files}),
+                                {"repo": "/srv/repo"}), self.assertRaises(host.HostKitError):
+                    host.check_host()
+            with self.serve(self.info(host.HOST_KIT_VERSION), {"repo": "/srv/other"}), \
+                    self.assertRaises(host.HostKitError) as cm:
+                host.check_host()
+            self.assertIn("/srv/other", str(cm.exception))
+            for conf in ({}, {"repo": 1}, []):
+                with self.serve(self.info(host.HOST_KIT_VERSION), conf), self.assertRaises(host.HostKitError, msg=conf):
+                    host.check_host()
+            with self.serve(self.info("0"), {"repo": "/srv/repo"}), self.assertRaises(host.HostKitError):
+                host.check_host()
+            with self.answer(rc=126, err="host_exec: denied (not whitelisted)"):
+                self.assertIsNone(host.check_host())           # the pre-kit bridge: reported by the first host check
 
     def test_matching_version(self):
         with self.answer(out=self.info(host.HOST_KIT_VERSION)):
@@ -272,7 +389,7 @@ class Roots(TempDir):
                 self.he.check_ka_resume(self.args(cwd))
 
     def test_a_second_root(self):
-        write_json(self.hj, good_config(self.root, roots=[self.root, self.other]))
+        write_json(self.hj, self.config(roots=[self.root, self.other]))
         he = load_he(self.hj)
         self.assertEqual(he.under_roots(self.other), self.other)
         self.assertIsNone(he.under_roots(self.outside))
@@ -280,11 +397,32 @@ class Roots(TempDir):
     def test_a_root_that_is_itself_a_symlink(self):
         link = os.path.join(self.tmp, "rootlink")
         os.symlink(self.root, link)
-        write_json(self.hj, good_config(link))
+        write_json(self.hj, good_config(link, self.data))
         he = load_he(self.hj)
         self.assertEqual(he.under_roots(self.sub), self.sub)
         self.assertEqual(he.under_roots(os.path.join(link, "proj")), self.sub)
         self.assertIsNone(he.under_roots(self.outside))
+
+    def test_the_data_dir_is_no_cwd_and_no_doc_dir(self):
+        """H3: the container writes the data dir (and .claude/settings.json in it would load as project settings
+        of a launch there). It is refused even when a root contains it, also through symlinks and `..`."""
+        write_json(self.hj, self.config(roots=[self.tmp]))              # a root that contains root/, outside/ and data/
+        he = load_he(self.hj)
+        sub = os.path.join(self.data, "sub")
+        os.mkdir(sub)
+        via = os.path.join(self.root, "to-data")
+        os.symlink(self.data, via)
+        for cwd in (self.data, sub, self.data + "/", self.data + "/sub/..", via, os.path.join(via, "sub"),
+                    os.path.join(self.root, "..", "data")):
+            self.assertIsNone(he.under_roots(cwd), cwd)
+            with self.assertRaises(SystemExit, msg=cwd):
+                he.check_ka_resume(self.args(cwd))
+            r = run_exec(f"doc-files read {shlex.quote(cwd)} PROGRESS.md", self.hj)
+            self.assertEqual(r.returncode, 126, cwd)
+        self.assertEqual(he.under_roots(self.root), self.root)          # its neighbours stay fine
+        self.assertEqual(he.under_roots(self.root + "/proj"), self.root + "/proj")
+        os.symlink(self.sub, os.path.join(self.data, "elsewhere"))      # a symlink in data to a root dir: resolved target
+        self.assertEqual(he.under_roots(os.path.join(self.data, "elsewhere")), self.sub)
 
     def test_over_the_wire(self):
         r = run_exec(f"ka_resume.sh {' '.join(self.args(self.outside))}", self.hj)
@@ -317,65 +455,59 @@ class OutputCap(TempDir):
                 he.emit("ä" * (he.OUT_MAX // 2 + 1))     # the cap counts bytes
 
 
-class HostConfigSet(TempDir):
-    def setUp(self):
-        super().setUp()
-        self.home = os.path.join(self.tmp, "home")
-        os.mkdir(self.home)
-        os.mkdir(os.path.join(self.home, ".claude"))
-        os.mkdir(os.path.join(self.home, "work"))
-        self.work = os.path.join(self.tmp, "work")
-        os.mkdir(self.work)
-        self.exe = os.path.join(self.tmp, "claude-stub")
-        write_json(self.exe, "#!/bin/sh\n", 0o755)
+class HostConfigIsReadOnly(TempDir):
+    """D-338 (review:k2 H1): host.json is written only by the owner's install on the host. The bridge has no
+    `host-config set`: a container that could change it could point the kit at files it writes itself."""
 
-    def cmd(self, *words):
-        return run_exec("host-config set " + " ".join(words), self.hj, home=self.home)
-
-    def config(self):
+    def test_every_set_shape_is_denied_and_the_file_stays(self):
         with open(self.hj) as fh:
-            return json.load(fh)
+            before = fh.read()
+        for cmd in ("host-config set roots /tmp", "host-config set repo /tmp", f"host-config set claude {sys.executable}",
+                    f"host-config set repo {self.data}", f"host-config set claude {self.data}/x.sh",
+                    f"host-config set roots {self.data}", "host-config set data /tmp", "host-config set"):
+            r = run_exec(cmd, self.hj)
+            self.assertEqual(r.returncode, 126, (cmd, r.stderr))
+            self.assertIn(b"not whitelisted", r.stderr)
+            with open(self.hj) as fh:
+                self.assertEqual(fh.read(), before, cmd)
+        self.assertEqual(run_exec("host-config get", self.hj).returncode, 0)
 
-    def test_set_roots(self):
-        r = self.cmd("roots", self.work, os.path.join(self.home, "work"))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.config()["roots"], [self.work, os.path.join(self.home, "work")])
-        self.assertEqual(os.stat(self.hj).st_mode & 0o777, 0o600)
-        self.assertEqual(run_exec("host-config get", self.hj).returncode, 0)     # the next call reads it fine
+    def test_the_image_has_no_such_shape_and_the_kit_has_no_writer(self):
+        with self.assertRaises(ValueError):
+            host.bridge_argv(["host-config", "set", "repo", "/x"])
+        self.assertFalse(hasattr(host, "HOST_CONFIG_KEYS"))
+        he = load_he(self.hj)
+        self.assertFalse(hasattr(he, "config_set"))
+        self.assertFalse(hasattr(he, "SET_KEYS"))
 
-    def test_set_resolves_symlinks(self):
-        link = os.path.join(self.tmp, "link")
-        os.symlink(self.work, link)
-        self.assertEqual(self.cmd("roots", link).returncode, 0)
-        self.assertEqual(self.config()["roots"], [self.work])
+    def test_the_container_writable_data_dir_is_refused_for_every_path_host_json_names(self):
+        """At read (host.json written by someone else, or a path turned into a symlink into the data dir)."""
+        he = load_he(self.hj)
+        link = os.path.join(self.tmp, "to-data")
+        os.symlink(self.data, link)
+        script = os.path.join(self.data, "x.sh")
+        write_json(script, "#!/bin/sh\n", 0o755)
+        for why, cfg in (("claude in data", self.config(claude=script)),
+                         ("claude via symlink", self.config(claude=os.path.join(link, "x.sh"))),
+                         ("repo is data", self.config(repo=self.data)),
+                         ("repo below data", self.config(repo=os.path.join(self.data, "r"))),
+                         ("root is data", self.config(roots=[self.data])),
+                         ("root via symlink", self.config(roots=[link])),
+                         ("root below data", self.config(roots=[os.path.join(self.data, "w")])),
+                         ("config dir in data", self.config(config_dirs={"w": os.path.join(self.data, "c")}))):
+            write_json(self.hj, cfg)
+            with self.assertRaises(he.ConfigError, msg=why):
+                he.load_config(self.hj)
+            self.assert_denied_everywhere()
+        # a root that CONTAINS the data dir is fine; the data dir itself is refused as a cwd (Roots)
+        write_json(self.hj, self.config(roots=[self.tmp]))
+        he.load_config(self.hj)
 
-    def test_set_repo_and_claude(self):
-        self.assertEqual(self.cmd("repo", self.work).returncode, 0)
-        self.assertEqual(self.cmd("claude", self.exe).returncode, 0)
-        self.assertEqual((self.config()["repo"], self.config()["claude"]), (self.work, self.exe))
-
-    def test_set_refused_leaves_the_file_alone(self):
-        before = self.config()
-        plain = os.path.join(self.tmp, "plain")
-        write_json(plain, "x", 0o644)
-        for words in (("roots", "relative/dir"), ("roots", os.path.join(self.tmp, "missing")), ("roots", self.work + "/.."),
-                      ("roots", "/"), ("roots", "/etc"), ("roots", self.home), ("roots", self.tmp),      # the home, its ancestor
-                      ("roots", os.path.join(self.home, ".claude")), ("roots", plain),
-                      ("roots", *[self.work] * 9), ("roots",), ("repo", self.work, self.work), ("repo", plain),
-                      ("claude", plain), ("claude", "claude"), ("claude", self.work), ("claude", os.path.join(self.tmp, "missing"))):
-            r = self.cmd(*words)
-            self.assertEqual(r.returncode, 126, (words, r.stderr))
-            self.assertEqual(self.config(), before, words)
-
-    def test_a_directory_of_another_user_is_refused(self):
-        he = load_he(self.hj, home=self.home)
-        real_stat = os.stat
-        def other_owner(path, *a, **kw):
-            st = real_stat(path, *a, **kw)
-            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, *st[5:]))
-        with mock.patch.object(he.os, "stat", other_owner):
-            with self.assertRaises(he.ConfigError):
-                he._owned_dir(self.work)
+    def assert_denied_everywhere(self):
+        for cmd in ("kit-version", "host-config get"):
+            r = run_exec(cmd, self.hj)
+            self.assertEqual(r.returncode, 126)
+            self.assertIn(b"inside the data directory", r.stderr)
 
 
 class InstallScript(unittest.TestCase):
@@ -408,9 +540,12 @@ class InstallScript(unittest.TestCase):
             shutil.copy(os.path.join(HERE, rel), os.path.join(self.src, rel))
         self.share = os.path.join(self.home, ".local", "share", "afclaude")
 
-    def run_install(self, *extra, args=None, src=None):
+    def run_install(self, *extra, args=None, src=None, env_extra=None, path=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("AFCLAUDE_", "XDG_", "SSH_"))}
         env["HOME"] = self.home
+        env.update(env_extra or {})
+        if path:
+            env["PATH"] = path + ":" + env["PATH"]
         a = args if args is not None else ["--root", self.root, "--data", self.data, "--claude", self.claude]
         return subprocess.run(["bash", os.path.join(src or self.src, "docker", "install_host_bridge.sh"), *a, *extra],
                               env=env, capture_output=True, text=True, timeout=120)
@@ -433,6 +568,22 @@ class InstallScript(unittest.TestCase):
         with open(self.ak) as fh:
             return fh.read().splitlines()
 
+    def derived(self, key):
+        return subprocess.run(["ssh-keygen", "-y", "-f", key], capture_output=True, text=True, check=True).stdout.strip()
+
+    def bridge_key(self):
+        return os.path.join(self.data, "bridge", "host_bridge_ed25519")
+
+    def make_key(self, comment, kind="ed25519"):
+        os.makedirs(os.path.dirname(self.bridge_key()), exist_ok=True)
+        if os.path.exists(self.bridge_key()):
+            os.unlink(self.bridge_key())
+        subprocess.run(["ssh-keygen", "-q", "-t", kind, "-N", "", "-C", comment, "-f", self.bridge_key()], check=True,
+                       capture_output=True)
+
+    def backups(self):
+        return sorted(f for f in os.listdir(os.path.dirname(self.ak)) if f.startswith("authorized_keys.bak-afclaude-"))
+
     def test_fresh_install(self):
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -444,7 +595,8 @@ class InstallScript(unittest.TestCase):
         # host.json: mode 0600, what was asked for
         self.assertEqual(os.stat(os.path.join(self.share, "host.json")).st_mode & 0o777, 0o600)
         with open(os.path.join(self.share, "host.json")) as fh:
-            self.assertEqual(json.load(fh), {"format": 1, "roots": [self.root], "repo": self.src, "claude": self.claude})
+            self.assertEqual(json.load(fh), {"format": 2, "roots": [self.root], "repo": self.src, "claude": self.claude,
+                                             "data": self.data})
         # the key lives in the data dir
         key = os.path.join(self.data, "bridge", "host_bridge_ed25519")
         self.assertEqual(os.stat(key).st_mode & 0o777, 0o600)
@@ -454,12 +606,11 @@ class InstallScript(unittest.TestCase):
         lines = self.lines()
         self.assertEqual(lines[:2], [self.OTHER, self.OLD])
         self.assertEqual(len(lines), 3)
-        with open(key + ".pub") as fh:
-            blob = fh.read().split()[1]
+        blob = self.derived(key).split()[1]
         new = lines[2]
-        self.assertIn(f'command="{kits}/current/host_exec.py",from="172.16.0.0/12",no-pty,no-port-forwarding,'
-                      'no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 ' + blob, new)
-        self.assertTrue(new.endswith("afclaude-host-bridge-kit"))
+        self.assertEqual(new, f'command="{kits}/current/host_exec.py",from="172.28.0.0/24",restrict ssh-ed25519 {blob} '
+                              'afclaude-host-bridge-kit')
+
         # the closing message names the old line and how to remove it; running that sed removes only it
         self.assertIn("1 old bridge line(s)", r.stdout)
         sed = [l for l in r.stdout.splitlines() if l.strip().startswith("sed -i")][0].strip()
@@ -479,7 +630,7 @@ class InstallScript(unittest.TestCase):
     def test_from_is_the_runners_network(self):
         r = self.run_install("--from", "10.20.0.0/16")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('from="10.20.0.0/16",no-pty', self.lines()[-1])
+        self.assertIn('from="10.20.0.0/16",restrict ', self.lines()[-1])
         for bad in ('10.0.0.1" ,command="x', "a b", ""):
             r = self.run_install("--from", bad)
             self.assertNotEqual(r.returncode, 0, bad)
@@ -495,6 +646,7 @@ class InstallScript(unittest.TestCase):
         self.assertEqual(len(again), len(first))
         self.assertEqual(again[:2], first[:2])
         self.assertIn('from="10.0.0.0/8"', again[2])                  # the same key's line is replaced
+        self.assertEqual(len(self.backups()), 2)                      # one timestamped backup per run
         with open(os.path.join(self.share, "host.json")) as fh:
             self.assertEqual(fh.read(), cfg)
         self.assertIn("already installed", r.stdout)
@@ -543,21 +695,187 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "2"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "3"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real = shutil.which("ssh-keygen")
         write_json(os.path.join(stub, "ssh-keygen"),
                    f'#!/bin/sh\ncase "$2" in *authorized_keys) exit 1;; esac\nexec {real} "$@"\n', 0o755)
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("AFCLAUDE_", "XDG_", "SSH_"))}
-        env.update(HOME=self.home, PATH=stub + ":" + os.environ["PATH"])
-        r = subprocess.run(["bash", os.path.join(self.src, "docker", "install_host_bridge.sh")], env=env,
-                           capture_output=True, text=True, timeout=120)
+        r = self.run_install(args=["--data", self.data], path=stub)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("back as they were", r.stderr)
         self.assertEqual(self.lines(), before_lines)
         self.assertEqual(os.readlink(os.path.join(self.share, "host-kit", "current")), before_link)
+
+    def test_a_failure_after_the_authorized_keys_write_and_the_link_switch_is_undone(self):
+        """M2: a plain `set -e` failure (not one of the script's own checks) at the link switch: the file and
+        the link are back, nothing is left over."""
+        self.assertEqual(self.run_install().returncode, 0)
+        before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
+        self.patch_kit('HOST_KIT_VERSION = "3"', 'HOST_KIT_VERSION = "99"')
+        stub = os.path.join(self.tmp, "bin")
+        os.mkdir(stub)
+        real, once = shutil.which("mv"), os.path.join(self.tmp, "mv-failed")
+        # fail the link switch (mv -T .current.NNN .../current) the first time only: the undo uses mv too
+        write_json(os.path.join(stub, "mv"),
+                   f'#!/bin/sh\ncase "$3" in */host-kit/current) [ -e {once} ] || {{ : > {once}; exit 1; }};; esac\n'
+                   f'exec {real} "$@"\n', 0o755)
+        r = self.run_install(args=["--data", self.data], path=stub)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertTrue(os.path.exists(once), "the stub never ran: the test does not exercise the failure")
+        self.assertIn("back as they were", r.stderr)
+        self.assertEqual(self.lines(), before_lines)
+        kits = os.path.join(self.share, "host-kit")
+        self.assertEqual(os.readlink(os.path.join(kits, "current")), before_link)
+        self.assertEqual([f for f in os.listdir(kits) if f.startswith(".")], [])
+
+    def test_a_failure_on_a_first_install_removes_the_link_and_restores_the_file(self):
+        before = self.lines()
+        stub = os.path.join(self.tmp, "bin")
+        os.mkdir(stub)
+        real = shutil.which("ssh-keygen")
+        write_json(os.path.join(stub, "ssh-keygen"),
+                   f'#!/bin/sh\ncase "$2" in *authorized_keys) exit 1;; esac\nexec {real} "$@"\n', 0o755)
+        r = self.run_install(path=stub)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(self.lines(), before)
+        kits = os.path.join(self.share, "host-kit")
+        self.assertFalse(os.path.lexists(os.path.join(kits, "current")))
+        self.assertEqual([f for f in os.listdir(kits) if f.startswith(".")], [])
+
+    def test_the_install_works_from_an_ssh_login(self):
+        """M1: an SSH login (SSH_CONNECTION, SSH_CLIENT, SSH_TTY set) is where the owner runs this; only a forced
+        command call (SSH_ORIGINAL_COMMAND) is refused the install modes."""
+        r = self.run_install(env_extra={"SSH_CONNECTION": "10.0.0.1 5555 10.0.0.2 22", "SSH_CLIENT": "10.0.0.1 5555 22",
+                                        "SSH_TTY": "/dev/pts/9"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.lines()), 3)
+        plain = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+        for argv in (["--print-version"], ["--check-config", os.path.join(self.share, "host.json")]):
+            r = subprocess.run([sys.executable, HOST_EXEC, *argv], env=dict(plain, SSH_CONNECTION="a b c d", SSH_ORIGINAL_COMMAND=""),
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 126, argv)                        # a forced-command call: refused
+            r = subprocess.run([sys.executable, HOST_EXEC, *argv], env=dict(plain, SSH_CONNECTION="a b c d"),
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, (argv, r.stderr))              # an interactive login: allowed
+
+    def test_a_forced_command_environment_refuses_the_install_modes(self):
+        r = self.run_install(env_extra={"SSH_ORIGINAL_COMMAND": "kit-version"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.lines(), [self.OTHER, self.OLD])
+        self.assertFalse(os.path.lexists(os.path.join(self.share, "host-kit", "current")))
+
+    def test_the_public_key_is_derived_never_copied_from_the_data_dir(self):
+        """H4: a .pub in the (container-writable) data dir is not read; a second line in it never reaches
+        authorized_keys, and an install that finds a hostile .pub still produces exactly one new line."""
+        self.assertEqual(self.run_install().returncode, 0)
+        base = [self.OTHER, self.OLD]
+        evil = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEVILEVILEVILEVILEVILEVILEVILEVILEVILEVILEV x"
+        key = self.bridge_key()
+        for pub in (self.derived(key) + "\n" + evil + "\n", evil + "\n", "ssh-ed25519\tAAAA\tx\n", "garbage", ""):
+            with open(key + ".pub", "w") as fh:
+                fh.write(pub)
+            r = self.run_install(args=["--data", self.data])
+            self.assertEqual(r.returncode, 0, (pub, r.stdout + r.stderr))
+            lines = self.lines()
+            self.assertEqual(len(lines), 3, pub)
+            self.assertEqual(lines[:2], base)
+            self.assertNotIn("EVIL", "\n".join(lines))
+            self.assertTrue(lines[2].endswith(self.derived(key).split()[1] + " afclaude-host-bridge-kit"))
+            with open(key + ".pub") as fh:
+                self.assertEqual(fh.read(), pub, "the install must not touch it")
+
+    def test_a_private_key_whose_comment_is_hostile_is_refused_or_neutralised(self):
+        """H4: the comment lives inside the private key file (container-controlled). A plain one is replaced by the
+        script's own; one with a tab or newline is refused, authorized_keys untouched."""
+        before = self.lines()
+        self.make_key("owner@laptop restrict,command=\"x\"")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(self.lines()[-1].endswith("afclaude-host-bridge-kit"))
+        self.assertNotIn("owner@laptop", self.lines()[-1])
+        self.assertNotIn("command=\"x\"", self.lines()[-1])
+        os.chmod(self.ak, 0o600)
+        with open(self.ak, "w") as fh:
+            fh.write("\n".join(before) + "\n")
+        for comment in ("a\tb", "a\nssh-ed25519 AAAAevil c"):
+            try:
+                self.make_key(comment)
+            except subprocess.CalledProcessError:
+                continue                                   # this ssh-keygen refuses such a comment itself
+            r = self.run_install()
+            joined = "\n".join(self.lines())
+            self.assertNotIn("evil", joined)               # whichever way ssh-keygen -y prints it (this one: no comment at all)
+            self.assertNotIn("a\tb", joined)
+            if r.returncode == 0:
+                self.assertEqual(len(self.lines()), 3)
+                with open(self.ak, "w") as fh:
+                    fh.write("\n".join(before) + "\n")
+            else:
+                self.assertIn("not one plain line", r.stderr)
+                self.assertEqual(self.lines(), before)
+
+    def test_a_derived_public_key_that_is_not_one_plain_line_is_refused(self):
+        """H4: whatever `ssh-keygen -y` prints (older/newer versions print the container-chosen comment), a result
+        with a second line, a tab, a CR or a non-base64 body stops the install before anything is changed."""
+        self.assertEqual(self.run_install().returncode, 0)
+        before = self.lines()
+        blob = self.derived(self.bridge_key()).split()[1]
+        stub = os.path.join(self.tmp, "bin")
+        os.mkdir(stub)
+        real = shutil.which("ssh-keygen")
+        for printed in (f"ssh-ed25519 {blob} c\\nssh-ed25519 AAAAevil", f"ssh-ed25519\\t{blob}", f"ssh-ed25519 {blob}\\tx",
+                        f"ssh-ed25519 {blob} c\\r", f"ssh-ed25519 {blob}x!", f"ssh-rsa {blob}", "", f'command=\\"x\\" ssh-ed25519 {blob}'):
+            write_json(os.path.join(stub, "ssh-keygen"),
+                       f'#!/bin/sh\ncase "$1" in -y) printf \'{printed}\\n\';; *) exec {real} "$@";; esac\n', 0o755)
+            r = self.run_install(args=["--data", self.data], path=stub)
+            self.assertEqual(r.returncode, 1, (printed, r.stdout))
+            self.assertIn("public key", r.stderr)
+            self.assertEqual(self.lines(), before, printed)
+
+    def test_a_key_that_is_not_ed25519_or_is_a_symlink_is_refused(self):
+        before = self.lines()
+        self.make_key("x", kind="ecdsa")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ssh-ed25519", r.stderr)
+        self.assertEqual(self.lines(), before)
+        os.unlink(self.bridge_key())
+        victim = os.path.join(self.tmp, "victim")
+        os.symlink(victim, self.bridge_key())              # dangling: ssh-keygen would write through it
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(os.path.exists(victim))
+        self.assertIn("symlink", r.stderr)
+
+    def test_paths_inside_the_data_dir_are_refused_at_install(self):
+        """H1/H3: the Claude binary, a root or the repo inside the container-writable data directory, and a
+        host.json that names another data directory than the one this install was given."""
+        script = os.path.join(self.data, "x.sh")
+        write_json(script, "#!/bin/sh\n", 0o755)
+        for args in (["--root", self.root, "--data", self.data, "--claude", script],
+                     ["--root", self.data, "--data", self.data, "--claude", self.claude],
+                     ["--root", self.root, "--data", self.src, "--claude", self.claude]):      # data = the repo
+            r = self.run_install(args=args)
+            self.assertEqual(r.returncode, 1, (args, r.stdout))
+            self.assertIn("data", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.share, "host.json")), args)
+            self.assertEqual(self.lines(), [self.OTHER, self.OLD])
+        self.assertEqual(self.run_install().returncode, 0)
+        other = os.path.join(self.tmp, "other-data")
+        os.mkdir(other)
+        r = self.run_install(args=["--data", other])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("names the data directory", r.stderr)
+
+    def test_old_backups_are_pruned_to_ten(self):
+        for i in range(14):
+            path = f"{self.ak}.bak-afclaude-2020010{i % 10}-0000{i:02d}-1"
+            write_json(path, "old\n")
+            os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(len(self.backups()), 10)
 
 
 LEGACY_EXEC = os.path.join(HERE, "docker", "host_exec.py")
@@ -565,7 +883,7 @@ LEGACY_EXEC = os.path.join(HERE, "docker", "host_exec.py")
 # main checkout, so merging a change of it would replace the live bridge at once, before any install. It is
 # removed only after the owner removed the old line (docs/phase5b_plan.md K2).
 LEGACY_SHA256 = "7c2e2e1e834a6bb1d3cfbde63b4d9cd9ac4eac1fb5752407a3ce93f5375ecc39"
-KIT_ONLY = [["kit-version"], ["host-config", "get"], ["host-config", "set", "repo", "/x"], ["tmux-check"], ["df"],
+KIT_ONLY = [["kit-version"], ["host-config", "get"], ["tmux-check"], ["df"],
             ["clock"], ["sessions", "default"], ["transcripts", "default", "--changed-since", "0"],
             ["doc-files", "read", "/x", "PROGRESS.md"], ["claude", "auth", "status"], ["claude", "doctor"]]
 
@@ -578,9 +896,6 @@ def run_legacy(command):
 class LegacyBridge(unittest.TestCase):
     """The live bridge is docker/host_exec.py of the main checkout (the owner's authorized_keys line): it stays
     as it is until the kit is installed, and the image works with it."""
-
-    def legacy_state(self):
-        return mock.patch.dict(host._kit_cache, {"at": float("inf"), "info": None})
 
     def test_the_legacy_file_is_the_one_main_has(self):
         with open(LEGACY_EXEC, "rb") as fh:
@@ -597,153 +912,112 @@ class LegacyBridge(unittest.TestCase):
             heads = set(re.findall(r'head == "([^"]+)"', fh.read())) | {"ka_resume.sh"}
         self.assertEqual(heads, set(host.LEGACY_HEADS))
 
-    def test_a_new_kit_command_is_known_to_the_gate(self):
+    def test_a_new_kit_command_is_known_to_the_legacy_list(self):
         he = load_he(os.devnull)
         self.assertEqual(set(he.COMMANDS) - host.LEGACY_HEADS,
                          {"kit-version", "host-config", "transcripts", "sessions", "doc-files", "tmux-check", "df",
-                          "clock"}, "a new kit command: the image must not send it to the pre-kit bridge (host.needs_kit)")
+                          "clock"}, "a new kit command: the pre-kit bridge denies it (rc 126 not whitelisted -> HostKitError)")
 
-    def test_the_runner_shapes_are_accepted_by_the_legacy_bridge_and_the_gate(self):
+    def test_the_runner_shapes_are_accepted_by_the_legacy_bridge(self):
         shapes = ([["tmux", verb, *rest] for verb, rest in (
             ("has-session", ["-t", "=afc-00000000"]), ("list-panes", ["-s", "-t", "=afc-00000000", "-F", "#{pane_pid}"]),
             ("list-clients", ["-t", "=afc-00000000", "-F", "#{client_activity}"]),
             ("capture-pane", ["-e", "-p", "-t", "=afc-00000000:"]), ("kill-session", ["-t", "=afc-00000000"]),
             ("rename-session", ["-t", "=afc-00000000", "afc-00000001"]))] + [["proc-snapshot"]])
-        with self.legacy_state():
-            for argv in shapes:
-                remote = host.bridge_argv(argv)
-                host.gate_command(remote)                                   # no error: the image sends it
-                self.assertNotEqual(run_legacy(shlex.join(remote)).returncode, 126, remote)
-            # the shapes that are only checked (a real claude / launch would start): the legacy file's own checks
-            spec = importlib.util.spec_from_file_location("host_exec_legacy", LEGACY_EXEC)
-            legacy = importlib.util.module_from_spec(spec)
-            with mock.patch.dict(os.environ, {"AFCLAUDE_HOST_EXEC_LOG": os.devnull}):
-                spec.loader.exec_module(legacy)
-            ka = ["--session", SID, "--tmux", "afc-abcdef01", "--message", "go", "--cwd", legacy.ROOT, "--name", "t",
-                  "--model", "claude-opus-5-5", "--effort", "high", "--new", "--no-remote-control"]
-            legacy.check_ka_resume(ka)
-            for argv in (["ka_resume.sh", *ka], ["claude", "agents", "--json"], ["claude", "agents", "--json", "--all"],
-                         ["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
-                         ["claude", "-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json"],
-                         ["claude", "stop", "0123abcd"], ["kill-claude", "1"], ["claude-env", "1"], ["usage-cache"],
-                         ["append-note", "ALERTS.md"], ["rc-send", "work-a1"]):
-                host.gate_command(host.bridge_argv(argv))
+        for argv in shapes:
+            remote = host.bridge_argv(argv)
+            self.assertNotEqual(run_legacy(shlex.join(remote)).returncode, 126, remote)
+        # the shapes that are only checked (a real claude / launch would start): the legacy file's own checks
+        spec = importlib.util.spec_from_file_location("host_exec_legacy", LEGACY_EXEC)
+        legacy = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"AFCLAUDE_HOST_EXEC_LOG": os.devnull}):
+            spec.loader.exec_module(legacy)
+        ka = ["--session", SID, "--tmux", "afc-abcdef01", "--message", "go", "--cwd", legacy.ROOT, "--name", "t",
+              "--model", "claude-opus-5-5", "--effort", "high", "--new", "--no-remote-control"]
+        legacy.check_ka_resume(ka)
+        for argv in (["ka_resume.sh", *ka], ["claude", "agents", "--json"], ["claude", "agents", "--json", "--all"],
+                     ["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
+                     ["claude", "-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json"],
+                     ["claude", "stop", "0123abcd"], ["kill-claude", "1"], ["claude-env", "1"], ["usage-cache"],
+                     ["append-note", "ALERTS.md"], ["rc-send", "work-a1"]):
+            host.bridge_argv(argv)      # the image builds the shape; the legacy file's heads are LEGACY_HEADS (above)
 
-    def test_kit_only_shapes_are_refused_by_the_legacy_bridge_and_never_sent(self):
-        with self.legacy_state():
-            for argv in KIT_ONLY:
-                remote = host.bridge_argv(argv)
-                r = run_legacy(shlex.join(remote))
-                self.assertEqual(r.returncode, 126, remote)
-                self.assertIn(b"not whitelisted", r.stderr)
-                if remote != ["kit-version"]:                      # the one command that asks which bridge this is
-                    with self.assertRaises(host.HostKitError, msg=remote) as cm:
-                        host.gate_command(remote)
-                    self.assertIn("not installed yet", str(cm.exception))
-            with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
-                    mock.patch.object(host.subprocess, "run") as run, self.assertRaises(host.HostKitError):
-                host.run_on_host(["claude", "doctor"])
-            run.assert_not_called()                               # refused before ssh
-
-    def test_kit_version_itself_is_never_gated(self):
-        with self.legacy_state():
-            host.gate_command(["kit-version"])
-
-
-class KitGate(unittest.TestCase):
-    """The image refuses a command the installed kit does not list; a kit that cannot be asked does not hide
-    the command's own failure."""
-
-    def setUp(self):
-        self.addCleanup(host._kit_cache.update, dict(host._kit_cache))
-        self.addCleanup(host._host_repo.update, dict(host._host_repo))
-        host._host_repo["path"] = None
-
-    def installed(self, commands, version=None):
-        host._kit_cache.update(at=time.monotonic(), info={"kit_version": version or host.HOST_KIT_VERSION,
-                                                            "whitelist_hash": "x", "commands": list(commands)})
-
-    def test_a_command_the_kit_does_not_list_is_refused(self):
-        self.installed(["tmux-has", "claude"])
-        host.gate_command(["tmux-has", "afc-a"])
-        host.gate_command(["claude", "agents", "--json"])
-        with self.assertRaises(host.HostKitError) as cm:
-            host.gate_command(["df"])
-        self.assertIn("does not list 'df'", str(cm.exception))
-        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
-                mock.patch.object(host.subprocess, "run") as run, self.assertRaises(host.HostKitError):
-            host.run_on_host(["proc-snapshot"])
-        run.assert_not_called()
-
-    def test_every_command_of_this_version_passes_the_gate(self):
-        he = load_he(os.devnull)
-        self.installed(he.COMMANDS)
+    def test_kit_only_shapes_are_refused_by_the_legacy_bridge_and_become_a_kit_error(self):
+        """M4: no pre-check round trip. The command is sent once; the old bridge's rc 126 "not whitelisted"
+        becomes a HostKitError naming the install."""
         for argv in KIT_ONLY:
-            host.gate_command(host.bridge_argv(argv))
+            remote = host.bridge_argv(argv)
+            r = run_legacy(shlex.join(remote))
+            self.assertEqual(r.returncode, 126, remote)
+            self.assertIn(b"not whitelisted", r.stderr)
+            answer = subprocess.CompletedProcess([], r.returncode, r.stdout.decode(), r.stderr.decode())
+            with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
+                    mock.patch.object(host.subprocess, "run", return_value=answer) as run, \
+                    self.assertRaises(host.HostKitError, msg=remote) as cm:
+                host.run_on_host(argv)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("host kit", str(cm.exception))
+            self.assertIn("install_host_bridge.sh", str(cm.exception))
 
-    def test_kit_state_is_cached_and_the_legacy_answer_is_asked_again(self):
-        host._kit_cache.update(at=None, info=None)
-        with mock.patch.object(host, "kit_info", return_value=None) as ki, mock.patch("sys.stderr") as err:
-            host.kit_state()
-            host.kit_state()
-            self.assertEqual(ki.call_count, 1)
-            self.assertIn("no host kit installed yet", "".join(c.args[0] for c in err.write.call_args_list))
-            host._kit_cache["at"] = time.monotonic() - host.KIT_RECHECK - 1
-            host.kit_state()
-            self.assertEqual(ki.call_count, 2)
-        info = {"kit_version": "2", "commands": ["df"]}
-        host._kit_cache["at"] = time.monotonic() - host.KIT_RECHECK - 1
-        with mock.patch.object(host, "kit_info", return_value=info) as ki:
-            self.assertEqual(host.kit_state(), info)
-            host._kit_cache["at"] = time.monotonic() - 10 * host.KIT_RECHECK
-            self.assertEqual(host.kit_state(), info)           # an installed kit is not asked again
-            self.assertEqual(ki.call_count, 1)
 
-    def test_a_kit_that_cannot_be_asked_does_not_stop_the_command(self):
-        host._kit_cache.update(at=None, info=None)
+class RunOnHost(unittest.TestCase):
+    """host.run_on_host in the container: one ssh call per command, the caller's timeout, no kit pre-check;
+    host.repo_dir() never calls the bridge (review:k2 M3, M4)."""
+    ENV = {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/repo/"}
+
+    def test_one_call_with_the_callers_timeout(self):
         calls = []
 
         def fake_run(argv, **kw):
-            calls.append(argv[-1])         # ssh's last argument: the remote command line
-            return subprocess.CompletedProcess(argv, 255 if argv[-1] == "kit-version" else 0, "", "")
+            calls.append((argv[-1], kw.get("timeout")))
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
 
-        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), mock.patch.object(host.subprocess, "run", fake_run):
-            r = host.run_on_host(["tmux", "has-session", "-t", "=afc-a"])
-        self.assertEqual(calls, ["kit-version", "tmux-has afc-a"])
-        self.assertEqual(r.returncode, 0)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(host.subprocess, "run", fake_run):
+            r = host.run_on_host(["tmux", "has-session", "-t", "=afc-a"], timeout=7)
+        self.assertEqual(calls, [("tmux-has afc-a", 7)])
+        self.assertEqual((r.returncode, r.stdout), (0, "ok"))
 
-    def test_repo_dir_is_the_kits_host_json_and_the_env_is_ignored(self):
-        self.installed(["host-config"])
-        out = json.dumps({"format": 1, "roots": ["/w"], "repo": "/srv/kit-repo/", "claude": "/c"})
-        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other"}), \
-                mock.patch.object(host, "run_on_host", return_value=subprocess.CompletedProcess([], 0, out, "")) as run, \
-                mock.patch("sys.stderr") as err:
-            self.assertEqual(host.repo_dir(), "/srv/kit-repo")
-            self.assertEqual(host.repo_dir(), "/srv/kit-repo")
-        run.assert_called_once_with(["host-config", "get"], timeout=30)       # once per process
-        self.assertIn("differs from the host kit's repo", "".join(c.args[0] for c in err.write.call_args_list))
+    def test_a_timeout_is_the_callers_own_and_comes_up_unchanged(self):
+        with mock.patch.dict(os.environ, self.ENV), \
+                mock.patch.object(host.subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 7)) as run, \
+                self.assertRaises(subprocess.TimeoutExpired):
+            host.run_on_host(["proc-snapshot"], timeout=7)
+        self.assertEqual(run.call_count, 1)                    # no kit-version round trip before it
 
-    def test_repo_dir_falls_back_to_the_env_only_while_no_kit_is_installed(self):
-        host._kit_cache.update(at=float("inf"), info=None)
-        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other/"}):
-            self.assertEqual(host.repo_dir(), "/srv/other")
+    def test_only_the_not_whitelisted_denial_is_a_kit_error(self):
+        for rc, err, kit in ((126, "host_exec: denied (not whitelisted)", True), (126, "host_exec: denied (not a claude pid)", False),
+                             (1, "not whitelisted", False), (255, "ssh: refused", False)):
+            answer = subprocess.CompletedProcess([], rc, "", err)
+            with mock.patch.dict(os.environ, self.ENV), mock.patch.object(host.subprocess, "run", return_value=answer):
+                if kit:
+                    with self.assertRaises(host.HostKitError):
+                        host.run_on_host(["kill-claude", "5"])
+                else:
+                    self.assertEqual(host.run_on_host(["kill-claude", "5"]).returncode, rc)
+
+    def test_repo_dir_is_the_env_and_never_calls_the_bridge(self):
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(host.subprocess, "run") as run:
+            self.assertEqual(host.repo_dir(), "/srv/repo")
+            self.assertEqual(host.repo_dir(), "/srv/repo")
+        run.assert_not_called()
         for bad in ("", "relative"):
             with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": bad}), \
-                    self.assertRaises(host.HostRepoError):
+                    mock.patch.object(host.subprocess, "run") as run, self.assertRaises(host.HostRepoError):
                 host.repo_dir()
+            run.assert_not_called()
 
-    def test_repo_dir_errors_when_the_kit_cannot_be_asked_or_answers_wrongly(self):
-        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other"}):
-            host._kit_cache.update(at=None, info=None)
-            with mock.patch.object(host.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "no")), \
-                    self.assertRaises(host.HostKitError):           # bridge down: no guess from the env
-                host.repo_dir()
-            self.installed(["host-config"])
-            for rc, out in ((1, ""), (0, "nope"), (0, "{}"), (0, '{"repo": "rel"}')):
-                with mock.patch.object(host, "run_on_host", return_value=subprocess.CompletedProcess([], rc, out, "")), \
-                        self.assertRaises(host.HostKitError, msg=(rc, out)):
-                    host.repo_dir()
-        self.assertIsNone(host._host_repo["path"])
+    def test_importing_the_modules_that_read_repo_dir_makes_no_bridge_call(self):
+        """M3: keepalive.py and the rest call repo_dir() at import; with a bridge that is down they must still
+        import (D-257: the runner records the alert and pauses, an import error would hide it)."""
+        code = ("import subprocess, sys\n"
+                "def boom(*a, **k): raise SystemExit('bridge called at import')\n"
+                "subprocess.run = boom; subprocess.Popen = boom\n"
+                "import testenv, host, keepalive, prompts, decisions, questions, actions, project_docs, nightly_tasks\n"
+                "print(host.repo_dir())\n")
+        env = dict(os.environ, **self.ENV)
+        r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertEqual(r.stdout.strip().splitlines()[-1], os.path.normpath(HERE))     # testenv's AFCLAUDE_HOST_REPO
 
 
 class KitReads(TempDir):
@@ -815,6 +1089,21 @@ class KitReads(TempDir):
         f = self.ok_json("transcripts default --changed-since 0")["files"][0]
         self.assertEqual((len(f["tail"]), f["bad_lines"]), (1, 1))
 
+    def test_unreadable_things_are_reported_not_skipped(self):
+        """L4 (D-235): a missing projects dir, a directory or a file that can't be read come back in `errors`."""
+        self.tx("a.jsonl", [self.user("one")])
+        out = self.ok_json("transcripts default --changed-since 0")
+        self.assertEqual((out["errors"], len(out["files"])), ([], 1))
+        with mock.patch.object(self.he, "read_head", side_effect=PermissionError(13, "Permission denied")):
+            out = json.loads(self.he.transcripts_json(["default", "--changed-since", "0"]))
+        self.assertEqual(out["files"], [])
+        self.assertEqual(out["errors"][0]["error"], "Permission denied")
+        self.assertTrue(out["errors"][0]["path"].endswith("a.jsonl"))
+        shutil.rmtree(os.path.join(self.cdir, "projects"))
+        out = self.ok_json("transcripts default --changed-since 0")
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertIn("No such file", out["errors"][0]["error"])
+
     def test_a_cap_is_a_truncated_flag_never_a_silent_cut(self):
         for i in range(3):
             self.tx(f"f{i}.jsonl", [self.user(str(i))])
@@ -843,7 +1132,7 @@ class KitReads(TempDir):
     def test_config_dir_ids(self):
         other = os.path.join(self.tmp, "cfg2")
         os.makedirs(os.path.join(other, "projects"))
-        write_json(self.hj, good_config(self.root, config_dirs={"work-2": other}))
+        write_json(self.hj, self.config(config_dirs={"work-2": other}))
         self.assertEqual(self.ok_json("transcripts work-2 --changed-since 0")["files"], [])
         self.assertEqual(self.ok_json("sessions work-2")["files"], [])
         he = load_he(self.hj, home=self.home)
@@ -853,7 +1142,7 @@ class KitReads(TempDir):
                     "transcripts /etc --changed-since 0", "sessions default extra"):
             self.assertEqual(self.call(cmd).returncode, 126, cmd)
         for bad in ({"default": other}, {"X": other}, {"a": "rel"}, {"a": other + "/"}, ["a"]):
-            write_json(self.hj, good_config(self.root, config_dirs=bad))
+            write_json(self.hj, self.config(config_dirs=bad))
             self.assertEqual(self.call("kit-version").returncode, 126, bad)
 
     def test_transcripts_near_misses(self):
@@ -926,7 +1215,7 @@ class KitReads(TempDir):
         os.mkdir(repo)
         with open(os.path.join(repo, "PROGRESS.md"), "w") as fh:
             fh.write("x")
-        write_json(self.hj, good_config(self.root, repo=repo))
+        write_json(self.hj, self.config(repo=repo))
         self.assertEqual(self.ok_json(f"doc-files read {repo} PROGRESS.md"), {"PROGRESS.md": "x"})
         self.assertEqual(self.call(f"doc-files read {repo}/data PROGRESS.md").returncode, 126)
 
@@ -946,7 +1235,7 @@ class KitReads(TempDir):
     def test_claude_auth_status_and_doctor_run_the_configured_binary(self):
         stub = os.path.join(self.tmp, "claude-stub")
         write_json(stub, '#!/bin/sh\necho "args: $*"\n', 0o755)
-        write_json(self.hj, good_config(self.root, claude=stub))
+        write_json(self.hj, self.config(claude=stub))
         for cmd, want in (("claude auth status", b"args: auth status\n"), ("claude doctor", b"args: doctor\n")):
             r = self.call(cmd)
             self.assertEqual((r.returncode, r.stdout), (0, want), r.stderr)
@@ -954,10 +1243,66 @@ class KitReads(TempDir):
                     "claude doctor --fix", "claude doctor x", "claude config", "claude mcp list"):
             self.assertEqual(self.call(cmd).returncode, 126, cmd)
 
+    def test_headless_claude_runs_in_the_kits_own_directory_with_user_settings_only(self):
+        """H3: -p, rc-send and the checks never run in a directory the container writes (the data dir's
+        .claude/settings.json would load as project settings there)."""
+        stub = os.path.join(self.tmp, "claude-stub")
+        write_json(stub, '#!/bin/sh\necho "cwd: $(pwd -P)"; echo "args: $*"; cat >/dev/null\n', 0o755)
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(repo, "data", ".claude"))
+        write_json(os.path.join(repo, "data", ".claude", "settings.json"), {"hooks": {"SessionStart": []}})
+        write_json(self.hj, self.config(claude=stub, repo=repo))
+        safe = os.path.join(self.home, ".local", "state", "afclaude", "cwd")
+        usage = "claude -p --no-session-persistence --permission-mode dontAsk /usage"
+        haiku = "claude -p --model haiku --no-session-persistence --output-format json"
+        for cmd, args in ((usage, "args: -p --setting-sources user --no-session-persistence --permission-mode dontAsk /usage"),
+                          (haiku, "args: -p --setting-sources user --model haiku --no-session-persistence --output-format json"),
+                          ("claude doctor", "args: doctor"), ("claude agents --json", "args: agents --json")):
+            r = self.call(cmd, stdin=b"hi")
+            self.assertEqual(r.returncode, 0, (cmd, r.stderr))
+            self.assertEqual(r.stdout.decode().splitlines(), [f"cwd: {safe}", args], cmd)
+        self.assertEqual(os.stat(safe).st_mode & 0o777, 0o700)
+        for bad in (0o755, 0o770):                          # somebody else could write it: refused
+            os.chmod(safe, bad)
+            r = self.call("claude doctor")
+            self.assertEqual(r.returncode, 126, bad)
+            self.assertIn(b"mode 0700", r.stderr)
+        os.chmod(safe, 0o700)
+        os.rmdir(safe)
+        os.symlink(os.path.join(repo, "data"), safe)        # a symlink into the data dir: refused, not followed
+        self.assertEqual(self.call("claude doctor").returncode, 126)
+
+    def test_rc_send_gets_the_user_settings_only_flag(self):
+        sessions = os.path.join(self.tmp, "sessions")
+        os.mkdir(sessions)
+        with open(os.path.join(sessions, "1.json"), "w") as fh:
+            json.dump({"pid": os.getpid(), "name": "rc-a", "entrypoint": "sdk-cli", "status": "idle"}, fh)
+        self.he.SESSIONS = sessions
+        cmd, _ = self.he.rc_send_cmd(["rc-a"], b"hello")
+        self.assertEqual(cmd[1:4], ["-p", "--setting-sources", "user"])
+        self.assertEqual(cmd[4:], host.RC_SEND_FLAGS[1:])
+
+    def test_append_note_refuses_a_symlink_and_appends_otherwise(self):
+        """H1/H2: PROGRESS.md as a symlink (to authorized_keys, say) is not written through."""
+        repo = os.path.join(self.tmp, "repo")
+        os.mkdir(repo)
+        write_json(self.hj, self.config(repo=repo))
+        r = run_exec("append-note PROGRESS.md", self.hj, stdin=b"- a\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(repo, "PROGRESS.md")) as fh:
+            self.assertEqual(fh.read(), "- a\n")
+        target = os.path.join(self.tmp, "authorized_keys")
+        write_json(target, "owner\n")
+        os.symlink(target, os.path.join(repo, "ALERTS.md"))
+        r = run_exec("append-note ALERTS.md", self.hj, stdin=b"ssh-ed25519 AAAA evil\n")
+        self.assertEqual(r.returncode, 126)
+        with open(target) as fh:
+            self.assertEqual(fh.read(), "owner\n")
+
     def test_check_commands_have_a_timeout(self):
         stub = os.path.join(self.tmp, "claude-stub")
         write_json(stub, "#!/bin/sh\nsleep 30\n", 0o755)
-        write_json(self.hj, good_config(self.root, claude=stub))
+        write_json(self.hj, self.config(claude=stub))
         he = load_he(self.hj, home=self.home)
         he.CHECK_TIMEOUT = 1
         with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "claude doctor"}), mock.patch("sys.stderr"):

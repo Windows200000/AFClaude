@@ -27,10 +27,12 @@ whitelist. So every host call is mapped onto one of those shapes here:
   append to PROGRESS.md / ALERTS.md       -> append-note PROGRESS.md|ALERTS.md (text on stdin)
   rc_send(NAME, text): the Haiku sender     -> rc-send NAME (text on stdin; host_exec.py builds the
                                                same `claude -p` + prompt as rc_send_argv/_prompt here)
-  kit_info() / check_kit()                -> kit-version          (the installed kit's version, whitelist hash
-                                                                  and command list; check_kit compares it with
-                                                                  HOST_KIT_VERSION and raises HostKitError)
-  host-config get | set roots|repo|claude VALUE...  (the host kit's host.json; K2, the setup's write)
+  kit_info() / check_kit() / check_host() -> kit-version          (the installed kit's version, whitelist hash,
+                                                                  command list and file hashes; check_kit compares
+                                                                  the version with HOST_KIT_VERSION, check_host the
+                                                                  files and the repo path too: HostKitError)
+  host-config get                         (the host kit's host.json, read-only: only the owner's install writes
+                                           it, D-338)
   transcripts ID --changed-since TS [--head N] [--tail N] | sessions ID | doc-files read DIR NAME...
                                           (the container's reads of the host's transcripts, the session registry
                                            and the project docs; kit version 2)
@@ -43,9 +45,11 @@ AFCLAUDE_BRIDGE_KEY, AFCLAUDE_BRIDGE_KNOWN_HOSTS.
 The code runs from /app in the image, so a path the HOST must understand (the project of "this
 checkout", the cwd of a launch, a path in a message to a session) is never the code's own directory:
 repo_dir() is the host path of the repo (the container gets it as AFCLAUDE_HOST_REPO from
-docker/.env until K4/K2 move it to the host kit's host.json); local_path() / to_local() map it back
-to the code directory for the places that read a file or run a stored command inside the container.
+docker/.env; it never calls the bridge: check_host() compares it with the kit's host.json `repo`, in the
+host check, not at import); local_path() / to_local() map it back to the code directory for the places
+that read a file or run a stored command inside the container.
 """
+import hashlib
 import json
 import os
 import re
@@ -60,7 +64,6 @@ TMUX_NAME = re.compile(r"^=?(afc-[a-z0-9-]{1,36})\Z")
 TMUX_PANE = re.compile(r"^=(afc-[a-z0-9-]{1,36}):\Z")
 TMUX_NEW = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
 NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
-HOST_CONFIG_KEYS = ("roots", "repo", "claude")   # host-config set KEY (docker/host-kit/host_exec.py SET_KEYS)
 CONFIG_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")   # a Claude config dir's id (host_exec.py CONFIG_ID)
 DOC_NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md", "DECISIONS.md")   # doc-files read (host_exec.py DOC_NAMES)
 # The bridge of before the host kit (docker/host_exec.py, still the owner's authorized_keys line until the kit
@@ -68,7 +71,8 @@ DOC_NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md", "DECISIONS.md")   # doc
 LEGACY_HEADS = frozenset(("ka_resume.sh", "claude", "kill-claude", "tmux-has", "claude-env", "tmux-panes",
                           "tmux-kill", "tmux-clients", "tmux-capture", "tmux-rename", "proc-snapshot",
                           "usage-cache", "append-note", "rc-send"))
-KIT_RECHECK = 300.0         # seconds before a "no kit installed yet" answer is asked again
+KIT_FILES = (("host_exec.py", os.path.join("docker", "host-kit", "host_exec.py")), ("ka_resume.sh", "ka_resume.sh"))
+                            # the kit files `kit-version` hashes (host_exec.py's KIT_FILES) and where this code has them
 # rc_send (docs/rc_server_mode.md §4.1, §8; D-288). Kept identical in docker/host_exec.py (it runs
 # alone as the SSH forced command; test_host.py compares them).
 RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")   # a thread's registry `name` (dir + 2 hex)
@@ -84,7 +88,7 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 # The host kit this code was written for (docker/host_exec.py's HOST_KIT_VERSION; test_host_kit.py compares
 # them): a kit with another version is the first host check's fail, "re-run the host kit install".
-HOST_KIT_VERSION = "2"
+HOST_KIT_VERSION = "3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
@@ -98,38 +102,19 @@ class HostRepoError(RuntimeError):
     """In a container, the host path of the repo is missing or not an absolute path (D-235)."""
 
 
-_host_repo = {"path": None}     # the kit's host.json `repo`, once read (never changes for an installed kit)
-
-
 def repo_dir() -> str:
     """The host path of the AFClaude repo (what projects.path holds for this checkout). On the host it
-    is the code's own directory. In the container (code at /app) it is the installed host kit's host.json
-    `repo` (`host-config get`, read once); only while no kit is installed yet (the pre-kit bridge) it is
-    AFCLAUDE_HOST_REPO, said once on stderr by kit_state(); an unset or relative value raises, as does a
-    bridge that does not answer (HostKitError: no guess, no fallback to /app, D-235)."""
+    is the code's own directory. In the container (code at /app) it is AFCLAUDE_HOST_REPO (docker/.env,
+    an absolute path; unset or relative raises HostRepoError: no guess, no fallback to /app, D-235). No
+    bridge call here, so a bridge outage never breaks work that only reads the DB: check_host() compares
+    this value with the installed kit's host.json `repo` and raises on a mismatch."""
     if not in_container():
         return HERE
     v = os.environ.get("AFCLAUDE_HOST_REPO", "").strip()
-    if kit_state() is None:
-        if not v.startswith("/"):
-            raise HostRepoError("no host kit is installed yet and AFCLAUDE_HOST_REPO (the host path of the repo, "
-                                f"docker/.env) is not set to an absolute path: {v!r}")
-        return os.path.normpath(v)
-    if _host_repo["path"] is None:
-        r = run_on_host(["host-config", "get"], timeout=30)
-        try:
-            if r.returncode != 0:
-                raise ValueError(f"rc {r.returncode}: {(r.stderr or r.stdout).strip()[:200]!r}")
-            repo = json.loads(r.stdout)["repo"]
-            if not isinstance(repo, str) or not repo.startswith("/"):
-                raise ValueError(f"repo is {repo!r}")
-        except (ValueError, KeyError, TypeError) as e:
-            raise HostKitError(f"host-config get did not give the repo path: {e}")
-        _host_repo["path"] = os.path.normpath(repo)
-        if v and os.path.normpath(v) != _host_repo["path"]:
-            print(f"host: AFCLAUDE_HOST_REPO {v!r} differs from the host kit's repo {repo!r}; the kit's is used",
-                  file=sys.stderr)
-    return _host_repo["path"]
+    if not v.startswith("/"):
+        raise HostRepoError("AFCLAUDE_HOST_REPO (the host path of the repo, docker/.env) is not set to an "
+                            f"absolute path: {v!r}")
+    return os.path.normpath(v)
 
 
 def local_path(path: str) -> str:
@@ -224,7 +209,7 @@ def bridge_argv(argv):
         return argv
     if head == "kit-version" and not rest:
         return argv
-    if head == "host-config" and (rest == ["get"] or (len(rest) >= 3 and rest[0] == "set" and rest[1] in HOST_CONFIG_KEYS)):
+    if head == "host-config" and rest == ["get"]:      # there is no `set`: host.json is the owner's (D-338)
         return argv
     if head in ("tmux-check", "df", "clock") and not rest:
         return argv
@@ -247,17 +232,18 @@ def run_on_host(argv, input=None, cwd=None, env=None, timeout=None):
         return subprocess.run(argv, input=input, cwd=cwd, env=env, capture_output=True, text=True,
                               timeout=timeout)
     remote = bridge_argv(argv)
-    gate_command(remote)
     r = subprocess.run(ssh_argv(remote), input=input, capture_output=True, text=True, timeout=timeout,
                        stdin=subprocess.DEVNULL if input is None else None)
+    if r.returncode == 126 and "not whitelisted" in r.stderr:
+        # the bridge does not know this shape: the pre-kit bridge for a kit-only command, or a kit older than
+        # this code. One answer, no extra round trip before the call (D-235)
+        raise HostKitError(f"the host bridge does not know {shlex.join(remote)[:80]!r}: it needs the host kit "
+                           f"{HOST_KIT_VERSION!r} (run docker/install_host_bridge.sh on the host)")
     return subprocess.CompletedProcess(argv, r.returncode, r.stdout, r.stderr)
 
 
 class HostKitError(RuntimeError):
     """The installed host kit is not the one this code needs, or does not answer (D-235)."""
-
-
-_kit_cache = {"at": None, "info": None}     # at: monotonic time of the last answer; info: None = no kit installed yet
 
 
 def kit_info(timeout=30):
@@ -294,48 +280,51 @@ def check_kit(timeout=30):
     return info
 
 
-def kit_state(timeout=30):
-    """kit_info() once per process while a kit answers; while only the legacy bridge answers it is asked
-    again every KIT_RECHECK seconds (the owner's install is noticed without a restart). The first
-    legacy answer, and the change to an installed kit, are logged to stderr."""
-    c = _kit_cache
-    now = time.monotonic()
-    if c["at"] is not None and (c["info"] is not None or now - c["at"] < KIT_RECHECK):
-        return c["info"]
-    info = kit_info(timeout)
-    if c["at"] is None and info is None:
-        print("host: no host kit installed yet (the bridge is the pre-kit one): kit-only commands are refused "
-              "here and the repo path comes from AFCLAUDE_HOST_REPO until the owner runs "
-              "docker/install_host_bridge.sh", file=sys.stderr)
-    elif c["info"] is None and info is not None:
-        print(f"host: host kit {info['kit_version']!r} is installed now", file=sys.stderr)
-    c.update(at=now, info=info)
-    return info
+def kit_source_hashes():
+    """{file name: sha256 hex} of this code's own copies of the kit files (what the install copies)."""
+    out = {}
+    for name, rel in KIT_FILES:
+        with open(os.path.join(HERE, rel), "rb") as fh:
+            out[name] = hashlib.sha256(fh.read()).hexdigest()
+    return out
 
 
-def needs_kit(remote):
-    """True for a shape the pre-kit bridge denies."""
-    return remote[0] not in LEGACY_HEADS or remote[:2] in (["claude", "auth"], ["claude", "doctor"])
-
-
-def gate_command(remote):
-    """Refuse (HostKitError) a bridge command the installed kit does not list, and a kit-only command while
-    no kit is installed, before it is sent (D-235): the bridge would deny it anyway, this names the cause.
-    Not asked for `kit-version` itself. When the kit cannot be asked (bridge down) the command goes out
-    and fails on its own account: the caller sees that failure."""
-    if remote[0] == "kit-version":
-        return
+def host_config(timeout=30):
+    """The installed kit's host.json (`host-config get`) as a dict; HostKitError when the call fails or
+    does not answer JSON."""
+    r = run_on_host(["host-config", "get"], timeout=timeout)
     try:
-        info = kit_state()
-    except HostKitError:
-        return
+        if r.returncode != 0:
+            raise ValueError(f"rc {r.returncode}: {(r.stderr or r.stdout).strip()[:200]!r}")
+        conf = json.loads(r.stdout)
+        if not isinstance(conf, dict):
+            raise ValueError("not an object")
+    except ValueError as e:
+        raise HostKitError(f"host-config get did not give host.json: {e}")
+    return conf
+
+
+def check_host(timeout=30):
+    """The bridge half of the host check (D-164), run by a runner job or the dashboard, never at import or
+    per request: kit_info(), and for an installed kit its version (HOST_KIT_VERSION), the sha256 of each kit
+    file against this code's own copies (a ka_resume.sh or argument-shape change without a version bump
+    shows here) and host.json's `repo` against repo_dir() (AFCLAUDE_HOST_REPO). Any difference raises
+    HostKitError: the caller alerts and pauses (D-235, D-257). -> the kit info, or None while no kit is
+    installed yet (the pre-kit bridge)."""
+    info = check_kit(timeout)
     if info is None:
-        if needs_kit(remote):
-            raise HostKitError(f"{shlex.join(remote)[:80]!r} needs the host kit, which is not installed yet "
-                               "(the bridge is the pre-kit one): run docker/install_host_bridge.sh")
-    elif remote[0] not in info["commands"]:
-        raise HostKitError(f"the installed host kit {info['kit_version']!r} does not list {remote[0]!r}: "
-                           "re-run the host kit install (docker/install_host_bridge.sh)")
+        return None
+    mine = kit_source_hashes()
+    theirs = info.get("files")
+    if theirs != mine:
+        raise HostKitError(f"the installed host kit {info['kit_version']!r} has other files than this code "
+                           f"(kit {theirs!r}, here {mine!r}): re-run the host kit install "
+                           "(docker/install_host_bridge.sh), and bump HOST_KIT_VERSION if the files changed")
+    repo = host_config(timeout).get("repo")
+    if not isinstance(repo, str) or os.path.normpath(repo) != repo_dir():
+        raise HostKitError(f"host.json's repo is {repo!r} but AFCLAUDE_HOST_REPO is {repo_dir()!r}: fix docker/.env "
+                           "or re-run the host kit install with the right checkout")
+    return info
 
 
 # ------------------------------------------------------------------ helpers

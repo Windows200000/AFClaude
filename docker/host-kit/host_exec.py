@@ -4,12 +4,19 @@
 forced command (see install_host_bridge.sh). sshd runs it for every call, with the
 requested command in $SSH_ORIGINAL_COMMAND. It is split with shlex (never a shell,
 never eval), checked against the whitelist below, and run directly. Everything else
-is rejected. Every call is logged to <repo>/data/host_exec.log.
+is rejected. Every call is logged to <share>/afclaude/host_exec.log (never in a directory the container
+can write, and every caller-supplied character outside printable ASCII is escaped).
+
+The container's data directory (host.json's `data`) is the one place the container can write on the host.
+Nothing the kit trusts or runs may live there: host.json's claude, repo, roots and config dirs are refused
+inside it (at the install and at every read), a launch's cwd and a doc-files directory inside it are
+refused, and the headless `claude` calls run in a kit-owned directory of mode 0700 (SAFE_CWD).
 
 It is part of the host kit (docs/phase5b_plan.md §3.2): installed by install_host_bridge.sh into
 <share>/afclaude/host-kit/<HOST_KIT_VERSION>/, run through the `current` link. Its machine-specific
-values (allowed roots, repo, Claude binary) are in <share>/afclaude/host.json (sshd passes no env):
-a missing or malformed file refuses every command. Python 3.9 compatible (the host's python3).
+values (data dir, allowed roots, repo, Claude binary) are in <share>/afclaude/host.json (sshd passes no env):
+a missing or malformed file refuses every command. host.json is written only by the owner's install on
+the host (D-338): there is no command that changes it. Python 3.9 compatible (the host's python3).
 
 Allowed (exact shapes):
   ka_resume.sh --session <uuid> --tmux <name> --message <text> [--cwd <dir under a root>] [--name <t>]
@@ -33,17 +40,17 @@ Allowed (exact shapes):
                            for claude and keepalive.py processes (preflight / watcher lookup)
   usage-cache              JSON of ~/.claude.json "cachedUsageUtilization" (fetchedAtMs, utilization only)
   append-note PROGRESS.md|ALERTS.md   append stdin (<= 16 KB UTF-8 text) to that repo file
-  kit-version              JSON {kit_version, whitelist_hash, commands, config_format}: the caller compares
-                           kit_version with its own HOST_KIT_VERSION (a mismatch = re-run the install)
-  host-config get          the host.json content (JSON)
-  host-config set roots <dir>...|repo <dir>|claude <file>
-                           change host.json (the setup's write, 5d): directories must exist, be owned by
-                           the host user and not be (or contain) the home or a dot-directory of it
+  kit-version              JSON {kit_version, whitelist_hash, commands, config_format, files}: the caller
+                           compares kit_version and the sha256 of each kit file (`files`) with its own
+                           (a mismatch = re-run the install)
+  host-config get          the host.json content (JSON); read-only, the install is its only writer
   transcripts <config-dir-id> --changed-since <epoch> [--head N] [--tail N]
                            JSON: every transcript (*.jsonl, recursive) under <config dir>/projects changed
                            since then: path, size, mtime, and the projected first/last entries (the fields
                            the stall scan, the keep-alive and the compaction timing read); `truncated` true
-                           when a cap cut it (the caller treats that as an error)
+                           when a cap cut it and `errors` non-empty when a directory or file could not be
+                           read (the caller treats both as an error). The output cap (OUT_MAX) is the real
+                           limit: a wider answer is denied ("output over"), never cut off
   sessions <config-dir-id> JSON of the <config dir>/sessions/*.json files (the running-session registry)
   doc-files read <dir> <name>...
                            JSON {name: text|null} of PROGRESS.md / GOALS.md / EXCEPTIONS.md / DECISIONS.md in
@@ -81,24 +88,30 @@ from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 # The kit version: bumped with every change of the whitelist (a new command, a new shape) or of the
 # host.json format. host.py's HOST_KIT_VERSION is the same string (test_host_kit.py compares them) and
 # the container's host check calls `kit-version` against it.
-HOST_KIT_VERSION = "2"
-CONFIG_FORMAT = 1
+HOST_KIT_VERSION = "3"
+CONFIG_FORMAT = 2
 # every command head the whitelist knows (the elif chain in main(); test_host_kit.py compares the two)
 COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "host-config", "ka_resume.sh",
             "kill-claude", "kit-version", "proc-snapshot", "rc-send", "sessions", "tmux-capture", "tmux-check",
             "tmux-clients", "tmux-has", "tmux-kill", "tmux-panes", "tmux-rename", "transcripts", "usage-cache")
 OUT_MAX = 2 * 1024 * 1024    # bytes of output this file produces itself (the commands it only runs write straight through)
 KIT_DIR = os.path.dirname(os.path.abspath(__file__))   # <share>/afclaude/host-kit/current when run by sshd
-# host.json: next to host-kit/, i.e. <share>/afclaude/host.json (override: tests only, sshd passes no env)
-HOST_JSON = os.environ.get("AFCLAUDE_HOST_JSON") or os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), "host.json")
-LOG_OVERRIDE = os.environ.get("AFCLAUDE_HOST_EXEC_LOG")   # override: tests only
+KIT_FILES = ("host_exec.py", "ka_resume.sh")           # what `kit-version` hashes (the install copies exactly these)
+# Run by sshd (a forced command with a client command) SSH_ORIGINAL_COMMAND is set: then no env override below
+# is read (sshd's AcceptEnv / PermitUserEnvironment must never be able to move host.json or the log) and the
+# `--run` test entry is refused. The tests run this file without it and pass the command as `--run <command>`.
+FORCED = "SSH_ORIGINAL_COMMAND" in os.environ
+# host.json: next to host-kit/, i.e. <share>/afclaude/host.json (override: tests only)
+HOST_JSON = (None if FORCED else os.environ.get("AFCLAUDE_HOST_JSON")) or \
+    os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), "host.json")
+LOG_OVERRIDE = None if FORCED else os.environ.get("AFCLAUDE_HOST_EXEC_LOG")   # override: tests only
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
 # the tmux session names (names.TMUX_RE; kept here: this file runs alone as the SSH forced command)
 TMUX = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")
-HOME = os.path.expanduser("~")
+HOME = pwd.getpwuid(os.getuid()).pw_dir if FORCED else os.path.expanduser("~")
 ENV = {"HOME": HOME, "USER": os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name, "LANG": "C.UTF-8",
-       "PATH": os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:/bin",
+       "PATH": os.path.join(HOME, ".local/bin") + ":/usr/local/bin:/usr/bin:/bin",
        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "TERM": "xterm-256color"}
 HAIKU_FLAGS = {"-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json",
                "stream-json", "--verbose", "--permission-mode", "dontAsk", "--tools=",
@@ -112,12 +125,16 @@ RC_SEND_FLAGS = ["-p", "--model", "haiku", "--permission-mode", "dontAsk",
                  "--tools=SendMessage", "--allowedTools=SendMessage", "--strict-mcp-config",
                  "--disable-slash-commands", "--output-format", "stream-json", "--verbose"]
 RC_HOST_TIMEOUT = 100       # seconds the sender may run here: below the container's 120 s ssh timeout
-SESSIONS = os.environ.get("AFCLAUDE_HOST_EXEC_SESSIONS") or os.path.expanduser("~/.claude/sessions")   # override: tests only
+SESSIONS = (None if FORCED else os.environ.get("AFCLAUDE_HOST_EXEC_SESSIONS")) or os.path.join(HOME, ".claude/sessions")   # override: tests only
 RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named exactly {name!r}, with the "
                   "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
                   "not reachable, do not try any other name or agent and do not retry. Do nothing else. "
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
-SET_KEYS = ("roots", "repo", "claude")
+# The directory the headless `claude` calls (-p, rc-send, the checks) run in: kit-owned, mode 0700, in no
+# directory the container can write, so no project settings, hooks or CLAUDE.md of the data dir load (H3)
+SAFE_CWD = os.path.join(HOME, ".local/state/afclaude/cwd")
+SETTINGS_ARGS = ["--setting-sources", "user"]                # the headless calls load the owner's user settings only
+LOG_LINE_MAX = 600                                          # chars of one log line
 CONFIG_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")      # a Claude config dir's id (`default` = ~/.claude)
 DOC_NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md", "DECISIONS.md")   # doc-files read: these only
 DOC_MAX = 1024 * 1024                                       # bytes of one doc file
@@ -126,6 +143,7 @@ TX_MAX_ENTRIES = 20
 TX_TEXT = 300                                               # chars of an entry's text in the projection
 TX_TAIL_READ = 16 * 1024 * 1024                             # most bytes read back from a file's end for its tail
 SESSIONS_MAX = 500
+CHECK_SESSION = "afc-check"                                 # tmux-check's session; names.py never generates it (reserved there)
 CHECK_TIMEOUT = 60                                          # seconds the check commands may run (exit 124)
 MAX_ROOTS = 8
 
@@ -136,12 +154,36 @@ def whitelist_hash() -> str:
     return hashlib.sha256("\n".join(sorted(COMMANDS)).encode()).hexdigest()[:16]
 
 
+def kit_file(name: str) -> str:
+    """The path of a kit file: next to this file when installed (<share>/afclaude/host-kit/<version>/). Run from a
+    checkout (docker/host-kit/, the tests and the install's --print-version) ka_resume.sh is the repo's own."""
+    path = os.path.join(KIT_DIR, name)
+    if not os.path.exists(path) and os.path.basename(os.path.dirname(KIT_DIR)) == "docker":
+        return os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), name)
+    return path
+
+
+def kit_file_hashes() -> Dict[str, str]:
+    """{file name: sha256 hex} of the kit files this process runs from (KIT_FILES in KIT_DIR). `kit-version`
+    reports them: ka_resume.sh and the argument shapes change on main without the command list changing,
+    and the container compares them with its own copies (test_host_kit.py pins them with the version)."""
+    out: Dict[str, str] = {}
+    for name in KIT_FILES:
+        try:
+            with open(kit_file(name), "rb") as fh:
+                out[name] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError as e:
+            deny(f"kit file {name} unreadable: {e.strerror}")
+    return out
+
+
 # ------------------------------------------------------------------ host.json
 
 class Config(NamedTuple):
     roots: List[str]     # allowed directories (a launch's cwd, project files); symlinks resolved at use
-    repo: str            # the checkout the kit's source came from: data/ (log, claude -p cwd), the notes
+    repo: str            # the checkout the kit's source came from: the notes (PROGRESS.md, ALERTS.md)
     claude: str          # the Claude binary
+    data: str            # the data directory the container mounts read-write: nothing above is allowed inside it
     config_dirs: Tuple[Tuple[str, str], ...] = ()   # optional: (id, Claude config dir) beyond `default` (~/.claude)
 
 
@@ -159,14 +201,14 @@ def _abs_path(v: Any, what: str) -> str:
 
 def parse_config(text: str) -> Config:
     """host.json's text -> Config, or ConfigError. These keys: format (CONFIG_FORMAT), roots (1..MAX_ROOTS
-    absolute paths), repo, claude (absolute paths), and optionally config_dirs ({id: absolute path})."""
+    absolute paths), repo, claude, data (absolute paths), and optionally config_dirs ({id: absolute path})."""
     try:
         d = json.loads(text)
     except ValueError as e:
         raise ConfigError(f"not JSON: {e}")
-    base = {"format", "roots", "repo", "claude"}
+    base = {"format", "roots", "repo", "claude", "data"}
     if not isinstance(d, dict) or not base <= set(d) <= base | {"config_dirs"}:
-        raise ConfigError("must be an object with the keys format, roots, repo, claude (and optionally config_dirs)")
+        raise ConfigError("must be an object with the keys format, roots, repo, claude, data (and optionally config_dirs)")
     if d["format"] != CONFIG_FORMAT or isinstance(d["format"], bool):
         raise ConfigError(f"format {d['format']!r}, this kit reads {CONFIG_FORMAT}")
     roots = d["roots"]
@@ -178,12 +220,31 @@ def parse_config(text: str) -> Config:
         raise ConfigError(f"config_dirs must be an object of at most {MAX_ROOTS} ids ({CONFIG_ID.pattern}, not "
                           "'default') to absolute paths")
     return Config([_abs_path(r, "a root") for r in roots], _abs_path(d["repo"], "repo"),
-                  _abs_path(d["claude"], "claude"),
+                  _abs_path(d["claude"], "claude"), _abs_path(d["data"], "data"),
                   tuple((k, _abs_path(v, f"config dir {k}")) for k, v in sorted(dirs.items())))
 
 
+def inside(real: str, base: str) -> bool:
+    """`real` is `base` or below it (both already resolved)."""
+    return real == base or real.startswith(base + os.sep)
+
+
+def check_outside_data(cfg_: Config) -> None:
+    """ConfigError when the Claude binary, the repo, a root or a config dir resolves (symlinks followed) to
+    the data directory or below it: the container writes there, so anything the host executes, appends to
+    or reads as its own from there is the container's. A root that merely contains the data dir is fine
+    (the data dir itself is refused as a cwd or doc dir at use)."""
+    data = os.path.realpath(cfg_.data)
+    things = [("claude", cfg_.claude), ("repo", cfg_.repo)] + [("a root", r) for r in cfg_.roots] \
+        + [(f"config dir {k}", v) for k, v in cfg_.config_dirs]
+    for what, path in things:
+        if inside(os.path.realpath(path), data):
+            raise ConfigError(f"{what} {path} is inside the data directory {cfg_.data} (container-writable)")
+
+
 def load_config(path: str) -> Config:
-    """Read and check host.json: a regular file (no symlink), the host user's own, no group/other bits."""
+    """Read and check host.json: a regular file (no symlink), the host user's own, no group/other bits, and
+    nothing it names inside the data directory (check_outside_data)."""
     try:
         st = os.lstat(path)
     except OSError as e:
@@ -192,20 +253,24 @@ def load_config(path: str) -> Config:
         raise ConfigError(f"{path} must be a regular file of this user with mode 0600")
     try:
         with open(path) as fh:
-            return parse_config(fh.read())
+            c = parse_config(fh.read())
     except OSError as e:
         raise ConfigError(f"{path} unreadable: {e.strerror}")
+    check_outside_data(c)
+    return c
 
 
 def config_text(cfg: Config) -> str:
-    d: Dict[str, Any] = {"format": CONFIG_FORMAT, "roots": cfg.roots, "repo": cfg.repo, "claude": cfg.claude}
+    d: Dict[str, Any] = {"format": CONFIG_FORMAT, "roots": cfg.roots, "repo": cfg.repo, "claude": cfg.claude,
+                         "data": cfg.data}
     if cfg.config_dirs:
         d["config_dirs"] = dict(cfg.config_dirs)
     return json.dumps(d, indent=2) + "\n"
 
 
 def write_config(path: str, cfg: Config) -> None:
-    """Atomic: a temp file in the same directory (0600), then rename."""
+    """Only the install's `--write-config` calls this (D-338). Atomic: a temp file in the same directory
+    (0600), then rename."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".host.json.")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -234,34 +299,44 @@ def cfg() -> Config:
 
 
 def under_roots(path: str) -> Optional[str]:
-    """The resolved path (symlinks and `..` gone) when `path` is absolute and at or below one of the
-    allowed roots (resolved too), else None. Part of every command that takes a path from the caller."""
+    """The resolved path (symlinks and `..` gone) when `path` is absolute, at or below one of the allowed
+    roots (resolved too) and not in the container-writable data directory, else None. Part of every command
+    that takes a path from the caller. Callers use the RETURNED path, not the one they were given: no
+    component of it is one the container can swap for a symlink between this check and the use."""
     if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
         return None
     real = os.path.realpath(path)
+    if inside(real, os.path.realpath(cfg().data)):
+        return None
     for root in cfg().roots:
-        r = os.path.realpath(root)
-        if real == r or real.startswith(r + os.sep):
+        if inside(real, os.path.realpath(root)):
             return real
     return None
 
 
 def log_path() -> str:
-    if LOG_OVERRIDE:
-        return LOG_OVERRIDE
-    if _cfg is not None:
-        return os.path.join(_cfg.repo, "data", "host_exec.log")
-    return os.path.join(os.path.dirname(HOST_JSON), "host_exec.log")      # no usable config yet
+    """<share>/afclaude/host_exec.log, beside host.json: a directory only the host user can write (the
+    container's data dir is where the log used to be, and it followed symlinks: H2)."""
+    return LOG_OVERRIDE or os.path.join(os.path.dirname(HOST_JSON), "host_exec.log")
+
+
+def printable(text: str) -> str:
+    """`text` with every control character and everything outside ASCII escaped (\\x0a, \\xe4, \\u20ac): a
+    line of the log is one line, whatever the caller put in its arguments."""
+    return text.encode("ascii", "backslashreplace").decode().translate(
+        {c: f"\\x{c:02x}" for c in list(range(32)) + [127]})
 
 
 def log(msg: str) -> None:
-    path = log_path()
+    """One escaped line, O_NOFOLLOW (a symlink at the log path is refused, not followed), mode 0600. A
+    failure to log goes to stderr (the caller sees it in the ssh output); it never stops the command."""
+    line = f"{datetime.datetime.now().isoformat(timespec='seconds')} {printable(msg)[:LOG_LINE_MAX]}\n"
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n")
-    except OSError:
-        pass
+        fd = os.open(log_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(line)
+    except OSError as e:
+        print(f"host_exec: log not written ({e.strerror}): {line.strip()[:200]}", file=sys.stderr)
 
 
 def deny(why: str) -> NoReturn:
@@ -279,12 +354,13 @@ def emit(text: str) -> None:
 
 def kit_version_json() -> str:
     return json.dumps({"kit_version": HOST_KIT_VERSION, "whitelist_hash": whitelist_hash(),
-                       "commands": sorted(COMMANDS), "config_format": CONFIG_FORMAT}) + "\n"
+                       "commands": sorted(COMMANDS), "config_format": CONFIG_FORMAT,
+                       "files": kit_file_hashes()}) + "\n"
 
 
 def _owned_dir(path: str) -> str:
-    """`path` resolved, for host-config set: an existing directory of this user, not the home, an
-    ancestor of it or inside a dot-directory of it (~/.ssh, ~/.claude, ...)."""
+    """`path` resolved, for the install's `--write-config`: an existing directory of this user, not the home,
+    an ancestor of it or inside a dot-directory of it (~/.ssh, ~/.claude, ...)."""
     real = os.path.realpath(_abs_path(path, "a root"))
     try:
         st = os.stat(real)
@@ -300,26 +376,17 @@ def _owned_dir(path: str) -> str:
     return real
 
 
-def config_set(key: str, values: List[str]) -> None:
-    """host-config set KEY VALUE...: the setup's write (5d). roots: 1..MAX_ROOTS directories; repo: a
-    directory; claude: an executable file. Every value is checked here, on the host."""
-    old = cfg()
-    if key == "roots":
-        if not 1 <= len(values) <= MAX_ROOTS:
-            deny(f"host-config set roots takes 1..{MAX_ROOTS} directories")
-        new = old._replace(roots=[_owned_dir(v) for v in values])
-    elif key == "repo" and len(values) == 1:
-        new = old._replace(repo=_owned_dir(values[0]))
-    elif key == "claude" and len(values) == 1:
-        real = os.path.realpath(_abs_path(values[0], "claude"))
-        if not os.path.isfile(real) or not os.access(real, os.X_OK) or os.stat(real).st_uid not in (0, os.getuid()):
-            raise ConfigError(f"{values[0]} is not an executable file of this user or root")
-        new = old._replace(claude=_abs_path(values[0], "claude"))
-    else:
-        deny("host-config set needs roots <dir>..., repo <dir> or claude <file>")
-    parse_config(config_text(new))      # the file the next call reads must pass its own check
-    write_config(HOST_JSON, new)
-    log(f"OK host-config set {key} {' '.join(values)[:200]}")
+def safe_cwd() -> str:
+    """SAFE_CWD, made (0700) when missing and checked on every use: a real directory of this user that
+    nobody else can write. The headless claude calls run here (H3)."""
+    try:
+        os.makedirs(SAFE_CWD, mode=0o700, exist_ok=True)
+        st = os.lstat(SAFE_CWD)
+    except OSError as e:
+        deny(f"the kit's working directory {SAFE_CWD}: {e.strerror}")
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        deny(f"the kit's working directory {SAFE_CWD} must be a directory of this user with mode 0700")
+    return SAFE_CWD
 
 
 # ------------------------------------------------------------------ the whitelist
@@ -440,7 +507,7 @@ def rc_send_cmd(args: List[str], data: bytes) -> Tuple[List[str], bytes]:
         deny("rc-send text not UTF-8")
     check_rc_thread(args[0])
     log(f"OK rc-send {args[0]} ({len(data)} bytes)")
-    return [cfg().claude] + RC_SEND_FLAGS, RC_SEND_PROMPT.format(name=args[0], text=text).encode()
+    return [cfg().claude, RC_SEND_FLAGS[0]] + SETTINGS_ARGS + RC_SEND_FLAGS[1:], RC_SEND_PROMPT.format(name=args[0], text=text).encode()
 
 
 # ------------------------------------------------------------------ reads for the container (§3.4)
@@ -544,16 +611,24 @@ def transcripts_json(args: List[str]) -> str:
         opts[rest[0]] = int(rest[1])
         rest = rest[2:]
     files: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []                    # what could not be read: reported, never skipped
     truncated = False
-    for dirpath, _dirs, names in os.walk(base):         # no symlinked directories are followed
+
+    def walk_error(e: OSError) -> None:
+        errors.append({"path": os.path.relpath(str(e.filename), base) if e.filename else "", "error": e.strerror or str(e)})
+
+    for dirpath, _dirs, names in os.walk(base, onerror=walk_error):    # no symlinked directories are followed
         for name in sorted(names):
             if not name.endswith(".jsonl"):
                 continue
             path = os.path.join(dirpath, name)
             try:
                 st = os.lstat(path)
-            except OSError:
-                continue                                  # removed while walking
+            except FileNotFoundError:
+                continue                                  # removed while walking: gone, nothing to report
+            except OSError as e:
+                errors.append({"path": os.path.relpath(path, base), "error": e.strerror or str(e)})
+                continue
             if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
                 continue
             if len(files) >= TX_MAX_FILES:
@@ -562,13 +637,16 @@ def transcripts_json(args: List[str]) -> str:
             try:
                 head, bad_h = read_head(path, opts["--head"])
                 tail, bad_t, complete = read_tail(path, opts["--tail"], st.st_size)
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                errors.append({"path": os.path.relpath(path, base), "error": e.strerror or str(e)})
                 continue
             truncated = truncated or not complete
             files.append({"path": os.path.relpath(path, base), "size": st.st_size, "mtime": st.st_mtime,
                           "head": head, "tail": tail, "bad_lines": bad_h + bad_t, "tail_complete": complete})
     files.sort(key=lambda f: f["path"])
-    return json.dumps({"config_dir": args[0], "truncated": truncated, "files": files}) + "\n"
+    return json.dumps({"config_dir": args[0], "truncated": truncated, "errors": errors, "files": files}) + "\n"
 
 
 def sessions_json(args: List[str]) -> str:
@@ -598,15 +676,16 @@ def sessions_json(args: List[str]) -> str:
 
 def doc_files_json(args: List[str]) -> str:
     """doc-files read <dir> <name>... -> JSON {name: text or null}: `dir` at or under an allowed root or the
-    repo, names from DOC_NAMES, regular files only (no symlink), at most DOC_MAX bytes, UTF-8."""
+    repo (never the data directory or below), names from DOC_NAMES, regular files only (no symlink), at
+    most DOC_MAX bytes, UTF-8. The directory is resolved once and the resolved path is used."""
     if len(args) < 3 or args[0] != "read" or len(set(args[2:])) != len(args[2:]) or not set(args[2:]) <= set(DOC_NAMES):
         deny("doc-files read <dir> <name>... (names: " + ", ".join(DOC_NAMES) + ")")
     real = under_roots(args[1])
     if real is None and args[1].startswith("/") and "\0" not in args[1] and \
             os.path.realpath(args[1]) == os.path.realpath(cfg().repo):
-        real = os.path.realpath(args[1])
+        real = os.path.realpath(args[1])      # the repo is outside the data dir (check_outside_data)
     if real is None:
-        deny("doc-files: directory outside the allowed roots")
+        deny("doc-files: directory outside the allowed roots (or in the data directory)")
     if not os.path.isdir(real):
         deny("doc-files: not a directory")
     out: Dict[str, Optional[str]] = {}
@@ -647,11 +726,11 @@ def df_json() -> str:
 def tmux_check() -> int:
     """Create the tmux session afc-check, see it, kill it: what the host check needs to know. A leftover
     session of that name (an interrupted earlier check) is killed first. Output: one line, `ok`."""
-    name = "afc-check"
-    root = cfg().roots[0]
+    name = CHECK_SESSION
+    here = safe_cwd()
 
     def tmux(*a: str) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(["tmux", *a], env=ENV, cwd=root, capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+        return subprocess.run(["tmux", *a], env=ENV, cwd=here, capture_output=True, text=True, timeout=CHECK_TIMEOUT)
 
     if tmux("has-session", "-t", "=" + name).returncode == 0:
         log("tmux-check: killing a leftover afc-check")
@@ -685,15 +764,15 @@ def main() -> int:
     cmd: List[str]
     root = config.roots[0]
     if head == "ka_resume.sh":
-        cmd = [os.path.join(KIT_DIR, "ka_resume.sh")] + check_ka_resume(args)
+        cmd = [kit_file("ka_resume.sh")] + check_ka_resume(args)
         # the script writes its launch files outside the versioned kit directory
         ENV["AFCLAUDE_KIT_RUN"] = os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), "run")
     elif head == "claude" and args in (["agents", "--json"], ["agents", "--json", "--all"]):
         cmd = [config.claude] + args
     elif head == "claude" and args == ["-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"]:
-        cmd = [config.claude] + args
+        cmd = [config.claude, args[0]] + SETTINGS_ARGS + args[1:]
     elif head == "claude" and args[:3] == ["-p", "--model", "haiku"] and set(args) <= HAIKU_FLAGS:
-        cmd, stdin = [config.claude] + args, sys.stdin.buffer.read(200_000)
+        cmd, stdin = [config.claude, args[0]] + SETTINGS_ARGS + args[1:], sys.stdin.buffer.read(200_000)
     elif head == "rc-send":
         cmd, stdin = rc_send_cmd(args, sys.stdin.buffer.read(RC_TEXT_MAX + 1))
     elif head == "claude" and len(args) == 2 and args[0] == "stop" and HEX8.match(args[1]):
@@ -721,15 +800,16 @@ def main() -> int:
         old, new = args
         cmd = ["tmux", "rename-session", "-t", "=" + old, new]
         log(f"OK {shlex.join(cmd)}")
-        r = subprocess.run(cmd, env=ENV, cwd=root, capture_output=True, text=True)
+        here = safe_cwd()
+        r = subprocess.run(cmd, env=ENV, cwd=here, capture_output=True, text=True)
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         # tmux can rename successfully and still exit 1 with "no current client" (no terminal
         # attached to a forced-command/cron run): verify from tmux's own state, not rc (D-281,
         # incident 2026-10-22 05:16).
-        renamed = subprocess.run(["tmux", "has-session", "-t", "=" + new], env=ENV, cwd=root,
+        renamed = subprocess.run(["tmux", "has-session", "-t", "=" + new], env=ENV, cwd=here,
                                  capture_output=True).returncode == 0 and \
-            subprocess.run(["tmux", "has-session", "-t", "=" + old], env=ENV, cwd=root,
+            subprocess.run(["tmux", "has-session", "-t", "=" + old], env=ENV, cwd=here,
                            capture_output=True).returncode != 0
         if renamed:
             if r.returncode != 0:
@@ -759,7 +839,11 @@ def main() -> int:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
             deny("append-note not UTF-8")
-        with open(os.path.join(config.repo, args[0]), "a") as fh:
+        try:      # O_NOFOLLOW: a symlink in the repo is refused, not followed (the repo is outside the data dir)
+            fd = os.open(os.path.join(config.repo, args[0]), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        except OSError as e:
+            deny(f"append-note {args[0]}: {e.strerror}")
+        with os.fdopen(fd, "w") as fh:
             fh.write(text)
         log(f"OK append-note {args[0]} ({len(data)} bytes)")
         return 0
@@ -799,16 +883,10 @@ def main() -> int:
         emit(config_text(config))
         log("OK host-config get")
         return 0
-    elif head == "host-config" and len(args) >= 3 and args[0] == "set" and args[1] in SET_KEYS:
-        try:
-            config_set(args[1], args[2:])
-        except ConfigError as e:
-            deny(f"host-config set: {e}")
-        return 0
     else:
         deny("not whitelisted")
     log(f"OK {shlex.join(cmd)[:300]}")
-    run_cwd = os.path.join(config.repo, "data") if (head == "claude" and args[:1] == ["-p"]) or head == "rc-send" else root
+    run_cwd = root if head == "ka_resume.sh" else safe_cwd()     # (ka_resume.sh moves to its own --cwd)
     limit = RC_HOST_TIMEOUT if head == "rc-send" else CHECK_TIMEOUT if args in (["auth", "status"], ["doctor"]) else None
     try:
         return subprocess.run(cmd, input=stdin, env=ENV, cwd=run_cwd, timeout=limit).returncode
@@ -819,19 +897,25 @@ def main() -> int:
 
 
 def install_args(argv: List[str]) -> int:
-    """The two things the install script asks of this file from a shell, never over ssh (sshd hands the
-    forced command no arguments, and it refuses to run with any when SSH_CONNECTION is set):
+    """What this file does when it is run from a shell, with arguments (sshd's forced command never has any,
+    and when the client sent a command SSH_ORIGINAL_COMMAND is set, which refuses all of these: FORCED; an
+    SSH login of the owner is fine, it only has SSH_CONNECTION):
       --print-version
-      --check-config <host.json>     (exit 0 when it passes load_config, else 1 with the reason)
-      --write-config <host.json> --root DIR... --repo DIR --claude FILE   (a new file; never overwrites)"""
-    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_ORIGINAL_COMMAND"):
+      --check-config <host.json> [--data DIR]   (exit 0 when it passes load_config, else 1 with the reason;
+                                                 with --data also when it names that data directory)
+      --write-config <host.json> --root DIR... --repo DIR --claude FILE --data DIR   (a new file; never overwrites)
+      --run <command>                           (tests: main() with <command> as the client's command)"""
+    if FORCED:
         deny("install mode over ssh")
     if argv == ["--print-version"]:
         print(HOST_KIT_VERSION)
         return 0
-    if len(argv) == 2 and argv[0] == "--check-config":
+    if len(argv) in (2, 4) and argv[0] == "--check-config" and (len(argv) == 2 or argv[2] == "--data"):
         try:
-            load_config(argv[1])
+            c = load_config(argv[1])
+            if len(argv) == 4 and os.path.realpath(c.data) != os.path.realpath(argv[3]):
+                raise ConfigError(f"{argv[1]} names the data directory {c.data}, this install was given {argv[3]}: "
+                                  "fix or delete it, then run the install again")
         except ConfigError as e:
             print(f"host_exec: {e}", file=sys.stderr)
             return 1
@@ -841,8 +925,9 @@ def install_args(argv: List[str]) -> int:
         opts: Dict[str, str] = {}
         rest = argv[2:]
         while rest:
-            if len(rest) < 2 or rest[0] not in ("--root", "--repo", "--claude"):
-                print("usage: --write-config FILE --root DIR [--root DIR...] --repo DIR --claude FILE", file=sys.stderr)
+            if len(rest) < 2 or rest[0] not in ("--root", "--repo", "--claude", "--data"):
+                print("usage: --write-config FILE --root DIR [--root DIR...] --repo DIR --claude FILE --data DIR",
+                      file=sys.stderr)
                 return 2
             if rest[0] == "--root":
                 roots.append(rest[1])
@@ -852,18 +937,24 @@ def install_args(argv: List[str]) -> int:
         try:
             if os.path.lexists(argv[1]):
                 raise ConfigError(f"{argv[1]} exists")
-            if "--repo" not in opts or "--claude" not in opts:
-                raise ConfigError("--repo and --claude are required")
-            new = Config([_owned_dir(r) for r in roots], _owned_dir(opts["--repo"]), _abs_path(opts["--claude"], "claude"))
+            if not {"--repo", "--claude", "--data"} <= set(opts):
+                raise ConfigError("--repo, --claude and --data are required")
+            new = Config([_owned_dir(r) for r in roots], _owned_dir(opts["--repo"]),
+                         _abs_path(opts["--claude"], "claude"), _owned_dir(opts["--data"]))
             if not os.access(new.claude, os.X_OK):
                 raise ConfigError(f"{new.claude} is not executable")
             parse_config(config_text(new))
+            check_outside_data(new)
             write_config(argv[1], new)
         except ConfigError as e:
-            print(f"host_exec: {e}", file=sys.stderr)
+            print(f"host_exec.py: {e}", file=sys.stderr)
             return 1
         return 0
-    print("usage: host_exec.py --print-version | --check-config FILE | --write-config ...", file=sys.stderr)
+    if len(argv) == 2 and argv[0] == "--run":
+        os.environ["SSH_ORIGINAL_COMMAND"] = argv[1]
+        return main()
+    print("usage: host_exec.py --print-version | --check-config FILE [--data DIR] | --write-config ... | --run CMD",
+          file=sys.stderr)
     return 2
 
 

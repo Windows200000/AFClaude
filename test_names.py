@@ -5,6 +5,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -66,6 +67,14 @@ class Names(unittest.TestCase):
         self.assertTrue(second.endswith("-task-manager-2"))
         with self.assertRaisesRegex(ValueError, "no free tmux name"):
             names.tmux_name("review", taken={"afc-review"} | {f"afc-review-{i}" for i in range(2, 100)})
+
+    def test_reserved_names_are_never_generated(self):
+        """The host check's tmux session (afc-check) is killed by the kit without asking: no session may carry it."""
+        self.assertEqual(names.RESERVED, ("afc-check",))
+        with mock.patch.object(names, "RESERVED", ("afc-review",)):
+            self.assertEqual(names.tmux_name("review"), "afc-review-2")
+        for kind in names.KINDS:
+            self.assertNotIn(names.tmux_name(kind, project="check", title="check", sid=SID), names.RESERVED)
 
     def test_the_whitelist_regex(self):
         for ok in ("afc-0123abcd", "afc-review", "afc-" + "a" * 36, "afc-a-b-1"):

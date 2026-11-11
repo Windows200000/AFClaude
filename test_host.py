@@ -66,9 +66,15 @@ class Env:
                 os.environ[k] = v
 
 
+TEST_HOME = os.path.join(testenv.DIR, "home")      # the kit makes its own working dir under HOME: never the real one
+os.makedirs(TEST_HOME, exist_ok=True)
+
+
 def run_host_exec(command, stdin=b"", log=None):
-    env = dict(os.environ, SSH_ORIGINAL_COMMAND=command, AFCLAUDE_HOST_EXEC_LOG=log or os.devnull)
-    return subprocess.run([sys.executable, HOST_EXEC], input=stdin, env=env, capture_output=True, timeout=60)
+    """The kit with `command` as the client's command (`--run`: under sshd the env overrides are ignored)."""
+    env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+    env.update(AFCLAUDE_HOST_EXEC_LOG=log or os.devnull, HOME=TEST_HOME)
+    return subprocess.run([sys.executable, HOST_EXEC, "--run", command], input=stdin, env=env, capture_output=True, timeout=60)
 
 
 class InContainer(unittest.TestCase):
@@ -353,8 +359,9 @@ class Whitelist(unittest.TestCase):
         he = importlib.util.module_from_spec(spec)
         sessions = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sessions)
-        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull, SSH_ORIGINAL_COMMAND="rc-send rc-t"):
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
             spec.loader.exec_module(he)
+        with Env(SSH_ORIGINAL_COMMAND="rc-send rc-t"):
             he.SESSIONS = sessions
             self.register_thread(sessions, "rc-t", os.getpid())
             run = mock.Mock(side_effect=subprocess.TimeoutExpired("claude", he.RC_HOST_TIMEOUT))
@@ -367,9 +374,10 @@ class Whitelist(unittest.TestCase):
     def test_rc_send_through_the_forced_command_is_denied_without_a_thread(self):
         sessions = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sessions)
-        env = dict(os.environ, SSH_ORIGINAL_COMMAND="rc-send rc-test-f1", AFCLAUDE_HOST_EXEC_LOG=os.devnull,
-                   AFCLAUDE_HOST_EXEC_SESSIONS=sessions)
-        r = subprocess.run([sys.executable, HOST_EXEC], input=b"go", env=env, capture_output=True, timeout=60)
+        env = dict(os.environ, AFCLAUDE_HOST_EXEC_LOG=os.devnull, AFCLAUDE_HOST_EXEC_SESSIONS=sessions)
+        env.pop("SSH_ORIGINAL_COMMAND", None)
+        r = subprocess.run([sys.executable, HOST_EXEC, "--run", "rc-send rc-test-f1"], input=b"go", env=env,
+                           capture_output=True, timeout=60)
         self.assertEqual((r.returncode, b"denied" in r.stderr), (126, True))   # no claude was run
 
     def test_rc_send_shape(self):
@@ -394,7 +402,7 @@ class Whitelist(unittest.TestCase):
             he.SESSIONS = sessions
             self.register_thread(sessions, "rc-test-f1", os.getpid())
             cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
-            self.assertEqual(cmd, [he.cfg().claude] + host.RC_SEND_FLAGS)
+            self.assertEqual(cmd, [he.cfg().claude, "-p", "--setting-sources", "user"] + host.RC_SEND_FLAGS[1:])
             self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
             for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
                                (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
@@ -422,16 +430,19 @@ class Whitelist(unittest.TestCase):
         r = run_host_exec("tmux-panes afc-00000000", log=log)
         self.assertNotEqual(r.returncode, 126)
         r = run_host_exec("proc-snapshot", log=log)
-        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 0, r.stderr)
         snap = json.loads(r.stdout)
         me = snap[str(os.getpid())]                      # this test runner: not claude -> no argv
         self.assertEqual(me[0], os.getppid())
         self.assertIsNone(me[2])
-        self.assertIn("OK proc-snapshot", open(log).read())
-        if os.path.exists(os.path.expanduser("~/.claude.json")):
-            r = run_host_exec("usage-cache", log=log)
-            self.assertEqual(r.returncode, 0)
-            self.assertIsInstance(json.loads(r.stdout), dict)
+        with open(log) as fh:
+            self.assertIn("OK proc-snapshot", fh.read())
+        with open(os.path.join(TEST_HOME, ".claude.json"), "w") as fh:     # the kit's HOME is a temp dir
+            json.dump({"cachedUsageUtilization": {"fetchedAtMs": 1, "utilization": {"five_hour": 3}, "other": "x"},
+                       "oauthAccount": "secret"}, fh)
+        r = run_host_exec("usage-cache", log=log)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"fetchedAtMs": 1, "utilization": {"five_hour": 3}})
 
     def test_every_host_py_shape_is_whitelisted(self):
         """The shapes host.py emits, run through host_exec.py's parser without executing:
