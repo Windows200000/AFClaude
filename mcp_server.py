@@ -74,10 +74,10 @@ INSTRUCTIONS = (
     "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin. "
     "The server resolves who calls (D-195, D-330): a machine user (one per machine, granted by an owner), a "
     "task-manager or an agent session; until this host's machine user is registered, its interactive sessions "
-    "count as the owner. An agent's write beyond its own task, hand-off and alerts is stored as a proposal for "
+    "(and their subagents, D-336) count as the owner. An agent's write beyond its own task, hand-off and alerts is stored as a proposal for "
     "its project's task-manager and answers {\"proposed\": true, \"proposal_id\": N, \"status\": \"proposed\", "
     "\"message\": \"proposed as P-N, waiting for the task-manager's review (nothing was changed): ...\"}: not an "
-    "error (with roles in shadow mode the write still applies).")
+    "error (while `tasks.py roles mode` says shadow, the write still applies).")
 
 # The identity hook's stamp on the call being served (identity_hook.py adds `_afc` to the arguments of every
 # afclaude call; the SDK would drop the unknown argument before a tool runs, so call_tool takes it out first).
