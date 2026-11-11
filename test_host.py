@@ -356,6 +356,7 @@ class Whitelist(unittest.TestCase):
         with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull, SSH_ORIGINAL_COMMAND="rc-send rc-t"):
             spec.loader.exec_module(he)
             he.SESSIONS = sessions
+            he.CWD = os.path.join(sessions, "cwd")        # never the real ~/.local/state
             self.register_thread(sessions, "rc-t", os.getpid())
             run = mock.Mock(side_effect=subprocess.TimeoutExpired("claude", he.RC_HOST_TIMEOUT))
             stdin = mock.Mock(buffer=io.BytesIO(b"go"))
@@ -394,7 +395,8 @@ class Whitelist(unittest.TestCase):
             he.SESSIONS = sessions
             self.register_thread(sessions, "rc-test-f1", os.getpid())
             cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
-            self.assertEqual(cmd, [he.CLAUDE] + host.RC_SEND_FLAGS)
+            self.assertEqual(he.USER_SETTINGS, ["--setting-sources", "user"])   # no project hooks (H3)
+            self.assertEqual(cmd, [he.CLAUDE] + he.USER_SETTINGS + host.RC_SEND_FLAGS)
             self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
             for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
                                (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
@@ -447,6 +449,148 @@ class Whitelist(unittest.TestCase):
                 (["tmux", "rename-session", "-t", "=afc-s2-whitelist-test-none", "afc-s2-whitelist-test-x"], None)):
             r = run_host_exec(shlex.join(host.bridge_argv(argv)))
             self.assertNotEqual(r.returncode, 126, (argv, r.stderr))
+
+
+def load_host_exec(state):
+    """docker/host_exec.py as a module with its state dir (log, headless cwd) in `state`."""
+    import importlib.util
+    with Env(AFCLAUDE_HOST_EXEC_STATE=state, AFCLAUDE_HOST_EXEC_LOG=None):
+        spec = importlib.util.spec_from_file_location("host_exec_hardening", HOST_EXEC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class BridgeHardening(unittest.TestCase):
+    """Review k2 H2/H3: the bridge log and the cwd of the `claude -p` calls are out of the container's
+    reach (<repo>/data is its read-write mount), caller text is one escaped log line, and a
+    ka_resume --cwd in data is refused. Nothing here launches or signals anything."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = os.path.join(self.tmp, "state")
+        self.hx = load_host_exec(self.state)
+
+    def test_the_log_lives_outside_data_and_is_private(self):
+        self.assertEqual(self.hx.LOG, os.path.join(self.state, "host_exec.log"))
+        self.assertFalse(self.hx.under_data(self.hx.LOG))
+        self.hx.log("OK x")
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(self.hx.LOG).st_mode & 0o777, 0o600)
+        default = load_host_exec(None)          # no override: the default is in the home, never in data
+        self.assertFalse(default.under_data(default.LOG))
+        self.assertTrue(default.LOG.endswith(os.path.join(".local", "state", "afclaude", "host_exec.log")))
+
+    def test_the_log_is_not_followed_through_a_symlink(self):
+        target = os.path.join(self.tmp, "authorized_keys")
+        with open(target, "w") as fh:
+            fh.write("ssh-ed25519 AAAA owner\n")
+        os.makedirs(self.state)
+        os.symlink(target, os.path.join(self.state, "host_exec.log"))
+        r = run_host_exec("tmux-has afc-00000000", log=os.path.join(self.state, "host_exec.log"))
+        self.assertNotEqual(r.returncode, 126)             # the call still runs: the log is a record, not a gate
+        self.assertIn(b"log", r.stderr)                    # but the failure is visible
+        self.assertEqual(open(target).read(), "ssh-ed25519 AAAA owner\n")
+
+    def test_caller_text_is_one_escaped_line(self):
+        evil = "x\nssh-ed25519 AAAAkey k\n\r\x1b[2J\x00\u2028y"
+        self.hx.log(f"OK {shlex.join(['ka_resume.sh', '--message', evil])}")
+        self.hx.log("next")
+        lines = open(self.hx.LOG).read().split("\n")
+        self.assertEqual(len(lines), 3)                    # two entries and the final newline: no injected line
+        self.assertIn("\\nssh-ed25519 AAAAkey k\\n", lines[0])
+        self.assertIn("\\x1b", lines[0])
+        for ln in lines[:2]:
+            self.assertEqual(self.hx.one_line(ln), ln)     # nothing raw left in it
+            self.assertFalse(ln.startswith("ssh-"))
+        # the denial path (the command as received) is escaped the same way
+        log = os.path.join(self.tmp, "deny.log")
+        run_host_exec("bogus 'a\nssh-ed25519 AAAAkey k\nb'", log=log)
+        self.assertEqual(len(open(log).read().splitlines()), 1)
+
+    def test_ka_resume_refuses_the_data_dir_as_cwd(self):
+        repo_data = os.path.join(self.hx.REPO, "data")
+        link = os.path.join(self.tmp, "datalink")
+        os.symlink(repo_data, link)
+        sub = os.path.join(self.tmp, "sub")
+        os.symlink(os.path.join(repo_data, "x", "y"), sub)
+        args = ["--session", "11111111-2222-4333-8444-555555555555", "--tmux", "afc-x", "--message", "hi"]
+        for cwd in (repo_data, os.path.join(repo_data, "a", "b"), repo_data + "/../data", link,
+                    os.path.join(link, "deeper"), sub):
+            with self.assertRaises(SystemExit, msg=cwd):
+                with mock.patch.object(self.hx, "log"), mock.patch("sys.stderr"):
+                    self.hx.check_ka_resume(args + ["--cwd", cwd])
+            r = run_host_exec("ka_resume.sh " + shlex.join(args + ["--cwd", cwd]))
+            self.assertEqual(r.returncode, 126, cwd)
+            self.assertIn(b"container-writable", r.stderr)
+        # the repo itself and a neighbour of data are not data
+        for cwd in (self.hx.ROOT, self.hx.REPO, self.hx.REPO + "/data-other"):
+            with mock.patch.object(self.hx, "log"):
+                self.hx.check_ka_resume(args + ["--cwd", cwd])
+
+    def test_ka_resume_sh_refuses_the_data_dir_itself(self):
+        script = os.path.join(HERE, "ka_resume.sh")
+        link = os.path.join(self.tmp, "datalink")
+        os.symlink(os.path.join(HERE, "data"), link)
+        for cwd in (os.path.join(HERE, "data"), os.path.join(HERE, "data", "z"), link):
+            r = subprocess.run([script, "--session", "11111111-2222-4333-8444-555555555555", "--tmux",
+                                "afc-hotfix-test-none", "--message", "hi", "--cwd", cwd],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 2, (cwd, r.stderr))
+            self.assertIn("container-writable", r.stderr)
+
+    def test_headless_calls_run_in_a_private_dir_outside_data_with_user_settings_only(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append((cmd, kw))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        for command, stdin in (("claude -p --no-session-persistence --permission-mode dontAsk /usage", b""),
+                               ("claude -p --model haiku --output-format json", b"prompt")):
+            with Env(SSH_ORIGINAL_COMMAND=command), mock.patch.object(self.hx.subprocess, "run", fake_run), \
+                    mock.patch.object(self.hx.sys, "stdin", mock.Mock(buffer=mock.Mock(read=lambda n: stdin))):
+                self.assertEqual(self.hx.main(), 0)
+            cmd, kw = calls[-1]
+            self.assertEqual(cmd[1:3], ["--setting-sources", "user"], command)
+            self.assertEqual(kw["cwd"], os.path.join(self.state, "cwd"))
+            self.assertFalse(self.hx.under_data(kw["cwd"]))
+            self.assertEqual(os.stat(kw["cwd"]).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
+        with mock.patch.object(self.hx, "check_rc_thread"):
+            cmd, _ = self.hx.rc_send_cmd(["rc-t"], b"text")
+        self.assertEqual(cmd[1:3], ["--setting-sources", "user"])
+        # everything else still runs in the workspace root
+        with Env(SSH_ORIGINAL_COMMAND="claude agents --json"), mock.patch.object(self.hx.subprocess, "run", fake_run):
+            self.hx.main()
+        self.assertEqual(calls[-1][1]["cwd"], self.hx.ROOT)
+        self.assertEqual(calls[-1][0], [self.hx.CLAUDE, "agents", "--json"])
+
+    def test_an_unusable_headless_dir_denies_instead_of_falling_back(self):
+        os.makedirs(self.state)
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(elsewhere)
+        os.symlink(elsewhere, self.hx.CWD)                 # a symlink is not the bridge's own dir
+        with mock.patch.object(self.hx, "log"), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            self.hx.claude_cwd()
+        os.unlink(self.hx.CWD)
+        os.mkdir(self.hx.CWD, 0o777)
+        os.chmod(self.hx.CWD, 0o777)
+        with mock.patch.object(self.hx, "log"), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            self.hx.claude_cwd()
+
+    def test_host_side_headless_cwd_is_not_data_and_own_transcripts_stay_own(self):
+        import usage_sampler as us
+        with Env(AFCLAUDE_IN_CONTAINER=None):
+            path = host.headless_cwd()
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+        self.assertFalse(self.hx.under_data(path))
+        default = os.path.join(os.path.expanduser("~"), ".local", "state", "afclaude", "cwd")
+        with Env(AFCLAUDE_HEADLESS_CWD=None, AFCLAUDE_IN_CONTAINER="1"):
+            self.assertEqual(host.headless_cwd(), default)
+        self.assertTrue(any(m in default for m in us.OWN_CWD_MARKERS))   # usage split / stalled scans: still AFClaude's own
 
 
 class KeepaliveInContainer(unittest.TestCase):

@@ -4,7 +4,12 @@
 forced command (see install_host_bridge.sh). sshd runs it for every call, with the
 requested command in $SSH_ORIGINAL_COMMAND. It is split with shlex (never a shell,
 never eval), checked against the whitelist below, and run directly. Everything else
-is rejected. Every call is logged to data/host_exec.log.
+is rejected. Every call is logged to ~/.local/state/afclaude/host_exec.log (0600, in a 0700 dir
+the container cannot reach: never under <repo>/data, which it mounts read-write; opened O_NOFOLLOW,
+caller text escaped to one line each). The one-shot `claude -p` calls (usage, Haiku, rc-send) run in
+the bridge-owned ~/.local/state/afclaude/cwd with `--setting-sources user`, and ka_resume refuses
+a --cwd at or under <repo>/data: a container-written .claude/settings.json (hooks) or CLAUDE.md
+there would otherwise run on the host (review k2 H2/H3).
 
 Allowed (exact shapes):
   ka_resume.sh --session <uuid> --tmux <name> --message <text> [--cwd <dir under ROOT>] [--name <t>]
@@ -42,12 +47,18 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 
 ROOT = "/mnt/BlockVolume/Claude"
 REPO = os.path.join(ROOT, "work", "AFClaude")
-LOG = os.environ.get("AFCLAUDE_HOST_EXEC_LOG") or os.path.join(REPO, "data", "host_exec.log")  # override: tests only (sshd passes no env)
+DATA = os.path.join(REPO, "data")        # the container's read-write mount: nothing here is trusted
+# the bridge's own state, outside every directory the container can write (override: tests only,
+# sshd passes no env)
+STATE = os.environ.get("AFCLAUDE_HOST_EXEC_STATE") or os.path.join(os.path.expanduser("~"), ".local", "state", "afclaude")
+LOG = os.environ.get("AFCLAUDE_HOST_EXEC_LOG") or os.path.join(STATE, "host_exec.log")
+CWD = os.path.join(STATE, "cwd")         # the cwd of the one-shot `claude -p` calls (empty, 0700, bridge-owned)
 CLAUDE = os.path.expanduser("~/.local/bin/claude")
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX8 = re.compile(r"^[0-9a-f]{8}$")
@@ -56,6 +67,10 @@ TMUX = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")
 ENV = {"HOME": os.path.expanduser("~"), "USER": os.environ.get("USER", "opc"), "LANG": "C.UTF-8",
        "PATH": os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:/bin",
        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "TERM": "xterm-256color"}
+# the one-shot calls read the user's settings only: a project or local .claude/settings.json (hooks)
+# in whatever directory they run in is never loaded (verified: `claude -p` honours project hooks
+# in an untrusted dir, even for /usage)
+USER_SETTINGS = ["--setting-sources", "user"]
 HAIKU_FLAGS = {"-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json",
                "stream-json", "--verbose", "--permission-mode", "dontAsk", "--tools=",
                "--tools=PushNotification", "--allowedTools=PushNotification",
@@ -75,13 +90,50 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 
 
+CTRL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_log_failed = False
+
+
+def one_line(text):
+    """`text` with every control character (newline, CR, ESC, NUL, the Unicode line breaks) as a
+    visible escape: caller-supplied text never makes a second log line (review k2 H2)."""
+    return CTRL.sub(lambda m: m.group().encode("unicode_escape").decode(), text)
+
+
 def log(msg):
+    """Append one line. A log that can't be written (a symlink or a stray file where the log
+    belongs, a full disk) is reported once on stderr and the call goes on, as before (the log is
+    a record, not a gate)."""
+    global _log_failed
     try:
-        os.makedirs(os.path.dirname(LOG), exist_ok=True)
-        with open(LOG, "a") as fh:
-            fh.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}\n")
-    except OSError:
-        pass
+        os.makedirs(os.path.dirname(LOG), mode=0o700, exist_ok=True)
+        fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {one_line(msg)}\n")
+    except OSError as e:
+        if not _log_failed:
+            _log_failed = True
+            print(f"host_exec: warning: log {LOG} not written ({e})", file=sys.stderr)
+
+
+def under_data(path):
+    """True when `path` (symlinks resolved) is <repo>/data or below: the container's writable tree."""
+    real, data = os.path.realpath(path), os.path.realpath(DATA)
+    return real == data or real.startswith(data + os.sep)
+
+
+def claude_cwd():
+    """The bridge-owned, empty, 0700 directory the one-shot `claude -p` calls run in (created on
+    first use). Anything that makes it unusable denies the call: never a fallback to another cwd."""
+    try:
+        os.makedirs(os.path.dirname(CWD), mode=0o700, exist_ok=True)   # each level private, not only the leaf
+        os.makedirs(CWD, mode=0o700, exist_ok=True)
+        st = os.lstat(CWD)
+    except OSError as e:
+        deny(f"claude cwd unavailable: {e}")
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or under_data(CWD):
+        deny("claude cwd is not a private directory of the bridge user")
+    return CWD
 
 
 def deny(why):
@@ -142,6 +194,8 @@ def check_ka_resume(args):
     if not TMUX.match(seen.get("--tmux", "")):
         deny("ka_resume needs --tmux <name>")
     cwd = os.path.realpath(seen.get("--cwd", ROOT))
+    if under_data(cwd):                    # container-writable: its .claude/settings.json would run here (H3)
+        deny("ka_resume cwd in the container-writable data dir")
     if cwd != ROOT and not cwd.startswith(ROOT + os.sep):
         deny("ka_resume cwd outside ROOT")
     if seen.get("--effort", "high") not in ("low", "medium", "high", "xhigh", "max"):
@@ -198,7 +252,7 @@ def rc_send_cmd(args, data):
         deny("rc-send text not UTF-8")
     check_rc_thread(args[0])
     log(f"OK rc-send {args[0]} ({len(data)} bytes)")
-    return [CLAUDE] + RC_SEND_FLAGS, RC_SEND_PROMPT.format(name=args[0], text=text).encode()
+    return [CLAUDE] + USER_SETTINGS + RC_SEND_FLAGS, RC_SEND_PROMPT.format(name=args[0], text=text).encode()
 
 
 def main():
@@ -217,9 +271,9 @@ def main():
     elif head == "claude" and args in (["agents", "--json"], ["agents", "--json", "--all"]):
         cmd = [CLAUDE] + args
     elif head == "claude" and args == ["-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"]:
-        cmd = [CLAUDE] + args
+        cmd = [CLAUDE] + USER_SETTINGS + args
     elif head == "claude" and args[:3] == ["-p", "--model", "haiku"] and set(args) <= HAIKU_FLAGS:
-        cmd, stdin = [CLAUDE] + args, sys.stdin.buffer.read(200_000)
+        cmd, stdin = [CLAUDE] + USER_SETTINGS + args, sys.stdin.buffer.read(200_000)
     elif head == "rc-send":
         cmd, stdin = rc_send_cmd(args, sys.stdin.buffer.read(RC_TEXT_MAX + 1))
     elif head == "claude" and len(args) == 2 and args[0] == "stop" and HEX8.match(args[1]):
@@ -297,7 +351,7 @@ def main():
     else:
         deny("not whitelisted")
     log(f"OK {shlex.join(cmd)[:300]}")
-    cwd = os.path.join(REPO, "data") if (head == "claude" and args[:1] == ["-p"]) or head == "rc-send" else ROOT
+    cwd = claude_cwd() if (head == "claude" and args[:1] == ["-p"]) or head == "rc-send" else ROOT
     try:
         return subprocess.run(cmd, input=stdin, env=ENV, cwd=cwd,
                               timeout=RC_HOST_TIMEOUT if head == "rc-send" else None).returncode

@@ -105,6 +105,19 @@ def local_path(path: str) -> str:
     return path
 
 
+def headless_cwd() -> str:
+    """The cwd of a one-shot `claude -p` run directly on the host (usage, Haiku, rc-send): a
+    bridge-owned 0700 directory under ~/.local/state/afclaude, never <repo>/data, which the
+    container writes: a .claude/settings.json (hooks) there would run on the host. docker/host_exec.py
+    uses the same directory for the calls that come over the bridge (and ignores a cwd sent along);
+    in the container the value is only a placeholder. AFCLAUDE_HEADLESS_CWD overrides it (tests)."""
+    path = os.environ.get("AFCLAUDE_HEADLESS_CWD") or os.path.join(os.path.expanduser("~"), ".local", "state",
+                                                                    "afclaude", "cwd")
+    if not in_container():
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 def to_local(text: str) -> str:
     """`text` (a stored command line, a cwd) with every occurrence of the host repo path replaced
     by the code directory: at-jobs scheduled before the code moved to /app still name the host
@@ -264,6 +277,5 @@ def rc_send(name, text, timeout):
         raise ValueError("rc_send text empty, binary or too long")
     if in_container():
         return run_on_host(["rc-send", name], input=text, timeout=timeout)
-    data = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")   # host_exec.py's cwd for -p
-    return subprocess.run(["claude"] + RC_SEND_FLAGS, input=rc_send_prompt(name, text), cwd=data,
+    return subprocess.run(["claude"] + RC_SEND_FLAGS, input=rc_send_prompt(name, text), cwd=headless_cwd(),
                           capture_output=True, text=True, timeout=timeout)

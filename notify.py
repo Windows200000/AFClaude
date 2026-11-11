@@ -37,7 +37,7 @@ def push(text):
         r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",
                               "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
                               "--tools=PushNotification", "--allowedTools=PushNotification",
-                              "--strict-mcp-config"], input=prompt, cwd=os.path.join(host.repo_dir(), "data"),
+                              "--strict-mcp-config"], input=prompt, cwd=host.headless_cwd(),
                              env=ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"push failed: {e}"

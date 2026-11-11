@@ -247,7 +247,7 @@ class HostRcSend(unittest.TestCase):
         argv, kw = run.call_args
         self.assertEqual(argv[0], ["claude"] + host.RC_SEND_FLAGS)
         self.assertEqual(kw["input"], host.rc_send_prompt("work-a1", "go on"))
-        self.assertEqual((kw["timeout"], os.path.basename(kw["cwd"])), (30, "data"))
+        self.assertEqual((kw["timeout"], os.path.basename(kw["cwd"])), (30, "headless-cwd"))
 
     def test_container_mode(self):
         with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
