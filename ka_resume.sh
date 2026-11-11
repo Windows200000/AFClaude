@@ -84,8 +84,10 @@ esac
 # Narrow allow rules, checked before the auto-mode classifier, for this launch only:
 # AFClaude sessions may start/continue sessions via this script and list sessions.
 ALLOW="Bash($DIR/ka_resume.sh:*),Bash(claude agents:*)"
-RUN="$DIR/run/$T.sh"
-mkdir -p "$DIR/run"
+# the host kit (host_exec.py) names a directory outside its versioned install dir
+RUN_DIR="${AFCLAUDE_KIT_RUN:-$DIR/run}"
+RUN="$RUN_DIR/$T.sh"
+mkdir -p "$RUN_DIR"
 {
   echo '#!/usr/bin/env bash'
   printf 'cd %q || exit 1\n' "$CWD"

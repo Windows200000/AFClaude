@@ -27,6 +27,10 @@ whitelist. So every host call is mapped onto one of those shapes here:
   append to PROGRESS.md / ALERTS.md       -> append-note PROGRESS.md|ALERTS.md (text on stdin)
   rc_send(NAME, text): the Haiku sender     -> rc-send NAME (text on stdin; host_exec.py builds the
                                                same `claude -p` + prompt as rc_send_argv/_prompt here)
+  kit_info() / check_kit()                -> kit-version          (the installed kit's version, whitelist hash
+                                                                  and command list; check_kit compares it with
+                                                                  HOST_KIT_VERSION and raises HostKitError)
+  host-config get | set roots|repo|claude VALUE...  (the host kit's host.json; K2, the setup's write)
 
 Anything else raises ValueError instead of being sent: it would be denied anyway.
 Settings (env, set by docker/compose.yml): AFCLAUDE_BRIDGE_HOST, AFCLAUDE_BRIDGE_USER,
@@ -51,6 +55,7 @@ TMUX_NAME = re.compile(r"^=?(afc-[a-z0-9-]{1,36})\Z")
 TMUX_PANE = re.compile(r"^=(afc-[a-z0-9-]{1,36}):\Z")
 TMUX_NEW = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
 NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
+HOST_CONFIG_KEYS = ("roots", "repo", "claude")   # host-config set KEY (docker/host_exec.py SET_KEYS)
 # rc_send (docs/rc_server_mode.md §4.1, §8; D-288). Kept identical in docker/host_exec.py (it runs
 # alone as the SSH forced command; test_host.py compares them).
 RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")   # a thread's registry `name` (dir + 2 hex)
@@ -64,6 +69,9 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "message between the BEGIN and END lines below as its text, unchanged. If that agent is "
                   "not reachable, do not try any other name or agent and do not retry. Do nothing else. "
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
+# The host kit this code was written for (docker/host_exec.py's HOST_KIT_VERSION; test_host_kit.py compares
+# them): a kit with another version is the first host check's fail, "re-run the host kit install".
+HOST_KIT_VERSION = "1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
@@ -161,6 +169,10 @@ def bridge_argv(argv):
         return argv
     if head == "rc-send" and len(rest) == 1 and RC_NAME.match(rest[0]):
         return argv
+    if head == "kit-version" and not rest:
+        return argv
+    if head == "host-config" and (rest == ["get"] or (len(rest) >= 3 and rest[0] == "set" and rest[1] in HOST_CONFIG_KEYS)):
+        return argv
     raise ValueError(f"no host_exec.py shape for {shlex.join(argv)[:200]!r}")
 
 
@@ -175,6 +187,38 @@ def run_on_host(argv, input=None, cwd=None, env=None, timeout=None):
     r = subprocess.run(ssh_argv(remote), input=input, capture_output=True, text=True, timeout=timeout,
                        stdin=subprocess.DEVNULL if input is None else None)
     return subprocess.CompletedProcess(argv, r.returncode, r.stdout, r.stderr)
+
+
+class HostKitError(RuntimeError):
+    """The installed host kit is not the one this code needs, or does not answer (D-235)."""
+
+
+def kit_info(timeout=30):
+    """The installed kit's `kit-version` answer ({kit_version, whitelist_hash, commands, config_format}),
+    over the bridge. Raises HostKitError when the call fails (an old kit has no such command: denied,
+    rc 126; a missing or malformed host.json refuses it too) or the answer is not that JSON."""
+    r = subprocess.run(ssh_argv(bridge_argv(["kit-version"])), capture_output=True, text=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise HostKitError(f"kit-version failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[:300]!r}; "
+                           "the bridge is down, the kit is older than version 1 or host.json is missing: "
+                           "re-run the host kit install (docker/install_host_bridge.sh)")
+    try:
+        info = json.loads(r.stdout)
+        if not isinstance(info, dict) or not isinstance(info.get("kit_version"), str):
+            raise ValueError("no kit_version")
+    except ValueError as e:
+        raise HostKitError(f"kit-version answered something else: {e}: {r.stdout[:200]!r}")
+    return info
+
+
+def check_kit(timeout=30):
+    """kit_info(), or HostKitError when its version is not HOST_KIT_VERSION (naming both)."""
+    info = kit_info(timeout)
+    if info["kit_version"] != HOST_KIT_VERSION:
+        raise HostKitError(f"host kit version {info['kit_version']!r}, this code needs {HOST_KIT_VERSION!r}: "
+                           "re-run the host kit install (docker/install_host_bridge.sh)")
+    return info
 
 
 # ------------------------------------------------------------------ helpers

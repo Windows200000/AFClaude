@@ -335,7 +335,7 @@ class Whitelist(unittest.TestCase):
         denied("another name")
         self.register_thread(sessions, "rc-t", me, procStart=start)
         cmd, _ = he.rc_send_cmd(["rc-t"], b"go")                  # the one live idle sdk-cli thread: allowed
-        self.assertEqual(cmd[0], he.CLAUDE)
+        self.assertEqual(cmd[0], he.cfg().claude)
         self.register_thread(sessions, "rc-t", 1, fname="b.json")  # pid 1 is alive too: two live entries
         denied("two live entries")
         os.remove(os.path.join(sessions, "b.json"))
@@ -394,7 +394,7 @@ class Whitelist(unittest.TestCase):
             he.SESSIONS = sessions
             self.register_thread(sessions, "rc-test-f1", os.getpid())
             cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
-            self.assertEqual(cmd, [he.CLAUDE] + host.RC_SEND_FLAGS)
+            self.assertEqual(cmd, [he.cfg().claude] + host.RC_SEND_FLAGS)
             self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
             for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
                                (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
