@@ -62,7 +62,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional, TypeVar
 from zoneinfo import ZoneInfo
@@ -299,7 +299,9 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
         if isinstance(e, RolesFailure):
             roles_report(e)           # the roles setting was unusable inside the transaction: nothing was written
         if isinstance(e, RoleRefusal):
-            _refusal_after(conn, ctx, spec, name, e)      # `on`: the audit row and the alert
+            _refusal_after(conn, ctx, spec, name, params, e.verdict.reason, e.verdict.projects, e)
+        elif isinstance(e, Forbidden) and _enforcing_after(conn, e):
+            _refusal_after(conn, ctx, spec, name, params, str(e), (), e)   # an action's own check, also `on` (L2)
         if seen:
             _shadow_after(conn, ctx, name, seen[0], f"the action was NOT carried out ({type(e).__name__}: {e})", e)
         raise
@@ -660,23 +662,59 @@ def _matrix_decides(conn: sqlite3.Connection) -> bool:
     return roles_mode(conn, report=False) == "on"
 
 
-REFUSAL_ALERT_EVERY = timedelta(hours=1)       # one refusal alert per actor and action in this time (§3.4)
+REFUSAL_ALERT_EVERY = timedelta(hours=1)       # one refusal alert per actor kind, action and project in this time
+REFUSAL_AUDIT_ONLY = ("user", "machine", "host")      # a person's refusal: the audit row, no alert to the owner
+_TARGET_KEYS = ("task_id", "decision", "proposal_id", "message_id", "rule_id", "request_id", "notice_id", "user_id",
+                "project", "session_id", "key", "name", "id")
+NO_TARGET = "n/a"                                     # the audit row's target when the params name none
 
 
-def _refusal_after(conn: sqlite3.Connection, ctx: Ctx, spec: Spec, name: str, refusal: RoleRefusal) -> None:
-    """`roles_enforce=on`: a refused write leaves an audit row (`action`=<name>, `after`={"refused": reason}) written in
-    its own transaction (the write's was rolled back) and, unless this actor was already refused this action in the
-    last hour (read from the audit log, so it holds across processes), an alert to the owner (plan §3.4: a looping
-    session can't flood the alerts doc). A failure here (audit write, alert) is an error the owner sees (D-235):
-    RolesFailure, saying the write itself was refused, chained to the refusal."""
-    reason = refusal.verdict.reason
+def _enforcing_after(conn: sqlite3.Connection, cause: BaseException) -> bool:
+    """Is `roles_enforce` `on`, asked after a plain Forbidden left the transaction? An unusable setting is a
+    RolesFailure (D-235), reported, chained to the refusal."""
+    try:
+        return roles_mode(conn, report=False) == "on"
+    except RolesFailure as failure:
+        roles_report(failure)
+        raise failure from cause
+
+
+def _refusal_target(spec: Spec, params: Mapping[str, Any]) -> str:
+    """The target a refused write named (its row id or name), for the audit row; NO_TARGET when the params name none."""
+    for k in ((f"{spec.target_type}_id", spec.target_type) if spec.target_type else ()) + _TARGET_KEYS:
+        v = params.get(k)
+        if isinstance(v, (int, str)) and not isinstance(v, bool) and str(v):
+            return str(v)[:80]
+    return NO_TARGET
+
+
+def _refusal_key(ctx: Ctx, kind: str, name: str, projects: Sequence[int | None]) -> str:
+    """The alert's dedupe key: actor kind, action and project; where no project is known, the session behind an
+    agent or task-manager (a task-manager's workers share it: not one alert per subagent id, M1)."""
+    pid = next((p for p in projects if p is not None), None)
+    sid = ctx.actor_session or roles.parse_actor(ctx.actor).session
+    where = f"project:{pid}" if pid is not None else f"session:{sid}" if sid and kind in ("agent", "task-manager") else "-"
+    return f"{kind}|{name}|{where}"
+
+
+def _refusal_after(conn: sqlite3.Connection, ctx: Ctx, spec: Spec, name: str, params: Mapping[str, Any], reason: str,
+                   projects: Sequence[int | None], refusal: Forbidden) -> None:
+    """`roles_enforce=on`: a refused write (the matrix's verdict, or the action's own check) leaves an audit row
+    (`action`=<name>, `after`={"refused": reason, "key": ...}) written in its own transaction (the write's was
+    rolled back) and, for an agent, task-manager or runner, an entry in the alerts doc (no push: the refused call
+    is not held up; the run summary lists REFUSED). One alert per key (_refusal_key) and hour, read from the audit
+    log so it holds across processes (plan §3.4: a looping session can't flood the alerts doc); a person's
+    refusal (user, machine, host owner) gets the audit row only. A failure here (audit write, alert) is an error
+    the owner sees (D-235): RolesFailure, saying the write itself was refused, chained to the refusal."""
+    kind = roles.parse_actor(ctx.actor).kind
+    key = _refusal_key(ctx, kind, name, projects)
     since = store.iso_ms(store._utcnow() - REFUSAL_ALERT_EVERY)
     try:
         def record() -> bool:
             with store.transaction(conn):
-                fresh = not store.refusal_audited_since(conn, ctx.actor, name, since)
-                store.add_audit(conn, ctx.actor, ctx.via, name, spec.target_type, None, None, {"refused": reason},
-                                session=ctx.actor_session)
+                fresh = not store.refusal_audited_since(conn, key, since)
+                store.add_audit(conn, ctx.actor, ctx.via, name, spec.target_type, _refusal_target(spec, params), None,
+                                {"refused": reason, "key": key}, session=ctx.actor_session)
             return fresh
         fresh = store.retrying(record, conn)
     except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure: the caller gets an error, the owner an alert
@@ -684,14 +722,15 @@ def _refusal_after(conn: sqlite3.Connection, ctx: Ctx, spec: Spec, name: str, re
                                "the write itself was refused")
         roles_report(failure)
         raise failure from refusal
-    if not fresh:
+    if not fresh or kind in REFUSAL_AUDIT_ONLY:
         return
-    who = ctx.actor.split(":", 1)[0]
     try:
-        deliver_alerts({"alerts": [{
-            "subject": f"role refusal: {name} for {who}",
-            "body": f"{ctx.actor} (via {ctx.via}) was refused {name}: {reason}. Audited as a `{name}` row with "
-                    "after.refused; further refusals of the same action by it stay quiet for an hour."}]})
+        import notify as notify_mod
+        notify_mod.notify(
+            f"role refusal: {name} for {kind}",
+            f"{ctx.actor} (via {ctx.via}) was refused {name}: {reason}. Audited as a `{name}` row with "
+            "after.refused; further refusals of the same kind of caller for this action and project stay quiet for "
+            "an hour.", do_push=False)
     except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure
         failure = RolesFailure("a refusal alert could not be sent", f"{name} by {ctx.actor}: {type(e).__name__}: {e}",
                                "the write itself was refused and audited")

@@ -3271,13 +3271,16 @@ def host_machine_users(conn: sqlite3.Connection, hostname: str) -> list[int]:
         "AND t.hostname_at_issue=? WHERE u.kind='machine' AND u.revoked_at IS NULL ORDER BY u.id", (hostname,))]
 
 
-def host_owner_machine(conn: sqlite3.Connection, hostname: str) -> bool:
+def host_owner_machine(conn: sqlite3.Connection, hostname: str, issued_before: str | None = None) -> bool:
     """Is there an unrevoked machine user holding a token issued on `hostname` and an owner grant? A7's
-    precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`."""
+    precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`.
+    `issued_before`: only a token issued at or before that time counts (`roles mode --set on` waits a night)."""
     return conn.execute(
         "SELECT 1 FROM users u JOIN grants g ON g.user_id=u.id AND g.scope='owner' "
         "JOIN machine_tokens t ON t.user_id=u.id AND t.revoked_at IS NULL AND t.hostname_at_issue=? "
-        "WHERE u.kind='machine' AND u.revoked_at IS NULL LIMIT 1", (hostname,)).fetchone() is not None
+        "AND (? IS NULL OR t.created_at<=?) "
+        "WHERE u.kind='machine' AND u.revoked_at IS NULL LIMIT 1", (hostname, issued_before, issued_before)
+    ).fetchone() is not None
 
 
 def add_roles_shadow(conn: sqlite3.Connection, day: str, actor: str, session: str | None, via: str, action: str,
@@ -3435,10 +3438,11 @@ def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:
                         (new, old)).rowcount
 
 
-def refusal_audited_since(conn: sqlite3.Connection, actor: str, action: str, since: str) -> bool:
-    """Has `actor` been refused `action` (an audit row with `after` = {"refused": ...}, actions._refusal_after) since?"""
-    return conn.execute("SELECT 1 FROM audit_log WHERE actor=? AND action=? AND ts>=? AND after LIKE '{\"refused\":%' "
-                        "LIMIT 1", (actor, action, since)).fetchone() is not None
+def refusal_audited_since(conn: sqlite3.Connection, key: str, since: str) -> bool:
+    """Was a refusal with this alert key (an audit row with `after` = {"refused": ..., "key": key},
+    actions._refusal_after) written since?"""
+    return conn.execute("SELECT 1 FROM audit_log WHERE ts>=? AND json_extract(after, '$.key')=? LIMIT 1",
+                        (since, key)).fetchone() is not None
 
 
 def audit_of_actors(conn: sqlite3.Connection, actors: Sequence[str], since: str, until: str) -> list[Row]:

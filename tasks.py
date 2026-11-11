@@ -160,7 +160,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -170,6 +170,7 @@ import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write: validation, one transaction, audit row)
 import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 import identity  # noqa: E402  (phase 5a A2: who is acting)
+import host as host_mod  # noqa: E402  (register-host is refused in the container)
 import proposals  # noqa: E402  (phase 5a A4: the run summary text)
 import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
 
@@ -361,10 +362,28 @@ def visible(conn, what, rows, project_of, public_global=False):
     return actions.read_filter(conn, w.actor, w.session, "cli", what, rows, project_of, public_global=public_global)
 
 
+def roles_on_wait(conn):
+    """`roles mode --set on` within ROLES_ON_AFTER of this host's machine user registering: refused (the matrix has
+    not seen the machine principal in shadow yet, review A7 M2). No machine user at all: the setting's own check
+    says so."""
+    import socket
+    host = socket.gethostname()
+    if not store.host_owner_machine(conn, host):
+        return
+    cutoff = store.iso_ms(store._utcnow() - ROLES_ON_AFTER)
+    if not store.host_owner_machine(conn, host, issued_before=cutoff):
+        raise ValueError(f"this host's machine user registered less than {ROLES_ON_AFTER.total_seconds() // 3600:g} h "
+                         "ago: stay in shadow for at least one night, check `python3 tasks.py roles shadow --since "
+                         "<day of registration>` for `machine:` rows (what the matrix would refuse the owner's "
+                         "sessions), then set `on`")
+
+
 def run_roles(conn, args):
     """Phase 5a A3: the shadow log of the permission matrix (setting roles_enforce): what it would have refused,
     turned into a proposal or hidden from a listing, grouped for the daily list the task-manager reviews."""
     if args.roles_cmd == "mode":
+        if args.set_mode == "on":
+            roles_on_wait(conn)
         if args.set_mode:
             act(conn, "setting.set", key="roles_enforce", value=args.set_mode)   # perform lets this repair through
         problem = actions.roles_mode_problem(conn)
@@ -504,7 +523,7 @@ def run_runs(conn, args):
         return print("no runs")
     for r in rows:
         who_ = r["session_id"] + (f"/{r['agent_id']}" if r["agent_id"] else "")
-        n = f"{r['summary']['write_count']} write(s)" if r["summary"] else "open"
+        n = f"{r['summary']['write_count']} write(s)" + proposals.refused_text(r["summary"]) if r["summary"] else "open"
         print(f"run {r['id']:<5} {r['kind']:<8} {names.get(r['project_id'], '-'):<14} {who_}  "
               f"{berlin(r['started_at'])}  {n}  {r['end_reason'] or ''}")
     return None
@@ -535,29 +554,57 @@ def machine_file_free(path, force):
         raise ValueError(f"{path} is not writable")
 
 
-def write_machine_file(path, rec):
+def write_machine_file(path, rec, replace=True):
+    """The token file: a temp file (0600, O_EXCL) renamed into place. `replace=False` never overwrites a file that
+    is there (a concurrent run's token stays): FileExistsError."""
     tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(rec, fh, indent=1)
             fh.write("\n")
-        os.replace(tmp, path)
+        if replace:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)           # fails if the path exists (no overwrite)
+            os.unlink(tmp)
     except BaseException:
         if os.path.lexists(tmp):
             os.unlink(tmp)
         raise
 
 
+ROLES_ON_AFTER = timedelta(hours=20)     # `roles mode --set on` waits this long after the host's machine user registered
+
+
+def _undo_registration(conn, r, why):
+    """register-host failed after the machine user was registered: revoke it (its token with it), so the owner
+    re-runs the command; when even that fails, say exactly what is left and how to finish by hand."""
+    try:
+        act(conn, "machine.revoke", user_id=r["user_id"])
+    except Exception as e2:      # noqa: BLE001 - the error below tells the owner what state is left
+        raise ValueError(f"{why}; undoing the registration failed too ({type(e2).__name__}: {e2}): machine "
+                         f"{r['user_id']} exists. Fix: `machine revoke {r['user_id']}`, then run register-host "
+                         f"again; or `grant set {r['user_id']} --owner` and put this token, shown once, in the "
+                         f"token file: {r['token']}") from e2
+    raise ValueError(f"{why}; the registration was undone (machine {r['user_id']} revoked): nothing is left, "
+                     "run register-host again")
+
+
 def register_host(conn, args):
     """Phase 5a A7 (D-290, D-330): this host's machine user in one step, for the owner at a plain shell: a
-    registration code, the machine user and its token (written to the token file), and the owner grant. Refused
-    inside a Claude session (its env or the hook's agent id is set: a session must not hand itself an owner
-    credential, plan A7), when this host has a machine user already (a lost token is re-issued with
-    `machine code --user ID`), or when the token file can't be written (checked before the code is spent)."""
+    registration code, the machine user, the owner grant, then its token written to the token file (a failure of
+    the grant or the file revokes the new user again). Refused inside a Claude session (its env or the hook's
+    agent id is set: a session must not hand itself an owner credential, plan A7; only a guard rail, a shell
+    is full control, D-290), inside the container (the token belongs to the host: K2), when this host has a
+    machine user already (a lost token is re-issued with `machine code --user ID`), or when the token file
+    can't be written (checked before the code is spent)."""
     import socket
     import roles
     env = os.environ
+    if host_mod.in_container():
+        raise ValueError("machine register-host registers the host, not the container: run it in a plain shell on "
+                         "the host itself (python3 tasks.py machine register-host)")
     if identity.in_claude_session(env) or env.get(identity.AGENT_VAR):
         raise ValueError("machine register-host is run by the owner in a plain shell, not inside a Claude session "
                          "(a session must not give itself an owner credential): open a terminal on this host and run "
@@ -576,20 +623,28 @@ def register_host(conn, args):
     act(conn, "machine.code", code_sha256=roles.code_sha256(code))
     r = actions.register_machine(conn, code, host, actor=who(conn).actor, via="cli", label=args.label)
     try:
+        g = act(conn, "grant.set", user_id=r["user_id"], scope="owner")
+    except Exception as e:       # noqa: BLE001 - undone or reported with the fix, never half-done silently
+        _undo_registration(conn, r, f"the owner grant for machine {r['user_id']} failed ({type(e).__name__}: {e})")
+    try:
         write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
-                                  "token_id": r["token_id"], "hostname": host})
-    except OSError as e:         # the code is spent: the token must not be lost with the error
-        raise ValueError(f"machine {r['user_id']} was registered but the token file could not be written ({e}); "
-                         f"the token, shown once: {r['token']}; the owner grant is not made yet: "
-                         f"`grant set {r['user_id']} --owner`") from e
-    g = act(conn, "grant.set", user_id=r["user_id"], scope="owner")
-    deliver(g)
+                                  "token_id": r["token_id"], "hostname": host}, replace=False)
+    except OSError as e:
+        _undo_registration(conn, r, f"the token file {path} could not be written ({type(e).__name__}: {e})")
     out = {"user_id": r["user_id"], "label": r["label"], "token_id": r["token_id"], "file": path, "owner": True}
+    done = (f"machine {r['user_id']} ({r['label']}) registered for this host and granted the owner role; "
+            f"token written to {path}\nSessions that start from now on act as machine:{r['user_id']} (owner). "
+            "Next: stay in shadow for at least one night (the matrix has never seen this principal), then check "
+            "`python3 tasks.py roles shadow --since <day of registration>` for `machine:` rows and only then "
+            f"`python3 tasks.py roles mode --set on` (it refuses within {ROLES_ON_AFTER.total_seconds() // 3600:g} h "
+            "of the registration).")
+    try:
+        deliver(g)
+    except ValueError as e:      # everything else is done: say so
+        raise ValueError(f"{e}. The registration itself is complete: {done}") from e
     if args.json:
         return dump(out)
-    return print(f"machine {r['user_id']} ({r['label']}) registered for this host and granted the owner role; "
-                 f"token written to {path}\nSessions that start from now on act as machine:{r['user_id']} (owner). "
-                 "To enforce the roles: python3 tasks.py roles mode --set on")
+    return print(done)
 
 
 def run_machine(conn, args):

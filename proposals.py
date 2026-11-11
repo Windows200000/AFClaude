@@ -77,6 +77,11 @@ def _loads(v: Any) -> Any:
     return v
 
 
+def is_refusal(after: Any) -> bool:
+    """An audit row's `after` of a refused write (actions._refusal_after: {"refused": reason, "key": ...}): not a write."""
+    return isinstance(after, dict) and "refused" in after and set(after) <= {"refused", "key"}
+
+
 def _write_line(row: Mapping[str, Any]) -> dict[str, Any]:
     """One audit row as a summary entry: when, what, on which target, and which fields changed to what."""
     after = _loads(row.get("after"))
@@ -86,9 +91,9 @@ def _write_line(row: Mapping[str, Any]) -> dict[str, Any]:
                  for k, v in list(after.items())[:CHANGE_MAX]]
         changes = ", ".join(shown) + (", ..." if len(after) > CHANGE_MAX else "")
     target = f" {row['target_type']}#{row['target_id']}" if row.get("target_type") else ""
-    if isinstance(after, dict) and set(after) == {"refused"}:       # A7: a write the matrix refused (audit only)
+    if is_refusal(after):       # A7: a write the matrix refused (audit only)
         return {"ts": row.get("ts"), "action": row.get("action"), "target": target.strip(),
-                "line": f"{row.get('action')}{target} REFUSED: {_short(after['refused'])}"}
+                "line": f"{row.get('action')}{target} REFUSED: {_short(after['refused'])}", "refused": True}
     return {"ts": row.get("ts"), "action": row.get("action"), "target": target.strip(),
             "line": f"{row.get('action')}{target}" + (f": {changes}" if changes else "")}
 
@@ -108,8 +113,10 @@ def summary(run: Mapping[str, Any], writes: Sequence[Mapping[str, Any]],
     so a delivery names them by id only. Code changes are not repeated: the task-manager reads the run's
     branch with change_manifest.py (D-243)."""
     by_kind: dict[str, list[dict[str, Any]]] = {}
+    refused = 0
     for w in writes:
         by_kind.setdefault(_kind_of(str(w.get("action"))), []).append(_write_line(w))
+        refused += is_refusal(_loads(w.get("after")))     # listed, but not a write: counted apart (L1)
     open_ = [p for p in proposals if not p.get("shadow") and p["status"] in ("proposed", "postponed")]
     pending = [{"id": p["id"], "status": p["status"], "summary": p["summary"], "payload": p["payload"]}
                for p in open_ if p["id"] not in noticed]
@@ -119,15 +126,21 @@ def summary(run: Mapping[str, Any], writes: Sequence[Mapping[str, Any]],
     shadow = [{"id": p["id"], "summary": p["summary"]} for p in proposals if p.get("shadow")]
     return {"run": run["id"], "kind": run["kind"], "session": run["session_id"], "agent_id": run.get("agent_id"),
             "project_id": run.get("project_id"), "started_at": run["started_at"], "ended_at": run.get("ended_at"),
-            "end_reason": run.get("end_reason"), "writes": by_kind, "write_count": len(writes),
+            "end_reason": run.get("end_reason"), "writes": by_kind,
+            "write_count": len(writes) - refused, "refused": refused,
             "pending": pending, "noticed": sent, "decided": decided, "shadow": shadow}
+
+
+def refused_text(s: Mapping[str, Any]) -> str:
+    """", N refused" for a run whose writes the matrix refused (roles_enforce=on); they are listed with the writes."""
+    return f", {s['refused']} refused" if s.get("refused") else ""
 
 
 def summary_text(s: Mapping[str, Any]) -> str:
     """The summary in the compact form a task-manager reads."""
     who = f"{s['kind']} {s['session']}" + (f"/{s['agent_id']}" if s.get("agent_id") else "")
     lines = [f"run {s['run']} ({who}, {s['started_at']} to {s.get('ended_at')}, {s.get('end_reason')}): "
-             f"{s['write_count']} write(s), {len(s['pending'])} proposal(s) pending"]
+             f"{s['write_count']} write(s), {len(s['pending'])} proposal(s) pending" + refused_text(s)]
     for label, rows in s["writes"].items():
         lines += [f"  {label}: " + r["line"] for r in rows]
     lines += [f"  pending P-{p['id']} ({p['status']}): {p['summary']}" for p in s["pending"]]
@@ -154,14 +167,14 @@ POSTPONED_LINES = 5      # postponed proposals named in the continue prompt
 def nothing_to_deliver(s: Mapping[str, Any]) -> bool:
     """An empty run: no write and no pending proposal (an applied shadow proposal is a write too; one sent as an
     inbox notice is not pending here: the notice told the task-manager)."""
-    return not s["write_count"] and not s["pending"]
+    return not s["write_count"] and not s["pending"] and not s.get("refused")
 
 
 def delivery_text(s: Mapping[str, Any]) -> str:
     """A closed run for the task-manager's context, in the compact form of the PostToolUse hook: pending proposals
     first (they need a decision), then the direct writes, no code (D-243: `change_manifest.py` on the branch) and
     no report (the parent has the subagent's own). At most DELIVERY_LINES writes."""
-    head = f"Run {s['run']}: {s['write_count']} write(s)"
+    head = f"Run {s['run']}: {s['write_count']} write(s)" + refused_text(s)
     if s["pending"]:
         head += f", {len(s['pending'])} proposal(s) pending (tasks.py review ID approve|edit|reject|postpone)"
     lines = [head]
@@ -196,6 +209,9 @@ def notice_text(summaries: Sequence[Mapping[str, Any]]) -> str:
     pending = sum(len(s["pending"]) for s in summaries)
     what = "subagent" if all(s.get("kind") == "subagent" for s in summaries) else "agent"
     line = f"AFClaude: {len(summaries)} {what} run(s) finished ({ids}): {writes} write(s)"
+    refused = sum(int(s.get("refused") or 0) for s in summaries)
+    if refused:
+        line += f", {refused} refused"
     if pending:
         line += f", {pending} proposal(s) pending, run `tasks.py proposals` then `tasks.py review`"
     sent = [p for s in summaries for p in s.get("noticed", [])]
