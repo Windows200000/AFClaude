@@ -180,8 +180,12 @@ def bridge_argv(argv):
 def run_on_host(argv, input=None, cwd=None, env=None, timeout=None):
     """subprocess.run(argv, capture_output=True, text=True) on the host.
     Returns a CompletedProcess (stdout/stderr are str). In the container `cwd` and
-    `env` are ignored: host_exec.py runs every command with its own fixed env/cwd."""
+    `env` are ignored: host_exec.py runs every command with its own fixed env/cwd. On the host a
+    one-shot `claude -p` gets `--setting-sources user` like the bridge's (docker/host_exec.py): no
+    project or local .claude/settings.json (hooks) of its cwd is ever loaded."""
     if not in_container():
+        if os.path.basename(argv[0]) == "claude" and "-p" in argv and "--setting-sources" not in argv:
+            argv = [argv[0], "--setting-sources", "user", *argv[1:]]
         return subprocess.run(argv, input=input, cwd=cwd, env=env, capture_output=True, text=True,
                               timeout=timeout)
     remote = bridge_argv(argv)

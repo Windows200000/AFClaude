@@ -16,7 +16,9 @@
 #      for this script's python and for the throwaway session (so its `tasks.py handoff write`
 #      lands in the temp DB);
 #   1. gives the session a driven_sessions row in the temp DB (follow_clear moves it), then starts `claude --model haiku --session-id <new uuid> --permission-mode dontAsk` with cwd =
-#      the repo's data/ dir (must exist and be trusted already; nothing is created or trusted here),
+#      a private dir ~/.local/state/afclaude/compact-test (0700, created and marked trusted in
+#      ~/.claude.json here, like ka_resume.sh does; never <repo>/data, which the container writes),
+#      with `--setting-sources user`,
 #      in the clean env ka_resume.sh uses, with no MCP servers (--strict-mcp-config: the afclaude
 #      MCP server would write the live DB), Edit/Write denied, and only
 #      `python3 <repo>/tasks.py handoff write` allowed;
@@ -49,7 +51,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 T=afc-compacttest
-CWD="$REPO/data"
+CWD="$HOME/.local/state/afclaude/compact-test"   # not <repo>/data: the container writes it (review H3)
 LIVE_DB="$REPO/data/afclaude.db"
 SID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -71,12 +73,33 @@ trap cleanup EXIT
 
 command -v tmux >/dev/null || die "tmux not found"
 command -v claude >/dev/null || die "claude not found"
-[ -d "$CWD" ] || die "$CWD does not exist (run from the main checkout, whose data/ dir is trusted)"
-python3 - "$CWD" <<'PY' || die "$CWD is not trusted in ~/.claude.json (run ./trust_dirs.sh yourself first)"
-import json, os, sys
-d = os.path.realpath(sys.argv[1])
-p = json.load(open(os.path.expanduser("~/.claude.json"))).get("projects", {}).get(d, {})
-sys.exit(0 if p.get("hasTrustDialogAccepted") is True else 1)
+# the throwaway session's cwd: a private dir of ours (each level 0700), trusted in ~/.claude.json
+python3 - "$CWD" <<'PY' || die "could not set up $CWD"
+import json, os, stat, sys, tempfile
+cwd = os.path.realpath(sys.argv[1])
+state = os.path.dirname(cwd)
+for d in (os.path.dirname(state), state, cwd):          # ~/.local/state, .../afclaude, the test dir
+    if not os.path.lexists(d):
+        os.mkdir(d, 0o700)
+for d in (state, cwd):
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        sys.exit(f"{d} is not a directory of ours")
+    if st.st_mode & 0o077:
+        os.chmod(d, 0o700)
+if os.listdir(cwd):
+    sys.exit(f"{cwd} is not empty")
+path = os.path.expanduser("~/.claude.json")
+data = json.load(open(path))
+proj = data.setdefault("projects", {}).setdefault(cwd, {})
+if proj.get("hasTrustDialogAccepted") is not True:
+    proj["hasTrustDialogAccepted"] = True
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claude.json.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+    print(f"marked {cwd} trusted", file=sys.stderr)
 PY
 tmux has-session -t "=$T" 2>/dev/null && die "tmux session $T already exists (a test still running?); not touching it"
 
@@ -178,12 +201,12 @@ PY
 RUN="$REPO/run/$T.sh"
 {
   echo '#!/usr/bin/env bash'
-  printf 'cd %q || exit 1\n' "$CWD"
+  printf 'cd -P -- %q || exit 1\n' "$CWD"
   printf 'exec env -i HOME=%q USER=%q LOGNAME=%q SHELL=/bin/bash LANG=C.UTF-8 TERM=xterm-256color ' "$HOME" "$USER" "$USER"
   printf 'XDG_RUNTIME_DIR=%q PATH=%q CLAUDE_GUARD_DISABLE=1 ' "/run/user/$(id -u)" "$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"
   printf 'AFCLAUDE_DB=%q AFCLAUDE_CONFIG=%q AFCLAUDE_DATA_DIR=%q DISPATCHER_DATA_DIR=%q ' \
     "$AFCLAUDE_DB" "$AFCLAUDE_CONFIG" "$TMPD" "$TMPD"
-  printf 'claude --model haiku --session-id %q --permission-mode dontAsk --name %q' "$SID" "$T"
+  printf 'claude --setting-sources user --model haiku --session-id %q --permission-mode dontAsk --name %q' "$SID" "$T"
   printf ' %q' --strict-mcp-config "--mcp-config=$TMPD/mcp.json" \
     "--allowedTools=Bash(python3 $REPO/tasks.py handoff write:*)" "--disallowedTools=Edit,Write,NotebookEdit"
   echo

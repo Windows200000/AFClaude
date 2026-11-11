@@ -8,11 +8,11 @@ is rejected. Every call is logged to ~/.local/state/afclaude/host_exec.log (0600
 the container cannot reach: never under <repo>/data, which it mounts read-write; opened O_NOFOLLOW,
 caller text escaped to one line each). The one-shot `claude -p` calls (usage, Haiku, rc-send) run in
 the bridge-owned ~/.local/state/afclaude/cwd with `--setting-sources user`, and ka_resume refuses
-a --cwd at or under <repo>/data: a container-written .claude/settings.json (hooks) or CLAUDE.md
+a --cwd at or under <repo>/data or not already its own realpath: a container-written .claude/settings.json (hooks) or CLAUDE.md
 there would otherwise run on the host (review k2 H2/H3).
 
 Allowed (exact shapes):
-  ka_resume.sh --session <uuid> --tmux <name> --message <text> [--cwd <dir under ROOT>] [--name <t>]
+  ka_resume.sh --session <uuid> --tmux <name> --message <text> [--cwd <resolved dir under ROOT>] [--name <t>]
                [--model <m>] [--effort low|medium|high|xhigh|max] [--new] [--no-remote-control]
   claude agents --json [--all]
   claude -p --no-session-persistence --permission-mode dontAsk /usage
@@ -106,9 +106,9 @@ def log(msg):
     a record, not a gate)."""
     global _log_failed
     try:
-        os.makedirs(os.path.dirname(LOG), mode=0o700, exist_ok=True)
+        private_dir(os.path.dirname(LOG))
         fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        with os.fdopen(fd, "a") as fh:
+        with os.fdopen(fd, "a", errors="backslashreplace") as fh:   # a lone surrogate is escaped, not a crash
             fh.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {one_line(msg)}\n")
     except OSError as e:
         if not _log_failed:
@@ -122,12 +122,34 @@ def under_data(path):
     return real == data or real.startswith(data + os.sep)
 
 
+def private_dir(path):
+    """Create `path` and its missing parents below the home dir as 0700, and make sure the directory is a
+    real directory of this user that no group or other can write to: a wider mode of one of ours is
+    narrowed to 0700; anything else (a symlink, someone else's, a file) raises OSError."""
+    home = os.path.expanduser("~")
+    if path.startswith(home + os.sep):      # the levels between home and `path` are ours to create private
+        todo = []
+        p = path
+        while p != home and not os.path.lexists(p):
+            todo.append(p)
+            p = os.path.dirname(p)
+        for p in reversed(todo):
+            os.mkdir(p, 0o700)
+    else:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(f"{path} is not a directory of the bridge user")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
 def claude_cwd():
     """The bridge-owned, empty, 0700 directory the one-shot `claude -p` calls run in (created on
     first use). Anything that makes it unusable denies the call: never a fallback to another cwd."""
     try:
-        os.makedirs(os.path.dirname(CWD), mode=0o700, exist_ok=True)   # each level private, not only the leaf
-        os.makedirs(CWD, mode=0o700, exist_ok=True)
+        private_dir(os.path.dirname(CWD))   # each level private, not only the leaf
+        private_dir(CWD)
         st = os.lstat(CWD)
     except OSError as e:
         deny(f"claude cwd unavailable: {e}")
@@ -193,9 +215,14 @@ def check_ka_resume(args):
         deny("ka_resume needs --session <uuid> --message")
     if not TMUX.match(seen.get("--tmux", "")):
         deny("ka_resume needs --tmux <name>")
-    cwd = os.path.realpath(seen.get("--cwd", ROOT))
+    cwd = seen.get("--cwd", ROOT)
     if under_data(cwd):                    # container-writable: its .claude/settings.json would run here (H3)
         deny("ka_resume cwd in the container-writable data dir")
+    # the value is passed on unchanged, so it must already be its own resolved path: a symlink or a `..`
+    # after one (data/l/.. is read as data by `cd`) or a swap after this check can't change where it lands
+    if not os.path.isabs(cwd) or os.path.realpath(cwd) != cwd:
+        deny(f"ka_resume --cwd must be a resolved absolute path (no symlink, `..`, `.` or trailing slash): "
+             f"use {os.path.realpath(cwd)}")
     if cwd != ROOT and not cwd.startswith(ROOT + os.sep):
         deny("ka_resume cwd outside ROOT")
     if seen.get("--effort", "high") not in ("low", "medium", "high", "xhigh", "max"):
