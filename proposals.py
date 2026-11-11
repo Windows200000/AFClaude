@@ -86,6 +86,9 @@ def _write_line(row: Mapping[str, Any]) -> dict[str, Any]:
                  for k, v in list(after.items())[:CHANGE_MAX]]
         changes = ", ".join(shown) + (", ..." if len(after) > CHANGE_MAX else "")
     target = f" {row['target_type']}#{row['target_id']}" if row.get("target_type") else ""
+    if isinstance(after, dict) and set(after) == {"refused"}:       # A7: a write the matrix refused (audit only)
+        return {"ts": row.get("ts"), "action": row.get("action"), "target": target.strip(),
+                "line": f"{row.get('action')}{target} REFUSED: {_short(after['refused'])}"}
     return {"ts": row.get("ts"), "action": row.get("action"), "target": target.strip(),
             "line": f"{row.get('action')}{target}" + (f": {changes}" if changes else "")}
 

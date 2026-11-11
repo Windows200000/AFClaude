@@ -118,6 +118,14 @@ class Forbidden(ValueError):
     """The actor may not do this (an autonomous session writing rules/decisions via MCP)."""
 
 
+class RoleRefusal(Forbidden):
+    """The permission matrix refused a write under `roles_enforce=on` (phase 5a A7). `perform` records it after
+    the rolled-back transaction: an audit row and, once per actor and action per hour, an alert."""
+    def __init__(self, message: str, verdict: "permissions.Verdict") -> None:
+        super().__init__(message)
+        self.verdict = verdict
+
+
 class Proposed(Exception):
     """An agent's write was stored as a proposal instead of applied (`roles_enforce=on`, phase 5a A4): nothing
     was changed. Raised by perform() once its transaction has committed; the entry points (MCP tools, tasks.py)
@@ -289,6 +297,8 @@ def _perform(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping[st
     except BaseException as e:
         if isinstance(e, RolesFailure):
             roles_report(e)           # the roles setting was unusable inside the transaction: nothing was written
+        if isinstance(e, RoleRefusal):
+            _refusal_after(conn, ctx, spec, name, e)      # `on`: the audit row and the alert
         if seen:
             _shadow_after(conn, ctx, name, seen[0], f"the action was NOT carried out ({type(e).__name__}: {e})", e)
         raise
@@ -329,7 +339,7 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                 mode = "on"           # the owner's repair of the setting itself: only what the matrix allows
             if mode == "on":
                 if verdict.outcome != "proposal":
-                    raise Forbidden(f"{name} refused for {actor}: {verdict.reason}")
+                    raise RoleRefusal(f"{name} refused for {actor}: {verdict.reason}", verdict)
                 # An agent's write in its project: stored for the task-manager, nothing applied (D-182, D-188).
                 # Proposals need no one to be up: the row waits (nothing is applied by timeout, §3.7).
                 prop = _capture_proposal(conn, ctx, name, params, verdict, shadow=False)
@@ -341,7 +351,7 @@ def _perform_tx(conn: sqlite3.Connection, spec: Spec, name: str, params: Mapping
                     store.put_idempotency(conn, key, actor, name, request_sha, done.stored())
                 return done
             seen.append(verdict)
-        if spec.owner_only and is_autonomous(conn, ctx):
+        if spec.owner_only and is_autonomous(conn, ctx) and not _matrix_decides(conn):
             raise Forbidden(f"{name} is not allowed for an autonomous AFClaude session via {via} "
                             "(the owner decides sessions, rules, settings and prompts)")
         res = spec.fn(conn, ctx, **params)
@@ -549,7 +559,7 @@ def _apply_proposed(conn: sqlite3.Connection, ctx: Ctx, row: Mapping[str, Any], 
     v = permissions.check(conn, name, params, ctx.actor, ctx.actor_session)
     if v.outcome != "allowed":
         raise Forbidden(f"P-{row['id']}: {name} refused for {ctx.actor} as the reviewer: {v.reason}")
-    if spec.owner_only and is_autonomous(conn, ctx):
+    if spec.owner_only and is_autonomous(conn, ctx) and not _matrix_decides(conn):
         raise Forbidden(f"P-{row['id']}: {name} is not allowed for an autonomous AFClaude session, as a reviewer "
                         "neither (the owner decides sessions, rules, settings and prompts)")
     inner = Ctx(ctx.actor, "proposal", None, ctx.autonomous, ctx.actor_session)
@@ -640,6 +650,52 @@ def roles_mode(conn: sqlite3.Connection, *, report: bool = True) -> str:
 
 def _repairs_roles_setting(name: str, params: Mapping[str, Any]) -> bool:
     return name in ("setting.set", "setting.reset") and params.get("key") == "roles_enforce"
+
+
+def _matrix_decides(conn: sqlite3.Connection) -> bool:
+    """A7: with `roles_enforce=on` the permission matrix decides alone; the old owner_only / is_autonomous rule (kept
+    for `shadow`, A8 removes it) applies only in shadow. An unusable setting raises RolesFailure (D-235), reported
+    by `_perform` like any other."""
+    return roles_mode(conn, report=False) == "on"
+
+
+REFUSAL_ALERT_EVERY = timedelta(hours=1)       # one refusal alert per actor and action in this time (§3.4)
+
+
+def _refusal_after(conn: sqlite3.Connection, ctx: Ctx, spec: Spec, name: str, refusal: RoleRefusal) -> None:
+    """`roles_enforce=on`: a refused write leaves an audit row (`action`=<name>, `after`={"refused": reason}) written in
+    its own transaction (the write's was rolled back) and, unless this actor was already refused this action in the
+    last hour (read from the audit log, so it holds across processes), an alert to the owner (plan §3.4: a looping
+    session can't flood the alerts doc). A failure here (audit write, alert) is an error the owner sees (D-235):
+    RolesFailure, saying the write itself was refused, chained to the refusal."""
+    reason = refusal.verdict.reason
+    since = store.iso_ms(store._utcnow() - REFUSAL_ALERT_EVERY)
+    try:
+        def record() -> bool:
+            with store.transaction(conn):
+                fresh = not store.refusal_audited_since(conn, ctx.actor, name, since)
+                store.add_audit(conn, ctx.actor, ctx.via, name, spec.target_type, None, None, {"refused": reason},
+                                session=ctx.actor_session)
+            return fresh
+        fresh = store.retrying(record, conn)
+    except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure: the caller gets an error, the owner an alert
+        failure = RolesFailure("a refusal could not be audited", f"{name} by {ctx.actor}: {type(e).__name__}: {e}",
+                               "the write itself was refused")
+        roles_report(failure)
+        raise failure from refusal
+    if not fresh:
+        return
+    who = ctx.actor.split(":", 1)[0]
+    try:
+        deliver_alerts({"alerts": [{
+            "subject": f"role refusal: {name} for {who}",
+            "body": f"{ctx.actor} (via {ctx.via}) was refused {name}: {reason}. Audited as a `{name}` row with "
+                    "after.refused; further refusals of the same action by it stay quiet for an hour."}]})
+    except Exception as e:   # noqa: BLE001 - re-raised as RolesFailure
+        failure = RolesFailure("a refusal alert could not be sent", f"{name} by {ctx.actor}: {type(e).__name__}: {e}",
+                               "the write itself was refused and audited")
+        roles_report(failure)
+        raise failure from refusal
 
 
 def roles_shadow_add(conn: sqlite3.Connection, *, actor: str, session: str | None, via: str, action: str,

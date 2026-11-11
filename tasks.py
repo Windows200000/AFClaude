@@ -128,6 +128,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            hostname, no access until granted) and its token, written to the
                                            token file (mode 0600; --file F: elsewhere, --print: show it once
                                            instead; an existing file is kept unless --force)
+    tasks.py machine register-host [--label L] [--file F]   this host's machine user, its token file and the owner
+                                           grant in one step (phase 5a A7; the owner in a plain shell, refused
+                                           inside a Claude session)
     tasks.py machine list | rename ID LABEL | revoke ID   the machine users, their tokens and grants
     tasks.py grant set USER --owner | --project P --level viewer|editor|manager   give a user the owner role
                                            or a level on a project (D-172, D-192); making an owner alerts
@@ -546,6 +549,49 @@ def write_machine_file(path, rec):
         raise
 
 
+def register_host(conn, args):
+    """Phase 5a A7 (D-290, D-330): this host's machine user in one step, for the owner at a plain shell: a
+    registration code, the machine user and its token (written to the token file), and the owner grant. Refused
+    inside a Claude session (its env or the hook's agent id is set: a session must not hand itself an owner
+    credential, plan A7), when this host has a machine user already (a lost token is re-issued with
+    `machine code --user ID`), or when the token file can't be written (checked before the code is spent)."""
+    import socket
+    import roles
+    env = os.environ
+    if identity.in_claude_session(env) or env.get(identity.AGENT_VAR):
+        raise ValueError("machine register-host is run by the owner in a plain shell, not inside a Claude session "
+                         "(a session must not give itself an owner credential): open a terminal on this host and run "
+                         "it there")
+    if who(conn).kind != "host":
+        raise ValueError(f"machine register-host needs the host owner (this is {who(conn).actor})")
+    host = socket.gethostname()
+    have = store.host_machine_users(conn, host)
+    if have:
+        raise ValueError(f"this host already has a machine user (#{have[0]}): nothing registered. A lost token: "
+                         f"`machine code --user {have[0]}`, then `machine register CODE --force`; the grant: "
+                         f"`grant set {have[0]} --owner`")
+    path = args.file or MACHINE_FILE
+    machine_file_free(path, False)
+    code = roles.new_registration_code()
+    act(conn, "machine.code", code_sha256=roles.code_sha256(code))
+    r = actions.register_machine(conn, code, host, actor=who(conn).actor, via="cli", label=args.label)
+    try:
+        write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
+                                  "token_id": r["token_id"], "hostname": host})
+    except OSError as e:         # the code is spent: the token must not be lost with the error
+        raise ValueError(f"machine {r['user_id']} was registered but the token file could not be written ({e}); "
+                         f"the token, shown once: {r['token']}; the owner grant is not made yet: "
+                         f"`grant set {r['user_id']} --owner`") from e
+    g = act(conn, "grant.set", user_id=r["user_id"], scope="owner")
+    deliver(g)
+    out = {"user_id": r["user_id"], "label": r["label"], "token_id": r["token_id"], "file": path, "owner": True}
+    if args.json:
+        return dump(out)
+    return print(f"machine {r['user_id']} ({r['label']}) registered for this host and granted the owner role; "
+                 f"token written to {path}\nSessions that start from now on act as machine:{r['user_id']} (owner). "
+                 "To enforce the roles: python3 tasks.py roles mode --set on")
+
+
 def run_machine(conn, args):
     """Phase 5a A1 (D-195, D-198): machine users: code | register | list | rename | revoke."""
     mc = args.machine_cmd
@@ -586,6 +632,8 @@ def run_machine(conn, args):
               + (f" written to {path}" if not args.print else f"\n  {r['token']}\n  (shown once)"))
         return print("no access until an owner grants it a role: tasks.py grant set "
                      f"{r['user_id']} --owner | --project P --level L") if not r["reissued"] else None
+    if mc == "register-host":
+        return register_host(conn, args)
     if mc == "list":
         rows = []
         for u in store.list_users(conn, "machine"):
@@ -1571,7 +1619,7 @@ def parser():
     q.add_argument("id", type=int)
 
     p = sub.add_parser("machine", help="machine users, one per machine running Claude Code (D-195, phase 5a): "
-                                       "code | register | list | rename | revoke")
+                                       "code | register | register-host | list | rename | revoke")
     ms = p.add_subparsers(dest="machine_cmd", required=True)
     q = ms.add_parser("code", parents=[js], help="a one-time registration code (shown once, 15 minutes)")
     q.add_argument("--user", type=int, help="re-issue the token of this machine user")
@@ -1583,6 +1631,10 @@ def parser():
     where.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
     where.add_argument("--print", action="store_true", help="show the token once instead of writing a file")
     q.add_argument("--force", action="store_true", help="replace an existing token file")
+    q = ms.add_parser("register-host", parents=[js], help="this host's machine user with the owner role, in one "
+                                                          "step (the owner, in a plain shell: A7)")
+    q.add_argument("--label", help="the machine user's name (default: this host's name)")
+    q.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
     ms.add_parser("list", parents=[js], help="the machine users, their tokens and grants")
     q = ms.add_parser("rename", parents=[js], help="change a machine user's label")
     q.add_argument("id", type=int)

@@ -129,15 +129,48 @@ class Table(Base):
 
     def test_an_interactive_session_without_a_token_is_the_host_owner(self):
         """D-330: an interactive session of this host with no valid token is the host owner (cli), its session id
-        recorded; a subagent of it stays an agent under its own id (owner-equivalent for the old rule)."""
+        recorded; a subagent of it is the same principal (D-336, see its own test)."""
         w = self.resolve(env(OWN))                                                         # an unknown session, no token
         self.assertEqual((w.actor, w.kind, w.session, w.autonomous, w.token), ("cli", "host", OWN, False, "none"))
-        w = self.resolve(env(OWN, AFCLAUDE_AGENT_ID="a7"))
-        self.assertEqual((w.actor, w.kind, w.agent_id, w.autonomous), (f"agent:{OWN}:a7", "agent", "a7", False))
-        w = self.resolve(env(OWN), transport="mcp", stamp={"session": OWN, "agent": "a7"})
-        self.assertEqual(w.actor, f"agent:{OWN}:a7")
         self.assertEqual(self.resolve(env()).actor, "cli")                                 # CLAUDECODE, no id
         self.assertEqual(self.resolve({}, transport="mcp").actor, "cli")                   # the server's env is empty
+
+    def test_a_subagent_of_the_owners_interactive_session_is_the_owner_too_d336(self):
+        """D-336: a worker started by the owner's own interactive session is the same principal as that session:
+        the host owner now, the machine user once the host's is registered (a token gives both the same one)."""
+        mine = self.resolve(env(OWN))
+        for w in (self.resolve(env(OWN, AFCLAUDE_AGENT_ID="a7")),
+                  self.resolve(env(OWN), transport="mcp", stamp={"session": OWN, "agent": "a7", "agent_type": "x"})):
+            self.assertEqual((w.actor, w.kind, w.session, w.autonomous), (mine.actor, "host", OWN, False))
+            self.assertEqual(w.agent_id, "a7")                  # still known to whoami and the hooks
+        uid, token = self.machine()
+        tok = {"AFCLAUDE_MACHINE_TOKEN": token}
+        for w in (self.resolve(env(OWN, AFCLAUDE_AGENT_ID="a7", **tok)),
+                  self.resolve(env(OWN, **tok), transport="mcp", stamp={"session": OWN, "agent": "a7"})):
+            self.assertEqual((w.actor, w.kind, w.user_id, w.agent_id), (f"machine:{uid}", "machine", uid, "a7"))
+            self.assertEqual(w.actor, self.resolve(env(OWN, **tok)).actor)
+
+    def test_workers_of_task_managers_and_driven_sessions_stay_agents_d336(self):
+        """Only the owner's own sessions pass their principal on: a project's task-manager, a driven session and a
+        guard-bypass session (every session AFClaude starts) keep their workers as agents, token or not."""
+        uid, token = self.machine()
+        for tok in ({}, {"AFCLAUDE_MACHINE_TOKEN": token}):
+            for sid, extra in ((TM, {}), (DRV, {}), (OTHER, {"CLAUDE_GUARD_DISABLE": "1"})):
+                w = self.resolve(env(sid, AFCLAUDE_AGENT_ID="a9", **extra, **tok))
+                self.assertEqual((w.kind, w.actor, w.autonomous), ("agent", f"agent:{sid}:a9", True), (sid, tok))
+                w = self.resolve(env(sid, **extra, **tok), transport="mcp", stamp={"session": sid, "agent": "a9"})
+                self.assertEqual((w.kind, w.actor), ("agent", f"agent:{sid}:a9"), (sid, tok))
+
+    def test_a_task_managers_worker_after_a_clear_stays_an_agent_d336(self):
+        uid, token = self.machine()
+        self.clear(TM, NEW)
+        for tok in ({}, {"AFCLAUDE_MACHINE_TOKEN": token}):
+            self.assertEqual(self.resolve(env(NEW, AFCLAUDE_AGENT_ID="a9", **tok)).actor, f"agent:{NEW}:a9")
+
+    def test_a_subagent_whose_parent_session_is_not_named_stays_an_agent_d336(self):
+        """No session id (the stamp and the env carry none): nothing says whose subagent it is: the safe side."""
+        w = self.resolve({}, transport="mcp", stamp={"agent": "a7"})
+        self.assertEqual((w.kind, w.actor, w.session), ("agent", "agent:unknown", None))
 
     def test_an_interactive_session_with_a_valid_token_is_the_machine_user(self):
         uid, token = self.machine()

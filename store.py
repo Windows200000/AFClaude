@@ -3263,6 +3263,14 @@ def list_grants(conn: sqlite3.Connection, user_id: int | None = None, project_id
     return [dict(r) for r in rows]
 
 
+def host_machine_users(conn: sqlite3.Connection, hostname: str) -> list[int]:
+    """The unrevoked machine users holding an unrevoked token issued on `hostname` (A7's register-host refuses a
+    second registration)."""
+    return [int(r[0]) for r in conn.execute(
+        "SELECT DISTINCT u.id FROM users u JOIN machine_tokens t ON t.user_id=u.id AND t.revoked_at IS NULL "
+        "AND t.hostname_at_issue=? WHERE u.kind='machine' AND u.revoked_at IS NULL ORDER BY u.id", (hostname,))]
+
+
 def host_owner_machine(conn: sqlite3.Connection, hostname: str) -> bool:
     """Is there an unrevoked machine user holding a token issued on `hostname` and an owner grant? A7's
     precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`."""
@@ -3425,6 +3433,12 @@ def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:
     """A /clear: the open runs of the old session id go on under the new one. -> how many."""
     return conn.execute("UPDATE agent_runs SET session_id=? WHERE session_id=? AND ended_at IS NULL",
                         (new, old)).rowcount
+
+
+def refusal_audited_since(conn: sqlite3.Connection, actor: str, action: str, since: str) -> bool:
+    """Has `actor` been refused `action` (an audit row with `after` = {"refused": ...}, actions._refusal_after) since?"""
+    return conn.execute("SELECT 1 FROM audit_log WHERE actor=? AND action=? AND ts>=? AND after LIKE '{\"refused\":%' "
+                        "LIMIT 1", (actor, action, since)).fetchone() is not None
 
 
 def audit_of_actors(conn: sqlite3.Connection, actors: Sequence[str], since: str, until: str) -> list[Row]:
