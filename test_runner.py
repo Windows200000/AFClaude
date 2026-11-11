@@ -44,7 +44,7 @@ CFG = schedule.Config.every_day()           # 23:00 x 2 x 5 h Europe/Berlin: 21:
 START = datetime(2026, 10, 19, 21, 0, tzinfo=UTC)
 OK_LINE = json.dumps({"status": "ok", "next_due": None, "note": ""})
 OTHER_BOOT = "a" * 32
-PRELUDE = ("import sys, notify, store; notify.push = lambda t: 'test: not sent'; "
+PRELUDE = ("import sys, notify, store, host; host._kit_cache.update(at=float('inf'), info=None); notify.push = lambda t: 'test: not sent'; "
            "store.NOTIFY = lambda s, b='': 'test: not sent'; ")
 
 

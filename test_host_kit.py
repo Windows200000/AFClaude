@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Offline tests for the host kit (phase 5b K2, part 1): docker/host_exec.py's host.json, `kit-version`,
-`host-config`, the allowed roots and the output cap, host.py's kit check, and
-docker/install_host_bridge.sh against a temporary HOME (the real authorized_keys and kit are never
+"""Offline tests for the host kit (phase 5b K2): docker/host-kit/host_exec.py's host.json, `kit-version`,
+`host-config`, the allowed roots and the output cap, the reads (transcripts, sessions, doc-files) and check
+commands, host.py's kit check and gate, the legacy bridge (docker/host_exec.py: pinned, still served and
+accepted by the image until the owner's install), and docker/install_host_bridge.sh against a temporary HOME (the real authorized_keys and kit are never
 touched). Nothing here signals a process or runs claude/tmux."""
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,11 +24,11 @@ sys.path.insert(0, HERE)
 import testenv  # noqa: E402,F401  (hermetic env; before the AFClaude imports)
 import host  # noqa: E402
 
-HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")
+HOST_EXEC = os.path.join(HERE, "docker", "host-kit", "host_exec.py")
 INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
 # every kit version and its whitelist hash: a command added without a version bump fails
-# test_whitelist_hash_matches_the_version (docker/host_exec.py: HOST_KIT_VERSION, COMMANDS)
-KIT_VERSIONS = {"1": "19f410841fbc971d"}
+# test_whitelist_hash_matches_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS)
+KIT_VERSIONS = {"1": "19f410841fbc971d", "2": "2d289ec6ac9ab583"}
 SID = "abcdef01-0000-4000-8000-000000000001"
 
 
@@ -210,14 +214,19 @@ class ImageSide(unittest.TestCase):
         self.assertIn(repr(host.HOST_KIT_VERSION), str(cm.exception))
         self.assertIn("re-run the host kit install", str(cm.exception))
 
-    def test_an_old_kit_denies_the_command(self):
+    def test_the_pre_kit_bridge_is_no_kit_yet_not_an_error(self):
+        """The old bridge denies `kit-version` as "not whitelisted" (126): kit_info/check_kit -> None, which
+        the host check reports; any other failure is still an error."""
         with self.answer(rc=126, err="host_exec: denied (not whitelisted)"):
-            with self.assertRaises(host.HostKitError) as cm:
+            self.assertIsNone(host.kit_info())
+            self.assertIsNone(host.check_kit())
+        for rc, err in ((126, "host_exec: denied (host config: /x unreadable: No such file)"), (255, "ssh: refused"), (1, "")):
+            with self.answer(rc=rc, err=err), self.assertRaises(host.HostKitError, msg=(rc, err)) as cm:
                 host.kit_info()
-        self.assertIn("re-run the host kit install", str(cm.exception))
+            self.assertIn("re-run the host kit install", str(cm.exception))
 
     def test_garbage_answer(self):
-        for out in ("", "not json", "[]", '{"kit_version": 1}'):
+        for out in ("", "not json", "[]", '{"kit_version": 1}', '{"kit_version": "2"}'):
             with self.answer(out=out):
                 with self.assertRaises(host.HostKitError, msg=out):
                     host.kit_info()
@@ -394,8 +403,8 @@ class InstallScript(unittest.TestCase):
         os.chmod(self.ak, 0o600)
         # a copy of the checkout's kit sources: the script finds them next to itself
         self.src = os.path.join(self.tmp, "src")
-        os.makedirs(os.path.join(self.src, "docker"))
-        for rel in ("docker/install_host_bridge.sh", "docker/host_exec.py", "ka_resume.sh"):
+        os.makedirs(os.path.join(self.src, "docker", "host-kit"))
+        for rel in ("docker/install_host_bridge.sh", "docker/host-kit/host_exec.py", "ka_resume.sh"):
             shutil.copy(os.path.join(HERE, rel), os.path.join(self.src, rel))
         self.share = os.path.join(self.home, ".local", "share", "afclaude")
 
@@ -413,7 +422,7 @@ class InstallScript(unittest.TestCase):
             return fh.read().strip()
 
     def patch_kit(self, old, new):
-        path = os.path.join(self.src, "docker", "host_exec.py")
+        path = os.path.join(self.src, "docker", "host-kit", "host_exec.py")
         with open(path) as fh:
             text = fh.read()
         self.assertIn(old, text)
@@ -507,7 +516,7 @@ class InstallScript(unittest.TestCase):
 
     def test_same_version_with_other_files_is_refused(self):
         self.assertEqual(self.run_install().returncode, 0)
-        with open(os.path.join(self.src, "docker", "host_exec.py"), "a") as fh:
+        with open(os.path.join(self.src, "docker", "host-kit", "host_exec.py"), "a") as fh:
             fh.write("# changed without a version bump\n")
         r = self.run_install()
         self.assertEqual(r.returncode, 1)
@@ -534,7 +543,7 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "1"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "2"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
@@ -549,6 +558,465 @@ class InstallScript(unittest.TestCase):
         self.assertIn("back as they were", r.stderr)
         self.assertEqual(self.lines(), before_lines)
         self.assertEqual(os.readlink(os.path.join(self.share, "host-kit", "current")), before_link)
+
+
+LEGACY_EXEC = os.path.join(HERE, "docker", "host_exec.py")
+# sha256 of docker/host_exec.py as main has it: the owner's live authorized_keys line runs THAT file from the
+# main checkout, so merging a change of it would replace the live bridge at once, before any install. It is
+# removed only after the owner removed the old line (docs/phase5b_plan.md K2).
+LEGACY_SHA256 = "7c2e2e1e834a6bb1d3cfbde63b4d9cd9ac4eac1fb5752407a3ce93f5375ecc39"
+KIT_ONLY = [["kit-version"], ["host-config", "get"], ["host-config", "set", "repo", "/x"], ["tmux-check"], ["df"],
+            ["clock"], ["sessions", "default"], ["transcripts", "default", "--changed-since", "0"],
+            ["doc-files", "read", "/x", "PROGRESS.md"], ["claude", "auth", "status"], ["claude", "doctor"]]
+
+
+def run_legacy(command):
+    env = dict(os.environ, SSH_ORIGINAL_COMMAND=command, AFCLAUDE_HOST_EXEC_LOG=os.devnull)
+    return subprocess.run([sys.executable, LEGACY_EXEC], input=b"", env=env, capture_output=True, timeout=60)
+
+
+class LegacyBridge(unittest.TestCase):
+    """The live bridge is docker/host_exec.py of the main checkout (the owner's authorized_keys line): it stays
+    as it is until the kit is installed, and the image works with it."""
+
+    def legacy_state(self):
+        return mock.patch.dict(host._kit_cache, {"at": float("inf"), "info": None})
+
+    def test_the_legacy_file_is_the_one_main_has(self):
+        with open(LEGACY_EXEC, "rb") as fh:
+            self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), LEGACY_SHA256,
+                             "docker/host_exec.py is the live bridge until the owner's install: do not edit it "
+                             "(the kit's source is docker/host-kit/host_exec.py)")
+
+    def test_the_kit_source_is_another_file(self):
+        with open(HOST_EXEC, "rb") as a, open(LEGACY_EXEC, "rb") as b:
+            self.assertNotEqual(a.read(), b.read())
+
+    def test_legacy_heads_are_what_the_file_dispatches(self):
+        with open(LEGACY_EXEC) as fh:
+            heads = set(re.findall(r'head == "([^"]+)"', fh.read())) | {"ka_resume.sh"}
+        self.assertEqual(heads, set(host.LEGACY_HEADS))
+
+    def test_a_new_kit_command_is_known_to_the_gate(self):
+        he = load_he(os.devnull)
+        self.assertEqual(set(he.COMMANDS) - host.LEGACY_HEADS,
+                         {"kit-version", "host-config", "transcripts", "sessions", "doc-files", "tmux-check", "df",
+                          "clock"}, "a new kit command: the image must not send it to the pre-kit bridge (host.needs_kit)")
+
+    def test_the_runner_shapes_are_accepted_by_the_legacy_bridge_and_the_gate(self):
+        shapes = ([["tmux", verb, *rest] for verb, rest in (
+            ("has-session", ["-t", "=afc-00000000"]), ("list-panes", ["-s", "-t", "=afc-00000000", "-F", "#{pane_pid}"]),
+            ("list-clients", ["-t", "=afc-00000000", "-F", "#{client_activity}"]),
+            ("capture-pane", ["-e", "-p", "-t", "=afc-00000000:"]), ("kill-session", ["-t", "=afc-00000000"]),
+            ("rename-session", ["-t", "=afc-00000000", "afc-00000001"]))] + [["proc-snapshot"]])
+        with self.legacy_state():
+            for argv in shapes:
+                remote = host.bridge_argv(argv)
+                host.gate_command(remote)                                   # no error: the image sends it
+                self.assertNotEqual(run_legacy(shlex.join(remote)).returncode, 126, remote)
+            # the shapes that are only checked (a real claude / launch would start): the legacy file's own checks
+            spec = importlib.util.spec_from_file_location("host_exec_legacy", LEGACY_EXEC)
+            legacy = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(os.environ, {"AFCLAUDE_HOST_EXEC_LOG": os.devnull}):
+                spec.loader.exec_module(legacy)
+            ka = ["--session", SID, "--tmux", "afc-abcdef01", "--message", "go", "--cwd", legacy.ROOT, "--name", "t",
+                  "--model", "claude-opus-5-5", "--effort", "high", "--new", "--no-remote-control"]
+            legacy.check_ka_resume(ka)
+            for argv in (["ka_resume.sh", *ka], ["claude", "agents", "--json"], ["claude", "agents", "--json", "--all"],
+                         ["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
+                         ["claude", "-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json"],
+                         ["claude", "stop", "0123abcd"], ["kill-claude", "1"], ["claude-env", "1"], ["usage-cache"],
+                         ["append-note", "ALERTS.md"], ["rc-send", "work-a1"]):
+                host.gate_command(host.bridge_argv(argv))
+
+    def test_kit_only_shapes_are_refused_by_the_legacy_bridge_and_never_sent(self):
+        with self.legacy_state():
+            for argv in KIT_ONLY:
+                remote = host.bridge_argv(argv)
+                r = run_legacy(shlex.join(remote))
+                self.assertEqual(r.returncode, 126, remote)
+                self.assertIn(b"not whitelisted", r.stderr)
+                if remote != ["kit-version"]:                      # the one command that asks which bridge this is
+                    with self.assertRaises(host.HostKitError, msg=remote) as cm:
+                        host.gate_command(remote)
+                    self.assertIn("not installed yet", str(cm.exception))
+            with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
+                    mock.patch.object(host.subprocess, "run") as run, self.assertRaises(host.HostKitError):
+                host.run_on_host(["claude", "doctor"])
+            run.assert_not_called()                               # refused before ssh
+
+    def test_kit_version_itself_is_never_gated(self):
+        with self.legacy_state():
+            host.gate_command(["kit-version"])
+
+
+class KitGate(unittest.TestCase):
+    """The image refuses a command the installed kit does not list; a kit that cannot be asked does not hide
+    the command's own failure."""
+
+    def setUp(self):
+        self.addCleanup(host._kit_cache.update, dict(host._kit_cache))
+        self.addCleanup(host._host_repo.update, dict(host._host_repo))
+        host._host_repo["path"] = None
+
+    def installed(self, commands, version=None):
+        host._kit_cache.update(at=time.monotonic(), info={"kit_version": version or host.HOST_KIT_VERSION,
+                                                            "whitelist_hash": "x", "commands": list(commands)})
+
+    def test_a_command_the_kit_does_not_list_is_refused(self):
+        self.installed(["tmux-has", "claude"])
+        host.gate_command(["tmux-has", "afc-a"])
+        host.gate_command(["claude", "agents", "--json"])
+        with self.assertRaises(host.HostKitError) as cm:
+            host.gate_command(["df"])
+        self.assertIn("does not list 'df'", str(cm.exception))
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), \
+                mock.patch.object(host.subprocess, "run") as run, self.assertRaises(host.HostKitError):
+            host.run_on_host(["proc-snapshot"])
+        run.assert_not_called()
+
+    def test_every_command_of_this_version_passes_the_gate(self):
+        he = load_he(os.devnull)
+        self.installed(he.COMMANDS)
+        for argv in KIT_ONLY:
+            host.gate_command(host.bridge_argv(argv))
+
+    def test_kit_state_is_cached_and_the_legacy_answer_is_asked_again(self):
+        host._kit_cache.update(at=None, info=None)
+        with mock.patch.object(host, "kit_info", return_value=None) as ki, mock.patch("sys.stderr") as err:
+            host.kit_state()
+            host.kit_state()
+            self.assertEqual(ki.call_count, 1)
+            self.assertIn("no host kit installed yet", "".join(c.args[0] for c in err.write.call_args_list))
+            host._kit_cache["at"] = time.monotonic() - host.KIT_RECHECK - 1
+            host.kit_state()
+            self.assertEqual(ki.call_count, 2)
+        info = {"kit_version": "2", "commands": ["df"]}
+        host._kit_cache["at"] = time.monotonic() - host.KIT_RECHECK - 1
+        with mock.patch.object(host, "kit_info", return_value=info) as ki:
+            self.assertEqual(host.kit_state(), info)
+            host._kit_cache["at"] = time.monotonic() - 10 * host.KIT_RECHECK
+            self.assertEqual(host.kit_state(), info)           # an installed kit is not asked again
+            self.assertEqual(ki.call_count, 1)
+
+    def test_a_kit_that_cannot_be_asked_does_not_stop_the_command(self):
+        host._kit_cache.update(at=None, info=None)
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv[-1])         # ssh's last argument: the remote command line
+            return subprocess.CompletedProcess(argv, 255 if argv[-1] == "kit-version" else 0, "", "")
+
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}), mock.patch.object(host.subprocess, "run", fake_run):
+            r = host.run_on_host(["tmux", "has-session", "-t", "=afc-a"])
+        self.assertEqual(calls, ["kit-version", "tmux-has afc-a"])
+        self.assertEqual(r.returncode, 0)
+
+    def test_repo_dir_is_the_kits_host_json_and_the_env_is_ignored(self):
+        self.installed(["host-config"])
+        out = json.dumps({"format": 1, "roots": ["/w"], "repo": "/srv/kit-repo/", "claude": "/c"})
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other"}), \
+                mock.patch.object(host, "run_on_host", return_value=subprocess.CompletedProcess([], 0, out, "")) as run, \
+                mock.patch("sys.stderr") as err:
+            self.assertEqual(host.repo_dir(), "/srv/kit-repo")
+            self.assertEqual(host.repo_dir(), "/srv/kit-repo")
+        run.assert_called_once_with(["host-config", "get"], timeout=30)       # once per process
+        self.assertIn("differs from the host kit's repo", "".join(c.args[0] for c in err.write.call_args_list))
+
+    def test_repo_dir_falls_back_to_the_env_only_while_no_kit_is_installed(self):
+        host._kit_cache.update(at=float("inf"), info=None)
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other/"}):
+            self.assertEqual(host.repo_dir(), "/srv/other")
+        for bad in ("", "relative"):
+            with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": bad}), \
+                    self.assertRaises(host.HostRepoError):
+                host.repo_dir()
+
+    def test_repo_dir_errors_when_the_kit_cannot_be_asked_or_answers_wrongly(self):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_HOST_REPO": "/srv/other"}):
+            host._kit_cache.update(at=None, info=None)
+            with mock.patch.object(host.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "", "no")), \
+                    self.assertRaises(host.HostKitError):           # bridge down: no guess from the env
+                host.repo_dir()
+            self.installed(["host-config"])
+            for rc, out in ((1, ""), (0, "nope"), (0, "{}"), (0, '{"repo": "rel"}')):
+                with mock.patch.object(host, "run_on_host", return_value=subprocess.CompletedProcess([], rc, out, "")), \
+                        self.assertRaises(host.HostKitError, msg=(rc, out)):
+                    host.repo_dir()
+        self.assertIsNone(host._host_repo["path"])
+
+
+class KitReads(TempDir):
+    """transcripts, sessions, doc-files read, the check commands (kit version 2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.tmp, "home")
+        self.cdir = os.path.join(self.home, ".claude")
+        os.makedirs(os.path.join(self.cdir, "projects", "-w-p", "subagents"))
+        os.makedirs(os.path.join(self.cdir, "sessions"))
+        self.he = load_he(self.hj, home=self.home)
+
+    def tx(self, name, entries, mtime=None, raw=None):
+        path = os.path.join(self.cdir, "projects", "-w-p", name)
+        with open(path, "w") as fh:
+            fh.write(raw if raw is not None else "".join(json.dumps(e) + "\n" for e in entries))
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def call(self, cmd, **kw):
+        r = run_exec(cmd, self.hj, home=self.home, **kw)
+        return r
+
+    def ok_json(self, cmd, **kw):
+        r = self.call(cmd, **kw)
+        self.assertEqual(r.returncode, 0, (cmd, r.stderr))
+        return json.loads(r.stdout)
+
+    def user(self, text, ts="2026-11-01T10:00:00Z", **kw):
+        return dict({"type": "user", "timestamp": ts, "uuid": "u-" + text,
+                     "message": {"role": "user", "content": text}}, **kw)
+
+    # ---- transcripts
+
+    def test_transcripts_filter_projection_and_recursion(self):
+        big = "x" * 5000
+        self.tx("old.jsonl", [self.user("old")], mtime=1000)
+        self.tx("new.jsonl", [self.user("first"), {"type": "assistant", "timestamp": "t2", "isApiErrorMessage": True,
+                                                   "message": {"model": "<synthetic>", "content": [
+                                                       {"type": "text", "text": "limit " + big},
+                                                       {"type": "tool_use", "id": "t", "input": {"big": big}}]}},
+                                self.user("last", isCompactSummary=True, extra="dropped")], mtime=5000)
+        sub = os.path.join(self.cdir, "projects", "-w-p", "subagents", "agent-1.jsonl")
+        with open(sub, "w") as fh:
+            fh.write(json.dumps(self.user("sub")) + "\n")
+        os.utime(sub, (6000, 6000))
+        self.tx("notes.txt", [], raw="no")
+        os.symlink(os.path.join(self.cdir, "projects", "-w-p", "new.jsonl"), os.path.join(self.cdir, "projects", "-w-p", "link.jsonl"))
+        out = self.ok_json("transcripts default --changed-since 2000 --head 1 --tail 2")
+        self.assertFalse(out["truncated"])
+        self.assertEqual([f["path"] for f in out["files"]], ["-w-p/new.jsonl", "-w-p/subagents/agent-1.jsonl"])
+        new = out["files"][0]
+        self.assertEqual((new["size"], new["mtime"], new["tail_complete"], new["bad_lines"]),
+                         (os.path.getsize(os.path.join(self.cdir, "projects", "-w-p", "new.jsonl")), 5000.0, True, 0))
+        self.assertEqual([e["uuid"] for e in new["head"]], ["u-first"])
+        self.assertEqual([e.get("uuid") for e in new["tail"]], [None, "u-last"])
+        self.assertEqual(new["tail"][0], {"type": "assistant", "timestamp": "t2", "isApiErrorMessage": True,
+                                          "model": "<synthetic>", "text": "limit " + big[:294], "tool_result": False})
+        self.assertEqual(new["tail"][1], {"type": "user", "timestamp": "2026-11-01T10:00:00Z", "uuid": "u-last",
+                                          "isCompactSummary": True, "text": "last"})
+        self.assertEqual(len(self.call("transcripts default --changed-since 0").stdout), len(self.call(
+            "transcripts default --changed-since 0 --head 1 --tail 5").stdout))        # the defaults: 1 and 5
+        self.assertEqual(len(self.ok_json("transcripts default --changed-since 0")["files"]), 3)
+
+    def test_a_half_written_last_line_is_counted_not_dropped_silently(self):
+        self.tx("a.jsonl", [], raw=json.dumps(self.user("one")) + '\n{"type": "assis')
+        f = self.ok_json("transcripts default --changed-since 0")["files"][0]
+        self.assertEqual((len(f["tail"]), f["bad_lines"]), (1, 1))
+
+    def test_a_cap_is_a_truncated_flag_never_a_silent_cut(self):
+        for i in range(3):
+            self.tx(f"f{i}.jsonl", [self.user(str(i))])
+        self.he.TX_MAX_FILES = 2
+        out = json.loads(self.he.transcripts_json(["default", "--changed-since", "0"]))
+        self.assertTrue(out["truncated"])
+        self.assertEqual(len(out["files"]), 2)
+        self.he.TX_MAX_FILES = 2000
+        self.tx("long.jsonl", [self.user("y" * 3000 + str(i)) for i in range(20)])
+        self.he.TX_TAIL_READ = 256 * 1024          # one block: the file is smaller, so complete
+        self.assertFalse(json.loads(self.he.transcripts_json(["default", "--changed-since", "0"]))["truncated"])
+        self.tx("huge.jsonl", [], raw=("z" * 400_000 + "\n") * 3)
+        self.he.TX_TAIL_READ = 256 * 1024
+        out = json.loads(self.he.transcripts_json(["default", "--changed-since", "0", "--tail", "3"]))
+        self.assertTrue(out["truncated"])
+        self.assertFalse([f for f in out["files"] if f["path"].endswith("huge.jsonl")][0]["tail_complete"])
+
+    def test_the_tail_of_a_big_file_is_read_from_the_end(self):
+        entries = [self.user(f"m{i}" + "p" * 2000) for i in range(2000)]      # ~4.6 MB
+        self.tx("big.jsonl", entries)
+        f = self.ok_json("transcripts default --changed-since 0 --head 2 --tail 3")["files"][0]
+        self.assertEqual([e["uuid"][:7] for e in f["tail"]], ["u-m1997", "u-m1998", "u-m1999"])
+        self.assertEqual([e["uuid"][:5] for e in f["head"]], ["u-m0p", "u-m1p"])
+        self.assertTrue(f["tail_complete"])
+
+    def test_config_dir_ids(self):
+        other = os.path.join(self.tmp, "cfg2")
+        os.makedirs(os.path.join(other, "projects"))
+        write_json(self.hj, good_config(self.root, config_dirs={"work-2": other}))
+        self.assertEqual(self.ok_json("transcripts work-2 --changed-since 0")["files"], [])
+        self.assertEqual(self.ok_json("sessions work-2")["files"], [])
+        he = load_he(self.hj, home=self.home)
+        self.assertEqual(he.cfg().config_dirs, (("work-2", other),))
+        self.assertEqual(json.loads(he.config_text(he.cfg()))["config_dirs"], {"work-2": other})
+        for cmd in ("transcripts nope --changed-since 0", "sessions nope", "sessions ../x", "sessions Default",
+                    "transcripts /etc --changed-since 0", "sessions default extra"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+        for bad in ({"default": other}, {"X": other}, {"a": "rel"}, {"a": other + "/"}, ["a"]):
+            write_json(self.hj, good_config(self.root, config_dirs=bad))
+            self.assertEqual(self.call("kit-version").returncode, 126, bad)
+
+    def test_transcripts_near_misses(self):
+        for cmd in ("transcripts", "transcripts default", "transcripts default --changed-since",
+                    "transcripts default --changed-since abc", "transcripts default --changed-since -1",
+                    "transcripts default --changed-since 0 --head", "transcripts default --changed-since 0 --head x",
+                    "transcripts default --changed-since 0 --head 21", "transcripts default --changed-since 0 --since 1",
+                    "transcripts default --changed-since 0 --tail 1 extra", "transcripts default --changed-since 1e99",
+                    "transcripts default --changed-since nan"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+
+    # ---- sessions
+
+    def test_sessions(self):
+        d = os.path.join(self.cdir, "sessions")
+        write_json(os.path.join(d, "123.json"), {"pid": 123, "name": "work-a1", "status": "idle"}, 0o644)
+        write_json(os.path.join(d, "456.json"), "{half", 0o644)
+        write_json(os.path.join(d, "x.txt"), "ignored", 0o644)
+        os.symlink("/etc/passwd", os.path.join(d, "link.json"))
+        out = self.ok_json("sessions default")
+        self.assertFalse(out["truncated"])
+        by = {f["file"]: f for f in out["files"]}
+        self.assertEqual(set(by), {"123.json", "456.json", "link.json"})
+        self.assertEqual(by["123.json"]["data"], {"pid": 123, "name": "work-a1", "status": "idle"})
+        self.assertIn("unreadable", by["456.json"]["error"])            # reported, not skipped
+        self.assertIn("not a small regular file", by["link.json"]["error"])
+        self.he.SESSIONS_MAX = 1
+        self.assertTrue(json.loads(self.he.sessions_json(["default"]))["truncated"])
+
+    # ---- doc-files
+
+    def test_doc_files(self):
+        proj = os.path.join(self.root, "proj")
+        os.mkdir(proj)
+        for name, text in (("PROGRESS.md", "p ä\n"), ("GOALS.md", "g\n")):
+            with open(os.path.join(proj, name), "w") as fh:
+                fh.write(text)
+        out = self.ok_json(f"doc-files read {proj} PROGRESS.md GOALS.md EXCEPTIONS.md")
+        self.assertEqual(out, {"PROGRESS.md": "p ä\n", "GOALS.md": "g\n", "EXCEPTIONS.md": None})
+        self.assertEqual(self.ok_json(f"doc-files read {self.root}/proj/../proj GOALS.md"), {"GOALS.md": "g\n"})
+
+    def test_doc_files_refusals(self):
+        proj = os.path.join(self.root, "proj")
+        os.mkdir(proj)
+        secret = os.path.join(self.tmp, "secret.md")
+        with open(secret, "w") as fh:
+            fh.write("s")
+        os.symlink(secret, os.path.join(proj, "GOALS.md"))                    # a symlinked file
+        os.symlink(self.tmp, os.path.join(self.root, "escape"))              # a symlinked directory
+        with open(os.path.join(proj, "DECISIONS.md"), "wb") as fh:
+            fh.write(b"\xff\xfe")
+        for cmd in (f"doc-files read {proj} GOALS.md", f"doc-files read {proj} DECISIONS.md",
+                    f"doc-files read {self.root}/escape PROGRESS.md", f"doc-files read {self.tmp} PROGRESS.md",
+                    "doc-files read /etc PROGRESS.md", "doc-files read relative PROGRESS.md",
+                    f"doc-files read {proj} README.md", f"doc-files read {proj} ../x", f"doc-files read {proj}",
+                    f"doc-files read {proj} PROGRESS.md PROGRESS.md", f"doc-files write {proj} PROGRESS.md",
+                    "doc-files read", f"doc-files read {proj}/PROGRESS.md PROGRESS.md"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+        os.unlink(os.path.join(proj, "DECISIONS.md"))
+        os.mkdir(os.path.join(proj, "DECISIONS.md"))                          # a directory by that name
+        self.assertEqual(self.call(f"doc-files read {proj} DECISIONS.md").returncode, 126)
+        self.he.DOC_MAX = 3
+        with open(os.path.join(proj, "PROGRESS.md"), "w") as fh:
+            fh.write("abcd")
+        with self.assertRaises(SystemExit):
+            self.he.doc_files_json(["read", proj, "PROGRESS.md"])
+
+    def test_the_repo_may_be_read_even_outside_the_roots(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.mkdir(repo)
+        with open(os.path.join(repo, "PROGRESS.md"), "w") as fh:
+            fh.write("x")
+        write_json(self.hj, good_config(self.root, repo=repo))
+        self.assertEqual(self.ok_json(f"doc-files read {repo} PROGRESS.md"), {"PROGRESS.md": "x"})
+        self.assertEqual(self.call(f"doc-files read {repo}/data PROGRESS.md").returncode, 126)
+
+    # ---- the check commands
+
+    def test_df_and_clock(self):
+        out = self.ok_json("df")
+        self.assertEqual(set(out), {"claude_dir", "repo"})
+        self.assertEqual(out["repo"]["path"], HERE)
+        for v in out.values():
+            self.assertGreater(v["total_bytes"], v["free_bytes"] - 1)
+        before = int(time.time() * 1000)
+        self.assertLess(abs(self.ok_json("clock")["epoch_ms"] - before), 60_000)
+        for cmd in ("df -h", "df /", "clock now", "clock --utc"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+
+    def test_claude_auth_status_and_doctor_run_the_configured_binary(self):
+        stub = os.path.join(self.tmp, "claude-stub")
+        write_json(stub, '#!/bin/sh\necho "args: $*"\n', 0o755)
+        write_json(self.hj, good_config(self.root, claude=stub))
+        for cmd, want in (("claude auth status", b"args: auth status\n"), ("claude doctor", b"args: doctor\n")):
+            r = self.call(cmd)
+            self.assertEqual((r.returncode, r.stdout), (0, want), r.stderr)
+        for cmd in ("claude auth", "claude auth login", "claude auth status --json", "claude auth logout",
+                    "claude doctor --fix", "claude doctor x", "claude config", "claude mcp list"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+
+    def test_check_commands_have_a_timeout(self):
+        stub = os.path.join(self.tmp, "claude-stub")
+        write_json(stub, "#!/bin/sh\nsleep 30\n", 0o755)
+        write_json(self.hj, good_config(self.root, claude=stub))
+        he = load_he(self.hj, home=self.home)
+        he.CHECK_TIMEOUT = 1
+        with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "claude doctor"}), mock.patch("sys.stderr"):
+            self.assertEqual(he.main(), 124)
+
+    def test_tmux_check_creates_sees_and_kills_the_session(self):
+        he = self.he
+        calls = []
+
+        def fake(rc_new=0, rc_has=(1, 0), rc_kill=0):
+            has = iter(rc_has)
+
+            def run(argv, **kw):
+                calls.append(argv[1:])
+                rc = {"has-session": lambda: next(has), "new-session": lambda: rc_new,
+                      "kill-session": lambda: rc_kill}[argv[1]]()
+                return subprocess.CompletedProcess(argv, rc, "", "boom")
+            return run
+
+        out = io.StringIO()
+        with mock.patch.object(he.subprocess, "run", fake()), mock.patch("sys.stdout", out):
+            self.assertEqual(he.tmux_check(), 0)
+        self.assertEqual(out.getvalue(), "ok\n")
+        self.assertEqual([c[0] for c in calls], ["has-session", "new-session", "has-session", "kill-session"])
+        self.assertEqual(calls[0], ["has-session", "-t", "=afc-check"])
+        for kw in ({"rc_new": 1, "rc_has": (1,)}, {"rc_has": (1, 1)}, {"rc_kill": 1}):
+            calls.clear()
+            with mock.patch.object(he.subprocess, "run", fake(**kw)), mock.patch("sys.stderr") as err:
+                self.assertEqual(he.tmux_check(), 1, kw)
+            self.assertIn("tmux-check failed", "".join(c.args[0] for c in err.write.call_args_list))
+        calls.clear()                                                         # a leftover session is killed first
+        with mock.patch.object(he.subprocess, "run", fake(rc_has=(0, 0))), mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(he.tmux_check(), 0)
+        self.assertEqual([c[0] for c in calls], ["has-session", "kill-session", "new-session", "has-session", "kill-session"])
+        for cmd in ("tmux-check afc-x", "tmux-check now"):
+            self.assertEqual(self.call(cmd).returncode, 126, cmd)
+
+    def test_every_new_bridge_shape_is_built_by_host_py_and_accepted_by_the_kit(self):
+        proj = os.path.join(self.root, "proj")
+        os.mkdir(proj)
+        for argv in (["sessions", "default"], ["transcripts", "default", "--changed-since", "1700000000.5"],
+                     ["transcripts", "default", "--changed-since", "0", "--head", "2", "--tail", "9"],
+                     ["transcripts", "default", "--changed-since", "0", "--tail", "9", "--head", "0"],
+                     ["doc-files", "read", proj, "PROGRESS.md", "GOALS.md"], ["df"], ["clock"]):
+            r = self.call(shlex.join(host.bridge_argv(argv)))
+            self.assertEqual(r.returncode, 0, (argv, r.stderr))
+        for argv in (["claude", "auth", "status"], ["claude", "doctor"]):
+            self.assertEqual(host.bridge_argv(argv), argv)
+        for argv in (["sessions"], ["sessions", "A"], ["sessions", "a", "b"], ["transcripts", "default"],
+                     ["transcripts", "default", "--changed-since", "x"],
+                     ["transcripts", "default", "--changed-since", "0", "--head"],
+                     ["transcripts", "default", "--changed-since", "0", "--head", "1", "--head", "2"],
+                     ["transcripts", "default", "--changed-since", "0", "--bogus", "1"],
+                     ["doc-files", "read", proj], ["doc-files", "read", "rel", "GOALS.md"],
+                     ["doc-files", "read", proj, "README.md"], ["doc-files", "write", proj, "GOALS.md"],
+                     ["doc-files", "read", proj, "GOALS.md", "GOALS.md"], ["df", "-h"], ["clock", "x"],
+                     ["tmux-check", "x"]):
+            with self.assertRaises(ValueError, msg=argv):
+                host.bridge_argv(argv)
 
 
 if __name__ == "__main__":

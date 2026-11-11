@@ -31,6 +31,11 @@ with open(os.open(HOST_JSON, os.O_WRONLY | os.O_CREAT, 0o600), "w") as _fh:
     json.dump({"format": 1, "roots": [HOST_ROOT], "repo": HERE, "claude": os.path.expanduser("~/.local/bin/claude")}, _fh)
 os.environ["AFCLAUDE_HOST_JSON"] = HOST_JSON
 os.environ["AFCLAUDE_HOST_REPO"] = HERE   # in the image host.repo_dir() reads it: the tests' checkout is "the host repo"
+import host  # noqa: E402  (after the env above)
+# no bridge in the tests: a suite that sets AFCLAUDE_IN_CONTAINER finds "no host kit installed yet" (the pre-kit
+# bridge, for good: `at` far in the future), so repo_dir() reads AFCLAUDE_HOST_REPO and the command gate lets
+# the shapes the old bridge knows through; test_host_kit resets this cache for the tests of the kit state itself
+host._kit_cache.update(at=float("inf"), info=None)
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
 for _v in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "AFCLAUDE_AGENT_ID", "AFCLAUDE_MACHINE_TOKEN"):
     os.environ.pop(_v, None)   # a session running the tests is not "the caller" in them: identity.py reads these

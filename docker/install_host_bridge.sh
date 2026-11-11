@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run by the USER (not by Claude; D-121): installs the AFClaude host kit and the SSH bridge to it, so the
-# manager container can ask this host to run a small whitelist of commands (docker/host_exec.py).
+# manager container can ask this host to run a small whitelist of commands (docker/host-kit/host_exec.py).
 #
 #   docker/install_host_bridge.sh --root DIR [--root DIR ...] [--data DIR] [--from CIDR] [--claude FILE]
 #     --root    an allowed root (a launch's cwd must be inside one); at least one; only used when
@@ -48,7 +48,7 @@ command -v python3 >/dev/null || die "python3 is needed"
 command -v ssh-keygen >/dev/null || die "ssh-keygen is needed"
 
 BASE="$SHARE/afclaude"; KITS="$BASE/host-kit"; HOSTJSON="$BASE/host.json"
-SRC_EXEC="$DIR/host_exec.py"; SRC_KA="$REPO/ka_resume.sh"
+SRC_EXEC="$DIR/host-kit/host_exec.py"; SRC_KA="$REPO/ka_resume.sh"
 [ -f "$SRC_EXEC" ] && [ -f "$SRC_KA" ] || die "kit sources not found ($SRC_EXEC, $SRC_KA)"
 VERSION="$(python3 "$SRC_EXEC" --print-version)"
 [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || die "bad kit version '$VERSION'"
@@ -74,7 +74,7 @@ selftest() {   # $1: a kit directory; host_exec.py exactly as sshd runs it: SSH_
 mkdir -p "$KITS"; chmod 700 "$BASE" "$KITS"
 if [ -d "$VDIR" ]; then
   cmp -s "$SRC_EXEC" "$VDIR/host_exec.py" && cmp -s "$SRC_KA" "$VDIR/ka_resume.sh" \
-    || die "kit version $VERSION is installed with different files: bump HOST_KIT_VERSION in docker/host_exec.py (a new whitelist command or a changed shape is a new version)"
+    || die "kit version $VERSION is installed with different files: bump HOST_KIT_VERSION in docker/host-kit/host_exec.py (a new whitelist command or a changed shape is a new version)"
   echo "kit version $VERSION already installed: $VDIR"
 else
   STAGE="$(mktemp -d "$KITS/.stage.XXXXXX")"
@@ -134,7 +134,7 @@ echo "  authorized_keys line: OK"
 echo
 echo "host kit $VERSION installed: $VDIR (current -> $VERSION)"
 echo "  authorized_keys: $AK (backup of the state before: $AK_SAVED)"
-echo "  bridge key for the container: $KEY (the container's compose mounts it from the data dir)"
+echo "  bridge key for the container: $KEY (compose still mounts the old key until the deploy that switches it)"
 OLD="$(grep -c ' afclaude-host-bridge$' "$AK" || true)"
 if [ "$OLD" != 0 ]; then
   echo

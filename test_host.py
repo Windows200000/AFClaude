@@ -42,7 +42,7 @@ def tearDownModule():
     budget.SAMPLES_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
-HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")
+HOST_EXEC = os.path.join(HERE, "docker", "host-kit", "host_exec.py")
 
 
 class Env:
