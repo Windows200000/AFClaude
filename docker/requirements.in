@@ -1,0 +1,2 @@
+# Direct dependencies of the image; docker/requirements.txt is compiled from this (hashes).
+mcp==2.2.0

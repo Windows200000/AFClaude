@@ -79,6 +79,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 if TYPE_CHECKING:
     import store   # the DB parts import it when called: the senders' import stays file-only
 
@@ -649,9 +650,9 @@ def tool_vars(repo: Optional[str] = None) -> dict[str, str]:
     tools: the prefix of a command (`python3 {tools}keepalive.py`): empty in this checkout's root,
     where the commands run as typed (what AFClaude's rules always said), else the install
     directory and a slash, so another project's task-manager can run them from its own."""
-    here = os.path.realpath(HERE)
+    here = os.path.realpath(host.repo_dir())    # the host path: sessions run there (the code itself is at /app)
     own = repo is None or os.path.realpath(repo) == here
-    return {"afclaude_dir": HERE, "tools": "" if own else here + "/"}
+    return {"afclaude_dir": host.repo_dir(), "tools": "" if own else here + "/"}
 
 
 def project_values_at(conn: sqlite3.Connection, repo: Optional[str] = None) -> dict[str, str]:
@@ -660,10 +661,10 @@ def project_values_at(conn: sqlite3.Connection, repo: Optional[str] = None) -> d
     checkout must have every CHECKOUT_SEED row (the migrate step wrote them): otherwise its
     rules would go out without its own lines, so NotMigrated (D-235)."""
     import store
-    p = store.get_project(conn, os.path.abspath(repo or HERE), nearest=True)
+    p = store.get_project(conn, os.path.abspath(repo or host.repo_dir()), nearest=True)
     if p is None:
         return {k: v.default for k, v in PROJECT_VARS.items()}
-    if os.path.realpath(p["path"]) == os.path.realpath(HERE):
+    if os.path.realpath(p["path"]) == os.path.realpath(host.repo_dir()):
         missing = sorted(set(CHECKOUT_SEED) - {r["name"] for r in store.list_prompt_vars(conn, p["id"])})
         if missing:
             raise NotMigrated(f"project {p['name']!r} (this checkout) has no value for {', '.join(missing)}: "
@@ -674,7 +675,7 @@ def project_values_at(conn: sqlite3.Connection, repo: Optional[str] = None) -> d
 def checkout_project(conn: sqlite3.Connection) -> store.Row | None:
     """The project whose path is this checkout (exactly: a worktree is not the project)."""
     import store
-    return store.get_project(conn, HERE, nearest=False)
+    return store.get_project(conn, host.repo_dir(), nearest=False)
 
 
 def migrate_plan(conn: sqlite3.Connection) -> list[dict[str, Any]]:

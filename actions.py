@@ -69,6 +69,7 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402
 import afclaude_config  # noqa: E402
 import schedule  # noqa: E402
@@ -3064,7 +3065,7 @@ def _decision_replaced(conn: sqlite3.Connection, d: Mapping[str, Any]) -> list[d
 def _question_project(conn: sqlite3.Connection, d: Mapping[str, Any]) -> str | None:
     """The project a decision's question belongs to: the entry's, else this checkout's if it is one."""
     p = store.get_project(conn, d["project_id"]) if d["project_id"] is not None \
-        else store.get_project(conn, HERE, nearest=False)
+        else store.get_project(conn, host.repo_dir(), nearest=False)
     return p["name"] if p else None
 
 

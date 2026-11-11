@@ -116,7 +116,7 @@ STATE_DIR = os.environ.get("KEEPALIVE_STATE_DIR") or os.path.dirname(runner_stat
 if not os.environ.get("KEEPALIVE_STATE_DIR"):
     runner_state.guard_tests("keepalive.STATE_DIR")
 STATE_FILE = os.path.join(STATE_DIR, "keepalive_state.json")   # names the state; the DB holds it (D-161)
-PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(HERE, "PROGRESS.md"))
+PROGRESS_FILE = os.environ.get("KEEPALIVE_PROGRESS_FILE", os.path.join(host.repo_dir(), "PROGRESS.md"))   # a host path (messages)
 KA_RESUME = os.environ.get("KEEPALIVE_KA_RESUME", os.path.join(HERE, "ka_resume.sh"))  # tests use a stub
 
 # Automation windows: schedule.py (the window_days / window_tz / session_hours settings, read on
@@ -152,7 +152,8 @@ SCRUBBED_ENV = {
     "USER": "opc",
     "LOGNAME": "opc",
     "SHELL": "/bin/bash",
-    "PATH": "/home/opc/.local/bin:/home/opc/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin",
+    "PATH": ":".join([os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.cargo/bin"),
+                      "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"]),
     "LANG": "C.UTF-8",
     "TERM": "xterm-256color",
     "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
@@ -204,10 +205,10 @@ HOOK_CONTEXT_CAP = 10000
 
 def rules_hooked(cwd):
     """True when a session in cwd gets the standing rules from the SessionStart hook: only a
-    session started in this checkout's root (where .claude/settings.json is read; the
-    container runs the code under the same path as the host repo)."""
+    session started in this checkout's root (where .claude/settings.json is read; `cwd` is a host
+    path, so it is compared with the host repo's path, not the container's /app)."""
     try:
-        return bool(cwd) and os.path.realpath(cwd) == os.path.realpath(HERE)
+        return bool(cwd) and os.path.realpath(cwd) == os.path.realpath(host.repo_dir())
     except (OSError, ValueError):
         return False
 
@@ -242,7 +243,7 @@ def session_rules_hook(part, hook_input, project_dir=None):
         text = standing_rules(part)
     except Exception as e:   # noqa: BLE001 - a hook must never fail the session start
         text = (f"[AFClaude standing rules, part {part}: could not be built ({type(e).__name__}: {e}). "
-                f"Read {os.path.join(HERE, 'prompts')}/manager.md, manager_project.md ({{session_stop_pct}} = "
+                f"Read {os.path.join(host.repo_dir(), 'prompts')}/manager.md, manager_project.md ({{session_stop_pct}} = "
                 f"the session_stop_pct setting, default 95; the other {{...}} are this project's prompt variables: "
                 f"`python3 prompts.py vars --project <its name>`), guard_respect.md and afk_rules.md now and follow them.]")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}
@@ -439,13 +440,13 @@ def usage_cache_checked():
     return u
 
 
-def refresh_usage(cwd=HERE):
+def refresh_usage(cwd=None):
     """`claude -p /usage` is a local slash command (no model call); it prints
     fresh numbers and rewrites the ~/.claude.json cache. Run it scrubbed, with
     no session persistence so it leaves no transcript behind."""
     try:
         r = host.run_on_host(["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
-                             cwd=cwd, env=SCRUBBED_ENV, timeout=120)
+                             cwd=cwd or host.repo_dir(), env=SCRUBBED_ENV, timeout=120)
         err = (r.stderr or "").strip()
         return r.returncode, r.stdout + (("\n" + err) if err else "")   # stderr too: a login error is printed there
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -481,7 +482,7 @@ def auth_ok(source, now=None):
         log(f"Claude login works again ({source}): the 'login expired' state is cleared")
 
 
-def poke_auth(cwd=HERE, now=None, verdict=None):
+def poke_auth(cwd=None, now=None, verdict=None):
     """One minimal real model request, to renew the OAuth access token. `-p /usage` is a local
     command: on 03./04.10.2026 it printed only the cost summary and refreshed nothing for
     34 h, until the first real request renewed the token (see usage_stale.py). Throttled to
@@ -498,7 +499,7 @@ def poke_auth(cwd=HERE, now=None, verdict=None):
     st["poke_at"] = now.isoformat()
     _save_usage_state(st)
     try:
-        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=cwd, env=SCRUBBED_ENV, timeout=180)
+        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=cwd or host.repo_dir(), env=SCRUBBED_ENV, timeout=180)
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
         return f"failed: {type(e).__name__}: {e}"[:200]
     found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
@@ -525,7 +526,7 @@ def _refreshed(u, before, now):
     return (before is not None and f > before) or timedelta(0) <= now - f <= REFRESH_OK_AGE
 
 
-def refresh_usage_checked(cwd=HERE, now=None):
+def refresh_usage_checked(cwd=None, now=None):
     """The ONE usage refresh with retry, used by the sampler and the watcher / window-start paths:
     /usage; if the cache did not refresh, one cheap real request (poke_auth: renews an expired
     OAuth token) and /usage again. This one retry is DELIBERATE (D-235 allows deliberate,
@@ -2029,7 +2030,7 @@ def window_ping(sid, now, key, u, why, args):
     record_window_ping(key, rec)    # claimed before the request: this start never pings twice
     log(f"window-ping {key}: no session window open, {why}: sending the ping")
     try:
-        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=HERE, env=SCRUBBED_ENV, timeout=WINDOW_PING_TIMEOUT)
+        r = host.run_on_host(POKE_ARGV, input=POKE_PROMPT, cwd=host.repo_dir(), env=SCRUBBED_ENV, timeout=WINDOW_PING_TIMEOUT)
         o = json.loads(r.stdout or "{}")
         problem = None if r.returncode == 0 and not o.get("is_error") else \
             f"rc={r.returncode} is_error={o.get('is_error')} result={str(o.get('result'))[:80]!r} " \
@@ -3197,7 +3198,7 @@ HANDOFF_REFRESHES = 3                       # a hand-off made stale by new input
 COMPACT_QUIET = timedelta(seconds=30)       # idle = transcript unchanged this long + the turn ended
 COMPACT_POLL = 10                           # seconds
 SAVE_TIMEOUT = timedelta(minutes=10)        # wait this long for the hand-off after the save prompt, then: error
-TASKS_PY = os.path.join(HERE, "tasks.py")
+TASKS_PY = os.path.join(host.repo_dir(), "tasks.py")   # a host path: named in messages to sessions
 COMPACT_GUARD = timedelta(minutes=40)       # no compaction this close before a start that types into the session
 COMPACT_LOCK_WAIT = timedelta(minutes=40)   # a start waits this long for a running compaction, then: error
 COMPACT_SESSION_RESERVE = 3.0               # session % the save turn and the first turn after the reset need (~2 %, D-238)
@@ -3246,9 +3247,10 @@ def release_lock(fh):
 
 
 def session_cwd(path):
-    """The session's last recorded cwd if it still exists (it can have been renamed/deleted), else HERE."""
-    return next((c for c in ((last_message(path) or {}).get("cwd") if path else None, HERE)
-                 if c and os.path.isdir(c)), HERE)
+    """The session's last recorded cwd (a host path) if it still exists (it can have been renamed/deleted;
+    in the container only the repo's own directory can be looked at), else the host repo."""
+    return next((c for c in ((last_message(path) or {}).get("cwd") if path else None, host.repo_dir())
+                 if c and os.path.isdir(host.local_path(c))), host.repo_dir())
 
 
 def session_idle(path, now=None):

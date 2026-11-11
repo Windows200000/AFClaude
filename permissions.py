@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
+import host
 import roles
 import store
 
@@ -106,8 +107,9 @@ class Who:
 # ---------------------------------------------------------------- the caller
 
 def afclaude_project_id(conn: sqlite3.Connection) -> Optional[int]:
-    """AFClaude's own project: the one whose path is this repository (plan §0, D-283/D-106)."""
-    here = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    """AFClaude's own project: the one whose path is this repository (plan §0, D-283/D-106). That is the
+    host checkout (`host.repo_dir()`; in the image the code is at /app, K1), as projects.path holds it."""
+    here = os.path.realpath(host.repo_dir())
     for r in conn.execute("SELECT id, path FROM projects WHERE path IS NOT NULL"):
         if os.path.realpath(os.path.expanduser(r["path"])) == here:
             return int(r["id"])

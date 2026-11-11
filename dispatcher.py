@@ -281,7 +281,7 @@ def session_cwd(conn, sid):
     path = ka.transcript_path(sid)
     cands = [(ka.last_message(path) or {}).get("cwd") if path else None,
              (store.get_session(conn, sid) or {}).get("cwd")]
-    return next((c for c in cands if c and os.path.isdir(c)), None)
+    return next((c for c in cands if c and os.path.isdir(ka.host.local_path(c))), None)
 
 
 def session_model(sid):
@@ -444,7 +444,7 @@ class Pass:
         if af:
             prog = os.path.join(cwd, "PROGRESS.md")
             msg = ka.session_message("continue", reason=reason_txt, repo=cwd, hooked=ka.rules_hooked(cwd),  # D-225
-                                     progress=prog if os.path.exists(prog) else ka.PROGRESS_FILE)
+                                     progress=prog if os.path.exists(ka.host.local_path(prog)) else ka.PROGRESS_FILE)
         else:                                         # the user's own session: neutral, on its own model
             msg = ka.session_message("continue_foreign", manager=False, reason=reason_txt, context="")
             model = session_model(sid)

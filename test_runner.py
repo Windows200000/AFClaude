@@ -1280,6 +1280,16 @@ class AtChild(unittest.TestCase):
         self.assertEqual(json.loads(p.stdout)["status"], "ok")
         self.assertIn(f"hello-{os.path.basename(self.tmp)}", self.log_text())
 
+    def test_a_job_that_names_the_host_repo_runs_in_the_code_directory(self):
+        """K1: at-jobs spooled before the code moved to /app carry the host repo's path (cmd and cwd)."""
+        fake = "/srv/not-here/AFClaude"
+        jid = self.add(f"cd {fake} && echo moved-$(basename $(pwd))\n", cwd=fake)
+        env = dict(os.environ, AFCLAUDE_IN_CONTAINER="1", AFCLAUDE_HOST_REPO=fake)
+        code = PRELUDE + "import runner_jobs as r; sys.exit(r.main(['at', '--key', sys.argv[1]]))"
+        p = subprocess.run([sys.executable, "-c", code, jid], cwd=HERE, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(f"moved-{os.path.basename(HERE)}", self.log_text())
+
     def test_a_failure_the_command_reported_exits_3(self):
         cmd = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{HERE}'); import failstop; "
                "failstop.fail('t', 'sample broke', pause=False, alert=lambda s, b='': None); sys.exit(1)\"\n")

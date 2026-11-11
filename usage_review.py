@@ -108,6 +108,7 @@ import keepalive as ka  # noqa: E402
 import runner_state  # noqa: E402  (phase 2d: the state in the DB only, D-161)
 import project_docs  # noqa: E402  (the report doc review:<date>, design §7.7)
 import telemetry  # noqa: E402  (the usage_reviews records, kind usage.review)
+import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import failstop  # noqa: E402  (D-234/D-235: a failure is an error the owner sees, automation paused)
 import nightly_tasks  # noqa: E402  (D-254: the monthly review is a task of the next nightly run)
 import prompts  # noqa: E402  (phase 4a P2: the one-off review bundles, usage_review_oneoff / stage_eta_review_oneoff)
@@ -395,7 +396,7 @@ def run_once(st, now, which, extra=None, record=None, sid=None):
     sid = sid or str(uuid.uuid4())
     ka.LAUNCH.update(model=MODEL, effort=EFFORT)
     tmux = ka.claim_tmux(sid, "review", actor="runner:usage_review")   # its readable name, stored first (3b S2)
-    rc, out, err = ka.fire(sid, HERE, msg, "resume", new=True, name=f"AFClaude {which} review (one-off) {d}",
+    rc, out, err = ka.fire(sid, host.repo_dir(), msg, "resume", new=True, name=f"AFClaude {which} review (one-off) {d}",
                            category=ka.remote_control.REVIEW,   # D-269
                            driver="auto", prompt=ONLY_BUNDLES[which], actor=ACTOR)
     ok = rc == 0 and out.strip().startswith("started")
