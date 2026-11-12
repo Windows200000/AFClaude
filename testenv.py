@@ -33,6 +33,7 @@ with open(os.open(HOST_JSON, os.O_WRONLY | os.O_CREAT, 0o600), "w") as _fh:
     json.dump({"format": 2, "roots": [HOST_ROOT], "repo": HERE, "claude": os.path.expanduser("~/.local/bin/claude"),
                "data": HOST_DATA}, _fh)
 os.environ["AFCLAUDE_HOST_JSON"] = HOST_JSON
+os.environ["AFCLAUDE_HEADLESS_CWD"] = os.path.join(DIR, "headless-cwd")   # host.headless_cwd(): never the real ~/.local/state
 os.environ["AFCLAUDE_HOST_REPO"] = HERE   # in the image host.repo_dir() reads it: the tests' checkout is "the host repo"
 import host  # noqa: E402  (after the env above)
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them

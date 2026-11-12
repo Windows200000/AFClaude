@@ -7,6 +7,8 @@
 #   ./trust_dirs.sh              # the default AFClaude folders below
 #   ./trust_dirs.sh DIR [DIR..]  # specific folders
 #
+# <repo>/data is deliberately not in the defaults: the container writes it (a .claude/settings.json
+# there would run on the host in a session started in it).
 # Only folders inside /mnt/BlockVolume/Claude (override: KA_TRUST_ROOT). Missing
 # folders are created. Writes atomically and keeps a backup (~/.claude.json.bak-trust).
 # Note: a running Claude process may later rewrite ~/.claude.json from its in-memory
@@ -16,7 +18,7 @@ set -euo pipefail
 ROOT="${KA_TRUST_ROOT:-/mnt/BlockVolume/Claude}"
 W="$ROOT/work"
 if [ $# -eq 0 ]; then
-  set -- "$W/AFClaude" "$W/AFClaude/probe" "$W/AFClaude/data" "$W/AFClaude-poc" \
+  set -- "$W/AFClaude" "$W/AFClaude/probe" "$W/AFClaude-poc" \
          "$W/spending-categorizer-report-generator" "$W/microslop-goolag-extension"
 fi
 mkdir -p "$@"

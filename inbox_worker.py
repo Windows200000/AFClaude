@@ -94,7 +94,6 @@ import usage_stale  # noqa: E402
 
 UTC = timezone.utc
 ACTOR = "runner:inbox"
-DATA = os.path.join(HERE, "data")
 TRIAGE_TIMEOUT = 120                      # seconds for the Haiku call
 TRIAGE_RETRY_MARGIN = timedelta(minutes=2)  # a triage held at a usage limit is tried again this long after its reset
 LIMIT_KINDS = ("session", "weekly", "")     # the usage limits a triage waits for ("": a plain "hit your limit")
@@ -177,7 +176,7 @@ def triage_call(text: str) -> dict[str, Any]:
     """One Haiku call -> inbox.parse_triage's dict; a failed call raises inbox.TriageError, one
     refused at a usage limit inbox.TriageLimit (limit_notice)."""
     try:
-        r = host.run_on_host(ka.POKE_ARGV, input=inbox.triage_prompt(text), cwd=DATA, env=ka.SCRUBBED_ENV,
+        r = host.run_on_host(ka.POKE_ARGV, input=inbox.triage_prompt(text), cwd=host.headless_cwd(), env=ka.SCRUBBED_ENV,
                              timeout=TRIAGE_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise inbox.TriageError(f"claude -p timed out after {TRIAGE_TIMEOUT} s") from None

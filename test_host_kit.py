@@ -882,7 +882,7 @@ LEGACY_EXEC = os.path.join(HERE, "docker", "host_exec.py")
 # sha256 of docker/host_exec.py as main has it: the owner's live authorized_keys line runs THAT file from the
 # main checkout, so merging a change of it would replace the live bridge at once, before any install. It is
 # removed only after the owner removed the old line (docs/phase5b_plan.md K2).
-LEGACY_SHA256 = "7c2e2e1e834a6bb1d3cfbde63b4d9cd9ac4eac1fb5752407a3ce93f5375ecc39"
+LEGACY_SHA256 = "d1100bc77eb7b695a60d1e6af2fc847fdc1da29b2b26e6fd8876be4cfe30c3e9"
 KIT_ONLY = [["kit-version"], ["host-config", "get"], ["tmux-check"], ["df"],
             ["clock"], ["sessions", "default"], ["transcripts", "default", "--changed-since", "0"],
             ["doc-files", "read", "/x", "PROGRESS.md"], ["claude", "auth", "status"], ["claude", "doctor"]]
