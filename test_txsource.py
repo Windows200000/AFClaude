@@ -304,6 +304,21 @@ class Scans(StubKit):
         self.assertEqual(st["files"], 1)
         self.assertEqual(self.calls, [])
 
+    def test_usage_sampler_scan_same_result_in_both_positions(self):
+        import usage_sampler as us
+        self.tx(f"{SID}.jsonl", [dict(entry("user", "hi", "2026-11-01T10:00:00Z"), cwd="/x/y"),
+                                 {"type": "custom-title", "customTitle": "T"}, notice("2026-11-01T10:05:00Z")])
+        self.tx("agent-a.jsonl", [entry("user", "sub", "2026-11-01T10:01:00Z")], sub=f"{SID}/subagents")
+        got = {}
+        for m in ("mount", "bridge"):
+            st = {}
+            with mock.patch.dict(os.environ, {"AFCLAUDE_READERS": m}), mock.patch.object(us, "PROJECTS", self.projects), \
+                    mock.patch.object(us, "track_driver", return_value=set()):
+                got[m] = (us.scan(st, {}), st["offsets"], st["sessions"])
+        self.assertEqual(got["mount"], got["bridge"])
+        self.assertEqual(len(got["bridge"][1]), 2)
+        self.assertEqual(got["bridge"][2][SID]["title"], "T")
+
     def test_usage_sampler_scan_listing(self):
         self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
         self.tx("agent-a.jsonl", [entry("user", "sub", "2026-11-01T10:01:00Z")], sub=f"{SID}/subagents")
