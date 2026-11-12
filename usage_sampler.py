@@ -81,7 +81,9 @@ PROJECTS = os.path.expanduser("~/.claude/projects")
 HAIKU_EVERY = timedelta(minutes=55)
 DRIVER_KEEP = timedelta(hours=24)    # per-session driver changes kept in the state (usage split §3.1)
 RECENT = timedelta(hours=6)          # sessions shown to Haiku
-OWN_CWD_MARKERS = ("/work/AFClaude", "AFClaude")
+# the last marker: the cwd of the bridge's one-shot `claude -p` calls (host.headless_cwd, which
+# replaced <repo>/data; their transcripts (rc-send) must stay "own", not count as the owner's)
+OWN_CWD_MARKERS = ("/work/AFClaude", "AFClaude", "/.local/state/afclaude/")
 # session names of AFClaude's launches: the tmux / Remote Control names (ka-<id8>; afc-..., 3b S2) and older ones
 OWN_NAME_RE = re.compile(r"^(ka-|afc-|task-manager keep-alive|guard-bypass-test|RC PoC test|"
                          r"limit continue test)", re.I)
@@ -113,7 +115,7 @@ def usage_now(t=None):
     """/usage (with the shared retry, keepalive.refresh_usage_checked) -> the row's usage dict.
     A refresh that failed raises failstop.Failed (D-234/D-235: no row from an old cache)."""
     t = t or now_utc()
-    res = ka.refresh_usage_checked(cwd=DATA, now=t)
+    res = ka.refresh_usage_checked(cwd=host.headless_cwd(), now=t)
     rc, out = res["rc"], res["out"]
     if not res.get("ok") or not res.get("usage"):
         raise failstop.Failed(ka.usage_failure_subject(res), ka.usage_failure_detail(res))
@@ -549,7 +551,7 @@ def haiku_judgement(st, t):
             r = host.run_on_host(["claude", "-p", "--model", "haiku", "--no-session-persistence",
                                   "--output-format", "json", "--tools=", "--strict-mcp-config", "--permission-mode", "dontAsk",
                                   "--disable-slash-commands"], input=prompt,
-                                 cwd=DATA, env=ka.SCRUBBED_ENV, timeout=180)
+                                 cwd=host.headless_cwd(), env=ka.SCRUBBED_ENV, timeout=180)
             found = claude_auth.detect(r.returncode, r.stdout or "", r.stderr or "")
             if found:   # D-320: an expired login is no "raw" answer: the row carries it, main fails with it
                 ka.auth_expired("Haiku usage judgement", found, t)

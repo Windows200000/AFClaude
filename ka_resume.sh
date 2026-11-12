@@ -38,6 +38,16 @@ done
 [[ "$T" =~ ^(afc-[a-z0-9-]{1,36})$ ]] ||
   { echo "need --tmux afc-<[a-z0-9-], at most 36>" >&2; exit 2; }
 NAME="${NAME:-$T}"
+# <repo>/data is the container's read-write mount: a .claude/settings.json (hooks) or CLAUDE.md
+# written there would run on the host in a session started there (review k2 H3). docker/host_exec.py
+# refuses it too (and any --cwd that is not already its own realpath); this is the same check for a
+# direct call. From here on only the resolved path is used (trust step, run script `cd -P`): a
+# `data/link/..` is read by a plain `cd` as data, and a symlink swapped in after this check is not followed.
+CWD_REAL="$(realpath -m -- "$CWD")"; DATA_REAL="$(realpath -m -- "$DIR/data")"
+if [ "$CWD_REAL" = "$DATA_REAL" ] || [[ "$CWD_REAL" == "$DATA_REAL"/* ]]; then
+  echo "--cwd $CWD is inside the container-writable data dir; refused" >&2; exit 2
+fi
+CWD="$CWD_REAL"
 
 if tmux has-session -t "=$T" 2>/dev/null; then
   if [ "$NEW" = 1 ]; then echo "tmux session $T already exists; a --new session is never typed into it" >&2; exit 1; fi
@@ -88,7 +98,7 @@ RUN="$DIR/run/$T.sh"
 mkdir -p "$DIR/run"
 {
   echo '#!/usr/bin/env bash'
-  printf 'cd %q || exit 1\n' "$CWD"
+  printf 'cd -P -- %q || exit 1\n' "$CWD"
   printf 'exec env -i HOME=%q USER=%q LOGNAME=%q SHELL=/bin/bash LANG=C.UTF-8 TERM=xterm-256color ' "$HOME" "$USER" "$USER"
   # Hook bypass for AFClaude-launched sessions only (user-requested, core to the
   # project: unattended runs must not hang on a guard "ask"). The continue

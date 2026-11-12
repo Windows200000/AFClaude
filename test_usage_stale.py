@@ -8,6 +8,7 @@ No claude calls, no real ~/.claude.json, no live data/ files."""
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -267,6 +268,9 @@ class BridgeWhitelist(unittest.TestCase):
         ran = []
         p = Patch(self)
         p(he, "log", lambda msg: None)
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        p(he, "CWD", os.path.join(cwd, "cwd"))      # the headless cwd: never the real ~/.local/state
         p(he.subprocess, "run", lambda cmd, **kw: ran.append((cmd, kw)) or types.SimpleNamespace(returncode=0))
         p(he.sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(ka.POKE_PROMPT.encode())))
         import shlex
@@ -280,7 +284,8 @@ class BridgeWhitelist(unittest.TestCase):
             else:
                 os.environ["SSH_ORIGINAL_COMMAND"] = old
         self.assertEqual(len(ran), 1)
-        self.assertEqual(ran[0][0][1:], ka.POKE_ARGV[1:])
+        self.assertEqual(ran[0][0][1:], he.USER_SETTINGS + ka.POKE_ARGV[1:])   # + the user-settings-only flag (H3)
+        self.assertEqual(ran[0][1]["cwd"], he.CWD)
         self.assertEqual(ran[0][1]["input"], ka.POKE_PROMPT.encode())
 
 

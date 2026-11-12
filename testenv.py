@@ -22,6 +22,7 @@ os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
 os.environ["AFCLAUDE_DECISIONS_FILE"] = os.path.join(DIR, "DECISIONS.md")   # no file: the repo's own is never read
+os.environ["AFCLAUDE_HEADLESS_CWD"] = os.path.join(DIR, "headless-cwd")   # host.headless_cwd(): never the real ~/.local/state
 os.environ["AFCLAUDE_HOST_REPO"] = HERE   # in the image host.repo_dir() reads it: the tests' checkout is "the host repo"
 os.environ.pop("CLAUDE_GUARD_DISABLE", None)   # an unattended session running the tests is not "autonomous" in them
 for _v in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "AFCLAUDE_AGENT_ID", "AFCLAUDE_MACHINE_TOKEN"):
