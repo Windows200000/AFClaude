@@ -7,8 +7,8 @@
 #   docker/install_host_bridge.sh --root DIR [--root DIR ...] [--data DIR] [--from CIDR] [--claude FILE]
 #     --root    an allowed root (a launch's cwd must be inside one); at least one; only used when
 #               host.json does not exist yet (to change it, delete the file and run the install again)
-#     --data    the data directory the container mounts read-write (default: <checkout>/data); the bridge
-#               key goes into <data>/bridge/. The kit refuses the Claude binary, the repo and every root
+#     --data    the data directory the container mounts read-write (default: <checkout>/data); a copy of the
+#               bridge key goes into <data>/bridge/. The kit refuses the Claude binary, the repo and every root
 #               inside it (the container can write there), and a launch's cwd inside it
 #     --from    the `from=` of the authorized_keys line: the network the runner connects from
 #               (default $AFCLAUDE_BRIDGE_FROM or 172.28.0.0/24, compose's AFCLAUDE_SUBNET)
@@ -20,9 +20,11 @@
 #      installed version means HOST_KIT_VERSION was not bumped, and the install stops
 #   2. writes <share>/afclaude/host.json (mode 0600) unless there is one that passes the kit's own check
 #      and names this --data
-#   3. generates the bridge key <data>/bridge/host_bridge_ed25519 (mode 0600) unless it exists, and DERIVES the
-#      public key from it (ssh-keygen -y) on every run: nothing in <data> (container-writable) is ever read
-#      as a public key, and only the key type and base64 body of that one line are used
+#   3. generates the bridge key in a host-only directory (<share>/afclaude/bridge-key/, 0700) unless it exists,
+#      and DERIVES the public key from it (ssh-keygen -y) on every run; only the key type and base64 body of
+#      that one line are used. A copy of the private key goes to <data>/bridge/host_bridge_ed25519 (0600,
+#      temp file + rename through no-follow directory fds; a symlink there is refused): nothing under <data>
+#      (container-writable) is ever read, chmod-ed or fed to ssh-keygen by path (review k2 N1)
 #   4. self-test of the new kit directly (host_exec.py as sshd would run it: allowed and rejected command)
 #   5. puts ONE restricted line into ~/.ssh/authorized_keys (command=current/host_exec.py, from=, restrict); a
 #      line with the same key is replaced, every other line stays; then points <share>/afclaude/host-kit/current
@@ -47,7 +49,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument $1 (see --help)";;
   esac
 done
-[[ "$FROM" =~ ^[0-9A-Fa-f:.,/*?!-]+$ ]] || die "--from: only addresses, networks and patterns, got '$FROM'"
+[[ "$FROM" =~ ^[0-9A-Fa-f:.,/!-]+$ ]] || die "--from: only addresses and networks (no wildcards: '*' or '?' would let any host connect), got '$FROM'"
 [[ "$DATA" == /* && "$CLAUDE_BIN" == /* ]] || die "--data and --claude must be absolute paths"
 SHARE="${XDG_DATA_HOME:-$HOME/.local/share}"
 [[ "$SHARE" == /* ]] || die "the share directory '$SHARE' is not absolute"
@@ -60,7 +62,8 @@ SRC_EXEC="$DIR/host-kit/host_exec.py"; SRC_KA="$REPO/ka_resume.sh"
 VERSION="$(python3 "$SRC_EXEC" --print-version)"
 [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || die "bad kit version '$VERSION'"
 VDIR="$KITS/$VERSION"
-KEY="$DATA/bridge/host_bridge_ed25519"
+KEYDIR="$BASE/bridge-key"; KEY="$KEYDIR/host_bridge_ed25519"   # host-only: the container never sees this directory
+DATA_KEY="$DATA/bridge/host_bridge_ed25519"                   # the copy the container uses
 AK="$HOME/.ssh/authorized_keys"
 STAGE=""; PUBTMP=""; NEWAK=""; PREV_LINK=""; AK_SAVED=""; AK_TOUCHED=0; LINK_SWITCHED=0; DONE=0
 
@@ -93,6 +96,52 @@ selftest() {   # $1: a kit directory; host_exec.py exactly as sshd runs it: SSH_
   echo "  rejected command: OK"
 }
 
+publish_key() {   # the private key into <data>/bridge/ for the container, with no path under <data> followed:
+  # every step goes through a directory fd opened with O_NOFOLLOW (data itself, then bridge/), the new file is
+  # created O_EXCL|O_NOFOLLOW under a temporary name and renamed over the target (a rename replaces a link, it
+  # never follows one); a target that is a symlink or not a regular file is refused, not replaced
+  python3 - "$DATA" "$KEY" <<'PY' || die "could not put the bridge key into $DATA/bridge (a symlink or a stray file there?)"
+import os, secrets, stat, sys
+data, src = sys.argv[1:3]
+with open(src, "rb") as fh:
+    blob = fh.read()
+NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+dfd = os.open(data, NOFOLLOW_DIR)
+try:
+    try:
+        os.mkdir("bridge", 0o700, dir_fd=dfd)
+    except FileExistsError:
+        pass
+    bfd = os.open("bridge", NOFOLLOW_DIR, dir_fd=dfd)
+    try:
+        os.fchmod(bfd, 0o700)
+        try:
+            st = os.stat("host_bridge_ed25519", dir_fd=bfd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            sys.exit("host_bridge_ed25519 is a symlink or not a regular file")
+        tmp = ".host_bridge_ed25519." + secrets.token_hex(8)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=bfd)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(blob)
+                out.flush()
+                os.fsync(out.fileno())
+            os.rename(tmp, "host_bridge_ed25519", src_dir_fd=bfd, dst_dir_fd=bfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=bfd)
+            except FileNotFoundError:
+                pass
+            raise
+    finally:
+        os.close(bfd)
+finally:
+    os.close(dfd)
+PY
+}
+
 # 1. the kit, as a new version directory
 mkdir -p "$KITS"; chmod 700 "$BASE" "$KITS"
 if [ -d "$VDIR" ]; then
@@ -118,13 +167,15 @@ else
   echo "host.json written: $HOSTJSON"
 fi
 
-# 3. the bridge key, in the data dir (travels with the data dir, never with the repo). The directory and the
-# key must be real: a symlink there (the container can make one) is refused, not followed
-[ ! -L "$DATA/bridge" ] || die "$DATA/bridge is a symlink"
-mkdir -p "$DATA/bridge"; chmod 700 "$DATA/bridge"
+# 3. the bridge key. The authoritative private key lives in a host-only directory ($BASE/bridge-key, 0700, outside
+# the data dir): it is generated, chmod-ed and derived there, and nothing under <data> (the container can swap
+# any path there for a symlink at any moment) is ever read, chmod-ed or fed to ssh-keygen by this script. The
+# container gets a COPY in <data>/bridge/, written without following links (publish_key below)
+[ ! -L "$KEYDIR" ] || die "$KEYDIR is a symlink"
+mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
 [ ! -L "$KEY" ] || die "$KEY is a symlink"
 [ -e "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C afclaude-host-bridge-kit -f "$KEY"
-[ -f "$KEY" ] || die "$KEY is not a regular file"
+[ -f "$KEY" ] && [ ! -L "$KEY" ] || die "$KEY is not a regular file"
 chmod 600 "$KEY"
 # The public key is derived from the private one on every run; a .pub file next to it is never read. The
 # comment inside the private key is the container's text: only the type and the base64 body of the first
@@ -136,6 +187,7 @@ read -r PTYPE BLOB _ <<<"$PUBOUT"
 PUBLINE="ssh-ed25519 $BLOB afclaude-host-bridge-kit"
 PUBTMP="$(mktemp "$BASE/.pub.XXXXXX")"; printf '%s\n' "$PUBLINE" > "$PUBTMP"
 ssh-keygen -lf "$PUBTMP" >/dev/null || die "the derived public key does not parse"
+publish_key
 
 # 4. self-test of the new kit before anything points at it
 echo "self-test of the kit:"
@@ -173,7 +225,7 @@ for b in ${OLDBAKS[@]+"${OLDBAKS[@]}"}; do rm -f -- "$b"; done
 echo
 echo "host kit $VERSION installed: $VDIR (current -> $VERSION)"
 echo "  authorized_keys: $AK (backup of the state before: $AK_SAVED; the last $KEEP_BACKUPS stay)"
-echo "  bridge key for the container: $KEY (compose still mounts the old key until the deploy that switches it)"
+echo "  bridge key for the container: $DATA_KEY (a copy of the host-only $KEY; compose still mounts the old key until the deploy that switches it)"
 OLD="$(grep -c ' afclaude-host-bridge$' "$AK" || true)"
 if [ "$OLD" != 0 ]; then
   echo

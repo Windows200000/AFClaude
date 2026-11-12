@@ -88,7 +88,7 @@ from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 # The kit version: bumped with every change of the whitelist (a new command, a new shape) or of the
 # host.json format. host.py's HOST_KIT_VERSION is the same string (test_host_kit.py compares them) and
 # the container's host check calls `kit-version` against it.
-HOST_KIT_VERSION = "3"
+HOST_KIT_VERSION = "4"
 CONFIG_FORMAT = 2
 # every command head the whitelist knows (the elif chain in main(); test_host_kit.py compares the two)
 COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "host-config", "ka_resume.sh",
@@ -117,6 +117,11 @@ HAIKU_FLAGS = {"-p", "--model", "haiku", "--no-session-persistence", "--output-f
                "stream-json", "--verbose", "--permission-mode", "dontAsk", "--tools=",
                "--tools=PushNotification", "--allowedTools=PushNotification",
                "--strict-mcp-config", "--disable-slash-commands"}
+
+# ka_resume.sh's free-text options: no leading dash (a value must never read as an option of claude), a short
+# plain model id, a display name without control characters and at most 100 long (review k2 N3)
+MODEL = re.compile(r"^[A-Za-z0-9][\w.\-]{0,63}\Z")
+NAME = re.compile(r"^[^\-\s\x00-\x1f\x7f-\x9f][^\x00-\x1f\x7f-\x9f]{0,99}\Z")
 
 # rc-send: kept identical to host.py's RC_NAME / RC_TEXT_MAX / RC_SEND_FLAGS / RC_SEND_PROMPT (test_host.py)
 RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
@@ -308,9 +313,14 @@ def under_roots(path: str) -> Optional[str]:
     real = os.path.realpath(path)
     if inside(real, os.path.realpath(cfg().data)):
         return None
+    return real if root_of(real) is not None else None
+
+
+def root_of(real: str) -> Optional[str]:
+    """The (resolved) allowed root that the resolved path `real` is at or below, else None."""
     for root in cfg().roots:
         if inside(real, os.path.realpath(root)):
-            return real
+            return os.path.realpath(root)
     return None
 
 
@@ -425,6 +435,20 @@ def proc_snapshot() -> Dict[str, List[Any]]:
     return out
 
 
+def haiku_shape_ok(args: List[str]) -> bool:
+    """The one-shot Haiku call (poke, notify, usage sample), prompt on stdin: only HAIKU_FLAGS, and always with
+    `--permission-mode dontAsk`, `--strict-mcp-config` and exactly one tool restriction (`--tools=` for none,
+    or PushNotification only, which must also be the only allowed tool): leaving any out would give the
+    container-written prompt every built-in tool (review k2 N4)."""
+    if args[:3] != ["-p", "--model", "haiku"] or not set(args) <= HAIKU_FLAGS or "--strict-mcp-config" not in args:
+        return False
+    if "--permission-mode" not in args or args[args.index("--permission-mode") + 1:][:1] != ["dontAsk"]:
+        return False
+    if "--tools=" in args:
+        return "--tools=PushNotification" not in args and "--allowedTools=PushNotification" not in args
+    return "--tools=PushNotification" in args and "--allowedTools=PushNotification" in args
+
+
 def check_ka_resume(args: List[str]) -> List[str]:
     """Deny a shape that is not ka_resume.sh's; -> the args with --cwd resolved (the path that was checked
     is the one used) or, when the caller gave none, the first root (the script's own default before
@@ -454,8 +478,10 @@ def check_ka_resume(args: List[str]) -> List[str]:
         deny("ka_resume cwd outside the allowed roots")
     if seen.get("--effort", "high") not in ("low", "medium", "high", "xhigh", "max"):
         deny("effort")
-    if not re.match(r"^[\w.\-]+$", seen.get("--model", "claude-opus-5-5")):
+    if not MODEL.match(seen.get("--model", "claude-opus-5-5")):
         deny("model")
+    if "--name" in seen and not NAME.match(seen["--name"]):
+        deny("name")
     return out + ["--cwd", cwd]
 
 
@@ -767,11 +793,13 @@ def main() -> int:
         cmd = [kit_file("ka_resume.sh")] + check_ka_resume(args)
         # the script writes its launch files outside the versioned kit directory
         ENV["AFCLAUDE_KIT_RUN"] = os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), "run")
+        # its auto-trust step only trusts inside ONE root: the one this launch's (resolved) cwd is in
+        ENV["KA_TRUST_ROOT"] = root_of(cmd[-1]) or root
     elif head == "claude" and args in (["agents", "--json"], ["agents", "--json", "--all"]):
         cmd = [config.claude] + args
     elif head == "claude" and args == ["-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"]:
         cmd = [config.claude, args[0]] + SETTINGS_ARGS + args[1:]
-    elif head == "claude" and args[:3] == ["-p", "--model", "haiku"] and set(args) <= HAIKU_FLAGS:
+    elif head == "claude" and haiku_shape_ok(args):
         cmd, stdin = [config.claude, args[0]] + SETTINGS_ARGS + args[1:], sys.stdin.buffer.read(200_000)
     elif head == "rc-send":
         cmd, stdin = rc_send_cmd(args, sys.stdin.buffer.read(RC_TEXT_MAX + 1))
@@ -889,7 +917,10 @@ def main() -> int:
     run_cwd = root if head == "ka_resume.sh" else safe_cwd()     # (ka_resume.sh moves to its own --cwd)
     limit = RC_HOST_TIMEOUT if head == "rc-send" else CHECK_TIMEOUT if args in (["auth", "status"], ["doctor"]) else None
     try:
-        return subprocess.run(cmd, input=stdin, env=ENV, cwd=run_cwd, timeout=limit).returncode
+        # no stdin of the client's own (sshd's pipe) for a command that was given none: `claude doctor` waits
+        # for a key on an open stdin without a TTY (review k2 L5); the timeout is the other half of that
+        return subprocess.run(cmd, input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL,
+                              env=ENV, cwd=run_cwd, timeout=limit).returncode
     except subprocess.TimeoutExpired:      # run() has killed the child
         log(f"TIMEOUT {head} after {limit} s")
         print(f"host_exec: {head} stopped after {limit} s", file=sys.stderr)

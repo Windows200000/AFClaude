@@ -29,8 +29,8 @@ INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
 # the current kit version with its whitelist hash and the sha256 of each kit file: a command added, or a change of
 # host_exec.py or ka_resume.sh, without a version bump fails test_whitelist_hash_matches_the_version and
 # test_kit_files_are_pinned_with_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS; M5)
-KIT_VERSIONS = {"3": {"whitelist": "2d289ec6ac9ab583", "host_exec.py": "74f4c84c4a915b9456591a7d422af3f706b361e43565fa845b80ea4415c932d7",  # public-check: allow (sha256 pin)
-                        "ka_resume.sh": "ce76821ea7a99fd5d14f26c3a228267d262e0193f0d88bd5f143cb0fe8ec257a"}}  # public-check: allow (sha256 pin)
+KIT_VERSIONS = {"4": {"whitelist": "2d289ec6ac9ab583", "host_exec.py": "64c136ad9e74c5bef0f9dd23da0a08328d3132ac11f15091a556e0fc4a50dc7a",  # public-check: allow (sha256 pin)
+                        "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af"}}  # public-check: allow (sha256 pin)
 SID = "abcdef01-0000-4000-8000-000000000001"
 
 
@@ -147,7 +147,7 @@ class HostJson(TempDir):
     def share(self):
         """host.json's own directory, as <share>/afclaude: a kit file path below it, so KIT_DIR/../.. is it."""
         share = os.path.join(self.tmp, "share")
-        kit = os.path.join(share, "host-kit", "3")
+        kit = os.path.join(share, "host-kit", "4")
         os.makedirs(kit)
         for name in ("host_exec.py", "ka_resume.sh"):
             shutil.copy(os.path.join(os.path.dirname(HOST_EXEC) if name == "host_exec.py" else HERE, name), kit)
@@ -574,11 +574,16 @@ class InstallScript(unittest.TestCase):
     def bridge_key(self):
         return os.path.join(self.data, "bridge", "host_bridge_ed25519")
 
+    def host_key(self):
+        """The authoritative private key: host-only, outside the data dir (review k2 N1)."""
+        return os.path.join(self.share, "bridge-key", "host_bridge_ed25519")
+
     def make_key(self, comment, kind="ed25519"):
-        os.makedirs(os.path.dirname(self.bridge_key()), exist_ok=True)
-        if os.path.exists(self.bridge_key()):
-            os.unlink(self.bridge_key())
-        subprocess.run(["ssh-keygen", "-q", "-t", kind, "-N", "", "-C", comment, "-f", self.bridge_key()], check=True,
+        """A key in the host-only key dir, as an earlier run (or the owner) left it."""
+        os.makedirs(os.path.dirname(self.host_key()), mode=0o700, exist_ok=True)
+        if os.path.exists(self.host_key()):
+            os.unlink(self.host_key())
+        subprocess.run(["ssh-keygen", "-q", "-t", kind, "-N", "", "-C", comment, "-f", self.host_key()], check=True,
                        capture_output=True)
 
     def backups(self):
@@ -597,10 +602,14 @@ class InstallScript(unittest.TestCase):
         with open(os.path.join(self.share, "host.json")) as fh:
             self.assertEqual(json.load(fh), {"format": 2, "roots": [self.root], "repo": self.src, "claude": self.claude,
                                              "data": self.data})
-        # the key lives in the data dir
+        # the key is made in the host-only dir; the data dir holds a copy of it
         key = os.path.join(self.data, "bridge", "host_bridge_ed25519")
         self.assertEqual(os.stat(key).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.dirname(key)).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(os.path.dirname(self.host_key())).st_mode & 0o777, 0o700)
+        with open(key, "rb") as a, open(self.host_key(), "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual([f for f in os.listdir(os.path.dirname(key))], ["host_bridge_ed25519"])   # no temp file left
         self.assertFalse(os.path.exists(os.path.join(self.src, "docker", "secrets")))
         # authorized_keys: the other keys and the OLD line stay, one new line points at current/
         lines = self.lines()
@@ -695,7 +704,7 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "3"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "4"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
@@ -713,7 +722,7 @@ class InstallScript(unittest.TestCase):
         the link are back, nothing is left over."""
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "3"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "4"', 'HOST_KIT_VERSION = "99"')
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real, once = shutil.which("mv"), os.path.join(self.tmp, "mv-failed")
@@ -841,13 +850,109 @@ class InstallScript(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("ssh-ed25519", r.stderr)
         self.assertEqual(self.lines(), before)
-        os.unlink(self.bridge_key())
+        os.unlink(self.host_key())
         victim = os.path.join(self.tmp, "victim")
-        os.symlink(victim, self.bridge_key())              # dangling: ssh-keygen would write through it
+        os.symlink(victim, self.host_key())                # dangling: ssh-keygen would write through it
         r = self.run_install()
         self.assertEqual(r.returncode, 1)
-        self.assertFalse(os.path.exists(victim))
+        self.assertFalse(os.path.lexists(victim))
+        self.assertEqual(self.lines(), before)
+
+    def owner_key(self):
+        """The owner's own private key (the one a swap would turn into the bridge line): path and bytes."""
+        path = os.path.join(self.home, ".ssh", "id_ed25519")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "owner-own", "-f", path], check=True)
+        with open(path + ".pub") as fh:
+            pub = fh.read().strip()
+        with open(self.ak, "a") as fh:
+            fh.write(pub + "\n")                          # the owner's normal, unrestricted login line
+        with open(path, "rb") as fh:
+            return path, fh.read(), pub
+
+    def assert_owner_untouched(self, path, blob, pub):
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), blob)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertIn(pub, self.lines())                   # the unrestricted line is still there, untouched
+        self.assertFalse([l for l in self.lines() if pub.split()[1] in l and l != pub])
+
+    def test_a_symlinked_data_key_or_dir_never_reaches_the_owners_key_n1(self):
+        """N1: the container can plant a symlink at <data>/bridge or the key path. The install never reads,
+        chmods or derives from a path under data: the owner's key (the target) and every line of
+        authorized_keys stay as they were, and a link is refused, not followed."""
+        path, blob, pub = self.owner_key()
+        os.chmod(path, 0o640)                              # a chmod through the link would show as 0600
+        os.makedirs(os.path.join(self.data, "bridge"))
+        os.symlink(path, self.bridge_key())
+        before = self.lines()
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("symlink", r.stderr)
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), blob)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+        self.assertEqual(self.lines(), before)
+        # the directory itself a link to a directory of the owner's: nothing is written there
+        os.unlink(self.bridge_key())
+        os.rmdir(os.path.join(self.data, "bridge"))
+        elsewhere = os.path.join(self.tmp, "elsewhere")
+        os.mkdir(elsewhere, 0o755)
+        os.symlink(elsewhere, os.path.join(self.data, "bridge"))
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertEqual(os.listdir(elsewhere), [])
+        self.assertEqual(os.stat(elsewhere).st_mode & 0o777, 0o755)
+        self.assertEqual(self.lines(), before)
+
+    def test_a_swap_to_a_link_between_check_and_use_changes_nothing_n1(self):
+        """N1, the race itself: a stub ssh-keygen swaps <data>/bridge/host_bridge_ed25519 for a symlink to the
+        owner's key (and to the claude binary) at every call, i.e. right between whatever check and use the
+        script has. The bridge line carries the host-only key, the owner's key and line and the claude
+        binary's mode are untouched; whether the install finishes or stops at the link, nothing else changed."""
+        path, blob, pub = self.owner_key()
+        os.chmod(self.claude, 0o755)
+        stub = os.path.join(self.tmp, "bin")
+        os.mkdir(stub)
+        real = shutil.which("ssh-keygen")
+        swap = os.path.dirname(self.bridge_key())
+        for target in (path, self.claude):
+            write_json(os.path.join(stub, "ssh-keygen"),
+                       f'#!/bin/sh\nrm -f {swap}/host_bridge_ed25519 && ln -s {target} {swap}/host_bridge_ed25519\n'
+                       f'exec {real} "$@"\n', 0o755)
+            os.makedirs(swap, exist_ok=True)
+            before = self.lines()
+            r = self.run_install(path=stub)
+            self.assert_owner_untouched(path, blob, pub)
+            self.assertEqual(os.stat(self.claude).st_mode & 0o777, 0o755)
+            host_blob = self.derived(self.host_key()).split()[1]
+            self.assertNotEqual(host_blob, pub.split()[1])
+            if r.returncode == 0:
+                self.assertTrue(self.lines()[-1].endswith(f"{host_blob} afclaude-host-bridge-kit"), self.lines()[-1])
+            else:
+                self.assertEqual(self.lines(), before)
+            with open(self.ak, "w") as fh:                 # the next round starts from the same file
+                fh.write("\n".join(before) + "\n")
+            os.unlink(os.path.join(swap, "host_bridge_ed25519"))
+
+    def test_the_data_copy_is_replaced_by_the_host_key_never_trusted(self):
+        """N1: a key already in <data>/bridge (planted by the container) is overwritten with the host-only one,
+        in place of a rename, and the line is derived from the host key."""
+        os.makedirs(os.path.join(self.data, "bridge"))
+        with open(self.bridge_key(), "w") as fh:
+            fh.write("planted")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.bridge_key(), "rb") as a, open(self.host_key(), "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertTrue(self.lines()[-1].endswith(self.derived(self.host_key()).split()[1] + " afclaude-host-bridge-kit"))
+
+    def test_from_refuses_wildcards(self):
+        for bad in ("*", "10.0.0.?", "172.28.*.*"):
+            r = self.run_install("--from", bad)
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("wildcards", r.stderr)
+            self.assertEqual(self.lines(), [self.OTHER, self.OLD])
+        self.assertEqual(self.run_install("--from", "10.0.0.0/8,!10.1.0.0/16").returncode, 0)
 
     def test_paths_inside_the_data_dir_are_refused_at_install(self):
         """H1/H3: the Claude binary, a root or the repo inside the container-writable data directory, and a
@@ -1254,9 +1359,10 @@ class KitReads(TempDir):
         write_json(self.hj, self.config(claude=stub, repo=repo))
         safe = os.path.join(self.home, ".local", "state", "afclaude", "cwd")
         usage = "claude -p --no-session-persistence --permission-mode dontAsk /usage"
-        haiku = "claude -p --model haiku --no-session-persistence --output-format json"
+        shape = "--no-session-persistence --output-format json --tools= --strict-mcp-config --permission-mode dontAsk"
+        haiku = f"claude -p --model haiku {shape}"
         for cmd, args in ((usage, "args: -p --setting-sources user --no-session-persistence --permission-mode dontAsk /usage"),
-                          (haiku, "args: -p --setting-sources user --model haiku --no-session-persistence --output-format json"),
+                          (haiku, f"args: -p --setting-sources user --model haiku {shape}"),
                           ("claude doctor", "args: doctor"), ("claude agents --json", "args: agents --json")):
             r = self.call(cmd, stdin=b"hi")
             self.assertEqual(r.returncode, 0, (cmd, r.stderr))
@@ -1271,6 +1377,63 @@ class KitReads(TempDir):
         os.rmdir(safe)
         os.symlink(os.path.join(repo, "data"), safe)        # a symlink into the data dir: refused, not followed
         self.assertEqual(self.call("claude doctor").returncode, 126)
+
+    def test_the_haiku_shape_needs_its_tool_and_permission_restrictions_n4(self):
+        ok = ["-p", "--model", "haiku", "--no-session-persistence", "--output-format", "json", "--tools=",
+              "--strict-mcp-config", "--permission-mode", "dontAsk", "--disable-slash-commands"]
+        notify = ["-p", "--model", "haiku", "--no-session-persistence", "--output-format", "stream-json", "--verbose",
+                  "--permission-mode", "dontAsk", "--tools=PushNotification", "--allowedTools=PushNotification",
+                  "--strict-mcp-config"]
+        self.assertTrue(self.he.haiku_shape_ok(ok))
+        self.assertTrue(self.he.haiku_shape_ok(notify))
+        for bad in ([a for a in ok if a != "--tools="],                       # every built-in tool
+                    [a for a in ok if a not in ("--permission-mode", "dontAsk")],
+                    ok[:7] + ["--permission-mode", "haiku", "--strict-mcp-config"],   # a flag word as the mode's value
+                    [a for a in ok if a != "--strict-mcp-config"],
+                    ok + ["--tools=PushNotification"],                     # two restrictions
+                    [a for a in notify if a != "--allowedTools=PushNotification"],
+                    [a for a in notify if a != "--tools=PushNotification"],
+                    ["-p", "--model", "haiku", "--tools=", "--permission-mode", "dontAsk", "--dangerously-skip-permissions"]):
+            self.assertFalse(self.he.haiku_shape_ok(bad), bad)
+
+    def test_ka_resume_model_and_name_never_read_as_options_n3(self):
+        base = ["--session", SID, "--tmux", "afc-abcdef01", "--message", "go"]
+        for good in (["--model", "claude-opus-5-5"], ["--model", "opus"], ["--name", "Project A: nightly (1)"],
+                     ["--name", "afc-abcdef01"], ["--name", "caf\u00e9"]):
+            self.he.check_ka_resume(base + good)
+        for bad in (["--model", "--dangerously-skip-permissions"], ["--model", "-x"], ["--model", "a" * 65],
+                    ["--model", "a b"], ["--name", "-p"], ["--name", "--add-dir"], ["--name", ""], ["--name", " x"],
+                    ["--name", "x\ny"], ["--name", "x" * 101], ["--name", "a\x1b[2Jb"]):
+            with self.assertRaises(SystemExit, msg=bad), mock.patch.object(self.he, "log"), mock.patch("sys.stderr"):
+                self.he.check_ka_resume(base + bad)
+
+    def test_ka_resume_trusts_only_the_root_of_its_cwd_n6(self):
+        other = os.path.join(self.tmp, "second-root")
+        os.mkdir(other)
+        write_json(self.hj, self.config(roots=[self.root, other]))
+        self.he = load_he(self.hj)
+        self.assertEqual(self.he.root_of(os.path.realpath(os.path.join(other, "p"))), os.path.realpath(other))
+        self.assertEqual(self.he.root_of(os.path.realpath(self.root)), os.path.realpath(self.root))
+        self.assertIsNone(self.he.root_of(os.path.realpath(self.tmp)))
+        seen = []
+        for cwd, want in ((other, other), (self.root, self.root)):
+            with mock.patch.object(self.he.subprocess, "run",
+                                   lambda cmd, **kw: seen.append((cmd, kw["env"].get("KA_TRUST_ROOT"))) or
+                                   subprocess.CompletedProcess(cmd, 0)), \
+                    mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": f"ka_resume.sh --session {SID} --tmux "
+                                                 f"afc-abcdef01 --message go --cwd {cwd}"}), \
+                    mock.patch.object(self.he, "log"):
+                self.assertEqual(self.he.main(), 0)
+            self.assertEqual(seen[-1][1], os.path.realpath(want))
+            self.assertEqual(seen[-1][0][-1], os.path.realpath(want))
+
+    def test_a_command_without_stdin_gets_none_of_the_clients_n5(self):
+        """L5: `claude doctor` over a pipe without a TTY would wait for input: it is given /dev/null."""
+        stub = os.path.join(self.tmp, "claude-stub")
+        write_json(stub, '#!/bin/sh\nif read -r line; then echo "got: $line"; else echo "eof"; fi\n', 0o755)
+        write_json(self.hj, self.config(claude=stub))
+        r = self.call("claude doctor", stdin=b"keystroke\n")
+        self.assertEqual((r.returncode, r.stdout), (0, b"eof\n"), r.stderr)
 
     def test_rc_send_gets_the_user_settings_only_flag(self):
         sessions = os.path.join(self.tmp, "sessions")

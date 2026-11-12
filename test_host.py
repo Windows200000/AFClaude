@@ -45,6 +45,7 @@ def tearDownModule():
     _CFG_DIR.cleanup()
 
 HOST_EXEC = os.path.join(HERE, "docker", "host-kit", "host_exec.py")
+LEGACY_HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")   # the pre-kit bridge (main's): BridgeHardening tests that one
 
 
 class Env:
@@ -77,6 +78,12 @@ def run_host_exec(command, stdin=b"", log=None):
     env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
     env.update(AFCLAUDE_HOST_EXEC_LOG=log or os.devnull, HOME=TEST_HOME)
     return subprocess.run([sys.executable, HOST_EXEC, "--run", command], input=stdin, env=env, capture_output=True, timeout=60)
+
+
+def run_legacy_exec(command, stdin=b"", log=None):
+    """The pre-kit bridge with `command` as SSH_ORIGINAL_COMMAND."""
+    env = dict(os.environ, SSH_ORIGINAL_COMMAND=command, AFCLAUDE_HOST_EXEC_LOG=log or os.devnull)
+    return subprocess.run([sys.executable, LEGACY_HOST_EXEC], input=stdin, env=env, capture_output=True, timeout=60)
 
 
 class InContainer(unittest.TestCase):
@@ -477,10 +484,10 @@ class Whitelist(unittest.TestCase):
 
 
 def load_host_exec(state):
-    """docker/host_exec.py as a module with its state dir (log, headless cwd) in `state`."""
+    """The pre-kit docker/host_exec.py as a module with its state dir (log, headless cwd) in `state`."""
     import importlib.util
     with Env(AFCLAUDE_HOST_EXEC_STATE=state, AFCLAUDE_HOST_EXEC_LOG=None):
-        spec = importlib.util.spec_from_file_location("host_exec_hardening", HOST_EXEC)
+        spec = importlib.util.spec_from_file_location("host_exec_hardening", LEGACY_HOST_EXEC)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     return mod
@@ -513,7 +520,7 @@ class BridgeHardening(unittest.TestCase):
             fh.write("ssh-ed25519 AAAA owner\n")
         os.makedirs(self.state)
         os.symlink(target, os.path.join(self.state, "host_exec.log"))
-        r = run_host_exec("tmux-has afc-00000000", log=os.path.join(self.state, "host_exec.log"))
+        r = run_legacy_exec("tmux-has afc-00000000", log=os.path.join(self.state, "host_exec.log"))
         self.assertNotEqual(r.returncode, 126)             # the call still runs: the log is a record, not a gate
         self.assertIn(b"log", r.stderr)                    # but the failure is visible
         self.assertEqual(open(target).read(), "ssh-ed25519 AAAA owner\n")
@@ -535,7 +542,7 @@ class BridgeHardening(unittest.TestCase):
             self.assertFalse(ln.startswith("ssh-"))
         # the denial path (the command as received) is escaped the same way
         log = os.path.join(self.tmp, "deny.log")
-        run_host_exec("bogus 'a\nssh-ed25519 AAAAkey k\nb'", log=log)
+        run_legacy_exec("bogus 'a\nssh-ed25519 AAAAkey k\nb'", log=log)
         self.assertEqual(len(open(log).read().splitlines()), 1)
 
     def test_ka_resume_refuses_the_data_dir_as_cwd(self):
@@ -550,7 +557,7 @@ class BridgeHardening(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=cwd):
                 with mock.patch.object(self.hx, "log"), mock.patch("sys.stderr"):
                     self.hx.check_ka_resume(args + ["--cwd", cwd])
-            r = run_host_exec("ka_resume.sh " + shlex.join(args + ["--cwd", cwd]))
+            r = run_legacy_exec("ka_resume.sh " + shlex.join(args + ["--cwd", cwd]))
             self.assertEqual(r.returncode, 126, cwd)
             self.assertIn(b"container-writable", r.stderr)
         # the repo itself and a neighbour of data are not data
