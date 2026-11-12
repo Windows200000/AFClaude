@@ -1,19 +1,45 @@
-# AFClaude manager container. Machine-specific values: docker/.env (gitignored),
-# see docker/env.example. Start (from the repo root; the hash is baked into the image as
-# its code version, not set in docker/.env where it would go stale):
-#   AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) docker compose -f docker/compose.yml up -d --build
-# No docker socket, no privileges, no published ports.
+# AFClaude: three services from one image (phase 5b K4, docs/phase5b_plan.md §3.1).
+#   afclaude-runner  `afclaude runner serve`: the schedule (sampler, window starts, keep-alive, inbox delivery, ...)
+#   afclaude-mcp     `afclaude mcp serve`: the MCP server over HTTP on an internal port (no port is published;
+#                    every MCP request is refused until K5's token check)
+#   afclaude-web     `afclaude web serve`: GET /health and the inbox API on a unix socket in the data directory
+# The only required variable is AFCLAUDE_DATA: the host directory that is the data directory (DB, key, logs, state).
+# It has no default (D-180/D-187): the setup chooses it, and an unset value stops compose before any container
+# is touched. Optional: AFCLAUDE_SCHEDULER (runner | off, default off), AFCLAUDE_BRIDGE_HOST, AFCLAUDE_MASTER_KEY,
+# AFCLAUDE_PUBLIC_URL, AFCLAUDE_NAME (container name prefix, default afclaude).
+# Start (from the repo root; the hash is baked into the image as its code version):
+#   AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) AFCLAUDE_DATA=/path/to/data docker compose -f docker/compose.yml up -d --build
+# On this host (and until the reader switch and the host kit's bridge key live in the data directory) add
+# `-f docker/compose.host-mounts.yml`: the transcript, repo and bridge mounts the runner still reads. `tools/deploy.py`
+# does all of this (drain, wait quiet, recreate the three services, wait for three health checks).
+# No docker socket, no privileges, no published ports. The data directory is mounted at /app/data, where the code
+# looks for it; the services refuse to start when nothing is mounted there (service.py).
 name: afclaude
+x-service: &service
+  image: afclaude:${AFCLAUDE_CODE_VERSION:-latest}
+  restart: unless-stopped
+  user: "1000:1000"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  networks: [afclaude]
+  volumes:
+    - ${AFCLAUDE_DATA:?AFCLAUDE_DATA is not set - choose the data directory (see setup)}:/app/data
+  environment: &env
+    AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
+    AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
+    AFCLAUDE_MASTER_KEY: ${AFCLAUDE_MASTER_KEY:-}
+    AFCLAUDE_PUBLIC_URL: ${AFCLAUDE_PUBLIC_URL:-}
 services:
-  afclaude:
+  afclaude-runner:
+    <<: *service
     build:
       context: ..
       dockerfile: docker/Dockerfile
       args:
         AFCLAUDE_CODE_VERSION: ${AFCLAUDE_CODE_VERSION:-}   # git commit, from the Start line
-    image: afclaude-manager:latest
-    container_name: afclaude
-    restart: unless-stopped
+    container_name: ${AFCLAUDE_NAME:-afclaude}-runner
+    command: ["runner"]
     # a `docker stop` reaches the runner directly (the entrypoint `exec`s it): its running runs get
     # up to 80 s (runner.STOP_GRACE) to end before it records its clean exit (phase 3a S2/S8)
     stop_grace_period: 90s
@@ -26,35 +52,48 @@ services:
       timeout: 30s
       retries: 3
       start_period: 120s
-    environment:
-      # the host path of the repo: what the host must understand (projects' directories, launch cwds,
-      # paths named in messages to sessions). The code itself runs from /app. K4/K2 take it from host.json.
-      AFCLAUDE_HOST_REPO: ${AFCLAUDE_HOST_REPO:?set in docker/.env}
-      # the host user's home, the same path as on the host: the transcript mounts below sit under it
-      HOME: ${HOST_HOME:?set in docker/.env}
-      AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
-      AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
-      AFCLAUDE_BRIDGE_USER: ${AFCLAUDE_BRIDGE_USER:?set in docker/.env}
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - ${AFCLAUDE_HOST_REPO:?}:/host/repo:ro                       # local-only files, read fresh
-      - ${AFCLAUDE_HOST_REPO}/data:/app/data                        # DB, samples, state, logs (rw)
-      - ${HOST_HOME:?}/.claude/projects:${HOST_HOME}/.claude/projects:ro
-      - ${HOST_HOME}/.claude/sessions:${HOST_HOME}/.claude/sessions:ro
-      - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro
-      - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
-      # the quickview key: inbox_api.py checks it on every request too (D-150/D-241)
-      - ${HOST_HOME}/.config/afclaude/quickview.key:/run/secrets/afclaude_quickview.key:ro
-    read_only: true
+    pids_limit: 512
     tmpfs:
       - /tmp:exec,mode=1777          # exec: the unit tests put stub binaries in temp dirs
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    networks: [afclaude]
+  afclaude-mcp:
+    <<: *service
+    pull_policy: never               # the image is the runner's build
+    container_name: ${AFCLAUDE_NAME:-afclaude}-mcp
+    command: ["mcp"]
+    # the runner migrates the schema first: this service starts once it is healthy
+    depends_on:
+      afclaude-runner:
+        condition: service_healthy
+    # a 401 or 200 means the listener is up; /health answers 200 only for a database this code may write
+    healthcheck:
+      test: ["CMD", "python3", "mcp_service.py", "health"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    pids_limit: 128
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:mode=1777
+  afclaude-web:
+    <<: *service
+    pull_policy: never
+    container_name: ${AFCLAUDE_NAME:-afclaude}-web
+    command: ["web"]
+    depends_on:
+      afclaude-runner:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "web.py", "health"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+    pids_limit: 128
+    mem_limit: 256m
+    tmpfs:
+      - /tmp:mode=1777
 networks:
-  afclaude:
-    # host_exec.py's authorized_keys line only accepts from="172.16.0.0/12"
-    ipam:
-      config:
-        - subnet: ${AFCLAUDE_SUBNET:-172.28.0.0/24}
+  afclaude: {}                       # no fixed subnet here: compose.subnet.yml pins this host's, the bridge key's from= needs one

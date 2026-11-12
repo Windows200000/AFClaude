@@ -52,7 +52,8 @@ heartbeat under HEALTH_STALE); it only reports, the watchdog thread is the one t
 
 Ownership: RUNNER_OWNS is what this image's runner runs: every job since the cut-over (§4: S2-S7
 moved them from docker/crontab into it step by step; S9 removed the crontabs). S7 added the inbox
-API as a supervised child (SUPERVISED).
+API as a supervised child (SUPERVISED); phase 5b K4 moved it into the web service (a container of its
+own, web.py), so SUPERVISED is empty and the mechanism stays for the next long-lived child.
 
 Watcher passes (S6, WATCHER_PASSES; keepalive.runner_pass in the child): the ticks `watch`,
 `run_readings` and `compaction_check` only read and plan; the acts `last_stretch`, `deferred_start`,
@@ -90,10 +91,10 @@ inbox_api after a post or a retry, §3.7) triages and delivers "now" messages ev
 pending or held; `inbox_verify` (inbox_worker.verify_tick) checks every 5 s the post-send
 verifications a delivery stored (runner_state "inbox" entries {msg, path, offset, deadline}), so a
 restart resumes one from the same offset and deadline and ends it seen or as an error at its
-deadline. The runner also keeps `inbox_api.py serve` running (SUPERVISED, started at
-boot and again, with an alert, whenever it exits before a stop was requested): it only serves HTTP,
-stores the message and wakes the runner; no run row, no outer timeout, no cron watchdog. Owner
-messages are not automation (D-186/D-244), so both run while paused.
+deadline. The inbox API (`web.py serve`, the web service since phase 5b K4; before that this runner's
+supervised child) only serves HTTP, stores the message and wakes the runner (runner.sock in the shared
+data directory); no run row, no outer timeout, no cron watchdog. Owner messages are not automation
+(D-186/D-244), so both run while paused.
 
 Run-now (phase 3b S5, the job "request"; docs/phase3b_plan.md §2): every open action_requests row
 (request.add, whose callers wake the runner; the loop's 60-s sleep is the backstop) is a keyed run
@@ -131,6 +132,7 @@ sys.path.insert(0, HERE)
 import actions  # noqa: E402
 import failstop  # noqa: E402
 import identity  # noqa: E402  (the drain commands act as this process's principal)
+import service  # noqa: E402  (the start check: the master key, K4)
 import runner_jobs  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
@@ -298,10 +300,10 @@ def _inbox_verify_pending(conn: Any, now: datetime) -> bool:
 # due time while there is none (_plan_poll), only a wake.
 POLL_PENDING: dict[str, Callable[[Any, datetime], bool]] = {"inbox": _inbox_pending, "inbox_verify": _inbox_verify_pending}
 # S7: a long-lived child the runner keeps alive (not a tick: no run row, no outer timeout) -> its
-# argv. inbox_api.py serve only serves HTTP, stores the message and wakes this runner
-# (§3.7); the runner's own `inbox` / `inbox_verify` jobs above do the triage, delivery and
-# verification.
-SUPERVISED: dict[str, tuple[str, ...]] = {"inbox_api": ("inbox_api.py", "serve")}
+# argv. None since phase 5b K4: the inbox API (web.py serve) is the web service's, a container of its own;
+# it stores the message and wakes this runner (§3.7), and the `inbox` / `inbox_verify` jobs above do the
+# triage, delivery and verification.
+SUPERVISED: dict[str, tuple[str, ...]] = {}
 # What this image's runner runs: every job (§4: each cut-over step S2-S7 moved jobs here and removed
 # their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
@@ -1458,6 +1460,12 @@ def serve(owns: Optional[frozenset[str]] = None) -> int:
     runner: Optional[Runner] = None
     try:
         conn = store.connect()
+        try:
+            service.ensure_key()             # K3/K4: the master key must load and match before anything runs
+        except service.ServiceError as e:
+            failstop.fail("masterkey", "the master key is not usable", str(e), log=log)
+            conn.close()
+            return service.EXIT_REFUSED
         runner = Runner(conn, owns=o)
         r = runner
         Watchdog(lambda: r.beat_mono, stale=STALE_LOOP, every=WATCHDOG_EVERY).start()   # (read now: tests patch them)

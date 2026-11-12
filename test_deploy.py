@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for tools/deploy.py (D-257, the 21.10. incident): the container-quiet wait logic,
-with fake `docker top` output and a fake clock/sleep (no docker, no real waiting)."""
+"""Tests for tools/deploy.py (D-257, the 21.10. incident; three services since phase 5b K4): the
+container-quiet wait logic, the three-service flow and the health wait, with fake `docker` output, stub
+subprocess calls and a fake clock/sleep (no docker, no real waiting)."""
 import os
 import sys
 import unittest
@@ -26,8 +27,9 @@ REVIEW = IDLE + ["8       python3 /mnt/BlockVolume/Claude/work/AFClaude/usage_re
 
 
 class FakeCompleted:
-    def __init__(self, stdout, returncode=0):
+    def __init__(self, stdout, returncode=0, stderr=""):
         self.stdout = stdout
+        self.stderr = stderr
         self.returncode = returncode
 
 
@@ -178,6 +180,8 @@ class MainGuardTest(unittest.TestCase):
         calls = []
         with mock.patch.object(deploy, "check_start_guard", side_effect=guards), \
              mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "check_data", return_value="/data/afclaude.db"), \
+             mock.patch.object(deploy, "check_old_container", return_value=True), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: calls.append("drain") or drained), \
              mock.patch.object(deploy.runner, "undrain", side_effect=lambda *a: calls.append("undrain")), \
@@ -221,6 +225,192 @@ class SchedulerModeTest(unittest.TestCase):
             with open(env, "w") as fh:
                 fh.write("AFCLAUDE_SCHEDULER=on\n")
             self.assertEqual(deploy.scheduler_mode(env, {}), "on")
+
+
+class EnvValueTest(unittest.TestCase):
+    def test_environment_first_then_the_last_env_file_line(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, ".env")
+            self.assertEqual(deploy.env_value("X", env, {}), "")
+            with open(env, "w") as fh:
+                fh.write("X=1\nX='2'\n")
+            self.assertEqual(deploy.env_value("X", env, {}), "2")
+            self.assertEqual(deploy.env_value("X", env, {"X": "3"}), "3")
+
+
+class ThreeServicesTest(unittest.TestCase):
+    """The pieces of the three-service deploy: data check, old container, compose files, health wait."""
+
+    def test_container_names(self):
+        self.assertEqual(deploy.container_names("afclaude"),
+                         ["afclaude-runner", "afclaude-mcp", "afclaude-web"])
+        self.assertEqual(deploy.container_names("x"), ["x-runner", "x-mcp", "x-web"])
+
+    def test_check_data_refuses_unset_and_a_directory_without_a_database(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, mock.patch("builtins.print") as out:
+            with mock.patch.object(deploy, "env_value", return_value=""):
+                self.assertIsNone(deploy.check_data())
+            self.assertIn("AFCLAUDE_DATA is not set", out.call_args[0][0])
+            with mock.patch.object(deploy, "env_value", return_value=d):
+                self.assertIsNone(deploy.check_data())
+            self.assertIn("no database", out.call_args[0][0])
+            open(os.path.join(d, "afclaude.db"), "w").close()
+            old = deploy.store.DB_PATH
+            try:
+                with mock.patch.object(deploy, "env_value", return_value=d):
+                    self.assertEqual(deploy.check_data(), os.path.join(d, "afclaude.db"))
+                self.assertEqual(deploy.store.DB_PATH, os.path.join(d, "afclaude.db"))   # the drain uses it
+            finally:
+                deploy.store.DB_PATH = old
+
+    def test_the_old_single_container_blocks_the_deploy(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return FakeCompleted("afclaude\n")
+        self.assertTrue(deploy.old_container_running(run, "afclaude"))
+        self.assertIn("name=^afclaude$", seen[0])
+        self.assertFalse(deploy.old_container_running(lambda c, **k: FakeCompleted("afclaude-runner\n"), "afclaude"))
+        self.assertFalse(deploy.old_container_running(lambda c, **k: FakeCompleted(""), "afclaude"))
+        with self.assertRaises(RuntimeError):
+            deploy.old_container_running(lambda c, **k: FakeCompleted("", 1), "afclaude")
+        with mock.patch.object(deploy, "old_container_running", return_value=True), mock.patch("builtins.print") as out:
+            self.assertFalse(deploy.check_old_container())
+        self.assertIn("old layout", out.call_args[0][0])
+
+    def test_compose_command_with_overrides(self):
+        with mock.patch.object(deploy, "env_value", return_value=""):
+            self.assertEqual(deploy.compose_command("up", "-d"), ["docker", "compose", "-f", deploy.COMPOSE_FILE, "up", "-d"])
+        with mock.patch.object(deploy, "env_value", return_value="compose.host-mounts.yml, compose.subnet.yml"):
+            cmd = deploy.compose_command("up")
+        self.assertEqual([os.path.basename(x) for x in cmd if x.endswith(".yml")],
+                         ["compose.yml", "compose.host-mounts.yml", "compose.subnet.yml"])
+        for bad in ("../x.yml", "/etc/x.yml", "x.sh"):
+            with mock.patch.object(deploy, "env_value", return_value=bad), self.assertRaises(ValueError):
+                deploy.compose_command("up")
+
+    def test_health_state_from_inspect(self):
+        import json
+
+        def inspect(state):
+            return lambda c, **k: FakeCompleted(json.dumps([{"State": state}]))
+        self.assertEqual(deploy.health_state("c", inspect({"Status": "running", "Health": {
+            "Status": "unhealthy", "Log": [{"Output": "a"}, {"Output": "no answer\n"}]}})), ("unhealthy", "no answer"))
+        self.assertEqual(deploy.health_state("c", inspect({"Status": "running", "Health": {"Status": "starting", "Log": []}})),
+                         ("starting", ""))
+        self.assertEqual(deploy.health_state("c", inspect({"Status": "running"})), ("none", ""))
+        self.assertEqual(deploy.health_state("c", inspect({"Status": "restarting"})), ("restarting", ""))
+        self.assertEqual(deploy.health_state("c", lambda c, **k: FakeCompleted("", 1))[0], "missing")
+
+    def _wait(self, script, max_wait=60):
+        """script: [{container: (state, output)}, ...] per poll; the last repeats. -> (ok, messages)."""
+        polls = iter(script)
+        current = {}
+        msgs, clock = [], [0.0]
+
+        def state(c):
+            return current[c]
+
+        def sleep(s):
+            clock[0] += s
+        # advance the script once per round of three states
+        cs = ["a", "b", "c"]
+
+        def lister(c):
+            if c == cs[0]:
+                nonlocal current
+                try:
+                    current = next(polls)
+                except StopIteration:
+                    pass
+            return current[c]
+        ok = deploy.wait_healthy(cs, timedelta(seconds=max_wait), poll=5, state=lister, sleep=sleep,
+                                 clock=lambda: clock[0], out=msgs.append)
+        return ok, msgs
+
+    def test_waits_for_all_three_then_reports_healthy(self):
+        H, S = ("healthy", ""), ("starting", "")
+        ok, msgs = self._wait([{"a": H, "b": S, "c": S}, {"a": H, "b": H, "c": S}, {"a": H, "b": H, "c": H}])
+        self.assertTrue(ok)
+        self.assertIn("healthy: a, b, c", msgs[-1])
+
+    def test_one_unhealthy_fails_at_once_with_its_output(self):
+        ok, msgs = self._wait([{"a": ("healthy", ""), "b": ("unhealthy", "no answer on 127.0.0.1:8000"), "c": ("starting", "")}])
+        self.assertFalse(ok)
+        self.assertIn("b is unhealthy (no answer on 127.0.0.1:8000)", msgs[-1])
+
+    def test_an_exited_or_missing_service_fails(self):
+        for bad in ("exited", "missing", "none", "restarting"):
+            ok, msgs = self._wait([{"a": ("healthy", ""), "b": ("healthy", ""), "c": (bad, "")}])
+            self.assertFalse(ok, bad)
+            self.assertIn(f"c is {bad}", msgs[-1])
+
+    def test_a_wait_that_runs_out_fails(self):
+        S = ("starting", "")
+        ok, msgs = self._wait([{"a": S, "b": S, "c": S}], max_wait=12)
+        self.assertFalse(ok)
+        self.assertIn("NOT healthy after", msgs[-1])
+        self.assertIn("a, b, c", msgs[-1])
+
+
+class MainFlowTest(unittest.TestCase):
+    """main() end to end with stubs: drain the runner, recreate the three services with one compose call,
+    wait for three health checks; an unhealthy service is exit 1."""
+
+    def _main(self, argv=(), compose_rc=0, healthy=True):
+        events = []
+        runs = []
+
+        def run(cmd, **kw):
+            runs.append((cmd, kw.get("env", {}).get("AFCLAUDE_CODE_VERSION")))
+            events.append("compose")
+            return FakeCompleted("", compose_rc)
+        with mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "check_data", return_value="/d/afclaude.db"), \
+             mock.patch.object(deploy, "check_old_container", return_value=True), \
+             mock.patch.object(deploy, "check_start_guard", return_value=True), \
+             mock.patch.object(deploy, "env_value", return_value=""), \
+             mock.patch.object(deploy, "code_version", return_value="abc1234"), \
+             mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+             mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: events.append("drain") or 0), \
+             mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
+             mock.patch.object(deploy, "wait_healthy", side_effect=lambda cs, t, **k: events.append(("health", tuple(cs))) or healthy), \
+             mock.patch.object(deploy.subprocess, "run", side_effect=run), \
+             mock.patch("builtins.print"):
+            rc = deploy.main(list(argv))
+        return rc, events, runs
+
+    def test_order_drain_quiet_recreate_health(self):
+        rc, events, runs = self._main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["drain", "top afclaude-runner", "compose",
+                                  ("health", ("afclaude-runner", "afclaude-mcp", "afclaude-web"))])
+        cmd, version = runs[0]
+        self.assertEqual(cmd[:4], ["docker", "compose", "-f", deploy.COMPOSE_FILE])
+        self.assertEqual(cmd[-3:], ["up", "-d", "--build"])
+        self.assertEqual(version, "abc1234")
+
+    def test_unhealthy_after_the_recreate_is_exit_1(self):
+        self.assertEqual(self._main(healthy=False)[0], 1)
+
+    def test_a_failed_compose_is_its_exit_code_and_waits_for_nothing(self):
+        rc, events, _ = self._main(compose_rc=17)
+        self.assertEqual(rc, 17)
+        self.assertNotIn("health", [e[0] for e in events if isinstance(e, tuple)])
+
+    def test_data_or_old_container_refusal_touches_nothing(self):
+        for which in ("check_data", "check_old_container"):
+            with mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+                 mock.patch.object(deploy, "check_data", return_value="/d/db"), \
+                 mock.patch.object(deploy, "check_old_container", return_value=True), \
+                 mock.patch.object(deploy, which, return_value=None if which == "check_data" else False), \
+                 mock.patch.object(deploy, "check_start_guard", side_effect=AssertionError("no guard")), \
+                 mock.patch.object(deploy.store, "connect", side_effect=AssertionError("no drain")), \
+                 mock.patch("builtins.print"):
+                self.assertEqual(deploy.main([]), 1, which)
 
 
 if __name__ == "__main__":

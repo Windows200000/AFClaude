@@ -919,4 +919,12 @@ def request_brief(r: Mapping[str, Any]) -> dict[str, Any]:
                     "at": bt(r["ts"]), "by": r["actor"], "tmux": res.get("tmux"), "reason": res.get("reason")})
 
 if __name__ == "__main__":
-    server.run("stdio")
+    # `afclaude mcp` = stdio (what the registrations run); `serve` / `health` are the mcp service's (K4)
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+    if cmd == "stdio":
+        server.run("stdio")
+    elif cmd in ("serve", "health"):
+        import mcp_service
+        sys.exit(mcp_service.main(sys.argv[1:]))
+    else:
+        sys.exit(f"usage: mcp_server.py [stdio|serve|health] (got {cmd!r})")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The inbox's HTTP endpoint (D-178, D-241; inbox.py has the overview): the only way a message typed
-on the temp dashboard reaches the DB. A tiny stdlib HTTP server on a unix socket (no port), run in
-the afclaude container (`inbox_api.py serve`); the quickview's nginx proxies /afclaude/api/ to the
-socket (quickview/nginx.conf: the socket's directory data/api/ is mounted into that container), so
+on the temp dashboard reaches the DB. The routes of the web service (web.py, K4: `afclaude web`) as a Starlette
+app on a unix socket (no port); the quickview's nginx proxies /afclaude/api/ to the socket
+(quickview/nginx.conf: the socket's directory data/api/ is mounted into that container), so
 nothing new is published and the request has passed nginx's X-AFClaude-Key check (D-150) first.
 
   GET  /afclaude/api/inbox               the box: the messages on their way, the thread cards (inbox.view)
@@ -31,26 +31,27 @@ go through actions.py (inbox.post / retry / dismiss, notice.dismiss, question.an
 owner, via dashboard: audited).
 
 Phase 3a S7 (docs/phase3a_plan.md §5 S7): this process only serves HTTP; a post or a retry wakes
-the resident runner (runner.wake), whose own `inbox` / `inbox_verify` jobs do the triage, delivery
-and verification (inbox_worker.py). The runner supervises `serve` as a child (restart + alert); the
-server writes its own log lines to data/inbox_api.log (log_to_file, once it is serving). The legacy
-mode's worker thread and its `ensure` watchdog are gone since S9.
-
-  inbox_api.py serve [--socket PATH]    the server (one per data/: a lock file), started by the runner
+the resident runner (runner.wake: a datagram on data/run/runner.sock, so it reaches the runner's container
+through the shared data directory), whose own `inbox` / `inbox_verify` jobs do the triage, delivery
+and verification (inbox_worker.py). Phase 5b K4 moved the server out of the runner (it was its supervised
+child) into the web service, a container of its own: its lines go to stdout (docker logs) and the old
+data/inbox_api.log is no longer written; the single-instance lock and the unix-socket serving are web.py's.
 """
 from __future__ import annotations
 
-import argparse
-import fcntl
 import hmac
 import json
 import os
 import re
-import socketserver
 import sys
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler
-from typing import IO, Any, Protocol
+from typing import Any, Mapping, Protocol
+
+from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -58,10 +59,6 @@ import actions  # noqa: E402
 import inbox  # noqa: E402
 import store  # noqa: E402
 
-DATA = os.environ.get("AFCLAUDE_DATA_DIR") or os.path.join(HERE, "data")
-SOCKET = os.environ.get("AFCLAUDE_INBOX_SOCKET") or os.path.join(DATA, "api", "inbox.sock")
-LOCK = os.path.join(DATA, ".inbox_api.lock")
-LOG = os.path.join(DATA, "inbox_api.log")
 KEY_FILE = os.environ.get("AFCLAUDE_INBOX_KEY_FILE", "/run/secrets/afclaude_quickview.key")
 KEY_HEADER = "X-AFClaude-Key"
 PREFIX = "/afclaude/api/inbox"
@@ -94,239 +91,169 @@ class HTTPError(Exception):
 
 
 class Waker(Protocol):
-    """_WakeRunner (the resident runner, S7), or a threading.Event in tests: the HTTP handler only
-    ever calls `.set()` on it."""
+    """_WakeRunner (the resident runner, S7), or a threading.Event in tests: the handlers only
+    ever call `.set()` on it."""
     def set(self) -> None: ...
 
 
-class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-
-    def __init__(self, path: str, key_file: str, wake: Waker) -> None:
-        self.key_file, self.wake = key_file, wake
-        super().__init__(path, Handler)
-
-
-class Handler(BaseHTTPRequestHandler):
-    server: Server
-    server_version = "afclaude-inbox"
-    sys_version = ""
-
-    def address_string(self) -> str:      # a unix socket has no client address
-        return "unix"
-
-    def log_message(self, format: str, *args: Any) -> None:
-        log("http " + (format % args))
-
-    # ---- plumbing
-    def reply(self, status: int, body: object) -> None:
-        data = json.dumps(body, ensure_ascii=False, default=str).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def check_key(self) -> None:
-        want = read_key(self.server.key_file)
-        if want is None:
-            raise HTTPError(503, "the inbox has no key configured; refusing every request")
-        got = self.headers.get(KEY_HEADER) or ""
-        if not hmac.compare_digest(got.encode(), want.encode()):
-            raise HTTPError(401, "unauthorized")
-
-    def json_body(self) -> dict[str, Any]:
-        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype != "application/json":
-            raise HTTPError(415, "the body must be application/json")
-        try:
-            size = int(self.headers.get("Content-Length") or "")
-        except ValueError:
-            raise HTTPError(411, "Content-Length required") from None
-        if size < 0 or size > BODY_MAX:
-            raise HTTPError(413, f"the body is too large (> {BODY_MAX} bytes)")
-        try:
-            body = json.loads(self.rfile.read(size).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPError(400, "the body is not valid JSON") from None
-        if not isinstance(body, dict):
-            raise HTTPError(400, "the body must be a JSON object")
-        return body
-
-    def handle_api(self, method: str) -> None:
-        try:
-            self.check_key()
-            path = self.path.split("?", 1)[0]
-            conn = store.connect()
-            try:
-                status, body = self.route(conn, method, path)
-            finally:
-                conn.close()
-            self.reply(status, body)
-        except HTTPError as e:
-            self.reply(e.status, {"error": e.message})
-        except actions.Forbidden as e:
-            self.reply(403, {"error": str(e)})
-        except store.NotFound as e:
-            self.reply(404, {"error": e.args[0] if e.args else "not found"})
-        except store.InvalidTransition as e:
-            self.reply(409, {"error": str(e)})
-        except ValueError as e:
-            self.reply(400, {"error": str(e)})
-        except Exception as e:   # noqa: BLE001 - the DB error path (already reported) and anything else
-            log(f"ERROR {method} {self.path}: {type(e).__name__}: {e}")
-            self.reply(503, {"error": f"{type(e).__name__}: {str(e)[:300]}"})
-
-    def route(self, conn: Any, method: str, path: str) -> tuple[int, object]:
-        if path == PREFIX:
-            if method == "GET":
-                return 200, inbox.view(conn)
-            body = self.json_body()
-            if set(body) - {"text", "parent"}:
-                raise HTTPError(400, f"unknown field(s) {sorted(set(body) - {'text', 'parent'})}")
-            if not inbox.rate_ok(conn):
-                raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
-            params = {"text": body.get("text"), **({"parent": body["parent"]} if "parent" in body else {})}
-            m = actions.perform(conn, "inbox.post", params, actor=ACTOR, via=VIA)
-            log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)" +
-                (f", follow-up in the thread of #{m['parent_id']}" if m["parent_id"] is not None else ""))
-            self.server.wake.set()
-            return 201, inbox.message_view(m)
-        question = QUESTION_RE.match(path)
-        if question:
-            if method != "POST":
-                raise HTTPError(405, "method not allowed")
-            return self.question(conn, int(question.group(1)), question.group(2))
-        notice = NOTICE_RE.match(path)
-        if notice:
-            if method != "POST":
-                raise HTTPError(405, "method not allowed")
-            self.json_body()
-            n = actions.perform(conn, "notice.dismiss", {"notice_id": int(notice.group(1))}, actor=ACTOR, via=VIA)
-            log(f"notice #{n['id']}: dismissed by the owner")
-            return 200, inbox.notice_view(n)
-        hit = MSG_RE.match(path)
-        if hit and method == "POST":
-            self.json_body()
-            verb = hit.group(2)
-            m = actions.perform(conn, f"inbox.{verb}", {"message_id": int(hit.group(1))}, actor=ACTOR, via=VIA)
-            log(f"inbox #{m['id']}: {'retried' if verb == 'retry' else 'dismissed'} by the owner")
-            if verb == "retry":
-                self.server.wake.set()
-            return 200, inbox.message_view(m)
-        raise HTTPError(404 if not hit else 405, "not found" if not hit else "method not allowed")
-
-    def question(self, conn: Any, qid: int, verb: str) -> tuple[int, object]:
-        """The owner answers question `qid` (D-300): "answer" a plain one, "decide" one about a decision
-        entry. Same JSON, size and rate rules as the box; a message the answer writes counts as one."""
-        body = self.json_body()
-        extra = set(body) - QUESTION_FIELDS[verb]
-        if extra:
-            raise HTTPError(400, f"unknown field(s) {sorted(extra)}")
-        typed = any(isinstance(body.get(k), str) and body[k].strip() for k in ("text", "note"))
-        if (verb == "answer" or typed) and not inbox.rate_ok(conn):
-            raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
-        if verb == "answer":
-            r = actions.perform(conn, "question.answer",
-                                {"task_id": qid, **{k: body[k] for k in ("answer", "option") if k in body}},
-                                actor=ACTOR, via=VIA)
-        else:
-            r = actions.perform(conn, "question.decide",
-                                {"task_id": qid, "choice": body.get("choice"), "decision_version": body.get("version"),
-                                 **{k: body[k] for k in ("text", "note") if k in body}}, actor=ACTOR, via=VIA)
-        mid = r.get("inbox")
-        log(f"question #{qid}: {'answered' if verb == 'answer' else 'decided'} by the owner" + (f", inbox #{mid}" if mid else ""))
-        if verb == "answer" and mid:
-            self.server.wake.set()
-        return 200, {"question": qid, "status": "done", "inbox": mid}
-
-    def do_GET(self) -> None:
-        self.handle_api("GET")
-
-    def do_POST(self) -> None:
-        self.handle_api("POST")
-
-    def _not_allowed(self) -> None:
-        self.reply(405, {"error": "method not allowed"})
-
-    do_PUT = do_DELETE = do_PATCH = _not_allowed
-
-
-def bind(path: str, key_file: str, wake: Waker) -> Server:
-    """The server on a fresh socket at `path` (its directory 0755, the socket 0666: nginx's worker
-    in the quickview container runs as another user; the key check guards every request)."""
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True)
-    os.chmod(d, 0o755)
-    if os.path.exists(path):
-        os.unlink(path)        # a stale socket of a dead server (the lock says none runs)
-    srv = Server(path, key_file, wake)
-    os.chmod(path, 0o666)
-    return srv
-
-
-def take_lock() -> IO[str] | None:
-    os.makedirs(DATA, exist_ok=True)
-    fh = open(LOCK, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fh.close()
-        return None
-    return fh
-
-
-class _WakeRunner:
-    """The resident runner's wake (S7): a `.set()` that sends it a datagram, the HTTP handler's one
-    `self.server.wake.set()` call (route()). Never blocks or raises (runner.wake's own contract)."""
+class WakeRunner:
+    """The resident runner's wake (S7): a `.set()` that sends it a datagram, the handlers' one
+    `wake.set()` call (route()). Never blocks or raises (runner.wake's own contract)."""
     def set(self) -> None:
         import runner
         runner.wake()
 
 
-def log_to_file() -> None:
-    """Point this process's stdout and stderr at data/inbox_api.log (append). Under the runner the
-    child's output is a pipe the runner only reads
-    when the child exits (an alert's tail), so the running server's own lines (posted, http, tracebacks)
-    would otherwise never reach the log the docs name. Opened only once the server really starts: an early
-    exit (lock held, no key) keeps its line on the pipe, which is what the runner's alert quotes."""
-    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+def reply(status: int, body: object) -> Response:
+    data = json.dumps(body, ensure_ascii=False, default=str).encode()
+    return Response(data, status_code=status, media_type="application/json; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+
+
+def check_key(headers: Mapping[str, str], key_file: str) -> None:
+    want = read_key(key_file)
+    if want is None:
+        raise HTTPError(503, "the inbox has no key configured; refusing every request")
+    got = headers.get(KEY_HEADER.lower()) or ""
+    if not hmac.compare_digest(got.encode(), want.encode()):
+        raise HTTPError(401, "unauthorized")
+
+
+def json_body(headers: Mapping[str, str], raw: bytes | None) -> dict[str, Any]:
+    """The request's JSON object. `raw` is the body as read before (None: not read, because the
+    Content-Length was missing, bad or over BODY_MAX: the matching error is raised here)."""
+    ctype = (headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        raise HTTPError(415, "the body must be application/json")
     try:
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-    finally:
-        os.close(fd)
-
-
-def serve(path: str) -> int:
-    lock = take_lock()
-    if lock is None:
-        log("another inbox_api.py serve holds the lock; exiting")
-        return 0
-    if read_key(KEY_FILE) is None:      # fail fast: without the key every request would be refused
-        log(f"ERROR: no key in {KEY_FILE}; not serving (the runner alerts it)")
-        lock.close()
-        return 1
-    log_to_file()                      # the runner does not write this child's output to the log
-    srv = bind(path, KEY_FILE, _WakeRunner())     # S7: the runner's own `inbox` / `inbox_verify` jobs do the work
-    log(f"inbox API listening on {path} (pid {os.getpid()})")
+        size = int(headers.get("content-length") or "")
+    except ValueError:
+        raise HTTPError(411, "Content-Length required") from None
+    if size < 0 or size > BODY_MAX:
+        raise HTTPError(413, f"the body is too large (> {BODY_MAX} bytes)")
     try:
-        srv.serve_forever()
-    finally:
-        srv.server_close()
-        lock.close()
-    return 0
+        body = json.loads((raw or b"").decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPError(400, "the body is not valid JSON") from None
+    if not isinstance(body, dict):
+        raise HTTPError(400, "the body must be a JSON object")
+    return body
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="The inbox's HTTP endpoint (D-178/D-241).")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("serve", help="run the server on the unix socket")
-    p.add_argument("--socket", default=SOCKET)
-    args = ap.parse_args(argv)
-    return serve(args.socket)
+async def read_body(request: Request) -> bytes | None:
+    """The body, read only when its declared length is sane (json_body() complains about the rest)."""
+    declared = request.headers.get("content-length") or ""
+    if not declared.isdigit() or int(declared) > BODY_MAX:
+        return None
+    return await request.body()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def route(conn: Any, method: str, path: str, headers: Mapping[str, str], raw: bytes | None,
+          wake: Waker) -> tuple[int, object]:
+    def body_of() -> dict[str, Any]:
+        return json_body(headers, raw)
+    if path == PREFIX:
+        if method == "GET":
+            return 200, inbox.view(conn)
+        body = body_of()
+        if set(body) - {"text", "parent"}:
+            raise HTTPError(400, f"unknown field(s) {sorted(set(body) - {'text', 'parent'})}")
+        if not inbox.rate_ok(conn):
+            raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
+        params = {"text": body.get("text"), **({"parent": body["parent"]} if "parent" in body else {})}
+        m = actions.perform(conn, "inbox.post", params, actor=ACTOR, via=VIA)
+        log(f"inbox #{m['id']}: posted ({len(m['text'])} characters)" +
+            (f", follow-up in the thread of #{m['parent_id']}" if m["parent_id"] is not None else ""))
+        wake.set()
+        return 201, inbox.message_view(m)
+    question = QUESTION_RE.match(path)
+    if question:
+        if method != "POST":
+            raise HTTPError(405, "method not allowed")
+        return answer_question(conn, int(question.group(1)), question.group(2), body_of(), wake)
+    notice = NOTICE_RE.match(path)
+    if notice:
+        if method != "POST":
+            raise HTTPError(405, "method not allowed")
+        body_of()
+        n = actions.perform(conn, "notice.dismiss", {"notice_id": int(notice.group(1))}, actor=ACTOR, via=VIA)
+        log(f"notice #{n['id']}: dismissed by the owner")
+        return 200, inbox.notice_view(n)
+    hit = MSG_RE.match(path)
+    if hit and method == "POST":
+        body_of()
+        verb = hit.group(2)
+        m = actions.perform(conn, f"inbox.{verb}", {"message_id": int(hit.group(1))}, actor=ACTOR, via=VIA)
+        log(f"inbox #{m['id']}: {'retried' if verb == 'retry' else 'dismissed'} by the owner")
+        if verb == "retry":
+            wake.set()
+        return 200, inbox.message_view(m)
+    raise HTTPError(404 if not hit else 405, "not found" if not hit else "method not allowed")
+
+
+def answer_question(conn: Any, qid: int, verb: str, body: dict[str, Any], wake: Waker) -> tuple[int, object]:
+    """The owner answers question `qid` (D-300): "answer" a plain one, "decide" one about a decision
+    entry. Same JSON, size and rate rules as the box; a message the answer writes counts as one."""
+    extra = set(body) - QUESTION_FIELDS[verb]
+    if extra:
+        raise HTTPError(400, f"unknown field(s) {sorted(extra)}")
+    typed = any(isinstance(body.get(k), str) and body[k].strip() for k in ("text", "note"))
+    if (verb == "answer" or typed) and not inbox.rate_ok(conn):
+        raise HTTPError(429, f"more than {inbox.RATE_MAX} messages in the last hour; wait a little")
+    if verb == "answer":
+        r = actions.perform(conn, "question.answer",
+                            {"task_id": qid, **{k: body[k] for k in ("answer", "option") if k in body}},
+                            actor=ACTOR, via=VIA)
+    else:
+        r = actions.perform(conn, "question.decide",
+                            {"task_id": qid, "choice": body.get("choice"), "decision_version": body.get("version"),
+                             **{k: body[k] for k in ("text", "note") if k in body}}, actor=ACTOR, via=VIA)
+    mid = r.get("inbox")
+    log(f"question #{qid}: {'answered' if verb == 'answer' else 'decided'} by the owner" + (f", inbox #{mid}" if mid else ""))
+    if verb == "answer" and mid:
+        wake.set()
+    return 200, {"question": qid, "status": "done", "inbox": mid}
+
+
+def handle(method: str, path: str, headers: Mapping[str, str], raw: bytes | None, key_file: str,
+           wake: Waker) -> Response:
+    """One request after the body was read: the key check, a DB connection, route(), and the error
+    mapping (a store error that is the caller's is a 4xx, the rest a 503 with the class and message)."""
+    try:
+        check_key(headers, key_file)
+        conn = store.connect()
+        try:
+            status, body = route(conn, method, path, headers, raw, wake)
+        finally:
+            conn.close()
+        return reply(status, body)
+    except HTTPError as e:
+        return reply(e.status, {"error": e.message})
+    except actions.Forbidden as e:
+        return reply(403, {"error": str(e)})
+    except store.NotFound as e:
+        return reply(404, {"error": e.args[0] if e.args else "not found"})
+    except store.InvalidTransition as e:
+        return reply(409, {"error": str(e)})
+    except ValueError as e:
+        return reply(400, {"error": str(e)})
+    except Exception as e:   # noqa: BLE001 - the DB error path (already reported) and anything else
+        log(f"ERROR {method} {path}: {type(e).__name__}: {e}")
+        return reply(503, {"error": f"{type(e).__name__}: {str(e)[:300]}"})
+
+
+def routes(key_file: str, wake: Waker) -> list[Route]:
+    """The inbox API as Starlette routes: one catch-all, because the old server answered every path
+    with the same JSON errors (401 before 404, 405 for any other method, JSON bodies throughout)."""
+    async def endpoint(request: Request) -> Response:
+        if request.method not in ("GET", "POST"):
+            return reply(405, {"error": "method not allowed"})
+        raw = await read_body(request) if request.method == "POST" else None
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        return await run_in_threadpool(handle, request.method, request.url.path, headers, raw, key_file, wake)
+
+    return [Route("/{path:path}", endpoint, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])]
+
+
+def app(key_file: str, wake: Waker) -> Starlette:
+    return Starlette(routes=routes(key_file, wake))

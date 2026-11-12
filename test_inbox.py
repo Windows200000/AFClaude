@@ -33,6 +33,7 @@ import host  # noqa: E402
 import inbox  # noqa: E402
 import prompts  # noqa: E402
 import inbox_api  # noqa: E402
+import web  # noqa: E402
 import inbox_worker as iw  # noqa: E402
 import keepalive as ka  # noqa: E402
 import runner_state  # noqa: E402
@@ -1129,8 +1130,7 @@ class Endpoint(DB):
             fh.write(self.KEY + "\n")
         self.sock = os.path.join(self.tmp.name, "api", "inbox.sock")
         self.wake = threading.Event()
-        self.srv = inbox_api.bind(self.sock, self.keyfile, self.wake)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.srv = web.bind(self.sock, self.keyfile, self.wake)
 
     def tearDown(self):
         self.srv.shutdown()
@@ -1265,46 +1265,6 @@ class Endpoint(DB):
         st, err = self.call("POST", body={"text": "one more"})
         self.assertEqual(st, 429)
         self.assertIn("last hour", err["error"])
-
-    def test_serve_refuses_to_start_without_a_key(self):
-        old = inbox_api.KEY_FILE, inbox_api.LOCK
-        inbox_api.KEY_FILE = os.path.join(self.tmp.name, "missing.key")
-        inbox_api.LOCK = os.path.join(self.tmp.name, "lock")
-        try:
-            self.assertEqual(inbox_api.serve(os.path.join(self.tmp.name, "x.sock")), 1)
-        finally:
-            inbox_api.KEY_FILE, inbox_api.LOCK = old
-        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x.sock")))
-
-    def test_serve_writes_its_log_lines_to_the_log_file(self):
-        """S7 follow-up: under the runner the child's stdout is a pipe nobody reads while it runs;
-        `serve` must put its lines (posted, http) in data/inbox_api.log itself."""
-        data = os.path.join(self.tmp.name, "data")
-        sock = os.path.join(self.tmp.name, "child", "inbox.sock")
-        env = dict(os.environ, AFCLAUDE_DATA_DIR=data, AFCLAUDE_INBOX_KEY_FILE=self.keyfile,
-                   AFCLAUDE_INBOX_SOCKET=sock)
-        proc = subprocess.Popen([sys.executable, "-u", os.path.join(HERE, "inbox_api.py"), "serve",
-                                 "--socket", sock], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        try:
-            for _ in range(100):
-                if os.path.exists(sock):
-                    break
-                time.sleep(0.1)
-            self.assertTrue(os.path.exists(sock), "the server did not start")
-            c = UnixHTTP(sock)
-            c.request("POST", "/afclaude/api/inbox", body=json.dumps({"text": "hello"}).encode(),
-                      headers={"X-AFClaude-Key": self.KEY, "Content-Type": "application/json"})
-            r = c.getresponse()
-            self.assertEqual(r.status, 201)
-            r.read()
-            c.close()
-        finally:
-            proc.terminate()
-            out = proc.communicate(timeout=10)[0].decode()
-        with open(os.path.join(data, "inbox_api.log")) as fh:
-            logged = fh.read()
-        self.assertRegex(logged, r"inbox #\d+: posted \(5 characters\)")
-        self.assertNotIn("posted", out)      # not duplicated into the runner's pipe
 
 
 # ---------------------------------------------------------------- the CLI and the quickview

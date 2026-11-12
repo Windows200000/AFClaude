@@ -414,6 +414,9 @@ class DeployGap(V4Env):
                 mock.patch.object(deploy, "check_start_guard", return_value=True), \
                 mock.patch.object(deploy, "check_scheduler_mode", return_value=True), \
                 mock.patch.object(deploy, "wait_clear", return_value=True), \
+                mock.patch.object(deploy, "check_data", return_value=self.path), \
+                mock.patch.object(deploy, "check_old_container", return_value=True), \
+                mock.patch.object(deploy, "wait_healthy", return_value=True), \
                 mock.patch.object(deploy, "code_version", return_value="abc1234"), \
                 mock.patch.object(deploy.runner, "wake", return_value=True), \
                 mock.patch.object(deploy.subprocess, "run", side_effect=fake_run), \
@@ -930,9 +933,10 @@ class Entrypoint(unittest.TestCase):
 
     def test_a_failed_migrate_idles_instead_of_starting_the_runner(self):
         r, calls = self.run_entry(1)
-        self.assertEqual(len(calls), 2, calls)                   # the migrate, then the idle: nothing else ran
-        self.assertIn("store.py migrate", calls[0])
-        self.assertEqual(calls[1], "sleep infinity")
+        self.assertEqual(len(calls), 3, calls)                   # the mount check, the migrate, then the idle: nothing else ran
+        self.assertIn("service.py check-mount runner", calls[0])
+        self.assertIn("store.py migrate", calls[1])
+        self.assertEqual(calls[2], "sleep infinity")
         self.assertIn("migrate FAILED", r.stderr)
 
     def test_no_database_yet_and_success_go_on_to_the_runner(self):
@@ -946,13 +950,15 @@ class Entrypoint(unittest.TestCase):
         loop through migrate): the fallback alert, then the idle; neither migrate nor the runner runs."""
         for mode in ("on", "legacy"):
             r, calls = self.run_entry(0, mode)
-            self.assertEqual(len(calls), 2, (mode, calls))
-            self.assertIn("store.alert_once", calls[0])
-            self.assertIn(f"AFClaude: unknown AFCLAUDE_SCHEDULER={mode}", calls[0])
-            self.assertEqual(calls[1], "sleep infinity")
+            self.assertEqual(len(calls), 3, (mode, calls))
+            self.assertIn("service.py check-mount runner", calls[0])      # the data dir is checked first of all
+            self.assertIn("store.alert_once", calls[1])
+            self.assertIn(f"AFClaude: unknown AFCLAUDE_SCHEDULER={mode}", calls[1])
+            self.assertEqual(calls[2], "sleep infinity")
             self.assertIn("must be runner or off", r.stderr)
         r, calls = self.run_entry(0, "off")
-        self.assertIn("store.py migrate", calls[0])
+        self.assertIn("store.py migrate", calls[1])
+        self.assertIn("service.py ensure-key runner", " ".join(calls))        # the master key is checked before it idles
         self.assertEqual(calls[-1], "sleep infinity")
 
 
