@@ -13,11 +13,18 @@ directory (data/api/); nothing is published. The dashboard (phase 6) grows from 
   /afclaude/api/...   the inbox API (X-AFClaude-Key on every request, see inbox_api.py)
 
 Start: the data directory must be mounted and the master key must load (service.start, D-235: it refuses
-with a message, exit 78). Single instance per data directory (a flock); a second one exits 75.
-Without the inbox key file the service still serves /health and answers every inbox request 503 (a
-fresh install has no quickview yet); `inbox_key` in /health says so.
+with a message, exit 78). Single instance per data directory (a flock); a second one exits 75. Every
+way the service does not come up or ends unexpectedly (no inbox key, a second instance, a crash of the
+server) is a failstop.fail (alert + pause, component `web`) and exit 1/75, as the runner's supervisor
+did for the inbox API's child: docker restarts the container, the next failure is only logged while the
+pause holds. A key file that goes missing while it runs shows in /health (503, `inbox_key` false).
 
-  web.py serve [--socket PATH]    the server (the container's command)
+`serve --supervised` is the single layout's (the default until the K7 cut-over, D-339) form: the runner
+(`SUPERVISED`) starts it as its child in the old container, as it did `inbox_api.py serve`: no mount or
+master key check (the runner's start did them), its output goes to data/inbox_api.log, exit 1 without the
+key and 0 for a second instance (the runner's supervisor alerts on an exit).
+
+  web.py serve [--socket PATH] [--supervised]   the server (the container's command)
   web.py health [--socket PATH]   GET /health on the socket: exit 0 healthy (the compose health check)
 """
 from __future__ import annotations
@@ -42,6 +49,7 @@ from starlette.routing import Route
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import failstop  # noqa: E402
 import inbox_api  # noqa: E402
 import service  # noqa: E402
 import store  # noqa: E402
@@ -49,6 +57,7 @@ import store  # noqa: E402
 DATA = os.environ.get("AFCLAUDE_DATA_DIR") or os.path.join(HERE, "data")
 SOCKET = os.environ.get("AFCLAUDE_INBOX_SOCKET") or os.path.join(DATA, "api", "inbox.sock")
 LOCK = os.path.join(DATA, ".web.lock")
+LOG = os.path.join(DATA, "inbox_api.log")      # --supervised only (the old child's log)
 EXIT_LOCKED = 75                      # EX_TEMPFAIL: another web service owns this data directory
 HEALTH_TIMEOUT = 10.0
 START_TIMEOUT = 20.0
@@ -140,19 +149,57 @@ def take_lock() -> IO[str] | None:
     return fh
 
 
-def serve(path: str, key_file: str = inbox_api.KEY_FILE) -> int:
+def log_to_file() -> None:
+    """--supervised: point stdout and stderr at data/inbox_api.log (append). The runner reads its child's
+    pipes only when the child exits (an alert's tail), so the running server's own lines would otherwise
+    never reach the log. Opened only once the server really starts: an early exit keeps its line on the
+    pipe, which is what the runner's alert quotes."""
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        service.start("web", mounted=service.in_container())
-    except service.ServiceError as e:
-        return service.refuse("web", e)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+    finally:
+        os.close(fd)
+
+
+def fail(subject: str, detail: str) -> None:
+    """The web service stops: alert + pause (failstop, D-235), as the runner did for its inbox API child."""
+    failstop.fail("web", subject, detail, log=inbox_api.log)
+
+
+def serve(path: str, key_file: str = inbox_api.KEY_FILE, *, supervised: bool = False) -> int:
+    if not supervised:
+        try:
+            service.start("web", mounted=service.in_container())
+        except service.ServiceError as e:
+            return service.refuse("web", e)
     lock = take_lock()
     if lock is None:
         inbox_api.log(f"another web service holds {LOCK}; exiting")
+        if supervised:
+            return 0
+        fail("the web service was not running", f"a second web service holds {LOCK}: two containers on one data directory?")
         return EXIT_LOCKED
-    if inbox_api.read_key(key_file) is None:
-        inbox_api.log(f"no inbox key in {key_file}: /health works, every inbox request is answered 503 until it is there")
+    if inbox_api.read_key(key_file) is None:      # fail fast: without the key every inbox request would be refused
+        msg = f"no inbox key in {key_file}: not serving (the inbox API would answer every request 503)"
+        inbox_api.log(f"ERROR: {msg}")
+        lock.close()
+        if not supervised:
+            fail("the inbox API was not running", msg)
+        return 1
+    if supervised:
+        log_to_file()
     try:
         make_server(path, build_app(key_file, inbox_api.WakeRunner())).run()
+    except Exception as e:   # noqa: BLE001 - alerted, then the container restarts
+        if supervised:
+            raise                # the traceback is on the pipe the runner's alert quotes
+        fail("the web service crashed", f"{type(e).__name__}: {e}")
+        return 1
+    except SystemExit as e:  # uvicorn ends a failed start (socket bind) with sys.exit(1)
+        if e.code and not supervised:
+            fail("the web service crashed", f"the server exited with {e.code} (see docker logs)")
+        raise
     finally:
         lock.close()
     return 0
@@ -190,8 +237,11 @@ def main(argv: list[str] | None = None) -> int:
     for name, text in (("serve", "run the server on the unix socket"), ("health", "GET /health on the socket")):
         p = sub.add_parser(name, help=text)
         p.add_argument("--socket", default=SOCKET)
+        if name == "serve":
+            p.add_argument("--supervised", action="store_true",
+                           help="the single layout's child of the runner (own log file, no master key check)")
     args = ap.parse_args(argv)
-    return serve(args.socket) if args.cmd == "serve" else health_cli(args.socket)
+    return serve(args.socket, supervised=args.supervised) if args.cmd == "serve" else health_cli(args.socket)
 
 
 if __name__ == "__main__":

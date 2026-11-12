@@ -248,8 +248,13 @@ def routes(key_file: str, wake: Waker) -> list[Route]:
     async def endpoint(request: Request) -> Response:
         if request.method not in ("GET", "POST"):
             return reply(405, {"error": "method not allowed"})
-        raw = await read_body(request) if request.method == "POST" else None
         headers = {k.lower(): v for k, v in request.headers.items()}
+        if request.method == "POST":     # the key first: an unauthenticated caller's body is never waited for (review k4a L1)
+            try:
+                check_key(headers, key_file)
+            except HTTPError as e:
+                return reply(e.status, {"error": e.message})
+        raw = await read_body(request) if request.method == "POST" else None
         return await run_in_threadpool(handle, request.method, request.url.path, headers, raw, key_file, wake)
 
     return [Route("/{path:path}", endpoint, methods=["GET", "POST", "PUT", "DELETE", "PATCH"])]

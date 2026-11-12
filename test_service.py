@@ -95,6 +95,18 @@ class KeyAndStart(unittest.TestCase):
         with self.assertRaises(service.ServiceError):
             service.start("nope", mounted=False)
 
+    def test_start_without_the_key_check_is_the_single_layouts(self):
+        self.assertIsNone(service.start("web", mounted=False, key=False))
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(store.DB_PATH), "master.key")))
+
+    def test_the_layout_is_single_unless_services_is_named(self):
+        self.assertEqual(service.layout({}), "single")
+        self.assertEqual(service.layout({"AFCLAUDE_LAYOUT": ""}), "single")
+        self.assertEqual(service.layout({"AFCLAUDE_LAYOUT": "services"}), "services")
+        with self.assertRaises(service.ServiceError) as cm:
+            service.layout({"AFCLAUDE_LAYOUT": "three"})
+        self.assertIn("single, services", str(cm.exception))
+
     def test_in_container_reads_the_image_flag(self):
         self.assertTrue(service.in_container({"AFCLAUDE_IN_CONTAINER": "1"}))
         self.assertFalse(service.in_container({"AFCLAUDE_IN_CONTAINER": ""}))
@@ -172,7 +184,10 @@ class HealthReport(unittest.TestCase):
     def test_the_inbox_key_file_is_reported(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "k")
-            self.assertFalse(service.health_report(self.conn, key_file=path)["inbox_key"])
+            r = service.health_report(self.conn, key_file=path)
+            self.assertFalse(r["inbox_key"])
+            self.assertEqual(r["status"], "unhealthy")          # the inbox API can't serve: an outage (review k4a M1)
+            self.assertIn("inbox key", r["problems"][0])
             open(path, "w").close()
             self.assertFalse(service.health_report(self.conn, key_file=path)["inbox_key"])     # empty = no key
             with open(path, "w") as fh:

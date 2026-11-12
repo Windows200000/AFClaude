@@ -1,6 +1,6 @@
 # Optional override: pin the compose network's subnet (this host's, and any host whose bridge key's `from=` names
-# one). The base compose.yml pins none, so two installs or a test project never collide.
-#   docker compose -f docker/compose.yml -f docker/compose.subnet.yml up -d
+# one). The services layout's compose.services.yml pins none, so two installs or a test project never collide.
+#   docker compose -f docker/compose.services.yml -f docker/compose.subnet.yml up -d
 # host_exec.py's authorized_keys line only accepts from="172.16.0.0/12", so the subnet must lie inside it.
 networks:
   afclaude:

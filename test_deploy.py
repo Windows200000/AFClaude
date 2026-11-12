@@ -283,14 +283,32 @@ class ThreeServicesTest(unittest.TestCase):
 
     def test_compose_command_with_overrides(self):
         with mock.patch.object(deploy, "env_value", return_value=""):
-            self.assertEqual(deploy.compose_command("up", "-d"), ["docker", "compose", "-f", deploy.COMPOSE_FILE, "up", "-d"])
+            self.assertEqual(deploy.compose_command("up", "-d", lay="services"),
+                             ["docker", "compose", "-f", deploy.COMPOSE_SERVICES, "up", "-d"])
         with mock.patch.object(deploy, "env_value", return_value="compose.host-mounts.yml, compose.subnet.yml"):
-            cmd = deploy.compose_command("up")
+            cmd = deploy.compose_command("up", lay="services")
+            single = deploy.compose_command("up")     # the single layout never takes overrides (main's behaviour)
         self.assertEqual([os.path.basename(x) for x in cmd if x.endswith(".yml")],
-                         ["compose.yml", "compose.host-mounts.yml", "compose.subnet.yml"])
+                         ["compose.services.yml", "compose.host-mounts.yml", "compose.subnet.yml"])
+        self.assertEqual(single, ["docker", "compose", "-f", deploy.COMPOSE_FILE, "up"])
         for bad in ("../x.yml", "/etc/x.yml", "x.sh"):
             with mock.patch.object(deploy, "env_value", return_value=bad), self.assertRaises(ValueError):
-                deploy.compose_command("up")
+                deploy.compose_command("up", lay="services")
+
+    def test_layout_is_single_unless_chosen(self):
+        with mock.patch.object(deploy, "env_value", return_value=""):
+            self.assertEqual(deploy.layout(), "single")
+        with mock.patch.object(deploy, "env_value", return_value="services"):
+            self.assertEqual(deploy.layout(), "services")
+        with mock.patch.object(deploy, "env_value", return_value="both"), self.assertRaises(ValueError):
+            deploy.layout()
+
+    def test_the_old_container_is_found_whatever_the_name_prefix(self):
+        """compose.yml fixes the single container's name, so a services prefix must not hide it (review k4a L5)."""
+        seen = []
+        with mock.patch.object(deploy, "env_value", return_value="other"):
+            deploy.old_container_running(lambda c, **k: seen.append(c) or FakeCompleted("afclaude\n"))
+        self.assertIn("name=^afclaude$", seen[0])
 
     def test_health_state_from_inspect(self):
         import json
@@ -360,6 +378,8 @@ class MainFlowTest(unittest.TestCase):
     """main() end to end with stubs: drain the runner, recreate the three services with one compose call,
     wait for three health checks; an unhealthy service is exit 1."""
 
+    layout = "services"
+
     def _main(self, argv=(), compose_rc=0, healthy=True):
         events = []
         runs = []
@@ -369,10 +389,12 @@ class MainFlowTest(unittest.TestCase):
             events.append("compose")
             return FakeCompleted("", compose_rc)
         with mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "layout", return_value=self.layout), \
              mock.patch.object(deploy, "check_data", return_value="/d/afclaude.db"), \
              mock.patch.object(deploy, "check_old_container", return_value=True), \
              mock.patch.object(deploy, "check_start_guard", return_value=True), \
              mock.patch.object(deploy, "env_value", return_value=""), \
+             mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
              mock.patch.object(deploy, "code_version", return_value="abc1234"), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: events.append("drain") or 0), \
@@ -389,21 +411,27 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(events, ["drain", "top afclaude-runner", "compose",
                                   ("health", ("afclaude-runner", "afclaude-mcp", "afclaude-web"))])
         cmd, version = runs[0]
-        self.assertEqual(cmd[:4], ["docker", "compose", "-f", deploy.COMPOSE_FILE])
+        self.assertEqual(cmd[:4], ["docker", "compose", "-f", deploy.COMPOSE_SERVICES])
         self.assertEqual(cmd[-3:], ["up", "-d", "--build"])
         self.assertEqual(version, "abc1234")
 
-    def test_unhealthy_after_the_recreate_is_exit_1(self):
-        self.assertEqual(self._main(healthy=False)[0], 1)
+    def test_unhealthy_after_the_recreate_is_exit_1_and_alerted(self):
+        rc, events, _ = self._main(healthy=False)
+        self.assertEqual(rc, 1)
+        self.assertIn(("alert", "deploy: the services are not healthy"), events)
 
-    def test_a_failed_compose_is_its_exit_code_and_waits_for_nothing(self):
-        rc, events, _ = self._main(compose_rc=17)
+    def test_a_failed_compose_is_its_exit_code_alerts_lifts_the_drain_and_waits_for_nothing(self):
+        with mock.patch.object(deploy.runner, "undrain") as undrain:
+            rc, events, _ = self._main(compose_rc=17)
         self.assertEqual(rc, 17)
         self.assertNotIn("health", [e[0] for e in events if isinstance(e, tuple)])
+        self.assertIn(("alert", "deploy: docker compose up failed"), events)
+        undrain.assert_called_once()
 
     def test_data_or_old_container_refusal_touches_nothing(self):
         for which in ("check_data", "check_old_container"):
             with mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+                 mock.patch.object(deploy, "layout", return_value="services"), \
                  mock.patch.object(deploy, "check_data", return_value="/d/db"), \
                  mock.patch.object(deploy, "check_old_container", return_value=True), \
                  mock.patch.object(deploy, which, return_value=None if which == "check_data" else False), \
@@ -411,6 +439,89 @@ class MainFlowTest(unittest.TestCase):
                  mock.patch.object(deploy.store, "connect", side_effect=AssertionError("no drain")), \
                  mock.patch("builtins.print"):
                 self.assertEqual(deploy.main([]), 1, which)
+
+
+class SingleLayoutTest(MainFlowTest):
+    """The default until K7 (D-339): deploy.py does what main's did, whatever the services layout needs."""
+
+    layout = "single"
+
+    def test_order_drain_quiet_recreate_health(self):
+        rc, events, runs = self._main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["drain", "top afclaude", "compose"])      # no health wait, the one container
+        cmd, version = runs[0]
+        self.assertEqual(cmd, ["docker", "compose", "-f", deploy.COMPOSE_FILE, "up", "-d", "--build"])
+        self.assertTrue(deploy.COMPOSE_FILE.endswith(os.path.join("docker", "compose.yml")))
+        self.assertEqual(version, "abc1234")
+
+    def test_unhealthy_after_the_recreate_is_exit_1_and_alerted(self):
+        rc, events, _ = self._main(healthy=False)        # nothing is waited for: exit 0 as main's
+        self.assertEqual(rc, 0)
+
+    def test_data_or_old_container_refusal_touches_nothing(self):
+        """Neither check applies to the single layout (the live .env has no AFCLAUDE_DATA)."""
+        with mock.patch.object(deploy, "check_data", side_effect=AssertionError("not in single")), \
+             mock.patch.object(deploy, "check_old_container", side_effect=AssertionError("not in single")):
+            self.assertEqual(self._main()[0], 0)
+
+    def test_window_start_refusal_still_comes_first(self):
+        with mock.patch.object(deploy, "check_start_guard", return_value=False), \
+             mock.patch.object(deploy.store, "connect", side_effect=AssertionError("no drain")), \
+             mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch("builtins.print"):
+            self.assertEqual(deploy.main([]), 1)
+
+
+class LiveLikeEnvTest(unittest.TestCase):
+    """Review k4a H1: a run of deploy.py against an environment like the live one (docker/.env without
+    AFCLAUDE_DATA and without AFCLAUDE_LAYOUT) takes the single layout end to end: no data or old-container
+    refusal, compose.yml, the one container's processes, no health wait."""
+
+    ENV = ("AFCLAUDE_DIR=/srv/afclaude\nAFCLAUDE_HOST_REPO=/srv/afclaude\nHOST_HOME=/home/u\nAFCLAUDE_BRIDGE_USER=u\n"
+           "AFCLAUDE_BRIDGE_HOST=host.docker.internal\nAFCLAUDE_SUBNET=172.28.0.0/24\nAFCLAUDE_SCHEDULER=runner\n")
+
+    def _run(self, extra=""):
+        import tempfile
+        events, runs = [], []
+        with tempfile.TemporaryDirectory() as d:
+            envfile = os.path.join(d, ".env")
+            with open(envfile, "w", encoding="utf-8") as fh:
+                fh.write(self.ENV + extra)
+            clean = {k: v for k, v in os.environ.items() if not k.startswith("AFCLAUDE_")}
+            with mock.patch.dict(os.environ, clean, clear=True), \
+                 mock.patch.object(deploy, "ENV_FILE", envfile), \
+                 mock.patch.object(deploy, "check_start_guard", return_value=True), \
+                 mock.patch.object(deploy, "code_version", return_value="abc1234"), \
+                 mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+                 mock.patch.object(deploy.runner, "drain", return_value=0), \
+                 mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
+                 mock.patch.object(deploy, "old_container_running", side_effect=AssertionError("single: not asked")), \
+                 mock.patch.object(deploy, "wait_healthy", side_effect=AssertionError("single: no health wait")), \
+                 mock.patch.object(deploy.subprocess, "run", side_effect=lambda cmd, **k: runs.append(cmd) or FakeCompleted("")), \
+                 mock.patch("builtins.print"):
+                return deploy.main([]), events, runs
+
+    def test_the_live_env_picks_the_single_layout(self):
+        rc, events, runs = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["top afclaude"])
+        self.assertEqual(runs, [["docker", "compose", "-f", deploy.COMPOSE_FILE, "up", "-d", "--build"]])
+
+    def test_the_layout_key_in_the_env_file_chooses_the_services(self):
+        """The same env plus AFCLAUDE_LAYOUT=services is the other path: refused for the missing AFCLAUDE_DATA."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            envfile = os.path.join(d, ".env")
+            with open(envfile, "w", encoding="utf-8") as fh:
+                fh.write(self.ENV + "AFCLAUDE_LAYOUT=services\n")
+            clean = {k: v for k, v in os.environ.items() if not k.startswith("AFCLAUDE_")}
+            with mock.patch.dict(os.environ, clean, clear=True), mock.patch.object(deploy, "ENV_FILE", envfile), \
+                 mock.patch.object(deploy.store, "connect", side_effect=AssertionError("no drain")), \
+                 mock.patch("builtins.print") as out:
+                self.assertEqual(deploy.layout(), "services")
+                self.assertEqual(deploy.main([]), 1)
+            self.assertIn("AFCLAUDE_DATA is not set", out.call_args[0][0])
 
 
 if __name__ == "__main__":

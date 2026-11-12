@@ -1156,6 +1156,17 @@ class Endpoint(DB):
         self.assertEqual(os.stat(self.sock).st_mode & 0o777, 0o666)
         self.assertEqual(os.stat(os.path.dirname(self.sock)).st_mode & 0o777, 0o755)
 
+    def test_a_post_without_the_key_is_answered_before_its_body_is_waited_for(self):
+        """Review k4a L1: Content-Length 100 and no body must not hold a coroutine for an unauthenticated caller."""
+        import socket as _socket
+        c = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        c.settimeout(10)
+        c.connect(self.sock)
+        c.sendall(b"POST /afclaude/api/inbox HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: 100\r\n\r\n")
+        self.assertIn(b" 401 ", c.recv(4096).split(b"\r\n")[0] + b" ")
+        c.close()
+
     def test_key_check(self):
         for key in (None, "", "wrong", self.KEY[:-1], self.KEY + "x"):
             with self.subTest(key=key):

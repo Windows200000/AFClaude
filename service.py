@@ -20,6 +20,10 @@ owner is alerted once (the fallback alert file + a push, as the entrypoint's oth
 database is reachable and at a schema this code may write, how old the runner's heartbeat is and whether
 the inbox key is there.
 
+Two layouts (D-339): `single` (the default until the K7 cut-over: one container, the runner supervising
+the inbox API, docker/compose.yml; no master key yet) and `services` (three containers,
+docker/compose.services.yml sets AFCLAUDE_LAYOUT=services; the master key is checked at every start).
+
   service.py check-mount <name>     exit 78 unless the data directory is a mounted volume
   service.py ensure-key <name>      load/create/check the master key (exit 78 on a problem)
 """
@@ -37,6 +41,8 @@ import masterkey  # noqa: E402
 import store  # noqa: E402
 
 SERVICES = ("runner", "mcp", "web")
+LAYOUTS = ("single", "services")
+DEFAULT_LAYOUT = "single"             # until K7 flips it (D-339)
 MOUNTINFO = "/proc/self/mountinfo"
 EXIT_REFUSED = 78                      # EX_CONFIG
 NOT_MOUNTED_FIX = ("AFCLAUDE_DATA is the host directory compose mounts as the data directory: set it "
@@ -45,6 +51,15 @@ NOT_MOUNTED_FIX = ("AFCLAUDE_DATA is the host directory compose mounts as the da
 
 class ServiceError(Exception):
     """A service must not start: the message says why and what to do."""
+
+
+def layout(env: Mapping[str, str] | None = None) -> str:
+    """AFCLAUDE_LAYOUT: `single` (default: the old one-container layout) or `services`. Anything else is an
+    error, not a guess (D-235)."""
+    v = ((os.environ if env is None else env).get("AFCLAUDE_LAYOUT") or DEFAULT_LAYOUT).strip()
+    if v not in LAYOUTS:
+        raise ServiceError(f"AFCLAUDE_LAYOUT must be one of {', '.join(LAYOUTS)}, not {v!r}")
+    return v
 
 
 def data_dir() -> str:
@@ -95,14 +110,15 @@ def ensure_key() -> str:
         conn.close()
 
 
-def start(name: str, *, mounted: bool = True) -> str:
+def start(name: str, *, mounted: bool = True, key: bool = True) -> str | None:
     """The start check of a long-running service: the mount (unless `mounted` is False, for a process
-    that is not in a container) and the master key, which stays loaded in this process. -> key id."""
+    that is not in a container) and the master key, which stays loaded in this process (unless `key` is
+    False: the single layout has no key yet). -> key id, or None without the key check."""
     if name not in SERVICES:
         raise ServiceError(f"unknown service {name!r} (one of {', '.join(SERVICES)})")
     if mounted:
         check_mounted(data_dir())
-    return ensure_key()
+    return ensure_key() if key else None
 
 
 def in_container(env: Mapping[str, str] | None = None) -> bool:
@@ -128,7 +144,8 @@ def refuse(name: str, err: Exception, *, alert: bool = True) -> int:
 def health_report(conn: Any, *, key_file: str | None = None, now: datetime | None = None) -> dict[str, Any]:
     """The body of `GET /health`: {"status": "ok" | "unhealthy", "problems": [...], "schema": int,
     "runner_heartbeat_age_s": int | None, "inbox_key": bool | None}. Unhealthy only for what makes this
-    service useless: a database this code can't write (schema_problem). The runner's heartbeat is
+    service useless: a database this code can't write (schema_problem) or, for the web service (a key_file
+    given), no readable inbox key. The runner's heartbeat is
     reported, not judged: the runner has its own health check and may be switched off on purpose."""
     problems: list[str] = []
     schema = store.get_meta(conn, "schema_version")
@@ -147,6 +164,8 @@ def health_report(conn: Any, *, key_file: str | None = None, now: datetime | Non
                 key_ok = bool(fh.read().strip())
         except OSError:
             key_ok = False
+        if not key_ok:       # the inbox API can't serve without it: that is an outage, not a detail (D-235, review k4a M1)
+            problems.append("inbox key: no readable key file (every inbox request is refused)")
     return {"status": "unhealthy" if problems else "ok", "problems": problems,
             "schema": int(schema) if schema and schema.isdigit() else None,
             "runner_heartbeat_age_s": beat_age, "inbox_key": key_ok}

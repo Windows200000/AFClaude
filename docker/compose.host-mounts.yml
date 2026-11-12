@@ -1,4 +1,4 @@
-# TRANSITIONAL override (phase 5b K4 until K4b/K6/K7 are live): what the runner still reads from the host
+# TRANSITIONAL override of compose.services.yml (phase 5b K4 until K4b/K6/K7 are live): what the runner still reads from the host
 # because the reader switch (the kit's `transcripts` / `sessions` / `doc-files read`, K4b) and the bridge
 # key in the data directory (K6) are not what the code uses yet:
 #   - the host repo read-only at /host/repo (PROGRESS/GOALS/EXCEPTIONS/DECISIONS and backlog/ via the image's symlinks)

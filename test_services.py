@@ -1,4 +1,5 @@
-"""The three services of the image, in containers (phase 5b K4, docs/phase5b_plan.md §3.1).
+"""The three services of the image, in containers (phase 5b K4, docs/phase5b_plan.md §3.1): the services layout,
+docker/compose.services.yml; docker/compose.yml stays the single container until K7 (D-339).
 
 Static checks (always): the compose file's shape (one image, three services, the hardening on each, only
 AFCLAUDE_DATA required, no fixed subnet, no published port), the entrypoint's order of checks, and the
@@ -11,7 +12,8 @@ generated override (the file's own intervals are checked statically). Three heal
 socket answers (/health, the inbox API: 503 without a key, 401 with a wrong one, 200 with the right one), the MCP
 service refuses every request, read-only file system, non-root, no capability, no published port, one master key;
 without AFCLAUDE_DATA compose stops with the message; an unmounted data directory and a wrong master key stop each
-service with exit 78. Everything is torn down afterwards, the image tag included.
+service with exit 78; the web and MCP services cannot read the bridge key in <data>/bridge (D-339), the runner can; the
+web service without an inbox key exits 1. Everything is torn down afterwards, the image tag included.
 """
 import base64
 import http.client
@@ -28,7 +30,7 @@ import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-COMPOSE = os.path.join(HERE, "docker", "compose.yml")
+COMPOSE = os.path.join(HERE, "docker", "compose.services.yml")
 
 
 def read(rel):
@@ -46,7 +48,7 @@ class ComposeShape(unittest.TestCase):
     SERVICES = ("afclaude-runner", "afclaude-mcp", "afclaude-web")
 
     def test_three_services_from_one_image_with_the_hardening_of_k0(self):
-        text = read("docker/compose.yml")
+        text = read("docker/compose.services.yml")
         for name in self.SERVICES:
             self.assertRegex(text, rf"(?m)^  {name}:\n    <<: \*service$")
         anchor = re.search(r"(?ms)^x-service: &service\n(.*?)^services:", text).group(1)
@@ -61,7 +63,7 @@ class ComposeShape(unittest.TestCase):
             self.assertIn("pull_policy: never", service_block(text, name))
 
     def test_only_afclaude_data_is_required_and_its_message_has_no_colon(self):
-        text = read("docker/compose.yml")
+        text = read("docker/compose.services.yml")
         required = re.findall(r"\$\{(\w+):\?([^}]*)\}", text)
         self.assertEqual([r[0] for r in required], ["AFCLAUDE_DATA"])
         self.assertNotIn(":", required[0][1], "a colon in a short-syntax volume's message breaks compose's parser (K0)")
@@ -72,7 +74,7 @@ class ComposeShape(unittest.TestCase):
         self.assertNotIn("ipam", text)
 
     def test_health_checks_and_the_start_order(self):
-        text = read("docker/compose.yml")
+        text = read("docker/compose.services.yml")
         self.assertIn('test: ["CMD", "python3", "mcp_service.py", "health"]', text)
         self.assertIn('test: ["CMD", "python3", "web.py", "health"]', text)
         for name in ("afclaude-mcp", "afclaude-web"):
@@ -90,10 +92,22 @@ class ComposeShape(unittest.TestCase):
         self.assertIn("pins", read("docker/compose.subnet.yml") + "pins")      # the file exists
         self.assertIn("172.28.0.0/24", read("docker/compose.subnet.yml"))
 
-    def test_the_single_container_layout_is_kept_for_the_rollback(self):
-        text = read("docker/compose.single.yml")
+    def test_the_single_container_layout_is_still_the_default_compose_file(self):
+        text = read("docker/compose.yml")
         self.assertRegex(text, r"(?m)^  afclaude:$")
         self.assertIn("container_name: afclaude\n", text)
+        self.assertNotIn("AFCLAUDE_LAYOUT", text)            # unset = single, in the entrypoint and the runner
+        self.assertNotIn("afclaude-runner", text)
+        self.assertEqual(read("docker/compose.dev.yml").count("afclaude:"), 1)      # main's dev override, unchanged
+        self.assertFalse(os.path.exists(os.path.join(HERE, "docker", "compose.single.yml")),
+                         "no second copy of the single layout: a rollback is the old commit/image (review k4a M2)")
+
+    def test_the_services_say_so_and_web_and_mcp_do_not_see_the_bridge_key(self):
+        text = read("docker/compose.services.yml")
+        self.assertRegex(text, r"(?m)^    AFCLAUDE_LAYOUT: services\b")
+        for name in ("afclaude-mcp", "afclaude-web"):
+            self.assertIn("      - /app/data/bridge:ro,", service_block(text, name), name)
+        self.assertNotIn("/app/data/bridge", service_block(text, "afclaude-runner"))
 
 
 class EntrypointOrder(unittest.TestCase):
@@ -150,6 +164,11 @@ class ThreeServicesInContainers(unittest.TestCase):
         os.chmod(cls.data, 0o700)
         cls.keyfile = os.path.join(cls.data, "..", f"{cls.project}.key")
         cls.keyfile = os.path.abspath(cls.keyfile)
+        os.makedirs(os.path.join(cls.data, "bridge"))      # what the host kit's install leaves there (K2)
+        cls.bridge_key = os.path.join(cls.data, "bridge", "host_bridge_ed25519")
+        with open(cls.bridge_key, "w") as fh:
+            fh.write("-----BEGIN FAKE KEY-----\n")
+        os.chmod(cls.bridge_key, 0o644)       # readable by any uid: only the overlay can hide it from web and mcp
         cls.key = secrets.token_hex(20)
         with open(cls.keyfile, "w") as fh:
             fh.write(cls.key + "\n")
@@ -276,8 +295,39 @@ class ThreeServicesInContainers(unittest.TestCase):
             self.assertEqual(int(caps, 16), 0, svc)
             self.assertFalse(info["NetworkSettings"]["Ports"] and any(info["NetworkSettings"]["Ports"].values()), svc)
             self.assertFalse([m for m in info["Mounts"] if "docker.sock" in m["Source"]], svc)
-            self.assertEqual([m["Destination"] for m in info["Mounts"] if m["Destination"] != "/run/secrets/afclaude_quickview.key"],
+            self.assertEqual(sorted(m["Destination"] for m in info["Mounts"]
+                                    if m["Destination"] not in ("/run/secrets/afclaude_quickview.key", "/app/data/bridge")),
                              ["/app/data"], svc)
+
+    def test_web_and_mcp_cannot_read_the_bridge_key_but_the_runner_can(self):
+        """D-339 (review k4a M3): an empty tmpfs over <data>/bridge in the services that face a network."""
+        path = "/app/data/bridge/host_bridge_ed25519"
+        self.assertEqual(self.exec("runner", "cat", path).stdout, "-----BEGIN FAKE KEY-----\n")
+        for svc in ("web", "mcp"):
+            self.assertNotEqual(self.exec(svc, "cat", path).returncode, 0, svc)
+            self.assertEqual(self.exec(svc, "ls", "-A", "/app/data/bridge").stdout, "", svc)
+            self.assertNotEqual(self.exec(svc, "touch", "/app/data/bridge/x").returncode, 0, svc)     # read-only too
+            self.assertEqual(self.exec(svc, "test", "-s", "/app/data/master.key").returncode, 0, svc)  # the key stays
+        self.assertTrue(os.path.isfile(self.bridge_key))       # the host side is untouched
+
+    def test_web_without_an_inbox_key_exits_1_and_says_why(self):
+        """Review k4a M1: not a silent 503 server; failstop alerts and pauses (in this throwaway database; the
+        alert needs AFCLAUDE_HOST_REPO: a K7 item). Its own data directory: the running web holds the lock of the
+        shared one."""
+        other = short_tmp()
+        try:
+            os.chmod(other, 0o700)
+            subprocess.run([sys.executable, os.path.join(HERE, "store.py"), "init", "--db", os.path.join(other, "afclaude.db")],
+                           check=True, capture_output=True, env=dict(os.environ, AFCLAUDE_DATA_DIR=other))
+            cmd = ["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL", "--tmpfs", "/tmp:mode=1777",
+                   "-e", "AFCLAUDE_LAYOUT=services", "-e", "AFCLAUDE_HOST_REPO=/srv/afclaude", "-v", f"{other}:/app/data",
+                   f"afclaude:{self.tag}", "web"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 1, (r.stdout, r.stderr))
+            self.assertIn("no inbox key", r.stdout + r.stderr)
+            self.assertIn("the inbox API was not running", r.stdout + r.stderr)
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
 
     def test_one_master_key_for_all_three(self):
         path = os.path.join(self.data, "master.key")
@@ -301,7 +351,7 @@ class ThreeServicesInContainers(unittest.TestCase):
         self.assertEqual(ps.stdout.strip(), "")
 
     def run_image(self, svc, *extra, mount=True):
-        cmd = ["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL", "--tmpfs", "/tmp:mode=1777", *extra]
+        cmd = ["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL", "--tmpfs", "/tmp:mode=1777", "-e", "AFCLAUDE_LAYOUT=services", *extra]
         if mount:
             cmd += ["-v", f"{self.data}:/app/data"]
         return subprocess.run(cmd + [f"afclaude:{self.tag}", svc], capture_output=True, text=True, timeout=120)
@@ -330,6 +380,102 @@ class ThreeServicesInContainers(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-1000:])
         self.assertEqual(key_bytes(), before)
         self.assertEqual(self.request("GET", "/health")[0], 200)
+
+
+SSH_HOST_KEY = "/etc/ssh/ssh_host_ed25519_key.pub"
+SINGLE = os.path.join(HERE, "docker", "compose.yml")
+
+
+@unittest.skipIf(NO_DOCKER is not None or not os.path.exists(SSH_HOST_KEY), f"container test: {NO_DOCKER or 'no host key to mount'}")
+class SingleLayoutInContainer(unittest.TestCase):
+    """D-339 (review k4a H1): docker/compose.yml, the default until K7, still brings up ONE container whose runner
+    supervises the inbox API (`web.py serve --supervised`), with no master key. Its own project, network (own
+    subnet), container name and image tag: compose.yml fixes `afclaude` and `afclaude-manager:latest`, so an
+    override renames both, and `docker compose config` is checked before anything starts. Never the live ones."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.started = False
+        cls.project = f"afk4s{os.getpid()}"
+        cls.tag = f"k4s{os.getpid()}"
+        cls.root = tempfile.mkdtemp(prefix="afk4s-", dir="/tmp")
+        cls.repo = os.path.join(cls.root, "repo")
+        cls.home = os.path.join(cls.root, "home")
+        cls.data = os.path.join(cls.repo, "data")
+        for d in (cls.data, os.path.join(cls.repo, "docker", "secrets"), os.path.join(cls.home, ".claude", "projects"),
+                  os.path.join(cls.home, ".claude", "sessions"), os.path.join(cls.home, ".config", "afclaude")):
+            os.makedirs(d)
+        os.chmod(cls.data, 0o700)
+        cls.key = secrets.token_hex(20)
+        for path, text in ((os.path.join(cls.repo, "docker", "secrets", "host_bridge_ed25519"), "x\n"),
+                           (os.path.join(cls.home, ".config", "afclaude", "quickview.key"), cls.key + "\n")):
+            with open(path, "w") as fh:
+                fh.write(text)
+            os.chmod(path, 0o644)
+        cls.override = os.path.join(cls.root, "override.yml")
+        with open(cls.override, "w") as fh:
+            fh.write("services:\n  afclaude:\n"
+                     f"    image: afclaude:{cls.tag}\n    container_name: {cls.project}\n"
+                     "    healthcheck: {interval: 3s, timeout: 20s, retries: 5, start_period: 0s}\n")
+        cls.env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
+        cls.env.update(AFCLAUDE_HOST_REPO=cls.repo, HOST_HOME=cls.home, AFCLAUDE_BRIDGE_USER="nobody",
+                       AFCLAUDE_SCHEDULER="runner", AFCLAUDE_SUBNET="172.31.213.0/24", AFCLAUDE_CODE_VERSION=cls.tag)
+        subprocess.run([sys.executable, os.path.join(HERE, "store.py"), "init", "--db", os.path.join(cls.data, "afclaude.db")],
+                       check=True, capture_output=True, env=dict(os.environ, AFCLAUDE_DATA_DIR=cls.data))
+        cfg = cls.compose("config", "--format", "json", check=True)
+        names = json.loads(cfg.stdout)
+        svc = names["services"]["afclaude"]
+        assert svc["container_name"] == cls.project and svc["image"] == f"afclaude:{cls.tag}", "would touch the live container"
+        assert names["name"] == cls.project, "would join the live compose project"
+        cls.started = True        # from here down() cleans up
+        cls.compose("build", timeout=900, check=True)
+        cls.up = cls.compose("up", "-d", "--wait", "--wait-timeout", "240", timeout=300)
+
+    @classmethod
+    def compose(cls, *args, timeout=120, check=False):
+        cmd = ["docker", "compose", "--env-file", "/dev/null", "-p", cls.project, "-f", SINGLE, "-f", cls.override, *args]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=cls.env, cwd=HERE)
+        if check and r.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd)}: {r.stderr[-1500:]}")
+        return r
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.started:
+            cls.compose("down", "--volumes", "--remove-orphans", timeout=180)
+            subprocess.run(["docker", "rmi", f"afclaude:{cls.tag}"], capture_output=True, timeout=60)
+        if getattr(cls, "root", "").startswith("/tmp/afk4s-"):
+            shutil.rmtree(cls.root, ignore_errors=True)
+
+    def test_one_healthy_container_whose_runner_supervises_the_inbox_api(self):
+        self.assertEqual(self.up.returncode, 0, self.up.stderr[-1500:])
+        info = json.loads(subprocess.run(["docker", "inspect", self.project], capture_output=True, text=True, timeout=30,
+                                         check=True).stdout)[0]
+        self.assertEqual((info["State"]["Status"], info["State"]["Health"]["Status"]), ("running", "healthy"))
+        ps = subprocess.run(["docker", "exec", self.project, "ps", "-eo", "args"], capture_output=True, text=True, timeout=60)
+        self.assertIn("web.py serve --supervised", ps.stdout)
+        self.assertIn("runner.py serve", ps.stdout)
+        self.assertNotIn("mcp_service.py", ps.stdout)
+
+    def test_the_inbox_api_answers_on_the_socket_and_no_master_key_is_made(self):
+        dfd = os.open(os.path.join(self.data, "api"), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            class Conn(http.client.HTTPConnection):
+                def connect(inner):
+                    inner.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    inner.sock.settimeout(15)
+                    inner.sock.connect(f"/proc/self/fd/{dfd}/inbox.sock")
+            for key, want in ((None, 401), (self.key, 200)):
+                c = Conn("localhost")
+                c.request("GET", "/afclaude/api/inbox", headers={"X-AFClaude-Key": key} if key else {})
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertEqual(r.status, want)
+        finally:
+            os.close(dfd)
+        self.assertFalse(os.path.exists(os.path.join(self.data, "master.key")))       # single: no key before K7
+        self.assertTrue(os.path.isfile(os.path.join(self.data, "inbox_api.log")))      # the child's own log
 
 
 if __name__ == "__main__":

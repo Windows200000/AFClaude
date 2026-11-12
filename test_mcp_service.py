@@ -87,6 +87,20 @@ class GateTest(unittest.TestCase):
         asyncio.run(go())
         self.assertEqual(inner.calls, ["lifespan"])
 
+    def test_a_websocket_is_refused_and_never_reaches_the_app(self):
+        """Review k4a L2: only http (gated) and lifespan reach the SDK app."""
+        inner = Inner()
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        async def go():
+            await mcp_service.Gate(inner)({"type": "websocket", "path": "/mcp", "headers": []}, None, send)
+        asyncio.run(go())
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        self.assertEqual(inner.calls, [])
+
     def test_the_default_authorizer_accepts_nothing(self):
         self.assertFalse(mcp_service.reject_all("anything"))
 

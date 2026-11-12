@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 import uvicorn
+from starlette.concurrency import run_in_threadpool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -71,20 +72,25 @@ def health_body() -> tuple[int, dict[str, Any]]:
 
 class Gate:
     """ASGI wrapper: /health is answered here, everything else needs a bearer token `authorize` accepts
-    (lifespan events go straight to the app: its session manager starts there)."""
+    (lifespan events go straight to the app: its session manager starts there; any other non-http scope, a
+    websocket, is refused: nothing here speaks it)."""
 
     def __init__(self, app: ASGI, authorize: Callable[[str], bool] = reject_all) -> None:
         self.app, self.authorize = app, authorize
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
         if scope["path"] == "/health":
             if scope["method"] != "GET":
                 await _respond(send, 405, {"error": "method not allowed"})
                 return
-            status, body = health_body()
+            status, body = await run_in_threadpool(health_body)     # a DB read: not on the event loop
             await _respond(send, status, body)
             return
         auth = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"authorization"), "")

@@ -16,22 +16,25 @@ quiet, so a rebuild never starts while one of these is in flight.
 
     python3 tools/deploy.py [--max-wait-drain MIN] [--max-wait-clear MIN] [--max-wait-healthy MIN] [--force]
 
-Phase 5b K4: three services (afclaude-runner, afclaude-mcp, afclaude-web) from one image, docker/compose.yml.
-Everything below is about the runner (the only one with host calls in flight); the other two are stateless and
-are recreated with it. Refused first: AFCLAUDE_DATA (environment, else docker/.env) not set or not a directory
-with the database (the drain must talk to the DB the containers mount); the old single container `afclaude`
-still running (one runner per data directory: stop it first, the cut-over's job, K7). Optional compose
-overrides come from AFCLAUDE_COMPOSE_OVERRIDES (environment, else docker/.env): file names in docker/,
-comma-separated (compose.host-mounts.yml, compose.subnet.yml). After the recreate the script waits for
-all three health checks (a bounded wait; an unhealthy or exited service fails the deploy with its last
-health output).
+Phase 5b K4, two layouts (D-339), chosen by AFCLAUDE_LAYOUT (environment, else docker/.env):
+  single (the default until the K7 cut-over): the one container `afclaude`, docker/compose.yml, exactly the deploy
+    below (drain, quiet wait, start guard, rebuild); no data-directory or health checks of its own.
+  services: three services (afclaude-runner, afclaude-mcp, afclaude-web) from one image, docker/compose.services.yml;
+    K7 flips docker/.env to it. Everything below is about the runner (the only one with host calls in flight);
+    the other two are stateless and are recreated with it. Refused first: AFCLAUDE_DATA (environment, else
+    docker/.env) not set or not a directory with the database (the drain must talk to the DB the containers
+    mount); the old single container `afclaude` still running (one runner per data directory: stop it first,
+    the cut-over's job, K7). Optional compose overrides come from AFCLAUDE_COMPOSE_OVERRIDES (environment, else
+    docker/.env): file names in docker/, comma-separated (compose.host-mounts.yml, compose.subnet.yml). After the
+    recreate the script waits for all three health checks (a bounded wait; an unhealthy or exited service fails
+    the deploy with its last health output, alerted).
 
 Steps: 0) refuse within START_GUARD (30 min) before or after a scheduled session-window start
 (schedule.py): from phase 3a S5 on, a restart during a start is an alert + pause (D-257), and a
 start missed by the restart gap is one too; the refusal prints the next safe time.
 1) `runner.py drain()` (existing). 2) poll `docker top` for a sampler / usage-review /
 unittest / claude process (any bridge call, including a plain usage read) still running in
-the runner container, bounded wait. 3) `docker compose -f docker/compose.yml [-f override ...] up -d --build` with
+the runner container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` (services: compose.services.yml and its overrides) with
 AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README and the AFClaude project's deploy_rule
 say to run it; the image has no .git, so without this the build commit is unknown).
 Exit 1 (no rebuild, nothing drained, even with --force) when AFCLAUDE_SCHEDULER (the environment,
@@ -59,10 +62,13 @@ import runner  # noqa: E402  (drain)
 import schedule  # noqa: E402
 import store  # noqa: E402
 
-NAME = "afclaude"                              # the container name prefix (AFCLAUDE_NAME), and the old single container
+NAME = "afclaude"                              # the container name prefix (AFCLAUDE_NAME, services layout), and the single container
 SERVICES = ("runner", "mcp", "web")           # container names: <prefix>-<service>
-CONTAINER = f"{NAME}-runner"                  # the one with processes to wait for
-COMPOSE_FILE = os.path.join(HERE, "docker", "compose.yml")
+CONTAINER = NAME                              # the single layout's container (its name is fixed in compose.yml)
+LAYOUTS = ("single", "services")
+DEFAULT_LAYOUT = "single"                     # until K7 flips it (D-339)
+COMPOSE_FILE = os.path.join(HERE, "docker", "compose.yml")                  # the single layout
+COMPOSE_SERVICES = os.path.join(HERE, "docker", "compose.services.yml")     # the three services
 ENV_FILE = os.path.join(HERE, "docker", ".env")      # compose's own: the scheduler mode the rebuild gets
 SCHEDULER_MODES = ("runner", "off")
 CLEAR_POLL = 5.0                              # seconds between docker-top polls
@@ -199,6 +205,20 @@ def check_scheduler_mode() -> bool:
     return False
 
 
+def layout() -> str:
+    """AFCLAUDE_LAYOUT (environment, else docker/.env): single (default) or services. ValueError for anything else."""
+    v = env_value("AFCLAUDE_LAYOUT") or DEFAULT_LAYOUT
+    if v not in LAYOUTS:
+        raise ValueError(f"AFCLAUDE_LAYOUT must be one of {', '.join(LAYOUTS)}, not {v!r}")
+    return v
+
+
+def alert(subject: str, body: str) -> None:
+    """A failed deploy step is an alert, not only stdout (D-235)."""
+    import notify
+    notify.notify(subject, body)
+
+
 def name_prefix() -> str:
     return env_value("AFCLAUDE_NAME") or NAME
 
@@ -217,7 +237,7 @@ def check_data() -> Optional[str]:
         print("deploy refused: AFCLAUDE_DATA is not set (the environment or docker/.env): it is the data directory "
               "the services mount, there is no default. Nothing was drained.")
         return None
-    db = os.path.join(os.path.abspath(os.path.join(os.path.dirname(COMPOSE_FILE), data)), DB_NAME)
+    db = os.path.join(os.path.abspath(os.path.join(os.path.dirname(COMPOSE_SERVICES), data)), DB_NAME)
     if not os.path.isfile(db):
         print(f"deploy refused: no database at {db} (AFCLAUDE_DATA={data}): a wrong or empty data directory would "
               "come up as a fresh install. Nothing was drained.")
@@ -228,8 +248,9 @@ def check_data() -> Optional[str]:
 
 def old_container_running(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
                           prefix: Optional[str] = None) -> bool:
-    """True when the single container of the old layout (named like the prefix alone) is running."""
-    p = prefix or name_prefix()
+    """True when the single container of the old layout is running. Its name is fixed in compose.yml
+    (`afclaude`), whatever AFCLAUDE_NAME the services get."""
+    p = prefix or NAME
     r = run(["docker", "ps", "--filter", f"name=^{p}$", "--format", "{{.Names}}"], capture_output=True, text=True,
             timeout=30)
     if r.returncode != 0:
@@ -240,22 +261,25 @@ def old_container_running(run: Callable[..., "subprocess.CompletedProcess[str]"]
 def check_old_container() -> bool:
     if not old_container_running():
         return True
-    print(f"deploy refused: the single container `{name_prefix()}` of the old layout is still running: two runners "
+    print(f"deploy refused: the single container `{NAME}` of the old layout is still running: two runners "
           "must never share a data directory. The cut-over (tools/cutover_5b.py, K7) stops it first and brings the "
           "three services up. Nothing was drained.")
     return False
 
 
-def compose_command(*tail: str) -> List[str]:
-    """`docker compose -f docker/compose.yml [-f docker/<override>] ... <tail>`; the overrides are named by
-    AFCLAUDE_COMPOSE_OVERRIDES (comma-separated file names in docker/, no paths)."""
-    cmd = ["docker", "compose", "-f", COMPOSE_FILE]
+def compose_command(*tail: str, lay: str = DEFAULT_LAYOUT) -> List[str]:
+    """`docker compose -f docker/compose.yml <tail>` (single); services: `-f docker/compose.services.yml [-f
+    docker/<override>] ...`, the overrides named by AFCLAUDE_COMPOSE_OVERRIDES (comma-separated file names in
+    docker/, no paths)."""
+    if lay == "single":
+        return ["docker", "compose", "-f", COMPOSE_FILE] + list(tail)
+    cmd = ["docker", "compose", "-f", COMPOSE_SERVICES]
     for name in (n.strip() for n in env_value("AFCLAUDE_COMPOSE_OVERRIDES").split(",")):
         if not name:
             continue
         if os.path.basename(name) != name or not name.endswith((".yml", ".yaml")):
             raise ValueError(f"AFCLAUDE_COMPOSE_OVERRIDES: {name!r} must be a compose file name in docker/")
-        cmd += ["-f", os.path.join(os.path.dirname(COMPOSE_FILE), name)]
+        cmd += ["-f", os.path.join(os.path.dirname(COMPOSE_SERVICES), name)]
     return cmd + list(tail)
 
 
@@ -308,23 +332,28 @@ def code_version(run: Callable[..., "subprocess.CompletedProcess[str]"] = subpro
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="THE AFClaude deploy command (D-257): drain the runner, wait for "
-                                              "its container to go quiet, recreate the three services, wait "
-                                              "for their health checks.")
+                                              "its container to go quiet, rebuild (the single container, or "
+                                              "the three services and wait for their health checks).")
     ap.add_argument("--max-wait-drain", type=float, default=None,
                     help="minutes for runner.py drain (default: its own, the longest session-run "
                          "timeout + 5)")
     ap.add_argument("--max-wait-clear", type=float, default=DEFAULT_CLEAR_WAIT.total_seconds() / 60,
                     help="minutes to wait for the runner container to go quiet (default 10)")
     ap.add_argument("--max-wait-healthy", type=float, default=DEFAULT_HEALTHY_WAIT.total_seconds() / 60,
-                    help="minutes to wait for the three health checks after the recreate (default 6)")
+                    help="services layout: minutes to wait for the three health checks after the recreate (default 6)")
     ap.add_argument("--force", action="store_true",
                     help="rebuild even within 30 min of a session-window start or if draining or "
                          "clearing timed out (prints what was still running)")
     args = ap.parse_args(argv)
 
+    try:
+        lay = layout()
+    except ValueError as e:
+        print(f"deploy refused: {e}. Nothing was drained.")
+        return 1
     if not check_scheduler_mode():             # before anything: --force does not skip it
         return 1
-    if check_data() is None or not check_old_container():
+    if lay == "services" and (check_data() is None or not check_old_container()):
         return 1
     if not check_start_guard(args.force):
         return 1
@@ -332,7 +361,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         drained = runner.drain(conn, timedelta(minutes=args.max_wait_drain)
                                if args.max_wait_drain is not None else None) == 0
-        cleared = wait_clear(timedelta(minutes=args.max_wait_clear), lister=lambda: container_processes(f"{name_prefix()}-runner"))
+        cleared = wait_clear(timedelta(minutes=args.max_wait_clear), lister=lambda: container_processes(CONTAINER if lay == "single" else f"{name_prefix()}-runner"))
         if not (drained and cleared) and not args.force:
             print("deploy aborted: not drained/clear (see above); rerun with --force to rebuild anyway")
             return lift_drain(conn)
@@ -344,10 +373,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     version = code_version()
     print(f"rebuilding (AFCLAUDE_CODE_VERSION={version}) ...")
     env = dict(os.environ, AFCLAUDE_CODE_VERSION=version)
-    r = subprocess.run(compose_command("up", "-d", "--build"), env=env)
+    r = subprocess.run(compose_command("up", "-d", "--build", lay=lay), env=env)
     if r.returncode != 0:
+        alert("deploy: docker compose up failed", f"exit {r.returncode} ({lay} layout): the old containers may still be "
+              "running; the drain was lifted. See the deploy's output.")
+        conn = store.connect()
+        try:
+            lift_drain(conn)               # no new runner boot will lift it (a failed build changes nothing)
+        finally:
+            conn.close()
         return r.returncode
-    return 0 if wait_healthy(container_names(), timedelta(minutes=args.max_wait_healthy)) else 1
+    if lay == "single":
+        return 0
+    healthy: List[str] = []
+    ok = wait_healthy(container_names(), timedelta(minutes=args.max_wait_healthy), out=lambda m: (healthy.append(m), print(m)))
+    if not ok:
+        alert("deploy: the services are not healthy", "; ".join(healthy)[:1200])
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

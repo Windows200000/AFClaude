@@ -911,14 +911,14 @@ class Entrypoint(unittest.TestCase):
     (no runner, so no restart loop writing a backup per start); no database yet or success goes on."""
     SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docker", "entrypoint.sh")
 
-    def run_entry(self, migrate_rc, mode="runner"):
+    def run_entry(self, migrate_rc, mode="runner", layout=None, fail_prompts=False):
         tmp = tempfile.mkdtemp(prefix="afc-entry-")
         self.addCleanup(shutil.rmtree, tmp, True)
         os.makedirs(os.path.join(tmp, "data"))
         os.makedirs(os.path.join(tmp, "bin"))
         log = os.path.join(tmp, "calls.log")
         for name, body in (("python3", f'echo "python3 $*" >> {log}\ncase "$*" in *"store.py migrate"*) exit '
-                                       f'{migrate_rc};; esac\nexit 0\n'),
+                                       f'{migrate_rc};; *"prompts.py migrate"*) exit {1 if fail_prompts else 0};; esac\nexit 0\n'),
                            ("sleep", f'echo "sleep $*" >> {log}\nexit 0\n')):
             path = os.path.join(tmp, "bin", name)
             with open(path, "w") as fh:
@@ -927,7 +927,12 @@ class Entrypoint(unittest.TestCase):
         env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], AFCLAUDE_APP=tmp,
                    KEEPALIVE_STATE_DIR=os.path.join(tmp, "ka"), AFCLAUDE_BRIDGE_KNOWN_HOSTS=os.path.join(tmp, "kh"),
                    AFCLAUDE_SCHEDULER=mode)
+        env.pop("AFCLAUDE_LAYOUT", None)
+        if layout:
+            env["AFCLAUDE_LAYOUT"] = layout
         r = subprocess.run(["sh", self.SCRIPT], env=env, capture_output=True, text=True, timeout=60)
+        if not os.path.exists(log):          # refused before anything ran
+            return r, []
         with open(log) as fh:
             return r, fh.read().splitlines()
 
@@ -956,10 +961,34 @@ class Entrypoint(unittest.TestCase):
             self.assertIn(f"AFClaude: unknown AFCLAUDE_SCHEDULER={mode}", calls[1])
             self.assertEqual(calls[2], "sleep infinity")
             self.assertIn("must be runner or off", r.stderr)
-        r, calls = self.run_entry(0, "off")
+        r, calls = self.run_entry(0, "off", layout="services")
         self.assertIn("store.py migrate", calls[1])
         self.assertIn("service.py ensure-key runner", " ".join(calls))        # the master key is checked before it idles
         self.assertEqual(calls[-1], "sleep infinity")
+
+    def test_a_failed_prompt_variables_migrate_alerts_in_every_mode_and_the_start_goes_on(self):
+        """Review k4a M4: in `off` mode nothing else would say that the seeding did not happen (D-235)."""
+        for mode, last in (("off", "sleep infinity"), ("runner", None)):
+            r, calls = self.run_entry(0, mode, fail_prompts=True)
+            text = "\n".join(calls)
+            self.assertIn("the prompt variables migrate failed at start", text, mode)
+            self.assertIn("prompt variables migrate did not complete", r.stderr, mode)
+            if last:
+                self.assertEqual(calls[-1], last)
+            else:
+                self.assertTrue(any("runner.py serve" in c for c in calls), calls)
+
+    def test_the_single_layout_checks_no_master_key_and_a_bad_layout_is_refused(self):
+        """D-339: the default layout (single) is main's start; nothing creates master.key before K7."""
+        for layout in (None, "single"):
+            r, calls = self.run_entry(0, "off", layout=layout)
+            self.assertNotIn("ensure-key", " ".join(calls), layout)
+            self.assertIn("check-mount runner", calls[0])
+            self.assertEqual(calls[-1], "sleep infinity")
+        r, calls = self.run_entry(0, "off", layout="three")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("AFCLAUDE_LAYOUT must be single or services", r.stderr)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
