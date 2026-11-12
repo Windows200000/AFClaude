@@ -54,6 +54,7 @@ from zoneinfo import ZoneInfo
 import identity
 import limit_ratio
 import telemetry
+import txsource
 import usage_stale
 
 UTC = timezone.utc
@@ -586,8 +587,12 @@ def session_activity(session_id, lo, hi, projects_dir=None):
     transcript that can't be read raises (D-235: no run end from part of the session's writes)."""
     import keepalive as ka
     pdir = projects_dir or ka.PROJECTS_DIR
-    mains = glob.glob(os.path.join(pdir, "*", f"{session_id}.jsonl"))
-    subs = glob.glob(os.path.join(pdir, "*", session_id, "subagents", "*.jsonl"))
+    if txsource.bridge_on() and not projects_dir:      # the mirror (K4); the subagent files are stubs until read
+        mains = [txsource.mirror(r) for r in txsource.session_mains(session_id)]
+        subs = [f for m in mains for f in txsource.subagent_files(m)]
+    else:
+        mains = glob.glob(os.path.join(pdir, "*", f"{session_id}.jsonl"))
+        subs = glob.glob(os.path.join(pdir, "*", session_id, "subagents", "*.jsonl"))
     if not mains:
         return None, [], None
     acts, hits, work = [], [], {"tasks": [], "prompts": []}

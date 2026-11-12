@@ -59,7 +59,7 @@ def thread_entry(session_id):
     """The registry entry (+ "pid", "argv") of the live rc-server thread child holding
     `session_id`, read now. RcError: no entry, no live child, several, or not an rc thread."""
     found = []
-    for path in glob.glob(os.path.join(ka.SESSIONS_DIR, "*.json")):
+    for path in glob.glob(os.path.join(ka.sessions_dir(), "*.json")):
         try:
             with open(path) as fh:
                 d = json.load(fh)
@@ -163,6 +163,7 @@ def scan_after(path, offset):
     """(message entry seen, real model reply after it) in `path` after byte `offset`. A synthetic
     notice or an API error entry is no reply (keepalive.is_real_reply)."""
     seen = answered = False
+    ka.refresh(path)
     with open(path, "rb") as fh:
         fh.seek(offset)
         data = fh.read().decode(errors="replace")
@@ -200,7 +201,7 @@ def send(session_id, text, runner=None, sleep=None, clock=time.monotonic, verify
     path = ka.transcript_path(session_id)
     if not path:
         raise RcError(f"no transcript of {session_id[:8]} to verify the message in")
-    offset = os.path.getsize(path)
+    offset = ka.file_size(path)
     if before_send:
         before_send(name)
     t0 = clock()

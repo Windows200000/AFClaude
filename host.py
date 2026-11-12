@@ -36,6 +36,8 @@ whitelist. So every host call is mapped onto one of those shapes here:
   transcripts ID --changed-since TS [--head N] [--tail N] | sessions ID | doc-files read DIR NAME...
                                           (the container's reads of the host's transcripts, the session registry
                                            and the project docs; kit version 2)
+  transcript-read ID PATH OFFSET LENGTH   (up to 1 MB of one transcript from an offset, base64 in JSON; the reader
+                                           switch's mirror, txsource.py; kit version 5)
   claude auth status | claude doctor | tmux-check | df | clock       (the host checks; kit version 2)
 
 Anything else raises ValueError instead of being sent: it would be denied anyway.
@@ -65,6 +67,7 @@ TMUX_PANE = re.compile(r"^=(afc-[a-z0-9-]{1,36}):\Z")
 TMUX_NEW = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # rename-session's new name
 NOTE_FILES = ("PROGRESS.md", "ALERTS.md")
 CONFIG_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}\Z")   # a Claude config dir's id (host_exec.py CONFIG_ID)
+TX_PATH = re.compile(r"^[A-Za-z0-9_.@+=-]+(/[A-Za-z0-9_.@+=-]+)*\.jsonl\Z")   # transcript-read path (host_exec.py TX_PATH)
 DOC_NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md", "DECISIONS.md")   # doc-files read (host_exec.py DOC_NAMES)
 # The bridge of before the host kit (docker/host_exec.py, still the owner's authorized_keys line until the kit
 # is installed): these heads are what it knows. Everything else (and `claude auth|doctor`) needs the kit.
@@ -88,7 +91,7 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 # The host kit this code was written for (docker/host_exec.py's HOST_KIT_VERSION; test_host_kit.py compares
 # them): a kit with another version is the first host check's fail, "re-run the host kit install".
-HOST_KIT_VERSION = "4"
+HOST_KIT_VERSION = "5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
@@ -230,6 +233,9 @@ def bridge_argv(argv):
         return argv
     if head == "transcripts" and len(rest) >= 3 and CONFIG_ID.match(rest[0]) and rest[1] == "--changed-since" \
             and _is_number(rest[2]) and _tx_opts(rest[3:]):
+        return argv
+    if head == "transcript-read" and len(rest) == 4 and CONFIG_ID.match(rest[0]) and TX_PATH.match(rest[1]) \
+            and not {".", ".."} & set(rest[1].split("/")) and rest[2].isdigit() and rest[3].isdigit():
         return argv
     if head == "doc-files" and len(rest) >= 3 and rest[0] == "read" and rest[1].startswith("/") \
             and set(rest[2:]) <= set(DOC_NAMES) and len(set(rest[2:])) == len(rest[2:]):

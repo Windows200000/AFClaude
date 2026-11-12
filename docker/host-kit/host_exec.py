@@ -51,6 +51,11 @@ Allowed (exact shapes):
                            when a cap cut it and `errors` non-empty when a directory or file could not be
                            read (the caller treats both as an error). The output cap (OUT_MAX) is the real
                            limit: a wider answer is denied ("output over"), never cut off
+  transcript-read <config-dir-id> <path> <offset> <length>
+                           JSON {path, size, mtime, offset, data}: <length> bytes (1..TX_READ_MAX, base64) of one
+                           transcript from <offset> on, <path> as `transcripts` lists it (relative to the config
+                           dir's projects/, *.jsonl, no symlink in the way); `size` is the file's size now, so a
+                           caller that mirrors the file appends until its copy is that long (K4's reader switch)
   sessions <config-dir-id> JSON of the <config dir>/sessions/*.json files (the running-session registry)
   doc-files read <dir> <name>...
                            JSON {name: text|null} of PROGRESS.md / GOALS.md / EXCEPTIONS.md / DECISIONS.md in
@@ -69,6 +74,7 @@ Allowed (exact shapes):
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import glob
 import hashlib
@@ -88,12 +94,13 @@ from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 # The kit version: bumped with every change of the whitelist (a new command, a new shape) or of the
 # host.json format. host.py's HOST_KIT_VERSION is the same string (test_host_kit.py compares them) and
 # the container's host check calls `kit-version` against it.
-HOST_KIT_VERSION = "4"
+HOST_KIT_VERSION = "5"
 CONFIG_FORMAT = 2
 # every command head the whitelist knows (the elif chain in main(); test_host_kit.py compares the two)
 COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "host-config", "ka_resume.sh",
             "kill-claude", "kit-version", "proc-snapshot", "rc-send", "sessions", "tmux-capture", "tmux-check",
-            "tmux-clients", "tmux-has", "tmux-kill", "tmux-panes", "tmux-rename", "transcripts", "usage-cache")
+            "tmux-clients", "tmux-has", "tmux-kill", "tmux-panes", "tmux-rename", "transcript-read", "transcripts",
+            "usage-cache")
 OUT_MAX = 2 * 1024 * 1024    # bytes of output this file produces itself (the commands it only runs write straight through)
 KIT_DIR = os.path.dirname(os.path.abspath(__file__))   # <share>/afclaude/host-kit/current when run by sshd
 KIT_FILES = ("host_exec.py", "ka_resume.sh")           # what `kit-version` hashes (the install copies exactly these)
@@ -148,6 +155,8 @@ TX_MAX_ENTRIES = 20
 TX_TEXT = 300                                               # chars of an entry's text in the projection
 TX_TAIL_READ = 16 * 1024 * 1024                             # most bytes read back from a file's end for its tail
 SESSIONS_MAX = 500
+TX_READ_MAX = 1024 * 1024                                   # bytes of one transcript-read answer (base64 stays under OUT_MAX)
+TX_PATH = re.compile(r"^[A-Za-z0-9_.@+=-]+(/[A-Za-z0-9_.@+=-]+)*\.jsonl\Z")
 CHECK_SESSION = "afc-check"                                 # tmux-check's session; names.py never generates it (reserved there)
 CHECK_TIMEOUT = 60                                          # seconds the check commands may run (exit 124)
 MAX_ROOTS = 8
@@ -675,6 +684,39 @@ def transcripts_json(args: List[str]) -> str:
     return json.dumps({"config_dir": args[0], "truncated": truncated, "errors": errors, "files": files}) + "\n"
 
 
+def transcript_read_json(args: List[str]) -> str:
+    """transcript-read <config-dir-id> <path> <offset> <length> -> JSON, or deny. Every directory of <path> and
+    the file itself are opened with O_NOFOLLOW from the projects dir down (a link in the way is a denial), the
+    file must be regular; an offset beyond the end answers no data (the caller sees `size`)."""
+    if len(args) != 4 or not args[2].isdigit() or not args[3].isdigit():
+        deny("transcript-read needs <config-dir-id> <path> <offset> <length>")
+    rel, offset, length = args[1], int(args[2]), int(args[3])
+    parts = rel.split("/")
+    if not TX_PATH.match(rel) or any(p in (".", "..") for p in parts) or offset >= 1 << 50 or not 1 <= length <= TX_READ_MAX:
+        deny("transcript-read: path, offset or length out of range")
+    fds: List[int] = []
+    try:
+        cur = os.open(os.path.join(config_dir(args[0]), "projects"), os.O_RDONLY | os.O_DIRECTORY)
+        fds.append(cur)
+        for part in parts[:-1]:
+            cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
+            fds.append(cur)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+        fds.append(fd)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            deny("transcript-read: not a regular file")
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = os.read(fd, length)
+    except OSError as e:
+        deny(f"transcript-read: {e.strerror}")
+    finally:
+        for f in fds:
+            os.close(f)
+    return json.dumps({"path": rel, "size": st.st_size, "mtime": st.st_mtime, "offset": offset,
+                       "data": base64.b64encode(data).decode("ascii")}) + "\n"
+
+
 def sessions_json(args: List[str]) -> str:
     """sessions <config-dir-id> -> JSON of <config dir>/sessions/*.json, or deny."""
     if len(args) != 1:
@@ -885,6 +927,10 @@ def main() -> int:
     elif head == "transcripts":
         emit(transcripts_json(args))
         log(f"OK transcripts {args[0]}")
+        return 0
+    elif head == "transcript-read":
+        emit(transcript_read_json(args))
+        log(f"OK transcript-read {args[0]} {args[1] if len(args) > 1 else ''} {args[2:3]}")
         return 0
     elif head == "sessions":
         emit(sessions_json(args))

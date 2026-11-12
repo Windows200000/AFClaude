@@ -93,6 +93,7 @@ import runner_state  # phase 2d: the state lives in the DB only (D-161); the log
 import schedule
 import usage_stale
 import host  # host calls: local subprocess on the host, the SSH bridge inside the container
+import txsource  # the reader switch (K4): transcripts and the session registry from the mounts or the bridge
 import manager_launch  # D-260: a project's task-manager model / effort
 import remote_control  # D-269: Remote Control per session category
 import prompts  # phase 4a: the prompt registry (prompts/*.md)
@@ -300,11 +301,52 @@ def parse_ts(s):
 # ---------------------------------------------------------------- transcript
 
 def transcript_path(session_id):
+    """The session's main transcript file. AFCLAUDE_READERS=bridge (txsource.py): the local mirror of the
+    host's file, brought up to date by this call; a bridge failure raises (D-235)."""
+    if txsource.bridge_on():
+        return txsource.session_transcript(session_id)
     hits = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
     return hits[0] if hits else None
 
 
+def subagent_files(path, content=False):
+    """The subagent transcripts of the session whose main transcript is `path` (bridge mode: mirror stubs
+    with the host's mtime, or full copies for content=True)."""
+    if txsource.bridge_on():
+        return txsource.subagent_files(path, content)
+    return glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
+
+
+def file_mtime(path):
+    """os.path.getmtime of a transcript, current: a mirrored main transcript is brought up to date first
+    (bridge mode; a subagent file's mtime is the one subagent_files() just set)."""
+    if txsource.bridge_on():
+        txsource.refresh_path(path, main_only=True)
+    return os.path.getmtime(path)
+
+
+def refresh(path):
+    """A reader of the transcript `path` that opens it itself calls this first (bridge mode: the mirror is
+    brought up to date; otherwise nothing to do)."""
+    if txsource.bridge_on():
+        txsource.refresh_path(path)
+
+
+def file_size(path):
+    """os.path.getsize of a transcript, current (a mirrored one is brought up to date first: bridge mode)."""
+    if txsource.bridge_on():
+        txsource.refresh_path(path)
+    return os.path.getsize(path)
+
+
+def sessions_dir():
+    """The directory of the running-session registry: SESSIONS_DIR, or (bridge mode) its current local copy."""
+    return txsource.sessions_dir() if txsource.bridge_on() else SESSIONS_DIR
+
+
 def iter_entries(path):
+    if txsource.bridge_on():
+        txsource.refresh_path(path)
     with open(path, errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -1033,7 +1075,7 @@ def proc_starttime(pid):
 def session_entry(pid):
     """The ~/.claude/sessions/<pid>.json registry entry of a process, or {}."""
     try:
-        with open(os.path.join(SESSIONS_DIR, f"{int(pid)}.json")) as fh:
+        with open(os.path.join(sessions_dir(), f"{int(pid)}.json")) as fh:
             d = json.load(fh)
         return d if isinstance(d, dict) else {}
     except (OSError, ValueError, TypeError):
@@ -1045,7 +1087,7 @@ def registry_holders(session_id):
     holders `claude agents --json` may not list. An entry whose procStart does
     not match the live process's start time is a stale file of a reused pid."""
     out = set()
-    for path in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+    for path in glob.glob(os.path.join(sessions_dir(), "*.json")):
         try:
             with open(path) as fh:
                 d = json.load(fh)
@@ -1374,7 +1416,7 @@ def run_active(session_id, now, st=None):
         return None
     files = [path] + chain_subagent_files(path, chain)
     try:
-        last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
+        last = max(file_mtime(f) for f in files if os.path.exists(f))
     except ValueError:
         return None
     return fire if now - datetime.fromtimestamp(last, UTC) <= RUN_IDLE else None
@@ -2831,7 +2873,7 @@ def _fire_start(sid, stall, reason, st, args, key, night, plan):
         progress_note(f"DRY-RUN would have continued {sid[:8]} via {plan} ({reason})")
         return None
     at_fire = _fire_usage()          # the run's start values (run_metrics.py, D-207)
-    offset = os.path.getsize(path) if held_ids and path else 0   # the held messages' markers come after
+    offset = file_size(path) if held_ids and path else 0   # the held messages' markers come after
     sent_at = datetime.now(UTC)
     rc, out, err = fire(sid, cwd, msg, plan, driver="auto", prompt=stall.get("prompt", "continue"))
     errors = []                      # failures after the continue went out: recorded, then raised;
@@ -3260,7 +3302,7 @@ def session_idle(path, now=None):
     if not path or not os.path.exists(path):
         return True
     now = now or datetime.now(UTC)
-    if now - datetime.fromtimestamp(os.path.getmtime(path), UTC) < COMPACT_QUIET:
+    if now - datetime.fromtimestamp(file_mtime(path), UTC) < COMPACT_QUIET:
         return False
     last = last_message(path)
     if last is None or last.get("isCompactSummary"):
@@ -3466,7 +3508,7 @@ def chain_subagent_files(path, chain):
     = session_chain, newest first; chain[0] is the session itself): a worker started before a /clear
     goes on writing under the old id's directory (D-328)."""
     paths = [path] + [transcript_path(s) for s in chain[1:]]
-    return [f for p in paths if p for f in glob.glob(os.path.join(p[:-len(".jsonl")], "subagents", "*.jsonl"))]
+    return [f for p in paths if p for f in subagent_files(p)]
 
 
 def follow_by_hand(old, new):
@@ -4136,7 +4178,7 @@ def compaction_busy_reason(path, now, subagents=True, sid=None, st=None):
     if not subagents:
         return None
     subs = chain_subagent_files(path, session_chain(sid, st) if sid else [None])
-    newest = max((os.path.getmtime(f) for f in subs if os.path.exists(f)), default=None)
+    newest = max((file_mtime(f) for f in subs if os.path.exists(f)), default=None)
     if newest is not None and now - datetime.fromtimestamp(newest, UTC) < SUBAGENT_QUIET:
         return "a subagent is working"
     return None

@@ -395,6 +395,9 @@ _CACHE: dict[str, tuple[tuple[float, int], Scan]] = {}
 
 def scan_cached(path: str) -> Scan:
     """scan(), re-read only when the file changed (the watcher looks every minute)."""
+    import keepalive
+    fn: Callable[[str], None] = getattr(keepalive, "refresh")   # bridge mode: bring the mirror up to date
+    fn(path)
     st = os.stat(path)
     sig = (st.st_mtime, st.st_size)
     hit = _CACHE.get(path)
