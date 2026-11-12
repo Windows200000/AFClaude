@@ -30,7 +30,7 @@ INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
 # the current kit version with its whitelist hash and the sha256 of each kit file: a command added, or a change of
 # host_exec.py or ka_resume.sh, without a version bump fails test_whitelist_hash_matches_the_version and
 # test_kit_files_are_pinned_with_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS; M5)
-KIT_VERSIONS = {"5": {"whitelist": "69a25c72326e80b0", "host_exec.py": "c2fe2a234a4b454903802c733d6d66b6683c33a4b1abc0fd7a0220308826f272",  # public-check: allow (sha256 pin)
+KIT_VERSIONS = {"6": {"whitelist": "69a25c72326e80b0", "host_exec.py": "7e9475ef2c98640ea64b40cce493a12c3e074e8cddcfe72518072d736ea02a03",  # public-check: allow (sha256 pin)
                         "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af"}}  # public-check: allow (sha256 pin)
 SID = "abcdef01-0000-4000-8000-000000000001"
 
@@ -148,7 +148,7 @@ class HostJson(TempDir):
     def share(self):
         """host.json's own directory, as <share>/afclaude: a kit file path below it, so KIT_DIR/../.. is it."""
         share = os.path.join(self.tmp, "share")
-        kit = os.path.join(share, "host-kit", "5")
+        kit = os.path.join(share, "host-kit", "6")
         os.makedirs(kit)
         for name in ("host_exec.py", "ka_resume.sh"):
             shutil.copy(os.path.join(os.path.dirname(HOST_EXEC) if name == "host_exec.py" else HERE, name), kit)
@@ -705,7 +705,7 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "5"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
@@ -723,7 +723,7 @@ class InstallScript(unittest.TestCase):
         the link are back, nothing is left over."""
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "5"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real, once = shutil.which("mv"), os.path.join(self.tmp, "mv-failed")
@@ -1252,7 +1252,7 @@ class KitReads(TempDir):
             self.assertEqual(self.call("kit-version").returncode, 126, bad)
 
     def test_transcript_read_ranges(self):
-        """kit version 5: a byte range of one transcript, base64, with the file's size and mtime now."""
+        """kit version 5 (6 hardened it): a byte range of one transcript, base64, with the file's size and mtime now."""
         raw = "".join(json.dumps(self.user(f"m{i}")) + "\n" for i in range(50))
         path = self.tx("a.jsonl", [], raw=raw, mtime=4000)
         data = raw.encode()
@@ -1290,6 +1290,28 @@ class KitReads(TempDir):
             self.assertEqual(r.returncode, 126, (cmd, r.stdout[:80]))
             self.assertNotIn(b"secret", r.stdout)
         self.assertIn(b"No such file", self.call("transcript-read default -w-p/missing.jsonl 0 10").stderr)
+
+    def test_transcript_read_hardening(self):
+        """L1-L3 of the K4b review: a FIFO named *.jsonl answers a denial at once (the open does not wait), Unicode
+        digits are a denial (not a traceback), a hard link is refused; the listing leaves out names transcript-read
+        cannot serve."""
+        proj = os.path.join(self.cdir, "projects", "-w-p")
+        self.tx("a.jsonl", [self.user("one")])
+        os.mkfifo(os.path.join(proj, "fifo.jsonl"))
+        open(os.path.join(self.root, "secret.jsonl"), "w").write("secret\n")
+        os.link(os.path.join(self.root, "secret.jsonl"), os.path.join(proj, "hard.jsonl"))
+        self.tx("odd name.jsonl", [self.user("two")])
+        for cmd in ("transcript-read default -w-p/fifo.jsonl 0 10", "transcript-read default -w-p/hard.jsonl 0 10",
+                    "transcript-read default -w-p/a.jsonl \u00b2 10", "transcript-read default -w-p/a.jsonl 0 \u0661\u0660",
+                    "transcript-read default -w-p/a.jsonl 12345678901234567 10"):
+            r = self.call(cmd)
+            self.assertEqual(r.returncode, 126, cmd)
+            self.assertNotIn(b"Traceback", r.stderr)
+            self.assertNotIn(b"secret", r.stdout)
+        listed = [f["path"] for f in self.ok_json("transcripts default --changed-since 0 --head 0 --tail 0")["files"]]
+        self.assertNotIn("-w-p/odd name.jsonl", listed)
+        self.assertIn("-w-p/a.jsonl", listed)
+        self.assertEqual(self.he.UINT.match("\u00b2"), None)
 
     def test_transcripts_near_misses(self):
         for cmd in ("transcripts", "transcripts default", "transcripts default --changed-since",

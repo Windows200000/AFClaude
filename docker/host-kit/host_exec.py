@@ -94,7 +94,7 @@ from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 # The kit version: bumped with every change of the whitelist (a new command, a new shape) or of the
 # host.json format. host.py's HOST_KIT_VERSION is the same string (test_host_kit.py compares them) and
 # the container's host check calls `kit-version` against it.
-HOST_KIT_VERSION = "5"
+HOST_KIT_VERSION = "6"
 CONFIG_FORMAT = 2
 # every command head the whitelist knows (the elif chain in main(); test_host_kit.py compares the two)
 COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "host-config", "ka_resume.sh",
@@ -157,6 +157,7 @@ TX_TAIL_READ = 16 * 1024 * 1024                             # most bytes read ba
 SESSIONS_MAX = 500
 TX_READ_MAX = 1024 * 1024                                   # bytes of one transcript-read answer (base64 stays under OUT_MAX)
 TX_PATH = re.compile(r"^[A-Za-z0-9_.@+=-]+(/[A-Za-z0-9_.@+=-]+)*\.jsonl\Z")
+UINT = re.compile(r"[0-9]{1,16}\Z")                         # a number argument (str.isdigit() takes Unicode digits)
 CHECK_SESSION = "afc-check"                                 # tmux-check's session; names.py never generates it (reserved there)
 CHECK_TIMEOUT = 60                                          # seconds the check commands may run (exit 124)
 MAX_ROOTS = 8
@@ -641,7 +642,7 @@ def transcripts_json(args: List[str]) -> str:
     opts = {"--head": 1, "--tail": 5}
     rest = args[3:]
     while rest:
-        if len(rest) < 2 or rest[0] not in opts or not rest[1].isdigit() or int(rest[1]) > TX_MAX_ENTRIES:
+        if len(rest) < 2 or rest[0] not in opts or not UINT.match(rest[1]) or int(rest[1]) > TX_MAX_ENTRIES:
             deny(f"transcripts: bad option {rest[0]!r}")
         opts[rest[0]] = int(rest[1])
         rest = rest[2:]
@@ -657,6 +658,8 @@ def transcripts_json(args: List[str]) -> str:
             if not name.endswith(".jsonl"):
                 continue
             path = os.path.join(dirpath, name)
+            if not TX_PATH.match(os.path.relpath(path, base)):
+                continue                                  # a name transcript-read cannot serve is not listed
             try:
                 st = os.lstat(path)
             except FileNotFoundError:
@@ -687,8 +690,10 @@ def transcripts_json(args: List[str]) -> str:
 def transcript_read_json(args: List[str]) -> str:
     """transcript-read <config-dir-id> <path> <offset> <length> -> JSON, or deny. Every directory of <path> and
     the file itself are opened with O_NOFOLLOW from the projects dir down (a link in the way is a denial), the
-    file must be regular; an offset beyond the end answers no data (the caller sees `size`)."""
-    if len(args) != 4 or not args[2].isdigit() or not args[3].isdigit():
+    file must be regular with one link (a FIFO or device cannot block it: the open does not wait); an offset
+    beyond the end answers no data (the caller sees `size`). A missing file is the denial
+    `transcript-read: No such file or directory` (rc 126), which txsource.py reads as "gone"."""
+    if len(args) != 4 or not UINT.match(args[2]) or not UINT.match(args[3]):
         deny("transcript-read needs <config-dir-id> <path> <offset> <length>")
     rel, offset, length = args[1], int(args[2]), int(args[3])
     parts = rel.split("/")
@@ -701,11 +706,11 @@ def transcript_read_json(args: List[str]) -> str:
         for part in parts[:-1]:
             cur = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur)
             fds.append(cur)
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=cur)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cur)
         fds.append(fd)
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            deny("transcript-read: not a regular file")
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            deny("transcript-read: not a plain regular file")
         os.lseek(fd, offset, os.SEEK_SET)
         data = os.read(fd, length)
     except OSError as e:

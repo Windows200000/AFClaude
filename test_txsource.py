@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import testenv  # noqa: F401  (hermetic env; before the AFClaude imports)
@@ -294,15 +295,25 @@ class Scans(StubKit):
         self.assertEqual(st["bytes"], os.path.getsize(os.path.join(self.projects, PROJ, f"{SID}.jsonl")) - first)
         self.assertEqual(self.reads()[-1][3], str(first))
 
-    def test_an_explicit_projects_dir_stays_local(self):
+    def test_an_explicit_other_projects_dir_raises_in_bridge_mode(self):
+        """L7: bridge mode never reads a local projects dir (it would answer an empty scan once the mounts are
+        gone); the default dir given explicitly is the bridge's."""
         self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
         db = os.path.join(self.tmp, "loc.db")
         store.connect(db, create=True).close()
         conn = store.connect(db)
+        with self.assertRaises(txsource.TxError):
+            stalled.scan(conn, os.path.join(self.tmp, "elsewhere"), own_list=os.path.join(self.tmp, "own.txt"))
+        with self.assertRaises(txsource.TxError):
+            import run_metrics
+            run_metrics.session_activity(SID, datetime(2026, 1, 1, tzinfo=timezone.utc),
+                                         datetime(2026, 12, 1, tzinfo=timezone.utc),
+                                         projects_dir=os.path.join(self.tmp, "elsewhere"))
+        self.assertEqual(self.calls, [])
         st = stalled.scan(conn, self.projects, own_list=os.path.join(self.tmp, "own.txt"))
         conn.close()
         self.assertEqual(st["files"], 1)
-        self.assertEqual(self.calls, [])
+        self.assertTrue(self.calls)
 
     def test_usage_sampler_scan_same_result_in_both_positions(self):
         import usage_sampler as us
@@ -375,6 +386,26 @@ class Failures(StubKit):
         with self.assertRaises(FileNotFoundError):
             txsource.mirror(f"{PROJ}/{SID}.jsonl")
 
+    def test_an_ssh_failure_is_never_a_gone_transcript(self):
+        """M1: error text that mentions a missing file (a missing bridge key makes ssh say so, rc 255) raises
+        TxError, so no reader takes the outage for a transcript that is gone."""
+        ssh_err = ("Warning: Identity file /run/secrets/key not accessible: No such file or directory.\n"
+                   "Permission denied (publickey).\n")
+        path = os.path.join(self.mirror, "projects", PROJ, f"{SID}.jsonl")
+        for rc, err in ((255, ssh_err), (1, "No such file or directory"), (126, "host_exec: denied (doc-files: No such file or directory)"),
+                        (126, "host_exec: denied (transcript-read: No such file or directory) and more"),
+                        (255, txsource.GONE)):
+            self.broken = self.bad(rc, "", err)
+            with self.assertRaises(txsource.TxError, msg=(rc, err)) as cm:
+                txsource.mirror(f"{PROJ}/{SID}.jsonl")
+            self.assertNotIsInstance(cm.exception, FileNotFoundError)
+        self.broken = self.bad(255, "", ssh_err)
+        with self.assertRaises(txsource.TxError):
+            inbox.seen(path, 0, "MARK")                 # the verify must not record "not delivered" on an outage
+        self.broken = self.bad(126, "", txsource.GONE + "\n")      # the kit's own answer
+        with self.assertRaises(FileNotFoundError):
+            txsource.mirror(f"{PROJ}/{SID}.jsonl")
+
     def test_a_wrong_answer_to_a_read_raises(self):
         txsource.drop_listing()
         self.broken = lambda remote: subprocess.CompletedProcess(remote, 0, json.dumps(
@@ -387,6 +418,120 @@ class Failures(StubKit):
         for bad in ("../x.jsonl", "/etc/x.jsonl", "a//b.jsonl", ""):
             with self.assertRaises(txsource.TxError):
                 txsource.mirror_path(bad)
+
+
+class Hardening(StubKit):
+    """The K4b fix round: stored host-form paths (M2), a bounded mirror (M3), vanished files (L6), links (L5)."""
+
+    def test_fork_families_reads_stored_host_paths_through_the_bridge(self):
+        import dispatcher
+        same = entry("user", "start", "2026-11-01T10:00:00Z")
+        self.tx(f"{SID}.jsonl", [same])
+        self.tx(f"{SID2}.jsonl", [same, entry("assistant", "more", "2026-11-01T10:01:00Z")])
+        db = os.path.join(self.tmp, "fork.db")
+        store.connect(db, create=True).close()
+        conn = store.connect(db)
+        stalled.scan(conn, None, own_list=os.path.join(self.tmp, "own.txt"))
+        paths = {r["session_id"]: r["path"] for r in conn.execute("SELECT session_id, path FROM sessions")}
+        self.assertTrue(all(p.startswith(self.projects + os.sep) for p in paths.values()))   # the host form
+        self.calls.clear()
+        with mock.patch("builtins.open", side_effect=self.no_host_open):
+            fam = dispatcher.fork_families(conn)
+        self.assertEqual(fam, {SID: sorted([SID, SID2]), SID2: sorted([SID, SID2])})
+        self.assertTrue(self.reads())                                  # through the kit, into the mirror
+        with self.assertRaises(txsource.TxError):                       # a path that is neither: never read
+            ka.refresh(os.path.join(self.tmp, "elsewhere", PROJ, f"{SID}.jsonl"))
+        conn.close()
+
+    def no_host_open(self, file, *a, **kw):
+        if str(file).startswith(self.projects + os.sep):
+            raise AssertionError(f"read the mount: {file}")
+        return self.real_open(file, *a, **kw)
+
+    def setUp(self):
+        super().setUp()
+        import builtins
+        self.real_open = builtins.open
+
+    def test_the_mirror_is_pruned(self):
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        self.tx(f"{SID2}.jsonl", [entry("user", "two", "2026-11-01T10:00:00Z")], sub=None)
+        self.tx("agent-1.jsonl", [entry("user", "s", "2026-11-01T10:00:00Z")], sub=f"{SID}/subagents")
+        for r in (f"{PROJ}/{SID}.jsonl", f"{PROJ}/{SID2}.jsonl", f"{PROJ}/{SID}/subagents/agent-1.jsonl"):
+            txsource.mirror(r)
+        root = txsource.projects_mirror()
+        files = txsource.listing(0)
+        now = txsource._now()
+        names = lambda: sorted(os.path.relpath(os.path.join(d, f), root) for d, _x, fs in os.walk(root) for f in fs)   # noqa: E731
+        with mock.patch.object(txsource, "_now", lambda: now + 60):                    # inside the grace time: nothing goes
+            self.assertEqual(txsource.prune_mirror({}, force=True), 0)
+        self.assertEqual(len(names()), 3)
+        with mock.patch.object(txsource, "_now", lambda: now + 2 * 3600):              # the host's copy of SID2 is gone
+            self.assertEqual(txsource.prune_mirror({k: v for k, v in files.items() if SID2 not in k}, force=True), 1)
+        self.assertEqual(len(names()), 2)
+        self.assertFalse(os.path.exists(os.path.join(root, PROJ, f"{SID2}.jsonl")))
+        with mock.patch.object(txsource, "_now", lambda: now + 13 * 86400):            # still used within 14 days
+            self.assertEqual(txsource.prune_mirror(files, force=True), 0)
+        with mock.patch.object(txsource, "_now", lambda: now + 15 * 86400):            # not touched for 14 days
+            self.assertEqual(txsource.prune_mirror(files, force=True), 2)
+        self.assertEqual(names(), [])
+        self.assertFalse(os.path.isdir(os.path.join(root, PROJ, SID)))                  # empty directories go too
+        txsource.mirror(f"{PROJ}/{SID}.jsonl")                                          # fetched again on demand
+        self.assertEqual(len(names()), 1)
+
+    def test_listing_prunes_at_most_once_an_hour(self):
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        txsource.mirror(f"{PROJ}/{SID}.jsonl")
+        now = txsource._now()
+        txsource.drop_listing()
+        with mock.patch.object(txsource, "_now", lambda: now + 20 * 86400):
+            txsource.listing(0)                                        # first listing: pruned (the file is 20 days stale)
+        self.assertFalse(os.path.exists(os.path.join(txsource.projects_mirror(), PROJ, f"{SID}.jsonl")))
+        txsource.mirror(f"{PROJ}/{SID}.jsonl")
+        with mock.patch.object(txsource, "_now", lambda: now + 20 * 86400 + 60):
+            txsource.listing(0)                                        # within the hour of the last prune: left alone
+        self.assertTrue(os.path.exists(os.path.join(txsource.projects_mirror(), PROJ, f"{SID}.jsonl")))
+
+    def test_a_file_deleted_after_the_listing_is_skipped_by_the_range_read(self):
+        path = self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        sizes = txsource.scan_listing(self.projects, True)
+        os.unlink(path)
+        (p, size), = sizes.items()
+        self.assertEqual(txsource.read_scan_chunk(self.projects, p, 0, size), b"")
+        db = os.path.join(self.tmp, "gone.db")
+        store.connect(db, create=True).close()
+        conn = store.connect(db)
+        self.tx(f"{SID2}.jsonl", [entry("user", "two", "2026-11-01T10:00:00Z")])
+        real = txsource.read_scan_chunk
+        def vanish(base, p, off, size):          # the file is gone between the scan's listing and its read
+            os.unlink(os.path.join(self.projects, PROJ, f"{SID2}.jsonl"))
+            return real(base, p, off, size)
+        with mock.patch.object(txsource, "read_scan_chunk", vanish):
+            st = stalled.scan(conn, None, own_list=os.path.join(self.tmp, "own.txt"))
+        conn.close()
+        self.assertEqual(st["files"], 1)
+
+    def test_the_listing_leaves_out_names_the_kit_cannot_read(self):
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        self.tx("odd name.jsonl", [entry("user", "x", "2026-11-01T10:00:00Z")])
+        self.assertEqual(list(txsource.listing(0)), [f"{PROJ}/{SID}.jsonl"])
+        self.assertEqual(len(txsource.scan_listing(self.projects, True)), 1)
+
+    def test_the_mirror_does_not_follow_links(self):
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        os.makedirs(txsource.projects_mirror())
+        os.symlink(outside, os.path.join(txsource.projects_mirror(), PROJ))          # a planted directory link
+        with self.assertRaises(txsource.TxError):
+            txsource.mirror(f"{PROJ}/{SID}.jsonl")
+        self.assertEqual(os.listdir(outside), [])
+        os.unlink(os.path.join(txsource.projects_mirror(), PROJ))
+        os.makedirs(os.path.join(txsource.projects_mirror(), PROJ))
+        os.symlink(os.path.join(outside, "x"), os.path.join(txsource.projects_mirror(), PROJ, f"{SID}.jsonl"))
+        with self.assertRaises(OSError):                                             # a planted file link
+            txsource.mirror(f"{PROJ}/{SID}.jsonl")
+        self.assertEqual(os.listdir(outside), [])
 
 
 class Docs(DocsEnv):

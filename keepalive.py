@@ -321,22 +321,22 @@ def file_mtime(path):
     """os.path.getmtime of a transcript, current: a mirrored main transcript is brought up to date first
     (bridge mode; a subagent file's mtime is the one subagent_files() just set)."""
     if txsource.bridge_on():
-        txsource.refresh_path(path, main_only=True)
+        path = txsource.refresh_path(path, main_only=True, host_projects=PROJECTS_DIR)
     return os.path.getmtime(path)
 
 
 def refresh(path):
-    """A reader of the transcript `path` that opens it itself calls this first (bridge mode: the mirror is
-    brought up to date; otherwise nothing to do)."""
+    """A reader of the transcript `path` that opens it itself calls this first and opens the path it returns
+    (bridge mode: the mirror is brought up to date and its path returned; `path` may be the host's form, as
+    the DB stores it. Otherwise `path` itself, nothing to do)."""
     if txsource.bridge_on():
-        txsource.refresh_path(path)
+        return txsource.refresh_path(path, host_projects=PROJECTS_DIR)
+    return path
 
 
 def file_size(path):
     """os.path.getsize of a transcript, current (a mirrored one is brought up to date first: bridge mode)."""
-    if txsource.bridge_on():
-        txsource.refresh_path(path)
-    return os.path.getsize(path)
+    return os.path.getsize(refresh(path))
 
 
 def sessions_dir():
@@ -345,8 +345,7 @@ def sessions_dir():
 
 
 def iter_entries(path):
-    if txsource.bridge_on():
-        txsource.refresh_path(path)
+    path = refresh(path)
     with open(path, errors="replace") as fh:
         for line in fh:
             line = line.strip()

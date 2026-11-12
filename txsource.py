@@ -24,14 +24,25 @@ Two ways to use the bridge, so each reader keeps its file-reading core:
     every file's size and mtime, read_range() the bytes from the stored offset on.
 
 Every bridge answer is checked: a non-zero exit, bad JSON, a `truncated` flag or a non-empty `errors` list of
-the listing raise TxError (or FileNotFoundError for a transcript that is gone); a timeout raises as the
-subprocess does. The mirror holds transcript text: its directories are 0700 and its files 0600.
+the listing raise TxError; a transcript that is gone is FileNotFoundError only when the kit says so in its own
+words (rc 126 and the line `host_exec: denied (transcript-read: No such file or directory)`), never because some
+error text mentions a file (an ssh failure raises TxError); a timeout raises as the subprocess does. The mirror
+holds transcript text: its directories are 0700 and its files 0600, nothing in it is followed through a link.
+The mirror is bounded (prune_mirror, run from listing() at most once an hour): a copy goes when the host no
+longer has the file or when it was not brought up to date for MIRROR_KEEP_DAYS days; a reader that needs it
+again fetches it again.
+
+A transcript path a reader holds may be the host's own form (the DB keeps `sessions.path` that way, inbox verify
+entries stored before the switch too): refresh_path maps a path below the host's projects dir to its mirror and
+returns the local path to open; a transcript path that is neither raises (bridge mode never reads the mount).
 """
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
+import stat
 import time
 from typing import Any, Callable, Optional
 
@@ -42,9 +53,14 @@ CHUNK = 1024 * 1024          # bytes per transcript-read call (host_exec.py TX_R
 LIST_TTL = 1.0               # seconds a listing is reused (one tick looks up many sessions)
 SESSIONS_TTL = 2.0           # seconds a mirrored session registry is reused (one preflight reads many pids)
 CALL_TIMEOUT = 60            # seconds one bridge call may take (D-234: a timeout raises)
+MIRROR_KEEP_DAYS = 14        # a mirrored file not brought up to date for this long is pruned (M3)
+MIRROR_GRACE = 3600          # ... but never one touched within this many seconds (a reader may be using it)
+PRUNE_EVERY = 3600           # seconds between two prunes of the mirror
+GONE = "host_exec: denied (transcript-read: No such file or directory)"   # the kit's own answer for a missing file
 
 _listing: tuple[float, dict[str, tuple[int, float]]] | None = None
 _sessions_at: float | None = None
+_pruned_at: float | None = None
 
 
 class TxError(RuntimeError):
@@ -61,6 +77,22 @@ def mode() -> str:
 
 def bridge_on() -> bool:
     return mode() == BRIDGE
+
+
+def _now() -> float:
+    return time.time()
+
+
+def use_bridge(projects_dir: Optional[str], default_dir: str) -> bool:
+    """Whether a scan of `projects_dir` (None = the default) goes through the bridge: always in bridge mode. An
+    explicit projects dir other than the default is a local one, which bridge mode must never read (it would
+    answer an empty scan once the mounts are gone): it raises (D-235)."""
+    if not bridge_on():
+        return False
+    if projects_dir and os.path.normpath(projects_dir) != os.path.normpath(default_dir):
+        raise TxError(f"projects dir {projects_dir!r} given with AFCLAUDE_READERS=bridge: the bridge reads the host's "
+                      f"{default_dir!r} only")
+    return True
 
 
 def config_id() -> str:
@@ -88,16 +120,20 @@ def _private_dirs(path: str) -> None:
     if not os.path.abspath(path).startswith(root + os.sep) and os.path.abspath(path) != root:
         raise TxError(f"{path!r} is outside the mirror {root!r}")
     os.makedirs(path, mode=0o700, exist_ok=True)
+    real_root = os.path.realpath(root)           # nothing below the mirror may be a link (it is a writer's tree)
+    if os.path.realpath(path) != os.path.normpath(os.path.join(real_root, os.path.relpath(path, root))):
+        raise TxError(f"{path!r} is not a plain directory below the mirror {root!r} (a link in the way)")
 
 
 def _call(argv: list[str]) -> Any:
     """One kit command that answers JSON. -> the parsed answer; rc != 0 or bad JSON raises TxError, a
-    timeout raises subprocess.TimeoutExpired."""
+    timeout raises subprocess.TimeoutExpired. A missing transcript is FileNotFoundError only by the kit's own
+    answer (GONE, rc 126); any other failure, an ssh one included, is a TxError."""
     run: Callable[..., Any] = getattr(host, "run_on_host")      # host.py is untyped; looked up per call (tests patch it)
     r = run(argv, timeout=CALL_TIMEOUT)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()[:300]
-        if "No such file" in err and argv[0] == "transcript-read":
+        if argv[0] == "transcript-read" and r.returncode == 126 and GONE in (r.stderr or "").splitlines():
             raise FileNotFoundError(f"{argv[2]}: gone on the host ({err})")
         raise TxError(f"`{' '.join(argv[:2])}` failed on the host, rc {r.returncode}: {err}")
     try:
@@ -124,6 +160,7 @@ def listing(max_age: float = LIST_TTL) -> dict[str, tuple[int, float]]:
         raise TxError(f"the host could not read part of the transcripts: {str(out['errors'])[:300]}")
     files = {str(f["path"]): (int(f["size"]), float(f["mtime"])) for f in out["files"]}
     _listing = (time.monotonic(), files)
+    prune_mirror(files)
     return files
 
 
@@ -137,17 +174,22 @@ def scan_listing(base: str, top_level_only: bool) -> dict[str, int]:
 
 def read_scan_chunk(base: str, path: str, offset: int, size: int) -> bytes:
     """The bytes [offset, size) of a transcript named by scan_listing's path (fewer when the host's file got
-    shorter since the listing)."""
+    shorter since the listing, none when it is gone)."""
     rel = os.path.relpath(path, base).replace(os.sep, "/")
-    data, _size, _mtime = read_range(rel, offset, size - offset) if size > offset else (b"", 0, 0.0)
-    return data
+    if size <= offset:
+        return b""
+    try:
+        return read_range(rel, offset, size - offset)[0]
+    except FileNotFoundError:        # deleted since the listing (Claude Code's cleanup): nothing to scan, as in mount mode
+        return b""
 
 
 def drop_listing() -> None:
     """Forget the cached listing (tests; a reader that must see a new file at once)."""
-    global _listing, _sessions_at
+    global _listing, _sessions_at, _pruned_at
     _listing = None
     _sessions_at = None
+    _pruned_at = None
 
 
 def _read_chunk(rel: str, offset: int, length: int) -> tuple[bytes, int, float]:
@@ -193,12 +235,16 @@ def _set_mtime(path: str, mtime: float) -> None:
 def mirror(rel: str) -> str:
     """Bring the local copy of the transcript up to date (appending what it lacks) -> its local path. The
     host's current size decides (no cached listing): a copy longer than the host's file is thrown away and
-    fetched again. FileNotFoundError when the host no longer has it."""
+    fetched again. FileNotFoundError when the host no longer has it. One writer per file at a time (flock): the
+    size is read under the lock."""
     path = mirror_path(rel)
     _private_dirs(os.path.dirname(path))
-    have = os.path.getsize(path) if os.path.exists(path) else 0
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise TxError(f"{path!r} is not a regular file")
+        have = os.fstat(fd).st_size
         while True:
             data, size, mtime = _read_chunk(rel, have, CHUNK)
             if size < have:                       # shorter than our copy: rewritten on the host
@@ -210,9 +256,9 @@ def mirror(rel: str) -> str:
                 have += len(data)
             if have >= size:
                 break
+        os.utime(fd, (mtime, mtime))
     finally:
         os.close(fd)
-    _set_mtime(path, mtime)
     return path
 
 
@@ -221,8 +267,11 @@ def stub(rel: str, mtime: float) -> str:
     host's mtime. Its size is the part mirrored so far, never the host's: a reader of the content calls mirror()."""
     path = mirror_path(rel)
     _private_dirs(os.path.dirname(path))
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
-    _set_mtime(path, mtime)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.utime(fd, (mtime, mtime))
+    finally:
+        os.close(fd)
     return path
 
 
@@ -233,12 +282,64 @@ def rel_of(path: str) -> Optional[str]:
     return p[len(root):].replace(os.sep, "/") if p.startswith(root) else None
 
 
-def refresh_path(path: str, main_only: bool = False) -> None:
-    """A reader is about to open `path`: when it is a mirrored transcript, bring it up to date first.
-    main_only: leave a subagent file alone (a reader that only wants its mtime, which a stub carries)."""
+def rel_of_host(path: str, host_projects: Optional[str] = None) -> Optional[str]:
+    """The transcript path relative to the host's projects dir (`host_projects`, default KEEPALIVE_PROJECTS_DIR
+    or ~/.claude/projects, keepalive.PROJECTS_DIR), or None when `path` is not below it: the host form a
+    stored path (sessions.path, an inbox verify entry) has."""
+    root = os.path.abspath(host_projects or os.environ.get("KEEPALIVE_PROJECTS_DIR", "")
+                           or os.path.expanduser("~/.claude/projects")) + os.sep
+    p = os.path.abspath(path)
+    return p[len(root):].replace(os.sep, "/") if p.startswith(root) else None
+
+
+def refresh_path(path: str, main_only: bool = False, host_projects: Optional[str] = None) -> str:
+    """A reader is about to open the transcript `path`: bring its mirror up to date and return the local path to
+    open. `path` is a mirror path, or the host's form (below `host_projects`: mapped to its mirror); anything
+    else raises TxError (bridge mode never reads another path, M2). main_only: leave a subagent file alone (a
+    reader that only wants its mtime, which a stub carries); its path is returned as the mirror's."""
     rel = rel_of(path)
-    if rel is not None and not (main_only and rel.count("/") != 1):
+    local = path
+    if rel is None:
+        rel = rel_of_host(path, host_projects)
+        if rel is None:
+            raise TxError(f"{path!r} is neither a mirrored transcript nor below the host's projects dir")
+        local = mirror_path(rel)
+    if not (main_only and rel.count("/") != 1):
         mirror(rel)
+    return local
+
+
+def prune_mirror(files: dict[str, tuple[int, float]], force: bool = False) -> int:
+    """Bound the mirror (M3): delete the mirrored transcripts the host no longer has (not in `files`, the
+    current listing) and those not brought up to date (every mirror() / stub() call touches the file's ctime)
+    for MIRROR_KEEP_DAYS days, but nothing touched within MIRROR_GRACE seconds; then empty directories (not those changed within the grace time). At
+    most once per PRUNE_EVERY seconds (force: now). A reader that needs a pruned copy again mirrors it again.
+    -> the number of files removed."""
+    global _pruned_at
+    now = _now()
+    if not force and _pruned_at is not None and now - _pruned_at < PRUNE_EVERY:
+        return 0
+    _pruned_at = now
+    root = projects_mirror()
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            try:
+                age = now - os.lstat(full).st_ctime
+                if age >= MIRROR_GRACE and (rel not in files or age > MIRROR_KEEP_DAYS * 86400):
+                    os.unlink(full)
+                    removed += 1
+            except FileNotFoundError:
+                continue
+        if dirpath != root:
+            try:
+                if now - os.lstat(dirpath).st_mtime >= MIRROR_GRACE:     # a directory just made is a reader's
+                    os.rmdir(dirpath)
+            except OSError:
+                pass                          # not empty (or gone): stays
+    return removed
 
 
 def session_mains(session_id: str) -> list[str]:
@@ -299,7 +400,7 @@ def sessions_dir() -> str:
         if "data" not in f or not name.endswith(".json") or "/" in name or name.startswith("."):
             continue
         tmp = os.path.join(path, "." + name + ".new")
-        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "w") as fh:
             json.dump(f["data"], fh)
         _set_mtime(tmp, float(f.get("mtime", time.time())))
         os.replace(tmp, os.path.join(path, name))

@@ -203,7 +203,7 @@ def first_message_uuid(path, max_lines=2000):
     """uuid of the first user/assistant entry. A fork (a resume while another
     process held the session) copies the whole history, so copies share it."""
     try:
-        ka.refresh(path)
+        path = ka.refresh(path)      # bridge mode: the mirror of a stored host-form path
         with open(path, errors="replace") as fh:
             for i, line in enumerate(fh):
                 if i >= max_lines:

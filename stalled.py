@@ -205,7 +205,7 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
     t0 = time.monotonic()
     own_conn = conn is None
     conn = conn or store.connect()
-    bridge = txsource.bridge_on() and not projects_dir      # an explicit projects dir is always a local one
+    bridge = txsource.use_bridge(projects_dir, ka.PROJECTS_DIR)      # an explicit other projects dir raises in bridge mode (L7)
     projects_dir = projects_dir or ka.PROJECTS_DIR
     own_list = own_list or OWN_LIST
     st = {"files": 0, "changed": 0, "rescanned": 0, "bytes": 0, "new_hits": 0, "new_sessions": 0}

@@ -587,7 +587,7 @@ def session_activity(session_id, lo, hi, projects_dir=None):
     transcript that can't be read raises (D-235: no run end from part of the session's writes)."""
     import keepalive as ka
     pdir = projects_dir or ka.PROJECTS_DIR
-    if txsource.bridge_on() and not projects_dir:      # the mirror (K4); the subagent files are stubs until read
+    if txsource.use_bridge(projects_dir, ka.PROJECTS_DIR):      # the mirror (K4); the subagent files are stubs until read
         mains = [txsource.mirror(r) for r in txsource.session_mains(session_id)]
         subs = [f for m in mains for f in txsource.subagent_files(m)]
     else:

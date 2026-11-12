@@ -163,7 +163,7 @@ def scan_after(path, offset):
     """(message entry seen, real model reply after it) in `path` after byte `offset`. A synthetic
     notice or an API error entry is no reply (keepalive.is_real_reply)."""
     seen = answered = False
-    ka.refresh(path)
+    path = ka.refresh(path)
     with open(path, "rb") as fh:
         fh.seek(offset)
         data = fh.read().decode(errors="replace")
