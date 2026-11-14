@@ -1,5 +1,17 @@
 #!/bin/sh
-# Entrypoint of the AFClaude manager container (PID 1 is tini).
+# Entrypoint of the AFClaude containers (PID 1 is tini); one image, two layouts (D-339, AFCLAUDE_LAYOUT):
+#   single (the default until the K7 cut-over)  one container, the runner service only (docker/compose.yml); the runner
+#                                supervises the inbox API and no master key is checked (nothing uses it yet)
+#   services                     three services from one image (docker/compose.services.yml sets AFCLAUDE_LAYOUT=services):
+#   afclaude-entrypoint [runner]   the runner service (compose's default command; no argument = runner)
+#   afclaude-entrypoint mcp        the MCP service: `afclaude mcp serve` (HTTP on an internal port)
+#   afclaude-entrypoint web        the web service: `afclaude web serve` (/health + the inbox API on a unix socket)
+# Every service first refuses an unmounted data directory (service.py check-mount, before any migration or
+# write) and, in the services layout, loads the master key (K3: service.py ensure-key here, and again inside the
+# long-running process, which keeps the key); a refusal exits 78 with the message in `docker logs`. Only the runner
+# service migrates the schema and imports the prompt defaults (once, before it starts); mcp and web wait for it
+# (compose: depends_on healthy) and then check the schema themselves (/health).
+# The rest of this header describes the runner service:
 #   AFCLAUDE_SCHEDULER=runner  the resident runner (runner.py serve, phase 3a S8): this script
 #                              `exec`s it, so it is tini's only child and `docker stop`'s SIGTERM
 #                              reaches it directly (its clean exit within compose's 90-s stop grace);
@@ -11,6 +23,31 @@
 # (phase 3a S9 removed the rollback mode `legacy`, supercronic and its crontabs, and the alias `on`)
 set -eu
 D="${AFCLAUDE_APP:-/app}"   # where the image keeps the code (the override is for the tests)
+SVC="${1:-runner}"
+case "$SVC" in
+  runner|mcp|web) ;;
+  *) echo "afclaude: unknown service ${SVC} (runner, mcp or web)" >&2; exit 2 ;;
+esac
+LAYOUT="${AFCLAUDE_LAYOUT:-single}"
+case "$LAYOUT" in
+  single|services) ;;
+  *) echo "afclaude: AFCLAUDE_LAYOUT must be single or services, not ${LAYOUT}" >&2; exit 2 ;;
+esac
+if [ "$LAYOUT" = single ] && [ "$SVC" != runner ]; then
+  echo "afclaude: the ${SVC} service needs AFCLAUDE_LAYOUT=services (docker/compose.services.yml)" >&2; exit 2
+fi
+# The data directory must be a mounted volume (AFCLAUDE_DATA, no default: D-180/D-187); nothing is written before.
+python3 "$D/service.py" check-mount "$SVC" || exit $?
+case "$SVC" in
+  mcp)
+    python3 "$D/service.py" ensure-key mcp || exit $?
+    exec python3 -u "$D/mcp_service.py" serve
+    ;;
+  web)
+    python3 "$D/service.py" ensure-key web || exit $?
+    exec python3 -u "$D/web.py" serve
+    ;;
+esac
 # The mode first, before migrate: an unknown one (e.g. a stale `on` after phase 3a S9) must not exit,
 # or `restart: unless-stopped` loops silently through migrate/import-prompts. It alerts the owner out of
 # the DB (the fallback file + a push, as a failed migrate does) and idles, unhealthy (`runner.py health`).
@@ -26,9 +63,16 @@ case "$MODE" in
     exec sleep infinity
     ;;
 esac
-# Strict host key checking against the host's own public host key (mounted read-only).
+# Strict host key checking against the host's own public host key (mounted read-only by
+# compose.host-mounts.yml until the bridge files move into the data directory, K6). Without it the
+# bridge is not configured: every host call then fails loudly on use, and the runner's host checks say so.
 KH="${AFCLAUDE_BRIDGE_KNOWN_HOSTS:-/tmp/afclaude_known_hosts}"
-printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 /run/host_ssh/ssh_host_ed25519_key.pub)" >"$KH"
+HOSTKEY="${AFCLAUDE_HOST_PUBKEY:-/run/host_ssh/ssh_host_ed25519_key.pub}"
+if [ -f "$HOSTKEY" ]; then
+  printf 'afclaude-host %s\n' "$(cut -d' ' -f1,2 "$HOSTKEY")" >"$KH"
+else
+  echo "afclaude: no host key at ${HOSTKEY}: the host bridge is not configured (host calls will fail)" >&2
+fi
 mkdir -p "${KEEPALIVE_STATE_DIR:?}"
 # Phase 4b Q1: the explicit schema step. A non-additive change (store.MIGRATIONS; v5 rebuilds `decisions`)
 # never runs on connect(): until this has run, code at the new version can't write the tables the migration
@@ -64,7 +108,20 @@ python3 "$D/store.py" import-prompts >>"$D/data/import_prompts.log" 2>&1 \
 # session message or the SessionStart hook that needs those values errors visibly instead of
 # going out without them (prompts.NotMigrated).
 python3 "$D/prompts.py" migrate --deploy >>"$D/data/import_prompts.log" 2>&1 \
-  || echo "afclaude: prompt variables migrate did not complete this start (see data/import_prompts.log)" >&2
+  || {
+    echo "afclaude: prompt variables migrate did not complete this start (see data/import_prompts.log)" >&2
+    # not fatal for the start, but never silent either (D-235; in `off` mode nothing else would say so)
+    python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import store; store.alert_once(store.fallback_path(), sys.argv[2], sys.argv[3], "entrypoint")' "$D" \
+      "AFClaude: the prompt variables migrate failed at start" \
+      "prompts.py migrate --deploy did not complete (see data/import_prompts.log in the data directory). The container started anyway; a session message or hook that needs those values errors until it is fixed (a missing AFCLAUDE_HOST_REPO is the usual cause)." \
+      >&2 || true
+  }
+# K3/K4 (services layout only, D-339): the master key (created once under a lock, or from AFCLAUDE_MASTER_KEY)
+# must load and match the DB before the runner starts or the container idles; `serve` loads it again for its own process. A DB that
+# does not exist yet (a first install) has no check to match: the start goes on, as for the migration above.
+if [ "$rc" -ne 3 ] && [ "$LAYOUT" = services ]; then
+  python3 "$D/service.py" ensure-key runner || exit $?
+fi
 case "$MODE" in
   runner)
     echo "afclaude: scheduler RUNNER ($(date -u +%FT%TZ))"

@@ -1,0 +1,32 @@
+# TRANSITIONAL override of compose.services.yml (phase 5b K4 until K4b/K6/K7 are live): what the runner still reads from the host
+# because the reader switch (the kit's `transcripts` / `sessions` / `doc-files read`, K4b) and the bridge
+# key in the data directory (K6) are not what the code uses yet:
+#   - the host repo read-only at /host/repo (PROGRESS/GOALS/EXCEPTIONS/DECISIONS and backlog/ via the image's symlinks)
+#   - the transcript and session directories read-only under HOME (the same path as on the host)
+#   - the bridge key, the host's public key, and (web) the quickview key for the inbox API
+# Needs docker/.env: AFCLAUDE_HOST_REPO, HOST_HOME, AFCLAUDE_BRIDGE_USER (see env.example).
+# Delete this file once the three readers use the bridge and the key lives in <data>/bridge/.
+x-host-env: &host-env
+  AFCLAUDE_HOST_REPO: ${AFCLAUDE_HOST_REPO:?set in docker/.env}
+  AFCLAUDE_BRIDGE_USER: ${AFCLAUDE_BRIDGE_USER:?set in docker/.env}
+services:
+  afclaude-runner:
+    environment:
+      <<: *host-env
+      # the host user's home, the same path as on the host: the transcript mounts below sit under it
+      HOME: ${HOST_HOME:?set in docker/.env}
+    volumes:
+      - ${AFCLAUDE_HOST_REPO:?}:/host/repo:ro                       # local-only files, read fresh
+      - ${HOST_HOME:?}/.claude/projects:${HOST_HOME}/.claude/projects:ro
+      - ${HOST_HOME}/.claude/sessions:${HOST_HOME}/.claude/sessions:ro
+      - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro
+      - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
+  afclaude-mcp:                      # its tools look up this install's own project through the host repo path
+    environment:
+      <<: *host-env
+  afclaude-web:
+    environment:
+      <<: *host-env
+    volumes:
+      # the quickview key: inbox_api.py checks it on every request too (D-150/D-241)
+      - ${HOST_HOME:?}/.config/afclaude/quickview.key:/run/secrets/afclaude_quickview.key:ro

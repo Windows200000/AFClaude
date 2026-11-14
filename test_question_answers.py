@@ -22,6 +22,7 @@ import actions
 import decisions as dec
 import inbox
 import inbox_api
+import web
 import inbox_worker
 import owner_words
 import store
@@ -62,8 +63,7 @@ class Base(unittest.TestCase):
             fh.write(KEY + "\n")
         self.sock = os.path.join(self.tmp.name, "api", "inbox.sock")
         self.wake = threading.Event()
-        self.srv = inbox_api.bind(self.sock, self.keyfile, self.wake)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.srv = web.bind(self.sock, self.keyfile, self.wake)
         self.addCleanup(self.srv.server_close)
         self.addCleanup(self.srv.shutdown)
 
