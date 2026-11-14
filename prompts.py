@@ -114,7 +114,7 @@ PROMPTS: dict[str, Prompt] = {
                                                "session after it, before /clear (D-307)"),
     "compact": Prompt(used_by="unused since D-328 (hand-off + /clear, no /compact): kept as the override tests' "
                                 "example prompt; remove it with them"),
-    "compact_resume": Prompt(("compaction", "handoff", "progress", "when"),
+    "compact_resume": Prompt(("compaction", "handoff", "progress", "tasks", "when"),
                              used_by="keepalive, inside compact_after(_run): the hand-off after the /clear"),
     "compact_after": Prompt(("resume",), used_by="keepalive message after a hand-off + /clear (D-328)"),
     "compact_after_run": Prompt(("budget", "pace", "reason", "resume", "started", "threshold"),

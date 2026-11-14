@@ -48,10 +48,13 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py inbox retry ID                send a failed message again (triage / delivery)
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
-                                           owner_messages, in_flight, lessons, working_notes,
-                                           drop_working_notes, open_question_ids, notes}
+                                           owner_messages, in_flight, held_workers, lessons,
+                                           working_notes, drop_working_notes, open_question_ids, notes}
                                            ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
+    tasks.py worker hold ID... | go ID...|--all | wait [ID] [--max S] | list
+                                           hold background workers' reports across the hand-off + /clear
+                                           (D-340, worker_hold.py): wait exits 0 = report now, 3 = still held
     tasks.py proposals [--project P] [--all | --status S] [--shadow] [--show ID]   agents' proposals for the
                                            task-manager (phase 5a A4, D-182): the open ones (proposed +
                                            postponed); --all: every one incl. the decided; --shadow: also the
@@ -128,6 +131,9 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
                                            hostname, no access until granted) and its token, written to the
                                            token file (mode 0600; --file F: elsewhere, --print: show it once
                                            instead; an existing file is kept unless --force)
+    tasks.py machine register-host [--label L] [--file F]   this host's machine user, its token file and the owner
+                                           grant in one step (phase 5a A7; the owner in a plain shell, refused
+                                           inside a Claude session)
     tasks.py machine list | rename ID LABEL | revoke ID   the machine users, their tokens and grants
     tasks.py grant set USER --owner | --project P --level viewer|editor|manager   give a user the owner role
                                            or a level on a project (D-172, D-192); making an owner alerts
@@ -157,7 +163,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -167,8 +173,10 @@ import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write: validation, one transaction, audit row)
 import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 import identity  # noqa: E402  (phase 5a A2: who is acting)
+import host as host_mod  # noqa: E402  (register-host is refused in the container)
 import proposals  # noqa: E402  (phase 5a A4: the run summary text)
 import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
+import worker_hold  # noqa: E402  (D-340: hold workers across the hand-off + /clear)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -358,10 +366,28 @@ def visible(conn, what, rows, project_of, public_global=False):
     return actions.read_filter(conn, w.actor, w.session, "cli", what, rows, project_of, public_global=public_global)
 
 
+def roles_on_wait(conn):
+    """`roles mode --set on` within ROLES_ON_AFTER of this host's machine user registering: refused (the matrix has
+    not seen the machine principal in shadow yet, review A7 M2). No machine user at all: the setting's own check
+    says so."""
+    import socket
+    host = socket.gethostname()
+    if not store.host_owner_machine(conn, host):
+        return
+    cutoff = store.iso_ms(store._utcnow() - ROLES_ON_AFTER)
+    if not store.host_owner_machine(conn, host, issued_before=cutoff):
+        raise ValueError(f"this host's machine user registered less than {ROLES_ON_AFTER.total_seconds() // 3600:g} h "
+                         "ago: stay in shadow for at least one night, check `python3 tasks.py roles shadow --since "
+                         "<day of registration>` for `machine:` rows (what the matrix would refuse the owner's "
+                         "sessions), then set `on`")
+
+
 def run_roles(conn, args):
     """Phase 5a A3: the shadow log of the permission matrix (setting roles_enforce): what it would have refused,
     turned into a proposal or hidden from a listing, grouped for the daily list the task-manager reviews."""
     if args.roles_cmd == "mode":
+        if args.set_mode == "on":
+            roles_on_wait(conn)
         if args.set_mode:
             act(conn, "setting.set", key="roles_enforce", value=args.set_mode)   # perform lets this repair through
         problem = actions.roles_mode_problem(conn)
@@ -501,7 +527,7 @@ def run_runs(conn, args):
         return print("no runs")
     for r in rows:
         who_ = r["session_id"] + (f"/{r['agent_id']}" if r["agent_id"] else "")
-        n = f"{r['summary']['write_count']} write(s)" if r["summary"] else "open"
+        n = f"{r['summary']['write_count']} write(s)" + proposals.refused_text(r["summary"]) if r["summary"] else "open"
         print(f"run {r['id']:<5} {r['kind']:<8} {names.get(r['project_id'], '-'):<14} {who_}  "
               f"{berlin(r['started_at'])}  {n}  {r['end_reason'] or ''}")
     return None
@@ -532,18 +558,97 @@ def machine_file_free(path, force):
         raise ValueError(f"{path} is not writable")
 
 
-def write_machine_file(path, rec):
+def write_machine_file(path, rec, replace=True):
+    """The token file: a temp file (0600, O_EXCL) renamed into place. `replace=False` never overwrites a file that
+    is there (a concurrent run's token stays): FileExistsError."""
     tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(rec, fh, indent=1)
             fh.write("\n")
-        os.replace(tmp, path)
+        if replace:
+            os.replace(tmp, path)
+        else:
+            os.link(tmp, path)           # fails if the path exists (no overwrite)
+            os.unlink(tmp)
     except BaseException:
         if os.path.lexists(tmp):
             os.unlink(tmp)
         raise
+
+
+ROLES_ON_AFTER = timedelta(hours=20)     # `roles mode --set on` waits this long after the host's machine user registered
+
+
+def _undo_registration(conn, r, why):
+    """register-host failed after the machine user was registered: revoke it (its token with it), so the owner
+    re-runs the command; when even that fails, say exactly what is left and how to finish by hand."""
+    try:
+        act(conn, "machine.revoke", user_id=r["user_id"])
+    except Exception as e2:      # noqa: BLE001 - the error below tells the owner what state is left
+        raise ValueError(f"{why}; undoing the registration failed too ({type(e2).__name__}: {e2}): machine "
+                         f"{r['user_id']} exists. Fix: `machine revoke {r['user_id']}`, then run register-host "
+                         f"again; or `grant set {r['user_id']} --owner` and put this token, shown once, in the "
+                         f"token file: {r['token']}") from e2
+    raise ValueError(f"{why}; the registration was undone (machine {r['user_id']} revoked): nothing is left, "
+                     "run register-host again")
+
+
+def register_host(conn, args):
+    """Phase 5a A7 (D-290, D-330): this host's machine user in one step, for the owner at a plain shell: a
+    registration code, the machine user, the owner grant, then its token written to the token file (a failure of
+    the grant or the file revokes the new user again). Refused inside a Claude session (its env or the hook's
+    agent id is set: a session must not hand itself an owner credential, plan A7; only a guard rail, a shell
+    is full control, D-290), inside the container (the token belongs to the host: K2), when this host has a
+    machine user already (a lost token is re-issued with `machine code --user ID`), or when the token file
+    can't be written (checked before the code is spent)."""
+    import socket
+    import roles
+    env = os.environ
+    if host_mod.in_container():
+        raise ValueError("machine register-host registers the host, not the container: run it in a plain shell on "
+                         "the host itself (python3 tasks.py machine register-host)")
+    if identity.in_claude_session(env) or env.get(identity.AGENT_VAR):
+        raise ValueError("machine register-host is run by the owner in a plain shell, not inside a Claude session "
+                         "(a session must not give itself an owner credential): open a terminal on this host and run "
+                         "it there")
+    if who(conn).kind != "host":
+        raise ValueError(f"machine register-host needs the host owner (this is {who(conn).actor})")
+    host = socket.gethostname()
+    have = store.host_machine_users(conn, host)
+    if have:
+        raise ValueError(f"this host already has a machine user (#{have[0]}): nothing registered. A lost token: "
+                         f"`machine code --user {have[0]}`, then `machine register CODE --force`; the grant: "
+                         f"`grant set {have[0]} --owner`")
+    path = args.file or MACHINE_FILE
+    machine_file_free(path, False)
+    code = roles.new_registration_code()
+    act(conn, "machine.code", code_sha256=roles.code_sha256(code))
+    r = actions.register_machine(conn, code, host, actor=who(conn).actor, via="cli", label=args.label)
+    try:
+        g = act(conn, "grant.set", user_id=r["user_id"], scope="owner")
+    except Exception as e:       # noqa: BLE001 - undone or reported with the fix, never half-done silently
+        _undo_registration(conn, r, f"the owner grant for machine {r['user_id']} failed ({type(e).__name__}: {e})")
+    try:
+        write_machine_file(path, {"token": r["token"], "user_id": r["user_id"], "label": r["label"],
+                                  "token_id": r["token_id"], "hostname": host}, replace=False)
+    except OSError as e:
+        _undo_registration(conn, r, f"the token file {path} could not be written ({type(e).__name__}: {e})")
+    out = {"user_id": r["user_id"], "label": r["label"], "token_id": r["token_id"], "file": path, "owner": True}
+    done = (f"machine {r['user_id']} ({r['label']}) registered for this host and granted the owner role; "
+            f"token written to {path}\nSessions that start from now on act as machine:{r['user_id']} (owner). "
+            "Next: stay in shadow for at least one night (the matrix has never seen this principal), then check "
+            "`python3 tasks.py roles shadow --since <day of registration>` for `machine:` rows and only then "
+            f"`python3 tasks.py roles mode --set on` (it refuses within {ROLES_ON_AFTER.total_seconds() // 3600:g} h "
+            "of the registration).")
+    try:
+        deliver(g)
+    except ValueError as e:      # everything else is done: say so
+        raise ValueError(f"{e}. The registration itself is complete: {done}") from e
+    if args.json:
+        return dump(out)
+    return print(done)
 
 
 def run_machine(conn, args):
@@ -586,6 +691,8 @@ def run_machine(conn, args):
               + (f" written to {path}" if not args.print else f"\n  {r['token']}\n  (shown once)"))
         return print("no access until an owner grants it a role: tasks.py grant set "
                      f"{r['user_id']} --owner | --project P --level L") if not r["reissued"] else None
+    if mc == "register-host":
+        return register_host(conn, args)
     if mc == "list":
         rows = []
         for u in store.list_users(conn, "machine"):
@@ -1415,13 +1522,26 @@ def parser():
     q = hs.add_parser("write", help="save a hand-off for your compacted self (prints HANDOFF SAVED)")
     q.add_argument("--session", required=True, help="the writing session (full id or unique prefix)")
     q.add_argument("--json", dest="body", required=True, metavar="BODY",
-                   help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, lessons, "
+                   help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, held_workers "
+                        "(D-340: '<agent id>: <task>, branch <b>' per worker held for the /clear), lessons, "
                         "working_notes, drop_working_notes (numbers of earlier notes that no longer hold; the last "
                         "hand-off's working notes are carried over), open_question_ids, notes}; - = stdin")
     q.add_argument("--project", help="name or directory (default: the project the session manages)")
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")
     q.add_argument("--all", action="store_true", help="the recent ones, newest first")
+    p = sub.add_parser("worker", help="hold background workers' reports across the hand-off + /clear (D-340)")
+    wks = p.add_subparsers(dest="worker_cmd", required=True)
+    q = wks.add_parser("hold", help="the task-manager, before its hand-off: hold these workers")
+    q.add_argument("ids", nargs="+", metavar="AGENT_ID")
+    q = wks.add_parser("go", help="the task-manager, after the /clear: release them")
+    q.add_argument("ids", nargs="*", metavar="AGENT_ID")
+    q.add_argument("--all", action="store_true", help="every held worker")
+    q = wks.add_parser("wait", help="the worker, before its final report: exit 0 = send it now, 3 = still held "
+                                    "(run it again)")
+    q.add_argument("id", nargs="?", metavar="AGENT_ID", help="your agent id (default: $AFCLAUDE_AGENT_ID)")
+    q.add_argument("--max", type=float, default=worker_hold.WAIT_MAX, help="seconds to poll (default %(default)s)")
+    wks.add_parser("list", help="the held workers")
     p = sub.add_parser("automation", help="the automation pause (D-234/D-235): status | resume | pause")
     ats = p.add_subparsers(dest="automation_cmd")
     ats.add_parser("status", parents=[js], help="paused or not, why, since when; every paused project (the default)")
@@ -1571,7 +1691,7 @@ def parser():
     q.add_argument("id", type=int)
 
     p = sub.add_parser("machine", help="machine users, one per machine running Claude Code (D-195, phase 5a): "
-                                       "code | register | list | rename | revoke")
+                                       "code | register | register-host | list | rename | revoke")
     ms = p.add_subparsers(dest="machine_cmd", required=True)
     q = ms.add_parser("code", parents=[js], help="a one-time registration code (shown once, 15 minutes)")
     q.add_argument("--user", type=int, help="re-issue the token of this machine user")
@@ -1583,6 +1703,10 @@ def parser():
     where.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
     where.add_argument("--print", action="store_true", help="show the token once instead of writing a file")
     q.add_argument("--force", action="store_true", help="replace an existing token file")
+    q = ms.add_parser("register-host", parents=[js], help="this host's machine user with the owner role, in one "
+                                                          "step (the owner, in a plain shell: A7)")
+    q.add_argument("--label", help="the machine user's name (default: this host's name)")
+    q.add_argument("--file", help=f"token file (default {MACHINE_FILE})")
     ms.add_parser("list", parents=[js], help="the machine users, their tokens and grants")
     q = ms.add_parser("rename", parents=[js], help="change a machine user's label")
     q.add_argument("id", type=int)
@@ -1674,6 +1798,8 @@ def delivery_notice(conn, args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.cmd == "worker":   # no connection: a waiting worker holds none
+        return worker_hold.cli(args, args.db or store.DB_PATH)
     if args.cmd == "run-hook" and hook_is_inert(args):
         return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
     if args.cmd == "run-hook" and args.hook == "deliver":

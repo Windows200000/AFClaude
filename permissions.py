@@ -419,8 +419,10 @@ MATRIX: dict[str, Perm] = {
     "setting.import": DEPLOY,
     "automation.set": Perm(task_manager="self_project", tm_if="pause_clear", runner=True,
                            note="D-283: the AFClaude task-manager clears the install-wide pause"),
-    "automation.set_project": Perm(scope="project_strict", task_manager="own_project", tm_if="pause_clear",
-                                   runner=True, note="D-283: a task-manager clears its own project's pause"),
+    "automation.set_project": Perm(scope="project_strict", human="manager", task_manager="own_project",
+                                   tm_if="pause_clear", runner=True,
+                                   note="D-335: the project's manager pauses and resumes it, owners as always; "
+                                        "D-283: its task-manager only clears"),
     "install.stamp": DEPLOY,
     "install.restored": DEPLOY,
     "masterkey.check": INTERNAL,

@@ -618,6 +618,18 @@ class Audit(unittest.TestCase):
         self.assertTrue(lines[2].startswith("  setting.set x1  by owner"))
         self.assertNotIn("task.finish", out)
 
+    def test_a_refused_write_is_listed_apart_and_not_counted(self):
+        conn = store.connect(self.db)
+        with store.transaction(conn):
+            store.add_audit(conn, "agent:s:a1", "mcp", "task.add", "task", "n/a",
+                            after={"refused": "not an agent's", "key": "agent|task.add|-"}, ts="2026-10-14T10:07:00.000Z")
+        conn.close()
+        out = cm.audit_section(self.db, "2026-10-14T12:00:00+02:00", "2026-10-14T12:30:00Z")
+        lines = out.splitlines()
+        self.assertIn("3 rows (+1 refused writes, not counted)", lines[0])
+        self.assertTrue(any(line.startswith("  task.add REFUSED x1") for line in lines))
+        self.assertTrue(any(line.startswith("  task.add x2") for line in lines))
+
     def test_missing_db_raises(self):
         with self.assertRaises(cm.ManifestError):
             cm.audit_section(os.path.join(self.tmp, "none.db"), "2026-10-14", None)
