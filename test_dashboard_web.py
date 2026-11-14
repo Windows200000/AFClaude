@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import os
 import re
+import io
 import subprocess
 import sys
+import tarfile
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +59,22 @@ def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["PATH"] = _NODE.bin_dir + os.pathsep + env.get("PATH", "")
     return subprocess.run(args, cwd=WEB, env=env, capture_output=True, text=True, timeout=600)
+
+
+class NodeExtractKeepsModes(unittest.TestCase):
+    """tools/node.py unpacks the pinned tarball with its exec bits, also as an unmapped-uid root (`unshare -Ur`),
+    where an extraction that keeps the archive's owner fails its chown and skips the chmod."""
+
+    def test_exec_bit_survives_a_foreign_owner(self) -> None:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as out:
+            info = tarfile.TarInfo("node-x/bin/node")
+            info.mode, info.uid, info.gid, info.uname, info.gname, info.size = 0o755, 4242, 4242, "iojs", "iojs", 3
+            out.addfile(info, io.BytesIO(b"abc"))
+        buf.seek(0)
+        with tempfile.TemporaryDirectory() as dest, tarfile.open(fileobj=buf) as tar:
+            node_tool._safe_extract(tar, dest)
+            self.assertEqual(os.stat(os.path.join(dest, "node-x", "bin", "node")).st_mode & 0o111, 0o111)
 
 
 @unittest.skipIf(bool(_SKIP), _SKIP)

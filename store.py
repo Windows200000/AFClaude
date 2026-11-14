@@ -70,6 +70,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                resident runner's due times and its run records (runner.py; actions.py writes).
                status_snapshot (phase 3a S9(b), additive the same way, STATUS_SNAPSHOT_SCHEMA): the
                latest usage / next-run / pause / running-runs sections the runner writes each minute.
+               host_checks (phase 5b K6, additive the same way, HOST_CHECKS_SCHEMA): the latest result
+               of each host check (hostcheck.py; actions.py writes).
                Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
                row's project) and action_requests.run_id / updated_at (run-now, D-153); S1's
                driven_sessions backfill (`import-driven`) is retired since 3b S6.
@@ -617,6 +619,31 @@ WHEN (SELECT allowed FROM app_log_prune_gate WHERE id = 1) = 0
 BEGIN SELECT RAISE(ABORT, 'app_log deletes only through store.prune_app_log (retention)'); END;
 """
 RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "runner_runs", "status_snapshot")
+
+# ---- the host checks (phase 5b K6, docs/phase5b_plan.md §3.6; hostcheck.py). Additive, no version bump. One
+# row per check (name), always the latest result, replaced by each run: the history is the app_log line every
+# run writes. status skip = not run (a check it depends on failed, or no host kit is installed yet: the
+# transitional mode of docs/phase5b_plan.md §3.6); since = when the check last changed status (an episode's
+# start); kit_version = the host kit's version when it ran (NULL: unknown / none installed). Written only
+# through actions.hostcheck_put (runner actors; like the status snapshot, no audit_log row per run, D-256).
+HOST_CHECKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS host_checks (
+    name        TEXT PRIMARY KEY,
+    status      TEXT NOT NULL CHECK (status IN ('ok', 'warn', 'fail', 'skip')),
+    detail      TEXT NOT NULL DEFAULT '',
+    fix         TEXT NOT NULL DEFAULT '',
+    ran_at      TEXT NOT NULL,           -- UTC
+    since       TEXT NOT NULL,           -- UTC, when `status` began (unchanged by a run with the same status)
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    kit_version TEXT,
+    blocking    INTEGER NOT NULL DEFAULT 0,
+    alerted_at  TEXT,                    -- UTC, when this episode (`since`) of a fail was alerted; NULL: not yet
+    version     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS host_checks_version AFTER UPDATE ON host_checks FOR EACH ROW
+WHEN NEW.version IS OLD.version
+BEGIN UPDATE host_checks SET version = OLD.version + 1 WHERE name = NEW.name; END;
+"""
 
 # ---- the status snapshot (phase 3a S9(b), design 04_architecture.md: the web container reads usage and
 # the next run from a row the runner writes, it imports no model code). Additive, no version bump. One
@@ -1377,6 +1404,7 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     conn.executescript(RUNNER_SCHEMA)
     conn.executescript(RUNNER_RUNS_SCHEMA)
     conn.executescript(STATUS_SNAPSHOT_SCHEMA)
+    conn.executescript(HOST_CHECKS_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     conn.executescript(PROMPT_VARS_SCHEMA)
@@ -4039,6 +4067,34 @@ def put_snapshot(conn: sqlite3.Connection, section: str, account_id: str, *, sta
                  "computed_at=excluded.computed_at, state=excluded.state, payload=excluded.payload, "
                  "error=excluded.error, builder=excluded.builder",
                  (section, account_id, computed_at, state, payload, error, builder))
+
+
+def put_host_check(conn: sqlite3.Connection, name: str, *, status: str, detail: str, fix: str, ran_at: str,
+                   duration_ms: int, kit_version: str | None, blocking: bool) -> str | None:
+    """Insert or replace the check's row; `since` and `alerted_at` stay while the status does not change (a new
+    status starts a new episode, not alerted yet). -> the episode's alerted_at (None: not alerted)."""
+    old = conn.execute("SELECT status, since, alerted_at FROM host_checks WHERE name=?", (name,)).fetchone()
+    same = old is not None and old["status"] == status
+    since = old["since"] if same else ran_at
+    alerted_at = old["alerted_at"] if same else None
+    conn.execute("INSERT INTO host_checks(name, status, detail, fix, ran_at, since, duration_ms, kit_version, blocking, "
+                 "alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                 "status=excluded.status, detail=excluded.detail, fix=excluded.fix, ran_at=excluded.ran_at, "
+                 "since=excluded.since, duration_ms=excluded.duration_ms, kit_version=excluded.kit_version, "
+                 "blocking=excluded.blocking, alerted_at=excluded.alerted_at",
+                 (name, status, detail, fix, ran_at, since, duration_ms, kit_version, int(blocking), alerted_at))
+    return None if alerted_at is None else str(alerted_at)
+
+
+def mark_host_checks_alerted(conn: sqlite3.Connection, names: Sequence[str], at: str) -> None:
+    """The current episodes of these checks were alerted (put_host_check keeps it until the status changes)."""
+    for name in names:
+        conn.execute("UPDATE host_checks SET alerted_at=? WHERE name=? AND alerted_at IS NULL", (at, name))
+
+
+def host_check_rows(conn: sqlite3.Connection) -> list[Row]:
+    """The latest result of every check, by name (hostcheck.CHECKS' order is the caller's)."""
+    return [dict(r) for r in conn.execute("SELECT * FROM host_checks ORDER BY name")]
 
 
 def snapshot_rows(conn: sqlite3.Connection, account_id: str = DEFAULT_ACCOUNT) -> dict[str, Row]:

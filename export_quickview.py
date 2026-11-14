@@ -535,6 +535,38 @@ def auth_block():
             "subject": claude_auth.SHORT, "error": err}
 
 
+def host_checks_block():
+    """Phase 5b K6 (D-164, D-316): the latest host-check results for one tile on the page: the counts and when the
+    newest run was, and the warn / fail rows in full (name, status, detail, fix, since); ok rows are only counted,
+    skip rows folded into one line per reason (`skipped`: [{reason, count, names}], e.g. 9 skipped: kit not
+    installed). `no_kit` marks the transitional state (hostcheck.NO_KIT: no host kit installed yet). A display path:
+    an error is shown, never raised."""
+    try:
+        import store
+        conn = store.connect()
+        try:
+            rows = store.host_check_rows(conn)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - the page shows the error instead
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+    counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("ok", "warn", "fail", "skip")}
+    shown = [{"name": r["name"], "status": r["status"], "detail": r["detail"], "fix": r["fix"],
+              "blocking": bool(r["blocking"]), "since_berlin": bstr(ka.parse_ts(r["since"]))}
+             for r in rows if r["status"] in ("warn", "fail")]
+    skipped = {}
+    for r in rows:
+        if r["status"] == "skip":
+            skipped.setdefault(r["detail"].removeprefix("not run: ") or "not run", []).append(r["name"])
+    ran = max((r["ran_at"] for r in rows), default=None)
+    return {"counts": counts, "total": len(rows), "ran_berlin": bstr(ka.parse_ts(ran)) if ran else None,
+            "age_minutes": (datetime.now(UTC) - ka.parse_ts(ran)).total_seconds() / 60 if ran else None,
+            "no_kit": any(r["name"] == "kit" and r["status"] == "warn" and r["detail"].startswith("kit not installed")
+                          for r in rows),
+            "checks": shown,
+            "skipped": [{"reason": why, "count": len(names), "names": names} for why, names in skipped.items()]}
+
+
 def manager_launch_block():
     """D-260: the code default and each project's task-manager launch (manager_launch.view: model,
     effort, source project|default per value). A display path: an error is shown, never raised."""
@@ -1118,6 +1150,7 @@ def main():
         "self_session_error": self_session()[1],  # D-239: shown, never crashes the export
         "automation": automation_block(),
         "auth": auth_block(),   # D-320: an expired Claude login, prominent on the page
+        "host_checks": host_checks_block(),   # K6: one tile in the keep-alive section, failures expanded
         "manager_launch": manager_launch_block(),
         "remote_control": remote_control_block(),
         "keepalive": keepalive_and_usage(now),

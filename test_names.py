@@ -70,7 +70,7 @@ class Names(unittest.TestCase):
 
     def test_reserved_names_are_never_generated(self):
         """The host check's tmux session (afc-check) is killed by the kit without asking: no session may carry it."""
-        self.assertEqual(names.RESERVED, ("afc-check",))
+        self.assertEqual(names.RESERVED, ("afc-check", "afc-check-e2e"))
         with mock.patch.object(names, "RESERVED", ("afc-review",)):
             self.assertEqual(names.tmux_name("review"), "afc-review-2")
         for kind in names.KINDS:

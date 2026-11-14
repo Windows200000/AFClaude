@@ -149,6 +149,20 @@ def short_tmp():
     return tempfile.mkdtemp(prefix="afk4-", dir="/tmp")
 
 
+def unique_suffix() -> str:
+    """A name part that stays unique per test class and per run. Not os.getpid(): under `unshare --pid` it is always 1,
+    so two suites running at once would share a compose project, an image tag and a key path."""
+    return secrets.token_hex(4)
+
+
+def require_files(*paths: str) -> None:
+    """Every host path docker bind-mounts as a file must exist as one before `compose up`: for a missing source
+    docker creates a root-owned DIRECTORY there that nothing in the tests can remove."""
+    for path in paths:
+        if not os.path.isfile(path):
+            raise RuntimeError(f"bind-mount source {path} is not a file: docker would create a directory there")
+
+
 NO_DOCKER = docker_usable()
 
 
@@ -158,12 +172,13 @@ class ThreeServicesInContainers(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tag = f"k4t{os.getpid()}"
-        cls.project = f"afk4t{os.getpid()}"
+        suffix = unique_suffix()
+        cls.tag = f"k4t{suffix}"
+        cls.project = f"afk4t{suffix}"
         cls.data = short_tmp()
         os.chmod(cls.data, 0o700)
-        cls.keyfile = os.path.join(cls.data, "..", f"{cls.project}.key")
-        cls.keyfile = os.path.abspath(cls.keyfile)
+        cls.override_dir = tempfile.mkdtemp(prefix="afk4o-", dir="/tmp")     # holds the key file too: removed with it
+        cls.keyfile = os.path.join(cls.override_dir, "quickview.key")
         os.makedirs(os.path.join(cls.data, "bridge"))      # what the host kit's install leaves there (K2)
         cls.bridge_key = os.path.join(cls.data, "bridge", "host_bridge_ed25519")
         with open(cls.bridge_key, "w") as fh:
@@ -173,7 +188,7 @@ class ThreeServicesInContainers(unittest.TestCase):
         with open(cls.keyfile, "w") as fh:
             fh.write(cls.key + "\n")
         os.chmod(cls.keyfile, 0o600)
-        cls.override = os.path.join(tempfile.mkdtemp(prefix="afk4o-", dir="/tmp"), "override.yml")
+        cls.override = os.path.join(cls.override_dir, "override.yml")
         hc = "{interval: 3s, timeout: 20s, retries: 5, start_period: 0s}"
         with open(cls.override, "w") as fh:
             fh.write("services:\n"
@@ -186,6 +201,7 @@ class ThreeServicesInContainers(unittest.TestCase):
         cls.env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
         cls.env.update(AFCLAUDE_DATA=cls.data, AFCLAUDE_CODE_VERSION=cls.tag, AFCLAUDE_NAME=cls.project)
         cls.started = False
+        require_files(cls.keyfile)
         # an initialised database: nothing creates one implicitly (D-163)
         subprocess.run([sys.executable, os.path.join(HERE, "store.py"), "init", "--db", os.path.join(cls.data, "afclaude.db")],
                        check=True, capture_output=True, env=dict(os.environ, AFCLAUDE_DATA_DIR=cls.data))
@@ -207,11 +223,9 @@ class ThreeServicesInContainers(unittest.TestCase):
         if getattr(cls, "env", None):
             cls.compose("down", "--volumes", "--remove-orphans", timeout=180)
             subprocess.run(["docker", "rmi", f"afclaude:{cls.tag}"], capture_output=True, timeout=60)
-        for path in (getattr(cls, "data", None), os.path.dirname(getattr(cls, "override", "") or "")):
+        for path in (getattr(cls, "data", None), getattr(cls, "override_dir", None)):
             if path and path.startswith("/tmp/afk4"):
                 shutil.rmtree(path, ignore_errors=True)
-        if getattr(cls, "keyfile", None) and os.path.exists(cls.keyfile):
-            os.unlink(cls.keyfile)
 
     names = ("runner", "mcp", "web")
 
@@ -398,8 +412,9 @@ class SingleLayoutInContainer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.started = False
-        cls.project = f"afk4s{os.getpid()}"
-        cls.tag = f"k4s{os.getpid()}"
+        suffix = unique_suffix()
+        cls.project = f"afk4s{suffix}"
+        cls.tag = f"k4s{suffix}"
         cls.root = tempfile.mkdtemp(prefix="afk4s-", dir="/tmp")
         cls.repo = os.path.join(cls.root, "repo")
         cls.home = os.path.join(cls.root, "home")
@@ -414,6 +429,8 @@ class SingleLayoutInContainer(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write(text)
             os.chmod(path, 0o644)
+        require_files(os.path.join(cls.repo, "docker", "secrets", "host_bridge_ed25519"),
+                      os.path.join(cls.home, ".config", "afclaude", "quickview.key"), SSH_HOST_KEY)
         cls.override = os.path.join(cls.root, "override.yml")
         with open(cls.override, "w") as fh:
             fh.write("services:\n  afclaude:\n"
