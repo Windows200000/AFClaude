@@ -4578,7 +4578,8 @@ def record_token_refusal(conn: sqlite3.Connection, token: str, hostname: str | N
     secret of an unknown id) is keyed by the reason alone, one row an hour for all of them, however many ids or
     host names an unauthenticated client tries; a real token id (wrong secret, revoked, no or bad host name) is
     keyed by that id and the reason, so the rows are bounded by the tokens that exist. The check reads the
-    audit_log_actor index (actor `mcp`). -> True when a row was written."""
+    audit_log_actor index (actor `mcp`) as a plain read first; only a row that must be written takes the write lock
+    (BEGIN IMMEDIATE), where the key is checked again. -> True when a row was written."""
     try:
         parsed: int | None = roles.parse_token(token)[0]
     except ValueError:
@@ -4589,9 +4590,12 @@ def record_token_refusal(conn: sqlite3.Connection, token: str, hostname: str | N
     key = f"token-refused:{token_id or '-'}:{reason}"
     since = store.iso_ms(store._utcnow() - REFUSAL_AUDIT_EVERY)
 
+    if store.refusal_audited_since(conn, key, since, actor="mcp"):     # a plain read: no write lock for a repeat
+        return False
+
     def record() -> bool:
         with store.transaction(conn):
-            if store.refusal_audited_since(conn, key, since, actor="mcp"):
+            if store.refusal_audited_since(conn, key, since, actor="mcp"):     # another thread wrote it meanwhile
                 return False
             store.add_audit(conn, "mcp", "mcp", "machine.token_refused", "machine_token", token_id, None,
                             {"refused": reason, "key": key, "hostname": host, "transport": transport})

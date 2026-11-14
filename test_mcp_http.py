@@ -12,7 +12,9 @@ Needs the project venv (the SDK wants Python >= 3.10):
     .venv/bin/python -m unittest test_mcp_http
 """
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -179,12 +181,25 @@ class Http(Base):
         mcp_http.check_bind("0.0.0.0", "on")
         for host in ("127.0.0.1", "localhost", "::1"):
             mcp_http.check_bind(host, "shadow")
-        with self.assertRaises(mcp_http.Refused):
-            mcp_http.serve(ms.server, "0.0.0.0")                     # the live check reads the DB's setting: shadow
         env = dict(os.environ, AFCLAUDE_PUBLIC_URL="not a url")
         r = subprocess.run([sys.executable, "-c", "import mcp_server"], cwd=HERE, env=env, capture_output=True, text=True,
                            timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
+
+    def test_a_repeated_refusal_takes_no_write_lock(self):
+        """A refusal already audited this hour is found by a plain read: no transaction, no BEGIN IMMEDIATE."""
+        self.assertTrue(actions.record_token_refusal(self.conn, "garbage", "h", "http", "malformed"))
+        with mock.patch.object(store, "transaction", side_effect=AssertionError("no write lock for a repeat")):
+            for i in range(3):
+                self.assertFalse(actions.record_token_refusal(self.conn, f"garbage{i}", f"h{i}", "http", "malformed"))
+        self.assertEqual(len(self.audit("machine.token_refused")), 1)
+
+    def test_the_serve_process_refuses_a_tool_call_without_a_remote_machine(self):
+        async def call_without_context():
+            return await ms.server.call_tool("afclaude_project", {}, None)
+        with mock.patch.object(mcp_http, "REQUIRE_REMOTE", True):
+            with self.assertRaises(PermissionError):
+                asyncio.run(call_without_context())
 
     def test_remote_machine_with_no_request_context_is_no_machine(self):
         class NoContext:
@@ -200,6 +215,14 @@ class Http(Base):
             mcp_http.check_stdio_env(env)
         mcp_http.check_stdio_env({**env, "AFCLAUDE_MACHINE_HOST": "h"})        # the wrapper's call
         mcp_http.check_stdio_env({"AFCLAUDE_MACHINE_TOKEN": self.token})       # on the host, as before
+
+    def test_the_stdio_entry_point_refuses_a_container_side_token_and_never_serves(self):
+        err = io.StringIO()
+        env = {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_MACHINE_TOKEN": self.token}
+        with mock.patch.dict(os.environ, env), mock.patch.object(ms.server, "run", side_effect=AssertionError("served")), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(ms.main(["stdio"]), 1)
+        self.assertIn("AFCLAUDE_MACHINE_TOKEN", err.getvalue())
 
     def test_a_missing_or_bad_host_name_header_is_refused(self):
         self.assertEqual(self.status(host=None).status_code, 401)

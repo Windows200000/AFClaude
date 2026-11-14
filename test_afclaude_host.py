@@ -14,7 +14,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "docker", "host-kit"))
@@ -130,6 +132,32 @@ class Build(unittest.TestCase):
         try:
             with self.assertRaises(w.Refused) as cm:
                 self.build({})
+            self.assertIn("directory", str(cm.exception))
+        finally:
+            os.chmod(self.tmp.name, 0o700)
+
+    def test_a_fifo_at_the_path_is_refused_without_blocking(self):
+        os.mkfifo(self.file, 0o600)
+        out = []
+
+        def run():
+            try:
+                self.build({})
+            except w.Refused as e:
+                out.append(str(e))
+        t = threading.Thread(target=run, daemon=True)         # a blocking open would leave this thread behind
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), "the FIFO blocked the open")
+        self.assertIn("regular file", out[0])
+
+    def test_a_writable_directory_is_refused_before_the_file_is_opened(self):
+        self.token_file()
+        os.chmod(self.tmp.name, 0o770)
+        try:
+            with mock.patch.object(os, "open", side_effect=AssertionError("opened before the directory check")):
+                with self.assertRaises(w.Refused) as cm:
+                    self.build({})
             self.assertIn("directory", str(cm.exception))
         finally:
             os.chmod(self.tmp.name, 0o700)

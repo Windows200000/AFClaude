@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -209,6 +210,18 @@ class Table(Base):
         os.chmod(d, 0o770)
         self.assertEqual(self.resolve(env(OWN), token_file=real).token, "insecure-file")
         os.chmod(d, 0o700)
+
+    def test_a_fifo_as_the_token_file_does_not_block(self):
+        d = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(d, 0o700)
+        fifo = os.path.join(d, "machine.json")
+        os.mkfifo(fifo, 0o600)
+        out = []
+        t = threading.Thread(target=lambda: out.append(identity.read_token(env(OWN), fifo)[1]), daemon=True)
+        t.start()
+        t.join(10)                              # a blocking open would leave this thread behind
+        self.assertFalse(t.is_alive(), "the FIFO blocked the open")
+        self.assertEqual(out, ["insecure-file"])
 
     def test_a_revoked_or_unknown_token_is_no_machine_identity(self):
         uid, token = self.machine()

@@ -1,0 +1,10 @@
+# Dev override: run the code from a checkout instead of the baked copy (read-only), in all three services,
+# no rebuild needed after edits (the data directory mount comes from compose.services.yml):
+#   AFCLAUDE_DATA=/path/to/data AFCLAUDE_DEV_SRC=/path/to/checkout docker compose -f docker/compose.services.yml -f docker/compose.services.dev.yml up -d
+x-dev-src: &dev-src
+  volumes:
+    - ${AFCLAUDE_DEV_SRC:-..}:/app:ro
+services:
+  afclaude-runner: *dev-src
+  afclaude-mcp: *dev-src
+  afclaude-web: *dev-src

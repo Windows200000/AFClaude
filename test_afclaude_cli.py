@@ -24,7 +24,9 @@ class Routes(unittest.TestCase):
         self.assertEqual(afclaude.resolve(["runner", "serve"]),
                          [py, "-u", os.path.join(HERE, "runner.py"), "serve"])
         self.assertEqual(afclaude.resolve(["mcp"]), [py, os.path.join(HERE, "mcp_server.py")])
-        self.assertEqual(afclaude.resolve(["web"]), [py, "-u", os.path.join(HERE, "inbox_api.py"), "serve"])
+        self.assertEqual(afclaude.resolve(["web", "serve"]), [py, "-u", os.path.join(HERE, "web.py"), "serve"])
+        self.assertEqual(afclaude.resolve(["web", "health"]), [py, "-u", os.path.join(HERE, "web.py"), "health"])
+        self.assertEqual(afclaude.resolve(["mcp", "serve"]), [py, os.path.join(HERE, "mcp_server.py"), "serve"])
         self.assertEqual(afclaude.resolve(["machine", "list"]), [py, os.path.join(HERE, "tasks.py"), "machine", "list"])
         self.assertEqual(afclaude.resolve(["hook", "session-rules", "manager"]),
                          [py, os.path.join(HERE, "keepalive.py"), "--session-rules", "manager"])

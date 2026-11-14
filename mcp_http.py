@@ -1,6 +1,7 @@
 """The MCP server's streamable HTTP transport with machine-token identity (phase 5b K5, docs/phase5b_plan.md §3.3).
 
-`afclaude mcp serve` runs `mcp_server.server` as the SDK's streamable HTTP app under uvicorn. Every request
+`afclaude mcp serve` (mcp_service.py, the one serve path: it adds /health, the start checks and uvicorn, D-343)
+runs `mcp_server.server` as the SDK's streamable HTTP app built here (`build_app`). Every request
 carries `Authorization: Bearer <machine token>` (5a's machine_tokens, issued by `afclaude machine register`)
 and `X-AFClaude-Hostname: <the client's host name>`; the SDK's bearer middleware calls `MachineTokenVerifier`,
 which accepts only a well-formed, unrevoked token of an unrevoked machine user, records the use and the
@@ -21,8 +22,9 @@ HTTP is for remote hosts only: this host's sessions use the wrapper (stdio), whi
 sessions task-manager / agent (D-198) and tokenless ones the host owner (D-330); over HTTP a token is required and
 the holder is always a machine user.
 
-A bind other than loopback is refused unless `roles_enforce` is `on` (`check_bind`): in shadow mode every valid
-token would write like the host owner (D-235: no quiet exposure).
+A bind other than loopback is refused unless `roles_enforce` is `on` (`check_bind`, called by mcp_service.serve): in
+shadow mode every valid token would write like the host owner (D-235: no quiet exposure). The serve process also
+refuses a tool call with no authenticated machine (`require_remote`): its own env is not a caller's identity.
 """
 from __future__ import annotations
 
@@ -46,6 +48,7 @@ DEFAULT_HOST = "127.0.0.1"            # the container passes --host 0.0.0.0 (the
 DEFAULT_PORT = 8000
 TRANSPORT = "http"
 HOSTNAME: ContextVar[str | None] = ContextVar("afclaude_http_hostname", default=None)
+REQUIRE_REMOTE = False        # set by the serve process: a tool call without an authenticated machine is refused
 
 
 class Refused(RuntimeError):
@@ -118,6 +121,14 @@ def remote_machine(context: Any) -> dict[str, Any] | None:
     return dict(claims)
 
 
+def require_remote() -> None:
+    """The serve process calls this once: from then on `AFClaudeServer.call_tool` refuses a call that has no
+    authenticated remote machine, so who() never falls back to the server's own env (defence in depth: every
+    HTTP call has a request context, a stdio server never sets this)."""
+    global REQUIRE_REMOTE
+    REQUIRE_REMOTE = True
+
+
 def placeholder_url() -> str:
     """What the server object is built with at import (the SDK wants auth settings next to a token verifier);
     `serve` replaces it. No env is read here: a bad AFCLAUDE_PUBLIC_URL must not stop a stdio server."""
@@ -162,13 +173,3 @@ def build_app(server: Any, host: str = DEFAULT_HOST, public_url: str | None = No
     app: Starlette = server.streamable_http_app(host=host)
     app.add_middleware(HostnameMiddleware)
     return app
-
-
-def serve(server: Any, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, public_url: str | None = None) -> None:
-    conn = store.connect(db_path())
-    try:
-        check_bind(host, actions.roles_mode(conn))
-    finally:
-        conn.close()
-    import uvicorn          # not needed by the stdio server, which every session starts
-    uvicorn.run(build_app(server, host, public_url, port), host=host, port=port, log_level="warning")

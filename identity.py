@@ -188,7 +188,16 @@ def read_token(env: Mapping[str, str], path: str | None = None) -> tuple[Optiona
         return tok.strip(), "valid"
     p = path or env.get(TOKEN_FILE_VAR) or os.path.expanduser(DEFAULT_TOKEN_FILE)
     try:
-        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)      # a symlink is no token file (L5: no check-then-open race)
+        os.lstat(p)
+    except FileNotFoundError:
+        return None, "none"
+    if os.stat(os.path.dirname(os.path.abspath(p))).st_mode & 0o022:         # before anything is opened
+        note_once(f"identity: the directory of the machine token file {p} can be written by others: its token is "
+                  "not used")
+        return None, "insecure-file"
+    try:
+        # a symlink is no token file (NOFOLLOW: no check-then-open race, L5) and a FIFO does not block (NONBLOCK)
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None, "none"
     except OSError as e:
@@ -197,10 +206,9 @@ def read_token(env: Mapping[str, str], path: str | None = None) -> tuple[Optiona
         return None, "insecure-file"
     with os.fdopen(fd) as fh:
         st = os.fstat(fh.fileno())
-        dir_mode = os.stat(os.path.dirname(os.path.abspath(p))).st_mode
-        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid() or dir_mode & 0o022:
-            note_once(f"identity: the machine token file {p} is not a regular file of this user with mode 0600 in a "
-                      "directory only this user can write: its token is not used")
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+            note_once(f"identity: the machine token file {p} is not a regular file of this user with mode 0600: "
+                      "its token is not used")
             return None, "insecure-file"
         doc = json.load(fh)
     t = doc.get("token") if isinstance(doc, dict) else None

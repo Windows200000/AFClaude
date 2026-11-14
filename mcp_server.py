@@ -101,7 +101,10 @@ class AFClaudeServer(MCPServer[Any]):
         tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
         try:
             tokens.append((STAMP, STAMP.set(arguments.pop(identity.STAMP_KEY, None))))
-            tokens.append((REMOTE, REMOTE.set(mcp_http.remote_machine(context))))
+            remote = mcp_http.remote_machine(context)
+            if remote is None and mcp_http.REQUIRE_REMOTE:
+                raise PermissionError("a tool call without an authenticated machine token in the HTTP server")
+            tokens.append((REMOTE, REMOTE.set(remote)))
             return await super().call_tool(name, arguments, context)
         finally:
             for var, tok in reversed(tokens):
@@ -937,27 +940,21 @@ def request_brief(r: Mapping[str, Any]) -> dict[str, Any]:
                     "at": bt(r["ts"]), "by": r["actor"], "tmux": res.get("tmux"), "reason": res.get("reason")})
 
 def main(argv: list[str]) -> int:
-    """`mcp_server.py [stdio]` (what Claude Code starts, one process per session) or `mcp_server.py serve
-    [--host H] [--port N] [--public-url U]`: the HTTP transport (`afclaude mcp serve`, mcp_http.py)."""
-    import argparse
-    ap = argparse.ArgumentParser(prog="mcp_server.py")
-    sub = ap.add_subparsers(dest="mode")
-    sub.add_parser("stdio", help="serve one client on stdin/stdout (the default)")
-    sv = sub.add_parser("serve", help="serve machines over streamable HTTP with bearer tokens")
-    sv.add_argument("--host", default=mcp_http.DEFAULT_HOST)
-    sv.add_argument("--port", type=int, default=mcp_http.DEFAULT_PORT)
-    sv.add_argument("--public-url", default=None, help="the URL clients reach this server at (default: AFCLAUDE_PUBLIC_URL)")
-    args = ap.parse_args(argv)
-    try:
-        if args.mode == "serve":
-            mcp_http.serve(server, args.host, args.port, args.public_url)
-        else:
+    """`mcp_server.py [stdio]` (what Claude Code starts, one process per session) or `serve` / `health`: the MCP
+    service's HTTP transport (`afclaude mcp serve|health`, mcp_service.py, the one serve path, D-343)."""
+    cmd = argv[0] if argv else "stdio"
+    if cmd == "stdio":
+        try:
             mcp_http.check_stdio_env(os.environ)
-            server.run("stdio")
-    except mcp_http.Refused as e:
-        print(f"afclaude mcp: {e}", file=sys.stderr)
-        return 1
-    return 0
+        except mcp_http.Refused as e:
+            print(f"afclaude mcp: {e}", file=sys.stderr)
+            return 1
+        server.run("stdio")
+        return 0
+    if cmd in ("serve", "health"):
+        import mcp_service
+        return mcp_service.main(argv)
+    sys.exit(f"usage: mcp_server.py [stdio|serve|health] (got {cmd!r})")
 
 
 if __name__ == "__main__":

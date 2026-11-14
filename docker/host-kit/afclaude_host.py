@@ -59,7 +59,15 @@ def read_token(env: Mapping[str, str]) -> Optional[str]:
     has no token, is refused."""
     path = env.get(FILE_VAR) or os.path.expanduser(DEFAULT_TOKEN_FILE)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)      # a link is refused; the checks are on the open file
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if os.stat(os.path.dirname(os.path.abspath(path))).st_mode & 0o022:      # before anything is opened
+        raise Refused("afclaude: the directory of the machine token file %s can be written by others: fix it "
+                      "(chmod go-w) or re-register the machine" % path)
+    try:
+        # a link is refused (NOFOLLOW) and a FIFO does not block the open (NONBLOCK); the checks are on the open file
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as e:
@@ -67,11 +75,9 @@ def read_token(env: Mapping[str, str]) -> Optional[str]:
                       % (path, e.strerror))
     with os.fdopen(fd) as fh:
         st = os.fstat(fh.fileno())
-        dir_mode = os.stat(os.path.dirname(os.path.abspath(path))).st_mode
-        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid() or dir_mode & 0o022:
-            raise Refused("afclaude: the machine token file %s is not a regular file of this user with mode 0600 in a "
-                          "directory only this user can write: fix it (chmod 600, chmod go-w the directory) or "
-                          "re-register the machine" % path)
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
+            raise Refused("afclaude: the machine token file %s is not a regular file of this user with mode 0600: "
+                          "fix it (chmod 600) or re-register the machine" % path)
         try:
             doc = json.load(fh)
         except ValueError as e:
