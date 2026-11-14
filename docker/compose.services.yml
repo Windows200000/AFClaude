@@ -12,8 +12,8 @@
 # AFCLAUDE_PUBLIC_URL, AFCLAUDE_NAME (container name prefix, default afclaude).
 # Start (from the repo root; the hash is baked into the image as its code version):
 #   AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) AFCLAUDE_DATA=/path/to/data docker compose -f docker/compose.services.yml up -d --build
-# On this host (and until the reader switch and the host kit's bridge key live in the data directory) add
-# `-f docker/compose.host-mounts.yml`: the transcript, repo and bridge mounts the runner still reads. `tools/deploy.py`
+# On this host (until the reader switch is complete and the host key needs no host mount) add
+# `-f docker/compose.host-mounts.yml`: the transcript, repo and host-key mounts the runner still reads. `tools/deploy.py`
 # does all of this (drain, wait quiet, recreate the three services, wait for three health checks).
 # No docker socket, no privileges, no published ports. The data directory is mounted at /app/data, where the code
 # looks for it; the services refuse to start when nothing is mounted there (service.py). The web and MCP services
@@ -34,6 +34,7 @@ x-service: &service
   environment: &env
     AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
     AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
+    AFCLAUDE_BRIDGE_KEY: /app/data/bridge/host_bridge_ed25519   # the host kit's key (K2 install); hidden from web and mcp
     AFCLAUDE_MASTER_KEY: ${AFCLAUDE_MASTER_KEY:-}
     AFCLAUDE_PUBLIC_URL: ${AFCLAUDE_PUBLIC_URL:-}
     AFCLAUDE_LAYOUT: services           # the runner then supervises no inbox API and loads the master key (runner.py, service.py)

@@ -86,11 +86,21 @@ class ComposeShape(unittest.TestCase):
 
     def test_the_host_specific_mounts_are_in_the_transitional_override_only(self):
         override = read("docker/compose.host-mounts.yml")
-        for needle in ("/host/repo:ro", ".claude/projects", ".claude/sessions", "host_bridge_ed25519",
-                       "afclaude_quickview.key"):
+        for needle in ("/host/repo:ro", ".claude/projects", ".claude/sessions", "afclaude_quickview.key"):
             self.assertIn(needle, override)
         self.assertIn("pins", read("docker/compose.subnet.yml") + "pins")      # the file exists
         self.assertIn("172.28.0.0/24", read("docker/compose.subnet.yml"))
+
+    def test_both_layouts_use_the_host_kits_bridge_key_in_the_data_directory(self):
+        """The bridge key is the host kit install's copy in <data>/bridge/ (K2, D-121); the pre-kit key in
+        docker/secrets/ is mounted by no compose file (its authorized_keys line is the owner's to remove)."""
+        want = "AFCLAUDE_BRIDGE_KEY: /app/data/bridge/host_bridge_ed25519"
+        self.assertIn(want, service_block(read("docker/compose.yml"), "afclaude"))
+        self.assertIn(want, read("docker/compose.services.yml").split("services:\n")[0])     # the shared environment
+        for name in ("compose.yml", "compose.dev.yml", "compose.services.yml", "compose.services.dev.yml",
+                     "compose.host-mounts.yml", "compose.subnet.yml"):
+            lines = [line for line in read("docker/" + name).splitlines() if not line.lstrip().startswith("#")]
+            self.assertFalse([line for line in lines if "docker/secrets" in line or "/run/secrets/host_bridge" in line], name)
 
     def test_the_single_container_layout_is_still_the_default_compose_file(self):
         text = read("docker/compose.yml")
@@ -402,16 +412,17 @@ class SingleLayoutInContainer(unittest.TestCase):
         cls.repo = os.path.join(cls.root, "repo")
         cls.home = os.path.join(cls.root, "home")
         cls.data = os.path.join(cls.repo, "data")
-        for d in (cls.data, os.path.join(cls.repo, "docker", "secrets"), os.path.join(cls.home, ".claude", "projects"),
+        for d in (cls.data, os.path.join(cls.data, "bridge"), os.path.join(cls.home, ".claude", "projects"),
                   os.path.join(cls.home, ".claude", "sessions"), os.path.join(cls.home, ".config", "afclaude")):
             os.makedirs(d)
         os.chmod(cls.data, 0o700)
+        os.chmod(os.path.join(cls.data, "bridge"), 0o700)       # as the host kit's install leaves it (K2)
         cls.key = secrets.token_hex(20)
-        for path, text in ((os.path.join(cls.repo, "docker", "secrets", "host_bridge_ed25519"), "x\n"),
-                           (os.path.join(cls.home, ".config", "afclaude", "quickview.key"), cls.key + "\n")):
+        for path, text, mode in ((os.path.join(cls.data, "bridge", "host_bridge_ed25519"), "-----BEGIN FAKE KEY-----\n", 0o600),
+                                 (os.path.join(cls.home, ".config", "afclaude", "quickview.key"), cls.key + "\n", 0o644)):
             with open(path, "w") as fh:
                 fh.write(text)
-            os.chmod(path, 0o644)
+            os.chmod(path, mode)
         cls.override = os.path.join(cls.root, "override.yml")
         with open(cls.override, "w") as fh:
             fh.write("services:\n  afclaude:\n"
@@ -456,6 +467,14 @@ class SingleLayoutInContainer(unittest.TestCase):
         self.assertIn("web.py serve --supervised", ps.stdout)
         self.assertIn("runner.py serve", ps.stdout)
         self.assertNotIn("mcp_service.py", ps.stdout)
+
+    def test_the_bridge_key_is_the_host_kits_copy_in_the_data_directory(self):
+        """host.ssh_argv's -i: AFCLAUDE_BRIDGE_KEY names the install's <data>/bridge/ key, readable by the container
+        user; the pre-kit key's mount point is gone."""
+        r = subprocess.run(["docker", "exec", self.project, "sh", "-c", 'printenv AFCLAUDE_BRIDGE_KEY && cat "$AFCLAUDE_BRIDGE_KEY"'
+                            ' && ! test -e /run/secrets/host_bridge_ed25519'], capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stdout), (0, "/app/data/bridge/host_bridge_ed25519\n-----BEGIN FAKE KEY-----\n"),
+                         r.stderr)
 
     def test_the_inbox_api_answers_on_the_socket_and_no_master_key_is_made(self):
         dfd = os.open(os.path.join(self.data, "api"), os.O_RDONLY | os.O_DIRECTORY)

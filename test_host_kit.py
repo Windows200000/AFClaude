@@ -1066,6 +1066,66 @@ class LegacyBridge(unittest.TestCase):
             self.assertIn("install_host_bridge.sh", str(cm.exception))
 
 
+class _Captured(Exception):
+    """Ends a caller at its host call (none of them catches it)."""
+
+
+class KitAcceptsTheRunnerShapes(TempDir):
+    """The kit switch (the live container's key moves to the kit's authorized_keys line): every shape the runner,
+    its jobs and the dispatcher send must pass the kit's own checks, or the first night denies it (rc 126).
+    The Haiku argvs are captured from their callers (keepalive and inbox_worker share POKE_ARGV, notify,
+    usage_sampler), the rest are the shapes those modules build; `claude` is /usr/bin/true in the test host.json,
+    so a shape that passes runs and exits 0."""
+
+    def captured(self, call):
+        seen = []
+
+        def fake(argv, **kw):
+            seen.append(list(argv))
+            raise _Captured()
+        with mock.patch.object(host, "run_on_host", side_effect=fake):
+            try:
+                call()
+            except _Captured:
+                pass
+        self.assertEqual(len(seen), 1, seen)
+        return seen[0]
+
+    def test_the_haiku_callers(self):
+        import datetime
+        import keepalive
+        import usage_sampler
+        spec = importlib.util.spec_from_file_location("notify_unstubbed", os.path.join(HERE, "notify.py"))
+        notify = importlib.util.module_from_spec(spec)      # testenv stubs notify.push in the imported module
+        spec.loader.exec_module(notify)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        st = {"sessions": {SID: {"last_activity": now.isoformat(), "prompts": [{"text": "hi"}], "title": "t"}}}
+        shapes = [keepalive.POKE_ARGV, self.captured(lambda: notify.push("x")),
+                  self.captured(lambda: usage_sampler.haiku_judgement(st, now))]
+        for argv in shapes:
+            r = run_exec(shlex.join(host.bridge_argv(argv)), self.hj)
+            self.assertEqual(r.returncode, 0, (argv, r.stderr))
+
+    def test_the_other_claude_and_check_shapes(self):
+        for argv in (["claude", "agents", "--json"], ["claude", "agents", "--json", "--all"],
+                     ["claude", "-p", "--no-session-persistence", "--permission-mode", "dontAsk", "/usage"],
+                     ["claude", "stop", SID[:8]], ["claude", "auth", "status"], ["kit-version"], ["host-config", "get"],
+                     ["clock"]):
+            r = run_exec(shlex.join(host.bridge_argv(argv)), self.hj)
+            self.assertEqual(r.returncode, 0, (argv, r.stderr))
+        for argv in (["kill-claude", "1"], ["claude-env", "1"]):     # pid 1 is no claude: the kit's pid check denies it
+            r = run_exec(shlex.join(host.bridge_argv(argv)), self.hj)
+            self.assertNotIn(b"not whitelisted", r.stderr, argv)
+
+    def test_the_resume_shape(self):
+        he = load_he(self.hj)
+        ka = ["--session", SID, "--tmux", "afc-abcdef01", "--message", "go", "--cwd", self.root, "--name", "t",
+              "--model", "claude-opus-5-5", "--effort", "high", "--new", "--no-remote-control"]
+        remote = host.bridge_argv(["ka_resume.sh", *ka])
+        self.assertEqual(remote[0], "ka_resume.sh")
+        self.assertEqual(he.check_ka_resume(remote[1:])[-2:], ["--cwd", self.root])
+
+
 class RunOnHost(unittest.TestCase):
     """host.run_on_host in the container: one ssh call per command, the caller's timeout, no kit pre-check;
     host.repo_dir() never calls the bridge (review:k2 M3, M4)."""

@@ -35,6 +35,11 @@ services:
       AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
       AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
       AFCLAUDE_BRIDGE_USER: ${AFCLAUDE_BRIDGE_USER:?set in docker/.env}
+      # the host kit's bridge key (K2, the owner's install puts it into <data>/bridge/; its authorized_keys line
+      # runs the installed kit). Rollback to the pre-kit bridge while its authorized_keys line still exists:
+      # this file from the commit before the kit switch (it mounts docker/secrets/ at the image's default
+      # AFCLAUDE_BRIDGE_KEY), then tools/deploy.py.
+      AFCLAUDE_BRIDGE_KEY: /app/data/bridge/host_bridge_ed25519
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -42,7 +47,6 @@ services:
       - ${AFCLAUDE_HOST_REPO}/data:/app/data                        # DB, samples, state, logs (rw)
       - ${HOST_HOME:?}/.claude/projects:${HOST_HOME}/.claude/projects:ro
       - ${HOST_HOME}/.claude/sessions:${HOST_HOME}/.claude/sessions:ro
-      - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro
       - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
       # the quickview key: inbox_api.py checks it on every request too (D-150/D-241)
       - ${HOST_HOME}/.config/afclaude/quickview.key:/run/secrets/afclaude_quickview.key:ro
@@ -54,7 +58,7 @@ services:
     networks: [afclaude]
 networks:
   afclaude:
-    # host_exec.py's authorized_keys line only accepts from="172.16.0.0/12"
+    # the host kit's authorized_keys line accepts from= this subnet only (install --from, default 172.28.0.0/24)
     ipam:
       config:
         - subnet: ${AFCLAUDE_SUBNET:-172.28.0.0/24}
