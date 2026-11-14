@@ -3466,11 +3466,13 @@ def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:
                         (new, old)).rowcount
 
 
-def refusal_audited_since(conn: sqlite3.Connection, key: str, since: str) -> bool:
+def refusal_audited_since(conn: sqlite3.Connection, key: str, since: str, actor: str | None = None) -> bool:
     """Was a refusal with this alert key (an audit row with `after` = {"refused": ..., "key": key},
-    actions._refusal_after) written since?"""
-    return conn.execute("SELECT 1 FROM audit_log WHERE ts>=? AND json_extract(after, '$.key')=? LIMIT 1",
-                        (since, key)).fetchone() is not None
+    actions._refusal_after) written since? `actor`: only that actor's rows (the audit_log_actor(actor, ts) index
+    narrows the scan; without it every row since `since` is read)."""
+    where, args = ("actor=? AND ts>=?", [actor, since]) if actor is not None else ("ts>=?", [since])
+    return conn.execute(f"SELECT 1 FROM audit_log WHERE {where} AND json_extract(after, '$.key')=? LIMIT 1",
+                        (*args, key)).fetchone() is not None
 
 
 def audit_of_actors(conn: sqlite3.Connection, actors: Sequence[str], since: str, until: str) -> list[Row]:

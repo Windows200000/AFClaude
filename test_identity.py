@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -195,6 +196,33 @@ class Table(Base):
         self.assertEqual(len(logs.output), 1)                              # D-235: visible, once
         self.assertIn("mode 0600", logs.output[0])
 
+    def test_a_linked_file_or_a_writable_directory_is_not_used(self):
+        """L5: no symlink (opened with O_NOFOLLOW, checks on the open file), no directory others can write."""
+        uid, token = self.machine()
+        d = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(d, 0o700)
+        real, link = os.path.join(d, "real.json"), os.path.join(d, "machine.json")
+        with open(os.open(real, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
+            json.dump({"token": token}, fh)
+        os.symlink(real, link)
+        self.assertEqual(self.resolve(env(OWN), token_file=link).token, "insecure-file")
+        self.assertEqual(self.resolve(env(OWN), token_file=real).actor, f"machine:{uid}")
+        os.chmod(d, 0o770)
+        self.assertEqual(self.resolve(env(OWN), token_file=real).token, "insecure-file")
+        os.chmod(d, 0o700)
+
+    def test_a_fifo_as_the_token_file_does_not_block(self):
+        d = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(d, 0o700)
+        fifo = os.path.join(d, "machine.json")
+        os.mkfifo(fifo, 0o600)
+        out = []
+        t = threading.Thread(target=lambda: out.append(identity.read_token(env(OWN), fifo)[1]), daemon=True)
+        t.start()
+        t.join(10)                              # a blocking open would leave this thread behind
+        self.assertFalse(t.is_alive(), "the FIFO blocked the open")
+        self.assertEqual(out, ["insecure-file"])
+
     def test_a_revoked_or_unknown_token_is_no_machine_identity(self):
         uid, token = self.machine()
         bad = [("unknown", "afcm_999_" + "0" * 64), ("garbage", "not-a-token")]
@@ -217,6 +245,34 @@ class Table(Base):
         self.assertEqual(self.resolve(env(OTHER, CLAUDE_GUARD_DISABLE="1", **tok)).actor, f"agent:{OTHER}")
         self.assertEqual(self.resolve(env(DRV, **tok), transport="mcp", stamp={"session": DRV}).actor, f"agent:{DRV}")
         self.assertIsNone(store.get_machine_token(self.conn, 1)["last_seen_at"])   # the token was never even used
+
+    def test_the_hosts_name_comes_from_the_wrapper_inside_a_container(self):
+        """K5: socket.gethostname() is the container's; the host wrapper passes the host's name, and the token's
+        use is recorded and clone-checked under it."""
+        uid, token = self.machine()                       # issued for host-a (gethostname is patched to it)
+        with mock.patch("socket.gethostname", return_value="3f2a9c1b7d4e"):
+            w = self.resolve(env(OWN, AFCLAUDE_MACHINE_TOKEN=token, AFCLAUDE_MACHINE_HOST="Host-A"))
+        self.assertEqual(w.actor, f"machine:{uid}")
+        self.assertEqual(store.get_machine_token(self.conn, 1)["last_hostname"], "Host-A")   # same host, case-folded: no alert
+
+    def test_a_machine_the_transport_authenticated_needs_no_token_in_the_env(self):
+        """K5: the HTTP server hands identity.resolve the machine its bearer check found; the empty env of a remote
+        caller is never read for a token, a session or the guard bypass, and a stamp names the session only."""
+        uid, _ = self.machine()
+        who = {"user_id": uid, "token_id": 1, "label": "host-a"}
+        w = self.resolve({}, transport="mcp", machine=who, stamp={"session": OWN})
+        self.assertEqual((w.actor, w.kind, w.user_id, w.session, w.token, w.autonomous),
+                         (f"machine:{uid}", "machine", uid, OWN, "valid", False))
+        w = self.resolve({}, transport="mcp", machine=who)
+        self.assertEqual((w.actor, w.session), (f"machine:{uid}", None))
+        w = self.resolve({}, transport="mcp", machine=who, stamp={"session": OWN, "agent": "a1"})
+        self.assertEqual((w.actor, w.agent_id), (f"machine:{uid}", "a1"))     # D-336: a subagent is its parent's principal
+        # a stamp naming a session AFClaude knows is ignored in shadow mode (never makes a remote caller a task-manager)
+        for sid in (TM, DRV):
+            w = self.resolve({}, transport="mcp", machine=who, stamp={"session": sid})
+            self.assertEqual((w.actor, w.session), (f"machine:{uid}", None), sid)
+        with mock.patch("identity.ENFORCE_CONFLICTS", True), self.assertRaises(identity.IdentityConflict):
+            self.resolve({}, transport="mcp", machine=who, stamp={"session": TM})
 
 
 class Clear(Base):
