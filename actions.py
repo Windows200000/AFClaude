@@ -1566,8 +1566,10 @@ SETTINGS: dict[str, Setting] = {
                                             "and fails (D-234)", "automation"),
     "runner_timeout_last_stretch": _num(90, 90, 720, "Runner: minutes a last-stretch slot start may take before "
                                         "it is killed and fails (D-234)", "automation"),
-    "runner_timeout_deferred_start": _num(90, 90, 720, "Runner: minutes a postponed or planned session-window "
-                                          "start may take before it is killed and fails (D-234)", "automation"),
+    "runner_timeout_deferred_start": _num(95, 95, 720, "Runner: minutes a postponed or planned session-window "
+                                          "start may take (with the host checks a start postponed for a "
+                                          "database problem runs first, K6) before it is killed and fails (D-234)",
+                                          "automation"),
     "runner_timeout_fillup": _num(90, 90, 720, "Runner: minutes a fill-up start (D-212) may take before it is "
                                   "killed and fails (D-234)", "automation"),
     "runner_timeout_compaction": _num(65, 65, 720, "Runner: minutes a compaction (save, /compact, the hand-off "
@@ -5375,8 +5377,9 @@ def hostcheck_put(conn: sqlite3.Connection, results: Sequence[Mapping[str, Any]]
     """Replace the host checks' rows (host_checks, phase 5b K6): each result is {name, status ok|warn|fail|skip,
     detail, fix, duration_ms, kit_version, blocking}, all in one transaction. Runner rows like snapshot_put
     (actor and via, or the `afclaude host check` CLI; no audit_log row: an hourly run plus one per window start would be a dozen rows each for
-    values that are replaced; the run's app_log line is the history, D-256). -> {name: the previous status}
-    (None = first result), which the caller reads to alert once per episode."""
+    values that are replaced; the run's app_log line is the history, D-256). -> {name: when the check's current
+    episode was alerted (None: not yet; a new status is a new episode)}, which the caller reads to alert once per
+    episode (hostcheck_alerted marks it, whoever wrote the row: a fail the CLI recorded first is still alerted)."""
     _check_writer(actor, via, store.DEFAULT_ACCOUNT)
     if not (actor.startswith("runner") or via == "cli"):
         raise PermissionError("the host checks are written by runner actors and the `host check` CLI only")
@@ -5400,12 +5403,29 @@ def hostcheck_put(conn: sqlite3.Connection, results: Sequence[Mapping[str, Any]]
                      "duration_ms": duration, "kit_version": kit, "blocking": bool(r.get("blocking"))})
 
     def run() -> dict[str, str | None]:
-        before: dict[str, str | None] = {}
+        alerted: dict[str, str | None] = {}
         with store.transaction(conn):
             for row in rows:
-                before[row["name"]] = store.put_host_check(conn, ran_at=at, **row)
-        return before
+                alerted[row["name"]] = store.put_host_check(conn, ran_at=at, **row)
+        return alerted
     return _runner_write(conn, "hostcheck.put", actor, {"checks": [r["name"] for r in rows]}, run)
+
+
+def hostcheck_alerted(conn: sqlite3.Connection, names: Sequence[str], *, actor: str, via: str) -> None:
+    """Mark the current fail episodes of these host checks as alerted (hostcheck.report_failures, after the alert;
+    runner actors only, no audit_log row like hostcheck_put)."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if not actor.startswith("runner"):
+        raise PermissionError("host check alerts are marked by runner actors only")
+    for name in names:
+        if not isinstance(name, str) or not HOST_CHECK_NAME_RE.match(name):
+            raise ValueError(f"bad host check name {name!r}")
+    at = store.now_iso()
+
+    def run() -> None:
+        with store.transaction(conn):
+            store.mark_host_checks_alerted(conn, list(names), at)
+    _runner_write(conn, "hostcheck.alerted", actor, {"checks": list(names)}, run)
 
 
 def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional[str], timeout_s: Optional[float],

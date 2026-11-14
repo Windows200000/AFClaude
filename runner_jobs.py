@@ -267,8 +267,9 @@ def window_start_min_timeout() -> timedelta:
 
 def window_start_job_min_timeout() -> timedelta:
     """The least outer timeout of the window_start job: the start's, plus the blocking host checks it runs first
-    (phase 5b K6: keepalive.window_start_pass -> hostcheck.pre_start, each check at its budget; the acts and
-    requests that continue a task-manager do not run them)."""
+    (phase 5b K6: keepalive.window_start_pass -> hostcheck.pre_start, each check at its budget; of the acts only
+    deferred_start runs them, for a start postponed for a database problem in them: act_inner; the requests
+    that continue a task-manager do not)."""
     pre = timedelta(seconds=float(importlib.import_module("hostcheck").PRE_START_WORST_CASE))
     return window_start_min_timeout() + pre
 
@@ -378,7 +379,10 @@ COMPACTION_HOST_CALLS: tuple[tuple[str, int, int], ...] = (("fire", 120, 3),)
 def act_inner(job: str) -> dict[str, timedelta]:
     """{what: worst-case time} of one run of the act `job` (a start or the compaction)."""
     if job in START_ACTS:
-        return window_start_inner()
+        out = window_start_inner()
+        if job == "deferred_start":   # a start postponed for a database problem in its host checks runs them first (K6)
+            out["hostcheck:pre_start"] = timedelta(seconds=float(importlib.import_module("hostcheck").PRE_START_WORST_CASE))
+        return out
     if job != "compaction":
         raise KeyError(f"{job} is not an act")
     ka = importlib.import_module("keepalive")

@@ -637,6 +637,7 @@ CREATE TABLE IF NOT EXISTS host_checks (
     duration_ms INTEGER NOT NULL DEFAULT 0,
     kit_version TEXT,
     blocking    INTEGER NOT NULL DEFAULT 0,
+    alerted_at  TEXT,                    -- UTC, when this episode (`since`) of a fail was alerted; NULL: not yet
     version     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TRIGGER IF NOT EXISTS host_checks_version AFTER UPDATE ON host_checks FOR EACH ROW
@@ -4068,16 +4069,25 @@ def put_snapshot(conn: sqlite3.Connection, section: str, account_id: str, *, sta
 
 def put_host_check(conn: sqlite3.Connection, name: str, *, status: str, detail: str, fix: str, ran_at: str,
                    duration_ms: int, kit_version: str | None, blocking: bool) -> str | None:
-    """Insert or replace the check's row; `since` stays while the status does not change. -> the previous status
-    (None: the first result of this check)."""
-    old = conn.execute("SELECT status, since FROM host_checks WHERE name=?", (name,)).fetchone()
-    since = old["since"] if old is not None and old["status"] == status else ran_at
-    conn.execute("INSERT INTO host_checks(name, status, detail, fix, ran_at, since, duration_ms, kit_version, blocking) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET status=excluded.status, "
-                 "detail=excluded.detail, fix=excluded.fix, ran_at=excluded.ran_at, since=excluded.since, "
-                 "duration_ms=excluded.duration_ms, kit_version=excluded.kit_version, blocking=excluded.blocking",
-                 (name, status, detail, fix, ran_at, since, duration_ms, kit_version, int(blocking)))
-    return None if old is None else str(old["status"])
+    """Insert or replace the check's row; `since` and `alerted_at` stay while the status does not change (a new
+    status starts a new episode, not alerted yet). -> the episode's alerted_at (None: not alerted)."""
+    old = conn.execute("SELECT status, since, alerted_at FROM host_checks WHERE name=?", (name,)).fetchone()
+    same = old is not None and old["status"] == status
+    since = old["since"] if same else ran_at
+    alerted_at = old["alerted_at"] if same else None
+    conn.execute("INSERT INTO host_checks(name, status, detail, fix, ran_at, since, duration_ms, kit_version, blocking, "
+                 "alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                 "status=excluded.status, detail=excluded.detail, fix=excluded.fix, ran_at=excluded.ran_at, "
+                 "since=excluded.since, duration_ms=excluded.duration_ms, kit_version=excluded.kit_version, "
+                 "blocking=excluded.blocking, alerted_at=excluded.alerted_at",
+                 (name, status, detail, fix, ran_at, since, duration_ms, kit_version, int(blocking), alerted_at))
+    return None if alerted_at is None else str(alerted_at)
+
+
+def mark_host_checks_alerted(conn: sqlite3.Connection, names: Sequence[str], at: str) -> None:
+    """The current episodes of these checks were alerted (put_host_check keeps it until the status changes)."""
+    for name in names:
+        conn.execute("UPDATE host_checks SET alerted_at=? WHERE name=? AND alerted_at IS NULL", (at, name))
 
 
 def host_check_rows(conn: sqlite3.Connection) -> list[Row]:

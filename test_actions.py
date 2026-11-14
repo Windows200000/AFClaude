@@ -662,7 +662,7 @@ class SettingActions(Base):
                           "runner_timeout_window_start": 95.0,
                           "runner_timeout_watch": 12.0, "runner_timeout_run_readings": 10.0,
                           "runner_timeout_compaction_check": 15.0, "runner_timeout_last_stretch": 90.0,
-                          "runner_timeout_deferred_start": 90.0, "runner_timeout_fillup": 90.0,
+                          "runner_timeout_deferred_start": 95.0, "runner_timeout_fillup": 90.0,
                           "runner_timeout_compaction": 65.0, "runner_timeout_inbox": 5.0,
                           "runner_timeout_inbox_verify": 0.5, "runner_timeout_request": 90.0, "runner_start_catchup": 30.0,
                           "runner_runs_retention_days": 30.0, "restore_starts_paused": True,

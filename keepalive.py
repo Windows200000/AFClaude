@@ -1732,13 +1732,17 @@ def last_stretch_act(sid, now, st, args, p):
 
 DB_PAUSE_RECHECK = timedelta(minutes=5)   # a DB pause at a window start: recheck this soon,
                                            # but never past schedule.postpone_deadline (D-202)
+HOST_CHECKS_DB = "db_paused"              # host_checks_before_start: the database failed, postpone like a DB pause
 
 
 def host_checks_before_start(now, sid):
     """Phase 5b K6 (docs/phase5b_plan.md §3.6): the blocking host checks (hostcheck.pre_start) right before a
     session-window start's decision. A failing one has paused automation and alerted (failstop) and holds the
     start: -> the HOLD reason. None = go on (all passed, or no host kit installed yet: the transitional mode,
-    hostcheck.NO_KIT, K7 removes it). A crash of the check itself is an error too (D-235): fail_stop and hold."""
+    hostcheck.NO_KIT, K7 removes it). A crash of the check itself is an error too (D-235): fail_stop and hold.
+    A database failure (recording the results; the DB error path has retried, reported and alerted it, §7.8) is
+    a DB pause like handle_fire's: -> HOST_CHECKS_DB, the caller postpones the start and rechecks (D-202)."""
+    import sqlite3
     import hostcheck
     import store
     try:
@@ -1747,6 +1751,10 @@ def host_checks_before_start(now, sid):
             why = hostcheck.pre_start(conn)
         finally:
             conn.close()
+    except (store.DBError, sqlite3.Error) as e:
+        log(f"window-start {berlin(now)}: the host checks hit a database problem ({type(e).__name__}: {e}); "
+            "the start is postponed like a DB pause (D-202)")
+        return HOST_CHECKS_DB
     except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): the start is aborted
         fail_stop("host check failed to run at a session-window start", f"{type(e).__name__}: {e}")
         return f"HOLD: the host check could not run ({type(e).__name__}); automation paused (D-234/D-235)"
@@ -1776,6 +1784,20 @@ def window_start_pass(sid, now, args):
                       f"`{resume_hint(sid)}` once the error is fixed (D-234/D-235)")
         return d
     blocked = host_checks_before_start(now, sid)
+    if blocked == HOST_CHECKS_DB:
+        d = {"go": False, "reason": "POSTPONE: the host checks hit a database problem (D-202)", "postpone": True}
+        deadline = schedule.postpone_deadline(now)
+        recheck_at = now + DB_PAUSE_RECHECK
+        # no run_log row (decided): the database is what failed; like handle_fire's db_paused, the note says it
+        if args.now or recheck_at >= deadline:
+            progress_note(f"window-start {berlin(now)}: not resumed, the host checks hit a database problem "
+                          + ("(a run-now start is not retried)" if args.now else
+                             "at the night's last session-window start, not retried before the window ends (D-202)"))
+            return dict(d, postpone=False)
+        defer_window_start(key, sid, recheck_at, d["reason"], deadline, host_checks=True)
+        progress_note(f"window-start {berlin(now)}: the host checks hit a database problem, postponed to "
+                      f"{berlin(recheck_at)} to retry (D-202)")
+        return dict(d, recheck_at=recheck_at)
     if blocked is not None:
         d = {"go": False, "reason": blocked, "postpone": False}
         decided(arm, "HOLD", f"window start {key}: {d['reason']}", sid)
@@ -2188,12 +2210,13 @@ def save_deferred(d):
     runner_state.save("keepalive.deferred", d, DEFER_FILE)
 
 
-def defer_window_start(key, sid, recheck_at, reason, deadline=None, planned=False):
+def defer_window_start(key, sid, recheck_at, reason, deadline=None, planned=False, host_checks=False):
     """The session-window-start decision was a POSTPONE (the user was active, ...) or the gate
     passed and the run starts late in its session window (planned=True, D-274): the watcher
     re-decides at recheck_at, still once per session-window start (same dedup key), and only
     before `deadline` (the night's next session-window start, D-202; for a planned start the
-    session window's end)."""
+    session window's end). host_checks=True: the host checks did not get through (a database
+    problem), the recheck runs them first (deferred_act)."""
     d = {k: v for k, v in load_deferred().items() if k == key}   # older starts are over
     d[key] = {"session": sid, "recheck_at": recheck_at.astimezone(UTC).isoformat(), "reason": reason,
               "deferred_at": datetime.now(UTC).isoformat()}
@@ -2201,6 +2224,8 @@ def defer_window_start(key, sid, recheck_at, reason, deadline=None, planned=Fals
         d[key]["deadline"] = deadline.astimezone(UTC).isoformat()
     if planned:
         d[key]["planned"] = True
+    if host_checks:
+        d[key]["host_checks"] = True
     save_deferred(d)
 
 
@@ -2274,6 +2299,28 @@ def deferred_act(sid, now, st, args, key, ent, defs):
     again, then fire, postpone again or drop it. -> the next recheck time or None."""
     arm = getattr(args, "arm", False)
     paused = automation_paused(f"the postponed session-window start {key}", sid)
+    if not paused and ent.get("host_checks"):   # the start's host checks hit a database problem: run them now
+        blocked = host_checks_before_start(now, sid)
+        if blocked == HOST_CHECKS_DB:
+            deadline = parse_ts(ent.get("deadline")) or schedule.postpone_deadline(now)
+            recheck_at = now + DB_PAUSE_RECHECK
+            if recheck_at < deadline:
+                ent["recheck_at"] = recheck_at.astimezone(UTC).isoformat()
+                save_deferred(defs)
+                return recheck_at
+            defs.pop(key, None)
+            save_deferred(defs)
+            progress_note(f"window-start (postponed) {berlin(now)}: the host checks hit a database problem at the "
+                          "night's last session-window start, not retried before the window ends (D-202)")
+            return None
+        if blocked is not None:
+            decided(arm, "HOLD", f"window start {key}: {blocked}", sid)
+            defs.pop(key, None)
+            save_deferred(defs)
+            progress_note(f"window-start (postponed) {berlin(now)}: not resumed, {blocked}")
+            return None
+        ent.pop("host_checks", None)
+        save_deferred(defs)
     u = None if paused else fresh_usage(now, force=True)
     if u is None:   # paused, or the usage reading failed (fresh_usage: alert + pause): dropped
         decided(arm, "HOLD", f"window start {key}: the postponed start is dropped, "

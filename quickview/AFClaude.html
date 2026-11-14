@@ -347,7 +347,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     if (w && w.running === false) lines.push('<div class="mut">the watcher is not running: nothing fires it</div>');
     return tile(f.test ? "Next fill-up (TEST)" : "Next fill-up", esc(f.at_berlin || "?"), lines.join(""));
   }
-  // phase 5b K6 (D-164, D-316): the host checks as one line in this section; warnings, failures and skipped ones expanded
+  // phase 5b K6 (D-164, D-316): the host checks as one line in this section; warnings and failures expanded, skipped ones one line per reason
   function hostTile(h) {
     if (!h) return "";
     if (h.error) return tile("Host checks", "–", '<div class="mut">' + esc(h.error) + "</div>");
@@ -362,6 +362,8 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var cls = r.status === "fail" ? "bad" : r.status === "warn" ? "warn" : "mut";
       return '<div class="' + cls + '"><strong>' + esc(r.name) + "</strong> " + esc(r.status) + (r.since_berlin ? " since " + esc(r.since_berlin) : "") +
         ": " + esc(r.detail) + (r.fix && r.status !== "skip" ? '<br><span class="mut">fix: ' + esc(r.fix) + "</span>" : "") + "</div>";
+    }).join("") + (h.skipped || []).map(function (g) {
+      return '<div class="mut" title="' + esc((g.names || []).join(", ")) + '">' + g.count + " skipped: " + esc(g.reason) + "</div>";
     }).join("");
     return tile("Host checks", v, line + rows);
   }

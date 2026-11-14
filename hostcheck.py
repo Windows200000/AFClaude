@@ -18,7 +18,8 @@ Severity (the plan's list): a check is blocking or not. A FAIL of a blocking che
 logged_in, mcp) is `failstop.fail("hostcheck", ...)`: alert + pause until the task-manager has looked at it
 and cleared it (D-257, D-283, D-235); the start is not attempted. failstop alerts once per pause (the subject
 is stable: "host check <name> failed"). A FAIL of another check (usage, doctor, disk, clock) alerts once per
-episode and does not pause (the status it fails on is `since` its row). A WARN is recorded and shown, never
+episode and does not pause (the episode is the row's `since`; its `alerted_at` says it was alerted, so a fail a
+manual run recorded first is still alerted by the next scheduled one). A WARN is recorded and shown, never
 alerted. A check that does not answer within its budget is a FAIL (D-234); an exception inside a check is a
 FAIL naming it (D-235): a flaky check is fixed here, not muted.
 
@@ -79,6 +80,8 @@ USAGE_WARN_MIN = 90.0               # minutes since the usage cache was fetched:
 USAGE_FAIL_MIN = 360.0
 CLOCK_WARN_S = 5.0                  # plan §3.6
 CLOCK_FAIL_S = 60.0
+BRIDGE_FIRST_TRY = 30.0             # seconds the bridge check's first call may take (keepalive's tmux_has allows
+                                    # 30 s too); the retry gets the rest of its budget (CHECKS: 40)
 _VERSION_LINE = re.compile(r"Running:[^(\n]*\(([0-9]+(?:\.[0-9]+)*)\)")
 
 Fn = Callable[["Ctx"], "Result"]
@@ -130,10 +133,13 @@ class Ctx:
             raise subprocess.TimeoutExpired("host check", self.budget)
         return left
 
-    def call(self, argv: list[str], input: Optional[str] = None) -> "subprocess.CompletedProcess[str]":
-        """host.run_on_host(argv), within the check's remaining budget (TimeoutExpired = the check fails)."""
+    def call(self, argv: list[str], input: Optional[str] = None,
+             cap: Optional[float] = None) -> "subprocess.CompletedProcess[str]":
+        """host.run_on_host(argv), within the check's remaining budget (TimeoutExpired = the check fails) and, given
+        `cap`, within cap seconds (a call the check retries leaves room for the retry)."""
         run: Callable[..., Any] = getattr(host, "run_on_host")
-        r: subprocess.CompletedProcess[str] = run(argv, input=input, timeout=self.remaining())
+        left = self.remaining()
+        r: subprocess.CompletedProcess[str] = run(argv, input=input, timeout=left if cap is None else min(left, cap))
         return r
 
     def setting(self, key: str) -> Any:
@@ -152,16 +158,28 @@ def _bytes_gb(n: float) -> str:
 
 def check_bridge(ctx: Ctx) -> Result:
     """The ssh handshake: a harmless whitelisted command both the legacy bridge and the kit answer (tmux
-    has-session: 0 or 1 = reached the host and ran tmux)."""
-    r = ctx.call(["tmux", "has-session", "-t", "=afc-check"])
+    has-session: 0 or 1 = reached the host and ran tmux). Retried once on ssh rc 255 or no answer within
+    BRIDGE_FIRST_TRY (a stale ControlMaster socket, a loaded host): one blip must not pause automation and hold a
+    window start; the retry gets the rest of the budget, and its answer decides."""
+    argv = ["tmux", "has-session", "-t", "=afc-check"]
+    retried = ""
+    try:
+        r = ctx.call(argv, cap=BRIDGE_FIRST_TRY)
+    except subprocess.TimeoutExpired:
+        r = None
+        retried = f" (retried once after no answer within {BRIDGE_FIRST_TRY:g} s)"
+    if r is not None and r.returncode == 255:
+        retried = f" (retried once after ssh rc 255: {_first(r.stderr or r.stdout, 160)})"
+    if r is None or r.returncode == 255:
+        r = ctx.call(argv)
     if r.returncode in (0, 1):
-        return Result("ok", "the host bridge answers")
+        return Result("ok", "the host bridge answers" + retried)
     err = _first(r.stderr or r.stdout)
     if r.returncode == 255:
-        return Result("fail", f"the bridge refused or could not be reached (ssh rc 255): {err}",
+        return Result("fail", f"the bridge refused or could not be reached (ssh rc 255){retried}: {err}",
                       "check that the host's authorized_keys line for the bridge key has a from= covering the "
                       "runner's network, that the host key in known_hosts is current, and that sshd runs")
-    return Result("fail", f"the bridge answered rc {r.returncode}: {err}", "see the host's host_exec log")
+    return Result("fail", f"the bridge answered rc {r.returncode}{retried}: {err}", "see the host's host_exec log")
 
 
 def check_kit(ctx: Ctx) -> Result:
@@ -460,7 +478,7 @@ def check_e2e(ctx: Ctx) -> Result:
 
 
 CHECKS: tuple[Check, ...] = (
-    Check("bridge", True, 20, check_bridge),
+    Check("bridge", True, 40, check_bridge),
     Check("kit", True, 70, check_kit),
     Check("tmux", True, 45, check_tmux),
     Check("claude", True, 70, check_claude),
@@ -504,8 +522,13 @@ def execute(check: Check, ctx: Ctx) -> Outcome:
 
 def run_checks(conn: Any, names: Optional[list[str]] = None, *, blocking_only: bool = False) -> list[Outcome]:
     """The checks in order (all scheduled ones; `names`: those, in the table's order, e2e only when named;
-    blocking_only: the pre-start subset). A failed bridge or kit, or no kit installed, skips the rest."""
+    blocking_only: the pre-start subset). A failed bridge or kit, or no kit installed, skips the rest. Named checks
+    pass the same gates: the bridge check runs before any of them, the kit check before any but the bridge (so
+    `host check tmux` without a kit installed is a skip, not a fail)."""
     chosen = [c for c in CHECKS if (c.name in names if names else c.scheduled) and (c.blocking or not blocking_only)]
+    if chosen:
+        gates = ["bridge"] + (["kit"] if any(c.name != "bridge" for c in chosen) else [])
+        chosen += [BY_NAME[g] for g in gates if BY_NAME[g] not in chosen]
     ctx = Ctx(conn=conn)
     out: list[Outcome] = []
     for c in CHECKS:
@@ -538,40 +561,46 @@ def _log(conn: Any, results: list[Outcome], what: str, actor: str, via: str) -> 
 
 def record(conn: Any, results: list[Outcome], *, actor: str = ACTOR, via: str = "runner",
            what: str = "all") -> dict[str, Optional[str]]:
-    """Store the results (actions.hostcheck_put) and write the run's app_log line. -> {name: previous status}."""
-    before = actions.hostcheck_put(conn, [
+    """Store the results (actions.hostcheck_put) and write the run's app_log line. -> {name: when its current
+    episode was alerted (None: not yet)}."""
+    alerted = actions.hostcheck_put(conn, [
         {"name": o.name, "status": o.status, "detail": o.detail, "fix": o.fix, "duration_ms": o.duration_ms,
          "kit_version": o.kit_version, "blocking": o.blocking} for o in results], actor=actor, via=via)
     _log(conn, results, what, actor, via)
-    return before
+    return alerted
 
 
-def report_failures(results: list[Outcome], before: dict[str, Optional[str]],
+def report_failures(conn: Any, results: list[Outcome], alerted: dict[str, Optional[str]],
                     fail: Optional[Callable[..., Any]] = None) -> list[str]:
     """Alert for each fail (module doc): a blocking one is failstop.fail (alert + pause; failstop alerts once
-    per pause), another one an alert without a pause once per episode (its previous status was not fail).
-    -> the names reported."""
+    per pause), another one an alert without a pause once per episode: while its row's episode is not marked
+    alerted (record's answer), then marked (actions.hostcheck_alerted), whoever recorded the fail first (a manual
+    `host check` records without alerting). -> the names reported."""
     fail = fail or failstop.fail
     reported: list[str] = []
+    marked: list[str] = []
     for o in results:
         if o.status != "fail":
             continue
         detail = o.detail + (f"\nFix: {o.fix}" if o.fix else "")
         if o.blocking:
             fail(COMPONENT, f"host check {o.name} failed", detail)
-        elif before.get(o.name) != "fail":
+        elif alerted.get(o.name) is None:
             fail(COMPONENT, f"host check {o.name} failed", detail, pause=False)
+            marked.append(o.name)
         else:
             continue
         reported.append(o.name)
+    if marked:
+        actions.hostcheck_alerted(conn, marked, actor=ACTOR, via="runner")
     return reported
 
 
 def run_job(conn: Any) -> str:
     """The hourly runner job: every scheduled check, recorded, failures reported. -> the run's one-line note."""
     results = run_checks(conn)
-    before = record(conn, results)
-    report_failures(results, before)
+    alerted = record(conn, results)
+    report_failures(conn, results, alerted)
     return summary(results)
 
 
@@ -580,11 +609,11 @@ def run_pre_start(conn: Any) -> Optional[str]:
     one is reported (failstop: alert + pause) and the start must not go on: -> its reason. None = go on. While no
     host kit is installed (NO_KIT, transitional) nothing blocks."""
     results = run_checks(conn, blocking_only=True)
-    before = record(conn, results, what="before a window start")
+    alerted = record(conn, results, what="before a window start")
     bad = [o for o in results if o.status == "fail"]
     if not bad:
         return None
-    report_failures(results, before)
+    report_failures(conn, results, alerted)
     return "; ".join(f"{o.name}: {o.detail}" for o in bad)[:600]
 
 

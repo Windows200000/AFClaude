@@ -274,6 +274,45 @@ class EachCheck(Base):
         self.assertRegex(o.detail, r"lists \d+ tools")
 
 
+class BridgeRetry(Base):
+    """One slow or refused bridge answer is retried once before the check fails (a blip must not lose a night)."""
+
+    def test_rc_255_then_an_answer_is_ok(self):
+        answers = iter([done(255, "", "mux_client_request_session: read from master failed"), done(1)])
+        s = self.stub(tmux_has=lambda argv, input: next(answers))
+        o = self.run_one("bridge")
+        self.assertEqual(o.status, "ok")
+        self.assertIn("retried once after ssh rc 255", o.detail)
+        self.assertEqual(len(s.calls), 2)
+
+    def test_no_answer_then_an_answer_is_ok_and_the_first_call_leaves_room(self):
+        answers = iter([subprocess.TimeoutExpired("ssh", 30), done(0)])
+
+        def answer(argv, input):
+            a = next(answers)
+            if isinstance(a, BaseException):
+                raise a
+            return a
+        s = self.stub(tmux_has=answer)
+        o = self.run_one("bridge")
+        self.assertEqual(o.status, "ok")
+        self.assertIn("no answer within 30 s", o.detail)
+        self.assertLessEqual(s.calls[0][1], hostcheck.BRIDGE_FIRST_TRY)       # the first try is capped
+        self.assertGreater(hostcheck.BY_NAME["bridge"].budget, hostcheck.BRIDGE_FIRST_TRY)
+
+    def test_two_timeouts_fail(self):
+        s = self.stub(tmux_has=subprocess.TimeoutExpired("ssh", 5))
+        o = self.run_one("bridge")
+        self.assertEqual(o.status, "fail")
+        self.assertIn("no answer within 40 s", o.detail)
+        self.assertEqual(len(s.calls), 2)
+
+    def test_another_rc_is_not_retried(self):
+        s = self.stub(tmux_has=done(2, "", "boom"))
+        self.assertEqual(self.run_one("bridge").status, "fail")
+        self.assertEqual(len(s.calls), 1)
+
+
 class Timeouts(Base):
     def test_a_timed_out_host_call_is_a_fail(self):
         self.stub(tmux_check=subprocess.TimeoutExpired("ssh", 5))
@@ -364,6 +403,16 @@ class Episodes(Base):
         hostcheck.run_job(self.conn)
         self.assertEqual(len(self.alerts), 2)
 
+    def test_a_fail_the_cli_recorded_first_is_still_alerted_once_by_the_job(self):
+        self.stub(clock=lambda argv, input: done(1, "", "x"))
+        with redirect_stdout(StringIO()):
+            hostcheck.main(["check", "clock"])           # a manual run records the fail, alerts nothing
+        self.assertEqual(self.alerts, [])
+        hostcheck.run_job(self.conn)
+        hostcheck.run_job(self.conn)
+        self.assertEqual(self.alerts, ["host check clock failed"])
+        self.assertIsNotNone(self.rows()["clock"]["alerted_at"])
+
     def test_a_warn_is_recorded_but_never_alerts_or_pauses(self):
         self.stub(claude_auth_status=done(0, json.dumps({"loggedIn": True, "authMethod": "console"})))
         testenv.set_setting("host_claude_tested_version", "2.0")
@@ -392,8 +441,9 @@ class Episodes(Base):
         hostcheck.run_job(self.conn)
         rows = self.rows()
         self.assertEqual(rows["bridge"]["status"], "fail")
+        self.assertIn("retried once after ssh rc 255", rows["bridge"]["detail"])
         self.assertTrue(all(rows[n]["status"] == "skip" for n in rows if n != "bridge"))
-        self.assertEqual(len(s.calls), 1)
+        self.assertEqual(len(s.calls), 2)                # the handshake and its one retry
         self.assertEqual(self.alerts, ["AFClaude STOPPED: host check bridge failed"])
 
     def test_a_kit_mismatch_fails_and_skips_the_rest(self):
@@ -426,7 +476,20 @@ class NoKitYet(Base):
         self.assertIn("1 warn (kit)", note)
         self.assertEqual((self.alerts, self.paused()["paused"]), ([], False))
         self.assertEqual([c[0][0] for c in s.calls], ["tmux"])          # only the bridge handshake touched the host
-        self.assertTrue(qv.host_checks_block()["no_kit"])
+        b = qv.host_checks_block()
+        self.assertTrue(b["no_kit"])
+        self.assertEqual([c["name"] for c in b["checks"]], ["kit"])      # the warn expanded, the skips folded
+        self.assertEqual([(g["reason"], g["count"]) for g in b["skipped"]], [(hostcheck.NO_KIT, len(rows) - 2)])
+
+    def test_a_named_check_passes_the_gate_and_is_skipped_not_failed(self):
+        s = self.stub_legacy()
+        s.answers["tmux-check"] = done(126, "", "host_exec: denied (not whitelisted)")
+        with redirect_stdout(StringIO()):
+            rc = hostcheck.main(["check", "tmux"])
+        self.assertEqual(rc, 0)
+        rows = self.rows()
+        self.assertEqual({n: r["status"] for n, r in rows.items()}, {"bridge": "ok", "kit": "warn", "tmux": "skip"})
+        self.assertEqual(qv.host_checks_block()["counts"]["fail"], 0)
 
     def test_the_pre_start_hook_does_not_block(self):
         self.stub_legacy()
@@ -493,6 +556,45 @@ class PreStart(Base):
             with self.assertRaises(RuntimeError) as cm:
                 ka.window_start_pass(testenv.SID, now, args)
         self.assertIs(cm.exception, stop)
+
+    def test_a_db_error_postpones_and_the_recheck_runs_the_checks_first(self):
+        notes, saved = [], {}
+        args = types.SimpleNamespace(arm=False, now=False)
+        now = ka.datetime(2026, 11, 14, 22, 0, tzinfo=ka.timezone.utc)
+        broken = mock.Mock(side_effect=store.DBError("database is locked", "locked"))
+        with mock.patch.object(ka, "progress_note", notes.append), \
+                mock.patch.object(ka, "fresh_usage", mock.Mock(side_effect=AssertionError("no"))), \
+                mock.patch.object(ka, "save_deferred", lambda d: saved.update(d)), \
+                mock.patch.object(ka, "load_deferred", lambda: {}), \
+                mock.patch.object(hostcheck, "pre_start", broken):
+            d = ka.window_start_pass(testenv.SID, now, args)
+        self.assertEqual((d["go"], d["postpone"], d["recheck_at"]), (False, True, now + ka.DB_PAUSE_RECHECK))
+        self.assertIn("postponed to", notes[0])
+        self.assertFalse(self.paused()["paused"])        # a DB pause, not a fail_stop (D-202)
+        (key, ent), = saved.items()
+        self.assertTrue(ent["host_checks"])
+        later = now + ka.DB_PAUSE_RECHECK
+        # the recheck: the database is still broken, postponed again
+        defs = {key: dict(ent)}
+        with mock.patch.object(ka, "save_deferred", lambda d: None), mock.patch.object(hostcheck, "pre_start", broken), \
+                mock.patch.object(ka, "fresh_usage", mock.Mock(side_effect=AssertionError("no"))):
+            self.assertEqual(ka.deferred_act(testenv.SID, later, {}, args, key, defs[key], defs),
+                             later + ka.DB_PAUSE_RECHECK)
+        # then a failing check holds it, before the usage read
+        with mock.patch.object(ka, "save_deferred", lambda d: None), mock.patch.object(ka, "progress_note", notes.append), \
+                mock.patch.object(hostcheck, "pre_start", lambda conn: "tmux: gone"), \
+                mock.patch.object(ka, "fresh_usage", mock.Mock(side_effect=AssertionError("no"))):
+            self.assertIsNone(ka.deferred_act(testenv.SID, later, {}, args, key, defs[key], defs))
+        self.assertNotIn(key, defs)
+        self.assertIn("a host check failed (tmux: gone)", notes[-1])
+        # a passing one goes on to the usage read, the flag cleared
+        defs = {key: dict(ent)}
+        stop = RuntimeError("reached the usage read")
+        with mock.patch.object(ka, "save_deferred", lambda d: None), mock.patch.object(hostcheck, "pre_start", lambda conn: None), \
+                mock.patch.object(ka, "fresh_usage", mock.Mock(side_effect=stop)):
+            with self.assertRaises(RuntimeError):
+                ka.deferred_act(testenv.SID, later, {}, args, key, defs[key], defs)
+        self.assertNotIn("host_checks", defs[key])
 
     def test_a_crashing_hook_is_an_error_that_pauses_and_holds(self):
         args = types.SimpleNamespace(arm=False, now=False)
@@ -604,12 +706,17 @@ class Storage(Base):
     def test_put_keeps_since_while_the_status_holds_and_validates(self):
         row = {"name": "tmux", "status": "ok", "detail": "d", "fix": "", "duration_ms": 5, "kit_version": "6", "blocking": True}
         first = actions.hostcheck_put(self.conn, [row], actor="runner:host_check", via="runner", ran_at="2026-11-14T10:00:00.000Z")
+        actions.hostcheck_alerted(self.conn, ["tmux"], actor="runner:host_check", via="runner")
         again = actions.hostcheck_put(self.conn, [row], actor="runner:host_check", via="runner", ran_at="2026-11-14T11:00:00.000Z")
-        self.assertEqual((first, again), ({"tmux": None}, {"tmux": "ok"}))
+        self.assertEqual(first, {"tmux": None})          # not alerted yet
+        self.assertIsNotNone(again["tmux"])              # the same episode keeps its alert mark
         r = self.rows()["tmux"]
-        self.assertEqual((r["since"], r["ran_at"], r["version"]), ("2026-11-14T10:00:00.000Z", "2026-11-14T11:00:00.000Z", 1))
+        self.assertEqual((r["since"], r["ran_at"], r["version"]), ("2026-11-14T10:00:00.000Z", "2026-11-14T11:00:00.000Z", 2))   # the alert mark and the put
         actions.hostcheck_put(self.conn, [dict(row, status="fail")], actor="runner:host_check", via="runner", ran_at="2026-11-14T12:00:00.000Z")
         self.assertEqual(self.rows()["tmux"]["since"], "2026-11-14T12:00:00.000Z")
+        self.assertIsNone(self.rows()["tmux"]["alerted_at"])    # a new status is a new episode, not alerted
+        with self.assertRaises(PermissionError):
+            actions.hostcheck_alerted(self.conn, ["tmux"], actor="cli", via="cli")
         for bad in (dict(row, status="great"), dict(row, name="Bad Name"), dict(row, duration_ms=-1), dict(row, kit_version=6)):
             with self.assertRaises(ValueError):
                 actions.hostcheck_put(self.conn, [bad], actor="runner:host_check", via="runner")
@@ -647,7 +754,7 @@ class Surfaces(Base):
         self.assertIn("FAIL  tmux", out.getvalue())
         self.assertIn("OK    clock", out.getvalue())
         self.assertIn("fix:", out.getvalue())
-        self.assertEqual({n for n in self.rows()}, {"tmux", "clock"})
+        self.assertEqual({n for n in self.rows()}, {"bridge", "kit", "tmux", "clock"})   # named checks pass the gates
         self.assertEqual((self.alerts, self.paused()["paused"]), ([], False))      # a manual run pauses nothing
         out = StringIO()
         with redirect_stdout(out):
@@ -672,7 +779,8 @@ class Surfaces(Base):
             {"name": "mcp", "status": "skip", "detail": "not run"}], actor="runner:host_check", via="runner")
         b = qv.host_checks_block()
         self.assertEqual(b["counts"], {"ok": 1, "warn": 1, "fail": 1, "skip": 1})
-        self.assertEqual(sorted(c["name"] for c in b["checks"]), ["clock", "mcp", "tmux"])     # ok is only counted
+        self.assertEqual(sorted(c["name"] for c in b["checks"]), ["clock", "tmux"])     # ok is only counted
+        self.assertEqual(b["skipped"], [{"reason": "not run", "count": 1, "names": ["mcp"]}])  # skip: one line per reason
         self.assertFalse(b["no_kit"])
         with open(os.path.join(HERE, "quickview", "AFClaude.html")) as fh:
             page = fh.read()

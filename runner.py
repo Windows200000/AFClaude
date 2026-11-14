@@ -274,7 +274,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # one is never rerun (D-257), a drain holds it
     Job("last_stretch", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="last-stretch slot start (D-020/D-204)"),
-    Job("deferred_start", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("deferred_start", 95, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="postponed or planned session-window start (D-202/D-274)"),
     Job("fillup", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="fill-up start (D-212)"),
