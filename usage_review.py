@@ -516,6 +516,8 @@ def agent_running(path, now):
     for e in ka.iter_entries(path):
         if e.get("isSidechain"):
             continue
+        if ka.transcript_only(e):
+            continue                # a notice that starts no turn: it neither ends nor hides a turn's end entry
         if e.get("type") in ("user", "assistant"):
             pending = None          # a newer turn: its own end entry decides
         elif e.get("type") == "system" and e.get("subtype") == "turn_duration":
@@ -554,7 +556,7 @@ def review_death(sid, now):
             return {"kind": "limit", "limit": hit["kind"], "reset": hit["reset_from_text"],
                     "why": f"a worker agent stopped at the usage limit: {summary[:200]!r}"}
         return {"kind": "dead", "why": f"a worker agent failed: {summary[:300]!r}"}
-    last = ka.last_message(path)
+    last = ka.last_turn_message(path)   # not a transcript-only notice after the answer
     if last and last.get("type") == "assistant" and ka.session_idle(path, now) and not agent_running(path, now):
         return {"kind": "dead", "why": "the session ended its turn without the report and with no agent running"}
     if session_idle(sid, now, idle=ka.SUBAGENT_QUIET) and not ka.tmux_alive(sid):

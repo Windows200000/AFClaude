@@ -456,6 +456,9 @@ def entry(kind, at, **kw):
     ts = at.isoformat().replace("+00:00", "Z")
     if kind == "user":
         return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": kw.get("text", "go")}}
+    if kind == "notice":        # a background worker's completion notice: written, starts no turn
+        return {"type": "user", "timestamp": ts, "queueTranscriptOnly": True,
+                "message": {"role": "user", "content": "<task-notification>done</task-notification>"}}
     if kind == "assistant":
         return {"type": "assistant", "timestamp": ts,
                 "message": {"model": "claude-opus-5-5", "stop_reason": kw.get("stop", "end_turn"),
@@ -934,6 +937,31 @@ class TrackDeaths(Transcripts):
         self.assertEqual(self.rec(sid)["status"], "died")
         self.assertTrue(self.paused())
         self.assertEqual(self.at_calls, [])
+
+    def test_transcript_only_notice_after_the_answer_does_not_hide_the_ended_turn(self):
+        """A review that ended its turn without the report, then a worker's completion notice (it
+        starts no turn): still ended, no agent running -> dead (not only at the tmux/deadline checks)."""
+        sid = "sid-notice-after-answer"
+        self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=3)),
+                              entry("notice", T0 + timedelta(minutes=4))])
+        death = ur.review_death(sid, self.now)
+        self.assertEqual(death["kind"], "dead")
+        self.assertIn("ended its turn", death["why"])
+
+    def test_transcript_only_notice_does_not_hide_the_pending_agent_count(self):
+        sid = "sid-notice-pending"
+        path = self.transcript(sid, [entry("user", T0), entry("assistant", T0 + timedelta(minutes=3)),
+                                     entry("turn_end", T0 + timedelta(minutes=3), pending=1),
+                                     entry("notice", T0 + timedelta(minutes=4))])
+        self.assertTrue(ur.agent_running(path, self.now))
+        death = ur.review_death(sid, self.now)
+        self.assertNotIn("ended its turn", (death or {}).get("why", ""))
+
+    def test_a_real_turn_after_the_end_entry_still_resets_the_pending_count(self):
+        path = self.transcript("sid-newer-turn", [entry("user", T0), entry("assistant", T0 + timedelta(minutes=3)),
+                                                  entry("turn_end", T0 + timedelta(minutes=3), pending=1),
+                                                  entry("user", T0 + timedelta(minutes=4))])
+        self.assertFalse(ur.agent_running(path, self.now))
 
 
 # ---------------------------------------------------------------- the monthly review (D-254)
