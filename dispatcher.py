@@ -593,7 +593,7 @@ class Pass:
         if name in never or sid in excluded:
             return
         path = ka.transcript_path(sid)
-        last = ka.last_message(path) if path else None
+        last = ka.last_turn_message(path) if path else None   # transcript-only notices start no turn
         if not last or ka.stall_info(last):
             return                       # no transcript yet, or stalled: waits for a continue
         m = last.get("message") or {}

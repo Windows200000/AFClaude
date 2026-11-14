@@ -1388,7 +1388,7 @@ def run_active(session_id, now, st=None):
     if any(t and fire <= t <= now for t in stops + hits + comps):
         return None
     path = transcript_path(session_id)
-    if not path or stall_info(last_message(path)):
+    if not path or stall_info(last_turn_message(path)):
         return None
     files = [path] + chain_subagent_files(path, chain)
     try:
@@ -1455,7 +1455,7 @@ def stall_status(session_id, now):
     path = transcript_path(session_id)
     if not path:
         return "NO_TRANSCRIPT", "transcript not found", None
-    last = last_message(path)
+    last = last_turn_message(path)   # a transcript-only notice after the limit notice is no new turn
     stall = stall_info(last)
     if not stall:
         if last and (last.get("message") or {}).get("model") == "<synthetic>" and last.get("isApiErrorMessage"):
@@ -2953,7 +2953,7 @@ def _fillup_ratio():
 def _limit_hit_in(sid, reset):
     """The session stopped on a limit notice inside the session window ending at `reset`."""
     path = transcript_path(sid)
-    stall = stall_info(last_message(path)) if path else None
+    stall = stall_info(last_turn_message(path)) if path else None
     t = (stall or {}).get("timestamp")
     return bool(stall and t and reset - afclaude_config.SESSION_LENGTH <= t < reset)
 
@@ -4227,7 +4227,7 @@ def _compaction_hold(sid, now, path):
     why = start_soon(sid, now)
     if why:
         return why
-    if stall_info(last_message(path)):
+    if stall_info(last_turn_message(path)):
         return "the session stopped at a usage limit"
     s = (usage_cache_checked() or {}).get("session") or {}
     pct, reset = s.get("percent"), s.get("resets_at")

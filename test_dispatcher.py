@@ -591,6 +591,21 @@ class Cleanup(Base):
         self.assertEqual({s for s, r in rows.items() if r["ended_at"]}, {sid(1), sid(2)})
         self.assertIsNone(rows[mgr]["ended_at"])
 
+    def test_a_transcript_only_notice_starts_no_turn(self):
+        """A notice written transcript-only (queueTranscriptOnly, no turn) after the last entry:
+        a stalled session stays stalled (kept), an idle finished one stays idle (killed)."""
+        def note(u, ts):
+            return dict(user(u, ts, self.work), queueTranscriptOnly=True)
+        self.track(sid(1)); self.transcript(sid(1), [user("s1u", NOW - timedelta(hours=5), self.work),
+                                                     stall("s1s", NOW - timedelta(hours=5), self.work),
+                                                     note("s1n", NOW - timedelta(hours=4))])
+        self.track(sid(2)); self.transcript(sid(2), [user("s2u", NOW - timedelta(hours=3, minutes=1), self.work),
+                                                     reply("s2a", NOW - timedelta(hours=3), self.work),
+                                                     note("s2n", NOW - timedelta(minutes=5))])
+        self.run_pass()
+        self.assertEqual(self.killed(), [tname(sid(2))])
+        self.assertEqual(self.st["sessions"][sid(1)]["status"], "running")
+
     def test_cleanup_goes_by_the_stored_names_only(self):
         """3b S2: no name pattern; a tracked name the session's row doesn't hold is left alone,
         a task-manager's stored name is never killed, whatever its state says."""

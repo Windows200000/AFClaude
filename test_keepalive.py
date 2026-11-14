@@ -248,6 +248,19 @@ class Evaluate(unittest.TestCase):
         write_transcript(self.tmp.name, SID, [USER, STALL] + TRAILING + [later])
         self.assertEqual(self.ev("2026-09-26T03:01:00Z")[0], "NO_STALL")
 
+    def test_transcript_only_notice_after_stall_stays_stalled(self):
+        """A notice written transcript-only (queueTranscriptOnly) after the limit notice starts no
+        turn: stall_status and _limit_hit_in still read the stall (as stalled.py does); a real
+        message after it un-stalls."""
+        note = dict(USER, uuid="n1", timestamp="2026-09-26T01:20:00.000Z", queueTranscriptOnly=True)
+        write_transcript(self.tmp.name, SID, [USER, REPLY, STALL] + TRAILING + [note])
+        self.assertEqual(ka.stall_status(SID, Z("2026-09-26T01:30:00Z"))[0], "WAIT_RESET")
+        self.assertTrue(ka._limit_hit_in(SID, Z("2026-09-26T02:49:00Z")))
+        later = dict(USER, uuid="u2", timestamp="2026-09-26T03:00:00.000Z")
+        write_transcript(self.tmp.name, SID, [USER, REPLY, STALL] + TRAILING + [note, later])
+        self.assertEqual(ka.stall_status(SID, Z("2026-09-26T03:01:00Z"))[0], "NO_STALL")
+        self.assertFalse(ka._limit_hit_in(SID, Z("2026-09-26T02:49:00Z")))
+
     def test_sequence(self):
         """evaluate() = an APPROVED stall's continue (D-206): at the reset + grace, no budget gate."""
         write_transcript(self.tmp.name, SID, [USER, REPLY, STALL] + TRAILING)
@@ -862,6 +875,13 @@ class BudgetWiring(unittest.TestCase):
             write_transcript(self.tmp.name, SID, [USER, REPLY, STALL])      # D-204: the limit ended the run
             os.utime(path, (fresh, fresh))
             self.assertIsNone(ka.run_active(SID, now, st))
+            note = dict(USER, uuid="n1", queueTranscriptOnly=True)        # transcript-only: no new turn
+            write_transcript(self.tmp.name, SID, [USER, REPLY, STALL, note])
+            os.utime(path, (fresh, fresh))
+            self.assertIsNone(ka.run_active(SID, now, st))
+            write_transcript(self.tmp.name, SID, [USER, REPLY, STALL, note, dict(USER, uuid="u2")])
+            os.utime(path, (fresh, fresh))
+            self.assertIsNotNone(ka.run_active(SID, now, st))              # a real message: running again
         finally:
             ka.PROJECTS_DIR = old
         start = self.NIGHT + timedelta(seconds=5)
