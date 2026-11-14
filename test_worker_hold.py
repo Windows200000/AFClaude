@@ -178,7 +178,7 @@ class Prompts(unittest.TestCase):
             self.assertIn(part, worker)
         with open(os.path.join(here, "prompts", "manager.md")) as fh:
             manager = fh.read()
-        for part in ("tasks.py worker hold", "held_workers", "tasks.py worker go", "TaskStop"):
+        for part in ("tasks.py worker hold|go <agent id>", "held_workers", "SendMessage HOLD / GO", "timers"):
             self.assertIn(part, manager)
 
 
