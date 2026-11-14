@@ -3263,13 +3263,24 @@ def list_grants(conn: sqlite3.Connection, user_id: int | None = None, project_id
     return [dict(r) for r in rows]
 
 
-def host_owner_machine(conn: sqlite3.Connection, hostname: str) -> bool:
+def host_machine_users(conn: sqlite3.Connection, hostname: str) -> list[int]:
+    """The unrevoked machine users holding an unrevoked token issued on `hostname` (A7's register-host refuses a
+    second registration)."""
+    return [int(r[0]) for r in conn.execute(
+        "SELECT DISTINCT u.id FROM users u JOIN machine_tokens t ON t.user_id=u.id AND t.revoked_at IS NULL "
+        "AND t.hostname_at_issue=? WHERE u.kind='machine' AND u.revoked_at IS NULL ORDER BY u.id", (hostname,))]
+
+
+def host_owner_machine(conn: sqlite3.Connection, hostname: str, issued_before: str | None = None) -> bool:
     """Is there an unrevoked machine user holding a token issued on `hostname` and an owner grant? A7's
-    precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`."""
+    precondition for roles_enforce=on (D-330): until then this host's own sessions act as the owner `cli`.
+    `issued_before`: only a token issued at or before that time counts (`roles mode --set on` waits a night)."""
     return conn.execute(
         "SELECT 1 FROM users u JOIN grants g ON g.user_id=u.id AND g.scope='owner' "
         "JOIN machine_tokens t ON t.user_id=u.id AND t.revoked_at IS NULL AND t.hostname_at_issue=? "
-        "WHERE u.kind='machine' AND u.revoked_at IS NULL LIMIT 1", (hostname,)).fetchone() is not None
+        "AND (? IS NULL OR t.created_at<=?) "
+        "WHERE u.kind='machine' AND u.revoked_at IS NULL LIMIT 1", (hostname, issued_before, issued_before)
+    ).fetchone() is not None
 
 
 def add_roles_shadow(conn: sqlite3.Connection, day: str, actor: str, session: str | None, via: str, action: str,
@@ -3425,6 +3436,13 @@ def move_run_session(conn: sqlite3.Connection, old: str, new: str) -> int:
     """A /clear: the open runs of the old session id go on under the new one. -> how many."""
     return conn.execute("UPDATE agent_runs SET session_id=? WHERE session_id=? AND ended_at IS NULL",
                         (new, old)).rowcount
+
+
+def refusal_audited_since(conn: sqlite3.Connection, key: str, since: str) -> bool:
+    """Was a refusal with this alert key (an audit row with `after` = {"refused": ..., "key": key},
+    actions._refusal_after) written since?"""
+    return conn.execute("SELECT 1 FROM audit_log WHERE ts>=? AND json_extract(after, '$.key')=? LIMIT 1",
+                        (since, key)).fetchone() is not None
 
 
 def audit_of_actors(conn: sqlite3.Connection, actors: Sequence[str], since: str, until: str) -> list[Row]:
@@ -4107,7 +4125,11 @@ def prune_runner_runs(conn: sqlite3.Connection, cutoff: str, *, batch_size: int 
 # D-305: owner_messages, in_flight, lessons and working_notes carry what only the compaction
 # summary used to hold (the owner's words, exact branch/commit names, errors and their lessons,
 # the know-how used afterwards). Optional on write and read: older hand-offs lack them.
-HANDOFF_LISTS = ("done", "in_progress", "next_steps", "owner_messages", "in_flight", "lessons", "working_notes")
+# D-340: held_workers, the background workers held for the /clear ("<agent id>: <task>, branch <b>"
+# each); the session releases them right after it (`tasks.py worker go <agent id>`, worker_hold.py).
+HANDOFF_LISTS = ("done", "in_progress", "next_steps", "owner_messages", "in_flight", "held_workers", "lessons",
+                 "working_notes")
+HELD_WORKER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}:\s")   # worker_hold.ID_RE, then ": "
 HANDOFF_KEYS = ("summary",) + HANDOFF_LISTS + ("open_question_ids", "notes")
 # Input only, never stored: the numbers (as in the hand-off message the session got back) of earlier
 # working notes that no longer hold. The notes of the last hand-off given back are carried into the
@@ -4166,8 +4188,8 @@ def _note_key(text: str) -> str:
 
 def handoff_body(value: object, carried: Sequence[str] = (), need_tests_note: bool = False) -> dict[str, Any]:
     """Validate + normalize a hand-off body (a dict or its JSON text): summary (required),
-    done / in_progress / next_steps / owner_messages (verbatim) / in_flight / lessons /
-    working_notes (lists of short strings; a single string is one item; missing = empty),
+    done / in_progress / next_steps / owner_messages (verbatim) / in_flight / held_workers (each
+    starting "<agent id>: ", D-340) / lessons / working_notes (lists of short strings; a single string is one item; missing = empty),
     open_question_ids (task ids), notes. Unknown keys and an oversized body are a ValueError.
     `carried`: the working notes of the hand-off the session was last given back; they go first
     in working_notes (an identical new note is kept once), except the ones whose 1-based numbers
@@ -4197,6 +4219,10 @@ def handoff_body(value: object, carried: Sequence[str] = (), need_tests_note: bo
     body: dict[str, Any] = {"summary": summary}
     for k in HANDOFF_LISTS:
         body[k] = _str_list(value.get(k), k, HANDOFF_OWNER_ITEM_MAX if k == "owner_messages" else HANDOFF_ITEM_MAX)
+    bad = [t for t in body["held_workers"] if not HELD_WORKER_RE.match(t)]
+    if bad:
+        raise ValueError(f"an item of held_workers must start with the worker's agent id and a colon "
+                         f"('<agent id>: <task>, branch <b>'), got {bad[0][:80]!r}")
     body["working_notes"] = _carry_notes(carried, body["working_notes"], value.get(HANDOFF_DROP_KEY))
     if need_tests_note and not any(_tests_note_ok(t) for t in body["working_notes"]):
         raise ValueError(f"working_notes needs a note starting `{HANDOFF_TESTS_NOTE}` with the project's exact "
@@ -4319,6 +4345,7 @@ def consume_handoff(conn: sqlite3.Connection, handoff_id: object, start_key: obj
 
 
 HANDOFF_LABELS = (("owner_messages", "The owner's messages (verbatim)"), ("in_flight", "In flight"),
+                  ("held_workers", "Held workers (waiting for your go)"),
                   ("done", "Done"), ("in_progress", "In progress"), ("next_steps", "Next steps"),
                   ("lessons", "Lessons from this run"), ("working_notes", "Working notes"))
 

@@ -997,16 +997,20 @@ def audit_section(db: str, since: str, until: str | None) -> str:
     lo, hi = utc_iso(since), utc_iso(until) if until else "9999"
     conn = ro_connect(db)
     try:
-        rows = conn.execute("SELECT ts, actor, action, target_type, target_id FROM audit_log "
+        rows = conn.execute("SELECT ts, actor, action, target_type, target_id, "
+                            "json_extract(after, '$.refused') IS NOT NULL AS refused FROM audit_log "
                             "WHERE ts >= ? AND ts < ? ORDER BY id", (lo, hi)).fetchall()
     except sqlite3.Error as e:
         raise ManifestError(f"audit_log in {db}: {e}") from e
     finally:
         conn.close()
-    head = f"audit_log {lo} .. {until and hi or 'now'}: {len(rows)} rows"
+    writes = [r for r in rows if not r["refused"]]       # a refused write (roles_enforce=on) changed nothing
+    head = f"audit_log {lo} .. {until and hi or 'now'}: {len(writes)} rows"
+    if len(writes) != len(rows):
+        head += f" (+{len(rows) - len(writes)} refused writes, not counted)"
     groups: dict[str, list[sqlite3.Row]] = {}
     for r in rows:
-        groups.setdefault(r["action"], []).append(r)
+        groups.setdefault(r["action"] + (" REFUSED" if r["refused"] else ""), []).append(r)
     out = [head]
     for action, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         actors = sorted({r["actor"] for r in rs})

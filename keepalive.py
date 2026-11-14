@@ -378,6 +378,24 @@ def last_message(path):
     return last
 
 
+def transcript_only(e):
+    """A user entry Claude Code writes to the transcript without starting a turn (queueTranscriptOnly:
+    e.g. a background subagent's completion notice after its hand-back was already delivered as a
+    peer message; the model reads it in its next turn). It neither starts nor ends a turn."""
+    return e.get("type") == "user" and bool(e.get("queueTranscriptOnly"))
+
+
+def last_turn_message(path):
+    """last_message without transcript-only entries (transcript_only): the entry that says whether a
+    turn is running. 12.11.: such a notice after the session's last end_turn read as a turn running
+    for 14 min, so a mid-run /clear failed as turn-busy and paused automation."""
+    last = None
+    for e in iter_entries(path):
+        if e.get("type") in ("user", "assistant") and not e.get("isSidechain") and not transcript_only(e):
+            last = e
+    return last
+
+
 def stall_info(entry):
     """Return a dict if `entry` is a synthetic usage-limit notice, else None."""
     if not entry or entry.get("type") != "assistant":
@@ -3297,13 +3315,14 @@ def session_cwd(path):
 def session_idle(path, now=None):
     """The session finished its turn: the transcript has not changed for COMPACT_QUIET and its last
     user/assistant entry ends a turn (assistant end_turn, a limit notice, a compaction summary or a
-    local slash command's output). No transcript: nothing to wait for."""
+    local slash command's output); a transcript-only entry starts no turn, so it is looked past
+    (last_turn_message). No transcript: nothing to wait for."""
     if not path or not os.path.exists(path):
         return True
     now = now or datetime.now(UTC)
     if now - datetime.fromtimestamp(file_mtime(path), UTC) < COMPACT_QUIET:
         return False
-    last = last_message(path)
+    last = last_turn_message(path)
     if last is None or last.get("isCompactSummary"):
         return True
     m = last.get("message") or {}
@@ -3608,8 +3627,9 @@ def last_activity(path):
 
 
 def replied_since(path, since):
-    """The session answered a message typed at `since` and finished that turn (idle again)."""
-    last = last_message(path) if path and os.path.exists(path) else None
+    """The session answered a message typed at `since` and finished that turn (idle again; a
+    transcript-only entry after the answer is no new turn, last_turn_message)."""
+    last = last_turn_message(path) if path and os.path.exists(path) else None
     ts = _entry_ts(last)
     return bool(last and last.get("type") == "assistant" and ts and ts >= since - timedelta(seconds=5)
                 and session_idle(path))
@@ -3832,7 +3852,7 @@ def compact_resume_text(sid, save, trigger="run-end", progress=None, comp=None):
         raise failstop.Failed("the saved hand-off was not found",
                               f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
                               + (f"#{h['id']}" if h else "none"))
-    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress,
+    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress, tasks=TASKS_PY,
                                                 when=TRIGGER_TEXT[trigger][1], compaction=reset_text(comp)), h
 
 

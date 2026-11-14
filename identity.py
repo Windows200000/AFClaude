@@ -7,12 +7,12 @@ CLIs, the MCP server, hand-run runner paths) call it instead of writing a litera
   host owner    cli                      no Claude session in the env (a shell), or an interactive session of
                                          this host that is none of the rows below and has no valid machine
                                          token (D-330: until A7 registers the host's machine user; its session
-                                         id goes in audit_log.session)
+                                         id goes in audit_log.session); a subagent of such a session is the
+                                         same principal as its parent (D-336), host owner or machine user
   machine user  machine:<id>             a valid machine token and no AFClaude-driven session
   task-manager  task-manager:<session>   the session is a project's manager_session, no subagent id
   agent         agent:<session>[:<id>]   a driven session, a task-manager's subagent, CLAUDE_GUARD_DISABLE=1,
-                                         or a subagent of an interactive session (recorded under its own id;
-                                         owner-equivalent for the old rule, which only reads `autonomous`)
+                                         or a subagent with no session id (agent:unknown: its parent can't be told)
   runner        runner:<component>       a runner process (no Claude session in its env)
 
 A2 only records who acts: nothing here refuses (the old owner_only rule stays in force, `autonomous` feeds it; A3 adds the shadow-mode permission matrix, permissions.py).
@@ -259,8 +259,14 @@ def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
     if who is not None:
         return Identity(f"machine:{who['user_id']}", "machine", sid, agent_id, int(who["user_id"]), False,
                         token, source)
-    if agent_id is None:                  # D-330: the host's own interactive session, owner until A7
-        return Identity(CLI, "host", sid, None, None, False, token, source)
+    if agent_id is None or sid is not None:
+        # D-330: the host's own interactive session is the host owner until A7 registers its machine user. D-336:
+        # a subagent of such a session is the same principal as its parent (the checks above already took every
+        # session AFClaude drives or started: a task-manager's or a driven session's workers stay agents, and a
+        # machine token gives the same machine user to parent and subagent). The audit row names the session.
+        return Identity(CLI, "host", sid, agent_id, None, False, token, source)
+    # A subagent whose parent session can't be named (the stamp or env carries no session id): nothing says
+    # whose it is, so it stays an agent (the safe side of D-336).
     return Identity(_agent_actor(sid, agent_id), "agent", sid, agent_id, None, False, token, source)
 
 
