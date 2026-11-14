@@ -44,7 +44,8 @@ def tearDownModule():
     budget.SAMPLES_FILE, budget.FIRE_FILES = _OLD_BUDGET
     _CFG_DIR.cleanup()
 
-HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")
+HOST_EXEC = os.path.join(HERE, "docker", "host-kit", "host_exec.py")
+LEGACY_HOST_EXEC = os.path.join(HERE, "docker", "host_exec.py")   # the pre-kit bridge (main's): BridgeHardening tests that one
 
 
 class Env:
@@ -68,9 +69,21 @@ class Env:
                 os.environ[k] = v
 
 
+TEST_HOME = os.path.join(testenv.DIR, "home")      # the kit makes its own working dir under HOME: never the real one
+os.makedirs(TEST_HOME, exist_ok=True)
+
+
 def run_host_exec(command, stdin=b"", log=None):
+    """The kit with `command` as the client's command (`--run`: under sshd the env overrides are ignored)."""
+    env = {k: v for k, v in os.environ.items() if k != "SSH_ORIGINAL_COMMAND"}
+    env.update(AFCLAUDE_HOST_EXEC_LOG=log or os.devnull, HOME=TEST_HOME)
+    return subprocess.run([sys.executable, HOST_EXEC, "--run", command], input=stdin, env=env, capture_output=True, timeout=60)
+
+
+def run_legacy_exec(command, stdin=b"", log=None):
+    """The pre-kit bridge with `command` as SSH_ORIGINAL_COMMAND."""
     env = dict(os.environ, SSH_ORIGINAL_COMMAND=command, AFCLAUDE_HOST_EXEC_LOG=log or os.devnull)
-    return subprocess.run([sys.executable, HOST_EXEC], input=stdin, env=env, capture_output=True, timeout=60)
+    return subprocess.run([sys.executable, LEGACY_HOST_EXEC], input=stdin, env=env, capture_output=True, timeout=60)
 
 
 class InContainer(unittest.TestCase):
@@ -350,7 +363,7 @@ class Whitelist(unittest.TestCase):
         denied("another name")
         self.register_thread(sessions, "rc-t", me, procStart=start)
         cmd, _ = he.rc_send_cmd(["rc-t"], b"go")                  # the one live idle sdk-cli thread: allowed
-        self.assertEqual(cmd[0], he.CLAUDE)
+        self.assertEqual(cmd[0], he.cfg().claude)
         self.register_thread(sessions, "rc-t", 1, fname="b.json")  # pid 1 is alive too: two live entries
         denied("two live entries")
         os.remove(os.path.join(sessions, "b.json"))
@@ -368,8 +381,9 @@ class Whitelist(unittest.TestCase):
         he = importlib.util.module_from_spec(spec)
         sessions = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sessions)
-        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull, SSH_ORIGINAL_COMMAND="rc-send rc-t"):
+        with Env(AFCLAUDE_HOST_EXEC_LOG=os.devnull):
             spec.loader.exec_module(he)
+        with Env(SSH_ORIGINAL_COMMAND="rc-send rc-t"):
             he.SESSIONS = sessions
             he.CWD = os.path.join(sessions, "cwd")        # never the real ~/.local/state
             self.register_thread(sessions, "rc-t", os.getpid())
@@ -383,9 +397,10 @@ class Whitelist(unittest.TestCase):
     def test_rc_send_through_the_forced_command_is_denied_without_a_thread(self):
         sessions = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, sessions)
-        env = dict(os.environ, SSH_ORIGINAL_COMMAND="rc-send rc-test-f1", AFCLAUDE_HOST_EXEC_LOG=os.devnull,
-                   AFCLAUDE_HOST_EXEC_SESSIONS=sessions)
-        r = subprocess.run([sys.executable, HOST_EXEC], input=b"go", env=env, capture_output=True, timeout=60)
+        env = dict(os.environ, AFCLAUDE_HOST_EXEC_LOG=os.devnull, AFCLAUDE_HOST_EXEC_SESSIONS=sessions)
+        env.pop("SSH_ORIGINAL_COMMAND", None)
+        r = subprocess.run([sys.executable, HOST_EXEC, "--run", "rc-send rc-test-f1"], input=b"go", env=env,
+                           capture_output=True, timeout=60)
         self.assertEqual((r.returncode, b"denied" in r.stderr), (126, True))   # no claude was run
 
     def test_rc_send_shape(self):
@@ -410,8 +425,7 @@ class Whitelist(unittest.TestCase):
             he.SESSIONS = sessions
             self.register_thread(sessions, "rc-test-f1", os.getpid())
             cmd, stdin = he.rc_send_cmd(["rc-test-f1"], "go on \u00e4".encode())
-            self.assertEqual(he.USER_SETTINGS, ["--setting-sources", "user"])   # no project hooks (H3)
-            self.assertEqual(cmd, [he.CLAUDE] + he.USER_SETTINGS + host.RC_SEND_FLAGS)
+            self.assertEqual(cmd, [he.cfg().claude, "-p", "--setting-sources", "user"] + host.RC_SEND_FLAGS[1:])
             self.assertEqual(stdin.decode(), host.rc_send_prompt("rc-test-f1", "go on \u00e4"))
             for args, data in (([], b"x"), (["a", "b"], b"x"), (["a;b"], b"x"), (["-p"], b"x"), (["a"], b""),
                                (["a"], b"x" * (host.RC_TEXT_MAX + 1)), (["a"], b"a\0b"), (["a"], b"\xff\xfe")):
@@ -439,16 +453,19 @@ class Whitelist(unittest.TestCase):
         r = run_host_exec("tmux-panes afc-00000000", log=log)
         self.assertNotEqual(r.returncode, 126)
         r = run_host_exec("proc-snapshot", log=log)
-        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 0, r.stderr)
         snap = json.loads(r.stdout)
         me = snap[str(os.getpid())]                      # this test runner: not claude -> no argv
         self.assertEqual(me[0], os.getppid())
         self.assertIsNone(me[2])
-        self.assertIn("OK proc-snapshot", open(log).read())
-        if os.path.exists(os.path.expanduser("~/.claude.json")):
-            r = run_host_exec("usage-cache", log=log)
-            self.assertEqual(r.returncode, 0)
-            self.assertIsInstance(json.loads(r.stdout), dict)
+        with open(log) as fh:
+            self.assertIn("OK proc-snapshot", fh.read())
+        with open(os.path.join(TEST_HOME, ".claude.json"), "w") as fh:     # the kit's HOME is a temp dir
+            json.dump({"cachedUsageUtilization": {"fetchedAtMs": 1, "utilization": {"five_hour": 3}, "other": "x"},
+                       "oauthAccount": "secret"}, fh)
+        r = run_host_exec("usage-cache", log=log)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout), {"fetchedAtMs": 1, "utilization": {"five_hour": 3}})
 
     def test_every_host_py_shape_is_whitelisted(self):
         """The shapes host.py emits, run through host_exec.py's parser without executing:
@@ -467,10 +484,10 @@ class Whitelist(unittest.TestCase):
 
 
 def load_host_exec(state):
-    """docker/host_exec.py as a module with its state dir (log, headless cwd) in `state`."""
+    """The pre-kit docker/host_exec.py as a module with its state dir (log, headless cwd) in `state`."""
     import importlib.util
     with Env(AFCLAUDE_HOST_EXEC_STATE=state, AFCLAUDE_HOST_EXEC_LOG=None):
-        spec = importlib.util.spec_from_file_location("host_exec_hardening", HOST_EXEC)
+        spec = importlib.util.spec_from_file_location("host_exec_hardening", LEGACY_HOST_EXEC)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     return mod
@@ -503,7 +520,7 @@ class BridgeHardening(unittest.TestCase):
             fh.write("ssh-ed25519 AAAA owner\n")
         os.makedirs(self.state)
         os.symlink(target, os.path.join(self.state, "host_exec.log"))
-        r = run_host_exec("tmux-has afc-00000000", log=os.path.join(self.state, "host_exec.log"))
+        r = run_legacy_exec("tmux-has afc-00000000", log=os.path.join(self.state, "host_exec.log"))
         self.assertNotEqual(r.returncode, 126)             # the call still runs: the log is a record, not a gate
         self.assertIn(b"log", r.stderr)                    # but the failure is visible
         self.assertEqual(open(target).read(), "ssh-ed25519 AAAA owner\n")
@@ -525,7 +542,7 @@ class BridgeHardening(unittest.TestCase):
             self.assertFalse(ln.startswith("ssh-"))
         # the denial path (the command as received) is escaped the same way
         log = os.path.join(self.tmp, "deny.log")
-        run_host_exec("bogus 'a\nssh-ed25519 AAAAkey k\nb'", log=log)
+        run_legacy_exec("bogus 'a\nssh-ed25519 AAAAkey k\nb'", log=log)
         self.assertEqual(len(open(log).read().splitlines()), 1)
 
     def test_ka_resume_refuses_the_data_dir_as_cwd(self):
@@ -540,7 +557,7 @@ class BridgeHardening(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=cwd):
                 with mock.patch.object(self.hx, "log"), mock.patch("sys.stderr"):
                     self.hx.check_ka_resume(args + ["--cwd", cwd])
-            r = run_host_exec("ka_resume.sh " + shlex.join(args + ["--cwd", cwd]))
+            r = run_legacy_exec("ka_resume.sh " + shlex.join(args + ["--cwd", cwd]))
             self.assertEqual(r.returncode, 126, cwd)
             self.assertIn(b"container-writable", r.stderr)
         # the repo itself and a neighbour of data are not data

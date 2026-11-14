@@ -20,7 +20,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 # machine-specific files that run on the HOST (the kit) or are launch helpers: until K2 moves the root
 # and the repo into host.json they keep their own paths; they are not what the image's code reads
-HOST_KIT = {"docker/host_exec.py", "hooks/delegation_reminder.py"}
+HOST_KIT = {"docker/host_exec.py", "docker/host-kit/host_exec.py", "hooks/delegation_reminder.py"}
 
 
 def env_example_paths():
