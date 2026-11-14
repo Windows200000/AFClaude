@@ -466,6 +466,24 @@ class CompactWhenIdle(Env):
         d, rec = self.compact()
         self.assertEqual((d.due, d.reason), (False, "the session stopped at a usage limit"))
 
+    def test_a_limit_notice_followed_by_a_transcript_only_notice_holds_it(self):
+        """A notice written transcript-only (queueTranscriptOnly) after the limit notice starts no
+        turn: still held at the limit; a real message after it lifts that hold."""
+        lim = entry("assistant", self.now - timedelta(minutes=53),
+                    message={"role": "assistant", "model": "<synthetic>",
+                             "content": [{"type": "text", "text": "You've hit your session limit · resets 5pm (UTC)"}]})
+        note = entry("user", self.now - timedelta(minutes=52), queueTranscriptOnly=True,
+                     message={"role": "user", "content": "<task-notification>done</task-notification>"})
+        self.write([assistant(self.now - timedelta(minutes=54), ctx=300_000), lim, note])
+        self.make_old()
+        d, rec = self.compact()
+        self.assertEqual((d.due, d.reason), (False, "the session stopped at a usage limit"))
+        self.write([assistant(self.now - timedelta(minutes=54), ctx=300_000), lim, note,
+                    owner(self.now - timedelta(minutes=51)), assistant(self.now - timedelta(minutes=50), ctx=300_000)])
+        self.make_old()
+        d, rec = self.compact()
+        self.assertNotEqual(d.reason, "the session stopped at a usage limit")
+
     def test_the_session_limit_nearly_used_up_holds_it(self):
         self.usage["session"]["percent"] = 98.0
         d, _ = self.compact()

@@ -379,7 +379,7 @@ def delivery_hold(sid: str, path: str, now: datetime) -> tuple[str | None, str]:
     flow = compaction_flow(sid, load_state(), now)
     if flow and flow[1] is None:
         return f"{HOLD_COMPACTING}, since {ka.berlin(flow[0])}", ""
-    stall = ka.stall_info(ka.last_message(path))
+    stall = ka.stall_info(ka.last_turn_message(path))
     if stall:
         reset = stall.get("reset_from_text")
         if reset is None or reset > now:

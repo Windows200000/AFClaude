@@ -13,8 +13,9 @@ result in the SQLite store (store.py, data/afclaude.db):
 Detection is keepalive.py's: stall_info() / parse_reset_text() / message_text()
 on the last user/assistant entry, where "user/assistant entry" is the
 predicate of keepalive.last_message() (trailing system / last-prompt /
-cost-state / atis-latch lines don't count). A later user/assistant entry
-un-stalls the session.
+cost-state / atis-latch lines don't count) without transcript-only entries
+(queueTranscriptOnly, keepalive.last_turn_message(): they start no turn). A later
+user/assistant entry un-stalls the session.
 
 Incremental: per file it remembers the byte offset of the last complete line
 and only reads what was appended since; a file that shrank is rescanned from 0.
@@ -74,6 +75,13 @@ FLUSH_SECONDS = 1.0     # parsed results are written (one short transaction) at 
 def is_message_entry(e):
     """Same predicate as keepalive.last_message()."""
     return e.get("type") in ("user", "assistant") and not e.get("isSidechain")
+
+
+def is_turn_entry(e):
+    """Same predicate as keepalive.last_turn_message(): a message entry that is not a transcript-only
+    one (queueTranscriptOnly, e.g. a worker's completion notice). Such an entry starts no turn, so
+    it neither un-stalls a session nor counts as its last message."""
+    return is_message_entry(e) and not ka.transcript_only(e)
 
 
 def _loads(line):
@@ -146,7 +154,7 @@ def process_chunk(sid, chunk, row):
             last_ts = e["timestamp"]
         if cwd is None and e.get("cwd"):
             cwd = e["cwd"]
-        if last_msg is None and is_message_entry(e):
+        if last_msg is None and is_turn_entry(e):
             last_msg = e
         if last_msg is not None:
             if cwd is not None and last_ts is not None:

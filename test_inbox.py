@@ -618,6 +618,22 @@ class Delivery(tc.Env):
         self.assertEqual(self.deliver(m), "held")
         self.assertIn("usage limit", self.row(m)["hold"])
 
+    def test_held_at_a_usage_limit_despite_a_transcript_only_notice(self):
+        """A notice written transcript-only (queueTranscriptOnly) after the limit notice starts no
+        turn: still held at the limit; a real message after it lifts that hold."""
+        at = datetime.now(UTC) - timedelta(minutes=5)
+        lim = tc.entry("assistant", at, uuid="lim", error="rate_limit",
+                       message={"role": "assistant", "model": "<synthetic>",
+                                "content": [{"type": "text", "text": "You've hit your session limit · resets 11pm"}]})
+        note = tc.entry("user", at + timedelta(minutes=1), uuid="n1", queueTranscriptOnly=True,
+                        message={"role": "user", "content": "<task-notification>done</task-notification>"})
+        self.write([lim, note], "a")
+        m = self.now_msg()
+        self.assertEqual(self.deliver(m), "held")
+        self.assertIn("usage limit", self.row(m)["hold"])
+        self.write([tc.owner(at + timedelta(minutes=2)), tc.assistant(at + timedelta(minutes=3))], "a")
+        self.assertEqual(self.deliver(m), "delivered")                        # a real turn after it: free
+
     def test_held_until_the_next_window_start_then_an_error(self):
         """D-244: no 2 h limit; the hold lasts until the next session-window start (+ START_GRACE for
         that start to take it along); still pending then: an error, alerted, automation paused.

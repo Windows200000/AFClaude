@@ -127,6 +127,24 @@ class Detect(Base):
         self.assertEqual(store.stalled_sessions(self.conn), [])
         self.assertEqual([r["session_id"] for r in store.stalled_sessions(self.conn, include_resolved=True)], [SID])
 
+    def test_transcript_only_notice_does_not_unstall(self):
+        """A worker's completion notice written transcript-only after the limit notice starts no turn:
+        the session stays stalled (and, incrementally, a lone such chunk changes nothing)."""
+        note = dict(user("u2", "2026-09-26T03:00:00.000Z", text="<task-notification>done</task-notification>"),
+                    queueTranscriptOnly=True)
+        self.write([U1, S1] + TRAILING + [note])
+        self.scan()
+        s = self.sess()
+        self.assertEqual((s["stalled"], s["last_msg_uuid"]), (1, "s1"))
+        self.assertEqual(s["stalled_since"], "2026-09-26T01:10:00Z")
+        self.assertEqual(s["last_activity"], "2026-09-26T03:00:00.000Z")   # still activity
+        self.write([dict(note, uuid="u3", timestamp="2026-09-26T03:05:00.000Z")], mode="a")
+        self.scan()
+        self.assertEqual((self.sess()["stalled"], self.sess()["last_msg_uuid"]), (1, "s1"))
+        self.write([user("u4", "2026-09-26T04:00:00.000Z")], mode="a")   # a real message does
+        self.scan()
+        self.assertEqual(self.sess()["stalled"], 0)
+
     def test_weekly_with_date(self):
         self.write([U1, stall("w1", "2026-09-26T01:10:00.000Z", reset="Oct 1, 4:59pm", kind="weekly")])
         self.scan()
@@ -249,12 +267,13 @@ class Incremental(Base):
         """Incremental result == keepalive's whole-file detection, at every prefix."""
         entries = [U1, A1, S1] + TRAILING + [user("u2", "2026-09-26T03:00:00.000Z"),
                                              stall("s2", "2026-09-26T04:00:00.000Z", reset="5pm"),
+                                             dict(user("u3", "2026-09-26T04:30:00.000Z"), queueTranscriptOnly=True),
                                              {"type": "last-prompt"}]
         open(self.path(), "w").close()
         for e in entries:
             self.write([e], mode="a")
             self.scan()
-            want = ka.stall_info(ka.last_message(self.path()))
+            want = ka.stall_info(ka.last_turn_message(self.path()))
             s = self.sess()
             self.assertEqual(bool(s["stalled"]), want is not None, e)
             if want:
@@ -382,7 +401,7 @@ class RealHost(unittest.TestCase):
                 continue
             if st.st_size != s["last_scanned_size"] or time.time() - st.st_mtime < 60:
                 continue  # still being written
-            want = ka.stall_info(ka.last_message(p))
+            want = ka.stall_info(ka.last_turn_message(p))
             self.assertEqual(bool(s["stalled"]), want is not None, p)
             if want:
                 self.assertEqual(s["stall_reset_at"], store.iso(want["reset_from_text"]), p)
