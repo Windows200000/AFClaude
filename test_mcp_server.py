@@ -935,7 +935,7 @@ class Stdio(unittest.TestCase):
         finally:
             c.close()
         self.assertEqual([rows[str(t["id"])] for t in tasks_],
-                         [("cli", CALLER), ("cli", now), (f"agent:{now}:a1b2", now)])   # D-330
+                         [("cli", CALLER), ("cli", now), ("cli", now)])   # D-330; D-336: the subagent is its parent's principal
         self.assertEqual(tasks_[1]["title"], "stamped")
 
 
