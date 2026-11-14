@@ -347,6 +347,24 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
     if (w && w.running === false) lines.push('<div class="mut">the watcher is not running: nothing fires it</div>');
     return tile(f.test ? "Next fill-up (TEST)" : "Next fill-up", esc(f.at_berlin || "?"), lines.join(""));
   }
+  // phase 5b K6 (D-164, D-316): the host checks as one line in this section; warnings, failures and skipped ones expanded
+  function hostTile(h) {
+    if (!h) return "";
+    if (h.error) return tile("Host checks", "–", '<div class="mut">' + esc(h.error) + "</div>");
+    if (!h.total) return tile("Host checks", "–", '<div class="mut">no run recorded yet</div>');
+    var c = h.counts || {}, bad = c.fail > 0, warn = c.warn > 0;
+    var v = bad ? '<span class="bad">' + c.fail + " failing</span>" : warn ? '<span class="warn">' + c.warn + " warning" + (c.warn > 1 ? "s" : "") + "</span>"
+      : '<span class="ok">ok</span>';
+    var line = '<div class="mut' + (h.age_minutes > 150 ? " warn" : "") + '">' + h.total + " checks · " + c.ok + " ok" +
+      (c.warn ? " · " + c.warn + " warn" : "") + (c.fail ? " · " + c.fail + " fail" : "") + (c.skip ? " · " + c.skip + " skipped" : "") +
+      " · run " + esc(h.ran_berlin || "?") + (h.age_minutes != null ? " (" + Math.round(h.age_minutes) + " min ago)" : "") + "</div>";
+    var rows = (h.checks || []).map(function (r) {
+      var cls = r.status === "fail" ? "bad" : r.status === "warn" ? "warn" : "mut";
+      return '<div class="' + cls + '"><strong>' + esc(r.name) + "</strong> " + esc(r.status) + (r.since_berlin ? " since " + esc(r.since_berlin) : "") +
+        ": " + esc(r.detail) + (r.fix && r.status !== "skip" ? '<br><span class="mut">fix: ' + esc(r.fix) + "</span>" : "") + "</div>";
+    }).join("");
+    return tile("Host checks", v, line + rows);
+  }
   function renderUsage(s) {
     var k = s.keepalive || {}, out = [];
     if (k.usage_error) out.push(tile("Usage", "–", '<div class="mut">' + esc(k.usage_error) + "</div>"));
@@ -368,6 +386,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
         '<div class="mut"><strong>' + esc(nr.label || nr.kind) + "</strong></div>" +
         (nr.reason ? '<div class="mut">' + esc(nr.reason) + "</div>" : "") + exTxt));
     }
+    out.push(hostTile(s.host_checks));
     out.push(fillTile(k.fill));
     out.push(fillupTile(k.fillup, k.watcher));
     var lim = k.limits || {};

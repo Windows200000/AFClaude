@@ -183,7 +183,7 @@ class Tables(Base):
         for name, job in runner.JOBS.items():
             self.assertEqual(actions.SETTINGS[actions.RUNNER_TIMEOUT + name].default(), job.timeout_min, name)
         lo = actions.SETTINGS["runner_timeout_window_start"].bounds[0]
-        inner = runner_jobs.window_start_min_timeout()
+        inner = runner_jobs.window_start_job_min_timeout()             # the start's and the host checks before it (K6)
         self.assertGreaterEqual(timedelta(minutes=lo), inner)          # an inner timeout always fires first
         self.assertGreater(inner, timedelta(minutes=60))               # COMPACT_LOCK_WAIT + VERIFY_TIMEOUT, ...
         self.assertIn("NEW_TRANSCRIPT_WAIT", runner_jobs.window_start_inner())     # 3b S4: a first start
@@ -409,7 +409,7 @@ class Runs(Base):
         r.boot()
         due, = r.plan(self.now)
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5400.0)])
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5700.0)])
         self.now += 5 * MIN
         self.assertEqual(r.plan(self.now), [])
         self.assertEqual(self.next_due("window_start"), START + 5 * 60 * MIN)
@@ -969,7 +969,7 @@ class SimpleTicks(Base):
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
                                                          "inbox", "inbox_verify", "status_snapshot", "request",
-                                                         "proposal_alert"}
+                                                         "proposal_alert", "host_check"}
                                                        | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4-S7, S9b, 3b S5
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 
@@ -1419,7 +1419,7 @@ class WindowStarts(Base):
         due, = r.plan(self.now)
         self.assertEqual((due.key, due.at), ("window-start-2026-10-20", START))
         await self.run_due(r, due)
-        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5400.0)])
+        self.assertEqual(self.spawner.calls, [("window_start", "window-start-2026-10-20", 5700.0)])
         self.assertEqual(self.fails, [])
 
     async def test_dst_nights_give_the_next_start(self):

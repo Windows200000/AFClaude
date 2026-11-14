@@ -1198,6 +1198,16 @@ def _tz(v: Any, conn: sqlite3.Connection | None = None) -> str:
     return v
 
 
+HOST_VERSION_RE = re.compile(r"^[0-9]{1,4}(\.[0-9]{1,4}){0,2}$")
+
+
+def _claude_version_prefix(v: Any, conn: sqlite3.Connection | None = None) -> str:
+    """A version prefix such as "2.1" or "2.1.325" (the host check compares that many numbers)."""
+    if not isinstance(v, str) or not HOST_VERSION_RE.match(v.strip()):
+        raise ValueError(f"must be a version such as 2.1 or 2.1.325, got {v!r}")
+    return v.strip()
+
+
 def _hhmm(v: Any) -> str:
     m = re.match(r"^(\d{1,2}):(\d{2})$", v) if isinstance(v, str) else None
     if not m or int(m[1]) > 23 or m[2] not in ("00", "30"):
@@ -1518,15 +1528,28 @@ SETTINGS: dict[str, Setting] = {
                                           "is killed and fails (D-234)", "automation"),
     "runner_timeout_status_snapshot": _num(2, 0.5, 720, "Runner: minutes a status-snapshot run may take before it "
                                            "is killed and fails (D-234)", "automation"),
+    # phase 5b K6: the lower bound is the sum of the scheduled checks' own timeouts + 1 min
+    # (hostcheck.RUN_WORST_CASE; test_runner checks it), so a check's own timeout and its clear error fire first
+    "runner_timeout_host_check": _num(10, 0.5, 720, "Runner: minutes a host-check run may take before it is "
+                                      "killed and fails (D-234)", "automation"),
+    "host_claude_tested_version": Setting("2.1", _claude_version_prefix, "Newest Claude Code version the "
+                                          "host check has been tested with, as a prefix (2.1 = any 2.1.x): a "
+                                          "newer one shows as a warning on the host check (no alert)",
+                                          section="automation", kind="text"),
+    "host_disk_warn_gb": _num(5, 0.1, 10_000, "Host check: free space in GB (the data directory, the host's "
+                              "Claude directory) below which it warns", "automation"),
+    "host_disk_fail_gb": _num(1, 0.1, 10_000, "Host check: free space in GB below which it fails (an alert, "
+                              "no pause: it is not a blocking check)", "automation"),
     "runner_timeout_usage_review": _num(30, 0.5, 720, "Runner: minutes a usage-review run may take before it "
                                         "is killed and fails (D-234)", "automation"),
     # an at-job's payload `timeout` (minutes, `at --timeout`) overrides it for that job (phase 3a S4)
     "runner_timeout_at": _num(30, 0.5, 720, "Runner: minutes an at-job (scheduled_jobs: the sampler's "
                               "weekly-reset samples, one-off reviews, the review chain's steps) may run before "
                               "it is killed and fails (D-234), unless the job sets its own", "automation"),
-    # the lower bound is the sum of the start's own inner timeouts + 5 min (runner_jobs.window_start_inner;
-    # test_runner checks it), so an inner timeout, with its own clear error, always fires first
-    "runner_timeout_window_start": _num(90, 90, 720, "Runner: minutes a session-window start may take (its "
+    # the lower bound is the sum of the start's own inner timeouts, the blocking host checks before it (phase 5b K6)
+    # and 5 min (runner_jobs.window_start_min_timeout; test_runner checks it), so an inner timeout, with its own
+    # clear error, always fires first
+    "runner_timeout_window_start": _num(95, 95, 720, "Runner: minutes a session-window start may take (its "
                                         "waits for a compaction, the resume and its verification, or the "
                                         "window-start ping and its check) before it is killed and fails (D-234)",
                                         "automation"),
@@ -4892,7 +4915,8 @@ STATE_COMPONENTS: dict[str, StateComponent] = {c.name: c for c in (
 )}
 # "db": store.TimedConnection's warnings about write transactions held too long, from any process
 LOG_COMPONENTS = ("keepalive", "dispatcher", "sampler", "watchdog", "host_exec", "at_shim", "runner", "db",
-                  "runner_shadow")   # runner_shadow: phase 3a S2-S7 (runner.py shadow_log)
+                  "runner_shadow",   # runner_shadow: phase 3a S2-S7 (runner.py shadow_log)
+                  "hostcheck")       # hostcheck: phase 5b K6, one line per host-check run (hostcheck.record)
 LOG_LEVELS = ("info", "warn", "error")
 STATE_MARK = "state_file:"          # meta: the state file as the last DB save saw it (mtime_ns:size)
 STATE_AUDIT_PATHS = 20              # changed paths named in a save's audit row
@@ -5339,6 +5363,49 @@ def snapshot_put(conn: sqlite3.Connection, sections: Mapping[str, Mapping[str, A
                 store.put_snapshot(conn, name, account_id, state=state, payload=text, error=err, builder=builder,
                                    computed_at=at)
     _runner_write(conn, "snapshot.put", actor, {"sections": sorted(sections)}, run)
+
+
+HOST_CHECK_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+HOST_CHECK_STATUSES = ("ok", "warn", "fail", "skip")
+HOST_CHECK_TEXT_MAX = 1500      # characters of a check's detail / fix hint
+
+
+def hostcheck_put(conn: sqlite3.Connection, results: Sequence[Mapping[str, Any]], *, actor: str, via: str,
+                  ran_at: str | None = None) -> dict[str, str | None]:
+    """Replace the host checks' rows (host_checks, phase 5b K6): each result is {name, status ok|warn|fail|skip,
+    detail, fix, duration_ms, kit_version, blocking}, all in one transaction. Runner rows like snapshot_put
+    (actor and via, or the `afclaude host check` CLI; no audit_log row: an hourly run plus one per window start would be a dozen rows each for
+    values that are replaced; the run's app_log line is the history, D-256). -> {name: the previous status}
+    (None = first result), which the caller reads to alert once per episode."""
+    _check_writer(actor, via, store.DEFAULT_ACCOUNT)
+    if not (actor.startswith("runner") or via == "cli"):
+        raise PermissionError("the host checks are written by runner actors and the `host check` CLI only")
+    at = ran_at if ran_at is not None else store.now_iso()
+    rows: list[dict[str, Any]] = []
+    for r in results:
+        name = r.get("name")
+        if not isinstance(name, str) or not HOST_CHECK_NAME_RE.match(name):
+            raise ValueError(f"bad host check name {name!r}")
+        status = r.get("status")
+        if status not in HOST_CHECK_STATUSES:
+            raise ValueError(f"host check {name}: bad status {status!r}")
+        kit = r.get("kit_version")
+        if kit is not None and not isinstance(kit, str):
+            raise ValueError(f"host check {name}: bad kit version {kit!r}")
+        duration = r.get("duration_ms", 0)
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            raise ValueError(f"host check {name}: bad duration {duration!r}")
+        rows.append({"name": name, "status": status, "detail": str(_short(r.get("detail") or "", "detail", HOST_CHECK_TEXT_MAX, required=False) or ""),
+                     "fix": str(_short(r.get("fix") or "", "fix", HOST_CHECK_TEXT_MAX, required=False) or ""),
+                     "duration_ms": duration, "kit_version": kit, "blocking": bool(r.get("blocking"))})
+
+    def run() -> dict[str, str | None]:
+        before: dict[str, str | None] = {}
+        with store.transaction(conn):
+            for row in rows:
+                before[row["name"]] = store.put_host_check(conn, ran_at=at, **row)
+        return before
+    return _runner_write(conn, "hostcheck.put", actor, {"checks": [r["name"] for r in rows]}, run)
 
 
 def run_begin(conn: sqlite3.Connection, *, boot_id: str, job: str, key: Optional[str], timeout_s: Optional[float],

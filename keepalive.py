@@ -1734,6 +1734,27 @@ DB_PAUSE_RECHECK = timedelta(minutes=5)   # a DB pause at a window start: rechec
                                            # but never past schedule.postpone_deadline (D-202)
 
 
+def host_checks_before_start(now, sid):
+    """Phase 5b K6 (docs/phase5b_plan.md §3.6): the blocking host checks (hostcheck.pre_start) right before a
+    session-window start's decision. A failing one has paused automation and alerted (failstop) and holds the
+    start: -> the HOLD reason. None = go on (all passed, or no host kit installed yet: the transitional mode,
+    hostcheck.NO_KIT, K7 removes it). A crash of the check itself is an error too (D-235): fail_stop and hold."""
+    import hostcheck
+    import store
+    try:
+        conn = store.connect()
+        try:
+            why = hostcheck.pre_start(conn)
+        finally:
+            conn.close()
+    except Exception as e:   # noqa: BLE001 - an error (D-234/D-235): the start is aborted
+        fail_stop("host check failed to run at a session-window start", f"{type(e).__name__}: {e}")
+        return f"HOLD: the host check could not run ({type(e).__name__}); automation paused (D-234/D-235)"
+    if why is None:
+        return None
+    return f"HOLD: a host check failed ({why}); automation paused, clear it once the host is fixed (D-257/D-283)"
+
+
 def window_start_pass(sid, now, args):
     """The session-window-start continue (no stall needed), one decision per session-window start
     of the night (D-202: 23:00 and 04:00): FIRE, a final HOLD, or a POSTPONE (e.g. the user was
@@ -1753,6 +1774,12 @@ def window_start_pass(sid, now, args):
         decided(arm, "HOLD", f"window start {key}: {d['reason']}", sid)
         progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}; clear it with "
                       f"`{resume_hint(sid)}` once the error is fixed (D-234/D-235)")
+        return d
+    blocked = host_checks_before_start(now, sid)
+    if blocked is not None:
+        d = {"go": False, "reason": blocked, "postpone": False}
+        decided(arm, "HOLD", f"window start {key}: {d['reason']}", sid)
+        progress_note(f"window-start {berlin(now)}: not resumed, {d['reason']}")
         return d
     u = fresh_usage(now, force=True)
     if u is None:      # fresh_usage raised the error (alert + pause): no decision on unknown numbers

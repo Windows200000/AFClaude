@@ -9,7 +9,8 @@ which module does what.
     afclaude tasks ...                                           the task store CLI (tasks.py)
     afclaude machine ...                                         machine users and tokens (tasks.py machine ...)
     afclaude hook session-rules|decisions|identity ...           the session hooks (keepalive.py, decisions.py, identity_hook.py)
-    afclaude host|key|setup                                      not built yet (K2/K6, K4, 5d/6a): refused with a message
+    afclaude host check [name ...] [--blocking] | status          the host checks (hostcheck.py; K6)
+    afclaude key|setup                                           not built yet (K4, 5d/6a): refused with a message
 
 The command finds the modules next to this file (the symlink /usr/local/bin/afclaude is followed) and
 replaces itself with the module's own process (os.execv): the same argv, exit code, signals and
@@ -42,6 +43,7 @@ ROUTES: dict[str, Route] = {
     "web": Route("web.py", unbuffered=True, help="the web service: serve | health (/health and the inbox API on a unix socket)"),
     "tasks": Route("tasks.py", help="the task store CLI (projects, tasks, decisions, docs, questions, ...)"),
     "machine": Route("tasks.py", ("machine",), help="machine users: code | register | register-host (on the host, not here) | list | rename | revoke"),
+    "host": Route("hostcheck.py", help="host check [name ...] [--blocking]: validate the host setup (hostcheck.py); status"),
 }
 # `afclaude hook <name>`: the session hooks the repo's .claude/settings.json runs (K5 moves them here).
 HOOKS: dict[str, Route] = {
@@ -51,7 +53,6 @@ HOOKS: dict[str, Route] = {
 }
 # Named in the plan, not built yet: refused loudly instead of doing something else (D-235).
 PLANNED: dict[str, str] = {
-    "host": "phase 5b K2 (the host kit) and K6 (host checks)",
     "key": "phase 5b K4 (the services call masterkey.ensure(); a key command comes with the setup)",
     "setup": "phase 5d / 6a (the setup wizard)",
 }

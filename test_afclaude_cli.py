@@ -35,7 +35,7 @@ class Routes(unittest.TestCase):
         self.assertEqual(afclaude.resolve(["hook", "identity", "bash"]), [py, os.path.join(HERE, "identity_hook.py"), "bash"])
 
     def test_the_planned_commands_and_unknown_ones_are_refused(self):
-        for cmd in ("host", "key", "setup"):
+        for cmd in ("key", "setup"):
             with self.assertRaises(SystemExit) as cm:
                 afclaude.resolve([cmd, "x"])
             self.assertIn("not built yet", str(cm.exception.code))
@@ -56,7 +56,7 @@ class Command(unittest.TestCase):
             self.assertIn(word, r.stdout)
 
     def test_refusals_exit_2_with_a_message(self):
-        for args in (("nope",), ("host",), ()):
+        for args in (("nope",), ("key",), ()):
             r = run(*args)
             self.assertEqual(r.returncode, afclaude.EXIT_USAGE, args)
             self.assertTrue(r.stderr.startswith("afclaude"), (args, r.stderr))

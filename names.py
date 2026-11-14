@@ -21,7 +21,7 @@ from typing import Collection, Optional
 
 PREFIX = "afc-"
 MAX_LEN = 40
-RESERVED = ("afc-check",)   # the host check's tmux session (docker/host-kit/host_exec.py CHECK_SESSION): never a session's name
+RESERVED = ("afc-check", "afc-check-e2e")   # the host checks' tmux sessions (docker/host-kit/host_exec.py CHECK_SESSION; hostcheck.E2E_TMUX): never a session's name
 TMUX_RE = re.compile(r"^(afc-[a-z0-9-]{1,36})\Z")   # \Z: no trailing newline
 KINDS = ("task-manager", "review", "stall", "request")
 MAX_SUFFIX = 99
