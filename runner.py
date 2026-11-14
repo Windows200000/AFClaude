@@ -251,8 +251,12 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # proposal_alert_hours (each proposal once); reads the DB, runs while paused (it is only a reminder)
     Job("proposal_alert", 2, every=30 * MIN, offset=20 * SEC,
         what="proposal alert (proposal_alert_hours): open agent proposals nobody reviewed"),
+    # phase 5b K6 (§3.6): the host checks (hostcheck.py), hourly and also while paused (they are read-only and
+    # the pause is lifted only after they pass); a failing blocking check pauses through failstop itself
+    Job("host_check", 10, every=60 * MIN, offset=25 * MIN,
+        what="host checks (hostcheck.py): bridge, host kit, tmux, Claude login, MCP, usage, doctor, disk, clock"),
     Job("usage_review", 30, every=60 * MIN, paused="handler", what="usage-model review"),
-    Job("window_start", 90, window_start=True, paused="handler", on_interrupt="fail", session=True,
+    Job("window_start", 95, window_start=True, paused="handler", on_interrupt="fail", session=True,
         what="window-start"),
     # the scheduled jobs check the pause themselves (the sampler samples while paused, D-239.4)
     Job("at", 30, at_jobs=True, paused="handler", on_interrupt="fail",
@@ -270,7 +274,7 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     # one is never rerun (D-257), a drain holds it
     Job("last_stretch", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="last-stretch slot start (D-020/D-204)"),
-    Job("deferred_start", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
+    Job("deferred_start", 95, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="postponed or planned session-window start (D-202/D-274)"),
     Job("fillup", 90, planned=True, paused="handler", on_interrupt="fail", session=True,
         what="fill-up start (D-212)"),
@@ -312,7 +316,7 @@ SUPERVISED: dict[str, tuple[str, ...]] = (
 # their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
                                          "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
-                                         "proposal_alert",
+                                         "proposal_alert", "host_check",
                                          "inbox", "inbox_verify", "request"}
                                         | WATCHER_PASSES)
 
