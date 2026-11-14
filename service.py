@@ -37,7 +37,6 @@ from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import masterkey  # noqa: E402
 import store  # noqa: E402
 
 SERVICES = ("runner", "mcp", "web")
@@ -98,6 +97,9 @@ def check_mounted(path: str, mountinfo: str = MOUNTINFO) -> None:
 def ensure_key() -> str:
     """masterkey.ensure on this install's database. -> the key id. ServiceError for any problem
     (no database, a key that is missing, torn or does not match)."""
+    # imported here: masterkey needs the `cryptography` library, which the image has but the host's own python
+    # (tools/deploy.py imports runner, which imports this module) does not; only the services layout comes here
+    import masterkey
     try:
         conn = store.connect()
     except store.DBUnavailable as e:

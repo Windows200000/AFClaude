@@ -524,5 +524,18 @@ class LiveLikeEnvTest(unittest.TestCase):
             self.assertIn("AFCLAUDE_DATA is not set", out.call_args[0][0])
 
 
+class HostPythonImportTest(unittest.TestCase):
+    """tools/deploy.py runs under the host's own python, which has no `cryptography` (the image does): importing
+    it, and so runner and service, must not need the master key's library (only service.ensure_key does)."""
+
+    def test_deploy_imports_without_cryptography(self) -> None:
+        import subprocess
+        code = ("import sys; sys.modules['cryptography'] = None; sys.path.insert(0, 'tools'); import deploy; "
+                "assert 'masterkey' not in sys.modules")
+        r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(os.path.abspath(__file__)),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+
+
 if __name__ == "__main__":
     unittest.main()
