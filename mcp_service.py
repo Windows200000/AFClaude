@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""The MCP service of the image (phase 5b K4, docs/phase5b_plan.md §3.3): `afclaude mcp serve`.
+"""The MCP service of the image (phase 5b K4/K5, docs/phase5b_plan.md §3.3): `afclaude mcp serve|health`, the one
+MCP HTTP serve path (D-343).
 
-The MCP server's streamable HTTP app (`mcp_server.server.streamable_http_app`) under uvicorn on an
-internal TCP port (compose publishes none; `compose.tunnel.yml` would, on the host's loopback only), behind
-a gate that checks the bearer token of every request. **K4 ships the gate closed**: `authorize` accepts no
-token, so every MCP request is a 401 (`WWW-Authenticate: Bearer`) and nothing reaches a tool. K5 puts 5a's
-machine-token check there (hash lookup, last_seen, revoked/unknown refused and audited) and passes the
-principal on; until then the service only proves the listener, the start check and the compose wiring.
+The MCP server's streamable HTTP app (mcp_http.build_app over `mcp_server.server`) under uvicorn on an internal TCP
+port (compose publishes none; `compose.tunnel.yml` would, on the host's loopback only). Every MCP request needs a
+machine token (`Authorization: Bearer`, the SDK's bearer middleware over mcp_http.MachineTokenVerifier) and the
+client's `X-AFClaude-Hostname` (mcp_http.HostnameMiddleware); a refusal is a 401 (`WWW-Authenticate: Bearer`) and,
+for a token that reached the verifier, a bounded `machine.token_refused` audit row (D-235). The process refuses a
+tool call without an authenticated machine (mcp_http.require_remote).
 
   GET /health   no token, no secrets: the same body as the web service's (service.health_report); 503
-                when unhealthy. Not an MCP route and not forwarded.
+                when unhealthy. Not an MCP route and not forwarded (the Gate answers it before the app).
 
 Start: the data directory must be mounted and the master key must load (service.start; it refuses with a
-message, exit 78). The listener binds 0.0.0.0 in the container (the SDK's DNS-rebinding protection is on
-only for a loopback host: the port is internal to the compose network, K0).
+message, exit 78). A bind other than loopback (the container's default, 0.0.0.0: the SDK's DNS-rebinding
+protection is on only for a loopback host, the port is internal to the compose network, K0) is refused, also exit
+78, unless `roles_enforce` is `on` (mcp_http.check_bind, M1): the compose MCP service starts only once roles are on.
 
-  mcp_service.py serve [--port N]    the server (`afclaude mcp serve`); N default $AFCLAUDE_MCP_PORT or 8000
+  mcp_service.py serve [--host H] [--port N] [--public-url U]   the server (`afclaude mcp serve`); host default
+                                $AFCLAUDE_MCP_HOST, else 0.0.0.0 in the container and 127.0.0.1 elsewhere; N default
+                                $AFCLAUDE_MCP_PORT or 8000; U (what the 401 advertises) default $AFCLAUDE_PUBLIC_URL
   mcp_service.py health [--port N]   GET /health on the loopback: exit 0 healthy (the compose health check)
 """
 from __future__ import annotations
@@ -33,6 +37,8 @@ from starlette.concurrency import run_in_threadpool
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import actions  # noqa: E402
+import mcp_http  # noqa: E402
 import service  # noqa: E402
 import store  # noqa: E402
 
@@ -43,11 +49,6 @@ ASGI = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 PORT = int(os.environ.get("AFCLAUDE_MCP_PORT") or 8000)
 HEALTH_TIMEOUT = 10.0
-
-
-def reject_all(token: str) -> bool:
-    """The gate's closed state (K4): no token is good. K5 replaces it with the machine-token check."""
-    return False
 
 
 async def _respond(send: Send, status: int, body: object, extra: list[tuple[bytes, bytes]] | None = None) -> None:
@@ -71,12 +72,12 @@ def health_body() -> tuple[int, dict[str, Any]]:
 
 
 class Gate:
-    """ASGI wrapper: /health is answered here, everything else needs a bearer token `authorize` accepts
-    (lifespan events go straight to the app: its session manager starts there; any other non-http scope, a
+    """ASGI wrapper: /health is answered here; everything else goes to the app, whose bearer middleware is the
+    token check (lifespan events go to the app too: its session manager starts there; any other non-http scope, a
     websocket, is refused: nothing here speaks it)."""
 
-    def __init__(self, app: ASGI, authorize: Callable[[str], bool] = reject_all) -> None:
-        self.app, self.authorize = app, authorize
+    def __init__(self, app: ASGI) -> None:
+        self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -93,26 +94,37 @@ class Gate:
             status, body = await run_in_threadpool(health_body)     # a DB read: not on the event loop
             await _respond(send, status, body)
             return
-        auth = next((v.decode("latin-1") for k, v in scope["headers"] if k == b"authorization"), "")
-        scheme, _, token = auth.partition(" ")
-        if scheme.lower() != "bearer" or not token.strip() or not self.authorize(token.strip()):
-            await _respond(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b"Bearer")])
-            return
         await self.app(scope, receive, send)
 
 
-def build_app(authorize: Callable[[str], bool] = reject_all) -> Gate:
+def build_app(host: str, port: int, public_url: str | None = None) -> Gate:
     import mcp_server        # imported here: the health check and the start check need none of it
-    return Gate(mcp_server.server.streamable_http_app(host="0.0.0.0"), authorize)
+    return Gate(mcp_http.build_app(mcp_server.server, host, public_url, port))
 
 
-def serve(port: int) -> int:
+def default_host() -> str:
+    return os.environ.get("AFCLAUDE_MCP_HOST") or ("0.0.0.0" if service.in_container() else mcp_http.DEFAULT_HOST)
+
+
+def check_bind(host: str) -> None:
+    """mcp_http.check_bind against the DB's roles_enforce setting (read now: the start check, M1)."""
+    conn = store.connect()
+    try:
+        mcp_http.check_bind(host, actions.roles_mode(conn))
+    finally:
+        conn.close()
+
+
+def serve(host: str, port: int, public_url: str | None = None) -> int:
     try:
         service.start("mcp", mounted=service.in_container())
-    except service.ServiceError as e:
+        check_bind(host)
+        app = build_app(host, port, public_url)
+    except (service.ServiceError, mcp_http.Refused, actions.RolesFailure) as e:
         return service.refuse("mcp", e)
-    print(f"afclaude mcp: serving on 0.0.0.0:{port} (every MCP request is refused until K5's token check)", flush=True)
-    uvicorn.run(build_app(), host="0.0.0.0", port=port, log_level="info", lifespan="on", server_header=False)
+    mcp_http.require_remote()
+    print(f"afclaude mcp: serving on {host}:{port} (machine token and host name header required)", flush=True)
+    uvicorn.run(app, host=host, port=port, log_level="info", lifespan="on", server_header=False)
     return 0
 
 
@@ -131,12 +143,17 @@ def health_cli(port: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="The AFClaude MCP service (phase 5b K4).")
+    ap = argparse.ArgumentParser(description="The AFClaude MCP service (phase 5b K4/K5).")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, text in (("serve", "run the HTTP server"), ("health", "GET /health on the loopback")):
-        sub.add_parser(name, help=text).add_argument("--port", type=int, default=PORT)
+    sv = sub.add_parser("serve", help="run the HTTP server")
+    sv.add_argument("--host", default=None, help="the address to listen on (default: see the module doc)")
+    sv.add_argument("--public-url", default=None, help="the URL clients reach this server at (default: AFCLAUDE_PUBLIC_URL)")
+    for p in (sv, sub.add_parser("health", help="GET /health on the loopback")):
+        p.add_argument("--port", type=int, default=PORT)
     args = ap.parse_args(argv)
-    return serve(args.port) if args.cmd == "serve" else health_cli(args.port)
+    if args.cmd == "serve":
+        return serve(args.host or default_host(), args.port, args.public_url)
+    return health_cli(args.port)
 
 
 if __name__ == "__main__":

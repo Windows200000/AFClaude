@@ -193,7 +193,9 @@ class ThreeServicesInContainers(unittest.TestCase):
         with open(cls.override, "w") as fh:
             fh.write("services:\n"
                      f"  afclaude-runner:\n    healthcheck: {hc}\n"
-                     f"  afclaude-mcp:\n    healthcheck: {hc}\n"
+                     # loopback: the default bind (0.0.0.0) starts only once roles are on (D-343); this test does not
+                     # set up roles
+                     f"  afclaude-mcp:\n    healthcheck: {hc}\n    environment:\n      AFCLAUDE_MCP_HOST: 127.0.0.1\n"
                      f"  afclaude-web:\n    healthcheck: {hc}\n    volumes:\n"
                      f"      - {cls.keyfile}:/run/secrets/afclaude_quickview.key:ro\n")
         cls.env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
@@ -276,12 +278,12 @@ class ThreeServicesInContainers(unittest.TestCase):
         self.assertEqual(self.request("PUT", "/afclaude/api/inbox", key=self.key)[0], 405)
         self.assertEqual(oct(os.stat(os.path.join(self.data, "api", "inbox.sock")).st_mode & 0o777), "0o666")
 
-    def test_the_mcp_service_refuses_every_request_until_the_token_check(self):
+    def test_the_mcp_service_refuses_a_request_without_a_valid_machine_token(self):
         r = self.exec("mcp", "python3", "-c", (
             "import http.client as h, json\n"
             "c = h.HTTPConnection('127.0.0.1', 8000, timeout=10)\n"
             "c.request('POST', '/mcp', body='{}', headers={'Content-Type': 'application/json'})\n"
-            "r = c.getresponse(); r.read(); print(r.status, r.getheader('WWW-Authenticate'))\n"
+            "r = c.getresponse(); r.read(); print(r.status, r.getheader('WWW-Authenticate').split()[0])\n"
             "c.request('POST', '/mcp', body='{}', headers={'Authorization': 'Bearer anything'})\n"
             "print(c.getresponse().status)"))
         self.assertEqual(r.stdout.split(), ["401", "Bearer", "401"], r.stderr)

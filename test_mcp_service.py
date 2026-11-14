@@ -1,5 +1,6 @@
-"""mcp_service.py (phase 5b K4): the gate in front of the MCP HTTP app is closed (K5 opens it with the machine
-token check), /health, the start refusals, and the real app behind the gate."""
+"""mcp_service.py (phase 5b K4/K5): the one serve path (D-343): /health answered by the Gate, everything else
+through to the app (token check, hostname header: test_mcp_http.py), the start refusals (unmounted data, a bind beyond
+loopback while roles are not on), and the real app behind the gate."""
 import asyncio
 import contextlib
 import io
@@ -11,6 +12,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402,F401  (hermetic: before the AFClaude imports)
+import actions  # noqa: E402
+import mcp_http  # noqa: E402
 import mcp_service  # noqa: E402
 import service  # noqa: E402
 import store  # noqa: E402
@@ -48,22 +51,9 @@ class GateTest(unittest.TestCase):
     def setUp(self):
         testenv.fresh_db(self)
 
-    def test_every_request_is_a_401_while_the_gate_is_closed(self):
+    def test_a_request_goes_to_the_app_whose_bearer_middleware_is_the_token_check(self):
         inner = Inner()
-        gate = mcp_service.Gate(inner)
-        for headers in ((), (("Authorization", "Bearer something"),), (("Authorization", "Basic abc"),),
-                        (("Authorization", "Bearer "),), (("Authorization", "bearer"),)):
-            status, hdrs, body = call(gate, headers=headers)
-            self.assertEqual((status, hdrs["www-authenticate"], body), (401, "Bearer", {"error": "unauthorized"}), headers)
-        self.assertEqual(inner.calls, [])        # nothing reached the app
-
-    def test_a_token_the_authorizer_accepts_reaches_the_app(self):
-        inner = Inner()
-        seen = []
-        gate = mcp_service.Gate(inner, lambda token: seen.append(token) or token == "good")
-        self.assertEqual(call(gate, headers=(("Authorization", "Bearer good"),))[0], 200)
-        self.assertEqual(call(gate, headers=(("Authorization", "Bearer bad"),))[0], 401)
-        self.assertEqual(seen, ["good", "bad"])
+        self.assertEqual(call(mcp_service.Gate(inner), headers=(("Authorization", "Bearer x"),))[0], 200)
         self.assertEqual(inner.calls, ["http"])
 
     def test_health_is_answered_by_the_gate_without_a_token(self):
@@ -101,13 +91,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
         self.assertEqual(inner.calls, [])
 
-    def test_the_default_authorizer_accepts_nothing(self):
-        self.assertFalse(mcp_service.reject_all("anything"))
-
-    def test_the_real_mcp_app_sits_behind_the_closed_gate(self):
-        gate = mcp_service.build_app()
+    def test_the_real_mcp_app_refuses_a_request_without_or_with_a_bad_token(self):
+        gate = mcp_service.build_app("127.0.0.1", 8000)
         status, hdrs, _ = call(gate, "POST", "/mcp", (("Content-Type", "application/json"),))
-        self.assertEqual((status, hdrs["www-authenticate"]), (401, "Bearer"))
+        self.assertEqual((status, hdrs["www-authenticate"].split()[0]), (401, "Bearer"))
+        status, hdrs, _ = call(gate, "POST", "/mcp", (("Authorization", "Bearer mt_bad"), ("X-AFClaude-Hostname", "h")))
+        self.assertEqual(status, 401)
+        self.assertEqual(call(gate, "GET", "/health")[0], 200)          # the Gate answers it before the app
 
 
 class StartTest(unittest.TestCase):
@@ -115,15 +105,46 @@ class StartTest(unittest.TestCase):
         with mock.patch.object(service, "start", side_effect=service.ServiceError("not mounted")), \
                 mock.patch.object(store, "_notify"), contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
-            self.assertEqual(mcp_service.serve(8000), 78)
+            self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 78)
 
-    def test_serve_hands_the_gated_app_to_uvicorn_on_all_interfaces(self):
+    def test_serve_hands_the_gated_app_to_uvicorn(self):
         with mock.patch.object(service, "start", return_value="id"), \
-                mock.patch.object(mcp_service.uvicorn, "run") as run, contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(mcp_service.serve(8123), 0)
-        app = run.call_args[0][0]
-        self.assertIsInstance(app, mcp_service.Gate)
-        self.assertEqual((run.call_args[1]["host"], run.call_args[1]["port"]), ("0.0.0.0", 8123))
+                mock.patch.object(mcp_service.uvicorn, "run") as run, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mcp_http, "REQUIRE_REMOTE", False):
+            self.assertEqual(mcp_service.serve("127.0.0.1", 8123), 0)
+            self.assertTrue(mcp_http.REQUIRE_REMOTE)                       # the serve process refuses a call with no machine
+        self.assertIsInstance(run.call_args[0][0], mcp_service.Gate)
+        self.assertEqual((run.call_args[1]["host"], run.call_args[1]["port"]), ("127.0.0.1", 8123))
+
+    def test_a_bind_beyond_loopback_is_refused_until_roles_are_on(self):
+        """M1, on the service's own bind (the container's 0.0.0.0): exit 78 and no listener while roles_enforce is shadow."""
+        testenv.fresh_db(self)
+        conn = store.connect()
+        self.assertEqual(actions.roles_mode(conn), "shadow")
+        err = io.StringIO()
+        with mock.patch.object(service, "start", return_value="id"), mock.patch.object(store, "_notify"), \
+                contextlib.redirect_stderr(err), \
+                mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
+            self.assertEqual(mcp_service.serve("0.0.0.0", 8000), 78)
+        self.assertIn("roles_enforce", err.getvalue())
+        with mock.patch.object(service, "start", return_value="id"), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mcp_service.uvicorn, "run") as run, mock.patch.object(mcp_http, "REQUIRE_REMOTE", False):
+            self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 0)        # loopback is fine in shadow
+            run.assert_called_once()
+        with mock.patch.object(actions, "roles_mode", return_value="on"), \
+                mock.patch.object(service, "start", return_value="id"), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mcp_service.uvicorn, "run") as run, mock.patch.object(mcp_http, "REQUIRE_REMOTE", False):
+            self.assertEqual(mcp_service.serve("0.0.0.0", 8000), 0)
+            run.assert_called_once()
+
+    def test_the_default_host_is_all_interfaces_only_in_the_container(self):
+        with mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}):
+            os.environ.pop("AFCLAUDE_MCP_HOST", None)
+            self.assertEqual(mcp_service.default_host(), "0.0.0.0")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AFCLAUDE_IN_CONTAINER", None)
+            os.environ.pop("AFCLAUDE_MCP_HOST", None)
+            self.assertEqual(mcp_service.default_host(), "127.0.0.1")
 
     def test_the_health_command_reports_a_dead_listener(self):
         out = io.StringIO()

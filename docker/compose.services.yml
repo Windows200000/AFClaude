@@ -4,7 +4,8 @@
 # `tools/deploy.py` deploys. Never run both layouts at once (one runner per data directory).
 #   afclaude-runner  `afclaude runner serve`: the schedule (sampler, window starts, keep-alive, inbox delivery, ...)
 #   afclaude-mcp     `afclaude mcp serve`: the MCP server over HTTP on an internal port (no port is published;
-#                    every MCP request is refused until K5's token check)
+#                    every request needs a machine token and the host name header). It binds 0.0.0.0 and starts
+#                    only once roles_enforce is `on` (exit 78 otherwise, K5 deploy gate, D-343)
 #   afclaude-web     `afclaude web serve`: GET /health and the inbox API on a unix socket in the data directory
 # The only required variable is AFCLAUDE_DATA: the host directory that is the data directory (DB, key, logs, state).
 # It has no default (D-180/D-187): the setup chooses it, and an unset value stops compose before any container

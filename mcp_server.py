@@ -48,6 +48,7 @@ import store  # noqa: E402  (reads)
 import actions  # noqa: E402  (every write)
 import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
 import identity  # noqa: E402  (who is calling: machine user, task-manager or agent, phase 5a A2)
+import mcp_http  # noqa: E402  (the HTTP transport's token identity, phase 5b K5)
 import prompts  # noqa: E402  (the prompt registry: read-only view, phase 4a P4)
 import tasks as cli  # noqa: E402  (berlin(), resolve_session(), session_json())
 
@@ -82,6 +83,9 @@ INSTRUCTIONS = (
 # The identity hook's stamp on the call being served (identity_hook.py adds `_afc` to the arguments of every
 # afclaude call; the SDK would drop the unknown argument before a tool runs, so call_tool takes it out first).
 STAMP: contextvars.ContextVar[Mapping[str, Any] | None] = contextvars.ContextVar("afclaude_stamp", default=None)
+# The machine behind an HTTP call (mcp_http.remote_machine), None on stdio: a remote caller is identified by its
+# token and its stamp only, never by this process's env (the server's, not the caller's).
+REMOTE: contextvars.ContextVar[Mapping[str, Any] | None] = contextvars.ContextVar("afclaude_remote", default=None)
 log = logging.getLogger("afclaude.mcp")
 UNSTAMPED_NOTE = ("an afclaude call arrived without the identity hook's stamp (the hooks in .claude/settings.json "
                   "are missing or failed): the server's own env names the session, so a subagent counts as "
@@ -90,20 +94,31 @@ unstamped_noted = False
 
 
 class AFClaudeServer(MCPServer[Any]):
-    """MCPServer that moves the hook's `_afc` stamp out of the arguments into STAMP for the tool run."""
+    """MCPServer that moves the hook's `_afc` stamp out of the arguments into STAMP for the tool run, and the
+    machine an HTTP call's token authenticated into REMOTE."""
 
     async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
-        token = STAMP.set(arguments.pop(identity.STAMP_KEY, None))
+        tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
         try:
+            tokens.append((STAMP, STAMP.set(arguments.pop(identity.STAMP_KEY, None))))
+            remote = mcp_http.remote_machine(context)
+            if remote is None and mcp_http.REQUIRE_REMOTE:
+                raise PermissionError("a tool call without an authenticated machine token in the HTTP server")
+            tokens.append((REMOTE, REMOTE.set(remote)))
             return await super().call_tool(name, arguments, context)
         finally:
-            STAMP.reset(token)
+            for var, tok in reversed(tokens):
+                var.reset(tok)
 
 
+# token_verifier + auth settings are what the HTTP transport (`serve`) uses (the SDK wants both at construction;
+# `serve` replaces the placeholder settings, which read no env); the stdio server ignores them.
 server = AFClaudeServer(
     name="afclaude",
     instructions=INSTRUCTIONS,
     log_level="WARNING",
+    token_verifier=mcp_http.MachineTokenVerifier(),
+    auth=mcp_http.auth_settings(mcp_http.placeholder_url()),
 )
 
 
@@ -164,7 +179,8 @@ def session_brief(s: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def session_id_env() -> str | None:
-    return os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    """The server's own session id (stdio); a remote caller has none here."""
+    return None if REMOTE.get() is not None else os.environ.get("CLAUDE_CODE_SESSION_ID") or None
 
 
 def who(conn: sqlite3.Connection) -> identity.Identity:
@@ -175,6 +191,9 @@ def who(conn: sqlite3.Connection) -> identity.Identity:
     if stamp is None and not unstamped_noted:
         unstamped_noted = True
         log.warning(UNSTAMPED_NOTE)
+    remote = REMOTE.get()
+    if remote is not None:       # HTTP: the verified machine and the stamp; the process's env is not the caller's
+        return identity.resolve(conn, {}, stamp=stamp, transport="mcp", machine=remote)
     return identity.resolve(conn, os.environ, stamp=stamp, transport="mcp")
 
 
@@ -232,6 +251,8 @@ async def caller_dir(ctx: Optional[Context]) -> tuple[str | None, str]:
                     return (None if _no_project_dir(p) else p), "roots"
     except Exception:           # no request context, no back-channel, timeout, bad reply: fall through
         pass
+    if REMOTE.get() is not None:    # the server's env and cwd are not the remote caller's
+        return None, "none"
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env and os.path.isabs(env):
         p = os.path.normpath(env)
@@ -918,13 +939,23 @@ def request_brief(r: Mapping[str, Any]) -> dict[str, Any]:
     return compact({"id": r["id"], "kind": r["kind"], "target": r["target"], "status": r["status"],
                     "at": bt(r["ts"]), "by": r["actor"], "tmux": res.get("tmux"), "reason": res.get("reason")})
 
-if __name__ == "__main__":
-    # `afclaude mcp` = stdio (what the registrations run); `serve` / `health` are the mcp service's (K4)
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "stdio"
+def main(argv: list[str]) -> int:
+    """`mcp_server.py [stdio]` (what Claude Code starts, one process per session) or `serve` / `health`: the MCP
+    service's HTTP transport (`afclaude mcp serve|health`, mcp_service.py, the one serve path, D-343)."""
+    cmd = argv[0] if argv else "stdio"
     if cmd == "stdio":
+        try:
+            mcp_http.check_stdio_env(os.environ)
+        except mcp_http.Refused as e:
+            print(f"afclaude mcp: {e}", file=sys.stderr)
+            return 1
         server.run("stdio")
-    elif cmd in ("serve", "health"):
+        return 0
+    if cmd in ("serve", "health"):
         import mcp_service
-        sys.exit(mcp_service.main(sys.argv[1:]))
-    else:
-        sys.exit(f"usage: mcp_server.py [stdio|serve|health] (got {cmd!r})")
+        return mcp_service.main(argv)
+    sys.exit(f"usage: mcp_server.py [stdio|serve|health] (got {cmd!r})")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
