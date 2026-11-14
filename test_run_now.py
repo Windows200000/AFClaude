@@ -494,12 +494,16 @@ class RetiredAndCli(Base):
         import asyncio
         import json
         woke = []
+        # an unstamped call from an interactive session that is not driven, no guard bypass, no machine token
+        # (nothing from the caller's own env: this runs inside Claude Code sessions too) is the host owner (D-330)
+        env = {"CLAUDE_CODE_SESSION_ID": SID_NEW, "CLAUDE_GUARD_DISABLE": "", "AFCLAUDE_AGENT_ID": "",
+               "AFCLAUDE_MACHINE_TOKEN": "", "AFCLAUDE_MACHINE_FILE": os.path.join(self.dir, "no-token")}
         with mock.patch.object(tasks, "run_now_usage", lambda: "usage now: x"), \
                 mock.patch.object(runner, "wake", lambda: woke.append(1)), \
-                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SID_NEW, "CLAUDE_GUARD_DISABLE": ""}):
+                mock.patch.dict(os.environ, env):
             r = json.loads(asyncio.run(ms.afclaude_request("work", "alpha")))
         self.assertEqual((r["kind"], r["target"], r["status"], r["by"], r["usage"]),
-                         ("work_on_now", "1", "open", f"mcp:{SID_NEW}", "usage now: x"))
+                         ("work_on_now", "1", "open", "cli", "usage now: x"))
         self.assertEqual(woke, [1])
 
     def test_run_now_usage_reads_the_cache(self):
