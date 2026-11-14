@@ -635,6 +635,48 @@ class Authenticate(Base):
         self.do("machine.revoke", user_id=self.r["user_id"])
         self.assertIsNone(self.auth())
 
+    def test_check_says_why_without_writing_anything(self):
+        """K5: the read-only part of the check names the reason for the audit row of a refusal."""
+        secret = roles.parse_token(self.r["token"])[1]
+        ok, why = actions.check_machine_token(self.conn, self.r["token"])
+        self.assertEqual((why, ok["user_id"]), ("ok", self.r["user_id"]))
+        self.assertEqual(actions.check_machine_token(self.conn, "garbage"), (None, "malformed"))
+        self.assertEqual(actions.check_machine_token(self.conn, roles.format_token(self.r["token_id"], roles.new_token_secret())),
+                         (None, "unknown or wrong secret"))
+        self.assertEqual(actions.check_machine_token(self.conn, roles.format_token(self.r["token_id"] + 5, secret)),
+                         (None, "unknown or wrong secret"))
+        self.do("machine.revoke", user_id=self.r["user_id"])
+        self.assertEqual(actions.check_machine_token(self.conn, self.r["token"]), (None, "token revoked"))
+        self.assertIsNone(store.get_machine_token(self.conn, self.r["token_id"])["last_seen_at"])
+
+    def test_a_revoked_machine_user_with_a_live_token_is_named(self):
+        self.conn.execute("UPDATE users SET revoked_at=? WHERE id=?", (store.now_iso(), self.r["user_id"]))
+        self.assertEqual(actions.check_machine_token(self.conn, self.r["token"]), (None, "machine user revoked"))
+
+    def remote(self, token=None, host="host-a"):
+        token = self.r["token"] if token is None else token
+        return actions.authenticate_remote(self.conn, token, host, "http", via="mcp", notify=self.notify)
+
+    def test_remote_needs_the_host_name_and_audits_every_refusal(self):
+        who, why = self.remote()
+        self.assertEqual((who["user_id"], why), (self.r["user_id"], "ok"))
+        self.assertEqual(store.get_machine_token(self.conn, self.r["token_id"])["last_transport"], "http")
+        for host, reason in ((None, "no host name given"), ("", "no host name given"), ("a b", "bad host name")):
+            self.assertEqual(self.remote(host=host), (None, reason))
+        self.assertEqual(self.remote("garbage"), (None, "malformed"))
+        rows = self.audit("machine.token_refused")
+        self.assertEqual([r["after"]["refused"] for r in rows], ["no host name given", "bad host name", "malformed"])
+        self.assertTrue(all(r["actor"] == "mcp" and r["via"] == "mcp" for r in rows))
+        self.assertNotIn("garbage", json.dumps(rows, default=str))                 # the token never reaches the log
+
+    def test_remote_audits_a_refusal_once_an_hour_and_again_after(self):
+        for _ in range(4):
+            self.remote("garbage")
+        self.assertEqual(len(self.audit("machine.token_refused")), 1)
+        self.clock.advance(minutes=61)
+        self.remote("garbage")
+        self.assertEqual(len(self.audit("machine.token_refused")), 2)
+
     def test_last_seen_is_written_at_most_once_a_minute_for_one_host(self):
         self.auth()
         t0 = store.get_machine_token(self.conn, self.r["token_id"])["last_seen_at"]

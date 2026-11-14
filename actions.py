@@ -4524,6 +4524,27 @@ def machine_seen(conn: sqlite3.Connection, ctx: Ctx, token_id: Any, hostname: An
 TOUCH_MIN_INTERVAL = TOUCH_EVERY                 # a token's use is recorded at most once a minute (same host)
 
 
+def check_machine_token(conn: sqlite3.Connection, token: str) -> tuple[dict[str, Any] | None, str]:
+    """The read-only part of the token check: -> ({user_id, token_id, label, row}, "ok") for a well-formed,
+    unrevoked token of an unrevoked machine user, else (None, why) with why = malformed | unknown or wrong
+    secret | token revoked | machine user revoked (for the audit row of a refusal; the caller tells the
+    client only "refused": no oracle). Constant-time on the secret; the token never reaches a log."""
+    try:
+        token_id, secret = roles.parse_token(token)
+    except ValueError:
+        return None, "malformed"
+    row = store.get_machine_token(conn, token_id)
+    ok = roles.secret_matches(row["token_sha256"] if row else "0" * 64, secret)
+    if row is None or not ok:
+        return None, "unknown or wrong secret"
+    if row["revoked_at"] is not None:
+        return None, "token revoked"
+    user = store.get_user(conn, row["user_id"])
+    if user is None or user["revoked_at"] is not None or user["kind"] != "machine":
+        return None, "machine user revoked"
+    return {"user_id": user["id"], "token_id": token_id, "label": user["label"], "row": row}, "ok"
+
+
 def authenticate_machine(conn: sqlite3.Connection, token: str, hostname: str | None = None,
                          transport: str | None = None, *, actor: str | None = None, via: str = "cli",
                          notify: Callable[[str, str], Any] | None = None) -> dict[str, Any] | None:
@@ -4532,24 +4553,71 @@ def authenticate_machine(conn: sqlite3.Connection, token: str, hostname: str | N
     (machine.seen, at most once a minute unless the hostname changed) and delivers the clone alert, if
     any, after the write (as `actor`, default the machine user itself: machine:<id>). Constant-time on the
     secret; the token never reaches a log."""
-    try:
-        token_id, secret = roles.parse_token(token)
-    except ValueError:
+    found, _ = check_machine_token(conn, token)
+    if found is None:
         return None
-    row = store.get_machine_token(conn, token_id)
-    ok = roles.secret_matches(row["token_sha256"] if row else "0" * 64, secret)
-    if row is None or not ok or row["revoked_at"] is not None:
-        return None
-    user = store.get_user(conn, row["user_id"])
-    if user is None or user["revoked_at"] is not None or user["kind"] != "machine":
-        return None
+    row = found.pop("row")
     last = None if row["last_seen_at"] is None else _when(row["last_seen_at"])
     same_host = hostname is None or (row["last_hostname"] or "").casefold() == hostname.casefold()
     if last is None or not same_host or store._utcnow() - last >= TOUCH_MIN_INTERVAL:
-        r = perform(conn, "machine.seen", {"token_id": token_id, "hostname": hostname, "transport": transport},
-                    actor=actor or f"machine:{user['id']}", via=via)
+        r = perform(conn, "machine.seen", {"token_id": found["token_id"], "hostname": hostname, "transport": transport},
+                    actor=actor or f"machine:{found['user_id']}", via=via)
         deliver_alerts(r, notify)
-    return {"user_id": user["id"], "token_id": token_id, "label": user["label"]}
+    return found
+
+
+REFUSAL_AUDIT_EVERY = timedelta(hours=1)        # one audit row per refused token / reason / host in this time
+
+
+def record_token_refusal(conn: sqlite3.Connection, token: str, hostname: str | None, transport: str,
+                         reason: str) -> bool:
+    """A transport refused a bearer token (the HTTP server's 401, D-235: a refusal is audited, never silent):
+    one `machine.token_refused` audit row (actor `mcp`: nobody is authenticated; `after` = reason, hostname,
+    transport and a key; the token itself is never stored, only its id when it parses) per token id (or
+    "none"), reason and hostname and hour, so a client that retries every second doesn't fill the log.
+    -> True when a row was written."""
+    try:
+        token_id: int | None = roles.parse_token(token)[0]
+    except ValueError:
+        token_id = None
+    host = None if hostname is None else str(hostname)[:HOSTNAME_MAX]
+    key = f"token-refused:{token_id or 'none'}:{reason}:{(host or '-').casefold()}"
+    since = store.iso_ms(store._utcnow() - REFUSAL_AUDIT_EVERY)
+
+    def record() -> bool:
+        with store.transaction(conn):
+            if store.refusal_audited_since(conn, key, since):
+                return False
+            store.add_audit(conn, "mcp", "mcp", "machine.token_refused", "machine_token", token_id, None,
+                            {"refused": reason, "key": key, "hostname": host, "transport": transport})
+            return True
+    return store.retrying(record, conn)
+
+
+def authenticate_remote(conn: sqlite3.Connection, token: str, hostname: str | None, transport: str, *,
+                        via: str, notify: Callable[[str, str], Any] | None = None) -> tuple[dict[str, Any] | None, str]:
+    """The token check of a transport that carries the client's host name beside the token (the HTTP server,
+    K5): authenticate_machine, plus the host name is required (without it the clone check, D-198, could not see
+    a second host) and every refusal is audited (record_token_refusal). -> ({user_id, token_id, label}, "ok") or
+    (None, the reason)."""
+    found, why = check_machine_token(conn, token)
+    host: str | None = None
+    if found is not None:
+        if not hostname:
+            found, why = None, "no host name given"
+        else:
+            try:
+                host = _hostname(hostname)
+            except ValueError:
+                found, why = None, "bad host name"
+    if found is None:
+        record_token_refusal(conn, token, hostname, transport, why)
+        return None, why
+    who = authenticate_machine(conn, token, host, transport, via=via, notify=notify)
+    if who is None:               # revoked between the two reads
+        record_token_refusal(conn, token, hostname, transport, "token revoked")
+        return None, "token revoked"
+    return who, "ok"
 
 
 def deliver_alerts(result: Mapping[str, Any] | None, notify: Callable[[str, str], Any] | None = None) -> None:

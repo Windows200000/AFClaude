@@ -4,7 +4,7 @@ every AFClaude program, so nothing outside the image needs to know where the cod
 which module does what.
 
     afclaude runner serve|status|drain|undrain|wake|health|...   the resident runner (runner.py)
-    afclaude mcp                                                 the MCP server on stdio (mcp_server.py)
+    afclaude mcp [stdio]|serve                                   the MCP server: stdio (one session) or HTTP (mcp_server.py)
     afclaude web                                                 the inbox API on its unix socket (inbox_api.py serve)
     afclaude tasks ...                                           the task store CLI (tasks.py)
     afclaude machine ...                                         machine users and tokens (tasks.py machine ...)
@@ -38,7 +38,7 @@ class Route:
 
 ROUTES: dict[str, Route] = {
     "runner": Route("runner.py", unbuffered=True, help="the resident runner: serve | status | drain | undrain | wake | health | ..."),
-    "mcp": Route("mcp_server.py", help="the MCP server on stdio"),
+    "mcp": Route("mcp_server.py", help="the MCP server: stdio (default) | serve (HTTP, bearer tokens)"),
     "web": Route("inbox_api.py", ("serve",), unbuffered=True, help="the inbox API (the web service's job until the dashboard)"),
     "tasks": Route("tasks.py", help="the task store CLI (projects, tasks, decisions, docs, questions, ...)"),
     "machine": Route("tasks.py", ("machine",), help="machine users: code | register | register-host (on the host, not here) | list | rename | revoke"),

@@ -48,6 +48,7 @@ AGENT_VAR = "AFCLAUDE_AGENT_ID"
 GUARD_VAR = "CLAUDE_GUARD_DISABLE"
 TOKEN_VAR = "AFCLAUDE_MACHINE_TOKEN"
 TOKEN_FILE_VAR = "AFCLAUDE_MACHINE_FILE"
+HOST_VAR = "AFCLAUDE_MACHINE_HOST"        # the host's name for the clone check, set by the host wrapper (inside the container socket.gethostname() is the container's)
 DEFAULT_TOKEN_FILE = "~/.config/afclaude/machine.json"
 STAMP_KEY = "_afc"                        # the hook's field in an MCP call's arguments (plan §3.3)
 
@@ -209,7 +210,7 @@ def machine_identity(conn: sqlite3.Connection, env: Mapping[str, str], via: str,
     token, state = read_token(env, token_file)
     if token is None:
         return None, state
-    who = actions.authenticate_machine(conn, token, socket.gethostname(), transport, via=via)
+    who = actions.authenticate_machine(conn, token, env.get(HOST_VAR) or socket.gethostname(), transport, via=via)
     if not who:
         note_once("identity: the machine token is unknown, revoked or malformed: no machine identity")
     return who, ("valid" if who else "invalid")
@@ -230,11 +231,14 @@ def _agent_actor(sid: str | None, agent_id: str | None) -> str:
 
 def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
             stamp: Mapping[str, Any] | None = None, claim: str | None = None,
-            transport: Literal["cli", "mcp"] = "cli", token_file: str | None = None) -> Identity:
+            transport: Literal["cli", "mcp"] = "cli", token_file: str | None = None,
+            machine: Mapping[str, Any] | None = None) -> Identity:
     """Who acts. `env`: the process's environment (default os.environ); `stamp`: the PreToolUse hook's
     `_afc` object of an MCP call; `claim`: the runner actor a runner path wants (runner:<component>),
-    honoured only when no Claude session is in the env; `transport`: "mcp" for the stdio server (always
-    inside a session, whatever its env shows)."""
+    honoured only when no Claude session is in the env; `transport`: "mcp" for the MCP server (always
+    inside a session, whatever its env shows); `machine`: the machine user the HTTP transport already
+    authenticated ({user_id, ...}, K5): the token is not read from `env` then, and `env` is the empty
+    mapping of a remote caller (the server process's own env says nothing about it)."""
     e = os.environ if env is None else env
     if transport == "cli" and not in_claude_session(e):
         return Identity(resolve_plain(claim), "host" if claim is None else "runner")
@@ -255,7 +259,10 @@ def resolve(conn: sqlite3.Connection, env: Mapping[str, str] | None = None, *,
         return Identity(f"task-manager:{sid}", "task-manager", sid, None, None, True, "none", source)
     if driven or manager or _guard(e):
         return Identity(_agent_actor(sid, agent_id), "agent", sid, agent_id, None, True, "none", source)
-    who, token = machine_identity(conn, e, transport, "stdio", token_file)
+    who: Optional[dict[str, Any]] = dict(machine) if machine is not None else None
+    token: TokenState = "valid"
+    if machine is None:
+        who, token = machine_identity(conn, e, transport, "stdio", token_file)
     if who is not None:
         return Identity(f"machine:{who['user_id']}", "machine", sid, agent_id, int(who["user_id"]), False,
                         token, source)

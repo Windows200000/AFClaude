@@ -218,6 +218,34 @@ class Table(Base):
         self.assertEqual(self.resolve(env(DRV, **tok), transport="mcp", stamp={"session": DRV}).actor, f"agent:{DRV}")
         self.assertIsNone(store.get_machine_token(self.conn, 1)["last_seen_at"])   # the token was never even used
 
+    def test_the_hosts_name_comes_from_the_wrapper_inside_a_container(self):
+        """K5: socket.gethostname() is the container's; the host wrapper passes the host's name, and the token's
+        use is recorded and clone-checked under it."""
+        uid, token = self.machine()                       # issued for host-a (gethostname is patched to it)
+        with mock.patch("socket.gethostname", return_value="3f2a9c1b7d4e"):
+            w = self.resolve(env(OWN, AFCLAUDE_MACHINE_TOKEN=token, AFCLAUDE_MACHINE_HOST="Host-A"))
+        self.assertEqual(w.actor, f"machine:{uid}")
+        self.assertEqual(store.get_machine_token(self.conn, 1)["last_hostname"], "Host-A")   # same host, case-folded: no alert
+
+    def test_a_machine_the_transport_authenticated_needs_no_token_in_the_env(self):
+        """K5: the HTTP server hands identity.resolve the machine its bearer check found; the empty env of a remote
+        caller is never read for a token, a session or the guard bypass, and a stamp names the session only."""
+        uid, _ = self.machine()
+        who = {"user_id": uid, "token_id": 1, "label": "host-a"}
+        w = self.resolve({}, transport="mcp", machine=who, stamp={"session": OWN})
+        self.assertEqual((w.actor, w.kind, w.user_id, w.session, w.token, w.autonomous),
+                         (f"machine:{uid}", "machine", uid, OWN, "valid", False))
+        w = self.resolve({}, transport="mcp", machine=who)
+        self.assertEqual((w.actor, w.session), (f"machine:{uid}", None))
+        w = self.resolve({}, transport="mcp", machine=who, stamp={"session": OWN, "agent": "a1"})
+        self.assertEqual((w.actor, w.agent_id), (f"machine:{uid}", "a1"))     # D-336: a subagent is its parent's principal
+        # a stamp naming a session AFClaude knows is ignored in shadow mode (never makes a remote caller a task-manager)
+        for sid in (TM, DRV):
+            w = self.resolve({}, transport="mcp", machine=who, stamp={"session": sid})
+            self.assertEqual((w.actor, w.session), (f"machine:{uid}", None), sid)
+        with mock.patch("identity.ENFORCE_CONFLICTS", True), self.assertRaises(identity.IdentityConflict):
+            self.resolve({}, transport="mcp", machine=who, stamp={"session": TM})
+
 
 class Clear(Base):
     """D-328/D-329: session ids follow the /clear chain; an id outside it is never accepted."""
