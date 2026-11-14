@@ -669,6 +669,21 @@ class Authenticate(Base):
         self.assertTrue(all(r["actor"] == "mcp" and r["via"] == "mcp" for r in rows))
         self.assertNotIn("garbage", json.dumps(rows, default=str))                 # the token never reaches the log
 
+    def test_remote_refusals_write_a_bounded_number_of_rows(self):
+        """H1: nothing the client chooses freely is in the once-an-hour key: 2000 refusals with varying token ids,
+        secrets and host names write one row per reason, plus one per real token and reason."""
+        for i in range(2000):
+            host = f"host-{i}"
+            self.remote(roles.format_token(10_000 + i, roles.new_token_secret()), host)       # unknown id
+            self.remote(f"garbage-{i}", host)                                                   # malformed
+            if i < 20:
+                self.remote(roles.format_token(self.r["token_id"], roles.new_token_secret()), host)   # real id, wrong secret
+                self.remote(self.r["token"], host=None)                                          # real token, no host
+        rows = self.audit("machine.token_refused")
+        keys = sorted(r["after"]["key"] for r in rows)
+        self.assertEqual(len(rows), 4, keys)
+        self.assertEqual([r["target_id"] for r in rows if "-:" in r["after"]["key"]], [None, None])   # unknown ids: no target
+
     def test_remote_audits_a_refusal_once_an_hour_and_again_after(self):
         for _ in range(4):
             self.remote("garbage")

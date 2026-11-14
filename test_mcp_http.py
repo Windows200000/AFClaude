@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -166,12 +167,39 @@ class Http(Base):
         self.assertEqual([r["after"]["refused"] for r in rows], ["token revoked"])
         self.assertEqual(rows[0]["target_id"], str(self.token_id))
 
-    def test_a_refusal_is_audited_once_an_hour_per_token_reason_and_host(self):
-        for _ in range(5):
-            self.assertEqual(self.status(token="garbage").status_code, 401)
+    def test_an_unauthenticated_client_cannot_make_new_audit_rows_with_new_ids_or_hosts(self):
+        for i in range(5):
+            self.assertEqual(self.status(token="garbage", host=f"host-{i}").status_code, 401)
         self.assertEqual(len(self.audit("machine.token_refused")), 1)
-        self.assertEqual(self.status(token="garbage", host="host-b").status_code, 401)
-        self.assertEqual(len(self.audit("machine.token_refused")), 2)
+
+    def test_a_bind_beyond_loopback_needs_roles_on_and_a_bad_public_url_does_not_stop_stdio(self):
+        with self.assertRaises(mcp_http.Refused) as cm:
+            mcp_http.check_bind("0.0.0.0", "shadow")
+        self.assertIn("roles_enforce", str(cm.exception))
+        mcp_http.check_bind("0.0.0.0", "on")
+        for host in ("127.0.0.1", "localhost", "::1"):
+            mcp_http.check_bind(host, "shadow")
+        with self.assertRaises(mcp_http.Refused):
+            mcp_http.serve(ms.server, "0.0.0.0")                     # the live check reads the DB's setting: shadow
+        env = dict(os.environ, AFCLAUDE_PUBLIC_URL="not a url")
+        r = subprocess.run([sys.executable, "-c", "import mcp_server"], cwd=HERE, env=env, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+
+    def test_remote_machine_with_no_request_context_is_no_machine(self):
+        class NoContext:
+            @property
+            def request_context(self):
+                raise ValueError("Context is not available outside of a request")
+        self.assertIsNone(mcp_http.remote_machine(NoContext()))
+        self.assertIsNone(mcp_http.remote_machine(None))
+
+    def test_a_container_side_token_is_refused_for_stdio(self):
+        env = {"AFCLAUDE_IN_CONTAINER": "1", "AFCLAUDE_MACHINE_TOKEN": self.token}
+        with self.assertRaises(mcp_http.Refused):
+            mcp_http.check_stdio_env(env)
+        mcp_http.check_stdio_env({**env, "AFCLAUDE_MACHINE_HOST": "h"})        # the wrapper's call
+        mcp_http.check_stdio_env({"AFCLAUDE_MACHINE_TOKEN": self.token})       # on the host, as before
 
     def test_a_missing_or_bad_host_name_header_is_refused(self):
         self.assertEqual(self.status(host=None).status_code, 401)

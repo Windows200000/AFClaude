@@ -109,9 +109,30 @@ class Build(unittest.TestCase):
         self.token_file(doc={"token": "  "})
         with self.assertRaises(w.Refused):
             self.build({})
+
+    def test_a_link_or_a_writable_directory_is_refused(self):
+        """L5: the checks are on the opened file (no race) and a link is no token file."""
+        real = os.path.join(self.tmp.name, "real.json")
+        with open(os.open(real, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
+            json.dump({"token": TOKEN}, fh)
+        os.symlink(real, self.file)
+        with self.assertRaises(w.Refused) as cm:
+            self.build({})
+        self.assertIn("link", str(cm.exception))
         os.remove(self.file)
-        os.symlink(os.path.join(self.tmp.name, "elsewhere"), self.file)    # a dangling link is no file, not a token
-        self.assertEqual(self.names(self.build({})[0]), ["CLAUDE_PROJECT_DIR"])
+        os.symlink(os.path.join(self.tmp.name, "elsewhere"), self.file)          # dangling
+        with self.assertRaises(w.Refused):
+            self.build({})
+        os.remove(self.file)
+        self.token_file()
+        self.build({})
+        os.chmod(self.tmp.name, 0o770)                                           # others could swap the file
+        try:
+            with self.assertRaises(w.Refused) as cm:
+                self.build({})
+            self.assertIn("directory", str(cm.exception))
+        finally:
+            os.chmod(self.tmp.name, 0o700)
 
 
 class Process(unittest.TestCase):

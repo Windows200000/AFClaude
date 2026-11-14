@@ -4573,20 +4573,25 @@ def record_token_refusal(conn: sqlite3.Connection, token: str, hostname: str | N
                          reason: str) -> bool:
     """A transport refused a bearer token (the HTTP server's 401, D-235: a refusal is audited, never silent):
     one `machine.token_refused` audit row (actor `mcp`: nobody is authenticated; `after` = reason, hostname,
-    transport and a key; the token itself is never stored, only its id when it parses) per token id (or
-    "none"), reason and hostname and hour, so a client that retries every second doesn't fill the log.
-    -> True when a row was written."""
+    transport and a key; the token itself is never stored). The once-an-hour key (REFUSAL_AUDIT_EVERY) holds
+    nothing the client chooses freely: a token whose id names no machine token (malformed, unknown id, wrong
+    secret of an unknown id) is keyed by the reason alone, one row an hour for all of them, however many ids or
+    host names an unauthenticated client tries; a real token id (wrong secret, revoked, no or bad host name) is
+    keyed by that id and the reason, so the rows are bounded by the tokens that exist. The check reads the
+    audit_log_actor index (actor `mcp`). -> True when a row was written."""
     try:
-        token_id: int | None = roles.parse_token(token)[0]
+        parsed: int | None = roles.parse_token(token)[0]
     except ValueError:
-        token_id = None
+        parsed = None
+    known = parsed is not None and store.get_machine_token(conn, parsed) is not None
+    token_id = parsed if known else None
     host = None if hostname is None else str(hostname)[:HOSTNAME_MAX]
-    key = f"token-refused:{token_id or 'none'}:{reason}:{(host or '-').casefold()}"
+    key = f"token-refused:{token_id or '-'}:{reason}"
     since = store.iso_ms(store._utcnow() - REFUSAL_AUDIT_EVERY)
 
     def record() -> bool:
         with store.transaction(conn):
-            if store.refusal_audited_since(conn, key, since):
+            if store.refusal_audited_since(conn, key, since, actor="mcp"):
                 return False
             store.add_audit(conn, "mcp", "mcp", "machine.token_refused", "machine_token", token_id, None,
                             {"refused": reason, "key": key, "hostname": host, "transport": transport})

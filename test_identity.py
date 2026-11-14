@@ -195,6 +195,21 @@ class Table(Base):
         self.assertEqual(len(logs.output), 1)                              # D-235: visible, once
         self.assertIn("mode 0600", logs.output[0])
 
+    def test_a_linked_file_or_a_writable_directory_is_not_used(self):
+        """L5: no symlink (opened with O_NOFOLLOW, checks on the open file), no directory others can write."""
+        uid, token = self.machine()
+        d = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(d, 0o700)
+        real, link = os.path.join(d, "real.json"), os.path.join(d, "machine.json")
+        with open(os.open(real, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
+            json.dump({"token": token}, fh)
+        os.symlink(real, link)
+        self.assertEqual(self.resolve(env(OWN), token_file=link).token, "insecure-file")
+        self.assertEqual(self.resolve(env(OWN), token_file=real).actor, f"machine:{uid}")
+        os.chmod(d, 0o770)
+        self.assertEqual(self.resolve(env(OWN), token_file=real).token, "insecure-file")
+        os.chmod(d, 0o700)
+
     def test_a_revoked_or_unknown_token_is_no_machine_identity(self):
         uid, token = self.machine()
         bad = [("unknown", "afcm_999_" + "0" * 64), ("garbage", "not-a-token")]

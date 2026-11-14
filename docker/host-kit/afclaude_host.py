@@ -16,7 +16,8 @@ socket.gethostname() is the container's, which would trip the two-hostname alert
 It refuses (exit 2, a message, nothing run: D-235) rather than passes: any `AFCLAUDE_*` variable in the caller's
 environment other than AFCLAUDE_AGENT_ID and AFCLAUDE_MACHINE_FILE (an `AFCLAUDE_DB` or a token in the env would
 otherwise be dropped silently while the caller believes it took effect; the token has one source, the file), and
-a token file that is not a regular file of this user with mode 0600 or holds no token. No token file is the
+a token file that is a link, not a regular file of this user with mode 0600 in a directory only this user can
+write, or holds no token. No token file is the
 host's own session (D-330): nothing is passed for it.
 
 Part of the host kit (§3.2), source file afclaude_host.py (it is installed under the name `afclaude`; the repo has an afclaude.py of its own); stdlib only, Python 3.9 compatible (the host's python3). Not installed by the
@@ -58,13 +59,19 @@ def read_token(env: Mapping[str, str]) -> Optional[str]:
     has no token, is refused."""
     path = env.get(FILE_VAR) or os.path.expanduser(DEFAULT_TOKEN_FILE)
     try:
-        st = os.stat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)      # a link is refused; the checks are on the open file
     except FileNotFoundError:
         return None
-    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid():
-        raise Refused("afclaude: the machine token file %s is not a regular file of this user with mode 0600: fix it "
-                      "(chmod 600) or re-register the machine" % path)
-    with open(path) as fh:
+    except OSError as e:
+        raise Refused("afclaude: the machine token file %s cannot be opened without following a link: %s"
+                      % (path, e.strerror))
+    with os.fdopen(fd) as fh:
+        st = os.fstat(fh.fileno())
+        dir_mode = os.stat(os.path.dirname(os.path.abspath(path))).st_mode
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != os.getuid() or dir_mode & 0o022:
+            raise Refused("afclaude: the machine token file %s is not a regular file of this user with mode 0600 in a "
+                          "directory only this user can write: fix it (chmod 600, chmod go-w the directory) or "
+                          "re-register the machine" % path)
         try:
             doc = json.load(fh)
         except ValueError as e:

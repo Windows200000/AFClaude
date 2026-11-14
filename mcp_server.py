@@ -98,22 +98,24 @@ class AFClaudeServer(MCPServer[Any]):
     machine an HTTP call's token authenticated into REMOTE."""
 
     async def call_tool(self, name: str, arguments: dict[str, Any], context: Any = None) -> Any:
-        token = STAMP.set(arguments.pop(identity.STAMP_KEY, None))
-        remote = REMOTE.set(mcp_http.remote_machine(context))
+        tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
         try:
+            tokens.append((STAMP, STAMP.set(arguments.pop(identity.STAMP_KEY, None))))
+            tokens.append((REMOTE, REMOTE.set(mcp_http.remote_machine(context))))
             return await super().call_tool(name, arguments, context)
         finally:
-            REMOTE.reset(remote)
-            STAMP.reset(token)
+            for var, tok in reversed(tokens):
+                var.reset(tok)
 
 
-# token_verifier + auth settings are what the HTTP transport (`serve`) uses; the stdio server ignores them.
+# token_verifier + auth settings are what the HTTP transport (`serve`) uses (the SDK wants both at construction;
+# `serve` replaces the placeholder settings, which read no env); the stdio server ignores them.
 server = AFClaudeServer(
     name="afclaude",
     instructions=INSTRUCTIONS,
     log_level="WARNING",
     token_verifier=mcp_http.MachineTokenVerifier(),
-    auth=mcp_http.auth_settings(),
+    auth=mcp_http.auth_settings(mcp_http.placeholder_url()),
 )
 
 
@@ -946,10 +948,15 @@ def main(argv: list[str]) -> int:
     sv.add_argument("--port", type=int, default=mcp_http.DEFAULT_PORT)
     sv.add_argument("--public-url", default=None, help="the URL clients reach this server at (default: AFCLAUDE_PUBLIC_URL)")
     args = ap.parse_args(argv)
-    if args.mode == "serve":
-        mcp_http.serve(server, args.host, args.port, args.public_url)
-    else:
-        server.run("stdio")
+    try:
+        if args.mode == "serve":
+            mcp_http.serve(server, args.host, args.port, args.public_url)
+        else:
+            mcp_http.check_stdio_env(os.environ)
+            server.run("stdio")
+    except mcp_http.Refused as e:
+        print(f"afclaude mcp: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
