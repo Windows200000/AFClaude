@@ -531,7 +531,7 @@ def deliver(conn: Any, m: dict[str, Any], now: datetime, verify: Callable[..., A
         cwd = ka.session_cwd(path)
         try:
             msg, ids = build(conn, m, plan, cwd)
-            offset = os.path.getsize(path)
+            offset = ka.file_size(path)
             rc, out, err = ka.fire(sid, cwd, msg, plan, driver="owner", prompt="inbox", actor=ACTOR)   # usage split S2
         except Exception as e:   # noqa: BLE001 - an error on the message (D-235)
             failed(conn, m, "inbox message not delivered", f"{type(e).__name__}: {e}")

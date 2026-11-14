@@ -93,7 +93,6 @@ run picks it up), a one-off one (its `at` job is used up) is reported and must b
 again.
 """
 import argparse
-import glob
 import json
 import os
 import re
@@ -471,9 +470,9 @@ def session_idle(sid, now, idle=None):
     path = ka.transcript_path(sid)
     if not path:
         return False
-    files = [path] + glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
+    files = [path] + ka.subagent_files(path)
     try:
-        last = max(os.path.getmtime(f) for f in files if os.path.exists(f))
+        last = max(ka.file_mtime(f) for f in files if os.path.exists(f))
     except ValueError:
         return False
     return now - datetime.fromtimestamp(last, UTC) >= idle
@@ -523,8 +522,8 @@ def agent_running(path, now):
             pending = int(e.get("pendingBackgroundAgentCount") or 0)
     if pending is not None:
         return pending > 0
-    subs = glob.glob(os.path.join(path[:-len(".jsonl")], "subagents", "*.jsonl"))
-    newest = max((os.path.getmtime(f) for f in subs if os.path.exists(f)), default=None)
+    subs = ka.subagent_files(path)
+    newest = max((ka.file_mtime(f) for f in subs if os.path.exists(f)), default=None)
     return newest is not None and now - datetime.fromtimestamp(newest, UTC) < ka.SUBAGENT_QUIET
 
 

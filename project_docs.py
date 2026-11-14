@@ -64,6 +64,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import host  # noqa: E402  (repo_dir: the host path of this checkout)
 import store  # noqa: E402  (reads)
+import txsource  # noqa: E402  (the reader switch, K4: the doc files through the host kit)
 import actions  # noqa: E402  (every write)
 
 FILES = (("progress", "PROGRESS.md"), ("goals", "GOALS.md"), ("exceptions", "EXCEPTIONS.md"),
@@ -87,6 +88,25 @@ def read_text(path: str) -> Optional[str]:
     except FileNotFoundError:
         return None
     return data.decode("utf-8")
+
+
+def host_doc_texts(directory: str) -> Optional[dict[str, Optional[str]]]:
+    """AFCLAUDE_READERS=bridge (txsource.py, plan §3.4): the build-log files (PROGRESS.md, GOALS.md, EXCEPTIONS.md) of
+    the project directory `directory` on the host, read with one `doc-files read` ({file name: text, None when
+    the host has no such file}); a bridge failure raises (D-235). None in mount mode: the files are read
+    from the path. ALERTS.md, the legacy file the kit cannot read, counts as missing in bridge mode."""
+    if not txsource.bridge_on():
+        return None
+    return txsource.read_docs(directory, tuple(fname for name, fname in FILES if name in BUILD_LOG))
+
+
+def file_text(name: str, path: str, host_texts: Optional[dict[str, Optional[str]]]) -> Optional[str]:
+    """The text of doc `name`'s file: from the bridge's answer `host_texts` for a repo file (host_doc_texts),
+    else read_text(path) (the reviews are in the data dir, readable in both modes)."""
+    fname = dict(FILES).get(name)
+    if host_texts is not None and fname is not None:
+        return host_texts.get(fname)
+    return read_text(path)
 
 
 def doc_files(repo: str, reviews_dir: Optional[str]) -> list[tuple[str, str]]:
@@ -138,6 +158,7 @@ def import_all(db_path: Optional[str] = None, repo: Optional[str] = None, review
     conn = store.connect(db_path)
     try:
         p = resolve_project(conn, project, repo, lookup)
+        host_texts = host_doc_texts(lookup)
         docs: dict[str, Any] = {}
         totals = {"files": 0, "imported": 0, "merged": 0, "in_sync": 0, "db_ahead": 0, "conflict": 0,
                   "missing": 0, "entries_added": 0, "unverified": 0}
@@ -147,7 +168,7 @@ def import_all(db_path: Optional[str] = None, repo: Optional[str] = None, review
             except ValueError as e:
                 docs[name] = {"file": path, "outcome": "skipped", "error": str(e)}
                 continue
-            text = read_text(path)
+            text = file_text(name, path, host_texts)
             if text is None:
                 docs[name] = {"file": path, "outcome": "missing"}
                 totals["missing"] += 1
@@ -315,11 +336,12 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
         p = resolve_project(conn, project, repo, lookup)
         files: dict[str, Any] = {}
         ok = True
+        host_texts = host_doc_texts(lookup)
         for name, fname in FILES:
             if name not in BUILD_LOG:
                 continue
             path = os.path.join(repo, fname)
-            on_disk = read_text(path)
+            on_disk = file_text(name, path, host_texts)
             rep: dict[str, Any] = {"file": path}
             if on_disk is not None and not check:
                 r = _sync(conn, p["name"], name, on_disk, actor, via, False)
@@ -348,6 +370,10 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
                 rep["result"] = ("the file changed since the last sync: the export imports it first" if edited
                                  else "would write")
             else:
+                if host_texts is not None:
+                    raise txsource.TxError(f"the export would write {fname} on the host, which only the host wrapper "
+                                           "may do (plan §3.4: not built yet); run it with AFCLAUDE_READERS=mount "
+                                           "on the host, or --check")
                 _write_atomic(path, text)
                 actions.perform(conn, "doc.sync", {"project": p["name"], "name": name, "text": text},
                                 actor=actor, via=via)          # in sync now: moves the mark

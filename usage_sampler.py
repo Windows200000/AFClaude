@@ -58,6 +58,7 @@ from zoneinfo import ZoneInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache parsing, scrubbed env)
+import txsource  # noqa: E402  (the reader switch, K4: AFCLAUDE_READERS=bridge reads the transcripts through the kit)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
 import limit_ratio  # noqa: E402  (session->weekly ratio snapshot, kept per-sample)
 import usage_stale  # noqa: E402  (stale /usage cache: rows marked, consumers ignore them)
@@ -324,10 +325,11 @@ def scan(st, baseline, problems=None):
 
 def _scan(st, baseline, problems, offsets, sessions, agg, seen_ids, typed):
     now = now_utc()
-    paths = glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True)
+    sizes = txsource.scan_listing(PROJECTS, False) if txsource.bridge_on() else None
+    paths = list(sizes) if sizes is not None else glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True)
     for path in sorted(paths, key=lambda p: (session_of(p)[1], p)):
         try:
-            size = os.path.getsize(path)
+            size = sizes[path] if sizes is not None else os.path.getsize(path)
         except OSError:
             continue
         off = offsets.get(path, 0)
@@ -337,9 +339,12 @@ def _scan(st, baseline, problems, offsets, sessions, agg, seen_ids, typed):
             continue
         sid, is_sub = session_of(path)
         meta = sessions.setdefault(sid, {})
-        with open(path, "rb") as fh:
-            fh.seek(off)
-            chunk = fh.read(size - off)
+        if sizes is not None:
+            chunk = txsource.read_scan_chunk(PROJECTS, path, off, size)
+        else:
+            with open(path, "rb") as fh:
+                fh.seek(off)
+                chunk = fh.read(size - off)
         # only consume complete lines
         last_nl = chunk.rfind(b"\n")
         if last_nl < 0:

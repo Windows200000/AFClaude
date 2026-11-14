@@ -50,7 +50,7 @@ import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +63,7 @@ import proposals  # noqa: E402
 import runner_state  # noqa: E402
 import schedule  # noqa: E402
 import store  # noqa: E402
+import txsource  # noqa: E402  (the reader switch, K4: a mirrored transcript is brought up to date before it is read)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -307,6 +308,10 @@ def hold_until(m: dict[str, Any], cfg: schedule.Config | None = None) -> datetim
 def seen(path: str, offset: int, mark: str) -> bool:
     """`mark` is in what the transcript `path` got after `offset` (an unreadable file: not seen)."""
     try:
+        if txsource.bridge_on():             # a bridge failure is not an OSError: it raises (D-235)
+            import keepalive      # (keepalive imports inbox)
+            refresh: Callable[[str], str] = getattr(keepalive, "refresh")   # keepalive.py is untyped
+            path = refresh(path)      # a stored host-form path is mapped to its mirror (M2)
         with open(path, "rb") as fh:
             fh.seek(offset)
             return mark.encode() in fh.read()

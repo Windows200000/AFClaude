@@ -4,6 +4,7 @@
 commands, host.py's kit check and gate, the legacy bridge (docker/host_exec.py: pinned, still served and
 accepted by the image until the owner's install), and docker/install_host_bridge.sh against a temporary HOME (the real authorized_keys and kit are never
 touched). Nothing here signals a process or runs claude/tmux."""
+import base64
 import hashlib
 import importlib.util
 import io
@@ -29,7 +30,7 @@ INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
 # the current kit version with its whitelist hash and the sha256 of each kit file: a command added, or a change of
 # host_exec.py or ka_resume.sh, without a version bump fails test_whitelist_hash_matches_the_version and
 # test_kit_files_are_pinned_with_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS; M5)
-KIT_VERSIONS = {"4": {"whitelist": "2d289ec6ac9ab583", "host_exec.py": "64c136ad9e74c5bef0f9dd23da0a08328d3132ac11f15091a556e0fc4a50dc7a",  # public-check: allow (sha256 pin)
+KIT_VERSIONS = {"6": {"whitelist": "69a25c72326e80b0", "host_exec.py": "7e9475ef2c98640ea64b40cce493a12c3e074e8cddcfe72518072d736ea02a03",  # public-check: allow (sha256 pin)
                         "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af"}}  # public-check: allow (sha256 pin)
 SID = "abcdef01-0000-4000-8000-000000000001"
 
@@ -147,7 +148,7 @@ class HostJson(TempDir):
     def share(self):
         """host.json's own directory, as <share>/afclaude: a kit file path below it, so KIT_DIR/../.. is it."""
         share = os.path.join(self.tmp, "share")
-        kit = os.path.join(share, "host-kit", "4")
+        kit = os.path.join(share, "host-kit", "6")
         os.makedirs(kit)
         for name in ("host_exec.py", "ka_resume.sh"):
             shutil.copy(os.path.join(os.path.dirname(HOST_EXEC) if name == "host_exec.py" else HERE, name), kit)
@@ -704,7 +705,7 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "4"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
@@ -722,7 +723,7 @@ class InstallScript(unittest.TestCase):
         the link are back, nothing is left over."""
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "4"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real, once = shutil.which("mv"), os.path.join(self.tmp, "mv-failed")
@@ -1020,8 +1021,8 @@ class LegacyBridge(unittest.TestCase):
     def test_a_new_kit_command_is_known_to_the_legacy_list(self):
         he = load_he(os.devnull)
         self.assertEqual(set(he.COMMANDS) - host.LEGACY_HEADS,
-                         {"kit-version", "host-config", "transcripts", "sessions", "doc-files", "tmux-check", "df",
-                          "clock"}, "a new kit command: the pre-kit bridge denies it (rc 126 not whitelisted -> HostKitError)")
+                         {"kit-version", "host-config", "transcripts", "transcript-read", "sessions", "doc-files", "tmux-check",
+                          "df", "clock"}, "a new kit command: the pre-kit bridge denies it (rc 126 not whitelisted -> HostKitError)")
 
     def test_the_runner_shapes_are_accepted_by_the_legacy_bridge(self):
         shapes = ([["tmux", verb, *rest] for verb, rest in (
@@ -1249,6 +1250,68 @@ class KitReads(TempDir):
         for bad in ({"default": other}, {"X": other}, {"a": "rel"}, {"a": other + "/"}, ["a"]):
             write_json(self.hj, self.config(config_dirs=bad))
             self.assertEqual(self.call("kit-version").returncode, 126, bad)
+
+    def test_transcript_read_ranges(self):
+        """kit version 5 (6 hardened it): a byte range of one transcript, base64, with the file's size and mtime now."""
+        raw = "".join(json.dumps(self.user(f"m{i}")) + "\n" for i in range(50))
+        path = self.tx("a.jsonl", [], raw=raw, mtime=4000)
+        data = raw.encode()
+        r = self.ok_json("transcript-read default -w-p/a.jsonl 0 100")
+        self.assertEqual((r["size"], r["mtime"], r["offset"], base64.b64decode(r["data"])), (len(data), 4000.0, 0, data[:100]))
+        r = self.ok_json(f"transcript-read default -w-p/a.jsonl 100 {len(data)}")
+        self.assertEqual(base64.b64decode(r["data"]), data[100:])
+        r = self.ok_json(f"transcript-read default -w-p/a.jsonl {len(data) + 5} 10")      # beyond the end: size says so
+        self.assertEqual((r["size"], r["data"]), (len(data), ""))
+        sub = os.path.join(self.cdir, "projects", "-w-p", "subagents", "agent-1.jsonl")
+        with open(sub, "w") as fh:
+            fh.write("x\n")
+        self.assertEqual(base64.b64decode(self.ok_json("transcript-read default -w-p/subagents/agent-1.jsonl 0 9")["data"]), b"x\n")
+        self.assertEqual(path, os.path.join(self.cdir, "projects", "-w-p", "a.jsonl"))
+
+    def test_transcript_read_refusals(self):
+        self.tx("a.jsonl", [self.user("one")])
+        os.symlink(os.path.join(self.cdir, "projects", "-w-p", "a.jsonl"), os.path.join(self.cdir, "projects", "-w-p", "link.jsonl"))
+        os.symlink(os.path.join(self.cdir, "projects", "-w-p"), os.path.join(self.cdir, "projects", "-w-q"))
+        os.symlink(self.root, os.path.join(self.cdir, "projects", "esc"))
+        open(os.path.join(self.root, "x.jsonl"), "w").write("secret\n")
+        os.mkdir(os.path.join(self.cdir, "projects", "-w-p", "dir.jsonl"))
+        self.tx("notes.txt", [], raw="no")
+        for cmd in ("transcript-read", "transcript-read default", "transcript-read default -w-p/a.jsonl 0",
+                    "transcript-read default -w-p/a.jsonl x 10", "transcript-read default -w-p/a.jsonl 0 0",
+                    f"transcript-read default -w-p/a.jsonl 0 {1024 * 1024 + 1}", "transcript-read default -w-p/a.jsonl -1 10",
+                    "transcript-read default -w-p/a.jsonl 0 10 extra", "transcript-read default ../a.jsonl 0 10",
+                    "transcript-read default -w-p/../-w-p/a.jsonl 0 10", "transcript-read default /etc/passwd 0 10",
+                    "transcript-read default -w-p/notes.txt 0 10", "transcript-read default -w-p/a.jsonl/ 0 10",
+                    "transcript-read default -w-p/link.jsonl 0 10", "transcript-read default -w-q/a.jsonl 0 10",
+                    "transcript-read default esc/x.jsonl 0 10", "transcript-read default -w-p/dir.jsonl 0 10",
+                    "transcript-read default -w-p/missing.jsonl 0 10", "transcript-read nope -w-p/a.jsonl 0 10",
+                    "transcript-read default -w-p//a.jsonl 0 10", "transcript-read default ./a.jsonl 0 10"):
+            r = self.call(cmd)
+            self.assertEqual(r.returncode, 126, (cmd, r.stdout[:80]))
+            self.assertNotIn(b"secret", r.stdout)
+        self.assertIn(b"No such file", self.call("transcript-read default -w-p/missing.jsonl 0 10").stderr)
+
+    def test_transcript_read_hardening(self):
+        """L1-L3 of the K4b review: a FIFO named *.jsonl answers a denial at once (the open does not wait), Unicode
+        digits are a denial (not a traceback), a hard link is refused; the listing leaves out names transcript-read
+        cannot serve."""
+        proj = os.path.join(self.cdir, "projects", "-w-p")
+        self.tx("a.jsonl", [self.user("one")])
+        os.mkfifo(os.path.join(proj, "fifo.jsonl"))
+        open(os.path.join(self.root, "secret.jsonl"), "w").write("secret\n")
+        os.link(os.path.join(self.root, "secret.jsonl"), os.path.join(proj, "hard.jsonl"))
+        self.tx("odd name.jsonl", [self.user("two")])
+        for cmd in ("transcript-read default -w-p/fifo.jsonl 0 10", "transcript-read default -w-p/hard.jsonl 0 10",
+                    "transcript-read default -w-p/a.jsonl \u00b2 10", "transcript-read default -w-p/a.jsonl 0 \u0661\u0660",
+                    "transcript-read default -w-p/a.jsonl 12345678901234567 10"):
+            r = self.call(cmd)
+            self.assertEqual(r.returncode, 126, cmd)
+            self.assertNotIn(b"Traceback", r.stderr)
+            self.assertNotIn(b"secret", r.stdout)
+        listed = [f["path"] for f in self.ok_json("transcripts default --changed-since 0 --head 0 --tail 0")["files"]]
+        self.assertNotIn("-w-p/odd name.jsonl", listed)
+        self.assertIn("-w-p/a.jsonl", listed)
+        self.assertEqual(self.he.UINT.match("\u00b2"), None)
 
     def test_transcripts_near_misses(self):
         for cmd in ("transcripts", "transcripts default", "transcripts default --changed-since",
