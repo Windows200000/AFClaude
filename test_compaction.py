@@ -237,6 +237,12 @@ class Env(unittest.TestCase):
         if kind == "notification":
             e = entry("user", t, origin={"kind": "task-notification"},
                       message={"role": "user", "content": "<task-notification><task-id>a1</task-id></task-notification>"})
+        elif kind == "notice-only":   # 12.11.: a hand-back turn, answered, then a transcript-only notice
+            self.write([entry("user", t, isMeta=True, origin={"kind": "peer", "from": "a1"},
+                              message={"role": "user", "content": "Another Claude session sent a message: report"}),
+                        assistant(t, text="the worker's report again")], "a")
+            e = entry("user", t, origin={"kind": "task-notification"}, queueTranscriptOnly=True, promptSource="system",
+                      message={"role": "user", "content": "<task-notification><task-id>a1</task-id></task-notification>"})
         elif kind == "handback":
             e = entry("user", t, isMeta=True, origin={"kind": "peer", "from": "a1", "handback": True},
                       message={"role": "user", "content": "Another Claude session sent a message: report"})
@@ -1203,6 +1209,41 @@ class MidRunWithSubagents(Env):
         self.assertEqual(rec["status"], "compacted", rec.get("error"))
         self.assertEqual([m[:len(REFRESH)] for _, m in self.sent][1], REFRESH)
         self.assertIn("a queued message", self.sent[1][1])
+
+    def test_a_transcript_only_notice_after_the_handoff_is_no_running_turn(self):
+        """12.11. (progress #1073): after HANDOFF SAVED a worker's hand-back started a short turn,
+        then its completion notice was written transcript-only (queueTranscriptOnly: no turn of its
+        own) and the session sat idle. That notice used to read as a turn still running, so the
+        /clear failed as turn-busy 10 min later and paused automation. Now the session is idle: the
+        hand-off is asked for again once (input reached it after the hand-off) and it is cleared."""
+        ka.COMPACT_TURN_WAIT = timedelta(0)        # no waiting: the session must read as idle at once
+        self.after_save = [("notice-only", 0)]
+        d, rec = self.compact()
+        self.assertEqual(rec["status"], "compacted", rec.get("error"))
+        self.assertEqual([m[:len(REFRESH)] for _, m in self.sent][1], REFRESH)
+        self.assertIn("a subagent's message and a task notification (from ", self.sent[1][1])
+        self.assertEqual([m for _, m in self.sent][2], "/clear")
+        self.assertEqual(len(rec["steps"]["save"]["refreshes"]), 1)
+        self.assertFalse(self.paused()["paused"])
+        self.assertEqual(self.alerts, [])
+
+    def test_session_idle_looks_past_a_transcript_only_entry(self):
+        t = datetime.now(UTC)
+        note = {"origin": {"kind": "task-notification"}, "message": {"role": "user", "content": "<task-notification>"}}
+        self.write([assistant(t, text="done"), entry("user", t, queueTranscriptOnly=True, **note)])
+        self.make_old()
+        self.assertTrue(ka.session_idle(self.path))
+        self.assertTrue(ka.replied_since(self.path, t))
+        self.write([assistant(t, text="done"), entry("user", t, **note)])   # a notification that starts a turn
+        self.make_old()
+        self.assertFalse(ka.session_idle(self.path))
+
+    def test_transcript_only_notices_after_every_refresh_still_fail(self):
+        """The refreshes stay bounded (HANDOFF_REFRESHES, D-234/D-235): input after every hand-off fails."""
+        self.after_save = [("notice-only", 0)] * (ka.HANDOFF_REFRESHES + 1)
+        d, rec = self.compact()
+        CompactionFailures.assert_failed(self, rec, "new input kept reaching the session after its hand-off",
+                                         [SAVE] + [REFRESH] * ka.HANDOFF_REFRESHES)
 
     def test_the_turn_wait_timing_out_fails_as_before(self):
         """D-234/D-235: the turn still running after COMPACT_TURN_WAIT: no /compact, recorded,

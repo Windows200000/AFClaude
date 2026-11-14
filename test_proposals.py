@@ -342,12 +342,14 @@ class ReviewGuards(Proposals):
     """Opus review of part 1: owner_only holds on the approval path, an agent never reviews, every audit row
     of an applied proposal names it."""
 
-    def test_approving_cannot_get_an_owner_only_write_through_for_an_autonomous_reviewer(self):
-        self.go_on()
+    def test_in_shadow_approving_cannot_get_an_owner_only_write_through_for_an_autonomous_reviewer(self):
+        """Shadow: the old owner_only rule holds on the approval path (A7: with `on` the matrix alone decides, see
+        the next test)."""
         params = {"project": self.A, "name": "project_notes", "value": "from the agent"}
         with self.assertRaises(actions.Forbidden):                  # the autonomous task-manager is refused directly
             self.as_tm("prompt_var.set", **params)
-        pid = self.propose("prompt_var.set", **params)
+        pid = store.add_proposal(self.conn, self.A, None, self.agent, "prompt_var.set", params, None, "pv")["id"]
+        self.conn.commit()
         with self.assertRaisesRegex(actions.Forbidden, "autonomous"):
             self.as_tm("proposal.review", proposal_id=pid, decision="approve")
         self.assertEqual(store.get_proposal(self.conn, pid)["status"], "proposed")      # rolled back, still open
@@ -355,6 +357,18 @@ class ReviewGuards(Proposals):
         actions.perform(self.conn, "proposal.review", {"proposal_id": pid, "decision": "approve"}, actor="cli",
                         via="cli")
         self.assertEqual(store.get_proposal(self.conn, pid)["status"], "approved")
+
+    def test_with_on_the_matrix_decides_alone_for_the_task_manager_and_its_reviews_d283_d197(self):
+        """A7: prompt variables are a project write the matrix gives the task-manager (D-197): direct and as the
+        reviewer of an agent's proposal; the old owner_only rule is not consulted any more."""
+        self.go_on()
+        params = {"project": self.A, "name": "project_notes", "value": "from the agent"}
+        pid = self.propose("prompt_var.set", **params)
+        self.as_tm("proposal.review", proposal_id=pid, decision="approve")
+        self.assertEqual(store.get_proposal(self.conn, pid)["status"], "approved")
+        self.as_tm("prompt_var.set", **dict(params, value="by the task-manager"))
+        with self.assertRaises(actions.Forbidden):                  # what the matrix refuses stays refused
+            self.as_tm("setting.set", key="session_hours", value=3.0)
 
     def test_an_agent_cannot_review_even_in_shadow(self):
         pid = store.add_proposal(self.conn, self.A, None, self.agent, "task.edit", {"task_id": self.task}, None, "x").get("id")

@@ -41,7 +41,7 @@ ROUTES: dict[str, Route] = {
     "mcp": Route("mcp_server.py", help="the MCP server: stdio (the default) | serve (HTTP, the mcp service)"),
     "web": Route("web.py", unbuffered=True, help="the web service: serve | health (/health and the inbox API on a unix socket)"),
     "tasks": Route("tasks.py", help="the task store CLI (projects, tasks, decisions, docs, questions, ...)"),
-    "machine": Route("tasks.py", ("machine",), help="machine users: code | register | list | rename | revoke"),
+    "machine": Route("tasks.py", ("machine",), help="machine users: code | register | register-host (on the host, not here) | list | rename | revoke"),
 }
 # `afclaude hook <name>`: the session hooks the repo's .claude/settings.json runs (K5 moves them here).
 HOOKS: dict[str, Route] = {

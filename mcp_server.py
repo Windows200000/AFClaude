@@ -74,10 +74,10 @@ INSTRUCTIONS = (
     "high stages (by project rank, then stage), then medium, then low. Times are Europe/Berlin. "
     "The server resolves who calls (D-195, D-330): a machine user (one per machine, granted by an owner), a "
     "task-manager or an agent session; until this host's machine user is registered, its interactive sessions "
-    "count as the owner. An agent's write beyond its own task, hand-off and alerts is stored as a proposal for "
+    "(and their subagents, D-336) count as the owner. An agent's write beyond its own task, hand-off and alerts is stored as a proposal for "
     "its project's task-manager and answers {\"proposed\": true, \"proposal_id\": N, \"status\": \"proposed\", "
     "\"message\": \"proposed as P-N, waiting for the task-manager's review (nothing was changed): ...\"}: not an "
-    "error (with roles in shadow mode the write still applies).")
+    "error (while `tasks.py roles mode` says shadow, the write still applies).")
 
 # The identity hook's stamp on the call being served (identity_hook.py adds `_afc` to the arguments of every
 # afclaude call; the SDK would drop the unknown argument before a tool runs, so call_tool takes it out first).
@@ -591,13 +591,13 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
         conn.close()
 
 
-@tool("Write your compaction hand-off (D-144): when the AFClaude keep-alive asks you to save your work before "
-      "a compaction, record a SHORT structured note for your compacted self; it is injected into the continue "
-      "message after the compaction. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
-      "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); lessons; "
+@tool("Write your hand-off (D-144/D-328): when the AFClaude keep-alive asks you to save your work before "
+      "a /clear, record a SHORT structured note for your cleared self; it is given back right after. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
+      "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); "
+      "held_workers (D-340: '<agent id>: <task>, branch <b>' each); lessons; "
       "working_notes (exact commands, gotchas; carried over, drop_working_notes: numbers of obsolete ones; a "
-      "`tests:` note is required); open_question_ids (AFClaude task ids of open questions for the "
-      "user); notes. session: your "
+      "`tests:` note is required); open_question_ids (AFClaude task ids of open "
+      "questions); notes. session: your "
       "full session id (default: this session's, when the client passes it). A newer hand-off replaces the "
       "older one. Returns the stored hand-off's id.")
 async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_progress: Optional[list[str]] = None,
@@ -606,10 +606,10 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
                            working_notes: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
                            notes: Optional[str] = None, session: Optional[str] = None,
                            project: Optional[str] = None, drop_working_notes: Optional[list[int]] = None,
-                           ctx: Optional[Context] = None) -> str:
+                           held_workers: Optional[list[str]] = None, ctx: Optional[Context] = None) -> str:
     body: dict[str, Any] = {"summary": summary, "done": done or [], "in_progress": in_progress or [],
                             "next_steps": next_steps or [], "owner_messages": owner_messages or [],
-                            "in_flight": in_flight or [], "lessons": lessons or [],
+                            "in_flight": in_flight or [], "held_workers": held_workers or [], "lessons": lessons or [],
                             "working_notes": working_notes or [], "open_question_ids": open_question_ids or [],
                             "notes": notes, "drop_working_notes": drop_working_notes or []}
     project = await resolve_dir_arg(ctx, project)

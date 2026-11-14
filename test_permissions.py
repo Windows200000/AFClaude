@@ -82,7 +82,7 @@ CLASSES = [
     (["doc.sync"], exp("AAAARRARARRRA")),
     (["user_model.set", "cost_model.set"], exp("AARRRRRRRRRRA")),
     (["automation.set"], exp("AARRRRRRRRARA")),                       # paused=False: a pause clear (D-283)
-    (["automation.set_project"], exp("AARRRRRRARRRA")),
+    (["automation.set_project"], exp("AAARRRRRARRRA")),               # D-335: the project's manager; tm: a clear only
     (["machine.register", "machine.seen"], exp("AAAAAAAAAAAAA")),
     (["auth.session_login", "auth.session_rotate", "auth.session_logout"], exp("AAAAAARRRRRRR")),
 ]
@@ -296,6 +296,27 @@ class Rules(Base):
         self.assertEqual(self.outcome("automation.set_project", "tm_own", paused=False), "allowed")
         self.assertEqual(self.outcome("automation.set_project", "tm_own", paused=True), "refused")
         self.assertEqual(self.outcome("automation.set_project", "tm_other", paused=False), "refused")
+
+    def test_the_projects_manager_pauses_and_resumes_its_project_d335(self):
+        for paused in (True, False):
+            self.assertEqual(self.outcome("automation.set_project", "manager", paused=paused, reason="r"),
+                             "allowed", paused)
+            self.assertEqual(self.outcome("automation.set_project", "owner", paused=paused, reason="r"), "allowed")
+            for who in ("editor", "viewer", "none", "machine_granted", "machine_ungranted"):
+                self.assertEqual(self.outcome("automation.set_project", who, paused=paused, reason="r"), "refused",
+                                 (who, paused))
+        # only its own project: alpha's manager has nothing on beta
+        self.assertEqual(self.outcome("automation.set_project", "manager", project="beta", paused=True), "refused")
+        # the install-wide pause stays the owner's (the AFClaude task-manager's clear aside, D-283)
+        self.assertEqual(self.outcome("automation.set", "manager", paused=True), "refused")
+        self.assertEqual(self.outcome("automation.set", "manager", paused=False), "refused")
+
+    def test_an_editor_cannot_edit_a_project_d334(self):
+        """Name, path and the task-manager session stay manager-only: an editor is refused, a manager allowed."""
+        for who in ("editor", "viewer", "none", "machine_granted", "agent"):
+            self.assertNotEqual(self.outcome("project.edit", who, name="x", path="/x"), "allowed", who)
+        self.assertEqual(self.outcome("project.edit", "editor"), "refused")
+        self.assertEqual(self.outcome("project.edit", "manager"), "allowed")
 
     def test_agent_direct_writes_and_proposals(self):
         t = self.task

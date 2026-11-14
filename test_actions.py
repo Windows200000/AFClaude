@@ -1405,7 +1405,8 @@ class Handoffs(Base):
         self.assertEqual(self.audit()[-1]["action"], "handoff.write")
         h2 = self.do("handoff.write", session_id=SID, body=json.dumps({"summary": "later"}))   # JSON text too
         self.assertEqual(h2["body"], {"summary": "later", "done": [], "in_progress": [], "next_steps": [],
-                                      "owner_messages": [], "in_flight": [], "lessons": [], "working_notes": [],
+                                      "owner_messages": [], "in_flight": [], "held_workers": [], "lessons": [],
+                                      "working_notes": [],
                                       "open_question_ids": [], "notes": None})
         for bad, msg in (({"done": ["x"]}, "summary is required"), ({"summary": "s", "colour": 1}, "unknown"),
                          ({"summary": "s", "done": [1]}, "must be a string"),
