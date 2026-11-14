@@ -52,6 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (detection)
 import store  # noqa: E402
+import txsource  # noqa: E402  (the reader switch, K4: AFCLAUDE_READERS=bridge)
 import usage_sampler as us  # noqa: E402  (own-session markers)
 
 UTC = timezone.utc
@@ -204,6 +205,7 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
     t0 = time.monotonic()
     own_conn = conn is None
     conn = conn or store.connect()
+    bridge = txsource.use_bridge(projects_dir, ka.PROJECTS_DIR)      # an explicit other projects dir raises in bridge mode (L7)
     projects_dir = projects_dir or ka.PROJECTS_DIR
     own_list = own_list or OWN_LIST
     st = {"files": 0, "changed": 0, "rescanned": 0, "bytes": 0, "new_hits": 0, "new_sessions": 0}
@@ -211,11 +213,12 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
     now = store.iso(datetime.now(UTC))
     pending = []
     flushed_at = time.monotonic()
-    for path in transcripts(projects_dir):
+    sizes = txsource.scan_listing(projects_dir, True) if bridge else None
+    for path in (sorted(sizes) if sizes is not None else transcripts(projects_dir)):
         st["files"] += 1
         sid = os.path.basename(path)[:-len(".jsonl")]
         try:
-            size = os.path.getsize(path)
+            size = sizes[path] if sizes is not None else os.path.getsize(path)
         except OSError:
             continue
         row = known.get(sid)
@@ -232,9 +235,12 @@ def scan(conn: sqlite3.Connection | None = None, projects_dir: str | None = None
             row = dict(row, **RESET_ON_RESCAN)
             upd.update(RESET_ON_RESCAN)
             st["rescanned"] += 1
-        with open(path, "rb") as fh:
-            fh.seek(off)
-            chunk = fh.read(size - off)
+        if sizes is not None:
+            chunk = txsource.read_scan_chunk(projects_dir, path, off, size)
+        else:
+            with open(path, "rb") as fh:
+                fh.seek(off)
+                chunk = fh.read(size - off)
         last_nl = chunk.rfind(b"\n")
         hits = []
         if last_nl >= 0:
