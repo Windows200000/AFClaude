@@ -161,13 +161,17 @@ def to_local(text: str) -> str:
 def ssh_argv(remote):
     """The ssh command that asks the host's host_exec.py to run `remote` (an argv list).
     sshd hands the joined string to the forced command as $SSH_ORIGINAL_COMMAND,
-    which host_exec.py splits again with shlex (never a shell)."""
+    which host_exec.py splits again with shlex (never a shell). The multiplexing socket's name carries a hash of
+    the key path: ssh's %C hashes host, port and user but not the key, so a master opened with another key
+    (the pre-kit bridge's) would otherwise carry this call to that key's forced command."""
     e = os.environ.get
-    return ["ssh", "-T", "-i", e("AFCLAUDE_BRIDGE_KEY", "/run/secrets/host_bridge_ed25519"),
+    key = e("AFCLAUDE_BRIDGE_KEY", "/run/secrets/host_bridge_ed25519")
+    tag = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return ["ssh", "-T", "-i", key,
             "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
             "-o", "UserKnownHostsFile=" + e("AFCLAUDE_BRIDGE_KNOWN_HOSTS", os.path.expanduser("~/.ssh/known_hosts")),
             "-o", "HostKeyAlias=afclaude-host", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
-            "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/afclaude-ssh-%C", "-o", "ControlPersist=60",
+            "-o", "ControlMaster=auto", "-o", f"ControlPath=/tmp/afclaude-ssh-{tag}-%C", "-o", "ControlPersist=60",
             f"{e('AFCLAUDE_BRIDGE_USER', 'opc')}@{e('AFCLAUDE_BRIDGE_HOST', 'host.docker.internal')}",
             "--", shlex.join(remote)]
 

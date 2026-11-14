@@ -223,6 +223,17 @@ class SshArgv(unittest.TestCase):
         # host_exec.py splits $SSH_ORIGINAL_COMMAND with shlex: it must get the argv back unchanged
         self.assertEqual(shlex.split(a[-1]), remote)
 
+    def test_the_multiplexing_socket_depends_on_the_key(self):
+        """%C ignores the key: a master of the pre-kit key must never carry a call made with the kit's key."""
+        paths = []
+        for key in ("/run/secrets/host_bridge_ed25519", "/app/data/bridge/host_bridge_ed25519"):
+            with Env(AFCLAUDE_BRIDGE_KEY=key):
+                a = host.ssh_argv(["clock"])
+            paths.append(a[a.index("ControlMaster=auto") + 2])
+        self.assertTrue(all(p.startswith("ControlPath=/tmp/afclaude-ssh-") and p.endswith("-%C") for p in paths), paths)
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertLess(max(len(p) for p in paths) - len("ControlPath=") - 2 + 40, 104)   # %C = 40 hex; sun_path limit
+
 
 class RunOnHost(unittest.TestCase):
     def setUp(self):
