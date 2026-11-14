@@ -82,7 +82,9 @@ def _safe_extract(tar: tarfile.TarFile, dest: str) -> None:
         target = os.path.abspath(os.path.join(dest_abs, member.name))
         if target != dest_abs and not target.startswith(dest_abs + os.sep):
             raise NodeSetupError(f"refusing to extract {member.name!r}: escapes {dest}")
-    tar.extractall(dest_abs)
+    # filter="data" also drops the archive's owner: with the owner kept, a root that cannot map the archive's uid
+    # (`unshare -Ur`) fails the chown, and tarfile then skips the chmod, so node came out without its exec bits
+    tar.extractall(dest_abs, filter="data")
 
 
 def ensure(*, force: bool = False) -> NodeBin:
