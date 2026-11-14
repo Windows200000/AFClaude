@@ -56,6 +56,8 @@ store.DB_PATH = DB
 store.NOTIFY = lambda subject, body="": "test: not sent"   # a DB-error alert never pushes / writes the alerts doc
 import notify  # noqa: E402
 notify.push = lambda text: "test: push not sent"   # an alert (failstop.fail, keepalive.alert) never runs claude
+import hostcheck  # noqa: E402
+hostcheck.pre_start = lambda conn: None   # a window start in a test never runs the host checks over a bridge (test_hostcheck calls run_pre_start)
 _conn = store.connect(DB, create=True)   # explicit, like a real install's setup: an empty DB, no
                                          # "no database" log line from the settings reads
 # the task-manager registry (phase 3b S3, projects.manager_session) holds the synthetic identity SID, as

@@ -162,6 +162,24 @@ def proposal_alert_tick() -> str:
 
 FUNCTIONS["proposal_alert"] = ("proposal_alert.log", proposal_alert_tick)
 
+
+def host_check_tick() -> str:
+    """Phase 5b K6 (§3.6): every scheduled host check (hostcheck.run_job), recorded in host_checks. A failing
+    blocking check pauses and alerts through failstop inside it (the runner then records the failure as
+    reported); no host kit installed yet is one warn and nothing else (the transitional mode, hostcheck.NO_KIT)."""
+    hostcheck: Any = importlib.import_module("hostcheck")
+    import store
+    conn = store.connect()
+    try:
+        line = str(hostcheck.run_job(conn))
+    finally:
+        conn.close()
+    print(line)
+    return line
+
+
+FUNCTIONS["host_check"] = ("host_check.log", host_check_tick)
+
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
 # legacy mode's worker thread (gone since S9).
 INBOX_LOG = "inbox_worker.log"
@@ -242,8 +260,18 @@ def window_start_inner() -> dict[str, timedelta]:
 
 
 def window_start_min_timeout() -> timedelta:
-    """The least outer timeout of a window start: its inner timeouts + OUTER_MARGIN."""
+    """The least outer timeout of a window start (also of a run-now request that continues a task-manager as a
+    start does): its inner timeouts + OUTER_MARGIN."""
     return sum(window_start_inner().values(), timedelta(0)) + OUTER_MARGIN
+
+
+def window_start_job_min_timeout() -> timedelta:
+    """The least outer timeout of the window_start job: the start's, plus the blocking host checks it runs first
+    (phase 5b K6: keepalive.window_start_pass -> hostcheck.pre_start, each check at its budget; of the acts only
+    deferred_start runs them, for a start postponed for a database problem in them: act_inner; the requests
+    that continue a task-manager do not)."""
+    pre = timedelta(seconds=float(importlib.import_module("hostcheck").PRE_START_WORST_CASE))
+    return window_start_min_timeout() + pre
 
 
 # ---- the ticks' inner timeouts (S3: a tick's outer timeout is above their sum + TICK_MARGIN)
@@ -303,6 +331,7 @@ TICK_CONSTANTS: dict[str, tuple[tuple[str, str], ...]] = {
     # sender's host call (the bridge's ssh timeout), then the poll for the thread's reply
     "dispatcher": (("rc_continue", "SEND_TIMEOUT"), ("rc_continue", "VERIFY_SECONDS")),
     "usage_review": (("usage_review", "LOCK_WAIT"),),      # waits this long for another pass
+    "host_check": (("hostcheck", "RUN_WORST_CASE"),),      # every check at its own budget (seconds)
 }
 TICK_MARGIN = timedelta(minutes=1)
 
@@ -350,7 +379,10 @@ COMPACTION_HOST_CALLS: tuple[tuple[str, int, int], ...] = (("fire", 120, 3),)
 def act_inner(job: str) -> dict[str, timedelta]:
     """{what: worst-case time} of one run of the act `job` (a start or the compaction)."""
     if job in START_ACTS:
-        return window_start_inner()
+        out = window_start_inner()
+        if job == "deferred_start":   # a start postponed for a database problem in its host checks runs them first (K6)
+            out["hostcheck:pre_start"] = timedelta(seconds=float(importlib.import_module("hostcheck").PRE_START_WORST_CASE))
+        return out
     if job != "compaction":
         raise KeyError(f"{job} is not an act")
     ka = importlib.import_module("keepalive")
