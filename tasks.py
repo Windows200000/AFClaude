@@ -48,10 +48,13 @@ stalled sessions, on store.py's SQLite DB (data/afclaude.db).
     tasks.py inbox retry ID                send a failed message again (triage / delivery)
     tasks.py handoff write --session S --json BODY [--project P]   a compaction hand-off (D-144):
                                            BODY = JSON {summary, done, in_progress, next_steps,
-                                           owner_messages, in_flight, lessons, working_notes,
-                                           drop_working_notes, open_question_ids, notes}
+                                           owner_messages, in_flight, held_workers, lessons,
+                                           working_notes, drop_working_notes, open_question_ids, notes}
                                            ("-" = read it from stdin)
     tasks.py handoff show [--session S] [--all] [--json]   the latest hand-off (--all: recent ones)
+    tasks.py worker hold ID... | go ID...|--all | wait [ID] [--max S] | list
+                                           hold background workers' reports across the hand-off + /clear
+                                           (D-340, worker_hold.py): wait exits 0 = report now, 3 = still held
     tasks.py proposals [--project P] [--all | --status S] [--shadow] [--show ID]   agents' proposals for the
                                            task-manager (phase 5a A4, D-182): the open ones (proposed +
                                            postponed); --all: every one incl. the decided; --shadow: also the
@@ -169,6 +172,7 @@ import manager_launch  # noqa: E402  (D-260: the task-manager launch choices)
 import identity  # noqa: E402  (phase 5a A2: who is acting)
 import proposals  # noqa: E402  (phase 5a A4: the run summary text)
 import delivery  # noqa: E402  (phase 5a A5: run summaries into the task-manager's context)
+import worker_hold  # noqa: E402  (D-340: hold workers across the hand-off + /clear)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -1415,13 +1419,26 @@ def parser():
     q = hs.add_parser("write", help="save a hand-off for your compacted self (prints HANDOFF SAVED)")
     q.add_argument("--session", required=True, help="the writing session (full id or unique prefix)")
     q.add_argument("--json", dest="body", required=True, metavar="BODY",
-                   help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, lessons, "
+                   help="JSON {summary, done, in_progress, next_steps, owner_messages, in_flight, held_workers "
+                        "(D-340: '<agent id>: <task>, branch <b>' per worker held for the /clear), lessons, "
                         "working_notes, drop_working_notes (numbers of earlier notes that no longer hold; the last "
                         "hand-off's working notes are carried over), open_question_ids, notes}; - = stdin")
     q.add_argument("--project", help="name or directory (default: the project the session manages)")
     q = hs.add_parser("show", parents=[js], help="the latest hand-off")
     q.add_argument("--session", help="only this session's (id or unique prefix)")
     q.add_argument("--all", action="store_true", help="the recent ones, newest first")
+    p = sub.add_parser("worker", help="hold background workers' reports across the hand-off + /clear (D-340)")
+    wks = p.add_subparsers(dest="worker_cmd", required=True)
+    q = wks.add_parser("hold", help="the task-manager, before its hand-off: hold these workers")
+    q.add_argument("ids", nargs="+", metavar="AGENT_ID")
+    q = wks.add_parser("go", help="the task-manager, after the /clear: release them")
+    q.add_argument("ids", nargs="*", metavar="AGENT_ID")
+    q.add_argument("--all", action="store_true", help="every held worker")
+    q = wks.add_parser("wait", help="the worker, before its final report: exit 0 = send it now, 3 = still held "
+                                    "(run it again)")
+    q.add_argument("id", nargs="?", metavar="AGENT_ID", help="your agent id (default: $AFCLAUDE_AGENT_ID)")
+    q.add_argument("--max", type=float, default=worker_hold.WAIT_MAX, help="seconds to poll (default %(default)s)")
+    wks.add_parser("list", help="the held workers")
     p = sub.add_parser("automation", help="the automation pause (D-234/D-235): status | resume | pause")
     ats = p.add_subparsers(dest="automation_cmd")
     ats.add_parser("status", parents=[js], help="paused or not, why, since when; every paused project (the default)")
@@ -1674,6 +1691,8 @@ def delivery_notice(conn, args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.cmd == "worker":   # no connection: a waiting worker holds none
+        return worker_hold.cli(args, args.db or store.DB_PATH)
     if args.cmd == "run-hook" and hook_is_inert(args):
         return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
     if args.cmd == "run-hook" and args.hook == "deliver":

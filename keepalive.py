@@ -3811,7 +3811,7 @@ def compact_resume_text(sid, save, trigger="run-end", progress=None, comp=None):
         raise failstop.Failed("the saved hand-off was not found",
                               f"hand-off #{want} was saved, but the latest unconsumed one of {sid[:8]} is "
                               + (f"#{h['id']}" if h else "none"))
-    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress,
+    return load_prompt("compact_resume").format(handoff=store.render_handoff(h), progress=progress, tasks=TASKS_PY,
                                                 when=TRIGGER_TEXT[trigger][1], compaction=reset_text(comp)), h
 
 
