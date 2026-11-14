@@ -591,13 +591,13 @@ async def afclaude_rule(action: Literal["add", "list", "rm"], scope: Optional[Li
         conn.close()
 
 
-@tool("Write your compaction hand-off (D-144): when the AFClaude keep-alive asks you to save your work before "
-      "a compaction, record a SHORT structured note for your compacted self; it is injected into the continue "
-      "message after the compaction. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
-      "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); lessons; "
+@tool("Write your hand-off (D-144/D-328): when the AFClaude keep-alive asks you to save your work before "
+      "a /clear, record a SHORT structured note for your cleared self; it is given back right after. summary (2-3 sentences, required); done, in_progress, next_steps (lists of "
+      "short items); owner_messages (verbatim); in_flight (exact branches, worktrees, commits, paths); "
+      "held_workers (D-340: '<agent id>: <task>, branch <b>' each); lessons; "
       "working_notes (exact commands, gotchas; carried over, drop_working_notes: numbers of obsolete ones; a "
-      "`tests:` note is required); open_question_ids (AFClaude task ids of open questions for the "
-      "user); notes. session: your "
+      "`tests:` note is required); open_question_ids (AFClaude task ids of open "
+      "questions); notes. session: your "
       "full session id (default: this session's, when the client passes it). A newer hand-off replaces the "
       "older one. Returns the stored hand-off's id.")
 async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_progress: Optional[list[str]] = None,
@@ -606,10 +606,10 @@ async def afclaude_handoff(summary: str, done: Optional[list[str]] = None, in_pr
                            working_notes: Optional[list[str]] = None, open_question_ids: Optional[list[int]] = None,
                            notes: Optional[str] = None, session: Optional[str] = None,
                            project: Optional[str] = None, drop_working_notes: Optional[list[int]] = None,
-                           ctx: Optional[Context] = None) -> str:
+                           held_workers: Optional[list[str]] = None, ctx: Optional[Context] = None) -> str:
     body: dict[str, Any] = {"summary": summary, "done": done or [], "in_progress": in_progress or [],
                             "next_steps": next_steps or [], "owner_messages": owner_messages or [],
-                            "in_flight": in_flight or [], "lessons": lessons or [],
+                            "in_flight": in_flight or [], "held_workers": held_workers or [], "lessons": lessons or [],
                             "working_notes": working_notes or [], "open_question_ids": open_question_ids or [],
                             "notes": notes, "drop_working_notes": drop_working_notes or []}
     project = await resolve_dir_arg(ctx, project)
