@@ -37,7 +37,9 @@ unittest / claude process (any bridge call, including a plain usage read) still 
 the runner container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` (services: compose.services.yml and its overrides) with
 AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README and the AFClaude project's deploy_rule
 say to run it; the image has no .git, so without this the build commit is unknown).
-Exit 1 (no rebuild, nothing drained, even with --force) when AFCLAUDE_SCHEDULER (the environment,
+Exit 1 (no rebuild, nothing drained, even with --force) when the layout's compose file uses the host kit's bridge
+key and the installed kit (its own kit-version answer, run on this host as sshd runs it) has another version or
+other kit files than the code being deployed (check_host_kit; the owner re-runs the install first), and when AFCLAUDE_SCHEDULER (the environment,
 else docker/.env, else compose's default off) is neither runner nor off: phase 3a S9 removed `on` and
 `legacy`, and the new entrypoint would only alert and idle. Exit 1 (no rebuild) inside the start guard (checked before the drain and again before the
 rebuild) or if draining or clearing timed out; an aborted deploy lifts its drain again. 4) wait for the three
@@ -59,6 +61,7 @@ from typing import Callable, List, Optional, Tuple
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 import runner  # noqa: E402  (drain)
+import host  # noqa: E402  (the kit files and HOST_KIT_VERSION of the code being deployed)
 import schedule  # noqa: E402
 import store  # noqa: E402
 
@@ -267,6 +270,71 @@ def check_old_container() -> bool:
     return False
 
 
+# A compose file whose container uses the host kit's bridge key (the install's copy in <data>/bridge/): its host
+# calls go to the installed kit. A non-comment line only; the pre-kit compose.yml (the rollback) has none.
+KIT_KEY_RE = re.compile(r"(?m)^[ \t]*AFCLAUDE_BRIDGE_KEY:[ \t]*/app/data/bridge/")
+KIT_TIMEOUT = 30                              # seconds for the installed kit's kit-version answer
+INSTALL_HINT = ("re-run the host kit install on the host with the options of the first install "
+                "(docker/install_host_bridge.sh --root <working root> [--from <subnet>], README \"Host kit\")")
+
+
+def kit_mode(lay: str) -> bool:
+    """True when the layout's compose file gives the container the host kit's bridge key."""
+    with open(COMPOSE_FILE if lay == "single" else COMPOSE_SERVICES, encoding="utf-8") as fh:
+        return bool(KIT_KEY_RE.search(fh.read()))
+
+
+def installed_kit_exec() -> str:
+    """<share>/afclaude/host-kit/current/host_exec.py, the share directory as docker/install_host_bridge.sh picks it."""
+    share = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(share, "afclaude", "host-kit", "current", "host_exec.py")
+
+
+def installed_kit_answer(run: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run) -> dict:
+    """The installed kit's own `kit-version` answer, asked on this host exactly as sshd runs the forced command
+    (SSH_ORIGINAL_COMMAND set, which also makes the kit ignore its test overrides). RuntimeError when the kit is
+    missing, refuses, times out or does not answer the JSON (D-234/D-235: the caller refuses the deploy)."""
+    path = installed_kit_exec()
+    if not os.path.isfile(path):
+        raise RuntimeError(f"no host kit installed at {path}")
+    env = dict(os.environ, SSH_ORIGINAL_COMMAND="kit-version")
+    try:
+        r = run([path], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=KIT_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"{path} kit-version: {e}")
+    if r.returncode != 0:
+        raise RuntimeError(f"{path} kit-version failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[:300]!r}")
+    try:
+        info = json.loads(r.stdout)
+    except ValueError as e:
+        raise RuntimeError(f"{path} kit-version answered no JSON ({e}): {r.stdout[:200]!r}")
+    if not isinstance(info, dict) or not isinstance(info.get("kit_version"), str):
+        raise RuntimeError(f"{path} kit-version answered no kit_version: {r.stdout[:200]!r}")
+    return info
+
+
+def check_host_kit(lay: str, answer: Callable[[], dict] = installed_kit_answer) -> bool:
+    """False (printed why) when the layout uses the host kit and the code being deployed has other kit files
+    (docker/host-kit/host_exec.py, ka_resume.sh) or another HOST_KIT_VERSION than the installed kit: the new
+    container's host check would fail at once and pause every start (K6, review:k6-fixes) until the owner
+    re-runs the install. Not in kit mode (the pre-kit compose.yml): True, nothing asked."""
+    if not kit_mode(lay):
+        return True
+    try:
+        info = answer()
+    except RuntimeError as e:
+        print(f"deploy refused: the {lay} layout uses the host kit, but {e}: {INSTALL_HINT}. Nothing was drained.")
+        return False
+    mine = {"kit_version": host.HOST_KIT_VERSION, "files": host.kit_source_hashes()}
+    theirs = {"kit_version": info.get("kit_version"), "files": info.get("files")}
+    if mine == theirs:
+        return True
+    print(f"deploy refused: the installed host kit is not the one this code needs (installed {theirs!r}, this code "
+          f"{mine!r}): the new container's host check would pause every start. First {INSTALL_HINT}, then deploy. "
+          "Nothing was drained.")
+    return False
+
+
 def compose_command(*tail: str, lay: str = DEFAULT_LAYOUT) -> List[str]:
     """`docker compose -f docker/compose.yml <tail>` (single); services: `-f docker/compose.services.yml [-f
     docker/<override>] ...`, the overrides named by AFCLAUDE_COMPOSE_OVERRIDES (comma-separated file names in
@@ -354,6 +422,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not check_scheduler_mode():             # before anything: --force does not skip it
         return 1
     if lay == "services" and (check_data() is None or not check_old_container()):
+        return 1
+    if not check_host_kit(lay):              # --force does not skip it either: the start would pause, not race
         return 1
     if not check_start_guard(args.force):
         return 1

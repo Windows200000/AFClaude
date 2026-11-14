@@ -13,6 +13,14 @@ sys.path.insert(0, os.path.join(HERE, "tools"))
 import deploy  # noqa: E402
 import schedule  # noqa: E402
 
+CHECK_HOST_KIT = deploy.check_host_kit      # KitGuardTest's; every other test runs main() without asking a kit
+
+
+def setUpModule():
+    p = mock.patch.object(deploy, "check_host_kit", return_value=True)
+    p.start()
+    unittest.addModuleCleanup(p.stop)
+
 HEADER = "PID                 COMMAND"
 IDLE = [HEADER,
        "1       /usr/bin/tini -- /usr/local/bin/afclaude-entrypoint",
@@ -20,7 +28,7 @@ IDLE = [HEADER,
        "3       python3 -u /mnt/BlockVolume/Claude/work/AFClaude/inbox_api.py serve",
        "4       ssh: /tmp/afclaude-ssh-deadbeef [mux]"]
 SAMPLER = IDLE + ["5       flock -n data/.sampler.lock python3 /mnt/BlockVolume/Claude/work/AFClaude/usage_sampler.py"]
-BRIDGE_CALL = IDLE + ["6       ssh -T -i /run/secrets/host_bridge_ed25519 -o ControlMaster=auto -- "
+BRIDGE_CALL = IDLE + ["6       ssh -T -i /app/data/bridge/host_bridge_ed25519 -o ControlMaster=auto -- "
                      "claude -p --no-session-persistence --permission-mode dontAsk /usage"]
 UNITTEST = IDLE + ["7       python3 -m unittest test_keepalive"]
 REVIEW = IDLE + ["8       python3 /mnt/BlockVolume/Claude/work/AFClaude/usage_review.py"]
@@ -535,6 +543,100 @@ class HostPythonImportTest(unittest.TestCase):
         r = subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(os.path.abspath(__file__)),
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr[-800:])
+
+
+
+class KitGuardTest(unittest.TestCase):
+    """review:k6-fixes (a): in kit mode a deploy whose kit files or HOST_KIT_VERSION differ from the installed
+    kit's own kit-version answer is refused before anything is drained (the new container's blocking kit check
+    would pause every start until the owner re-runs the install)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="deploy-kit-"))
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def mine(self, **kw):
+        info = {"kit_version": deploy.host.HOST_KIT_VERSION, "files": deploy.host.kit_source_hashes(),
+                "commands": [], "whitelist_hash": "x"}
+        info.update(kw)
+        return info
+
+    def test_both_layouts_are_in_kit_mode_and_the_pre_kit_compose_is_not(self):
+        self.assertTrue(deploy.kit_mode("single"))
+        self.assertTrue(deploy.kit_mode("services"))
+        old = os.path.join(self.tmp, "compose.yml")
+        with open(old, "w") as fh:
+            fh.write("services:\n  afclaude:\n    environment:\n      # AFCLAUDE_BRIDGE_KEY: /app/data/bridge/k (a comment)\n"
+                     "    volumes:\n      - ${AFCLAUDE_HOST_REPO}/docker/secrets/host_bridge_ed25519:/run/secrets/host_bridge_ed25519:ro\n")
+        with mock.patch.object(deploy, "COMPOSE_FILE", old):
+            self.assertFalse(deploy.kit_mode("single"))
+            self.assertTrue(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=AssertionError("not asked"))))
+
+    def test_the_same_kit_passes(self):
+        self.assertTrue(CHECK_HOST_KIT("single", answer=lambda: self.mine()))
+
+    def test_another_version_or_other_files_refuse_naming_the_install(self):
+        files = dict(deploy.host.kit_source_hashes(), **{"ka_resume.sh": "0" * 64})
+        for info in (self.mine(kit_version="5"), self.mine(files=files), self.mine(files=None)):
+            with mock.patch("builtins.print") as out:
+                self.assertFalse(CHECK_HOST_KIT("services", answer=lambda: info), info)
+            text = " ".join(str(c.args[0]) for c in out.call_args_list)
+            self.assertIn("install_host_bridge.sh", text)
+            self.assertIn("Nothing was drained", text)
+
+    def test_a_kit_that_does_not_answer_refuses(self):
+        with mock.patch("builtins.print") as out:
+            self.assertFalse(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=RuntimeError("no host kit installed"))))
+        self.assertIn("install_host_bridge.sh", out.call_args[0][0])
+
+    def test_main_refuses_before_the_drain_even_with_force(self):
+        with mock.patch.object(deploy, "check_host_kit", return_value=False), \
+             mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "layout", return_value="single"), \
+             mock.patch.object(deploy, "check_start_guard", side_effect=AssertionError("refused before")), \
+             mock.patch.object(deploy.runner, "drain", side_effect=AssertionError("nothing drained")):
+            self.assertEqual(deploy.main(["--force"]), 1)
+
+    def test_the_installed_kit_is_asked_as_sshd_runs_it(self):
+        """The real kit file, installed into a temp share directory with its host.json: its answer is this code's."""
+        import json
+        import shutil
+        kit = os.path.join(self.tmp, "share", "afclaude", "host-kit", "current")
+        os.makedirs(kit)
+        for name, rel in deploy.host.KIT_FILES:
+            shutil.copy(os.path.join(HERE, rel), os.path.join(kit, name))
+        os.chmod(os.path.join(kit, "host_exec.py"), 0o755)
+        root, data = os.path.join(self.tmp, "root"), os.path.join(self.tmp, "data")
+        os.makedirs(root)
+        os.makedirs(data)
+        hj = os.path.join(self.tmp, "share", "afclaude", "host.json")
+        with open(hj, "w") as fh:
+            json.dump({"format": 2, "roots": [root], "repo": HERE, "claude": "/usr/bin/true", "data": data}, fh)
+        os.chmod(hj, 0o600)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": os.path.join(self.tmp, "share"),
+                                          "AFCLAUDE_HOST_JSON": "/nonexistent"}):   # ignored, as under sshd
+            info = deploy.installed_kit_answer()
+            self.assertTrue(CHECK_HOST_KIT("single"))
+        self.assertEqual((info["kit_version"], info["files"]), (deploy.host.HOST_KIT_VERSION, deploy.host.kit_source_hashes()))
+
+    def test_the_answer_errors(self):
+        import subprocess
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": os.path.join(self.tmp, "none")}), \
+                self.assertRaisesRegex(RuntimeError, "no host kit installed"):
+            deploy.installed_kit_answer()
+        kit = os.path.join(self.tmp, "afclaude", "host-kit", "current")
+        os.makedirs(kit)
+        open(os.path.join(kit, "host_exec.py"), "w").close()
+        answers = (FakeCompleted("", 126, "host_exec: denied (host config)"), FakeCompleted("not json"),
+                   FakeCompleted("[]"), subprocess.TimeoutExpired("k", 30), OSError("exec format"))
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": self.tmp}):
+            for a in answers:
+                run = mock.Mock(side_effect=a) if isinstance(a, BaseException) else mock.Mock(return_value=a)
+                with self.assertRaises(RuntimeError, msg=a):
+                    deploy.installed_kit_answer(run=run)
+                self.assertEqual(run.call_args.kwargs["env"]["SSH_ORIGINAL_COMMAND"], "kit-version")
+                self.assertEqual(run.call_args.kwargs["timeout"], deploy.KIT_TIMEOUT)
 
 
 if __name__ == "__main__":
