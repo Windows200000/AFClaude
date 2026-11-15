@@ -624,7 +624,7 @@ RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "ru
 # row per check (name), always the latest result, replaced by each run: the history is the app_log line every
 # run writes. status skip = not run (a check it depends on failed, or no host kit is installed yet: the
 # transitional mode of docs/phase5b_plan.md §3.6); since = when the check last changed status (an episode's
-# start); kit_version = the host kit's version when it ran (NULL: unknown / none installed). Written only
+# start; a skip is no result, it neither starts nor ends an episode, put_host_check); kit_version = the host kit's version when it ran (NULL: unknown / none installed). Written only
 # through actions.hostcheck_put (runner actors; like the status snapshot, no audit_log row per run, D-256).
 HOST_CHECKS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS host_checks (
@@ -638,7 +638,8 @@ CREATE TABLE IF NOT EXISTS host_checks (
     kit_version TEXT,
     blocking    INTEGER NOT NULL DEFAULT 0,
     alerted_at  TEXT,                    -- UTC, when this episode (`since`) of a fail was alerted; NULL: not yet
-    version     INTEGER NOT NULL DEFAULT 0
+    version     INTEGER NOT NULL DEFAULT 0,
+    episode_status TEXT                  -- the episode's status: = status, but a skip row keeps the one it interrupted
 );
 CREATE TRIGGER IF NOT EXISTS host_checks_version AFTER UPDATE ON host_checks FOR EACH ROW
 WHEN NEW.version IS OLD.version
@@ -1160,6 +1161,9 @@ COLUMNS = {
     # override (no row) / no prompt_defaults row yet for that name; else 0 (matches) or 1 (the
     # default moved on since this override was made).
     "prompt_overrides": [("base_outdated", "INTEGER")],
+    # K6 review L3: the status of the episode `since` / `alerted_at` belong to (a skip carries the one it
+    # interrupted; NULL on a row from before the column = its status). In HOST_CHECKS_SCHEMA too
+    "host_checks": [("episode_status", "TEXT")],
     # §7.7 switch: the file's text at the sync mark, the base of the 3-way merge when the file
     # (hand edits) and the DB (doc.append/doc.set) both changed since (actions.doc_sync).
     "docs": [("file_text", "TEXT")],
@@ -4071,18 +4075,25 @@ def put_snapshot(conn: sqlite3.Connection, section: str, account_id: str, *, sta
 
 def put_host_check(conn: sqlite3.Connection, name: str, *, status: str, detail: str, fix: str, ran_at: str,
                    duration_ms: int, kit_version: str | None, blocking: bool) -> str | None:
-    """Insert or replace the check's row; `since` and `alerted_at` stay while the status does not change (a new
-    status starts a new episode, not alerted yet). -> the episode's alerted_at (None: not alerted)."""
-    old = conn.execute("SELECT status, since, alerted_at FROM host_checks WHERE name=?", (name,)).fetchone()
-    same = old is not None and old["status"] == status
+    """Insert or replace the check's row. The episode rule (K6 review L3): an episode is a run of results with
+    one status; `since` (its start), `alerted_at` and `episode_status` stay while it lasts. A skip is no result
+    (the check did not run): it neither starts nor ends an episode, the skip row carries the episode it
+    interrupted, so fail, skip, fail is one fail episode (alerted once) and ok, skip, ok one ok episode. A result
+    with another status than the episode's starts a new one, not alerted yet; a skip with no episode before it
+    starts a skip episode. -> the episode's alerted_at (None: not alerted)."""
+    old = conn.execute("SELECT status, since, alerted_at, episode_status FROM host_checks WHERE name=?",
+                       (name,)).fetchone()
+    episode = None if old is None else (old["episode_status"] or old["status"])
+    same = old is not None and (status == "skip" or episode == status)
     since = old["since"] if same else ran_at
     alerted_at = old["alerted_at"] if same else None
+    episode = episode if same else status
     conn.execute("INSERT INTO host_checks(name, status, detail, fix, ran_at, since, duration_ms, kit_version, blocking, "
-                 "alerted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+                 "alerted_at, episode_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
                  "status=excluded.status, detail=excluded.detail, fix=excluded.fix, ran_at=excluded.ran_at, "
                  "since=excluded.since, duration_ms=excluded.duration_ms, kit_version=excluded.kit_version, "
-                 "blocking=excluded.blocking, alerted_at=excluded.alerted_at",
-                 (name, status, detail, fix, ran_at, since, duration_ms, kit_version, int(blocking), alerted_at))
+                 "blocking=excluded.blocking, alerted_at=excluded.alerted_at, episode_status=excluded.episode_status",
+                 (name, status, detail, fix, ran_at, since, duration_ms, kit_version, int(blocking), alerted_at, episode))
     return None if alerted_at is None else str(alerted_at)
 
 
