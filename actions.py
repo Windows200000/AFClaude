@@ -5455,7 +5455,7 @@ def hostcheck_put(conn: sqlite3.Connection, results: Sequence[Mapping[str, Any]]
     detail, fix, duration_ms, kit_version, blocking}, all in one transaction. Runner rows like snapshot_put
     (actor and via, or the `afclaude host check` CLI; no audit_log row: an hourly run plus one per window start would be a dozen rows each for
     values that are replaced; the run's app_log line is the history, D-256). -> {name: when the check's current
-    episode was alerted (None: not yet; a new status is a new episode)}, which the caller reads to alert once per
+    episode was alerted (None: not yet; a new status is a new episode, a skip keeps the one it interrupts)}, which the caller reads to alert once per
     episode (hostcheck_alerted marks it, whoever wrote the row: a fail the CLI recorded first is still alerted)."""
     _check_writer(actor, via, store.DEFAULT_ACCOUNT)
     if not (actor.startswith("runner") or via == "cli"):
