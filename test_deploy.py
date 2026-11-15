@@ -573,6 +573,32 @@ class KitGuardTest(unittest.TestCase):
             self.assertFalse(deploy.kit_mode("single"))
             self.assertTrue(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=AssertionError("not asked"))))
 
+    def compose_with(self, line):
+        path = os.path.join(self.tmp, "compose.yml")
+        with open(path, "w") as fh:
+            fh.write("services:\n  afclaude:\n    environment:\n" + line)
+        return mock.patch.object(deploy, "COMPOSE_FILE", path)
+
+    def test_a_key_set_by_interpolation_refuses_the_deploy_instead_of_skipping_the_guard(self):
+        for line in ("      AFCLAUDE_BRIDGE_KEY: ${KEY_DIR}/host_bridge_ed25519\n",
+                     "      AFCLAUDE_BRIDGE_KEY: \"${AFCLAUDE_BRIDGE_KEY:-/app/data/bridge/k}\"\n",
+                     "      - AFCLAUDE_BRIDGE_KEY=$KEY\n"):
+            with self.compose_with(line):
+                with self.assertRaises(deploy.KitModeUnknown):
+                    deploy.kit_mode("single")
+                with mock.patch("builtins.print") as out:
+                    self.assertFalse(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=AssertionError("asked"))), line)
+                self.assertIn("Nothing was drained", out.call_args[0][0])
+                self.assertIn("interpolation", out.call_args[0][0])
+
+    def test_other_literal_forms_of_the_key_are_read(self):
+        with self.compose_with("      - AFCLAUDE_BRIDGE_KEY=/app/data/bridge/k  # kit\n"):
+            self.assertTrue(deploy.kit_mode("single"))
+        with self.compose_with("      \"AFCLAUDE_BRIDGE_KEY\": '/app/data/bridge/k'\n"):
+            self.assertTrue(deploy.kit_mode("single"))
+        with self.compose_with("      AFCLAUDE_BRIDGE_KEY: /run/secrets/host_bridge_ed25519\n"):
+            self.assertFalse(deploy.kit_mode("single"))
+
     def test_the_same_kit_passes(self):
         self.assertTrue(CHECK_HOST_KIT("single", answer=lambda: self.mine()))
 

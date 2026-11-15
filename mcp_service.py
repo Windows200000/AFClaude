@@ -122,6 +122,8 @@ def serve(host: str, port: int, public_url: str | None = None) -> int:
         app = build_app(host, port, public_url)
     except (service.ServiceError, mcp_http.Refused, actions.RolesFailure) as e:
         return service.refuse("mcp", e)
+    except Exception as e:      # noqa: BLE001 - any other start error (a bad public URL, an unreachable DB): the same exit and alert, no traceback
+        return service.refuse("mcp", RuntimeError(f"{type(e).__name__}: {e}"))
     mcp_http.require_remote()
     print(f"afclaude mcp: serving on {host}:{port} (machine token and host name header required)", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="info", lifespan="on", server_header=False)

@@ -211,6 +211,17 @@ class Table(Base):
         self.assertEqual(self.resolve(env(OWN), token_file=real).token, "insecure-file")
         os.chmod(d, 0o700)
 
+    def test_a_directory_of_another_user_is_not_used(self):
+        uid, token = self.machine()
+        d = os.path.join(self.tmp.name, "cfg")
+        os.mkdir(d, 0o700)
+        path = os.path.join(d, "machine.json")
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600), "w") as fh:
+            json.dump({"token": token}, fh)
+        self.assertEqual(self.resolve(env(OWN), token_file=path).actor, f"machine:{uid}")
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            self.assertEqual(self.resolve(env(OWN), token_file=path).token, "insecure-file")
+
     def test_a_fifo_as_the_token_file_does_not_block(self):
         d = os.path.join(self.tmp.name, "cfg")
         os.mkdir(d, 0o700)

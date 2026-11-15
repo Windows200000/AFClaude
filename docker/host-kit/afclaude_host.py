@@ -62,9 +62,10 @@ def read_token(env: Mapping[str, str]) -> Optional[str]:
         os.lstat(path)
     except FileNotFoundError:
         return None
-    if os.stat(os.path.dirname(os.path.abspath(path))).st_mode & 0o022:      # before anything is opened
-        raise Refused("afclaude: the directory of the machine token file %s can be written by others: fix it "
-                      "(chmod go-w) or re-register the machine" % path)
+    ds = os.stat(os.path.dirname(os.path.abspath(path)))                     # before anything is opened
+    if ds.st_mode & 0o022 or ds.st_uid != os.getuid():
+        raise Refused("afclaude: the directory of the machine token file %s can be written by others or is not "
+                      "this user's: fix it (chmod go-w, owned by you) or re-register the machine" % path)
     try:
         # a link is refused (NOFOLLOW) and a FIFO does not block the open (NONBLOCK); the checks are on the open file
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

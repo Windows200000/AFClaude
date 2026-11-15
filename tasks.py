@@ -547,13 +547,31 @@ def deliver(result):
 MACHINE_FILE = os.environ.get("AFCLAUDE_MACHINE_FILE", os.path.expanduser("~/.config/afclaude/machine.json"))
 
 
+def secure_token_dir(d):
+    """The token's directory must not be writable by others and must be the user's own (identity.read_token and the
+    host wrapper ignore a token in any other): an existing one of this user's with group/world write (a umask 002
+    host) gets go-w now; one of another user is refused, with the reason. Read errors surface (D-235)."""
+    st = os.stat(d)
+    if st.st_uid != os.getuid():
+        raise ValueError(f"{d} is not owned by this user: the token in it would be ignored (identity.read_token). "
+                         "Use a directory of your own (AFCLAUDE_MACHINE_FILE or --file)")
+    if st.st_mode & 0o022:
+        try:
+            os.chmod(d, st.st_mode & ~0o022)
+        except OSError as e:
+            raise ValueError(f"{d} can be written by others and could not be fixed ({e.strerror}): chmod go-w it, "
+                             "or the token in it would be ignored") from e
+
+
 def machine_file_free(path, force):
     """Refuse before registering when the token file can't be written (the code would be spent and the
     token lost)."""
     if os.path.lexists(path) and not force:
         raise ValueError(f"{path} exists: this machine has a token already (--force replaces it, --print shows "
                          "the new one instead)")
-    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    secure_token_dir(d)
     if not os.access(os.path.dirname(path) or ".", os.W_OK):
         raise ValueError(f"{path} is not writable")
 
