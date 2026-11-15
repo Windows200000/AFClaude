@@ -339,9 +339,13 @@ class HostRegistration(Base):
         cwd = os.getcwd()
         self.addCleanup(os.chdir, cwd)
         for args, env, why in ((("--file", "machine.json"), {}, "the current directory"),
+                               (("--file", os.path.join("..", "shared", "machine.json")), {}, "the current directory"),
+                               (("--file", os.path.join(target, "machine.json")), {}, "the current directory"),
                                (("--file", os.path.join(target, "machine.json")), {"HOME": target}, "home directory"),
-                               (("--file", os.path.join(link, "machine.json")), {}, f"a symlink (to {target})")):
-            os.chdir(target)
+                               (("--file", os.path.join(link, "machine.json")), {}, f"a symlink (to {target})"),
+                               (("--file", os.path.join(link, ".", "machine.json")), {}, f"a symlink (to {target})")):
+            # the cwd cases run in the target; the home and symlink ones elsewhere, so their own check answers
+            os.chdir(target if why == "the current directory" else self.tmp.name)
             rc, out, err = self.run_cmd(*args, env=env)
             os.chdir(cwd)
             self.assertNotEqual(rc, 0, args)

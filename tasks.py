@@ -558,12 +558,13 @@ def secure_token_dir(d):
         raise ValueError(f"{d} is not owned by this user: the token in it would be ignored (identity.read_token). "
                          "Use a directory of your own (AFCLAUDE_MACHINE_FILE or --file)")
     if st.st_mode & 0o022:
-        if os.path.normpath(d) == ".":
-            what = "the current directory (the --file path names no directory)"
-        elif os.path.realpath(d) == os.path.realpath(os.path.expanduser("~")):
+        real, a = os.path.realpath(d), os.path.abspath(d)
+        if real == os.path.realpath(os.getcwd()):
+            what = "the current directory"
+        elif real == os.path.realpath(os.path.expanduser("~")):
             what = "your home directory"
-        elif os.path.islink(d):
-            what = f"a symlink (to {os.path.realpath(d)})"
+        elif real != os.path.join(os.path.realpath(os.path.dirname(a)), os.path.basename(a)):
+            what = f"a symlink (to {real})"      # its last component resolves elsewhere (also link/. or link/x/..)
         else:
             what = ""
         if what:
