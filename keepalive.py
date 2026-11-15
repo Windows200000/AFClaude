@@ -1760,6 +1760,10 @@ def host_checks_before_start(now, sid):
         return f"HOLD: the host check could not run ({type(e).__name__}); automation paused (D-234/D-235)"
     if why is None:
         return None
+    if hostcheck.UNRECORDED in why:      # the database failed too: failstop could not store the pause either
+        return (f"HOLD: a host check failed ({why}); the database failed too, so automation may not be paused (the "
+                "alert says): this start is held, and the hourly host check pauses once the database is healthy, "
+                "if the host still fails (D-235/D-202)")
     return f"HOLD: a host check failed ({why}); automation paused, clear it once the host is fixed (D-257/D-283)"
 
 

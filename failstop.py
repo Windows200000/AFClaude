@@ -35,8 +35,9 @@ path: fail() appends "<component>: <subject>" to it, and the runner records the 
 by the handler instead of alerting a second time.
 
 A DB that can't be written can't record the pause: the DB-error path (D-171) then holds every
-start anyway (store.db_gate) and the alert goes to data/ALERTS.fallback.md; fail() logs that the
-pause was not stored.
+start while the DB fails (store.db_gate) and the alert goes to data/ALERTS.fallback.md; fail() logs
+that the pause was not stored. Once the DB is healthy nothing is paused until the failure is recorded
+again (the alert says so).
 
 paused(): the strict read of the switch (afclaude_config.automation_pause: unreadable = paused);
 pauses(): every pause (the status listing, the quickview).
@@ -202,8 +203,10 @@ def fail(component: str, subject: str, detail: str = "", *, log: Optional[LogFn]
     body = detail[:1200]
     if pause:
         if not out["paused"]:
-            stop = ("AFClaude could NOT record the pause (database problem); the database error path holds "
-                    "the starts until it is healthy.")
+            stop = ("AFClaude could NOT record the pause (database problem). The database error path holds "
+                    "the starts only while the database fails: once it is healthy again nothing is paused, and runs "
+                    "go on until the failure is recorded again (a recurring check pauses at its next run) or you "
+                    "pause by hand (`python3 tasks.py automation pause`).")
         elif name:
             stop = (f"AFClaude automation of the project {name} is PAUSED until you clear it (`{resume_cmd(name)}`): "
                     "none of its runs starts or continues; other projects go on.")

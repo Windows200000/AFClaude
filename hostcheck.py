@@ -19,7 +19,8 @@ logged_in, mcp) is `failstop.fail("hostcheck", ...)`: alert + pause until the ta
 and cleared it (D-257, D-283, D-235); the start is not attempted. failstop alerts once per pause (the subject
 is stable: "host check <name> failed"). A FAIL of another check (usage, doctor, disk, clock) alerts once per
 episode and does not pause (the episode is the row's `since`; its `alerted_at` says it was alerted, so a fail a
-manual run recorded first is still alerted by the next scheduled one). A WARN is recorded and shown, never
+manual run recorded first is still alerted by the next scheduled one; a skip neither starts nor ends an episode,
+store.put_host_check: fail, skip, fail is alerted once). A WARN is recorded and shown, never
 alerted. A check that does not answer within its budget is a FAIL (D-234); an exception inside a check is a
 FAIL naming it (D-235): a flaky check is fixed here, not muted.
 
@@ -42,6 +43,7 @@ import os
 import re
 import select
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -133,13 +135,16 @@ class Ctx:
             raise subprocess.TimeoutExpired("host check", self.budget)
         return left
 
-    def call(self, argv: list[str], input: Optional[str] = None,
-             cap: Optional[float] = None) -> "subprocess.CompletedProcess[str]":
+    def call(self, argv: list[str], input: Optional[str] = None, cap: Optional[float] = None,
+             multiplex: bool = True) -> "subprocess.CompletedProcess[str]":
         """host.run_on_host(argv), within the check's remaining budget (TimeoutExpired = the check fails) and, given
-        `cap`, within cap seconds (a call the check retries leaves room for the retry)."""
+        `cap`, within cap seconds (a call the check retries leaves room for the retry). multiplex=False: not over
+        the shared ssh master socket (host.ssh_argv; a retry after the master did not answer)."""
         run: Callable[..., Any] = getattr(host, "run_on_host")
         left = self.remaining()
-        r: subprocess.CompletedProcess[str] = run(argv, input=input, timeout=left if cap is None else min(left, cap))
+        timeout = left if cap is None else min(left, cap)
+        r: subprocess.CompletedProcess[str] = (run(argv, input=input, timeout=timeout) if multiplex
+                                               else run(argv, input=input, timeout=timeout, multiplex=False))
         return r
 
     def setting(self, key: str) -> Any:
@@ -160,7 +165,8 @@ def check_bridge(ctx: Ctx) -> Result:
     """The ssh handshake: a harmless whitelisted command both the legacy bridge and the kit answer (tmux
     has-session: 0 or 1 = reached the host and ran tmux). Retried once on ssh rc 255 or no answer within
     BRIDGE_FIRST_TRY (a stale ControlMaster socket, a loaded host): one blip must not pause automation and hold a
-    window start; the retry gets the rest of the budget, and its answer decides."""
+    window start; the retry gets the rest of the budget, goes over a connection of its own (not the master
+    socket: a hung master would hang it too), and its answer decides."""
     argv = ["tmux", "has-session", "-t", "=afc-check"]
     retried = ""
     try:
@@ -171,7 +177,7 @@ def check_bridge(ctx: Ctx) -> Result:
     if r is not None and r.returncode == 255:
         retried = f" (retried once after ssh rc 255: {_first(r.stderr or r.stdout, 160)})"
     if r is None or r.returncode == 255:
-        r = ctx.call(argv)
+        r = ctx.call(argv, multiplex=False)
     if r.returncode in (0, 1):
         return Result("ok", "the host bridge answers" + retried)
     err = _first(r.stderr or r.stdout)
@@ -604,17 +610,35 @@ def run_job(conn: Any) -> str:
     return summary(results)
 
 
+UNRECORDED = "the results could not be recorded"   # in run_pre_start's reason: the database failed too
+
+
 def run_pre_start(conn: Any) -> Optional[str]:
     """Right before a session-window start (keepalive.window_start_pass): the blocking checks, recorded. A fail of
     one is reported (failstop: alert + pause) and the start must not go on: -> its reason. None = go on. While no
-    host kit is installed (NO_KIT, transitional) nothing blocks."""
+    host kit is installed (NO_KIT, transitional) nothing blocks.
+
+    A database error recording the results (store.DBError / sqlite3.Error; the DB error path has retried, reported
+    and alerted it) is raised when every check passed: only the DB failed, the caller postpones like a DB pause
+    (D-202). With a blocking fail it does not hide the fail (K6 review L5): the fail is reported all the same
+    (failstop alerts; its pause write fails too and its alert says so) and the reason is returned, so this start
+    is held (D-235: a failed host is an error to fix, not a database blip to retry every few minutes). Nothing
+    is paused then: once the database heals, other runners may act on the failing host until the hourly
+    host_check job records the fail and pauses (at most an hour later)."""
     results = run_checks(conn, blocking_only=True)
-    alerted = record(conn, results, what="before a window start")
     bad = [o for o in results if o.status == "fail"]
+    unrecorded = ""
+    try:
+        alerted = record(conn, results, what="before a window start")
+    except (store.DBError, sqlite3.Error) as e:
+        if not bad:
+            raise
+        alerted = {}       # blocking fails only (blocking_only): report_failures writes nothing else
+        unrecorded = f" [{UNRECORDED}: {type(e).__name__}: {_first(str(e), 120)}]"
     if not bad:
         return None
     report_failures(conn, results, alerted)
-    return "; ".join(f"{o.name}: {o.detail}" for o in bad)[:600]
+    return ("; ".join(f"{o.name}: {o.detail}" for o in bad)[:600 - len(unrecorded)] + unrecorded)
 
 
 # keepalive.host_checks_before_start calls it by this name: testenv replaces it, so no window start in a test

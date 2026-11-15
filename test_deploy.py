@@ -639,6 +639,28 @@ class KitGuardTest(unittest.TestCase):
                 self.assertIn("Nothing was drained", out.call_args[0][0])
                 self.assertIn("interpolation", out.call_args[0][0])
 
+    def test_a_passed_through_key_or_an_env_file_refuses_the_deploy(self):
+        """No value (compose takes it from the deploying shell) or an env_file: that may set it: fail closed."""
+        for line, why in (("      - AFCLAUDE_BRIDGE_KEY\n", "without a value"),
+                          ("      - AFCLAUDE_BRIDGE_KEY   # from the shell\n", "without a value"),
+                          ("      AFCLAUDE_BRIDGE_KEY:\n", "without a value"),
+                          ("      AFCLAUDE_BRIDGE_KEY: ~\n", "without a value"),
+                          ("      AFCLAUDE_BRIDGE_KEY:   # unset\n", "without a value"),
+                          ("      TZ: UTC\n    env_file:\n      - bridge.env\n", "env_file"),
+                          ("      AFCLAUDE_BRIDGE_KEY: /run/secrets/k\n    env_file: bridge.env\n", "env_file")):
+            with self.compose_with(line):
+                with self.assertRaises(deploy.KitModeUnknown):
+                    deploy.kit_mode("single")
+                with mock.patch("builtins.print") as out:
+                    self.assertFalse(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=AssertionError("asked"))), line)
+                self.assertIn("Nothing was drained", out.call_args[0][0])
+                self.assertIn(why, out.call_args[0][0])
+        # the kit's key set literally: an env_file cannot override the environment, so it is read as before
+        with self.compose_with("      AFCLAUDE_BRIDGE_KEY: /app/data/bridge/k\n    env_file: other.env\n"):
+            self.assertTrue(deploy.kit_mode("single"))
+        with self.compose_with("      AFCLAUDE_BRIDGE_KEY_FILE: /x\n      # env_file: x\n"):
+            self.assertFalse(deploy.kit_mode("single"))
+
     def test_other_literal_forms_of_the_key_are_read(self):
         with self.compose_with("      - AFCLAUDE_BRIDGE_KEY=/app/data/bridge/k  # kit\n"):
             self.assertTrue(deploy.kit_mode("single"))

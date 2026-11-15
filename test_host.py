@@ -234,6 +234,18 @@ class SshArgv(unittest.TestCase):
         self.assertNotEqual(paths[0], paths[1])
         self.assertLess(max(len(p) for p in paths) - len("ControlPath=") - 2 + 40, 104)   # %C = 40 hex; sun_path limit
 
+    def test_without_multiplexing_no_master_socket_is_used(self):
+        """K6 review L2: the bridge check's retry must not go through a master that may hang."""
+        normal, own = host.ssh_argv(["clock"]), host.ssh_argv(["clock"], multiplex=False)
+        self.assertIn("ControlMaster=auto", normal)
+        self.assertIn("ControlPersist=60", normal)
+        self.assertIn("ControlMaster=no", own)
+        self.assertIn("ControlPath=none", own)
+        self.assertFalse([o for o in own if o.startswith("ControlPersist") or o.startswith("ControlPath=/")], own)
+        def rest(a):
+            return [o for o in a if o != "-o" and not o.startswith("Control")]
+        self.assertEqual(rest(normal), rest(own))        # only the multiplexing options differ
+
 
 class RunOnHost(unittest.TestCase):
     def setUp(self):
@@ -275,6 +287,16 @@ class RunOnHost(unittest.TestCase):
             self.assertEqual(json.load(open(self.rec)), {"cmd": "claude -p --model haiku", "stdin": "the prompt"})
             with self.assertRaises(ValueError):
                 host.run_on_host(["rm", "-rf", "/"])
+
+    def test_container_mode_multiplex_switch(self):
+        calls = []
+        with Env(AFCLAUDE_IN_CONTAINER="1"), mock.patch.object(
+                host.subprocess, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 1)):
+            host.run_on_host(["tmux", "has-session", "-t", "=afc-check"], timeout=5)
+            host.run_on_host(["tmux", "has-session", "-t", "=afc-check"], timeout=5, multiplex=False)
+        self.assertIn("ControlMaster=auto", calls[0])
+        self.assertIn("ControlPath=none", calls[1])
+        self.assertNotIn("ControlMaster=auto", calls[1])
 
     def test_helpers_container_mode(self):
         with Env(AFCLAUDE_IN_CONTAINER="1", PATH=self.d + os.pathsep + os.environ["PATH"]):

@@ -310,9 +310,11 @@ def check_old_container() -> bool:
 
 # A compose file whose container uses the host kit's bridge key (the install's copy in <data>/bridge/): its host
 # calls go to the installed kit. A non-comment line only (mapping or `- NAME=value` form); the pre-kit
-# compose.yml (the rollback) sets the key to a secrets path. A value built with ${...} / $VAR is not read here:
-# kit_mode refuses it (fail closed) instead of guessing what compose would make of it.
-KIT_KEY_RE = re.compile(r"""(?m)^[ \t]*(?:-[ \t]*)?["']?AFCLAUDE_BRIDGE_KEY["']?[ \t]*[:=][ \t]*(?P<value>[^\n]*)$""")
+# compose.yml (the rollback) sets the key to a secrets path. kit_mode refuses (fail closed) whatever it cannot
+# read instead of guessing what compose would make of it: a value built with ${...} / $VAR, a key without a value
+# (passed through from the deploying shell) and an env_file: source that may set it.
+KIT_KEY_RE = re.compile(r"""(?m)^[ \t]*(?:-[ \t]*)?["']?AFCLAUDE_BRIDGE_KEY["']?(?P<rest>[ \t]*(?:[:=#][^\n]*)?)$""")
+ENV_FILE_RE = re.compile(r"(?m)^[ \t]*env_file[ \t]*:")
 KIT_KEY_DIR = "/app/data/bridge/"
 KIT_TIMEOUT = 30                              # seconds for the installed kit's kit-version answer
 INSTALL_HINT = ("re-run the host kit install on the host with the options of the first install "
@@ -320,21 +322,31 @@ INSTALL_HINT = ("re-run the host kit install on the host with the options of the
 
 
 class KitModeUnknown(RuntimeError):
-    """The compose file sets the bridge key through an interpolation: whether it is the kit's cannot be told here."""
+    """The compose file sets the bridge key in a way not read here (interpolation, passthrough, env_file): whether
+    it is the kit's cannot be told."""
 
 
 def kit_mode(lay: str) -> bool:
     """True when the layout's compose file gives the container the host kit's bridge key. KitModeUnknown when a
-    key line has a value with `$` (interpolation): the deploy refuses rather than skip the kit guard."""
+    key line has a value with `$` (interpolation) or none at all (passthrough), or when an env_file: may set the
+    key: the deploy refuses rather than skip the kit guard (D-235)."""
     path = COMPOSE_FILE if lay == "single" else COMPOSE_SERVICES
     with open(path, encoding="utf-8") as fh:
-        found = False
-        for m in KIT_KEY_RE.finditer(fh.read()):
-            value = re.sub(r"[ \t]+#.*$", "", m.group("value")).strip().strip("\"'")
-            if "$" in value:
-                raise KitModeUnknown(f"{path} sets AFCLAUDE_BRIDGE_KEY to {value!r} (an interpolation): write the "
-                                     "path out literally, so the kit guard can tell")
-            found = found or value.startswith(KIT_KEY_DIR)
+        text = fh.read()
+    found = False
+    for m in KIT_KEY_RE.finditer(text):
+        rest = m.group("rest").strip()
+        value = "" if rest.startswith("#") else re.sub(r"(^|[ \t]+)#.*$", "", rest[1:]).strip().strip("\"'")
+        if value in ("", "null", "~"):
+            raise KitModeUnknown(f"{path} has AFCLAUDE_BRIDGE_KEY without a value (passed through from the shell "
+                                 "that runs compose): write the key path out literally, so the kit guard can tell")
+        if "$" in value:
+            raise KitModeUnknown(f"{path} sets AFCLAUDE_BRIDGE_KEY to {value!r} (an interpolation): write the "
+                                 "path out literally, so the kit guard can tell")
+        found = found or value.startswith(KIT_KEY_DIR)
+    if not found and ENV_FILE_RE.search(text):
+        raise KitModeUnknown(f"{path} has an env_file: source that may set AFCLAUDE_BRIDGE_KEY: set the key in the "
+                             "compose file's environment literally, so the kit guard can tell")
     return found
 
 

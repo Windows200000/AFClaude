@@ -159,20 +159,24 @@ def to_local(text: str) -> str:
     return re.sub(re.escape(repo_dir()) + r"(?![\w.-])", lambda m: HERE, text)
 
 
-def ssh_argv(remote):
+def ssh_argv(remote, multiplex=True):
     """The ssh command that asks the host's host_exec.py to run `remote` (an argv list).
     sshd hands the joined string to the forced command as $SSH_ORIGINAL_COMMAND,
     which host_exec.py splits again with shlex (never a shell). The multiplexing socket's name carries a hash of
     the key path: ssh's %C hashes host, port and user but not the key, so a master opened with another key
-    (the pre-kit bridge's) would otherwise carry this call to that key's forced command."""
+    (the pre-kit bridge's) would otherwise carry this call to that key's forced command. multiplex=False: a
+    connection of its own, no master socket used or opened (ControlPath=none), for a retry after a call over
+    the master did not answer (a hung master would hang the retry too)."""
     e = os.environ.get
     key = e("AFCLAUDE_BRIDGE_KEY", "/run/secrets/host_bridge_ed25519")
     tag = hashlib.sha256(key.encode()).hexdigest()[:12]
+    control = (["-o", "ControlMaster=auto", "-o", f"ControlPath=/tmp/afclaude-ssh-{tag}-%C", "-o", "ControlPersist=60"]
+               if multiplex else ["-o", "ControlMaster=no", "-o", "ControlPath=none"])
     return ["ssh", "-T", "-i", key,
             "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
             "-o", "UserKnownHostsFile=" + e("AFCLAUDE_BRIDGE_KNOWN_HOSTS", os.path.expanduser("~/.ssh/known_hosts")),
             "-o", "HostKeyAlias=afclaude-host", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
-            "-o", "ControlMaster=auto", "-o", f"ControlPath=/tmp/afclaude-ssh-{tag}-%C", "-o", "ControlPersist=60",
+            *control,
             f"{e('AFCLAUDE_BRIDGE_USER', 'opc')}@{e('AFCLAUDE_BRIDGE_HOST', 'host.docker.internal')}",
             "--", shlex.join(remote)]
 
@@ -249,10 +253,11 @@ def bridge_argv(argv):
     raise ValueError(f"no host_exec.py shape for {shlex.join(argv)[:200]!r}")
 
 
-def run_on_host(argv, input=None, cwd=None, env=None, timeout=None):
+def run_on_host(argv, input=None, cwd=None, env=None, timeout=None, multiplex=True):
     """subprocess.run(argv, capture_output=True, text=True) on the host.
     Returns a CompletedProcess (stdout/stderr are str). In the container `cwd` and
-    `env` are ignored: host_exec.py runs every command with its own fixed env/cwd. On the host a
+    `env` are ignored: host_exec.py runs every command with its own fixed env/cwd; multiplex=False: the ssh
+    call does not go over the shared master socket (ssh_argv). On the host a
     one-shot `claude -p` gets `--setting-sources user` like the bridge's (docker/host_exec.py): no
     project or local .claude/settings.json (hooks) of its cwd is ever loaded."""
     if not in_container():
@@ -261,7 +266,7 @@ def run_on_host(argv, input=None, cwd=None, env=None, timeout=None):
         return subprocess.run(argv, input=input, cwd=cwd, env=env, capture_output=True, text=True,
                               timeout=timeout)
     remote = bridge_argv(argv)
-    r = subprocess.run(ssh_argv(remote), input=input, capture_output=True, text=True, timeout=timeout,
+    r = subprocess.run(ssh_argv(remote, multiplex), input=input, capture_output=True, text=True, timeout=timeout,
                        stdin=subprocess.DEVNULL if input is None else None)
     if r.returncode == 126 and "not whitelisted" in r.stderr:
         # the bridge does not know this shape: the pre-kit bridge for a kit-only command, or a kit older than

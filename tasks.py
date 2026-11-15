@@ -550,17 +550,33 @@ MACHINE_FILE = os.environ.get("AFCLAUDE_MACHINE_FILE", os.path.expanduser("~/.co
 def secure_token_dir(d):
     """The token's directory must not be writable by others and must be the user's own (identity.read_token and the
     host wrapper ignore a token in any other): an existing one of this user's with group/world write (a umask 002
-    host) gets go-w now; one of another user is refused, with the reason. Read errors surface (D-235)."""
+    host) gets go-w now, with a note; one of another user is refused, with the reason. The current directory (a
+    bare --file name), the home directory and a symlink are never changed this way: refused, naming the fix.
+    Read errors surface (D-235)."""
     st = os.stat(d)
     if st.st_uid != os.getuid():
         raise ValueError(f"{d} is not owned by this user: the token in it would be ignored (identity.read_token). "
                          "Use a directory of your own (AFCLAUDE_MACHINE_FILE or --file)")
     if st.st_mode & 0o022:
+        real, a = os.path.realpath(d), os.path.abspath(d)
+        if real == os.path.realpath(os.getcwd()):
+            what = "the current directory"
+        elif real == os.path.realpath(os.path.expanduser("~")):
+            what = "your home directory"
+        elif real != os.path.join(os.path.realpath(os.path.dirname(a)), os.path.basename(a)):
+            what = f"a symlink (to {real})"      # its last component resolves elsewhere (also link/. or link/x/..)
+        else:
+            what = ""
+        if what:
+            raise ValueError(f"{d} can be written by others, and it is {what}: its mode is not changed here. Put the "
+                             "token in a directory of its own (--file <dir>/machine.json, default "
+                             "~/.config/afclaude/machine.json), or chmod go-w the directory yourself")
         try:
             os.chmod(d, st.st_mode & ~0o022)
         except OSError as e:
             raise ValueError(f"{d} can be written by others and could not be fixed ({e.strerror}): chmod go-w it, "
                              "or the token in it would be ignored") from e
+        print(f"note: {d} could be written by others; made it go-w (a token in it would be ignored otherwise)")
 
 
 def machine_file_free(path, force):
