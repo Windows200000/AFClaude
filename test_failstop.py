@@ -91,6 +91,7 @@ class Fail(unittest.TestCase):
         self.assertEqual((r["paused"], r["alerted"]), (False, True))
         self.assertIn("automation_paused could not be set", self.logs[-1])
         self.assertIn("could NOT record the pause", self.alerts[0][1])
+        self.assertIn("only while the database fails: once it is healthy again nothing is paused", self.alerts[0][1])
 
     def test_no_pause(self):
         r = self.fail("something to report", pause=False)

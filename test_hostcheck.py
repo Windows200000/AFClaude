@@ -655,6 +655,8 @@ class PreStart(Base):
             d = ka.window_start_pass(testenv.SID, now, args)
         self.assertEqual((d["go"], d["postpone"]), (False, False))
         self.assertIn("HOLD: a host check failed (tmux:", d["reason"])
+        self.assertIn("the database failed too, so automation may not be paused", d["reason"])   # not "paused"
+        self.assertNotIn("automation paused", d["reason"])
         self.assertEqual(saved, {})                      # no postponed recheck
         self.assertTrue(self.paused()["paused"])         # the pause itself could be written here
 

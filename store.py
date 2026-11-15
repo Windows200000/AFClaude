@@ -624,8 +624,9 @@ RUNNER_TABLES = ("runner_state", "scheduled_jobs", "app_log", "runner_jobs", "ru
 # row per check (name), always the latest result, replaced by each run: the history is the app_log line every
 # run writes. status skip = not run (a check it depends on failed, or no host kit is installed yet: the
 # transitional mode of docs/phase5b_plan.md §3.6); since = when the check last changed status (an episode's
-# start; a skip is no result, it neither starts nor ends an episode, put_host_check); kit_version = the host kit's version when it ran (NULL: unknown / none installed). Written only
-# through actions.hostcheck_put (runner actors; like the status snapshot, no audit_log row per run, D-256).
+# start; a skip is no result, it neither starts nor ends an episode, put_host_check); kit_version = the host
+# kit's version when it ran (NULL: unknown / none installed). Written only through actions.hostcheck_put
+# (runner actors; like the status snapshot, no audit_log row per run, D-256).
 HOST_CHECKS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS host_checks (
     name        TEXT PRIMARY KEY,

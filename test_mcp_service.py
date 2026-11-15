@@ -107,8 +107,9 @@ class StartTest(unittest.TestCase):
                 mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
             self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 78)
 
-    def test_any_other_start_error_exits_78_with_an_alert_not_a_traceback(self):
-        """A bad public URL (pydantic) and an unreachable DB end like a refusal (D-235): exit 78, the alert, no listener."""
+    def test_any_other_start_error_exits_78_with_an_alert_and_its_traceback_on_stderr(self):
+        """A bad public URL (pydantic) and an unreachable DB end like a refusal (D-235): exit 78, the alert, no
+        listener; the unexpected error's traceback goes to stderr (the log), the alert keeps one line."""
         for fail in ({"target": mcp_service, "attr": "build_app", "exc": ValueError("bad public url")},
                      {"target": store, "attr": "connect", "exc": store.DBUnavailable("database is locked")}):
             err = io.StringIO()
@@ -118,7 +119,9 @@ class StartTest(unittest.TestCase):
                     mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
                 self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 78)
             self.assertIn(type(fail["exc"]).__name__, err.getvalue())
+            self.assertIn("Traceback (most recent call last)", err.getvalue())
             alert.assert_called_once()
+            self.assertNotIn("Traceback", repr(alert.call_args))
 
     def test_serve_hands_the_gated_app_to_uvicorn(self):
         with mock.patch.object(service, "start", return_value="id"), \

@@ -610,6 +610,9 @@ def run_job(conn: Any) -> str:
     return summary(results)
 
 
+UNRECORDED = "the results could not be recorded"   # in run_pre_start's reason: the database failed too
+
+
 def run_pre_start(conn: Any) -> Optional[str]:
     """Right before a session-window start (keepalive.window_start_pass): the blocking checks, recorded. A fail of
     one is reported (failstop: alert + pause) and the start must not go on: -> its reason. None = go on. While no
@@ -618,8 +621,10 @@ def run_pre_start(conn: Any) -> Optional[str]:
     A database error recording the results (store.DBError / sqlite3.Error; the DB error path has retried, reported
     and alerted it) is raised when every check passed: only the DB failed, the caller postpones like a DB pause
     (D-202). With a blocking fail it does not hide the fail (K6 review L5): the fail is reported all the same
-    (failstop alerts; its pause write fails too and its alert says so) and the reason is returned, so the start
-    is held (D-235: a failed host is an error to fix, not a database blip to retry every few minutes)."""
+    (failstop alerts; its pause write fails too and its alert says so) and the reason is returned, so this start
+    is held (D-235: a failed host is an error to fix, not a database blip to retry every few minutes). Nothing
+    is paused then: once the database heals, other runners may act on the failing host until the hourly
+    host_check job records the fail and pauses (at most an hour later)."""
     results = run_checks(conn, blocking_only=True)
     bad = [o for o in results if o.status == "fail"]
     unrecorded = ""
@@ -629,7 +634,7 @@ def run_pre_start(conn: Any) -> Optional[str]:
         if not bad:
             raise
         alerted = {}       # blocking fails only (blocking_only): report_failures writes nothing else
-        unrecorded = f" [the results could not be recorded: {type(e).__name__}: {_first(str(e), 120)}]"
+        unrecorded = f" [{UNRECORDED}: {type(e).__name__}: {_first(str(e), 120)}]"
     if not bad:
         return None
     report_failures(conn, results, alerted)
