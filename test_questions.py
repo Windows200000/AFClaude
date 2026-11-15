@@ -527,6 +527,7 @@ class DeployPath(unittest.TestCase):
                 mock.patch.object(deploy, "wait_clear", return_value=True), \
                 mock.patch.object(deploy, "check_data", return_value=self.path), \
                 mock.patch.object(deploy, "check_old_container", return_value=True), \
+                mock.patch.object(deploy, "check_host_kit", return_value=True), \
                 mock.patch.object(deploy, "wait_healthy", return_value=True), \
                 mock.patch.object(deploy, "code_version", return_value="abc1234"), \
                 mock.patch.object(deploy.runner, "wake", return_value=True), \

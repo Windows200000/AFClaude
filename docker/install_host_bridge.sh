@@ -4,7 +4,7 @@
 # commands (docker/host-kit/host_exec.py). This script is the ONLY writer of host.json (D-338): the bridge has
 # no command that changes it.
 #
-#   docker/install_host_bridge.sh --root DIR [--root DIR ...] [--data DIR] [--from CIDR] [--claude FILE]
+#   docker/install_host_bridge.sh --root DIR [--root DIR ...] [--data DIR] [--from CIDR] [--claude FILE] [--bin DIR]
 #     --root    an allowed root (a launch's cwd must be inside one); at least one; only used when
 #               host.json does not exist yet (to change it, delete the file and run the install again)
 #     --data    the data directory the container mounts read-write (default: <checkout>/data); a copy of the
@@ -13,9 +13,11 @@
 #     --from    the `from=` of the authorized_keys line: the network the runner connects from
 #               (default $AFCLAUDE_BRIDGE_FROM or 172.28.0.0/24, compose's AFCLAUDE_SUBNET)
 #     --claude  the Claude binary (default ~/.local/bin/claude)
+#     --bin     where the `afclaude` wrapper is linked (default ~/.local/bin; put it on PATH)
 #
 # What it does, in this order (docs/phase5b_plan.md §3.2):
-#   1. copies the kit (host_exec.py, ka_resume.sh) to <share>/afclaude/host-kit/<version>/ (share =
+#   1. copies the kit (host_exec.py, ka_resume.sh, and docker/host-kit/afclaude_host.py as `afclaude`, the
+#      host wrapper of K5) to <share>/afclaude/host-kit/<version>/ (share =
 #      $XDG_DATA_HOME or ~/.local/share); a version dir is never changed: a different file under an
 #      installed version means HOST_KIT_VERSION was not bumped, and the install stops
 #   2. writes <share>/afclaude/host.json (mode 0600) unless there is one that passes the kit's own check
@@ -28,15 +30,16 @@
 #   4. self-test of the new kit directly (host_exec.py as sshd would run it: allowed and rejected command)
 #   5. puts ONE restricted line into ~/.ssh/authorized_keys (command=current/host_exec.py, from=, restrict); a
 #      line with the same key is replaced, every other line stays; then points <share>/afclaude/host-kit/current
-#      at the version. Everything after the first change is undone (authorized_keys from its timestamped
-#      backup, the link) when ANY later step fails, and the script exits 1
+#      at the version, and links <bin>/afclaude to current/afclaude (a plain file of that name there is
+#      refused, as is a link to anything outside the kit directory). Everything after the first change is undone (authorized_keys from its
+#      timestamped backup, the links) when ANY later step fails, and the script exits 1
 # The OLD bridge line (the pre-kit install, comment "afclaude-host-bridge") is never removed here: it stays
 # until the new one works; the closing message says how to remove it.
 set -Eeuo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$DIR")"
-ROOTS=(); DATA="$REPO/data"; FROM="${AFCLAUDE_BRIDGE_FROM:-172.28.0.0/24}"; CLAUDE_BIN="$HOME/.local/bin/claude"
+ROOTS=(); DATA="$REPO/data"; FROM="${AFCLAUDE_BRIDGE_FROM:-172.28.0.0/24}"; CLAUDE_BIN="$HOME/.local/bin/claude"; BINDIR="$HOME/.local/bin"
 KEEP_BACKUPS=10
 die() { echo "install_host_bridge: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
@@ -45,26 +48,28 @@ while [ $# -gt 0 ]; do
     --data) [ $# -ge 2 ] || die "--data needs a directory"; DATA="$2"; shift 2;;
     --from) [ $# -ge 2 ] || die "--from needs a network"; FROM="$2"; shift 2;;
     --claude) [ $# -ge 2 ] || die "--claude needs a file"; CLAUDE_BIN="$2"; shift 2;;
+    --bin) [ $# -ge 2 ] || die "--bin needs a directory"; BINDIR="$2"; shift 2;;
     -h|--help) sed -n '2,/^set -Eeuo/p' "$0" | sed '$d'; exit 0;;
     *) die "unknown argument $1 (see --help)";;
   esac
 done
 [[ "$FROM" =~ ^[0-9A-Fa-f:.,/!-]+$ ]] || die "--from: only addresses and networks (no wildcards: '*' or '?' would let any host connect), got '$FROM'"
-[[ "$DATA" == /* && "$CLAUDE_BIN" == /* ]] || die "--data and --claude must be absolute paths"
+[[ "$DATA" == /* && "$CLAUDE_BIN" == /* && "$BINDIR" == /* ]] || die "--data, --claude and --bin must be absolute paths"
 SHARE="${XDG_DATA_HOME:-$HOME/.local/share}"
 [[ "$SHARE" == /* ]] || die "the share directory '$SHARE' is not absolute"
 command -v python3 >/dev/null || die "python3 is needed"
 command -v ssh-keygen >/dev/null || die "ssh-keygen is needed"
 
 BASE="$SHARE/afclaude"; KITS="$BASE/host-kit"; HOSTJSON="$BASE/host.json"
-SRC_EXEC="$DIR/host-kit/host_exec.py"; SRC_KA="$REPO/ka_resume.sh"
-[ -f "$SRC_EXEC" ] && [ -f "$SRC_KA" ] || die "kit sources not found ($SRC_EXEC, $SRC_KA)"
+SRC_EXEC="$DIR/host-kit/host_exec.py"; SRC_KA="$REPO/ka_resume.sh"; SRC_AF="$DIR/host-kit/afclaude_host.py"
+[ -f "$SRC_EXEC" ] && [ -f "$SRC_KA" ] && [ -f "$SRC_AF" ] || die "kit sources not found ($SRC_EXEC, $SRC_KA, $SRC_AF)"
 VERSION="$(python3 "$SRC_EXEC" --print-version)"
 [[ "$VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || die "bad kit version '$VERSION'"
 VDIR="$KITS/$VERSION"
 KEYDIR="$BASE/bridge-key"; KEY="$KEYDIR/host_bridge_ed25519"   # host-only: the container never sees this directory
 DATA_KEY="$DATA/bridge/host_bridge_ed25519"                   # the copy the container uses
 AK="$HOME/.ssh/authorized_keys"
+BIN_LINK="$BINDIR/afclaude"; PREV_BIN=""; BIN_SWITCHED=0   # the wrapper link in <bin>
 STAGE=""; PUBTMP=""; NEWAK=""; PREV_LINK=""; AK_SAVED=""; AK_TOUCHED=0; LINK_SWITCHED=0; DONE=0
 
 cleanup() {   # EXIT: temp files go; a run that changed authorized_keys or the link and did not finish undoes both
@@ -73,13 +78,16 @@ cleanup() {   # EXIT: temp files go; a run that changed authorized_keys or the l
   [ -z "$STAGE" ] || rm -rf "$STAGE"
   [ -z "$PUBTMP" ] || rm -f "$PUBTMP"
   [ -z "$NEWAK" ] || rm -f "$NEWAK"
-  [ "$DONE" = 1 ] || rm -f "$KITS/.current.$$"
-  if [ "$DONE" != 1 ] && { [ "$AK_TOUCHED" = 1 ] || [ "$LINK_SWITCHED" = 1 ]; }; then
+  [ "$DONE" = 1 ] || rm -f "$KITS/.current.$$" "$BINDIR/.afclaude.$$"
+  if [ "$DONE" != 1 ] && { [ "$AK_TOUCHED" = 1 ] || [ "$LINK_SWITCHED" = 1 ] || [ "$BIN_SWITCHED" = 1 ]; }; then
     [ "$AK_TOUCHED" = 1 ] && cp -p "$AK_SAVED" "$AK"
     if [ "$LINK_SWITCHED" = 1 ]; then
       if [ -n "$PREV_LINK" ]; then ln -sfn "$PREV_LINK" "$KITS/.current.$$" && mv -T "$KITS/.current.$$" "$KITS/current"; else rm -f "$KITS/current"; fi
     fi
-    echo "install_host_bridge: failed (exit $rc); authorized_keys and the current link are back as they were" >&2
+    if [ "$BIN_SWITCHED" = 1 ]; then
+      if [ -n "$PREV_BIN" ]; then ln -sfn "$PREV_BIN" "$BINDIR/.afclaude.$$" && mv -T "$BINDIR/.afclaude.$$" "$BIN_LINK"; else rm -f "$BIN_LINK"; fi
+    fi
+    echo "install_host_bridge: failed (exit $rc); authorized_keys, the current link and the afclaude link in $BINDIR are back as they were" >&2
   fi
 }
 trap cleanup EXIT
@@ -91,6 +99,8 @@ selftest() {   # $1: a kit directory; host_exec.py exactly as sshd runs it: SSH_
   python3 -c 'import json, sys; sys.exit(0 if json.loads(sys.argv[1])["kit_version"] == sys.argv[2] else 1)' "$out" "$VERSION" \
     || { echo "  kit-version does not report $VERSION: FAILED" >&2; return 1; }
   echo "  allowed command: OK"
+  [ -x "$1/afclaude" ] && [ "$(head -c 2 "$1/afclaude")" = "#!" ] || { echo "  wrapper $1/afclaude missing, not executable or no script: FAILED" >&2; return 1; }
+  echo "  wrapper: OK"
   rc=0; SSH_ORIGINAL_COMMAND="cat /etc/passwd" "$1/host_exec.py" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 126 ] || { echo "  rejected command: FAILED (exit $rc, wanted 126)" >&2; return 1; }
   echo "  rejected command: OK"
@@ -142,16 +152,26 @@ finally:
 PY
 }
 
+# <bin>/afclaude is replaced only when it is this kit's own link (before anything changes): a plain file, or a link
+# to anywhere but the kit directory (another install, the owner's own script), is refused and named
+[ ! -e "$BIN_LINK" ] || [ -L "$BIN_LINK" ] || die "$BIN_LINK exists and is not a link: move it away (or pick another --bin), the wrapper is linked there"
+if [ -L "$BIN_LINK" ]; then
+  case "$(readlink "$BIN_LINK")" in
+    "$KITS"/*) ;;
+    *) die "$BIN_LINK is a link to $(readlink "$BIN_LINK"), not into $KITS: remove it yourself (rm $BIN_LINK) or pick another --bin; it is not replaced silently";;
+  esac
+fi
 # 1. the kit, as a new version directory
 mkdir -p "$KITS"; chmod 700 "$BASE" "$KITS"
 if [ -d "$VDIR" ]; then
-  cmp -s "$SRC_EXEC" "$VDIR/host_exec.py" && cmp -s "$SRC_KA" "$VDIR/ka_resume.sh" \
+  cmp -s "$SRC_EXEC" "$VDIR/host_exec.py" && cmp -s "$SRC_KA" "$VDIR/ka_resume.sh" && cmp -s "$SRC_AF" "$VDIR/afclaude" \
     || die "kit version $VERSION is installed with different files: bump HOST_KIT_VERSION in docker/host-kit/host_exec.py (a new whitelist command or a changed shape is a new version)"
   echo "kit version $VERSION already installed: $VDIR"
 else
   STAGE="$(mktemp -d "$KITS/.stage.XXXXXX")"
   install -m 755 "$SRC_EXEC" "$STAGE/host_exec.py"
   install -m 755 "$SRC_KA" "$STAGE/ka_resume.sh"
+  install -m 755 "$SRC_AF" "$STAGE/afclaude"
 fi
 
 # 2. host.json (the data directory first: the kit refuses every path it names inside that directory)
@@ -207,6 +227,10 @@ LINE="command=\"$KITS/current/host_exec.py\",from=\"$FROM\",restrict $PUBLINE"
 chmod 600 "$NEWAK"; mv "$NEWAK" "$AK"; NEWAK=""
 LINK_SWITCHED=1
 ln -s "$VERSION" "$KITS/.current.$$"; mv -T "$KITS/.current.$$" "$KITS/current"
+mkdir -p "$BINDIR"
+[ -L "$BIN_LINK" ] && PREV_BIN="$(readlink "$BIN_LINK")"
+BIN_SWITCHED=1
+ln -s "$KITS/current/afclaude" "$BINDIR/.afclaude.$$"; mv -T "$BINDIR/.afclaude.$$" "$BIN_LINK"
 
 echo "self-test of the line:"
 FP="$(ssh-keygen -lf "$PUBTMP" | cut -d' ' -f2)"
@@ -217,6 +241,8 @@ grep -qF -- "command=\"$KITS/current/host_exec.py\",from=\"$FROM\",restrict " <<
 [ "$(wc -l <<<"$KEYLINES")" = 1 ] || die "more than one line carries the bridge key"
 selftest "$KITS/current" || die "the kit behind the current link fails its self-test"
 echo "  authorized_keys line: OK"
+[ "$(readlink "$BIN_LINK")" = "$KITS/current/afclaude" ] && [ -x "$BIN_LINK" ] || die "$BIN_LINK does not lead to the installed wrapper"
+echo "  wrapper link: OK"
 DONE=1
 
 mapfile -t OLDBAKS < <(ls -1t "$AK".bak-afclaude-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)))
@@ -225,6 +251,7 @@ for b in ${OLDBAKS[@]+"${OLDBAKS[@]}"}; do rm -f -- "$b"; done
 echo
 echo "host kit $VERSION installed: $VDIR (current -> $VERSION)"
 echo "  authorized_keys: $AK (backup of the state before: $AK_SAVED; the last $KEEP_BACKUPS stay)"
+echo "  host wrapper: $BIN_LINK -> $KITS/current/afclaude (the \`afclaude\` command; $BINDIR must be on PATH)"
 echo "  bridge key for the container: $DATA_KEY (a copy of the host-only $KEY; compose still mounts the old key until the deploy that switches it)"
 OLD="$(grep -c ' afclaude-host-bridge$' "$AK" || true)"
 if [ "$OLD" != 0 ]; then

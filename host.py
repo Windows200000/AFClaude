@@ -75,8 +75,9 @@ DOC_NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md", "DECISIONS.md")   # doc
 LEGACY_HEADS = frozenset(("ka_resume.sh", "claude", "kill-claude", "tmux-has", "claude-env", "tmux-panes",
                           "tmux-kill", "tmux-clients", "tmux-capture", "tmux-rename", "proc-snapshot",
                           "usage-cache", "append-note", "rc-send"))
-KIT_FILES = (("host_exec.py", os.path.join("docker", "host-kit", "host_exec.py")), ("ka_resume.sh", "ka_resume.sh"))
-                            # the kit files `kit-version` hashes (host_exec.py's KIT_FILES) and where this code has them
+# the kit files `kit-version` hashes (host_exec.py's KIT_FILES: installed name, and where this code has the file)
+KIT_FILES = (("host_exec.py", os.path.join("docker", "host-kit", "host_exec.py")), ("ka_resume.sh", "ka_resume.sh"),
+             ("afclaude", os.path.join("docker", "host-kit", "afclaude_host.py")))
 # rc_send (docs/rc_server_mode.md §4.1, §8; D-288). Kept identical in docker/host_exec.py (it runs
 # alone as the SSH forced command; test_host.py compares them).
 RC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")   # a thread's registry `name` (dir + 2 hex)
@@ -92,7 +93,7 @@ RC_SEND_PROMPT = ("Call the SendMessage tool exactly once, to the agent named ex
                   "Afterwards reply with the tool's result word for word.\nBEGIN\n{text}\nEND")
 # The host kit this code was written for (docker/host_exec.py's HOST_KIT_VERSION; test_host_kit.py compares
 # them): a kit with another version is the first host check's fail, "re-run the host kit install".
-HOST_KIT_VERSION = "6"
+HOST_KIT_VERSION = "7"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_TTL = 2.0          # seconds; one preflight reads many pids, a take-over loop polls
 _snapshot = {"at": 0.0, "data": None}
@@ -279,6 +280,17 @@ class HostKitError(RuntimeError):
     """The installed host kit is not the one this code needs, or does not answer (D-235)."""
 
 
+class HostKitTooNew(HostKitError):
+    """The installed kit's version is NEWER than this code's: the install must not be re-run from this checkout
+    (it would downgrade the kit); the matching, newer code is what to deploy."""
+
+
+def kit_is_newer(installed, expected=None):
+    """True when the installed kit version is a number above this code's (versions are counted: "6" < "7")."""
+    expected = HOST_KIT_VERSION if expected is None else expected
+    return isinstance(installed, str) and installed.isdigit() and expected.isdigit() and int(installed) > int(expected)
+
+
 def kit_info(timeout=30):
     """The installed kit's `kit-version` answer ({kit_version, whitelist_hash, commands, config_format}) over
     the bridge, or None when the bridge is the one from before the host kit (it denies the command as
@@ -307,6 +319,10 @@ def check_kit(timeout=30):
     """kit_info(), or HostKitError when its version is not HOST_KIT_VERSION (naming both). None: no kit
     installed yet (the legacy bridge answers): the first host check reports that, it is not an error here."""
     info = kit_info(timeout)
+    if info is not None and kit_is_newer(info["kit_version"]):
+        raise HostKitTooNew(f"host kit version {info['kit_version']!r} is newer than this code's {HOST_KIT_VERSION!r}: "
+                            "deploy the matching code (tools/deploy.py from the checkout that has that kit version); "
+                            "do not re-run the install from this older checkout")
     if info is not None and info["kit_version"] != HOST_KIT_VERSION:
         raise HostKitError(f"host kit version {info['kit_version']!r}, this code needs {HOST_KIT_VERSION!r}: "
                            "re-run the host kit install (docker/install_host_bridge.sh)")

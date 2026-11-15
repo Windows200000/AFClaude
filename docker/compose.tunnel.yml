@@ -1,0 +1,11 @@
+# Optional override: publish the MCP service's port on this host's loopback only (K5 part 2a, plan §3.3), so a remote
+# machine reaches it through the owner's own tunnel (ssh -L, VPN) and nothing else can. There is no route through the
+# reverse proxy before 8d (D-157/D-198). Needs the `mcp` profile (see compose.services.yml). The bind inside the
+# container stays 0.0.0.0, which starts only once roles_enforce is `on` (D-343); the loopback here is the publish.
+#   COMPOSE_PROFILES=mcp docker compose -f docker/compose.services.yml -f docker/compose.tunnel.yml up -d
+# (tools/deploy.py: AFCLAUDE_COMPOSE_OVERRIDES=compose.tunnel.yml, with COMPOSE_PROFILES=mcp.) The container listens on 8000; the
+# loopback port is AFCLAUDE_MCP_PORT (default 8000). A client must send the machine token and the X-AFClaude-Hostname header.
+services:
+  afclaude-mcp:
+    ports:
+      - "127.0.0.1:${AFCLAUDE_MCP_PORT:-8000}:8000"

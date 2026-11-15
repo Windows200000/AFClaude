@@ -121,6 +121,44 @@ class ComposeShape(unittest.TestCase):
         self.assertNotIn("/app/data/bridge", service_block(text, "afclaude-runner"))
 
 
+class McpProfile(unittest.TestCase):
+    """K5 part 2a: afclaude-mcp binds 0.0.0.0 and exits 78 while roles_enforce is not `on` (D-343), so a normal start
+    (tools/deploy.py, a plain `up`) must not start it: it is in the compose profile `mcp`."""
+
+    def test_only_the_mcp_service_has_the_profile(self):
+        text = read("docker/compose.services.yml")
+        self.assertIn("profiles: [mcp]", service_block(text, "afclaude-mcp"))
+        for name in ("afclaude-runner", "afclaude-web"):
+            self.assertNotIn("profiles", service_block(text, name), name)
+        self.assertEqual(len(re.findall(r"(?m)^\s+profiles:", re.sub(r"(?m)^\s*#.*$", "", text))), 1)
+
+    def test_a_plain_compose_file_set_lists_runner_and_web_only_and_the_profile_adds_mcp(self):
+        if not shutil.which("docker"):
+            self.skipTest("no docker")
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
+        env["AFCLAUDE_DATA"] = "/tmp/afclaude-profile-check"
+        base = ["docker", "compose", "--env-file", "/dev/null", "-f", COMPOSE]
+        plain = subprocess.run(base + ["config", "--services"], capture_output=True, text=True, timeout=60, env=env)
+        if plain.returncode != 0 and "unknown" in plain.stderr:
+            self.skipTest("no docker compose")
+        self.assertEqual(plain.returncode, 0, plain.stderr[-500:])
+        self.assertEqual(sorted(plain.stdout.split()), ["afclaude-runner", "afclaude-web"])
+        on = subprocess.run(base[:2] + ["--profile", "mcp"] + base[2:] + ["config", "--services"],
+                            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(sorted(on.stdout.split()), ["afclaude-mcp", "afclaude-runner", "afclaude-web"])
+        via_env = subprocess.run(base + ["config", "--services"], capture_output=True, text=True, timeout=60,
+                                 env=dict(env, COMPOSE_PROFILES="mcp"))
+        self.assertEqual(sorted(via_env.stdout.split()), ["afclaude-mcp", "afclaude-runner", "afclaude-web"])
+
+    def test_the_tunnel_override_publishes_the_port_on_loopback_only(self):
+        text = read("docker/compose.tunnel.yml")
+        code = re.sub(r"(?m)^\s*#.*$", "", text)
+        self.assertEqual(re.findall(r"(?m)^\s+- \"([^\"]+)\"", code), ["127.0.0.1:${AFCLAUDE_MCP_PORT:-8000}:8000"])
+        self.assertEqual(re.findall(r"(?m)^  (afclaude-\w+):", code), ["afclaude-mcp"])
+        base = re.sub(r"(?m)^\s*#.*$", "", read("docker/compose.services.yml"))
+        self.assertNotIn("ports:", base)                                 # nothing is published without the override
+
+
 class EntrypointOrder(unittest.TestCase):
     def test_the_mount_check_comes_before_anything_is_written(self):
         sh = read("docker/entrypoint.sh")
@@ -239,7 +277,8 @@ class ThreeServicesInContainers(unittest.TestCase):
 
     @classmethod
     def compose(cls, *args, timeout=120, check=False, env=None):
-        cmd = ["docker", "compose", "--env-file", "/dev/null", "-p", cls.project, "-f", COMPOSE, "-f", cls.override, *args]
+        cmd = ["docker", "compose", "--env-file", "/dev/null", "-p", cls.project, "--profile", "mcp", "-f", COMPOSE,
+               "-f", cls.override, *args]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env or cls.env, cwd=HERE)
         if check and r.returncode != 0:
             raise RuntimeError(f"{' '.join(cmd)}: {r.stderr[-1500:]}")
@@ -293,6 +332,18 @@ class ThreeServicesInContainers(unittest.TestCase):
         for svc in self.names:
             st = self.inspect(svc)["State"]
             self.assertEqual((st["Status"], st["Health"]["Status"]), ("running", "healthy"), svc)
+
+    def test_the_mcp_container_carries_no_machine_identity(self):
+        """K5 part 2a (review rule 1): no machine token, token file or CLAUDE_* variable in the container or its
+        user's home; the host wrapper brings the token per `docker exec`."""
+        env = self.exec("mcp", "printenv")
+        self.assertEqual(env.returncode, 0, env.stderr)
+        bad = [line.split("=", 1)[0] for line in env.stdout.splitlines()
+               if re.match(r"(AFCLAUDE_MACHINE_|CLAUDE_|CLAUDECODE|AFCLAUDE_AGENT_ID)", line)]
+        self.assertEqual(bad, [])
+        r = self.exec("mcp", "sh", "-c", "ls -A ~/.config 2>&1; find / -xdev -name machine.json 2>/dev/null; echo end")
+        self.assertEqual(r.stdout.split(), ["ls:", "cannot", "access", "'/home/afclaude/.config':", "No", "such", "file",
+                                            "or", "directory", "end"], r.stdout)
 
     def test_the_web_service_answers_on_the_socket(self):
         st, body = self.request("GET", "/health")

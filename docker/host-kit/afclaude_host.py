@@ -20,8 +20,11 @@ a token file that is a link, not a regular file of this user with mode 0600 in a
 write, or holds no token. No token file is the
 host's own session (D-330): nothing is passed for it.
 
-Part of the host kit (§3.2), source file afclaude_host.py (it is installed under the name `afclaude`; the repo has an afclaude.py of its own); stdlib only, Python 3.9 compatible (the host's python3). Not installed by the
-kit yet: K5's deploy adds it to the install, the repo's settings and the hook scripts.
+Part of the host kit (§3.2), source file afclaude_host.py: docker/install_host_bridge.sh installs it as `afclaude`
+(kit version 7; the repo has an afclaude.py of its own) into the kit's version directory and links it from the
+bin directory (~/.local/bin). Stdlib only, Python 3.9 compatible (the host's python3). The container it calls
+carries no token, token file or CLAUDE_* variable of its own (`docker exec` only adds variables, so one in the
+container would make a tokenless host session resolve as that machine, D-330): the token goes in per call, above.
 """
 from __future__ import annotations
 

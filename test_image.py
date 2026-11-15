@@ -20,7 +20,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 # machine-specific files that run on the HOST (the kit) or are launch helpers: until K2 moves the root
 # and the repo into host.json they keep their own paths; they are not what the image's code reads
-HOST_KIT = {"docker/host_exec.py", "docker/host-kit/host_exec.py", "hooks/delegation_reminder.py"}
+HOST_KIT = {"docker/host_exec.py", "docker/host-kit/host_exec.py", "docker/host-kit/afclaude_host.py",
+            "hooks/delegation_reminder.py"}
 
 
 def env_example_paths():
@@ -88,6 +89,75 @@ class NoHostPathsInTheImage(unittest.TestCase):
         self.assertIn("ARG APP=/app", text)
         self.assertIn("COPY . ${APP}", text)
         self.assertIn('WORKDIR ${APP}', text)
+
+
+def uncommented(rel):
+    with open(os.path.join(HERE, rel), encoding="utf-8") as fh:
+        return "\n".join(line for line in fh.read().splitlines() if not line.lstrip().startswith("#"))
+
+
+class NoMachineIdentityInTheContainer(unittest.TestCase):
+    """K5 part 2a, review rule (1) of the part 1 review (plan §5): the `afclaude-mcp` container and the image carry NO
+    machine token, no token file and no CLAUDE_* variable of their own. `docker exec` only adds variables to what the
+    container has: one in the compose environment (or the image's ENV) would make a host session without a token
+    resolve as that machine (D-330) and a driven session lose its role (D-198). The host wrapper passes the token
+    per call (test_afclaude_host)."""
+    COMPOSE = sorted(f for f in os.listdir(os.path.join(HERE, "docker")) if re.match(r"compose.*\.ya?ml$", f))
+    # a variable name or a file the container would read its identity from
+    IDENTITY = re.compile(r"AFCLAUDE_MACHINE_(?:TOKEN|HOST|FILE)|\bCLAUDE_[A-Z_]+|CLAUDECODE|AFCLAUDE_AGENT_ID|machine\.json|"
+                          r"\.config/afclaude/machine|env_file")
+
+    def test_there_are_compose_files_to_check(self):
+        self.assertIn("compose.services.yml", self.COMPOSE)
+        self.assertIn("compose.tunnel.yml", self.COMPOSE)
+
+    def test_no_compose_file_names_a_machine_identity(self):
+        for name in self.COMPOSE:
+            found = self.IDENTITY.findall(uncommented("docker/" + name))
+            self.assertEqual(found, [], f"docker/{name} gives a container a machine token, token file or CLAUDE_* variable")
+
+    def test_the_dockerfile_and_the_entrypoint_set_none(self):
+        for rel in ("docker/Dockerfile", "docker/entrypoint.sh"):
+            found = self.IDENTITY.findall(uncommented(rel))
+            self.assertEqual(found, [], f"{rel} bakes a machine token, token file or CLAUDE_* variable into the image")
+
+    def test_the_image_has_no_token_file_in_the_container_users_home(self):
+        text = uncommented("docker/Dockerfile")
+        self.assertIn("useradd -u \"${UID}\" -g \"${GID}\" -m -d /home/afclaude", text)      # an empty home
+        for line in text.splitlines():
+            if line.startswith(("COPY", "ADD")) and "/home/afclaude" in line:
+                self.fail(f"the Dockerfile copies something into the container user's home: {line}")
+        self.assertNotIn(".config/afclaude", text)
+
+    def test_a_token_file_is_never_sent_to_the_build_context(self):
+        ignore = uncommented(".dockerignore").split()
+        for pattern in ("data", "*.key", "machine.json"):
+            self.assertIn(pattern, ignore)
+
+    def test_the_resolved_compose_environment_has_none_even_from_a_shell_that_has_them(self):
+        """The effective environment of every service (docker compose config), with the mcp profile on and a hostile
+        shell: no identity variable reaches a container from the invoking shell either (compose passes nothing
+        through that the file does not name)."""
+        if not shutil.which("docker"):
+            self.skipTest("no docker")
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
+        env.update(AFCLAUDE_DATA="/tmp/afclaude-config-check", AFCLAUDE_MACHINE_TOKEN="x", CLAUDE_CODE_SESSION_ID="y",
+                   CLAUDECODE="1")
+        r = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "--profile", "mcp",
+                            "-f", os.path.join(HERE, "docker", "compose.services.yml"),
+                            "-f", os.path.join(HERE, "docker", "compose.tunnel.yml"), "config", "--format", "json"],
+                           capture_output=True, text=True, timeout=60, env=env)
+        if r.returncode != 0 and "docker compose" in r.stderr and "unknown" in r.stderr:
+            self.skipTest("no docker compose")
+        self.assertEqual(r.returncode, 0, r.stderr[-500:])
+        import json
+        services = json.loads(r.stdout)["services"]
+        self.assertIn("afclaude-mcp", services)
+        for name, svc in services.items():
+            bad = [k for k in svc.get("environment", {}) if self.IDENTITY.search(k)]
+            self.assertEqual(bad, [], name)
+            for vol in svc.get("volumes", []):
+                self.assertNotIn("machine", str(vol.get("source", "")), name)
 
 
 class Pinned(unittest.TestCase):

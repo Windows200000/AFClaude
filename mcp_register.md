@@ -1,26 +1,43 @@
 # Registering the AFClaude MCP server
 
-`mcp_server.py` is a local stdio MCP server over the task store (`data/afclaude.db`, same DB as `tasks.py`). It runs in the project venv, because the MCP SDK needs Python ≥ 3.10 and the system `python3` is 3.9.
+The MCP server (`mcp_server.py`) is one server over the task store with two transports. In the container layout (phase 5b K5, `docs/phase5b_plan.md` §3.3) it runs in the `afclaude-mcp` container and a registration is one of two lines, both of which change your Claude Code config (`~/.claude.json`, user scope), so you run them yourself: AFClaude never edits it.
 
-## One-time setup (already done if `.venv/` exists)
+## This host, after the switch: stdio through the `afclaude` wrapper
+
+The host kit (version 7 and later) installs the wrapper as `afclaude` (source `docker/host-kit/afclaude_host.py`, linked from `~/.local/bin`: put that on `PATH`). It runs every AFClaude command inside the container, `docker exec -i afclaude-mcp afclaude <arguments>`, and passes only the identity environment of `identity.py` plus this machine's token, read from its token file (`~/.config/afclaude/machine.json`, written by `python3 tasks.py machine register-host`, which runs in a plain shell on the host and so before the switch makes the container the only writer; mode 0600, the directory yours alone) and this host's name. The token is never in an argv or in a Claude config.
 
 ```sh
-cd /mnt/BlockVolume/Claude/work/AFClaude
+claude mcp remove --scope user afclaude      # the old venv registration, if you have it
+claude mcp add --scope user afclaude -- afclaude mcp stdio
+```
+
+Needs: the kit installed (`docker/install_host_bridge.sh`, run by you), the container running (the compose profile `mcp`: `docker/compose.services.yml` header; it starts only once `roles_enforce` is `on`), and this host's machine user (`tasks.py machine register-host`). A session without a token file is the host owner (D-330); a session AFClaude drives is a task-manager or agent whatever file there is (D-198). The wrapper refuses (exit 2, nothing run) an `AFCLAUDE_*` variable in the environment other than `AFCLAUDE_AGENT_ID` and `AFCLAUDE_MACHINE_FILE`, and a token file that is a link, not yours, not 0600 or in a directory others can write.
+
+Check: `claude mcp list` shows `afclaude … ✓ Connected`; `/mcp` inside a session lists the tools. Remove: `claude mcp remove --scope user afclaude`.
+
+## Another machine: HTTP
+
+A machine that is not this host registers its user on the host (`afclaude machine code`, then `afclaude machine register CODE` there) and gets the token copied over a channel you trust. Before 8d (the reverse-proxy route) the port is reachable only through your own tunnel: `docker/compose.tunnel.yml` publishes it on this host's loopback (`127.0.0.1:8000`), and you forward that port (`ssh -L`, a VPN). On that machine:
+
+```sh
+claude mcp add --scope user --transport http afclaude http://127.0.0.1:8000/mcp \
+  --header "Authorization: Bearer <the machine's token>" --header "X-AFClaude-Hostname: <this machine's host name>"
+```
+
+The name and the URL come **before** `--header` (the option takes several values and would swallow them). Both headers are required: a request without the host name header is refused (401 and an audit row, D-342); the header is the client's own claim and only feeds the alert when one token shows up from two host names (D-198), it never authorises. A request without a valid token, or from a revoked machine, is a 401 and an audited refusal. Over HTTP the caller is always the machine user, never the host owner; this host's own sessions use the stdio line above.
+
+## Until the switch: the venv registration
+
+Before the switch (the old single container, `meta.writers` not `container`) the server runs on the host in the project venv, because the MCP SDK needs Python >= 3.10 and the system `python3` is 3.9:
+
+```sh
+cd <the checkout>
 python3.12 -m venv .venv
 .venv/bin/pip install mcp          # official MCP Python SDK (2.x)
+claude mcp add --scope user afclaude -- <the checkout>/.venv/bin/python <the checkout>/mcp_server.py
 ```
 
-## Register for all your sessions on this host
-
-This changes your Claude Code config (`~/.claude.json`, user scope), so run it yourself:
-
-```sh
-claude mcp add --scope user afclaude -- /mnt/BlockVolume/Claude/work/AFClaude/.venv/bin/python /mnt/BlockVolume/Claude/work/AFClaude/mcp_server.py
-```
-
-Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its 12 tools. Sessions that are already running only pick it up after a restart or `/mcp` reconnect.
-
-Remove it: `claude mcp remove --scope user afclaude`.
+Check it: `claude mcp list` should show `afclaude … ✓ Connected`, and `/mcp` inside a session lists its tools. Sessions that are already running only pick up a registration after a restart or `/mcp` reconnect.
 
 ## Only on explicit request, no approval step
 
@@ -62,6 +79,6 @@ The server takes the caller's directory from these sources, in order. Every `afc
 
 `created_by_session` comes from `$CLAUDE_CODE_SESSION_ID`, if Claude Code passes it to the server. The server process starts with the session, so the value can be stale after `/clear` or `/resume` inside the same process.
 
-## Not verified yet
+## What Claude Code supplies to a stdio server
 
-Nobody has yet checked which of the three sources Claude Code actually supplies. A headless probe run (`claude -p` with a probe MCP config) was blocked in the build session. After you register the server, add one task from a normal session and look at `project_source` and `created_by_session`.
+Checked on 14.11. (Claude Code 2.1.325, a headless run with a stub server that wrote its environment): the server starts with `CLAUDE_CODE_SESSION_ID` (the session's id at its start; after `/clear` the hook's `_afc` stamp carries the new one), `CLAUDECODE=1` and `CLAUDE_PROJECT_DIR` (the session's directory), so the second source of "How project defaults" works, and through the wrapper too (it passes these variables into the container and sets `CLAUDE_PROJECT_DIR` from its own cwd when the caller has none). Over HTTP no session id or directory reaches the server: the machine comes from the token, the session from the stamp, and a call has no project default.

@@ -27,7 +27,9 @@ Phase 5b K4, two layouts (D-339), chosen by AFCLAUDE_LAYOUT (environment, else d
     the cut-over's job, K7). Optional compose overrides come from AFCLAUDE_COMPOSE_OVERRIDES (environment, else
     docker/.env): file names in docker/, comma-separated (compose.host-mounts.yml, compose.subnet.yml). After the
     recreate the script waits for all three health checks (a bounded wait; an unhealthy or exited service fails
-    the deploy with its last health output, alerted).
+    the deploy with its last health output, alerted). afclaude-mcp is in the compose profile `mcp` (K5 part 2a): it
+    is neither started nor waited for unless COMPOSE_PROFILES (environment, else docker/.env) names `mcp`, and then
+    only with roles_enforce `on` (its 0.0.0.0 bind refuses to start otherwise: the deploy refuses first, D-343).
 
 Steps: 0) refuse within START_GUARD (30 min) before or after a scheduled session-window start
 (schedule.py): from phase 3a S5 on, a restart during a start is an alert + pause (D-257), and a
@@ -67,6 +69,7 @@ import store  # noqa: E402
 
 NAME = "afclaude"                              # the container name prefix (AFCLAUDE_NAME, services layout), and the single container
 SERVICES = ("runner", "mcp", "web")           # container names: <prefix>-<service>
+MCP_PROFILE = "mcp"                           # compose profile of the afclaude-mcp service (compose.services.yml)
 CONTAINER = NAME                              # the single layout's container (its name is fixed in compose.yml)
 LAYOUTS = ("single", "services")
 DEFAULT_LAYOUT = "single"                     # until K7 flips it (D-339)
@@ -226,9 +229,44 @@ def name_prefix() -> str:
     return env_value("AFCLAUDE_NAME") or NAME
 
 
-def container_names(prefix: Optional[str] = None) -> List[str]:
+def mcp_enabled(env_file: Optional[str] = None, environ: Optional[dict] = None) -> bool:
+    """Whether compose starts afclaude-mcp: COMPOSE_PROFILES as compose resolves it (the shell environment, else
+    docker/.env) names the `mcp` profile (or `*`, all of them)."""
+    names = [n.strip() for n in env_value("COMPOSE_PROFILES", env_file, environ).split(",")]
+    return MCP_PROFILE in names or "*" in names
+
+
+def container_names(prefix: Optional[str] = None, with_mcp: Optional[bool] = None) -> List[str]:
+    """The services' containers: afclaude-mcp only when its profile is enabled (with_mcp, default: as configured)."""
     p = prefix or name_prefix()
-    return [f"{p}-{svc}" for svc in SERVICES]
+    with_mcp = mcp_enabled() if with_mcp is None else with_mcp
+    return [f"{p}-{svc}" for svc in SERVICES if svc != "mcp" or with_mcp]
+
+
+def check_mcp_profile(lay: str, mode: Optional[Callable[[], str]] = None) -> bool:
+    """False (printed why) when the services layout enables the `mcp` profile while roles_enforce is not `on`: the
+    service binds 0.0.0.0 and would exit 78 at once (mcp_http.check_bind, D-343), so the deploy would end in a failed
+    health wait after the drain. Needs check_data() first (it points store.DB_PATH at the mounted database)."""
+    if lay != "services" or not mcp_enabled():
+        return True
+    import actions
+
+    def read() -> str:
+        conn = store.connect()
+        try:
+            return actions.roles_mode(conn, report=False)
+        finally:
+            conn.close()
+    try:
+        current = (mode or read)()
+    except actions.RolesFailure as e:
+        current = f"unusable ({e})"
+    if current == "on":
+        return True
+    print(f"deploy refused: COMPOSE_PROFILES enables the mcp service (it listens on 0.0.0.0), but roles_enforce is "
+          f"{current!r}, not 'on': it would exit 78 at start. Set roles on first (tasks.py roles mode --set on) or drop "
+          "the mcp profile from COMPOSE_PROFILES. Nothing was drained.")
+    return False
 
 
 def check_data() -> Optional[str]:
@@ -361,9 +399,13 @@ def check_host_kit(lay: str, answer: Callable[[], dict] = installed_kit_answer) 
     theirs = {"kit_version": info.get("kit_version"), "files": info.get("files")}
     if mine == theirs:
         return True
+    if host.kit_is_newer(theirs["kit_version"]):
+        fix = ("the installed kit is NEWER than this code: deploy the matching code (tools/deploy.py from the checkout "
+               "with that kit version); the install from this checkout would downgrade it")
+    else:
+        fix = f"First {INSTALL_HINT}, then deploy"
     print(f"deploy refused: the installed host kit is not the one this code needs (installed {theirs!r}, this code "
-          f"{mine!r}): the new container's host check would pause every start. First {INSTALL_HINT}, then deploy. "
-          "Nothing was drained.")
+          f"{mine!r}): the new container's host check would pause every start. {fix}. Nothing was drained.")
     return False
 
 
@@ -454,6 +496,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not check_scheduler_mode():             # before anything: --force does not skip it
         return 1
     if lay == "services" and (check_data() is None or not check_old_container()):
+        return 1
+    if not check_mcp_profile(lay):
         return 1
     if not check_host_kit(lay):              # --force does not skip it either: the start would pause, not race
         return 1

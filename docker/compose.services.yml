@@ -5,7 +5,14 @@
 #   afclaude-runner  `afclaude runner serve`: the schedule (sampler, window starts, keep-alive, inbox delivery, ...)
 #   afclaude-mcp     `afclaude mcp serve`: the MCP server over HTTP on an internal port (no port is published;
 #                    every request needs a machine token and the host name header). It binds 0.0.0.0 and starts
-#                    only once roles_enforce is `on` (exit 78 otherwise, K5 deploy gate, D-343)
+#                    only once roles_enforce is `on` (exit 78 otherwise, K5 deploy gate, D-343), so it is in the
+#                    compose profile `mcp` and a plain `up` does not start it. It is also the container the host
+#                    wrapper (`afclaude`, host kit 7) runs every command in (`docker exec afclaude-mcp ...`), so the
+#                    session switch (K5 part 2b) needs it. To enable it: set roles_enforce on (tasks.py roles mode
+#                    --set on), then COMPOSE_PROFILES=mcp in docker/.env (tools/deploy.py reads it there and then waits
+#                    for it; it refuses the deploy while roles are not on). By hand: `docker compose --profile mcp ...`.
+#                    The container carries no machine token, token file or CLAUDE_* variable (test_services): the
+#                    wrapper passes the token per call.
 #   afclaude-web     `afclaude web serve`: GET /health and the inbox API on a unix socket in the data directory
 # The only required variable is AFCLAUDE_DATA: the host directory that is the data directory (DB, key, logs, state).
 # It has no default (D-180/D-187): the setup chooses it, and an unset value stops compose before any container
@@ -70,6 +77,7 @@ services:
     <<: *service
     pull_policy: never               # the image is the runner's build
     container_name: ${AFCLAUDE_NAME:-afclaude}-mcp
+    profiles: [mcp]                  # not started by a plain `up` (see the header); COMPOSE_PROFILES=mcp enables it
     command: ["mcp"]
     # the runner migrates the schema first: this service starts once it is healthy
     depends_on:

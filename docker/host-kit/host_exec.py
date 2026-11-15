@@ -94,7 +94,7 @@ from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 # The kit version: bumped with every change of the whitelist (a new command, a new shape) or of the
 # host.json format. host.py's HOST_KIT_VERSION is the same string (test_host_kit.py compares them) and
 # the container's host check calls `kit-version` against it.
-HOST_KIT_VERSION = "6"
+HOST_KIT_VERSION = "7"
 CONFIG_FORMAT = 2
 # every command head the whitelist knows (the elif chain in main(); test_host_kit.py compares the two)
 COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "host-config", "ka_resume.sh",
@@ -103,7 +103,8 @@ COMMANDS = ("append-note", "claude", "claude-env", "clock", "df", "doc-files", "
             "usage-cache")
 OUT_MAX = 2 * 1024 * 1024    # bytes of output this file produces itself (the commands it only runs write straight through)
 KIT_DIR = os.path.dirname(os.path.abspath(__file__))   # <share>/afclaude/host-kit/current when run by sshd
-KIT_FILES = ("host_exec.py", "ka_resume.sh")           # what `kit-version` hashes (the install copies exactly these)
+KIT_FILES = ("host_exec.py", "ka_resume.sh", "afclaude")   # what `kit-version` hashes (the install copies exactly these;
+                                                         # `afclaude` is docker/host-kit/afclaude_host.py, the host wrapper, K5)
 # Run by sshd (a forced command with a client command) SSH_ORIGINAL_COMMAND is set: then no env override below
 # is read (sshd's AcceptEnv / PermitUserEnvironment must never be able to move host.json or the log) and the
 # `--run` test entry is refused. The tests run this file without it and pass the command as `--run <command>`.
@@ -171,9 +172,12 @@ def whitelist_hash() -> str:
 
 def kit_file(name: str) -> str:
     """The path of a kit file: next to this file when installed (<share>/afclaude/host-kit/<version>/). Run from a
-    checkout (docker/host-kit/, the tests and the install's --print-version) ka_resume.sh is the repo's own."""
+    checkout (docker/host-kit/, the tests and the install's --print-version) ka_resume.sh is the repo's own and
+    `afclaude` is afclaude_host.py beside this file."""
     path = os.path.join(KIT_DIR, name)
     if not os.path.exists(path) and os.path.basename(os.path.dirname(KIT_DIR)) == "docker":
+        if name == "afclaude":
+            return os.path.join(KIT_DIR, "afclaude_host.py")
         return os.path.join(os.path.dirname(os.path.dirname(KIT_DIR)), name)
     return path
 

@@ -139,6 +139,15 @@ class EachCheck(Base):
         self.assertIn("install_host_bridge.sh", o.fix)
         self.assertIn("version '1'", o.detail)
 
+    def test_kit_newer_than_the_code_says_deploy_not_install(self):
+        self.stub()
+        newer = host.HostKitTooNew("host kit version '99' is newer than this code's '7': deploy the matching code")
+        with mock.patch.object(host, "check_host", side_effect=newer):
+            o = self.run_one("kit")
+        self.assertEqual(o.status, "fail")
+        self.assertIn("tools/deploy.py", o.fix)
+        self.assertNotIn("re-run the host kit install", o.fix)
+
     def test_tmux(self):
         for ans, status in ((done(0, "ok\n"), "ok"), (done(1, "", "host_exec: tmux-check failed"), "fail"),
                             (done(124, "", "stopped after 60 s"), "fail"), (done(0, "weird\n"), "fail")):
