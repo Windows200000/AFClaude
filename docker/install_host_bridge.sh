@@ -31,7 +31,7 @@
 #   5. puts ONE restricted line into ~/.ssh/authorized_keys (command=current/host_exec.py, from=, restrict); a
 #      line with the same key is replaced, every other line stays; then points <share>/afclaude/host-kit/current
 #      at the version, and links <bin>/afclaude to current/afclaude (a plain file of that name there is
-#      refused, never replaced). Everything after the first change is undone (authorized_keys from its
+#      refused, as is a link to anything outside the kit directory). Everything after the first change is undone (authorized_keys from its
 #      timestamped backup, the links) when ANY later step fails, and the script exits 1
 # The OLD bridge line (the pre-kit install, comment "afclaude-host-bridge") is never removed here: it stays
 # until the new one works; the closing message says how to remove it.
@@ -87,7 +87,7 @@ cleanup() {   # EXIT: temp files go; a run that changed authorized_keys or the l
     if [ "$BIN_SWITCHED" = 1 ]; then
       if [ -n "$PREV_BIN" ]; then ln -sfn "$PREV_BIN" "$BINDIR/.afclaude.$$" && mv -T "$BINDIR/.afclaude.$$" "$BIN_LINK"; else rm -f "$BIN_LINK"; fi
     fi
-    echo "install_host_bridge: failed (exit $rc); authorized_keys and the current link are back as they were" >&2
+    echo "install_host_bridge: failed (exit $rc); authorized_keys, the current link and the afclaude link in $BINDIR are back as they were" >&2
   fi
 }
 trap cleanup EXIT
@@ -152,8 +152,15 @@ finally:
 PY
 }
 
-# a plain file named afclaude in <bin> is not ours to replace (before anything changes)
+# <bin>/afclaude is replaced only when it is this kit's own link (before anything changes): a plain file, or a link
+# to anywhere but the kit directory (another install, the owner's own script), is refused and named
 [ ! -e "$BIN_LINK" ] || [ -L "$BIN_LINK" ] || die "$BIN_LINK exists and is not a link: move it away (or pick another --bin), the wrapper is linked there"
+if [ -L "$BIN_LINK" ]; then
+  case "$(readlink "$BIN_LINK")" in
+    "$KITS"/*) ;;
+    *) die "$BIN_LINK is a link to $(readlink "$BIN_LINK"), not into $KITS: remove it yourself (rm $BIN_LINK) or pick another --bin; it is not replaced silently";;
+  esac
+fi
 # 1. the kit, as a new version directory
 mkdir -p "$KITS"; chmod 700 "$BASE" "$KITS"
 if [ -d "$VDIR" ]; then

@@ -65,11 +65,14 @@ import store  # noqa: E402
 
 COMPONENT = "hostcheck"
 HOST_KIT_ERROR: type[Exception] = getattr(host, "HostKitError")
+HOST_KIT_TOO_NEW: type[Exception] = getattr(host, "HostKitTooNew")
 ACTOR = "runner:host_check"        # the runner job and the pre-start hook
 CLI_ACTOR = "cli"                  # `afclaude host check` (a manual run records its results too)
 BERLIN = ZoneInfo("Europe/Berlin")
 STATUSES = ("ok", "warn", "fail", "skip")
 KIT_FIX = "re-run the host kit install on the host (docker/install_host_bridge.sh, D-121)"
+KIT_FIX_NEWER = ("the installed kit is newer than this code: deploy the matching code (tools/deploy.py from the checkout "
+                 "with that kit version); re-running the install from this checkout would downgrade the kit")
 # TRANSITIONAL (module doc, K7 removes it): what the `kit` check records while no kit is installed.
 NO_KIT = "kit not installed"
 NO_KIT_DETAIL = (f"{NO_KIT}: the host bridge is still the legacy docker/host_exec.py; the other checks need the "
@@ -517,7 +520,7 @@ def execute(check: Check, ctx: Ctx) -> Outcome:
         res = Result("fail", f"no answer within {check.budget:g} s ({_first(str(e), 160)})",
                      "a hung host call is an error (D-234): look at the host and the bridge")
     except HOST_KIT_ERROR as e:
-        res = Result("fail", _first(str(e), 500), KIT_FIX)
+        res = Result("fail", _first(str(e), 500), KIT_FIX_NEWER if isinstance(e, HOST_KIT_TOO_NEW) else KIT_FIX)
     except Exception as e:   # noqa: BLE001 - a crashing check is a failing check, not a silent one (D-235)
         res = Result("fail", f"the check itself raised {type(e).__name__}: {_first(str(e), 400)}",
                      "a bug in hostcheck.py or an unexpected host answer: fix the check")

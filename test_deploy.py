@@ -681,6 +681,16 @@ class KitGuardTest(unittest.TestCase):
             self.assertIn("install_host_bridge.sh", text)
             self.assertIn("Nothing was drained", text)
 
+    def test_a_newer_installed_kit_refuses_naming_the_matching_code_not_the_install(self):
+        with mock.patch("builtins.print") as out:
+            self.assertFalse(CHECK_HOST_KIT("services", answer=lambda: self.mine(
+                kit_version=str(int(deploy.host.HOST_KIT_VERSION) + 1))))
+        text = " ".join(str(c.args[0]) for c in out.call_args_list)
+        self.assertIn("NEWER", text)
+        self.assertIn("deploy the matching code", text)
+        self.assertNotIn("First re-run", text)
+        self.assertIn("Nothing was drained", text)
+
     def test_a_kit_that_does_not_answer_refuses(self):
         with mock.patch("builtins.print") as out:
             self.assertFalse(CHECK_HOST_KIT("single", answer=mock.Mock(side_effect=RuntimeError("no host kit installed"))))

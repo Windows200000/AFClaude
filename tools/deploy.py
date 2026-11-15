@@ -399,9 +399,13 @@ def check_host_kit(lay: str, answer: Callable[[], dict] = installed_kit_answer) 
     theirs = {"kit_version": info.get("kit_version"), "files": info.get("files")}
     if mine == theirs:
         return True
+    if host.kit_is_newer(theirs["kit_version"]):
+        fix = ("the installed kit is NEWER than this code: deploy the matching code (tools/deploy.py from the checkout "
+               "with that kit version); the install from this checkout would downgrade it")
+    else:
+        fix = f"First {INSTALL_HINT}, then deploy"
     print(f"deploy refused: the installed host kit is not the one this code needs (installed {theirs!r}, this code "
-          f"{mine!r}): the new container's host check would pause every start. First {INSTALL_HINT}, then deploy. "
-          "Nothing was drained.")
+          f"{mine!r}): the new container's host check would pause every start. {fix}. Nothing was drained.")
     return False
 
 

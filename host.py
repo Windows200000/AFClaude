@@ -280,6 +280,17 @@ class HostKitError(RuntimeError):
     """The installed host kit is not the one this code needs, or does not answer (D-235)."""
 
 
+class HostKitTooNew(HostKitError):
+    """The installed kit's version is NEWER than this code's: the install must not be re-run from this checkout
+    (it would downgrade the kit); the matching, newer code is what to deploy."""
+
+
+def kit_is_newer(installed, expected=None):
+    """True when the installed kit version is a number above this code's (versions are counted: "6" < "7")."""
+    expected = HOST_KIT_VERSION if expected is None else expected
+    return isinstance(installed, str) and installed.isdigit() and expected.isdigit() and int(installed) > int(expected)
+
+
 def kit_info(timeout=30):
     """The installed kit's `kit-version` answer ({kit_version, whitelist_hash, commands, config_format}) over
     the bridge, or None when the bridge is the one from before the host kit (it denies the command as
@@ -308,6 +319,10 @@ def check_kit(timeout=30):
     """kit_info(), or HostKitError when its version is not HOST_KIT_VERSION (naming both). None: no kit
     installed yet (the legacy bridge answers): the first host check reports that, it is not an error here."""
     info = kit_info(timeout)
+    if info is not None and kit_is_newer(info["kit_version"]):
+        raise HostKitTooNew(f"host kit version {info['kit_version']!r} is newer than this code's {HOST_KIT_VERSION!r}: "
+                            "deploy the matching code (tools/deploy.py from the checkout that has that kit version); "
+                            "do not re-run the install from this older checkout")
     if info is not None and info["kit_version"] != HOST_KIT_VERSION:
         raise HostKitError(f"host kit version {info['kit_version']!r}, this code needs {HOST_KIT_VERSION!r}: "
                            "re-run the host kit install (docker/install_host_bridge.sh)")

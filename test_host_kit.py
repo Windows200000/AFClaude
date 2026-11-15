@@ -324,6 +324,21 @@ class ImageSide(unittest.TestCase):
             with self.answer(rc=126, err="host_exec: denied (not whitelisted)"):
                 self.assertIsNone(host.check_host())           # the pre-kit bridge: reported by the first host check
 
+    def test_a_newer_installed_kit_says_deploy_the_matching_code_not_reinstall(self):
+        newer = str(int(host.HOST_KIT_VERSION) + 1)
+        with self.answer(out=self.info(newer)), self.assertRaises(host.HostKitTooNew) as cm:
+            host.check_kit()
+        self.assertIn("deploy the matching code", str(cm.exception))
+        self.assertNotIn("re-run the host kit install", str(cm.exception))
+        older = str(int(host.HOST_KIT_VERSION) - 1)
+        with self.answer(out=self.info(older)), self.assertRaises(host.HostKitError) as cm:
+            host.check_kit()
+        self.assertNotIsInstance(cm.exception, host.HostKitTooNew)
+        self.assertIn("re-run the host kit install", str(cm.exception))
+        self.assertFalse(host.kit_is_newer("abc"))
+        self.assertFalse(host.kit_is_newer(None))
+        self.assertTrue(host.kit_is_newer("10", "9"))                      # counted, not compared as text
+
     def test_matching_version(self):
         with self.answer(out=self.info(host.HOST_KIT_VERSION)):
             self.assertEqual(host.check_kit()["kit_version"], host.HOST_KIT_VERSION)
@@ -765,35 +780,69 @@ class InstallScript(unittest.TestCase):
         self.assertFalse(os.path.lexists(os.path.join(kits, "current")))
         self.assertEqual([f for f in os.listdir(kits) if f.startswith(".")], [])
 
-    def test_the_wrapper_link_is_replaced_but_a_plain_file_is_refused_before_any_change(self):
-        """K5: <bin>/afclaude is a link to current/afclaude: an old link (another target) is replaced, a plain file of
-        that name is refused with nothing changed (no kit directory, no authorized_keys line)."""
+    def test_the_wrapper_link_is_replaced_only_when_it_is_the_kits_own(self):
+        """K5: <bin>/afclaude is replaced when it already leads into the kit directory (an earlier install); a plain
+        file, or a link to anywhere else, is refused and named with nothing changed (no kit directory, no
+        authorized_keys line, the file or link untouched)."""
         bindir = os.path.join(self.home, ".local", "bin")
         os.makedirs(bindir)
         link = os.path.join(bindir, "afclaude")
-        os.symlink("/old/place/afclaude", link)
+        kits = os.path.join(self.share, "host-kit")
+        os.makedirs(os.path.join(kits, "6"))
+        os.symlink(os.path.join(kits, "6", "afclaude"), link)             # an earlier kit's link
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(os.readlink(link), os.path.join(self.share, "host-kit", "current", "afclaude"))
-        os.unlink(link)
-        write_json(link, "#!/bin/sh\necho mine\n", 0o755)
-        shutil.rmtree(self.share)
-        with open(self.ak, "w") as fh:
-            fh.write(self.OTHER + "\n")
-        r = self.run_install()
-        self.assertEqual(r.returncode, 1, r.stdout)
-        self.assertIn("is not a link", r.stderr)
-        self.assertFalse(os.path.exists(self.share))
-        self.assertEqual(self.lines(), [self.OTHER])
+        self.assertEqual(os.readlink(link), os.path.join(kits, "current", "afclaude"))
+        for make, wanted in ((lambda: os.symlink("/old/place/afclaude", link), "/old/place/afclaude, not into"),
+                             (lambda: write_json(link, "#!/bin/sh\necho mine\n", 0o755), "is not a link")):
+            os.unlink(link)
+            make()
+            shutil.rmtree(self.share, ignore_errors=True)
+            with open(self.ak, "w") as fh:
+                fh.write(self.OTHER + "\n")
+            r = self.run_install()
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn(wanted, r.stderr)
+            self.assertFalse(os.path.exists(self.share))
+            self.assertEqual(self.lines(), [self.OTHER])
         with open(link) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+
+    def test_upgrading_an_installed_kit_6_to_7(self):
+        """The owner's step at K5 part 2a's merge: a host with kit 6 (two files, no wrapper, no bin link) gets 7 beside it:
+        host.json and the key line stay, version 6 stays as it was, `current` moves, the wrapper is installed and linked."""
+        kits = os.path.join(self.share, "host-kit")
+        self.patch_kit('HOST_KIT_VERSION = "7"', 'HOST_KIT_VERSION = "6"')
+        self.assertEqual(self.run_install().returncode, 0)
+        six = os.path.join(kits, "6")
+        os.unlink(os.path.join(six, "afclaude"))                           # kit 6 had no wrapper
+        os.unlink(os.path.join(self.home, ".local", "bin", "afclaude"))
+        self.assertEqual(os.readlink(os.path.join(kits, "current")), "6")
+        with open(os.path.join(self.share, "host.json"), "rb") as fh:
+            conf, lines = fh.read(), self.lines()
+        before6 = {n: open(os.path.join(six, n), "rb").read() for n in os.listdir(six)}
+        shutil.copy(os.path.join(HERE, "docker", "host-kit", "host_exec.py"), os.path.join(self.src, "docker", "host-kit"))
+        r = self.run_install(args=["--data", self.data])                   # the install of the checkout with kit 7
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(os.path.join(kits, "current")), "7")
+        self.assertEqual(sorted(os.listdir(os.path.join(kits, "7"))), ["afclaude", "host_exec.py", "ka_resume.sh"])
+        self.assertEqual({n: open(os.path.join(six, n), "rb").read() for n in os.listdir(six)}, before6)
+        with open(os.path.join(self.share, "host.json"), "rb") as fh:
+            self.assertEqual(fh.read(), conf)
+        self.assertEqual(self.lines(), lines)                              # the same key line (current/ is a link)
+        self.assertEqual(os.readlink(os.path.join(self.home, ".local", "bin", "afclaude")), os.path.join(kits, "current", "afclaude"))
+        cur = os.path.join(kits, "current", "host_exec.py")
+        env = {"SSH_ORIGINAL_COMMAND": "kit-version", "PATH": os.environ["PATH"], "HOME": self.home}
+        info = json.loads(subprocess.run([cur], env=env, capture_output=True, text=True, timeout=60).stdout)
+        self.assertEqual((info["kit_version"], sorted(info["files"])), ("7", ["afclaude", "host_exec.py", "ka_resume.sh"]))
 
     def test_a_failure_after_the_wrapper_link_is_made_puts_the_old_link_back(self):
         """K5: the final check fails after the bin link was switched: it points where it did before (or is gone)."""
         bindir = os.path.join(self.home, ".local", "bin")
         os.makedirs(bindir)
         link = os.path.join(bindir, "afclaude")
-        os.symlink("/old/place/afclaude", link)
+        os.makedirs(os.path.join(self.share, "host-kit", "6"))
+        os.symlink(os.path.join(self.share, "host-kit", "6", "afclaude"), link)
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real = shutil.which("ssh-keygen")
@@ -801,8 +850,9 @@ class InstallScript(unittest.TestCase):
                    f'#!/bin/sh\ncase "$2" in *authorized_keys) exit 1;; esac\nexec {real} "$@"\n', 0o755)
         r = self.run_install(path=stub)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-        self.assertEqual(os.readlink(link), "/old/place/afclaude")
+        self.assertEqual(os.readlink(link), os.path.join(self.share, "host-kit", "6", "afclaude"))
         self.assertEqual([f for f in os.listdir(bindir) if f.startswith(".")], [])
+        self.assertIn("the afclaude link", r.stderr)
         os.unlink(link)
         shutil.rmtree(self.share)
         r = self.run_install(path=stub)
