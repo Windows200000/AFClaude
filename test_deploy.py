@@ -251,9 +251,43 @@ class ThreeServicesTest(unittest.TestCase):
     """The pieces of the three-service deploy: data check, old container, compose files, health wait."""
 
     def test_container_names(self):
-        self.assertEqual(deploy.container_names("afclaude"),
+        self.assertEqual(deploy.container_names("afclaude", with_mcp=True),
                          ["afclaude-runner", "afclaude-mcp", "afclaude-web"])
-        self.assertEqual(deploy.container_names("x"), ["x-runner", "x-mcp", "x-web"])
+        self.assertEqual(deploy.container_names("x", with_mcp=True), ["x-runner", "x-mcp", "x-web"])
+        self.assertEqual(deploy.container_names("x", with_mcp=False), ["x-runner", "x-web"])
+
+    def test_the_mcp_service_is_waited_for_only_with_its_profile(self):
+        """K5 part 2a: afclaude-mcp is in the compose profile `mcp` (a plain up does not start it), so the health wait
+        names it only when COMPOSE_PROFILES does."""
+        for value, want in (("", False), ("other", False), ("mcp", True), ("a, mcp", True), ("*", True), ("mcp2", False)):
+            self.assertEqual(deploy.mcp_enabled(environ={"COMPOSE_PROFILES": value}, env_file="/nonexistent"), want, value)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, ".env")
+            with open(env, "w") as fh:
+                fh.write("COMPOSE_PROFILES=mcp\n")
+            self.assertTrue(deploy.mcp_enabled(env, {}))
+        with mock.patch.object(deploy, "mcp_enabled", return_value=False):
+            self.assertEqual(deploy.container_names("x"), ["x-runner", "x-web"])
+        with mock.patch.object(deploy, "mcp_enabled", return_value=True):
+            self.assertEqual(deploy.container_names("x"), ["x-runner", "x-mcp", "x-web"])
+
+    def test_the_mcp_profile_is_refused_while_roles_are_not_on(self):
+        with mock.patch.object(deploy, "mcp_enabled", return_value=False):
+            self.assertTrue(deploy.check_mcp_profile("services", mode=lambda: self.fail("no read without the profile")))
+        with mock.patch.object(deploy, "mcp_enabled", return_value=True):
+            self.assertTrue(deploy.check_mcp_profile("single", mode=lambda: self.fail("single layout: no mcp service")))
+            self.assertTrue(deploy.check_mcp_profile("services", mode=lambda: "on"))
+            with mock.patch("builtins.print") as out:
+                self.assertFalse(deploy.check_mcp_profile("services", mode=lambda: "shadow"))
+            self.assertIn("roles_enforce is 'shadow'", out.call_args[0][0])
+            self.assertIn("Nothing was drained", out.call_args[0][0])
+            import actions
+            def broken():
+                raise actions.RolesFailure("the saved roles_enforce setting can't be used", "bad", "fix")
+            with mock.patch("builtins.print") as out:
+                self.assertFalse(deploy.check_mcp_profile("services", mode=broken))
+            self.assertIn("unusable", out.call_args[0][0])
 
     def test_check_data_refuses_unset_and_a_directory_without_a_database(self):
         import tempfile
@@ -388,7 +422,7 @@ class MainFlowTest(unittest.TestCase):
 
     layout = "services"
 
-    def _main(self, argv=(), compose_rc=0, healthy=True):
+    def _main(self, argv=(), compose_rc=0, healthy=True, profiles="", roles="on"):
         events = []
         runs = []
 
@@ -401,7 +435,8 @@ class MainFlowTest(unittest.TestCase):
              mock.patch.object(deploy, "check_data", return_value="/d/afclaude.db"), \
              mock.patch.object(deploy, "check_old_container", return_value=True), \
              mock.patch.object(deploy, "check_start_guard", return_value=True), \
-             mock.patch.object(deploy, "env_value", return_value=""), \
+             mock.patch.object(deploy, "env_value", side_effect=lambda name, *a, **k: profiles if name == "COMPOSE_PROFILES" else ""), \
+             mock.patch("actions.roles_mode", return_value=roles), \
              mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
              mock.patch.object(deploy, "code_version", return_value="abc1234"), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
@@ -417,11 +452,24 @@ class MainFlowTest(unittest.TestCase):
         rc, events, runs = self._main()
         self.assertEqual(rc, 0)
         self.assertEqual(events, ["drain", "top afclaude-runner", "compose",
-                                  ("health", ("afclaude-runner", "afclaude-mcp", "afclaude-web"))])
+                                  ("health", ("afclaude-runner", "afclaude-web"))])      # the mcp profile is not enabled
         cmd, version = runs[0]
         self.assertEqual(cmd[:4], ["docker", "compose", "-f", deploy.COMPOSE_SERVICES])
         self.assertEqual(cmd[-3:], ["up", "-d", "--build"])
         self.assertEqual(version, "abc1234")
+
+    def test_with_the_mcp_profile_and_roles_on_the_health_wait_names_the_mcp_service_too(self):
+        if self.layout != "services":
+            self.skipTest("the single layout has no mcp service")
+        rc, events, _ = self._main(profiles="mcp")
+        self.assertEqual(rc, 0)
+        self.assertIn(("health", ("afclaude-runner", "afclaude-mcp", "afclaude-web")), events)
+
+    def test_the_mcp_profile_with_roles_in_shadow_refuses_before_the_drain(self):
+        if self.layout != "services":
+            self.skipTest("the single layout has no mcp service")
+        rc, events, runs = self._main(profiles="mcp", roles="shadow")
+        self.assertEqual((rc, events, runs), (1, [], []))
 
     def test_unhealthy_after_the_recreate_is_exit_1_and_alerted(self):
         rc, events, _ = self._main(healthy=False)

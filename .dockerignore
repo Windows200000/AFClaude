@@ -14,6 +14,7 @@ quickview/.env
 *.log
 *.key
 *.pem
+machine.json
 keepalive_state.json
 keepalive.lock
 STOP

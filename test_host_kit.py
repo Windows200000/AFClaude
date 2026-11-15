@@ -31,7 +31,10 @@ INSTALL = os.path.join(HERE, "docker", "install_host_bridge.sh")
 # host_exec.py or ka_resume.sh, without a version bump fails test_whitelist_hash_matches_the_version and
 # test_kit_files_are_pinned_with_the_version (docker/host-kit/host_exec.py: HOST_KIT_VERSION, COMMANDS; M5)
 KIT_VERSIONS = {"6": {"whitelist": "69a25c72326e80b0", "host_exec.py": "7e9475ef2c98640ea64b40cce493a12c3e074e8cddcfe72518072d736ea02a03",  # public-check: allow (sha256 pin)
-                        "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af"}}  # public-check: allow (sha256 pin)
+                        "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af"},  # public-check: allow (sha256 pin)
+                "7": {"whitelist": "69a25c72326e80b0", "host_exec.py": "37d8e5d3feb1e95b60f203fb2bbd6e6e615874ae30ec882040c19067f8b8bd60",  # public-check: allow (sha256 pin)
+                      "ka_resume.sh": "5e1d35b7abc508288e439ba97d6009549700a8da71af72c7eeddd2c4e49328af",  # public-check: allow (sha256 pin)
+                      "afclaude": "af6f65ec3163f180830a523f819c34f1ba4cc4000c216bcacf0036948105c6ee"}}  # public-check: allow (sha256 pin)
 SID = "abcdef01-0000-4000-8000-000000000001"
 
 
@@ -148,10 +151,11 @@ class HostJson(TempDir):
     def share(self):
         """host.json's own directory, as <share>/afclaude: a kit file path below it, so KIT_DIR/../.. is it."""
         share = os.path.join(self.tmp, "share")
-        kit = os.path.join(share, "host-kit", "6")
+        kit = os.path.join(share, "host-kit", "7")
         os.makedirs(kit)
         for name in ("host_exec.py", "ka_resume.sh"):
             shutil.copy(os.path.join(os.path.dirname(HOST_EXEC) if name == "host_exec.py" else HERE, name), kit)
+        shutil.copy(os.path.join(os.path.dirname(HOST_EXEC), "afclaude_host.py"), os.path.join(kit, "afclaude"))
         write_json(os.path.join(share, "host.json"), self.config())
         return share, os.path.join(kit, "host_exec.py")
 
@@ -537,7 +541,8 @@ class InstallScript(unittest.TestCase):
         # a copy of the checkout's kit sources: the script finds them next to itself
         self.src = os.path.join(self.tmp, "src")
         os.makedirs(os.path.join(self.src, "docker", "host-kit"))
-        for rel in ("docker/install_host_bridge.sh", "docker/host-kit/host_exec.py", "ka_resume.sh"):
+        for rel in ("docker/install_host_bridge.sh", "docker/host-kit/host_exec.py", "docker/host-kit/afclaude_host.py",
+                    "ka_resume.sh"):
             shutil.copy(os.path.join(HERE, rel), os.path.join(self.src, rel))
         self.share = os.path.join(self.home, ".local", "share", "afclaude")
 
@@ -596,8 +601,14 @@ class InstallScript(unittest.TestCase):
         kits = os.path.join(self.share, "host-kit")
         he = load_he(os.path.join(self.share, "host.json"))
         self.assertEqual(os.readlink(os.path.join(kits, "current")), he.HOST_KIT_VERSION)
-        for name in ("host_exec.py", "ka_resume.sh"):
+        for name in ("host_exec.py", "ka_resume.sh", "afclaude"):
             self.assertTrue(os.access(os.path.join(kits, he.HOST_KIT_VERSION, name), os.X_OK), name)
+        # the wrapper: the installed `afclaude` is the source file, linked from <home>/.local/bin through current/
+        with open(os.path.join(kits, he.HOST_KIT_VERSION, "afclaude"), "rb") as a, \
+                open(os.path.join(HERE, "docker", "host-kit", "afclaude_host.py"), "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual(os.readlink(os.path.join(self.home, ".local", "bin", "afclaude")), os.path.join(kits, "current", "afclaude"))
+        self.assertIn("host wrapper:", r.stdout)
         # host.json: mode 0600, what was asked for
         self.assertEqual(os.stat(os.path.join(self.share, "host.json")).st_mode & 0o777, 0o600)
         with open(os.path.join(self.share, "host.json")) as fh:
@@ -705,7 +716,7 @@ class InstallScript(unittest.TestCase):
         # a newer kit is installed first; the next install's final check fails -> link and file as before
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "7"', 'HOST_KIT_VERSION = "99"')
         # the stub ssh-keygen cannot read the key from authorized_keys: the line check fails
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
@@ -723,7 +734,7 @@ class InstallScript(unittest.TestCase):
         the link are back, nothing is left over."""
         self.assertEqual(self.run_install().returncode, 0)
         before_lines, before_link = self.lines(), os.readlink(os.path.join(self.share, "host-kit", "current"))
-        self.patch_kit('HOST_KIT_VERSION = "6"', 'HOST_KIT_VERSION = "99"')
+        self.patch_kit('HOST_KIT_VERSION = "7"', 'HOST_KIT_VERSION = "99"')
         stub = os.path.join(self.tmp, "bin")
         os.mkdir(stub)
         real, once = shutil.which("mv"), os.path.join(self.tmp, "mv-failed")
@@ -753,6 +764,59 @@ class InstallScript(unittest.TestCase):
         kits = os.path.join(self.share, "host-kit")
         self.assertFalse(os.path.lexists(os.path.join(kits, "current")))
         self.assertEqual([f for f in os.listdir(kits) if f.startswith(".")], [])
+
+    def test_the_wrapper_link_is_replaced_but_a_plain_file_is_refused_before_any_change(self):
+        """K5: <bin>/afclaude is a link to current/afclaude: an old link (another target) is replaced, a plain file of
+        that name is refused with nothing changed (no kit directory, no authorized_keys line)."""
+        bindir = os.path.join(self.home, ".local", "bin")
+        os.makedirs(bindir)
+        link = os.path.join(bindir, "afclaude")
+        os.symlink("/old/place/afclaude", link)
+        r = self.run_install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(link), os.path.join(self.share, "host-kit", "current", "afclaude"))
+        os.unlink(link)
+        write_json(link, "#!/bin/sh\necho mine\n", 0o755)
+        shutil.rmtree(self.share)
+        with open(self.ak, "w") as fh:
+            fh.write(self.OTHER + "\n")
+        r = self.run_install()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("is not a link", r.stderr)
+        self.assertFalse(os.path.exists(self.share))
+        self.assertEqual(self.lines(), [self.OTHER])
+        with open(link) as fh:
+            self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+
+    def test_a_failure_after_the_wrapper_link_is_made_puts_the_old_link_back(self):
+        """K5: the final check fails after the bin link was switched: it points where it did before (or is gone)."""
+        bindir = os.path.join(self.home, ".local", "bin")
+        os.makedirs(bindir)
+        link = os.path.join(bindir, "afclaude")
+        os.symlink("/old/place/afclaude", link)
+        stub = os.path.join(self.tmp, "bin")
+        os.mkdir(stub)
+        real = shutil.which("ssh-keygen")
+        write_json(os.path.join(stub, "ssh-keygen"),
+                   f'#!/bin/sh\ncase "$2" in *authorized_keys) exit 1;; esac\nexec {real} "$@"\n', 0o755)
+        r = self.run_install(path=stub)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(os.readlink(link), "/old/place/afclaude")
+        self.assertEqual([f for f in os.listdir(bindir) if f.startswith(".")], [])
+        os.unlink(link)
+        shutil.rmtree(self.share)
+        r = self.run_install(path=stub)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertFalse(os.path.lexists(link))
+
+    def test_an_installed_version_with_another_wrapper_stops_the_install(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        path = os.path.join(self.src, "docker", "host-kit", "afclaude_host.py")
+        with open(path, "a") as fh:
+            fh.write("# changed without a version bump\n")
+        r = self.run_install(args=["--data", self.data])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bump HOST_KIT_VERSION", r.stderr)
 
     def test_the_install_works_from_an_ssh_login(self):
         """M1: an SSH login (SSH_CONNECTION, SSH_CLIENT, SSH_TTY set) is where the owner runs this; only a forced
