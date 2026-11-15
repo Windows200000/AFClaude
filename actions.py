@@ -1862,6 +1862,23 @@ def masterkey_check(conn: sqlite3.Connection, ctx: Ctx, value: str, key_id: str)
     return Result({"key_id": key_id}, key_id, {"check": have}, {"check": value}, changed=have is None)
 
 
+@action("writers.set", "install", owner_only=True)
+def writers_set(conn: sqlite3.Connection, ctx: Ctx, value: Any) -> Result:
+    """Set meta.writers (K5 part 2b, D-344): `container` = only the container's processes write the
+    database (store.connect refuses every other process's writes, reads go on), `host` = any process
+    does (the rollback). `container` is set from inside the container only: the host's own code could
+    lock itself out of the database it is running on. -> {writers}; the same value is a no-op."""
+    if value not in (store.WRITERS_CONTAINER, store.WRITERS_HOST):
+        raise ValueError(f"writers must be {store.WRITERS_CONTAINER} or {store.WRITERS_HOST}, got {value!r}")
+    if value == store.WRITERS_CONTAINER and not store.in_container():
+        raise ValueError("writers=container is set inside the container only: run `afclaude tasks writers "
+                         "container` through the host wrapper")
+    have = store.get_meta(conn, store.WRITERS_KEY)
+    if have != value:
+        store.set_meta(conn, store.WRITERS_KEY, value)
+    return Result({"writers": value}, value, {"writers": have}, {"writers": value}, changed=have != value)
+
+
 @action("install.restored", "install", owner_only=True)
 def install_restored(conn: sqlite3.Connection, ctx: Ctx, source: Any) -> Result:
     """Mark this (just restored) database as a restore of `source` (backup.py restore, design

@@ -323,12 +323,16 @@ def _write_atomic(path: str, text: str) -> None:
 
 
 def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: Optional[str] = None,
-           check: bool = False, actor: str = IMPORT_ACTOR, via: str = "runner") -> dict[str, Any]:
+           check: bool = False, actor: str = IMPORT_ACTOR, via: str = "runner", emit: bool = False) -> dict[str, Any]:
     """Regenerate the public build log (PROGRESS.md, GOALS.md, EXCEPTIONS.md) from the DB into `repo`.
     Per file: import it first (a hand edit since the last sync wins over nothing; a conflict stops
     this file), render the DB's text, run the public-repo check on it, and write it if it differs
     (then mark it synced). check=True: report only, write nothing. -> report; ok=False if any file
-    had a conflict or a public-check finding, or has no doc."""
+    had a conflict or a public-check finding, or has no doc.
+    emit=True (K5 part 2b, D-344): the container cannot write the host's repo, so nothing is written and
+    the sync mark is not moved: each file's report carries its `text` (result "emitted", or "unchanged"
+    when the file already reads so) for tools/write_docs.py on the host, whose write the next import
+    sees as in sync."""
     lookup = repo or host.repo_dir()
     repo = repo or HERE
     conn = store.connect(db_path)
@@ -361,6 +365,8 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
             if findings:
                 rep.update(result="refused: public-repo check", findings=findings[:20])
                 ok = False
+            elif emit:
+                rep.update(result="unchanged" if text == on_disk else "emitted", text=text)
             elif text == on_disk:
                 rep["result"] = "unchanged"
             elif check:
@@ -380,7 +386,8 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
                 rep["result"] = "written"
             rep["chars"] = len(text)
             files[fname] = rep
-        return {"project": p["name"], "repo": os.path.abspath(repo), "check": check, "ok": ok, "files": files}
+        return {"project": p["name"], "repo": os.path.abspath(repo), "check": check, "emit": emit, "ok": ok,
+                "files": files}
     finally:
         conn.close()
 

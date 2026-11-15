@@ -425,6 +425,7 @@ MATRIX: dict[str, Perm] = {
                                         "D-283: its task-manager only clears"),
     "install.stamp": DEPLOY,
     "install.restored": DEPLOY,
+    "writers.set": DEPLOY,
     "masterkey.check": INTERNAL,
     "prompt.set": OWNER,
     "prompt.reset": OWNER,

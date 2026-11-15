@@ -1274,6 +1274,12 @@ class TimedConnection(sqlite3.Connection):
     _tx_origin: str = ""
     _tx_reporting: bool = False
     _gap: bool = False      # a migration-gap authorizer is installed (init); check_writable lifts it
+    _refuse: bool = False   # meta.writers = container and this process is not in the container (K5 part 2b)
+    _refuse_msg: str = ""
+
+    def _refusal(self, e: sqlite3.DatabaseError) -> "WriterRefused | None":
+        """The clear error to raise in place of `e`, a statement the foreign-writer authorizer denied."""
+        return WriterRefused(self._refuse_msg) if self._refuse and "not authorized" in str(e) else None
 
     def _tx_mark(self, how: str) -> None:
         if self._tx_reporting:
@@ -1297,18 +1303,33 @@ class TimedConnection(sqlite3.Connection):
     def execute(self, *args: Any) -> sqlite3.Cursor:
         try:
             return super().execute(*args)
+        except sqlite3.DatabaseError as e:
+            refused = self._refusal(e)
+            if refused is None:
+                raise
+            raise refused from e
         finally:
             self._tx_mark("a statement")
 
     def executemany(self, *args: Any) -> sqlite3.Cursor:
         try:
             return super().executemany(*args)
+        except sqlite3.DatabaseError as e:
+            refused = self._refusal(e)
+            if refused is None:
+                raise
+            raise refused from e
         finally:
             self._tx_mark("a statement")
 
     def executescript(self, *args: Any) -> sqlite3.Cursor:
         try:
             return super().executescript(*args)
+        except sqlite3.DatabaseError as e:
+            refused = self._refusal(e)
+            if refused is None:
+                raise
+            raise refused from e
         finally:
             self._tx_mark("a script")
 
@@ -1352,7 +1373,16 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
     real first install. Every other caller (the runners, tasks.py, the MCP server,
     export_quickview.py) keeps the default: on a live install the database already exists, so
     this is a no-op change for them, and a lost or mis-mounted data directory is reported
-    instead of silently recreated."""
+    instead of silently recreated.
+
+    A database marked `meta.writers = container` (K5 part 2b) is written by the container only: opened
+    anywhere else it is read-only for every statement that changes it (WriterRefused, naming the
+    rollback); reads go on. An unmarked database, and every temp test database, is not affected."""
+    return _connect(path, create, enforce_writers=True)
+
+
+def _connect(path: str | None, create: bool, enforce_writers: bool) -> sqlite3.Connection:
+    """connect(); enforce_writers=False is only for the explicit host rollback (`store.py writers host`)."""
     db = path or DB_PATH
     if not create and not os.path.isfile(db):
         raise DBUnavailable(f"the database {db} does not exist: nothing creates it implicitly "
@@ -1370,6 +1400,9 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            if enforce_writers and foreign_writer(conn):
+                _refuse_writes(conn, db)     # no init: the container owns the schema too
+                return conn
             init(conn)
         except sqlite3.Error as e:
             if classify(e) == ("persistent", "read_only"):
@@ -1489,6 +1522,72 @@ class MigrationNeeded(SchemaMismatch):
     """Needs a non-additive migration (MIGRATIONS) first: `python3 store.py migrate`."""
 
 
+WRITERS_KEY = "writers"                # meta key: who may write (K5 part 2b)
+WRITERS_CONTAINER = "container"        # only the container's processes write; the host's refuse (WriterRefused)
+WRITERS_HOST = "host"                  # (or no key) any process writes, as before
+WRITERS_ROLLBACK = "python3 store.py writers host"
+WRITERS_REFUSAL = ("this database is marked meta.writers=container: only the AFClaude container writes to it, "
+                   "reads are fine here. Use `afclaude tasks ...` (the host wrapper) instead of a direct host "
+                   "call. Rollback while the container is down: `{rollback}`")
+
+
+class WriterRefused(DBError):
+    """A write outside the container on a database marked meta.writers=container. Not a fault to
+    retry: the caller uses the container's command (or the explicit rollback)."""
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg, "writers")
+
+
+def in_container() -> bool:
+    """AFCLAUDE_IN_CONTAINER set to anything but empty or 0 (host.in_container, which store doesn't import)."""
+    return os.environ.get("AFCLAUDE_IN_CONTAINER", "").strip() not in ("", "0")
+
+
+def writers_mark(conn: sqlite3.Connection) -> str | None:
+    """meta.writers, None when the database has no meta table or no such key (read only)."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
+        return None
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (WRITERS_KEY,)).fetchone()
+    return None if r is None else str(r[0])
+
+
+def foreign_writer(conn: sqlite3.Connection) -> bool:
+    """Is this process barred from writing the database: it is marked writers=container and this
+    process is not in the container."""
+    return writers_mark(conn) == WRITERS_CONTAINER and not in_container()
+
+
+# authorizer actions that change the database, a connection's attached files or its settings
+_WRITE_ACTIONS = frozenset({
+    sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+    sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TRIGGER,
+    sqlite3.SQLITE_CREATE_VIEW, sqlite3.SQLITE_CREATE_TEMP_INDEX, sqlite3.SQLITE_CREATE_TEMP_TABLE,
+    sqlite3.SQLITE_CREATE_TEMP_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_VIEW, sqlite3.SQLITE_CREATE_VTABLE,
+    sqlite3.SQLITE_DROP_INDEX, sqlite3.SQLITE_DROP_TABLE, sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_VIEW,
+    sqlite3.SQLITE_DROP_TEMP_INDEX, sqlite3.SQLITE_DROP_TEMP_TABLE, sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+    sqlite3.SQLITE_DROP_TEMP_VIEW, sqlite3.SQLITE_DROP_VTABLE, sqlite3.SQLITE_ALTER_TABLE,
+    sqlite3.SQLITE_REINDEX, sqlite3.SQLITE_ANALYZE, sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH})
+_PRAGMAS_SETTABLE = frozenset({"foreign_keys", "busy_timeout", "query_only"})   # a pragma with a value: only these
+
+
+def _foreign_writer_authorizer(action: int, arg1: str | None, arg2: str | None,
+                               db: str | None, source: str | None) -> int:
+    if action in _WRITE_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_PRAGMA and arg2 is not None and (arg1 or "").lower() not in _PRAGMAS_SETTABLE:
+        return sqlite3.SQLITE_DENY       # user_version, writable_schema, journal_mode, wal_checkpoint, ...
+    return sqlite3.SQLITE_OK
+
+
+def _refuse_writes(conn: sqlite3.Connection, db: str) -> None:
+    """Make `conn` read-only for the foreign writer (the authorizer; a denied statement surfaces as
+    WriterRefused from TimedConnection, and transaction() raises it before BEGIN)."""
+    conn.set_authorizer(_foreign_writer_authorizer)
+    if isinstance(conn, TimedConnection):
+        conn._refuse = True
+        conn._refuse_msg = WRITERS_REFUSAL.format(rollback=WRITERS_ROLLBACK + ("" if db == DB_PATH else f" --db {db}"))
+
+
 def pending_migrations(version: int) -> list[int]:
     """The non-additive steps a database at `version` needs, in order."""
     return sorted(v for v in MIGRATIONS if version < v <= SCHEMA_VERSION)
@@ -1580,6 +1679,8 @@ def check_writable(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> None
     that migration changes: it raises only when `tables` names one of them (the authorizer
     catches whatever isn't announced, see transaction). Also drops the gap authorizer of a
     connection opened before the database was migrated."""
+    if isinstance(conn, TimedConnection) and conn._refuse:
+        raise WriterRefused(conn._refuse_msg)
     problem = schema_problem(conn)
     if problem is None:
         if isinstance(conn, TimedConnection) and conn._gap:
@@ -1655,6 +1756,9 @@ def migrate(path: str | None = None) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys=ON")
+        if foreign_writer(conn):
+            raise WriterRefused(WRITERS_REFUSAL.format(rollback=WRITERS_ROLLBACK + f" --db {path}")
+                                + " (the container migrates)")
         stored = _stored_version(conn)
         problem = schema_problem(conn)
         if isinstance(problem, SchemaTooNew):
@@ -5382,6 +5486,8 @@ MIGRATE_NO_DB = 3        # `store.py migrate`: no database file (the entrypoint 
 NEXT_STEP = ("Wait about 30 seconds and retry this once. If it fails again, stop the work that needs the "
              "AFClaude database, don't work around it (no hand-edited files or other stores instead), and "
              "tell the user it needs their intervention (they are alerted outside the database).")
+WRITERS_NEXT_STEP = ("This is not a fault to retry: run the command through the host wrapper (`afclaude ...`), "
+                     "which runs it in the container. Don't work around it.")
 _sleep = time.sleep                                      # patched by tests
 
 # (sqlite error name prefixes, message fragments, class, kind): the first match wins
@@ -5745,7 +5851,13 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
     Sets err.not_saved and err.escalation (the hand-back). Never raises. -> err
     Inside quick_waits() (a hook's 1-2 s lock wait, one try) a transient error is only the hand-back: no fallback
     record and no alert, so two short lock misses never read as a DB that needs the owner (D-331: the hook
-    shows a short note); any other error takes the full path (D-171, D-235)."""
+    shows a short note); any other error takes the full path (D-171, D-235).
+    A WriterRefused is neither stored nor escalated: nothing is wrong with the database, the caller uses
+    the container's command (its message says which)."""
+    if isinstance(err, WriterRefused):
+        err.not_saved = "nothing was changed by this call (a refused write is not recorded for a replay)"
+        err.escalation = "none: use the container's command, or the rollback named in the message"
+        return err
     if _QUICK.get() is not None and err.error_class == "transient":
         err.not_saved = (f"{action} was not applied (a hook's short lock wait)" if write else
                          "nothing was changed by this call")
@@ -5792,7 +5904,7 @@ def handback(err: DBError) -> dict[str, str]:
     message, what was not saved, the escalation and the suggested next step."""
     return {"error_class": err.error_class, "kind": err.kind, "message": str(err),
             "not_saved": err.not_saved or "unknown", "escalation": err.escalation or "none",
-            "next_step": NEXT_STEP}
+            "next_step": WRITERS_NEXT_STEP if isinstance(err, WriterRefused) else NEXT_STEP}
 
 
 def handback_text(err: DBError) -> str:
@@ -5879,7 +5991,32 @@ def main(argv: list[str] | None = None) -> int:
                                                "(docker/entrypoint.sh), audited as prompt.defaults_sync")
     pp.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     pp.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
+    wr = sub.add_parser("writers", help="who may write the database (meta.writers, K5 part 2b): `show`, or `host` = "
+                                         "the rollback of `container` (the one write the host may do on a "
+                                         "container-marked database, usable while the container is down; audited)")
+    wr.add_argument("value", choices=("show", WRITERS_HOST))
+    wr.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
     args = ap.parse_args(argv)
+    if args.cmd == "writers":
+        import importlib
+        actions = importlib.import_module("actions")
+        try:
+            conn = _connect(args.db, False, enforce_writers=False)    # the one connection that is not refused
+        except DBError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        try:
+            if args.value == "show":
+                print(json.dumps({"writers": writers_mark(conn) or WRITERS_HOST}))
+                return 0
+            out = actions.perform(conn, "writers.set", {"value": WRITERS_HOST}, actor="cli", via="cli")
+            print(json.dumps(out, ensure_ascii=False))
+            return 0
+        except (DBError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
     if args.cmd == "import-prompts":
         import importlib
         actions = importlib.import_module("actions")

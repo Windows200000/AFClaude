@@ -809,7 +809,9 @@ def task_out(args, t):
 
 def project_ref(p):
     """CLI project argument: '.', './x', '../x', '~/x' are directories (made absolute)."""
-    if p is not None and (p == "." or p == ".." or p.startswith(("./", "../", "~"))):
+    if p is not None and (p == "." or p == ".." or p.startswith(("./", "../"))):
+        return os.path.normpath(os.path.join(host_mod.caller_dir(), p))     # relative to $CLAUDE_PROJECT_DIR, else the cwd
+    if p is not None and p.startswith("~"):
         return os.path.abspath(os.path.expanduser(p))
     return p
 
@@ -988,7 +990,7 @@ def run_decision(conn, args):
 
 def doc_project(conn, p):
     """--project for the doc commands: a name or directory, default this directory's project."""
-    ref = project_ref(p) if p else os.getcwd()
+    ref = project_ref(p) if p else host_mod.caller_dir()
     proj = store.get_project(conn, ref)
     if proj is None:
         raise store.NotFound(f"no project {p!r}" if p else f"no project for {ref} (pass --project)")
@@ -1016,9 +1018,14 @@ def run_doc(conn, args):
                     extra = f"  +{d['appended']}" if d.get("appended") else ""
                     print(f"{name:<12} {d['outcome']}{extra}" + (f"  {d['error']}" if d.get("error") else ""))
         else:
-            r = project_docs.export(args.db, repo, args.project, check=args.check, actor=who(conn).actor, via="cli")
+            if args.emit and args.check:
+                raise ValueError("--emit and --check are exclusive")
+            r = project_docs.export(args.db, repo, args.project, check=args.check, actor=who(conn).actor, via="cli",
+                                    emit=args.emit)
             ok = r["ok"]
-            if args.json:
+            if args.emit:
+                dump(r)     # always JSON: the host helper reads it
+            elif args.json:
                 dump(r)
             else:
                 for fname, d in r["files"].items():
@@ -1082,6 +1089,13 @@ def run(conn, args):
         dump(rows) if args.json else print_tasks(rows, numbered=True)
     elif c == "project":
         run_project(conn, args)
+    elif c == "writers":
+        if args.value is None:
+            have = store.writers_mark(conn) or store.WRITERS_HOST
+            dump({"writers": have}) if args.json else print(f"writers: {have}")
+        else:
+            r = act(conn, "writers.set", value=args.value)
+            dump(r) if args.json else print(f"writers: {r['writers']}")
     elif c == "whoami":
         w = who(conn)
         dump(w.as_dict()) if args.json else print(
@@ -1401,7 +1415,7 @@ def run_question(conn, args):
     if qc == "ask":
         project = project_ref(args.project)
         if project is None:     # the project of the directory the command runs in, if there is one
-            p = store.get_project(conn, os.getcwd())
+            p = store.get_project(conn, host_mod.caller_dir())
             project = p["name"] if p else None
         q = act(conn, "task.ask", question=args.text, title=args.title, options=args.option, project=project,
                 created_by_session=os.environ.get("CLAUDE_CODE_SESSION_ID"))
@@ -1604,6 +1618,11 @@ def parser():
     rns.add_parser("review", parents=[js], help="a one-off usage review now, without its quota wait")
     q = rns.add_parser("list", parents=[js], help="the open requests")
     q.add_argument("--all", action="store_true", help="the recent ones too, with their outcome")
+    p = sub.add_parser("writers", parents=[js], help="who may write the database (K5 part 2b, D-344): "
+                                                     "`container` = only the container does, `host` = any process "
+                                                     "(the rollback); no value = show")
+    p.add_argument("value", nargs="?", choices=(store.WRITERS_CONTAINER, store.WRITERS_HOST),
+                   help="container (run it inside the container: through the host wrapper) | host")
     p = sub.add_parser("doc", help="project docs in the DB: progress, goals, exceptions, alerts, reviews")
     ds = p.add_subparsers(dest="doc_cmd", required=True)
     q = ds.add_parser("list", parents=[js], help="the project's docs")
@@ -1629,6 +1648,9 @@ def parser():
     q.add_argument("--repo", help="the project's directory (default: this repo)")
     q.add_argument("--project", help="project name (default: the project of --repo)")
     q.add_argument("--check", action="store_true", help="report only, write nothing")
+    q.add_argument("--emit", action="store_true",
+                   help="write nothing: print the three files' texts as JSON ({files: {name: {result, text}}}) for "
+                        "tools/write_docs.py on the host (the container cannot write the host's repo)")
     p = sub.add_parser("decision", help="the owner's decisions in the DB (D-242): tldr | find | show | keywords | topics | "
                                       "add | edit | expire | delete | confirm | link | import")
     dcs = p.add_subparsers(dest="decision_cmd", required=True)

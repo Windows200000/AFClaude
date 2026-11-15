@@ -191,6 +191,7 @@ class MainGuardTest(unittest.TestCase):
              mock.patch.object(deploy, "check_data", return_value="/data/afclaude.db"), \
              mock.patch.object(deploy, "check_old_container", return_value=True), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+             mock.patch.object(deploy.store, "writers_mark", return_value=None), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: calls.append("drain") or drained), \
              mock.patch.object(deploy.runner, "undrain", side_effect=lambda *a: calls.append("undrain")), \
              mock.patch.object(deploy, "wait_clear", return_value=True), \
@@ -440,6 +441,7 @@ class MainFlowTest(unittest.TestCase):
              mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
              mock.patch.object(deploy, "code_version", return_value="abc1234"), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+             mock.patch.object(deploy.store, "writers_mark", return_value=None), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: events.append("drain") or 0), \
              mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
              mock.patch.object(deploy, "wait_healthy", side_effect=lambda cs, t, **k: events.append(("health", tuple(cs))) or healthy), \
@@ -529,6 +531,86 @@ class SingleLayoutTest(MainFlowTest):
             self.assertEqual(deploy.main([]), 1)
 
 
+class DrainViaContainerTest(unittest.TestCase):
+    """K5 part 2b: once the database is marked writers=container the host cannot write it, so the drain and
+    the undrain go through `docker exec <runner container> afclaude runner ...` (a stub docker here); an
+    unmarked database keeps the host path. Order and guards of main() are unchanged."""
+
+    def _main(self, marked, layout="services", docker_rc=0, compose_rc=0, argv=(), guards=(True, True)):
+        events = []
+
+        def run(cmd, **kw):
+            if cmd[:2] == ["docker", "exec"]:
+                events.append(" ".join(cmd[2:]))
+                return FakeCompleted("", docker_rc if "drain" in cmd else 0)      # only the drain fails
+            events.append("compose")
+            return FakeCompleted("", compose_rc)
+        with mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "layout", return_value=layout), \
+             mock.patch.object(deploy, "check_data", return_value="/d/afclaude.db"), \
+             mock.patch.object(deploy, "check_old_container", return_value=True), \
+             mock.patch.object(deploy, "check_start_guard", side_effect=list(guards)), \
+             mock.patch.object(deploy, "env_value", return_value=""), \
+             mock.patch.object(deploy, "code_version", return_value="abc1234"), \
+             mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
+             mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+             mock.patch.object(deploy.store, "writers_mark", return_value="container" if marked else None), \
+             mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: events.append("host drain") or 0), \
+             mock.patch.object(deploy.runner, "undrain", side_effect=lambda *a: events.append("host undrain")), \
+             mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
+             mock.patch.object(deploy, "wait_healthy", side_effect=lambda cs, t, **k: events.append("health") or True), \
+             mock.patch.object(deploy.subprocess, "run", side_effect=run), \
+             mock.patch("builtins.print"):
+            return deploy.main(list(argv)), events
+
+    def test_marked_services_layout_drains_through_the_runner_container_in_the_same_order(self):
+        rc, events = self._main(True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["afclaude-runner afclaude runner drain", "top afclaude-runner", "compose", "health"])
+
+    def test_marked_single_layout_uses_the_one_container(self):
+        rc, events = self._main(True, layout="single")
+        self.assertEqual(events, ["afclaude afclaude runner drain", "top afclaude", "compose"])
+
+    def test_the_wait_limit_is_passed_on(self):
+        rc, events = self._main(True, argv=["--max-wait-drain", "12.5"])
+        self.assertEqual(events[0], "afclaude-runner afclaude runner drain --max-wait 12.5")
+
+    def test_unmarked_database_keeps_the_host_path(self):
+        rc, events = self._main(False)
+        self.assertEqual(events, ["host drain", "top afclaude-runner", "compose", "health"])
+
+    def test_a_failed_container_drain_aborts_and_lifts_it_through_the_container(self):
+        rc, events = self._main(True, docker_rc=1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(events, ["afclaude-runner afclaude runner drain", "top afclaude-runner",
+                                  "afclaude-runner afclaude runner undrain"])      # no compose
+
+    def test_a_refusal_after_the_drain_lifts_it_through_the_container(self):
+        rc, events = self._main(True, guards=(True, False))
+        self.assertEqual(rc, 1)
+        self.assertEqual(events[-1], "afclaude-runner afclaude runner undrain")
+        self.assertNotIn("compose", events)
+
+    def test_a_failed_compose_lifts_the_drain_through_the_container(self):
+        rc, events = self._main(True, compose_rc=3)
+        self.assertEqual(rc, 3)
+        self.assertEqual(events[-1], "afclaude-runner afclaude runner undrain")
+        self.assertIn(("alert", "deploy: docker compose up failed"), events)
+
+    def test_an_undrain_that_fails_is_an_alert_not_silence(self):
+        with mock.patch.object(deploy.store, "writers_mark", return_value="container"), \
+             mock.patch.object(deploy.subprocess, "run", return_value=FakeCompleted("", 1)), \
+             mock.patch.object(deploy, "alert") as al, mock.patch("builtins.print"):
+            self.assertEqual(deploy.lift_drain(mock.Mock(), "afclaude"), 1)
+        self.assertIn("could not be lifted", al.call_args[0][0])
+
+    def test_the_container_name_follows_the_prefix(self):
+        with mock.patch.object(deploy, "env_value", side_effect=lambda n, *a, **k: "af2" if n == "AFCLAUDE_NAME" else ""):
+            self.assertEqual(deploy.runner_container("services"), "af2-runner")
+            self.assertEqual(deploy.runner_container("single"), "afclaude")
+
+
 class LiveLikeEnvTest(unittest.TestCase):
     """Review k4a H1: a run of deploy.py against an environment like the live one (docker/.env without
     AFCLAUDE_DATA and without AFCLAUDE_LAYOUT) takes the single layout end to end: no data or old-container
@@ -550,6 +632,7 @@ class LiveLikeEnvTest(unittest.TestCase):
                  mock.patch.object(deploy, "check_start_guard", return_value=True), \
                  mock.patch.object(deploy, "code_version", return_value="abc1234"), \
                  mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+                 mock.patch.object(deploy.store, "writers_mark", return_value=None), \
                  mock.patch.object(deploy.runner, "drain", return_value=0), \
                  mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
                  mock.patch.object(deploy, "old_container_running", side_effect=AssertionError("single: not asked")), \
