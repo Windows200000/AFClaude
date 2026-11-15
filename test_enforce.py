@@ -324,9 +324,32 @@ class HostRegistration(Base):
         rc, out, err = self.run_cmd()
         self.assertEqual((rc, err), (0, ""), out)
         self.assertEqual(os.stat(self.tmp.name).st_mode & 0o022, 0)
+        self.assertIn(f"note: {self.tmp.name} could be written by others; made it go-w", out)
         rec = json.load(open(self.file))
         w = identity.resolve(self.conn, {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s-1"}, token_file=self.file)
         self.assertEqual(w.actor, f"machine:{rec['user_id']}")
+
+    def test_the_cwd_the_home_or_a_symlinked_directory_is_not_chmodded_but_refused(self):
+        """A bare --file name (the cwd), $HOME or a symlink with group write: refused naming the fix, mode kept."""
+        target = os.path.join(self.tmp.name, "shared")
+        os.mkdir(target)
+        os.chmod(target, 0o775)
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(target, link)
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        for args, env, why in ((("--file", "machine.json"), {}, "the current directory"),
+                               (("--file", os.path.join(target, "machine.json")), {"HOME": target}, "home directory"),
+                               (("--file", os.path.join(link, "machine.json")), {}, f"a symlink (to {target})")):
+            os.chdir(target)
+            rc, out, err = self.run_cmd(*args, env=env)
+            os.chdir(cwd)
+            self.assertNotEqual(rc, 0, args)
+            self.assertIn(why, err + out)
+            self.assertIn("--file <dir>/machine.json", err + out)
+            self.assertEqual(os.stat(target).st_mode & 0o777, 0o775)
+            self.assertEqual(os.listdir(target), [])
+            self.assertEqual(store.host_machine_users(self.conn, socket.gethostname()), [])
 
     def test_a_directory_of_another_user_is_refused_before_a_code_is_spent(self):
         with mock.patch("os.getuid", return_value=os.getuid() + 1):
