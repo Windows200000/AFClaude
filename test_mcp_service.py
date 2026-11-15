@@ -107,6 +107,19 @@ class StartTest(unittest.TestCase):
                 mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
             self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 78)
 
+    def test_any_other_start_error_exits_78_with_an_alert_not_a_traceback(self):
+        """A bad public URL (pydantic) and an unreachable DB end like a refusal (D-235): exit 78, the alert, no listener."""
+        for fail in ({"target": mcp_service, "attr": "build_app", "exc": ValueError("bad public url")},
+                     {"target": store, "attr": "connect", "exc": store.DBUnavailable("database is locked")}):
+            err = io.StringIO()
+            with mock.patch.object(service, "start", return_value="id"), \
+                    mock.patch.object(fail["target"], fail["attr"], side_effect=fail["exc"]), \
+                    mock.patch.object(store, "alert_once") as alert, contextlib.redirect_stderr(err), \
+                    mock.patch.object(mcp_service.uvicorn, "run", side_effect=AssertionError("must not listen")):
+                self.assertEqual(mcp_service.serve("127.0.0.1", 8000), 78)
+            self.assertIn(type(fail["exc"]).__name__, err.getvalue())
+            alert.assert_called_once()
+
     def test_serve_hands_the_gated_app_to_uvicorn(self):
         with mock.patch.object(service, "start", return_value="id"), \
                 mock.patch.object(mcp_service.uvicorn, "run") as run, contextlib.redirect_stdout(io.StringIO()), \

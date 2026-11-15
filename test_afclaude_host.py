@@ -136,6 +136,14 @@ class Build(unittest.TestCase):
         finally:
             os.chmod(self.tmp.name, 0o700)
 
+    def test_a_directory_of_another_user_is_refused(self):
+        self.token_file()
+        self.build({})
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(w.Refused) as cm:
+                self.build({})
+        self.assertIn("directory", str(cm.exception))
+
     def test_a_fifo_at_the_path_is_refused_without_blocking(self):
         os.mkfifo(self.file, 0o600)
         out = []

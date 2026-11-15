@@ -271,17 +271,33 @@ def check_old_container() -> bool:
 
 
 # A compose file whose container uses the host kit's bridge key (the install's copy in <data>/bridge/): its host
-# calls go to the installed kit. A non-comment line only; the pre-kit compose.yml (the rollback) has none.
-KIT_KEY_RE = re.compile(r"(?m)^[ \t]*AFCLAUDE_BRIDGE_KEY:[ \t]*/app/data/bridge/")
+# calls go to the installed kit. A non-comment line only (mapping or `- NAME=value` form); the pre-kit
+# compose.yml (the rollback) sets the key to a secrets path. A value built with ${...} / $VAR is not read here:
+# kit_mode refuses it (fail closed) instead of guessing what compose would make of it.
+KIT_KEY_RE = re.compile(r"""(?m)^[ \t]*(?:-[ \t]*)?["']?AFCLAUDE_BRIDGE_KEY["']?[ \t]*[:=][ \t]*(?P<value>[^\n]*)$""")
+KIT_KEY_DIR = "/app/data/bridge/"
 KIT_TIMEOUT = 30                              # seconds for the installed kit's kit-version answer
 INSTALL_HINT = ("re-run the host kit install on the host with the options of the first install "
                 "(docker/install_host_bridge.sh --root <working root> [--from <subnet>], README \"Host kit\")")
 
 
+class KitModeUnknown(RuntimeError):
+    """The compose file sets the bridge key through an interpolation: whether it is the kit's cannot be told here."""
+
+
 def kit_mode(lay: str) -> bool:
-    """True when the layout's compose file gives the container the host kit's bridge key."""
-    with open(COMPOSE_FILE if lay == "single" else COMPOSE_SERVICES, encoding="utf-8") as fh:
-        return bool(KIT_KEY_RE.search(fh.read()))
+    """True when the layout's compose file gives the container the host kit's bridge key. KitModeUnknown when a
+    key line has a value with `$` (interpolation): the deploy refuses rather than skip the kit guard."""
+    path = COMPOSE_FILE if lay == "single" else COMPOSE_SERVICES
+    with open(path, encoding="utf-8") as fh:
+        found = False
+        for m in KIT_KEY_RE.finditer(fh.read()):
+            value = re.sub(r"[ \t]+#.*$", "", m.group("value")).strip().strip("\"'")
+            if "$" in value:
+                raise KitModeUnknown(f"{path} sets AFCLAUDE_BRIDGE_KEY to {value!r} (an interpolation): write the "
+                                     "path out literally, so the kit guard can tell")
+            found = found or value.startswith(KIT_KEY_DIR)
+    return found
 
 
 def installed_kit_exec() -> str:
@@ -318,8 +334,12 @@ def check_host_kit(lay: str, answer: Callable[[], dict] = installed_kit_answer) 
     (docker/host-kit/host_exec.py, ka_resume.sh) or another HOST_KIT_VERSION than the installed kit: the new
     container's host check would fail at once and pause every start (K6, review:k6-fixes) until the owner
     re-runs the install. Not in kit mode (the pre-kit compose.yml): True, nothing asked."""
-    if not kit_mode(lay):
-        return True
+    try:
+        if not kit_mode(lay):
+            return True
+    except KitModeUnknown as e:
+        print(f"deploy refused: {e}. Nothing was drained.")
+        return False
     try:
         info = answer()
     except RuntimeError as e:

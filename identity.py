@@ -191,9 +191,10 @@ def read_token(env: Mapping[str, str], path: str | None = None) -> tuple[Optiona
         os.lstat(p)
     except FileNotFoundError:
         return None, "none"
-    if os.stat(os.path.dirname(os.path.abspath(p))).st_mode & 0o022:         # before anything is opened
-        note_once(f"identity: the directory of the machine token file {p} can be written by others: its token is "
-                  "not used")
+    ds = os.stat(os.path.dirname(os.path.abspath(p)))                        # before anything is opened
+    if ds.st_mode & 0o022 or ds.st_uid != os.getuid():
+        note_once(f"identity: the directory of the machine token file {p} can be written by others or is not "
+                  "this user's: its token is not used")
         return None, "insecure-file"
     try:
         # a symlink is no token file (NOFOLLOW: no check-then-open race, L5) and a FIFO does not block (NONBLOCK)
