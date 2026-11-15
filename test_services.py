@@ -17,6 +17,7 @@ web service without an inbox key exits 1. Everything is torn down afterwards, th
 """
 import base64
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -163,6 +164,22 @@ def unique_suffix() -> str:
     """A name part that stays unique per test class and per run. Not os.getpid(): under `unshare --pid` it is always 1,
     so two suites running at once would share a compose project, an image tag and a key path."""
     return secrets.token_hex(4)
+
+
+def free_subnet() -> str:
+    """A /24 in 172.31.0.0/16 that no docker network uses now, picked at random: the single layout's compose file fixes
+    one subnet per network, so two suites running at once must not take the same one (docker refuses an overlap)."""
+    ids = subprocess.run(["docker", "network", "ls", "-q"], capture_output=True, text=True, timeout=30, check=True).stdout.split()
+    used = []
+    if ids:
+        out = subprocess.run(["docker", "network", "inspect", *ids, "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+                             capture_output=True, text=True, timeout=30, check=True).stdout
+        used = [ipaddress.ip_network(n, strict=False) for n in out.split() if ":" not in n]
+    for _ in range(50):
+        net = ipaddress.ip_network(f"172.31.{secrets.randbelow(254) + 1}.0/24")
+        if not any(net.overlaps(u) for u in used):
+            return str(net)
+    raise RuntimeError("no free 172.31.x.0/24 subnet among the docker networks")
 
 
 def require_files(*paths: str) -> None:
@@ -397,6 +414,14 @@ class ThreeServicesInContainers(unittest.TestCase):
             self.assertIn("master key", r.stderr)
         self.assertEqual(os.stat(os.path.join(self.data, "master.key")).st_mode & 0o777, 0o600)    # nothing replaced
 
+    def test_the_mcp_service_on_all_interfaces_refuses_to_start_while_roles_are_shadow(self):
+        """The D-343 deploy gate: the compose default bind (0.0.0.0, no AFCLAUDE_MCP_HOST here) is refused with exit 78
+        until roles_enforce is on; the override above binds loopback only so that the running service can start."""
+        r = self.run_image("mcp")
+        self.assertEqual(r.returncode, 78, (r.stdout, r.stderr))
+        self.assertIn("0.0.0.0", r.stderr)
+        self.assertIn("roles_enforce", r.stderr)
+
     def test_the_recreate_keeps_the_key_and_the_data(self):
         def key_bytes():
             with open(os.path.join(self.data, "master.key"), "rb") as fh:
@@ -416,7 +441,7 @@ SINGLE = os.path.join(HERE, "docker", "compose.yml")
 class SingleLayoutInContainer(unittest.TestCase):
     """D-339 (review k4a H1): docker/compose.yml, the default until K7, still brings up ONE container whose runner
     supervises the inbox API (`web.py serve --supervised`), with no master key. Its own project, network (own
-    subnet), container name and image tag: compose.yml fixes `afclaude` and `afclaude-manager:latest`, so an
+    subnet, picked free per run), container name and image tag: compose.yml fixes `afclaude` and `afclaude-manager:latest`, so an
     override renames both, and `docker compose config` is checked before anything starts. Never the live ones."""
 
     @classmethod
@@ -448,7 +473,7 @@ class SingleLayoutInContainer(unittest.TestCase):
                      "    healthcheck: {interval: 3s, timeout: 20s, retries: 5, start_period: 0s}\n")
         cls.env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "XDG_RUNTIME_DIR")}
         cls.env.update(AFCLAUDE_HOST_REPO=cls.repo, HOST_HOME=cls.home, AFCLAUDE_BRIDGE_USER="nobody",
-                       AFCLAUDE_SCHEDULER="runner", AFCLAUDE_SUBNET="172.31.213.0/24", AFCLAUDE_CODE_VERSION=cls.tag)
+                       AFCLAUDE_SCHEDULER="runner", AFCLAUDE_SUBNET=free_subnet(), AFCLAUDE_CODE_VERSION=cls.tag)
         subprocess.run([sys.executable, os.path.join(HERE, "store.py"), "init", "--db", os.path.join(cls.data, "afclaude.db")],
                        check=True, capture_output=True, env=dict(os.environ, AFCLAUDE_DATA_DIR=cls.data))
         cfg = cls.compose("config", "--format", "json", check=True)

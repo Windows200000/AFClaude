@@ -319,6 +319,22 @@ class HostRegistration(Base):
         self.assertEqual(w.actor, f"machine:{rec['user_id']}")
         self.assertIn("roles mode --set on", out)
 
+    def test_an_existing_group_writable_directory_is_fixed_so_the_token_is_not_ignored(self):
+        os.chmod(self.tmp.name, 0o775)                                     # a umask 002 host's ~/.config/afclaude
+        rc, out, err = self.run_cmd()
+        self.assertEqual((rc, err), (0, ""), out)
+        self.assertEqual(os.stat(self.tmp.name).st_mode & 0o022, 0)
+        rec = json.load(open(self.file))
+        w = identity.resolve(self.conn, {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s-1"}, token_file=self.file)
+        self.assertEqual(w.actor, f"machine:{rec['user_id']}")
+
+    def test_a_directory_of_another_user_is_refused_before_a_code_is_spent(self):
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            rc, out, err = self.run_cmd()
+        self.assertNotEqual(rc, 0)
+        self.assertIn("not owned by this user", err + out)
+        self.nothing_left()
+
     def test_it_refuses_inside_a_claude_session_and_changes_nothing(self):
         for env in ({"CLAUDE_CODE_SESSION_ID": "s-1"}, {"CLAUDECODE": "1"}, {"CLAUDE_GUARD_DISABLE": "1"},
                     {"AFCLAUDE_AGENT_ID": "a1"}):
