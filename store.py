@@ -5848,6 +5848,55 @@ def alert_once(path: str, subject: str, body: str, who: str) -> str:
     return _alert(path, subject, body, who, scope="runner")
 
 
+_REFUSED_ALERTING: contextvars.ContextVar[bool] = contextvars.ContextVar("refused_alerting", default=False)
+REFUSED_ALERT_SUBJECT = ("A host process tried to write to AFClaude's database after the switch to container-only "
+                         "writes; it was refused. Tell the task-manager.")
+
+
+_NOTIFY_FAILED = ("push failed", "push: no tool result", "notify failed")   # notify.push's / _notify's failure texts
+
+
+def alert_refused_write(actor: str, action: str, where: str | None, db_path: str | None = None) -> str:
+    """The owner sees a host write that the container-only database refused (D-235, D-345): one alert per
+    (actor, action) -- the first opens it -- pushed although the DB write is refused (the push does not need
+    the DB). `where`: the fallback file the refused write was kept in (None: only stderr). The alert's own
+    notes (notify.py writes the alerts doc) are refused too: they are recorded but not alerted again (a
+    contextvar, so the dedupe record is written only after a push that worked). A push that failed is
+    recorded as "alert_failed" (not "alert"): the next refusal tries again, and the text says the owner was
+    not told (D-235). Never raises. -> what happened."""
+    if _REFUSED_ALERTING.get():
+        return "recorded; not alerted again (this is the alert's own note)"
+    try:
+        path = fallback_path(db_path)
+        scope = f"refused:{actor}:{action}"
+        opened = _open_alert(fallback_events(path), scope)
+        if opened is not None:
+            return f"the owner was already alerted at {opened.get('time')} (one alert per actor and action)"
+        saved = f"a copy is kept in {where}" if where else "a copy is only on stderr (the fallback file could not be written)"
+        body = (f"The change was not applied to the database; {saved}. Tell the task-manager so this caller is "
+                "moved to the container's command.\n"
+                f"Technical detail: actor {actor}, action {action}; the database is marked "
+                f"meta.{WRITERS_KEY}={WRITERS_CONTAINER}. Rollback if needed (usable while the container is "
+                f"down): `{WRITERS_ROLLBACK} --db {db_path or DB_PATH}`.")
+        token = _REFUSED_ALERTING.set(True)          # the alert's own notes are refused too: no loop
+        try:
+            sent = _notify(REFUSED_ALERT_SUBJECT, body)
+        finally:
+            _REFUSED_ALERTING.reset(token)
+        if sent.startswith(_NOTIFY_FAILED):
+            # the push is the owner's only channel here: no "alert" record, so the next refusal tries again
+            _append_record(path, f"ALERT FAILED ({actor}): refused host write {action}: {sent[:200]}",
+                           {"event": "alert_failed", "time": now_iso(), "who": actor, "action": action,
+                            "scope": scope, "error": sent[:500]})
+            return f"the alert failed ({sent[:200]}); the owner was NOT told"
+        _append_record(path, f"ALERT ({actor}): refused host write {action}",
+                       {"event": "alert", "time": now_iso(), "who": actor, "action": action,
+                        "subject": REFUSED_ALERT_SUBJECT, "scope": scope})
+        return "the owner has been alerted (notify.py)"
+    except Exception as e:   # noqa: BLE001 - the escalation must never hide the refusal itself
+        return f"the alert failed ({type(e).__name__}: {e})"
+
+
 def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[str, Any] | None = None,
                     write: bool = True, db_path: str | None = None, payload_sha: str | None = None,
                     payload_max: int = PAYLOAD_MAX, runner: bool = False) -> DBError:
@@ -5865,9 +5914,10 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
     A WriterRefused is not escalated (nothing is wrong with the database, the caller uses the container's
     command, its message says which) and an interactive call's refusal is not recorded: the caller sees it.
     A runner's write (runner=True: telemetry, state, jobs) is recorded as a "refused" event with its payload,
-    so a host-side write that never reached the database is not silent (D-235)."""
+    so a host-side write that never reached the database is not silent (D-235), and the owner is alerted once per
+    (actor, action) (alert_refused_write, D-345)."""
     if isinstance(err, WriterRefused):
-        err.escalation = "none: use the container's command, or the rollback named in the message"
+        escalation = "none: use the container's command, or the rollback named in the message"
         err.not_saved = "nothing was changed by this call (a refused write is not recorded for a replay)"
         if runner:
             payload = json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False, default=str)
@@ -5878,6 +5928,8 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
                                   db_path)
             err.not_saved = (f"{action} was not applied; recorded in {where}" if where else
                              f"{action} was not applied; recorded on stderr")
+            escalation += "; " + alert_refused_write(actor, action, where, db_path)
+        err.escalation = escalation
         return err
     if _QUICK.get() is not None and err.error_class == "transient":
         err.not_saved = (f"{action} was not applied (a hook's short lock wait)" if write else
