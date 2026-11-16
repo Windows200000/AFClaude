@@ -44,7 +44,9 @@ class FakeDocker:
         self.calls = []
         self.strict = strict
         self.fail = lambda cmd: 0
-        self.images = {"afclaude-manager:latest": "sha256:old"}
+        self.images = {}              # image ref -> id (pre-k7 only, unless a test adds more)
+        self.container_image = "sha256:old"      # what `docker inspect -f {{.Image}} afclaude` answers
+        self.code_version = "abc1234"            # /app/CODE_VERSION of the old container ("" = no such file)
         self.old_running = True
         self.existing = []            # container names that exist (`ps -a`)
         self.appear = []              # names that exist once `compose up` ran
@@ -64,6 +66,10 @@ class FakeDocker:
         rc = self.fail(cmd)
         if rc:
             return Done("", rc, "it broke")
+        if argv[:3] == ["docker", "inspect", "-f"]:
+            return Done(self.container_image + "\n")
+        if argv[:2] == ["docker", "exec"] and argv[3:] == ["cat", "/app/CODE_VERSION"]:
+            return Done(self.code_version + "\n") if self.code_version else Done("", 1, "No such file")
         if argv[:3] == ["docker", "image", "inspect"]:
             ref = argv[-1]
             return Done(self.images[ref] + "\n") if ref in self.images else Done("", 1, "no such image")
@@ -99,7 +105,9 @@ class Base(unittest.TestCase):
         open(os.path.join(self.data, "bridge", "host_bridge_ed25519"), "w").close()
         self.env_file = os.path.join(self.tmp, ".env")
         self.write_env(ENV_TEXT + f"AFCLAUDE_DATA={self.data}\n")
+        self.alerts, self.lines = [], []
         for p in (mock.patch.object(deploy, "ENV_FILE", self.env_file),
+                  mock.patch.object(deploy, "alert", side_effect=lambda s, b: self.alerts.append((s, b))),   # deploy's own (a drain timeout)
                   mock.patch.object(cutover_5b.store, "DB_PATH", cutover_5b.store.DB_PATH),
                   mock.patch.object(cutover_5b.store, "connect", return_value=mock.Mock()),
                   mock.patch.object(deploy, "container_writes", return_value=True),
@@ -108,7 +116,6 @@ class Base(unittest.TestCase):
                   mock.patch.object(deploy, "name_prefix", return_value="afclaude")):
             p.start()
             self.addCleanup(p.stop)
-        self.alerts, self.lines = [], []
         self.docker = FakeDocker()
         self.guard = True
         self.kit = True
@@ -150,12 +157,19 @@ class ReadOnlyTest(unittest.TestCase):
         ro = [["docker", "ps"], ["docker", "ps", "-a", "--format", "{{.Names}}"], ["docker", "inspect", "c"],
               ["docker", "images"], ["docker", "image", "inspect", "x"],
               ["docker", "compose", "-f", "a.yml", "-f", "b.yml", "config", "-q"],
+              ["docker", "compose", "--ansi", "never", "-f", "a.yml", "config", "--services"],
+              ["docker", "exec", "afclaude", "cat", "/app/CODE_VERSION"],
               ["git", "-C", "/r", "rev-parse", "--short", "HEAD"]]
         for argv in ro:
             self.assertTrue(is_read_only(argv), argv)
         rw = [["docker", "stop", "c"], ["docker", "rm", "c"], ["docker", "tag", "a", "b"], ["docker", "exec", "c", "ls"],
               ["docker", "compose", "-f", "a.yml", "up", "-d"], ["docker", "compose", "build"],
               ["docker", "compose", "-f", "config", "up"], ["docker", "image", "rm", "x"], ["docker", "rmi", "x"],
+              ["docker", "compose", "--ansi", "config", "up", "-d"],           # --ansi takes a value: `up` is the subcommand
+              ["docker", "compose", "--progress", "plain", "--parallel", "2", "up"],
+              ["docker", "compose", "config", "-o", "/tmp/x"], ["docker", "compose", "config", "--output=/tmp/x"],
+              ["docker", "compose", "config", "-q", "--format", "json"],
+              ["docker", "exec", "afclaude", "cat", "/etc/shadow"], ["docker", "exec", "afclaude", "sh", "-c", "x"],
               ["git", "-C", "/r", "checkout", "x"], ["git", "push"], ["rm", "-rf", "/"], ["docker"], []]
         for argv in rw:
             self.assertFalse(is_read_only(argv), argv)
@@ -192,10 +206,11 @@ class DryRunTest(Base):
         self.assertEqual(self.env_text(), before)
         self.assertEqual(os.listdir(self.tmp).count(".env"), 1)          # no backup either
         t = self.text()
-        for needle in ("DRY RUN", "docker tag afclaude-manager:latest afclaude-manager:pre-k7",
+        for needle in ("DRY RUN", "docker tag sha256:old afclaude-manager:pre-k7",
                        "AFCLAUDE_CODE_VERSION=abc1234", "build afclaude-runner",
                        "docker exec afclaude afclaude runner drain", "docker stop afclaude",
-                       "AFCLAUDE_LAYOUT=services", "up -d", "docker exec afclaude-runner afclaude host check",
+                       "AFCLAUDE_LAYOUT=services", "up -d", "docker exec afclaude-runner afclaude host check --blocking",
+                       "docker exec afclaude-runner afclaude host check\n",
                        "claude mcp add --scope user afclaude -- afclaude mcp stdio",
                        "compose.single.yml", "Preflight OK"):
             self.assertIn(needle, t)
@@ -261,11 +276,62 @@ class PreflightTest(Base):
         self.assertEqual(rc, 1)
         self.assertIn("run the host kit install first", t)
 
-    def test_no_old_image_means_nothing_to_roll_back_to(self):
-        self.docker.images = {}
+    def test_the_old_image_is_the_one_the_running_container_uses(self):
+        self.docker.container_image = "sha256:running"
+        rc, t = self.run_dry()
+        self.assertEqual(rc, 0, t)
+        self.assertIn("docker tag sha256:running afclaude-manager:pre-k7", t)
+
+    def test_an_existing_rollback_tag_on_another_image_is_retagged(self):
+        self.docker.images["afclaude-manager:pre-k7"] = "sha256:older"
+        rc, t = self.run_dry()
+        self.assertEqual(rc, 0, t)
+        self.assertIn("is NOT the image `afclaude` runs now: it will be re-tagged", t)
+        self.assertIn("docker tag sha256:old afclaude-manager:pre-k7", t)
+
+    def test_the_old_code_version_must_be_heads(self):
+        self.docker.code_version = "9999999"
         rc, t = self.run_dry()
         self.assertEqual(rc, 1)
-        self.assertIn("nothing to roll back to", t)
+        self.assertIn("[FAIL] old code version", t)
+        self.assertIn("run `python3 tools/deploy.py` first", t)
+
+    def test_an_old_image_without_a_baked_version_refuses(self):
+        self.docker.code_version = ""
+        rc, t = self.run_dry()
+        self.assertEqual(rc, 1)
+        self.assertIn("has no /app/CODE_VERSION", t)
+
+    def test_a_long_or_short_sha_of_the_same_commit_matches(self):
+        self.docker.code_version = "abc1234def"
+        self.assertEqual(self.run_dry()[0], 0)
+
+    def test_the_guard_is_60_minutes_not_deploys_30(self):
+        from datetime import timedelta
+        seen = []
+
+        def fake(now, cfg, guard):
+            seen.append(guard)
+            return None, now
+        with mock.patch.object(cutover_5b.deploy, "start_guard", side_effect=fake), \
+             mock.patch.object(cutover_5b.schedule, "load", return_value=mock.Mock()):
+            self.assertTrue(Cutover(self.docker, False).guard_ok())
+        self.assertEqual(seen, [timedelta(minutes=60)])
+
+    def test_a_start_between_30_and_60_minutes_away_refuses(self):
+        from datetime import timedelta
+        import schedule as sched
+        now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+        cfg = sched.Config(*([None] * 3)) if False else mock.Mock(zone=timezone.utc)
+        start = now + timedelta(minutes=45)
+        slots = lambda a, b, c: [(start, 1)] if a < start < b else []
+        with mock.patch.object(cutover_5b.deploy.schedule, "session_slots", side_effect=slots), \
+             mock.patch.object(cutover_5b.schedule, "load", return_value=cfg):
+            c = Cutover(self.docker, False, now=lambda: now, out=self.lines.append)
+            buf = __import__("io").StringIO()
+            with __import__("contextlib").redirect_stdout(buf):
+                self.assertFalse(c.guard_ok())
+        self.assertIn("60 min clear", buf.getvalue())
 
     def test_compose_config_gets_the_target_environment(self):
         self.run_dry()
@@ -305,10 +371,22 @@ class PreflightTest(Base):
         c.check_env()
         self.assertEqual(c.target["AFCLAUDE_DATA"], "/repo/data")
 
-    def test_the_old_container_not_running_skips_drain_and_stop(self):
+    def test_the_old_container_must_be_running(self):
         self.docker.old_running = False
-        self.assertEqual(self.make().go(), 0)
-        self.assertIn("skipped, the old container is not running", self.text())
+        rc, t = self.run_dry()
+        self.assertEqual(rc, 1)
+        self.assertIn("is not running: its image and code version cannot be read", t)
+
+    def test_a_dry_run_with_a_failed_data_check_never_opens_the_database(self):
+        os.unlink(os.path.join(self.data, "afclaude.db"))
+        cutover_5b.store.connect.reset_mock()
+        c = self.make()
+        with mock.patch.object(Cutover, "writers_container", side_effect=AssertionError("opened the database")):
+            rc = c.go()
+        self.assertEqual(rc, 1)
+        self.assertIn("no database at", self.text())
+        self.assertIn("(once the database is marked writers=container)", self.text())
+        cutover_5b.store.connect.assert_not_called()
 
 
 class ApplyTest(Base):
@@ -321,11 +399,12 @@ class ApplyTest(Base):
         self.assertEqual(self.alerts, [])
         ch = self.docker.changing()
         names = [re.sub(r"^docker compose.* (build|up -d).*$", r"compose \1", c) for c in ch]
-        self.assertEqual(names, ["docker tag afclaude-manager:latest afclaude-manager:pre-k7",
+        self.assertEqual(names, ["docker tag sha256:old afclaude-manager:pre-k7",
                                  "compose build",
                                  "docker exec afclaude afclaude runner drain",
                                  "docker stop afclaude",
                                  "compose up -d",
+                                 "docker exec afclaude-runner afclaude host check --blocking",
                                  "docker exec afclaude-runner afclaude host check"])
         up = [(a, kw) for a, kw in self.docker.calls if a[:2] == ["docker", "compose"] and "up" in a][0]
         self.assertNotIn("--build", up[0])
@@ -345,13 +424,18 @@ class ApplyTest(Base):
 
     def test_the_health_wait_names_runner_and_web(self):
         self.apply()
-        inspected = [a[2] for a, _ in self.docker.calls if a[:2] == ["docker", "inspect"]]
+        inspected = [a[2] for a, _ in self.docker.calls if a[:2] == ["docker", "inspect"] and a[2] != "-f"]
         self.assertEqual(sorted(set(inspected)), ["afclaude-runner", "afclaude-web"])
 
-    def test_an_existing_rollback_tag_is_kept_not_retagged(self):
+    def test_a_rollback_tag_on_the_running_image_is_kept_not_retagged(self):
+        self.docker.images["afclaude-manager:pre-k7"] = "sha256:old"
+        self.assertEqual(self.apply(), 0)
+        self.assertFalse([c for c in self.docker.commands() if c.startswith("docker tag")])
+
+    def test_a_rollback_tag_on_another_image_is_moved_to_the_running_one(self):
         self.docker.images["afclaude-manager:pre-k7"] = "sha256:older"
         self.assertEqual(self.apply(), 0)
-        self.assertNotIn("docker tag afclaude-manager:latest afclaude-manager:pre-k7", self.docker.commands())
+        self.assertIn("docker tag sha256:old afclaude-manager:pre-k7", self.docker.commands())
 
     def test_a_refused_preflight_touches_nothing_and_does_not_alert(self):
         self.guard = False
@@ -368,6 +452,7 @@ class ApplyTest(Base):
         self.assertNotIn("docker stop afclaude", self.docker.commands())
         self.assertNotIn("afclaude runner undrain", " ".join(self.docker.commands()))   # never drained
         self.assertEqual(self.env_text(), ENV_TEXT + f"AFCLAUDE_DATA={self.data}\n")
+        self.assertNotIn("drain is lifted", self.alerts[0][1])          # nothing was drained: the text says so
 
     def test_a_drain_that_fails_lifts_it_and_stops_nothing(self):
         self.docker.fail = lambda cmd: 1 if "runner drain" in cmd else 0
@@ -375,6 +460,15 @@ class ApplyTest(Base):
         self.assertNotIn("docker stop afclaude", self.docker.commands())
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("could not be drained", self.alerts[0][1])
+        self.assertIn("docker exec afclaude afclaude runner undrain", self.docker.commands())     # the mark was set: lifted
+        self.assertIn("the drain is lifted again", self.alerts[0][1])
+
+    def test_a_drain_exec_that_times_out_is_lifted_too(self):
+        self.docker.timeouts = {"docker exec afclaude afclaude runner drain": 1}
+        self.assertEqual(self.apply(), 1)
+        self.assertIn("docker exec afclaude afclaude runner undrain", self.docker.commands())
+        self.assertNotIn("docker stop afclaude", self.docker.commands())
+        self.assertGreaterEqual(len(self.alerts), 2)           # deploy's own timeout alert, and the cut-over's
 
     def test_a_guard_that_closes_during_the_drain_lifts_it_and_stops_nothing(self):
         c = self.make(True)
@@ -432,11 +526,93 @@ class ApplyTest(Base):
         self.assertIn("no heartbeat", self.alerts[0][1])
         self.assertRolledBack()
 
-    def test_a_failed_host_check_rolls_back(self):
-        self.docker.fail = lambda cmd: 1 if "afclaude host check" in cmd else 0
+    def test_a_failed_blocking_host_check_rolls_back(self):
+        self.docker.fail = lambda cmd: 1 if "afclaude host check --blocking" in cmd else 0
         self.assertEqual(self.apply(), 1)
         self.assertIn("host check", self.alerts[0][1])
         self.assertRolledBack()
+
+    def test_a_failed_non_blocking_check_is_reported_not_rolled_back(self):
+        self.docker.fail = lambda cmd: 1 if cmd.endswith("afclaude host check") else 0
+        self.assertEqual(self.apply(), 0, self.text())
+        self.assertFalse([c for c in self.docker.commands() if "compose.single.yml" in c])
+        self.assertIn("non-blocking host check(s) failed", self.text())
+        self.assertEqual(self.alerts, [])
+
+    def test_an_exception_out_of_a_parser_still_rolls_back_and_alerts(self):
+        self.docker.health_by = {"afclaude-runner": "[]"}        # deploy.health_state: IndexError
+        self.docker.appear = ["afclaude-runner"]
+        self.assertEqual(self.apply(), 1)
+        self.assertIn("IndexError", self.alerts[0][1])
+        self.assertRolledBack()
+
+    def test_a_ctrl_c_during_the_build_alerts_and_is_re_raised(self):
+        original = self.docker.__call__
+
+        def run(argv, **kw):
+            if " build " in " ".join(argv):
+                raise KeyboardInterrupt
+            return original(argv, **kw)
+        c = self.make(True)
+        c.run = run
+        with self.assertRaises(KeyboardInterrupt):
+            c.go()
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("KeyboardInterrupt", self.alerts[0][1])
+        self.assertNotIn("docker stop afclaude", self.docker.commands())
+
+    def test_a_ctrl_c_during_the_drain_lifts_it(self):
+        original = self.docker.__call__
+
+        def run(argv, **kw):
+            if argv[-2:] == ["runner", "drain"]:
+                raise KeyboardInterrupt
+            return original(argv, **kw)
+        c = self.make(True)
+        c.run = run
+        with self.assertRaises(KeyboardInterrupt):
+            c.go()
+        self.assertIn("docker exec afclaude afclaude runner undrain", self.docker.commands())
+        self.assertNotIn("docker stop afclaude", self.docker.commands())
+
+    def test_a_ctrl_c_during_the_rollback_is_a_rollback_failed_alert_and_re_raised(self):
+        self.docker.appear = ["afclaude-runner"]
+        original = self.docker.__call__
+
+        def run(argv, **kw):
+            if " up -d" in " ".join(argv) and "compose.services.yml" in " ".join(argv):
+                return Done("", 1, "broke")
+            if "compose.single.yml" in " ".join(argv):
+                raise KeyboardInterrupt
+            return original(argv, **kw)
+        c = self.make(True)
+        c.run = run
+        with self.assertRaises(KeyboardInterrupt):
+            c.go()
+        self.assertIn("ROLLBACK failed", self.alerts[-1][0])
+
+    def test_the_end_says_to_keep_master_key_and_the_acceptance_order(self):
+        self.apply()
+        t = self.text()
+        self.assertIn(f"KEEP and BACK UP {self.data}/master.key", t)
+        i, j, k = (t.index(x) for x in ("docker rm afclaude ", "docker rmi afclaude-manager:pre-k7", "docker rmi afclaude-manager:latest"))
+        self.assertTrue(i < j < k)
+
+    def test_the_mcp_line_comes_now_only_with_the_profile_on(self):
+        self.apply()
+        self.assertIn("the MCP registration comes later", self.text())
+        self.lines.clear()
+        with mock.patch.object(deploy, "mcp_enabled", return_value=True):
+            self.docker = FakeDocker()
+            self.make(True).go()
+        self.assertNotIn("comes later", self.text())
+        self.assertIn("switch the interactive MCP registration", self.text())
+
+    def test_a_rollback_says_to_keep_master_key(self):
+        self.docker.appear = ["afclaude-runner"]
+        self.docker.fail = lambda cmd: 1 if " up -d" in cmd and "compose.services.yml" in cmd else 0
+        self.apply()
+        self.assertIn("keep <data>/master.key", self.text())
 
     def test_a_failed_rollback_is_a_second_alert_with_the_manual_commands(self):
         self.docker.fail = lambda cmd: 1 if "compose.services.yml" in cmd and " up -d" in cmd or (
@@ -448,7 +624,7 @@ class ApplyTest(Base):
         self.assertIn("ROLLBACK FAILED", self.text())
 
     def test_no_rollback_leaves_things_and_prints_the_way_back(self):
-        self.docker.fail = lambda cmd: 1 if "afclaude host check" in cmd else 0
+        self.docker.fail = lambda cmd: 1 if "afclaude host check --blocking" in cmd else 0
         self.assertEqual(self.apply(rollback=False), 1)
         self.assertFalse([c for c in self.docker.commands() if "compose.single.yml" in c])
         self.assertIn("no rollback requested", self.alerts[0][0])
@@ -462,10 +638,10 @@ class ApplyTest(Base):
         self.assertEqual(drains[0][0][:3], ["docker", "exec", "afclaude"])
         self.assertIsNotNone(drains[0][1]["timeout"])      # a hung exec cannot hold the cut-over (D-234)
 
-    def test_a_cutover_with_nothing_running_skips_the_old_container_steps(self):
+    def test_an_old_container_that_is_not_running_is_refused_not_skipped(self):
         self.docker.old_running = False
-        self.assertEqual(self.apply(), 0, self.text())
-        self.assertNotIn("docker stop afclaude", self.docker.commands())
+        self.assertEqual(self.apply(), 1)
+        self.assertEqual(self.docker.changing(), [])
 
     def test_no_real_command_is_made_anywhere_but_the_runner(self):
         with mock.patch("subprocess.run", side_effect=AssertionError("real subprocess")), \

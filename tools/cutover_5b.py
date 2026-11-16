@@ -53,11 +53,11 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deploy  # noqa: E402  (the guards, the drain, the health wait: one implementation)
+import schedule  # noqa: E402
 import store  # noqa: E402
 
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
-OLD_IMAGE = "afclaude-manager:latest"          # compose.yml's image: the running old container's
 ROLLBACK_TAG = "afclaude-manager:pre-k7"       # what docker/compose.single.yml runs; kept for ROLLBACK_KEEP
 ROLLBACK_KEEP = timedelta(days=7)
 OLD_CONTAINER = deploy.CONTAINER
@@ -73,17 +73,22 @@ CHECK_LIMIT = 600        # `afclaude host check` (the non-e2e checks' budgets ad
 EXEC_LIMIT = 60
 HEALTH_WAIT = timedelta(minutes=6)
 CLEAR_WAIT = timedelta(minutes=10)
+GUARD = timedelta(minutes=60)    # no session-window start within this of now (and again before the stop): the worst case
+                                 # after the stop is ~30 min (stop + up + health + host check), a rollback ~25 more
+CODE_VERSION_READ = ("cat", "/app/CODE_VERSION")      # the one `docker exec` that only reads: the old image's baked version
 
 READ_ONLY_DOCKER = ("ps", "inspect", "images", "top")
-COMPOSE_VALUE_OPTIONS = ("-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory")
+COMPOSE_VALUE_OPTIONS = ("-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory",
+                         "--ansi", "--progress", "--parallel", "--context", "-c", "--host", "-H")
+COMPOSE_CONFIG_ARGS = ("-q", "--quiet", "--services", "--volumes", "--images", "--profiles", "--no-interpolate")  # no -o/--output
 
 
 class CutoverError(RuntimeError):
     """A step failed: the caller alerts (D-235) and, once the old container is stopped, rolls back."""
 
 
-def compose_subcommand(argv: List[str]) -> str:
-    """The subcommand of a `docker compose [options] <subcommand> ...` call ('' when none)."""
+def compose_split(argv: List[str]) -> "tuple[str, List[str]]":
+    """(the subcommand, the arguments after it) of a `docker compose [options] <subcommand> ...` call; ('', []) when none."""
     i = 2
     while i < len(argv):
         if argv[i] in COMPOSE_VALUE_OPTIONS:
@@ -91,20 +96,26 @@ def compose_subcommand(argv: List[str]) -> str:
         elif argv[i].startswith("-"):
             i += 1
         else:
-            return argv[i]
-    return ""
+            return argv[i], argv[i + 1:]
+    return "", []
 
 
 def is_read_only(argv: List[str]) -> bool:
-    """Whether the call only reads (what a dry-run may run): docker ps | inspect | images | image inspect |
-    compose ... config, and `git -C <dir> rev-parse`."""
+    """Whether the call only reads (what a dry-run may run): docker ps | inspect | images | top | image inspect |
+    exec <c> cat /app/CODE_VERSION, compose ... config with only the listed read options (no -o/--output), and
+    `git -C <dir> rev-parse`."""
     if argv[:1] == ["git"]:
         return len(argv) >= 4 and argv[1] == "-C" and argv[3] == "rev-parse"
     if argv[:1] != ["docker"] or len(argv) < 2:
         return False
     if argv[1] in READ_ONLY_DOCKER or argv[1:3] == ["image", "inspect"]:
         return True
-    return argv[1] == "compose" and compose_subcommand(argv) == "config"
+    if argv[1] == "exec":
+        return len(argv) == 5 and tuple(argv[3:]) == CODE_VERSION_READ
+    if argv[1] == "compose":
+        sub, rest = compose_split(argv)
+        return sub == "config" and all(a in COMPOSE_CONFIG_ARGS for a in rest)
+    return False
 
 
 def render(argv: List[str], env: Optional[Mapping[str, str]] = None) -> str:
@@ -171,6 +182,7 @@ class Cutover:
         self.version = ""
         self.old_running = False
         self.have_pre_tag = False
+        self.running_image = ""
         self.drained = False
         self.old_stopped = False
         self.env_backup: Optional[str] = None
@@ -257,7 +269,16 @@ class Cutover:
 
     # overridable by tests (they would otherwise read the real schedule, kit, database)
     def guard_ok(self) -> bool:
-        return deploy.check_start_guard(False, self.now())
+        """No session-window start within GUARD (60 min) before or after now: longer than deploy.py's 30 min, since the
+        cut-over's downtime and a rollback after it run to ~55 min (review:k7-groundwork MED-4)."""
+        cfg = schedule.load()
+        near, safe = deploy.start_guard(self.now(), cfg, GUARD)
+        if near is None:
+            return True
+        print(f"a session-window start is at {near.astimezone(cfg.zone):%Y-%m-%d %H:%M %Z}: the cut-over needs "
+              f"{GUARD.total_seconds() / 60:.0f} min clear of any start (its downtime and a rollback would run into it, "
+              f"D-257); next safe time {safe.astimezone(cfg.zone):%Y-%m-%d %H:%M %Z}")
+        return False
 
     def kit_ok(self) -> bool:
         return deploy.check_host_kit("services")
@@ -276,11 +297,12 @@ class Cutover:
         self.out("Preflight")
         env_ok = self.check_env()
         good, why = self.captured(self.guard_ok)
-        (self.ok if good else self.fail)("session-window start guard", why or "no start within 30 min")
+        (self.ok if good else self.fail)("session-window start guard", why or f"no start within {GUARD.total_seconds() / 60:.0f} min")
         if env_ok:
             self.check_data()
-            self.check_images()
             self.check_containers()
+            self.check_images()
+            self.check_code_version()
             self.check_compose()
             good, why = self.captured(self.mcp_ok)
             (self.ok if good else self.fail)("mcp profile / roles", why or ("roles on" if deploy.mcp_enabled() else "mcp profile off"))
@@ -343,16 +365,37 @@ class Cutover:
         return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
     def check_images(self) -> None:
-        latest, pinned = self.image_id(OLD_IMAGE), self.image_id(ROLLBACK_TAG)
-        self.have_pre_tag = pinned is not None
-        if latest is None and pinned is None:
-            self.fail("old image", f"neither {OLD_IMAGE} nor {ROLLBACK_TAG} exists: there would be nothing to roll back to")
-        elif pinned is not None and latest is not None and pinned != latest:
-            self.ok("old image", f"{ROLLBACK_TAG} already exists (an earlier attempt) and is kept; {OLD_IMAGE} is another image")
-        elif pinned is not None:
-            self.ok("old image", f"{ROLLBACK_TAG} already points at it")
+        """The rollback image is the one the RUNNING old container uses (not whatever `latest` names now), re-tagged when
+        an earlier attempt left a different pre-k7 (review:k7-groundwork MED-2)."""
+        if not self.running_image:
+            return
+        pinned = self.image_id(ROLLBACK_TAG)
+        self.have_pre_tag = pinned == self.running_image
+        if self.have_pre_tag:
+            self.ok("old image", f"{ROLLBACK_TAG} already points at the image `{OLD_CONTAINER}` runs")
+        elif pinned is None:
+            self.ok("old image", f"the image `{OLD_CONTAINER}` runs will be tagged {ROLLBACK_TAG}")
         else:
-            self.ok("old image", f"{OLD_IMAGE} will be tagged {ROLLBACK_TAG}")
+            self.ok("old image", f"{ROLLBACK_TAG} exists (an earlier attempt) but is NOT the image `{OLD_CONTAINER}` runs now: "
+                    "it will be re-tagged")
+
+    def check_code_version(self) -> None:
+        """The old container's baked code version must be HEAD's: the new runner migrates the database and the host
+        kit is checked against HEAD's, so a rollback onto older code could meet a newer schema or kit (review:k7-groundwork
+        MED-3). Run `python3 tools/deploy.py` (single layout) on this commit first."""
+        if not self.old_running:
+            return
+        head = self.git_version()
+        r = self.read(["docker", "exec", OLD_CONTAINER, *CODE_VERSION_READ])
+        old = r.stdout.strip() if r.returncode == 0 else ""
+        if not old:
+            self.fail("old code version", f"`{OLD_CONTAINER}` has no /app/CODE_VERSION ({(r.stderr or r.stdout).strip()[:150]!r}): "
+                      "run `python3 tools/deploy.py` from this checkout first, so the old image is built with the version")
+        elif not (head.startswith(old) or old.startswith(head)):
+            self.fail("old code version", f"`{OLD_CONTAINER}` runs {old}, this checkout is {head}: the rollback would start "
+                      "other code than the cut-over's (schema, host kit): run `python3 tools/deploy.py` first")
+        else:
+            self.ok("old code version", f"{old} = this checkout's HEAD")
 
     def check_containers(self) -> None:
         r = self.read(["docker", "ps", "--filter", f"name=^{OLD_CONTAINER}$", "--format", "{{.Names}}"])
@@ -360,8 +403,16 @@ class Cutover:
             self.fail("old container", f"docker ps failed: {(r.stderr or r.stdout).strip()[:200]}")
             return
         self.old_running = OLD_CONTAINER in r.stdout.split()
-        self.ok("old container", f"`{OLD_CONTAINER}` is running (drained and stopped by the steps)" if self.old_running
-                else f"`{OLD_CONTAINER}` is not running (an earlier attempt: drain and stop are skipped)")
+        if not self.old_running:
+            self.fail("old container", f"`{OLD_CONTAINER}` is not running: its image and code version cannot be read, and "
+                      "there is nothing to drain; start it (python3 tools/deploy.py) or clean up the earlier attempt first")
+        else:
+            r = self.read(["docker", "inspect", "-f", "{{.Image}}", OLD_CONTAINER])
+            self.running_image = r.stdout.strip() if r.returncode == 0 else ""
+            if not self.running_image:
+                self.fail("old container", f"its image cannot be read: {(r.stderr or r.stdout).strip()[:200]}")
+            else:
+                self.ok("old container", f"`{OLD_CONTAINER}` is running (drained and stopped by the steps)")
         r = self.read(["docker", "ps", "-a", "--format", "{{.Names}}"])
         if r.returncode != 0:
             self.fail("new containers", f"docker ps -a failed: {(r.stderr or r.stdout).strip()[:200]}")
@@ -408,7 +459,7 @@ class Cutover:
             return 1
         if not self.apply:
             if self.target:
-                self.plan()
+                self.plan(clear)
             self.out("")
             self.out("Preflight OK: --apply would run the steps above now." if clear else
                      f"Preflight found {len(self.problems)} problem(s) (above): --apply would refuse.")
@@ -418,26 +469,30 @@ class Cutover:
             return 1
         try:
             self.steps()
-        except CutoverError as e:
-            return self.failed(str(e))
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            return self.failed(f"{type(e).__name__}: {e}")
+        except BaseException as e:      # whatever it is (a Ctrl-C, a KeyError out of a parser): lift, roll back, alert (D-235)
+            self.failed(str(e) if isinstance(e, CutoverError) else f"{type(e).__name__}: {e}")
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            return 1
         self.finish()
         return 0
 
-    def plan(self) -> None:
+    def tag_command(self) -> List[str]:
+        return ["docker", "tag", self.running_image or f"<the image of {OLD_CONTAINER}>", ROLLBACK_TAG]
+
+    def plan(self, preflight_ok: bool = True) -> None:
         self.out("")
         self.out("Steps")
-        self.out(f"  1. keep the old image for {ROLLBACK_KEEP.days} days of rollback")
+        self.out(f"  1. keep the image `{OLD_CONTAINER}` runs for {ROLLBACK_KEEP.days} days of rollback")
         if self.have_pre_tag:
-            self.out(f"     ({ROLLBACK_TAG} exists: kept, no new tag)")
+            self.out(f"     ({ROLLBACK_TAG} already points at it: no new tag)")
         else:
-            self.act(["docker", "tag", OLD_IMAGE, ROLLBACK_TAG], timeout=EXEC_LIMIT)
+            self.act(self.tag_command(), timeout=EXEC_LIMIT)
         self.out("  2. build the services image (the old container keeps running)")
         self.act(self.compose("build", "afclaude-runner"), timeout=BUILD_LIMIT, env=self.compose_env())
         if self.old_running:
             self.out("  3. drain the runner, wait until it is quiet, check the session-window guard again")
-            self.out(f"    $ {self.drain_command()}")
+            self.out(f"    $ {self.drain_command() if preflight_ok else f'docker exec {OLD_CONTAINER} afclaude runner drain (once the database is marked writers=container)'}")
             self.out(f"    (waits up to {CLEAR_WAIT.seconds // 60} min for sampler / usage review / unittest / claude processes in `{OLD_CONTAINER}`)")
             self.out("  4. stop the old container (its runner records a clean exit)")
             self.act(["docker", "stop", OLD_CONTAINER], timeout=STOP_LIMIT)
@@ -448,16 +503,19 @@ class Cutover:
         self.out("  6. start the three services on the same data directory")
         self.act(self.compose("up", "-d"), timeout=UP_LIMIT, env=self.compose_env())
         self.out(f"  7. wait for health: {', '.join(self.service_names())} (up to {HEALTH_WAIT.seconds // 60} min; the new runner's boot lifts the drain)")
-        self.out("  8. the host checks in the new runner")
-        self.act(self.host_check_command(), timeout=CHECK_LIMIT)
-        self.out("  9. then (owner, once): switch the MCP registration to the container")
+        self.out("  8. the host checks in the new runner: a failed BLOCKING check rolls back, the others are reported")
+        self.act(self.host_check_command(True), timeout=CHECK_LIMIT)
+        self.act(self.host_check_command(False), timeout=CHECK_LIMIT)
+        self.out("  9. then (owner, once; with the mcp profile on and roles enforced): switch the MCP registration to the container"
+                 if deploy.mcp_enabled() else
+                 "  9. later (owner, once, after roles are on and COMPOSE_PROFILES=mcp is set): switch the MCP registration")
         self.out(f"    $ {MCP_LINE}")
         self.out("  Rollback (automatic after a failure past step 4, unless --no-rollback; by hand:)")
         for line in self.rollback_commands():
             self.out(f"    $ {line}")
 
-    def host_check_command(self) -> List[str]:
-        return ["docker", "exec", self.runner_container(), "afclaude", "host", "check"]
+    def host_check_command(self, blocking: bool) -> List[str]:
+        return ["docker", "exec", self.runner_container(), "afclaude", "host", "check"] + (["--blocking"] if blocking else [])
 
     def rollback_commands(self) -> List[str]:
         stamp = "<docker/.env.pre-k7-...>"
@@ -471,20 +529,16 @@ class Cutover:
         self.out("Steps")
         if not self.have_pre_tag:
             self.out("  1. keep the old image")
-            self.step(["docker", "tag", OLD_IMAGE, ROLLBACK_TAG], "tagging the old image", timeout=EXEC_LIMIT)
+            self.step(self.tag_command(), "tagging the old image", timeout=EXEC_LIMIT)
         else:
-            self.out(f"  1. {ROLLBACK_TAG} exists: kept")
+            self.out(f"  1. {ROLLBACK_TAG} already points at the old image")
         self.out("  2. build the services image")
         self.step(self.compose("build", "afclaude-runner"), "building the services image", timeout=BUILD_LIMIT,
                   env=self.compose_env(), capture=False)
-        if self.old_running:
-            self.out("  3. drain")
-            self.drain_old()
-            self.out("  4. stop the old container")
-            self.stop_old()
-        else:
-            self.out("  3./4. skipped: the old container is not running")
-            self.old_stopped = True
+        self.out("  3. drain")
+        self.drain_old()
+        self.out("  4. stop the old container")
+        self.stop_old()
         self.out("  5. docker/.env")
         self.write_env()
         self.out("  6. start the services")
@@ -492,14 +546,17 @@ class Cutover:
         self.out("  7. health")
         self.wait_healthy(self.service_names(), "the services")
         self.out("  8. host checks")
-        self.step(self.host_check_command(), "`afclaude host check` in the new runner", timeout=CHECK_LIMIT)
+        self.step(self.host_check_command(True), "a blocking host check in the new runner", timeout=CHECK_LIMIT)
+        r = self.act(self.host_check_command(False), timeout=CHECK_LIMIT)
+        if r is not None and r.returncode != 0:      # a non-blocking fail pauses nothing and alerts once per episode by itself
+            self.out("     non-blocking host check(s) failed (above): reported, the cut-over stays (review them)")
 
     def drain_old(self) -> None:
         conn = store.connect()
         try:
+            self.drained = True      # runner.drain sets its mark first and then waits: any attempt is lifted by failed()
             if not deploy.drain(conn, OLD_CONTAINER, None, run=self.run):
-                raise CutoverError("the runner could not be drained (a session run is still going): rerun later; the drain is lifted")
-            self.drained = True
+                raise CutoverError("the runner could not be drained (a session run is still going): rerun later")
         finally:
             conn.close()
         cleared = deploy.wait_clear(CLEAR_WAIT, lister=lambda: deploy.container_processes(OLD_CONTAINER, run=self.run),
@@ -555,14 +612,21 @@ class Cutover:
         self.out(f"CUT-OVER FAILED: {reason}")
         if not self.old_stopped:
             self.alert("cut-over: failed before the old container was stopped",
-                       f"{reason}. Nothing was cut over; the drain is lifted again.")
+                       f"{reason}. Nothing was cut over" + ("; the drain is lifted again." if self.drained else "."))
             if self.drained:
-                conn = store.connect()
                 try:
-                    deploy.undrain(conn, OLD_CONTAINER, run=self.run)
-                finally:
-                    conn.close()
-                self.out("drain lifted (the old container keeps running)")
+                    conn = store.connect()
+                    try:
+                        deploy.undrain(conn, OLD_CONTAINER, run=self.run)
+                    finally:
+                        conn.close()
+                    self.out("drain lifted (the old container keeps running)")
+                except BaseException as e:
+                    self.alert("cut-over: the drain could not be lifted", f"{type(e).__name__}: {e}: run "
+                               f"`docker exec {OLD_CONTAINER} afclaude runner undrain` by hand")
+                    self.out(f"DRAIN NOT LIFTED: {e}")
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raise
             return 1
         if not self.rollback_enabled:
             self.alert("cut-over: failed after the old container was stopped (no rollback requested)",
@@ -576,11 +640,15 @@ class Cutover:
                    f"{reason}. Removing the new containers and starting the old image ({ROLLBACK_TAG}) again.")
         try:
             self.rollback()
-        except (CutoverError, OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            self.alert("cut-over: the ROLLBACK failed", f"{e}. By hand: " + "; ".join(self.rollback_commands()))
+        except BaseException as e:
+            self.alert("cut-over: the ROLLBACK failed", f"{type(e).__name__}: {e}. By hand: " + "; ".join(self.rollback_commands()))
             self.out(f"ROLLBACK FAILED: {e}")
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
             return 1
         self.out(f"rolled back: `{OLD_CONTAINER}` runs the old image again (the cut-over failed: {reason})")
+        self.out(f"  keep <data>/master.key and back it up with the database: the new runner created it, and a database with "
+                 "its master_key_check but no key refuses the services' start (the old code ignores both)")
         return 1
 
     def rollback(self) -> None:
@@ -601,9 +669,19 @@ class Cutover:
         self.out("")
         self.out("Cut-over done: three services on the same data directory, host checks passed.")
         self.out("Owner steps:")
-        self.out("  - switch the interactive MCP registration to the container (once; needs the afclaude wrapper of host kit 7 and the mcp profile):")
-        self.out(f"      {MCP_LINE}")
-        self.out(f"  - the old image stays tagged {ROLLBACK_TAG} until {until} (rollback week); then:  docker rmi {ROLLBACK_TAG}")
+        self.out(f"  - KEEP and BACK UP {self.data_dir()}/master.key together with the database: the first services start created it "
+                 "(0600) and recorded its check in the database; a database with that check and no key refuses the services' start")
+        if deploy.mcp_enabled():
+            self.out("  - switch the interactive MCP registration to the container (once; needs the afclaude wrapper of host kit 7):")
+            self.out(f"      {MCP_LINE}")
+        else:
+            self.out("  - the MCP registration comes later: roles on (tasks.py roles mode --set on), COMPOSE_PROFILES=mcp in docker/.env, "
+                     "`python3 tools/deploy.py`; then, once:")
+            self.out(f"      {MCP_LINE}")
+        self.out(f"  - the old image stays tagged {ROLLBACK_TAG} until {until} (rollback week); when the cut-over is accepted, in this order:")
+        self.out(f"      docker rm {OLD_CONTAINER}            (the stopped old container: it pins the image)")
+        self.out(f"      docker rmi {ROLLBACK_TAG}")
+        self.out("      docker rmi afclaude-manager:latest   (the old image's other name)")
         self.out("  - to roll back before then:")
         for line in self.rollback_commands():
             self.out(f"      {line}")
