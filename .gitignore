@@ -56,3 +56,4 @@ dashboard/web/.node/
 dashboard/web/node_modules/
 dashboard/web/dist/
 dashboard/web/dist-preview/
+docker/.env.pre-k7-*
