@@ -8,7 +8,7 @@ on the SAME data directory. A checked script, DRY-RUN by default:
     python3 tools/cutover_5b.py --apply --no-rollback    on a failure after the old container stopped, leave the new
                                                 services up for a look instead of rolling back (the command is printed)
 
-Dry-run changes nothing: it runs only read-only docker/git commands (ps, inspect, images, `compose config`,
+Dry-run changes nothing: it runs only read-only docker/git commands (ps, inspect, images, top, `compose config`,
 `git rev-parse`: `Cutover.read` refuses anything else, tested) and prints each changing step as `$ <command>`.
 
 Preflight (both modes; a failed one is exit 1 and in --apply nothing is touched):
@@ -74,7 +74,7 @@ EXEC_LIMIT = 60
 HEALTH_WAIT = timedelta(minutes=6)
 CLEAR_WAIT = timedelta(minutes=10)
 
-READ_ONLY_DOCKER = ("ps", "inspect", "images")
+READ_ONLY_DOCKER = ("ps", "inspect", "images", "top")
 COMPOSE_VALUE_OPTIONS = ("-f", "--file", "-p", "--project-name", "--profile", "--env-file", "--project-directory")
 
 
@@ -404,7 +404,8 @@ class Cutover:
             self.out(f"cut-over refused: {e}")
             return 1
         if not self.apply:
-            self.plan()
+            if self.target:
+                self.plan()
             self.out("")
             self.out("Preflight OK: --apply would run the steps above now." if clear else
                      f"Preflight found {len(self.problems)} problem(s) (above): --apply would refuse.")
