@@ -183,6 +183,14 @@ class Helper(unittest.TestCase):
         self.addCleanup(os.unlink, link)
         self.assertEqual(wd.run(emission(link, **{"GOALS.md": "g\n"}), self.repo), {"GOALS.md": "written"})
 
+    def test_a_project_path_stored_with_a_tilde_is_the_home_directory_it_names(self):
+        home = os.path.dirname(self.repo)          # `~/<name>` is the target when $HOME is its parent
+        with unittest.mock.patch.dict(os.environ, {"HOME": home}):
+            written = wd.run(emission("~/" + os.path.basename(self.repo), **{"GOALS.md": "g\n"}), self.repo)
+            with self.assertRaisesRegex(wd.Refused, "not of the target"):
+                wd.run(emission("~/elsewhere", **{"GOALS.md": "g\n"}), self.repo)
+        self.assertEqual(written, {"GOALS.md": "written"})
+
     def test_an_emission_without_the_project_directory_is_refused(self):
         x = json.loads(emission(self.repo, **{"GOALS.md": "g\n"}))
         del x["project_path"]

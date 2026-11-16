@@ -235,7 +235,73 @@ class RefusedHostRecords(Marked):
         self.assertIn("refused write: doc.append by runner:notify", text)
         self.assertIn('"text": "x"', text)
         self.assertIn(path, out.not_saved)
-        self.assertNotIn("alert", [e.get("event") for e in store.fallback_events(path)])     # recorded, not escalated
+        self.assertEqual([e["event"] for e in store.fallback_events(path)], ["refused", "alert"])  # kept + alerted once
+
+    def refuse(self, actor="runner:keepalive", action="progress.note"):
+        return store.report_db_error(store.WriterRefused("m"), actor=actor, action=action, params={"text": "x"},
+                                     db_path=self.db, runner=True)
+
+    def test_a_refused_runner_write_alerts_the_owner_once_per_actor_and_action(self):
+        sent = []
+        with mock.patch.object(store, "NOTIFY", lambda subject, body="": sent.append((subject, body))):
+            first = self.refuse()
+            self.refuse()
+            self.refuse()
+            self.refuse(action="doc.append")                       # another action: its own alert
+            self.refuse(actor="runner:deploy")                     # another actor too
+        self.assertEqual(len(sent), 3)
+        subject, body = sent[0]
+        self.assertEqual(subject, store.REFUSED_ALERT_SUBJECT)     # D-345: one plain sentence, what to do
+        self.assertIn("Tell the task-manager", subject)
+        self.assertIn("Nothing was lost".lower(), body.lower())
+        self.assertIn(store.fallback_path(self.db), body)                    # where it was saved
+        self.assertIn("runner:keepalive", body.split("Technical detail:")[1])        # technical part after the plain part
+        self.assertIn(f"{store.WRITERS_ROLLBACK} --db {self.db}", body)
+        self.assertIn("alerted", first.escalation or "")
+        self.assertEqual(len([e for e in store.fallback_events(store.fallback_path(self.db))
+                              if e.get("event") == "refused"]), 5)                # every refusal is still recorded
+
+    def test_the_alert_needs_no_database_write_and_its_own_notes_do_not_alert_again(self):
+        import notify
+        pushed, notes = [], []
+        def fake_notify(subject, body=""):
+            # notify.notify's shape: the push, then two notes into the DB, which the host may not write
+            pushed.append(subject)
+            for doc in ("alerts", "progress"):
+                notes.append(notify.project_docs.append_note(doc, subject, "runner:notify", repo=self.tmp.name,
+                                                             db_path=self.db))
+            return "pushed"
+        self.mark()
+        with env(**OUT), mock.patch.object(store, "NOTIFY", fake_notify), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.refuse()
+        self.assertEqual((pushed, notes), ([store.REFUSED_ALERT_SUBJECT], [False, False]))
+        scopes = [e.get("scope") for e in store.fallback_events(store.fallback_path(self.db))
+                  if e.get("event") == "alert"]
+        self.assertEqual(scopes, ["refused:runner:keepalive:progress.note"])        # no second alert for runner:notify
+
+    def test_nothing_alerts_for_a_failure_that_is_not_a_refusal_or_an_interactive_refusal(self):
+        sent = []
+        with mock.patch.object(store, "NOTIFY", lambda subject, body="": sent.append(subject)):
+            store.report_db_error(store.WriterRefused("m"), actor="cli", action="project.add", db_path=self.db)
+        self.assertEqual(sent, [])
+
+    def test_a_host_note_refused_alerts_once(self):
+        import project_docs
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(repo)
+        with env(**OUT):
+            conn = store.connect(self.db)
+            actions.perform(conn, "project.add", {"name": "p2", "path": repo}, actor="cli", via="cli")
+            conn.close()
+        self.mark()
+        sent = []
+        with env(**OUT), mock.patch("sys.stderr", new_callable=io.StringIO), \
+                mock.patch.object(store, "NOTIFY", lambda subject, body="": sent.append(body)):
+            for _ in range(2):
+                project_docs.append_note("alerts", "x\n", "runner:deploy", repo=repo, db_path=self.db)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("runner:deploy, action doc.append", sent[0])
 
     def test_an_interactive_refusal_is_still_only_the_hand_back(self):
         err = store.report_db_error(store.WriterRefused("m"), actor="cli", action="project.add", db_path=self.db)
