@@ -1276,6 +1276,7 @@ class TimedConnection(sqlite3.Connection):
     _gap: bool = False      # a migration-gap authorizer is installed (init); check_writable lifts it
     _refuse: bool = False   # meta.writers = container and this process is not in the container (K5 part 2b)
     _refuse_msg: str = ""
+    _enforce_writers: bool = False   # opened by connect(): the mark is re-read at every write (check_writable)
 
     def _refusal(self, e: sqlite3.DatabaseError) -> "WriterRefused | None":
         """The clear error to raise in place of `e`, a statement the foreign-writer authorizer denied."""
@@ -1397,6 +1398,8 @@ def _connect(path: str | None, create: bool, enforce_writers: bool) -> sqlite3.C
     def open_() -> sqlite3.Connection:
         conn = sqlite3.connect(db, timeout=_QUICK.get() or BUSY_TIMEOUT, factory=TimedConnection)
         conn.row_factory = sqlite3.Row
+        if isinstance(conn, TimedConnection):
+            conn._enforce_writers = enforce_writers
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
@@ -1679,8 +1682,13 @@ def check_writable(conn: sqlite3.Connection, tables: Iterable[str] = ()) -> None
     that migration changes: it raises only when `tables` names one of them (the authorizer
     catches whatever isn't announced, see transaction). Also drops the gap authorizer of a
     connection opened before the database was migrated."""
-    if isinstance(conn, TimedConnection) and conn._refuse:
-        raise WriterRefused(conn._refuse_msg)
+    if isinstance(conn, TimedConnection):
+        if conn._enforce_writers and not conn._refuse and not in_container() and writers_mark(conn) == WRITERS_CONTAINER:
+            # a connection opened before `writers container` was set (a long-lived host process): refuse from now on
+            db = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "") or DB_PATH
+            _refuse_writes(conn, db)
+        if conn._refuse:
+            raise WriterRefused(conn._refuse_msg)
     problem = schema_problem(conn)
     if problem is None:
         if isinstance(conn, TimedConnection) and conn._gap:
@@ -5852,11 +5860,22 @@ def report_db_error(err: DBError, *, actor: str, action: str, params: Mapping[st
     Inside quick_waits() (a hook's 1-2 s lock wait, one try) a transient error is only the hand-back: no fallback
     record and no alert, so two short lock misses never read as a DB that needs the owner (D-331: the hook
     shows a short note); any other error takes the full path (D-171, D-235).
-    A WriterRefused is neither stored nor escalated: nothing is wrong with the database, the caller uses
-    the container's command (its message says which)."""
+    A WriterRefused is not escalated (nothing is wrong with the database, the caller uses the container's
+    command, its message says which) and an interactive call's refusal is not recorded: the caller sees it.
+    A runner's write (runner=True: telemetry, state, jobs) is recorded as a "refused" event with its payload,
+    so a host-side write that never reached the database is not silent (D-235)."""
     if isinstance(err, WriterRefused):
-        err.not_saved = "nothing was changed by this call (a refused write is not recorded for a replay)"
         err.escalation = "none: use the container's command, or the rollback named in the message"
+        err.not_saved = "nothing was changed by this call (a refused write is not recorded for a replay)"
+        if runner:
+            payload = json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False, default=str)
+            where = fallback_note(f"refused write: {action} by {actor} (the database is container-only)",
+                                  {"event": "refused", "actor": actor, "action": action, "write": write,
+                                   "kind": err.kind, "message": str(err)[:500],
+                                   "params": dict(params or {}) if len(payload) <= payload_max else None},
+                                  db_path)
+            err.not_saved = (f"{action} was not applied; recorded in {where}" if where else
+                             f"{action} was not applied; recorded on stderr")
         return err
     if _QUICK.get() is not None and err.error_class == "transient":
         err.not_saved = (f"{action} was not applied (a hook's short lock wait)" if write else
@@ -6000,6 +6019,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "writers":
         import importlib
         actions = importlib.import_module("actions")
+        identity = importlib.import_module("identity")
         try:
             conn = _connect(args.db, False, enforce_writers=False)    # the one connection that is not refused
         except DBError as e:
@@ -6009,7 +6029,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.value == "show":
                 print(json.dumps({"writers": writers_mark(conn) or WRITERS_HOST}))
                 return 0
-            out = actions.perform(conn, "writers.set", {"value": WRITERS_HOST}, actor="cli", via="cli")
+            out = actions.perform(conn, "writers.set", {"value": WRITERS_HOST},
+                                  actor=identity.cli_identity(conn).actor, via="cli")
             print(json.dumps(out, ensure_ascii=False))
             return 0
         except (DBError, ValueError) as e:
