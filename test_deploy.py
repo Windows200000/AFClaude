@@ -536,12 +536,17 @@ class DrainViaContainerTest(unittest.TestCase):
     the undrain go through `docker exec <runner container> afclaude runner ...` (a stub docker here); an
     unmarked database keeps the host path. Order and guards of main() are unchanged."""
 
-    def _main(self, marked, layout="services", docker_rc=0, compose_rc=0, argv=(), guards=(True, True)):
+    def _main(self, marked, layout="services", docker_rc=0, compose_rc=0, argv=(), guards=(True, True),
+              hang=False, limits=None):
         events = []
 
         def run(cmd, **kw):
             if cmd[:2] == ["docker", "exec"]:
                 events.append(" ".join(cmd[2:]))
+                if limits is not None:
+                    limits.append(kw.get("timeout"))
+                if hang and "drain" in cmd and "undrain" not in cmd:
+                    raise deploy.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
                 return FakeCompleted("", docker_rc if "drain" in cmd else 0)      # only the drain fails
             events.append("compose")
             return FakeCompleted("", compose_rc)
@@ -557,6 +562,7 @@ class DrainViaContainerTest(unittest.TestCase):
              mock.patch.object(deploy.store, "writers_mark", return_value="container" if marked else None), \
              mock.patch.object(deploy.runner, "drain", side_effect=lambda *a, **k: events.append("host drain") or 0), \
              mock.patch.object(deploy.runner, "undrain", side_effect=lambda *a: events.append("host undrain")), \
+             mock.patch.object(deploy.runner, "drain_span", return_value=timedelta(minutes=35)), \
              mock.patch.object(deploy, "container_processes", side_effect=lambda c: events.append(f"top {c}") or []), \
              mock.patch.object(deploy, "wait_healthy", side_effect=lambda cs, t, **k: events.append("health") or True), \
              mock.patch.object(deploy.subprocess, "run", side_effect=run), \
@@ -575,6 +581,21 @@ class DrainViaContainerTest(unittest.TestCase):
     def test_the_wait_limit_is_passed_on(self):
         rc, events = self._main(True, argv=["--max-wait-drain", "12.5"])
         self.assertEqual(events[0], "afclaude-runner afclaude runner drain --max-wait 12.5")
+
+    def test_the_exec_has_a_limit_of_the_wait_plus_a_margin(self):
+        limits = []
+        self._main(True, limits=limits)                                    # no --max-wait-drain: the drain's own span
+        self.assertEqual(limits, [(35 + 2) * 60])
+        limits = []
+        self._main(True, argv=["--max-wait-drain", "10"], limits=limits)
+        self.assertEqual(limits[0], 12 * 60)
+
+    def test_a_hung_container_drain_alerts_and_aborts_without_a_rebuild(self):
+        rc, events = self._main(True, hang=True)
+        self.assertEqual(rc, 1)
+        self.assertIn(("alert", "deploy: a container runner command timed out"), events)
+        self.assertNotIn("compose", events)
+        self.assertEqual(events[-1], "afclaude-runner afclaude runner undrain")      # the drain is lifted again
 
     def test_unmarked_database_keeps_the_host_path(self):
         rc, events = self._main(False)

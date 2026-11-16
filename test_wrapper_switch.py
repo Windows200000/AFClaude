@@ -93,8 +93,11 @@ class AllowRules(unittest.TestCase):
                      "Bash(claude agents:*)", "Bash(bash tools/test_compact_live.sh:*)"):
             self.assertIn(rule, ALLOW)
 
-    def test_the_doc_export_helper_is_allowed_as_a_relative_pattern(self):
-        self.assertIn("Bash(python3 tools/write_docs.py:*)", ALLOW)
+    def test_the_doc_export_helper_is_allowed_only_without_a_target_option(self):
+        # a prefix rule would let a session write the three log names into any --repo/--input without a prompt
+        self.assertIn("Bash(python3 tools/write_docs.py)", ALLOW)
+        self.assertIn("Bash(python3 tools/write_docs.py --check)", ALLOW)
+        self.assertNotIn("Bash(python3 tools/write_docs.py:*)", ALLOW)
         self.assertFalse([r for r in ALLOW if "/mnt/" in r or "/home/" in r], "D-217: no personal paths")
 
 

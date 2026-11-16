@@ -25,9 +25,9 @@ from test_project_docs import Env  # noqa: E402
 NAMES = ("PROGRESS.md", "GOALS.md", "EXCEPTIONS.md")
 
 
-def emission(**files):
-    """The JSON `doc export --emit` prints, for the given {name: text}."""
-    return json.dumps({"project": "P", "emit": True, "ok": True,
+def emission(path, **files):
+    """The JSON `doc export --emit` prints for the project whose directory is `path`, for the given {name: text}."""
+    return json.dumps({"project": "P", "project_path": path, "emit": True, "ok": True,
                        "files": {n: {"result": "emitted", "text": t} for n, t in files.items()}})
 
 
@@ -52,6 +52,7 @@ class Emit(Env):
         self.assertEqual({x["files"][f]["result"] for f in ("GOALS.md", "EXCEPTIONS.md")}, {"unchanged"})
         self.assertEqual({f: self.read(f) for f in NAMES}, before)       # the container wrote no file
         self.assertEqual(set(x["files"]), set(NAMES))                    # never ALERTS.md (D-181)
+        self.assertEqual(os.path.realpath(x["project_path"]), os.path.realpath(self.repo))   # for write_docs
 
     def test_the_mark_is_not_moved_so_a_stale_file_never_overwrites_the_db(self):
         self.act("doc.append", project="P", name="progress", text="- new\n")
@@ -107,22 +108,22 @@ class Helper(unittest.TestCase):
     def test_writes_the_three_files_atomically_and_keeps_the_mode(self):
         self.put("GOALS.md")
         os.chmod(self.path("GOALS.md"), 0o640)
-        res = wd.run(emission(**{"PROGRESS.md": "p\n", "GOALS.md": "g\n", "EXCEPTIONS.md": "e\n"}), self.repo)
+        res = wd.run(emission(self.repo, **{"PROGRESS.md": "p\n", "GOALS.md": "g\n", "EXCEPTIONS.md": "e\n"}), self.repo)
         self.assertEqual(res, dict.fromkeys(NAMES, "written"))
         self.assertEqual([self.get(n) for n in NAMES], ["p\n", "g\n", "e\n"])
         self.assertEqual(os.stat(self.path("GOALS.md")).st_mode & 0o777, 0o640)
         self.assertEqual(sorted(os.listdir(self.repo)), sorted(NAMES))       # no temp file left behind
-        self.assertEqual(wd.run(emission(**{"GOALS.md": "g\n"}), self.repo), {"GOALS.md": "unchanged"})
+        self.assertEqual(wd.run(emission(self.repo, **{"GOALS.md": "g\n"}), self.repo), {"GOALS.md": "unchanged"})
 
     def test_text_is_written_byte_for_byte(self):
         text = "a\r\nbä\n\n"
-        wd.run(emission(**{"PROGRESS.md": text}), self.repo)
+        wd.run(emission(self.repo, **{"PROGRESS.md": text}), self.repo)
         with open(self.path("PROGRESS.md"), "rb") as f:
             self.assertEqual(f.read(), text.encode("utf-8"))
 
     def test_check_writes_nothing_and_says_what_would_change(self):
         self.put("PROGRESS.md", "same\n")
-        res = wd.run(emission(**{"PROGRESS.md": "same\n", "GOALS.md": "new\n"}), self.repo, check=True)
+        res = wd.run(emission(self.repo, **{"PROGRESS.md": "same\n", "GOALS.md": "new\n"}), self.repo, check=True)
         self.assertEqual(res, {"PROGRESS.md": "unchanged", "GOALS.md": "would write"})
         self.assertFalse(os.path.exists(self.path("GOALS.md")))
 
@@ -132,7 +133,7 @@ class Helper(unittest.TestCase):
             f.write("keep\n")
         os.symlink(outside, self.path("GOALS.md"))
         with self.assertRaisesRegex(wd.Refused, "symlink"):
-            wd.run(emission(**{"PROGRESS.md": "p\n", "GOALS.md": "g\n"}), self.repo)
+            wd.run(emission(self.repo, **{"PROGRESS.md": "p\n", "GOALS.md": "g\n"}), self.repo)
         self.assertFalse(os.path.exists(self.path("PROGRESS.md")))          # all or nothing
         with open(outside) as f:
             self.assertEqual(f.read(), "keep\n")
@@ -140,20 +141,21 @@ class Helper(unittest.TestCase):
     def test_a_dangling_symlink_is_refused_too(self):
         os.symlink(os.path.join(self.repo, "nowhere"), self.path("PROGRESS.md"))
         with self.assertRaisesRegex(wd.Refused, "symlink"):
-            wd.run(emission(**{"PROGRESS.md": "p\n"}), self.repo)
+            wd.run(emission(self.repo, **{"PROGRESS.md": "p\n"}), self.repo)
 
     def test_a_name_outside_the_whitelist_is_refused(self):
         for bad in ("ALERTS.md", "../PROGRESS.md", "sub/GOALS.md", "progress.md", "README.md", ".git/config", "/etc/passwd"):
             with self.assertRaisesRegex(wd.Refused, "only PROGRESS.md"):
-                wd.run(emission(**{"PROGRESS.md": "p\n", bad: "x"}), self.repo)
+                wd.run(emission(self.repo, **{"PROGRESS.md": "p\n", bad: "x"}), self.repo)
         self.assertEqual(os.listdir(self.repo), [])
 
     def test_a_directory_in_the_place_of_a_file_or_a_missing_repo_is_refused(self):
         os.mkdir(self.path("GOALS.md"))
         with self.assertRaisesRegex(wd.Refused, "regular file"):
-            wd.run(emission(**{"GOALS.md": "g\n"}), self.repo)
+            wd.run(emission(self.repo, **{"GOALS.md": "g\n"}), self.repo)
         with self.assertRaisesRegex(wd.Refused, "not a directory"):
-            wd.run(emission(**{"PROGRESS.md": "p\n"}), os.path.join(self.repo, "none"))
+            none = os.path.join(self.repo, "none")
+            wd.run(emission(none, **{"PROGRESS.md": "p\n"}), none)
 
     def test_bad_input_is_refused(self):
         good = {"result": "emitted", "text": "t"}
@@ -167,11 +169,59 @@ class Helper(unittest.TestCase):
                 wd.run(raw, self.repo)
         self.assertEqual(os.listdir(self.repo), [])
 
+    def test_another_projects_log_is_refused(self):
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaisesRegex(wd.Refused, "not of the target"):
+                wd.run(emission(other, **{"PROGRESS.md": "p\n"}), self.repo)
+            with self.assertRaisesRegex(wd.Refused, "not of the target"):       # --check too
+                wd.run(emission(other, **{"PROGRESS.md": "p\n"}), self.repo, check=True)
+        self.assertEqual(os.listdir(self.repo), [])
+
+    def test_a_link_to_the_projects_directory_is_the_same_directory(self):
+        link = self.repo + "-link"
+        os.symlink(self.repo, link)
+        self.addCleanup(os.unlink, link)
+        self.assertEqual(wd.run(emission(link, **{"GOALS.md": "g\n"}), self.repo), {"GOALS.md": "written"})
+
+    def test_an_emission_without_the_project_directory_is_refused(self):
+        x = json.loads(emission(self.repo, **{"GOALS.md": "g\n"}))
+        del x["project_path"]
+        with self.assertRaisesRegex(wd.Refused, "project_path"):
+            wd.run(json.dumps(x), self.repo)
+        x["project_path"] = None
+        with self.assertRaisesRegex(wd.Refused, "project_path"):
+            wd.run(json.dumps(x), self.repo)
+
+    def test_a_failure_while_writing_the_second_file_changes_no_file(self):
+        self.put("PROGRESS.md")
+        self.put("GOALS.md")
+        real = wd.stage
+        calls = []
+
+        def flaky(path, text):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(path, text)
+        with unittest.mock.patch.object(wd, "stage", side_effect=flaky), self.assertRaises(OSError):
+            wd.run(emission(self.repo, **{"PROGRESS.md": "p\n", "GOALS.md": "g\n"}), self.repo)
+        self.assertEqual(sorted(os.listdir(self.repo)), ["GOALS.md", "PROGRESS.md"])      # no temp file
+        self.assertEqual((self.get("PROGRESS.md"), self.get("GOALS.md")), ("old\n", "old\n"))
+
+    def test_nothing_is_renamed_before_every_temp_file_is_written(self):
+        self.put("PROGRESS.md")
+        order = []
+        real_stage, real_replace = wd.stage, wd.os.replace
+        with unittest.mock.patch.object(wd, "stage", side_effect=lambda *a: order.append("stage") or real_stage(*a)), \
+                unittest.mock.patch.object(wd.os, "replace", side_effect=lambda *a: order.append("rename") or real_replace(*a)):
+            wd.run(emission(self.repo, **{"PROGRESS.md": "p\n", "GOALS.md": "g\n", "EXCEPTIONS.md": "e\n"}), self.repo)
+        self.assertEqual(order, ["stage"] * 3 + ["rename"] * 3)
+
     def test_a_failed_write_leaves_no_temp_file(self):
         self.put("PROGRESS.md")
         with unittest.mock.patch.object(wd.os, "replace", side_effect=OSError("disk")):
             with self.assertRaises(OSError):
-                wd.run(emission(**{"PROGRESS.md": "p\n"}), self.repo)
+                wd.run(emission(self.repo, **{"PROGRESS.md": "p\n"}), self.repo)
         self.assertEqual(os.listdir(self.repo), ["PROGRESS.md"])
         self.assertEqual(self.get("PROGRESS.md"), "old\n")
 
@@ -185,11 +235,11 @@ class Script(unittest.TestCase):
 
     def test_exit_codes(self):
         with tempfile.TemporaryDirectory() as d:
-            r = self.run_helper(emission(**{"GOALS.md": "g\n"}), "--repo", d, "--check")
+            r = self.run_helper(emission(d, **{"GOALS.md": "g\n"}), "--repo", d, "--check")
             self.assertEqual((r.returncode, r.stdout.split()), (1, ["GOALS.md", "would", "write"]))
-            r = self.run_helper(emission(**{"GOALS.md": "g\n"}), "--repo", d)
+            r = self.run_helper(emission(d, **{"GOALS.md": "g\n"}), "--repo", d)
             self.assertEqual((r.returncode, r.stdout.split()), (0, ["GOALS.md", "written"]))
-            r = self.run_helper(emission(**{"GOALS.md": "g\n"}), "--repo", d, "--check")
+            r = self.run_helper(emission(d, **{"GOALS.md": "g\n"}), "--repo", d, "--check")
             self.assertEqual(r.returncode, 0)
             r = self.run_helper("nope", "--repo", d)
             self.assertEqual(r.returncode, 1)

@@ -174,6 +174,91 @@ class Refusal(Marked):
         self.assertFalse(os.path.exists(store.fallback_path(self.db)))   # no replay record, no alert
 
 
+class LateMark(Marked):
+    """Review LOW-3: a host connection opened before `writers container` keeps writing no longer (the mark is read
+    again when a write starts), and a connection that is not enforcing (the rollback's) is left alone."""
+
+    def test_a_connection_opened_before_the_mark_is_refused_at_its_next_write(self):
+        with env(**OUT):
+            conn = store.connect(self.db)
+            actions.perform(conn, "project.add", {"name": "before"}, actor="cli", via="cli")      # unmarked: fine
+            self.mark()
+            self.assertEqual([p["name"] for p in store.list_projects(conn)], ["p1", "before"])   # reads go on
+            with self.assertRaises(store.WriterRefused) as cm:
+                actions.perform(conn, "project.add", {"name": "after"}, actor="cli", via="cli")
+            self.assertIn(store.WRITERS_ROLLBACK, str(cm.exception))
+            self.assertIn(self.db, str(cm.exception))                    # the rollback names this database
+            with self.assertRaises(store.WriterRefused):                 # and the raw write is denied from now on
+                conn.execute("DELETE FROM projects")
+            conn.close()
+        self.assertEqual(self.projects(), ["p1", "before"])
+
+    def test_the_container_connection_is_not_asked(self):
+        with env(**IN):
+            conn = store.connect(self.db)
+            self.mark()
+            actions.perform(conn, "project.add", {"name": "in"}, actor="cli", via="cli")
+            conn.close()
+        self.assertEqual(self.projects(), ["p1", "in"])
+
+    def test_the_rollback_connection_is_not_refused_by_the_late_check(self):
+        self.mark()
+        with env(**OUT):
+            conn = store._connect(self.db, False, enforce_writers=False)
+            actions.perform(conn, "writers.set", {"value": "host"}, actor="cli", via="cli")
+            conn.close()
+        self.assertEqual(self.audit(), ["writers.set", "writers.set"])
+
+    def test_the_check_costs_a_host_connection_two_cheap_reads_and_a_container_one_none(self):
+        counts = {}
+        for label, flag in (("host", OUT), ("container", IN)):
+            with env(**flag):
+                conn = store.connect(self.db)
+                seen = []
+                conn.set_trace_callback(seen.append)
+                store.check_writable(conn)
+                counts[label] = len(seen)
+                conn.close()
+        self.assertEqual(counts["host"] - counts["container"], 2)       # writers_mark: the table check + the key
+
+
+class RefusedHostRecords(Marked):
+    """Review MED-2: a host note or runner write that the container-only database refused is not left to stderr."""
+
+    def test_a_runner_write_leaves_a_refused_record_with_its_payload(self):
+        err = store.WriterRefused("m")
+        out = store.report_db_error(err, actor="runner:notify", action="doc.append",
+                                    params={"name": "alerts", "text": "x"}, db_path=self.db, runner=True)
+        path = store.fallback_path(self.db)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("refused write: doc.append by runner:notify", text)
+        self.assertIn('"text": "x"', text)
+        self.assertIn(path, out.not_saved)
+        self.assertNotIn("alert", [e.get("event") for e in store.fallback_events(path)])     # recorded, not escalated
+
+    def test_an_interactive_refusal_is_still_only_the_hand_back(self):
+        err = store.report_db_error(store.WriterRefused("m"), actor="cli", action="project.add", db_path=self.db)
+        self.assertFalse(os.path.exists(store.fallback_path(self.db)))
+        self.assertIn("not recorded", err.not_saved)
+
+    def test_a_host_note_is_kept_in_the_fallback_file(self):
+        import project_docs
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(repo)
+        with env(**OUT):
+            conn = store.connect(self.db)
+            actions.perform(conn, "project.add", {"name": "p2", "path": repo}, actor="cli", via="cli")
+            conn.close()
+        self.mark()
+        with env(**OUT), mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertFalse(project_docs.append_note("alerts", "drain could not be lifted\n", "runner:deploy",
+                                                      repo=repo, db_path=self.db))
+        recs = [e for e in store.fallback_events(store.fallback_path(self.db)) if e.get("event") == "note"]
+        self.assertEqual([(e["doc"], e["text"], e["actor"]) for e in recs],
+                         [("alerts", "drain could not be lifted\n", "runner:deploy")])
+
+
 class Rollback(Marked):
     def run_store(self, *argv, flag=OUT):
         out, err = io.StringIO(), io.StringIO()
@@ -195,6 +280,20 @@ class Rollback(Marked):
             conn.close()
         rc, out, _ = self.run_store("writers", "show", "--db", self.db)
         self.assertEqual(json.loads(out), {"writers": "host"})
+
+    def test_the_rollback_is_audited_under_the_callers_identity_not_a_literal_cli(self):
+        import identity
+        self.mark()
+        who = mock.Mock(actor="task-manager:aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
+        with mock.patch.object(identity, "cli_identity", return_value=who):
+            rc, _, err = self.run_store("writers", "host", "--db", self.db)
+        self.assertEqual(rc, 0, err)
+        c = sqlite3.connect(self.db)
+        try:
+            actors = [r[0] for r in c.execute("SELECT actor FROM audit_log WHERE action='writers.set' ORDER BY id")]
+        finally:
+            c.close()
+        self.assertEqual(actors, ["cli", who.actor])        # the container's mark by the test's cli, then the rollback
 
     def test_no_database_is_an_error_not_a_new_one(self):
         rc, _, err = self.run_store("writers", "host", "--db", os.path.join(self.tmp.name, "none.db"))

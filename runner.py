@@ -1317,6 +1317,14 @@ def _held_by_drain(conn: Any, r: store.Row) -> bool:
     return job.session
 
 
+def drain_span(conn: Any) -> timedelta:
+    """How long a drain holds new session runs, and so how long it waits at most without --max-wait: the longest
+    timeout of a job that acts on a session + DRAIN_MARGIN."""
+    held = session_jobs() + [j for j in JOBS.values() if j.at_jobs]
+    longest = max((float(actions.get_setting(conn, actions.RUNNER_TIMEOUT + j.name)) for j in held), default=0.0)
+    return timedelta(minutes=longest) + DRAIN_MARGIN
+
+
 def drain(conn: Any, max_wait: Optional[timedelta] = None, *, poll: float = DRAIN_POLL,
           clock: Callable[[], datetime] = _utcnow, sleep: Callable[[float], object] = time.sleep,
           out: Callable[[str], object] = print) -> int:
@@ -1325,9 +1333,7 @@ def drain(conn: Any, max_wait: Optional[timedelta] = None, *, poll: float = DRAI
     whose interruption fails (on_interrupt "fail": a one-off review start) counts as one (S4).
     -> 0 drained, 1 still running after max_wait (do not deploy)."""
     now = clock()
-    held = session_jobs() + [j for j in JOBS.values() if j.at_jobs]
-    longest = max((float(actions.get_setting(conn, actions.RUNNER_TIMEOUT + j.name)) for j in held), default=0.0)
-    span = timedelta(minutes=longest) + DRAIN_MARGIN
+    span = drain_span(conn)
     until = now + span
     actions.runner_state_put(conn, {"drain": {"until": _iso(until), "at": _iso(now)}},
                              actor=identity.cli_identity(conn).actor, via="cli")

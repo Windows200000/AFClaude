@@ -1378,7 +1378,9 @@ def connect(path: str | None = None, create: bool = False) -> sqlite3.Connection
 
     A database marked `meta.writers = container` (K5 part 2b) is written by the container only: opened
     anywhere else it is read-only for every statement that changes it (WriterRefused, naming the
-    rollback); reads go on. An unmarked database, and every temp test database, is not affected."""
+    rollback); reads go on. The mark is read again when a write starts (check_writable), so a long-lived host
+    connection opened before the mark is refused from then on. An unmarked database, and every temp test
+    database, is not affected."""
     return _connect(path, create, enforce_writers=True)
 
 

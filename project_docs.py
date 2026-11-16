@@ -336,7 +336,8 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
     emit=True (K5 part 2b, D-344): the container cannot write the host's repo, so nothing is written and
     the sync mark is not moved: each file's report carries its `text` (result "emitted", or "unchanged"
     when the file already reads so) for tools/write_docs.py on the host, whose write the next import
-    sees as in sync."""
+    sees as in sync. `project_path` (the project's directory as the host knows it) lets that helper refuse
+    another project's log."""
     lookup = repo or host.repo_dir()
     repo = repo or HERE
     conn = store.connect(db_path)
@@ -390,8 +391,8 @@ def export(db_path: Optional[str] = None, repo: Optional[str] = None, project: O
                 rep["result"] = "written"
             rep["chars"] = len(text)
             files[fname] = rep
-        return {"project": p["name"], "repo": os.path.abspath(repo), "check": check, "emit": emit, "ok": ok,
-                "files": files}
+        return {"project": p["name"], "project_path": p["path"], "repo": os.path.abspath(repo), "check": check,
+                "emit": emit, "ok": ok, "files": files}
     finally:
         conn.close()
 
