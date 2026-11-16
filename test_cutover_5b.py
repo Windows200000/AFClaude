@@ -267,6 +267,13 @@ class PreflightTest(Base):
         self.assertEqual(rc, 1)
         self.assertIn("nothing to roll back to", t)
 
+    def test_compose_config_gets_the_target_environment(self):
+        self.run_dry()
+        cfg = [(a, kw) for a, kw in self.docker.calls if a[:2] == ["docker", "compose"] and "config" in a]
+        self.assertEqual(len(cfg), 1)
+        self.assertEqual(cfg[0][1]["env"]["AFCLAUDE_DATA"], self.data)
+        self.assertEqual(cfg[0][1]["env"]["AFCLAUDE_LAYOUT"], "services")
+
     def test_leftover_new_containers_refuse(self):
         self.docker.existing = ["afclaude-web"]
         rc, t = self.run_dry()

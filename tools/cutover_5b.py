@@ -178,11 +178,14 @@ class Cutover:
 
     # --- the one place a command is made --------------------------------------------------------------------
 
-    def read(self, argv: List[str], *, timeout: int = 30) -> "subprocess.CompletedProcess[str]":
-        """Run a READ-ONLY command (both modes). Anything else is a bug here: ValueError."""
+    def read(self, argv: List[str], *, timeout: int = 30,
+             env: Optional[Mapping[str, str]] = None) -> "subprocess.CompletedProcess[str]":
+        """Run a READ-ONLY command (both modes). Anything else is a bug here: ValueError. env: variables on top of the
+        process's own (the target configuration, for `compose config`)."""
         if not is_read_only(argv):
             raise ValueError(f"not a read-only command: {render(argv)}")
-        return self.run(argv, capture_output=True, text=True, timeout=timeout)
+        kw: dict[str, Any] = {} if env is None else {"env": dict(self.environ, **env)}
+        return self.run(argv, capture_output=True, text=True, timeout=timeout, **kw)
 
     def act(self, argv: List[str], *, timeout: int, env: Optional[Mapping[str, str]] = None,
             capture: bool = True) -> "Optional[subprocess.CompletedProcess[str]]":
@@ -375,7 +378,7 @@ class Cutover:
 
     def check_compose(self) -> None:
         self.version = self.git_version()
-        r = self.read(self.compose("config", "-q"))
+        r = self.read(self.compose("config", "-q"), env=self.compose_env())
         if r.returncode != 0:
             self.fail("compose config", f"the services configuration does not validate: {(r.stderr or r.stdout).strip()[:300]}")
         else:
