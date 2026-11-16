@@ -12,8 +12,8 @@ Dry-run changes nothing: it runs only read-only docker/git commands (ps, inspect
 `git rev-parse`: `Cutover.read` refuses anything else, tested) and prints each changing step as `$ <command>`.
 
 Preflight (both modes; a failed one is exit 1 and in --apply nothing is touched):
-  - no session-window start within 30 min before or after now (deploy.check_start_guard, the 22:30-23:30 /
-    03:30-04:30 windows of the schedule included; no --force here, D-257);
+  - no session-window start within 60 min before or after now (deploy.start_guard with a 60 min guard, a superset of
+    deploy.py's 30 min and its 22:30-23:30 / 03:30-04:30 windows: the downtime and a rollback run to ~55 min; no --force, D-257);
   - docker/.env has what the services layout needs: AFCLAUDE_HOST_REPO, HOST_HOME, AFCLAUDE_BRIDGE_USER; the flips it
     still lacks are listed (AFCLAUDE_LAYOUT=services, AFCLAUDE_SCHEDULER=runner, AFCLAUDE_DATA = the repo's data/,
     AFCLAUDE_COMPOSE_OVERRIDES=compose.host-mounts.yml,compose.subnet.yml) and written only by --apply (the old file is
@@ -21,15 +21,19 @@ Preflight (both modes; a failed one is exit 1 and in --apply nothing is touched)
   - the data directory holds the database and the host kit's bridge key (<data>/bridge/host_bridge_ed25519);
   - the host kit is installed and is the one this code needs (deploy.check_host_kit: D-121/D-338, the OWNER installs
     it: this script does not, and the no-kit transitional mode of K6 stays until a later commit);
-  - the old image `afclaude-manager:latest` (or the kept tag) exists, `docker/compose.single.yml` (the rollback file)
-    exists, no `afclaude-runner|mcp|web` container exists yet, and the target compose config validates;
+  - the old container is running and its baked code version (/app/CODE_VERSION) is this checkout's HEAD (else run
+    `python3 tools/deploy.py` first: a rollback must start the same code, schema and host kit), `docker/compose.single.yml`
+    (the rollback file) exists, no `afclaude-runner|mcp|web` container exists yet, and the target compose config validates;
   - the mcp profile (COMPOSE_PROFILES) only with roles_enforce on (deploy.check_mcp_profile).
-Steps (--apply): tag the old image `afclaude-manager:pre-k7` (kept one week) -> build the services image (the old
+Steps (--apply): tag the image the RUNNING old container uses as `afclaude-manager:pre-k7` (kept one week; an older
+pre-k7 is re-tagged) -> build the services image (the old
 container still runs) -> drain the runner (through the container, deploy.drain) -> wait until it is quiet -> start guard
 again -> stop the old container -> write the .env flips -> `compose up -d` -> wait for the health checks -> `afclaude
-host check` in the new runner -> print the MCP registration line and the rollback command.
-Every failure is an alert (notify) and exit 1, no silent fallback. Before the old container is stopped it only lifts the
-drain; after, it rolls back: remove the new containers, restore docker/.env, `docker compose -f docker/compose.single.yml
+host check` in the new runner (a failed BLOCKING check rolls back, non-blocking ones are reported) -> print the owner steps
+(keep master.key, the MCP line only with the mcp profile on, the acceptance clean-up, the rollback commands).
+Every failure (any exception; a Ctrl-C is re-raised after the clean-up) is an alert (notify) and exit 1, no silent
+fallback. Before the old container is stopped it only lifts the drain (a failed or timed-out drain attempt too: the mark
+is set first); after, it rolls back: remove the new containers, restore docker/.env, `docker compose -f docker/compose.single.yml
 up -d` (the kept old image, no build), wait healthy. A failed rollback is a second alert with the manual commands.
 All docker, compose and git calls go through ONE injectable runner (`Cutover.run`); tests stub it (test_cutover_5b.py).
 """
