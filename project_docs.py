@@ -218,9 +218,10 @@ def append_note(name: str, text: str, actor: str, repo: Optional[str] = None,
                             {"event": "note", "actor": actor, "doc": name, "repo": where, "error": str(e)[:500],
                              "text": text[:NOTE_PAYLOAD_MAX]}, db_path)
     except store.WriterRefused as e:     # the host may not write a container-only database (K5 part 2b): keep the note
-        store.fallback_note(f"note not stored in the DB ({actor}, {name}): {e}",
-                            {"event": "note", "actor": actor, "doc": name, "repo": where, "error": str(e)[:500],
-                             "text": text[:NOTE_PAYLOAD_MAX]}, db_path)
+        kept = store.fallback_note(f"note not stored in the DB ({actor}, {name}): {e}",
+                                   {"event": "note", "actor": actor, "doc": name, "repo": where,
+                                    "error": str(e)[:500], "text": text[:NOTE_PAYLOAD_MAX]}, db_path)
+        store.alert_refused_write(actor, "doc.append", kept, db_path)     # the owner sees it (D-235)
     except Exception as e:   # noqa: BLE001 - a note never takes a runner down
         err = store.as_db_error(e)
         if err.escalation is None:          # not reported yet (perform reports its own failures)

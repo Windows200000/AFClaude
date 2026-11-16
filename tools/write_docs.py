@@ -45,7 +45,7 @@ def parse(raw: str, repo: str) -> dict[str, str]:
     here = data.get("project_path")
     if not isinstance(here, str) or not here:
         raise Refused("input names no `project_path`: not the output of this version's `doc export --emit`")
-    if os.path.realpath(here) != os.path.realpath(repo):
+    if os.path.realpath(os.path.expanduser(here)) != os.path.realpath(repo):
         raise Refused("the export is of project %r (directory %s), not of the target %s: refusing to write another "
                       "project's log" % (data.get("project"), here, repo))
     texts: dict[str, str] = {}
