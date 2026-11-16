@@ -11,6 +11,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import testenv  # noqa: E402,F401  (hermetic: a temp DB and the live-store guard; before the AFClaude imports)
 import roles  # noqa: E402
 from roles import GrantRow, UserRow  # noqa: E402
 

@@ -18,6 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (hermetic: a temp DB and the live-store guard; before the AFClaude imports)
 import change_manifest as cm  # noqa: E402
 import store  # noqa: E402
 
