@@ -47,7 +47,8 @@ class Routes(unittest.TestCase):
 
     def test_the_planned_commands_are_the_plans_list(self):
         listed = set(afclaude.ROUTES) | set(afclaude.PLANNED) | {"hook"}
-        self.assertEqual(listed, {"runner", "mcp", "web", "host", "key", "setup", "machine", "tasks", "hook"})
+        self.assertEqual(listed, {"runner", "mcp", "web", "host", "key", "setup", "machine", "tasks", "hook", "keepalive",
+                                  "usage-report", "prompts"})
 
 
 class Command(unittest.TestCase):

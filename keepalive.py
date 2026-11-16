@@ -237,7 +237,7 @@ def session_rules_hook(part, hook_input, project_dir=None):
     migrated (prompts.NotMigrated), is that case: a hook must not fail a session start, so the
     documented fallback is the "read these files" text, which names the template, not the values;
     phase 4a P3)."""
-    cwd = (hook_input or {}).get("cwd") or project_dir or os.getcwd()
+    cwd = (hook_input or {}).get("cwd") or project_dir or host.caller_dir()
     if not rules_hooked(cwd):
         return None
     try:

@@ -26,7 +26,8 @@ import sys
 STAMP_KEY = "_afc"                       # identity.STAMP_KEY (not imported: no store/actions import here)
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 CLI_RE = re.compile(r"\b(tasks|keepalive|usage_report|limit_ratio|runner|project_docs|decisions|prompts|backup|"
-                    r"telemetry|compact_timing|deploy|export_quickview|questions|setup|runner_state)\.py\b")
+                    r"telemetry|compact_timing|deploy|export_quickview|questions|setup|runner_state)\.py\b"
+                    r"|(?:^|[;&|(/\s])afclaude\s+(?:tasks|machine|keepalive|usage-report|prompts|runner|hook)\b")
 REWRITE_MODES = ("auto", "bypassPermissions")   # payload["permission_mode"] values where the Bash rewrite is safe
 
 

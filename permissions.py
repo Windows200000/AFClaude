@@ -425,6 +425,9 @@ MATRIX: dict[str, Perm] = {
                                         "D-283: its task-manager only clears"),
     "install.stamp": DEPLOY,
     "install.restored": DEPLOY,
+    "writers.set": Perm(task_manager="self_project",
+                        note="K5 part 2b (D-344): the owner and AFClaude's own task-manager set who writes the "
+                             "database; no runner sets it, an agent is refused"),
     "masterkey.check": INTERNAL,
     "prompt.set": OWNER,
     "prompt.reset": OWNER,

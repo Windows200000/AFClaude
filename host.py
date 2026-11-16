@@ -103,6 +103,14 @@ def in_container():
     return os.environ.get("AFCLAUDE_IN_CONTAINER", "").strip() not in ("", "0")
 
 
+def caller_dir():
+    """The directory that stands for "here" in a CLI call: $CLAUDE_PROJECT_DIR when it is an absolute path
+    (Claude Code sets it for hooks and tools; the host wrapper passes the caller's cwd through `docker exec`,
+    where the container's own cwd says nothing), else os.getcwd(). Same order as mcp_server.caller_dir."""
+    env = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    return os.path.normpath(env) if env and os.path.isabs(env) else os.getcwd()
+
+
 class HostRepoError(RuntimeError):
     """In a container, the host path of the repo is missing or not an absolute path (D-235)."""
 

@@ -8,6 +8,7 @@ which module does what.
     afclaude web serve|health                                    the web service: /health and the inbox API on its unix socket (web.py)
     afclaude tasks ...                                           the task store CLI (tasks.py)
     afclaude machine ...                                         machine users and tokens (tasks.py machine ...)
+    afclaude keepalive --decide|--run-stopped|... | usage-report | prompts ...   the keep-alive, usage report and prompt CLIs (keepalive.py, usage_report.py, prompts.py)
     afclaude hook session-rules|decisions|identity ...           the session hooks (keepalive.py, decisions.py, identity_hook.py)
     afclaude host check [name ...] [--blocking] | status          the host checks (hostcheck.py; K6)
     afclaude key|setup                                           not built yet (K4, 5d/6a): refused with a message
@@ -43,6 +44,9 @@ ROUTES: dict[str, Route] = {
     "web": Route("web.py", unbuffered=True, help="the web service: serve | health (/health and the inbox API on a unix socket)"),
     "tasks": Route("tasks.py", help="the task store CLI (projects, tasks, decisions, docs, questions, ...)"),
     "machine": Route("tasks.py", ("machine",), help="machine users: code | register | register-host (on the host, not here) | list | rename | revoke"),
+    "keepalive": Route("keepalive.py", help="the keep-alive CLI: --decide | --run-stopped | ... (keepalive.py)"),
+    "usage-report": Route("usage_report.py", help="the usage report (usage_report.py)"),
+    "prompts": Route("prompts.py", help="the prompt store: vars | override | ... (prompts.py)"),
     "host": Route("hostcheck.py", help="host check [name ...] [--blocking]: validate the host setup (hostcheck.py); status"),
 }
 # `afclaude hook <name>`: the session hooks the repo's .claude/settings.json runs (K5 moves them here).

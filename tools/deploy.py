@@ -58,7 +58,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, HERE)
@@ -168,11 +168,62 @@ def check_start_guard(force: bool, now: Optional[datetime] = None,
     return False
 
 
-def lift_drain(conn: object) -> int:
-    """An aborted deploy lifts its drain at once (runner.undrain): else it would hold the next
+def container_writes(conn: Any) -> bool:
+    """The database says only the container writes it (meta.writers=container, K5 part 2b): the host's own
+    store connection refuses writes then, so the drain goes through the container."""
+    return store.writers_mark(conn) == store.WRITERS_CONTAINER
+
+
+def runner_container(lay: str) -> str:
+    """The container whose `afclaude runner ...` the deploy talks to (it holds the database's writes)."""
+    return CONTAINER if lay == "single" else f"{name_prefix()}-runner"
+
+
+EXEC_MARGIN = timedelta(minutes=2)      # docker exec's own start-up and the runner's state writes, on top of a wait
+UNDRAIN_EXEC_LIMIT = timedelta(minutes=2)
+
+
+def container_runner(container: str, *args: str, limit: Optional[timedelta] = None) -> int:
+    """`docker exec <container> afclaude runner <args>`, its output passed through. -> its exit code. limit: a hung
+    exec must not hang the deploy past the start guard (D-234): after it the docker client is killed, an alert is
+    raised and 124 is returned (what a timeout is, by convention) so the caller aborts."""
+    try:
+        return int(subprocess.run(["docker", "exec", container, "afclaude", "runner", *args],
+                                  timeout=None if limit is None else limit.total_seconds()).returncode)
+    except subprocess.TimeoutExpired:
+        alert("deploy: a container runner command timed out",
+              f"`afclaude runner {' '.join(args)}` in {container} did not finish within "
+              f"{limit.total_seconds() / 60 if limit else 0:.0f} min: the deploy is aborted. Check the container "
+              "(docker ps, docker logs); a drain may still be held (afclaude runner undrain) until it expires")
+        return 124
+
+
+def drain(conn: Any, container: str, max_wait_minutes: Optional[float]) -> bool:
+    """Hold new session runs and wait until none runs (runner.drain). -> drained. Through the container once the
+    database is marked writers=container (the host cannot write it), else as before on the host's connection."""
+    if container_writes(conn):
+        extra = [] if max_wait_minutes is None else ["--max-wait", str(max_wait_minutes)]
+        wait = timedelta(minutes=max_wait_minutes) if max_wait_minutes is not None else runner.drain_span(conn)
+        return container_runner(container, "drain", *extra, limit=wait + EXEC_MARGIN) == 0
+    return runner.drain(conn, timedelta(minutes=max_wait_minutes) if max_wait_minutes is not None else None) == 0
+
+
+def undrain(conn: Any, container: str) -> None:
+    if container_writes(conn):
+        rc = container_runner(container, "undrain", limit=UNDRAIN_EXEC_LIMIT)
+        if rc != 0:     # a drain that stays holds the next session runs until it expires (D-257): loud, not silent
+            alert("deploy: the drain could not be lifted", f"`afclaude runner undrain` in {container} exited {rc}: "
+                  "run it by hand (docker exec ... afclaude runner undrain), else new session runs wait until the "
+                  "drain expires")
+        return
+    runner.undrain(conn)
+
+
+def lift_drain(conn: Any, container: str = CONTAINER) -> int:
+    """An aborted deploy lifts its drain at once (undrain): else it would hold the next
     session runs until the drain expires (the longest session-run timeout + 5 min), long enough
     to turn a start into a missed one (D-257). -> 1 (the deploy's exit code)."""
-    runner.undrain(conn)
+    undrain(conn, container)
     print("drain lifted (no rebuild)")
     return 1
 
@@ -505,14 +556,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     conn = store.connect()
     try:
-        drained = runner.drain(conn, timedelta(minutes=args.max_wait_drain)
-                               if args.max_wait_drain is not None else None) == 0
-        cleared = wait_clear(timedelta(minutes=args.max_wait_clear), lister=lambda: container_processes(CONTAINER if lay == "single" else f"{name_prefix()}-runner"))
+        rc_container = runner_container(lay)
+        drained = drain(conn, rc_container, args.max_wait_drain)
+        cleared = wait_clear(timedelta(minutes=args.max_wait_clear), lister=lambda: container_processes(rc_container))
         if not (drained and cleared) and not args.force:
             print("deploy aborted: not drained/clear (see above); rerun with --force to rebuild anyway")
-            return lift_drain(conn)
+            return lift_drain(conn, rc_container)
         if not check_start_guard(args.force):  # again: the drain and the clear wait can be long
-            return lift_drain(conn)
+            return lift_drain(conn, rc_container)
     finally:
         conn.close()
 
@@ -525,7 +576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               "running; the drain was lifted. See the deploy's output.")
         conn = store.connect()
         try:
-            lift_drain(conn)               # no new runner boot will lift it (a failed build changes nothing)
+            lift_drain(conn, runner_container(lay))   # no new runner boot will lift it (a failed build changes nothing)
         finally:
             conn.close()
         return r.returncode

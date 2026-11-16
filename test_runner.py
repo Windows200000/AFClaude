@@ -780,6 +780,11 @@ class Misc(Base):
             runner.undrain(self.conn)
         self.assertIsNone(actions.runner_drain(self.conn))
 
+    def test_the_drain_span_is_the_longest_session_timeout_plus_the_margin(self):
+        longest = max(float(actions.get_setting(self.conn, actions.RUNNER_TIMEOUT + j.name))
+                      for j in runner.session_jobs() + [j for j in runner.JOBS.values() if j.at_jobs])
+        self.assertEqual(runner.drain_span(self.conn), timedelta(minutes=longest) + runner.DRAIN_MARGIN)
+
     def test_a_boot_lifts_the_drain(self):
         until = runner._iso(datetime.now(UTC) + timedelta(hours=1))
         actions.runner_state_put(self.conn, {"drain": {"until": until}}, actor="cli", via="cli")

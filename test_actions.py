@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402,F401  (hermetic: a temp DB, config and data dir; before the AFClaude
@@ -589,6 +590,7 @@ class Autonomous(Base):
                   # decision.confirm is not here: decision_autonomous refuses an autonomous session without an owner
                   # message naming the id (phase 4b Q2, owner_words.py), D-104/D-285
                   "install.stamp", "install.restored",                          # phase 5c: backup.py
+                  "writers.set",                                                # K5 part 2b (D-344)
                   "grant.set", "grant.remove", "grant.sync_groups", "user.rename", "user.revoke",   # phase 5a A1
                   "machine.code", "machine.rename", "machine.revoke"}
 
@@ -1231,6 +1233,7 @@ class EveryAction(Base):
                                              "app_version": None, "schema_version": store.SCHEMA_VERSION,
                                              "bundle_sha256": "0" * 64, "kind": "backup"}}),
             ("install.stamp", {}),
+            ("writers.set", {"value": "host"}),     # a marked database (set below): the rollback changes it
             ("masterkey.check", {"value": "ab" * 32, "key_id": "abcdef012345"}),
             ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
             ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
@@ -1293,7 +1296,12 @@ class EveryAction(Base):
                 self.conn.execute("DELETE FROM meta WHERE key='install_id'")
                 self.conn.commit()
             own_session = name.startswith("auth.session_") and name != "auth.session_revoke"   # the user's own
-            self.do(name, actor="user:7" if own_session else "owner", via="dashboard", idem=f"every-{i:04d}", **params)
+            with contextlib.ExitStack() as stack:
+                if name == "writers.set":       # a marked database, so setting it back to host changes something
+                    stack.enter_context(mock.patch.dict(os.environ, {"AFCLAUDE_IN_CONTAINER": "1"}))
+                    store.set_meta(self.conn, store.WRITERS_KEY, store.WRITERS_CONTAINER)
+                    self.conn.commit()
+                self.do(name, actor="user:7" if own_session else "owner", via="dashboard", idem=f"every-{i:04d}", **params)
             rows = self.audit()
             extra += name == "decision.confirm"
             self.assertEqual(len(rows), i + extra, name)

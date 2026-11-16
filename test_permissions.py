@@ -62,6 +62,7 @@ CLASSES = [
       ).split(), OWNER_GLOBAL),
     (("question.import setting.import install.stamp install.restored prompt.defaults_sync prompt_var.migrate "
       "decision.import decision.seed decision.activate_own").split(), DEPLOY),
+    (["writers.set"], exp("AARRRRRRRRARR")),                          # owner and AFClaude's task-manager; no runner
     (("request.start request.finish driven.set session.cleared handoff.consume inbox.triage inbox.triage_hold "
       "inbox.hold inbox.deliver inbox.include inbox.fail typed.record log.prune runner.prune run.open run.close "
       "run.deliver proposal.alert request.wake masterkey.check").split(), INTERNAL),
