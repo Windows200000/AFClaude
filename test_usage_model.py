@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (hermetic: a temp DB and the live-store guard; before the AFClaude imports)
 import usage_model as um  # noqa: E402
 
 UTC = timezone.utc
