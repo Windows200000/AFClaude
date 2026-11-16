@@ -253,13 +253,40 @@ class RefusedHostRecords(Marked):
         subject, body = sent[0]
         self.assertEqual(subject, store.REFUSED_ALERT_SUBJECT)     # D-345: one plain sentence, what to do
         self.assertIn("Tell the task-manager", subject)
-        self.assertIn("Nothing was lost".lower(), body.lower())
+        self.assertIn("not applied to the database; a copy is kept in", body)
         self.assertIn(store.fallback_path(self.db), body)                    # where it was saved
         self.assertIn("runner:keepalive", body.split("Technical detail:")[1])        # technical part after the plain part
         self.assertIn(f"{store.WRITERS_ROLLBACK} --db {self.db}", body)
         self.assertIn("alerted", first.escalation or "")
         self.assertEqual(len([e for e in store.fallback_events(store.fallback_path(self.db))
                               if e.get("event") == "refused"]), 5)                # every refusal is still recorded
+
+    def test_a_failed_push_is_reported_and_retried_by_the_next_refusal(self):
+        results = iter(["push failed: timeout", "push: no tool result (rc=1)", "notify failed: OSError: x", "sent"])
+        sent = []
+        def fake(subject, body=""):
+            sent.append(subject)
+            return next(results)
+        with mock.patch.object(store, "NOTIFY", fake):
+            outs = [self.refuse().escalation for _ in range(5)]
+        self.assertEqual(len(sent), 4)                       # three failures retried, the fourth sent, the fifth deduped
+        for o in outs[:3]:
+            self.assertIn("the alert failed", o)
+            self.assertIn("NOT told", o)
+        self.assertIn("alerted", outs[3])
+        self.assertIn("already alerted", outs[4])
+        events = [e["event"] for e in store.fallback_events(store.fallback_path(self.db))]
+        self.assertEqual(events.count("alert_failed"), 3)
+        self.assertEqual(events.count("alert"), 1)
+
+    def test_a_raising_notify_is_a_failed_alert_not_an_alerted_owner(self):
+        def boom(subject, body=""):
+            raise RuntimeError("no claude")
+        with mock.patch.object(store, "NOTIFY", boom):
+            out = self.refuse()
+        self.assertIn("the alert failed (notify failed: RuntimeError", out.escalation or "")
+        self.assertEqual([e["event"] for e in store.fallback_events(store.fallback_path(self.db))],
+                         ["refused", "alert_failed"])
 
     def test_the_alert_needs_no_database_write_and_its_own_notes_do_not_alert_again(self):
         import notify

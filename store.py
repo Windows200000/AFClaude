@@ -5853,12 +5853,17 @@ REFUSED_ALERT_SUBJECT = ("A host process tried to write to AFClaude's database a
                          "writes; it was refused. Tell the task-manager.")
 
 
+_NOTIFY_FAILED = ("push failed", "push: no tool result", "notify failed")   # notify.push's / _notify's failure texts
+
+
 def alert_refused_write(actor: str, action: str, where: str | None, db_path: str | None = None) -> str:
     """The owner sees a host write that the container-only database refused (D-235, D-345): one alert per
     (actor, action) -- the first opens it -- pushed although the DB write is refused (the push does not need
     the DB). `where`: the fallback file the refused write was kept in (None: only stderr). The alert's own
-    notes (notify.py writes the alerts doc) are refused too: they are recorded but not alerted again.
-    Never raises. -> what happened."""
+    notes (notify.py writes the alerts doc) are refused too: they are recorded but not alerted again (a
+    contextvar, so the dedupe record is written only after a push that worked). A push that failed is
+    recorded as "alert_failed" (not "alert"): the next refusal tries again, and the text says the owner was
+    not told (D-235). Never raises. -> what happened."""
     if _REFUSED_ALERTING.get():
         return "recorded; not alerted again (this is the alert's own note)"
     try:
@@ -5867,20 +5872,26 @@ def alert_refused_write(actor: str, action: str, where: str | None, db_path: str
         opened = _open_alert(fallback_events(path), scope)
         if opened is not None:
             return f"the owner was already alerted at {opened.get('time')} (one alert per actor and action)"
-        _append_record(path, f"ALERT ({actor}): refused host write {action}",
-                       {"event": "alert", "time": now_iso(), "who": actor, "action": action,
-                        "subject": REFUSED_ALERT_SUBJECT, "scope": scope})
-        saved = f"saved to {where}" if where else "kept on stderr only (the fallback file could not be written)"
-        body = (f"This does not break anything for you: nothing was lost ({saved}). Tell the task-manager so "
-                "the caller is moved to the container's command.\n"
+        saved = f"a copy is kept in {where}" if where else "a copy is only on stderr (the fallback file could not be written)"
+        body = (f"The change was not applied to the database; {saved}. Tell the task-manager so this caller is "
+                "moved to the container's command.\n"
                 f"Technical detail: actor {actor}, action {action}; the database is marked "
                 f"meta.{WRITERS_KEY}={WRITERS_CONTAINER}. Rollback if needed (usable while the container is "
                 f"down): `{WRITERS_ROLLBACK} --db {db_path or DB_PATH}`.")
-        token = _REFUSED_ALERTING.set(True)
+        token = _REFUSED_ALERTING.set(True)          # the alert's own notes are refused too: no loop
         try:
-            _notify(REFUSED_ALERT_SUBJECT, body)
+            sent = _notify(REFUSED_ALERT_SUBJECT, body)
         finally:
             _REFUSED_ALERTING.reset(token)
+        if sent.startswith(_NOTIFY_FAILED):
+            # the push is the owner's only channel here: no "alert" record, so the next refusal tries again
+            _append_record(path, f"ALERT FAILED ({actor}): refused host write {action}: {sent[:200]}",
+                           {"event": "alert_failed", "time": now_iso(), "who": actor, "action": action,
+                            "scope": scope, "error": sent[:500]})
+            return f"the alert failed ({sent[:200]}); the owner was NOT told"
+        _append_record(path, f"ALERT ({actor}): refused host write {action}",
+                       {"event": "alert", "time": now_iso(), "who": actor, "action": action,
+                        "subject": REFUSED_ALERT_SUBJECT, "scope": scope})
         return "the owner has been alerted (notify.py)"
     except Exception as e:   # noqa: BLE001 - the escalation must never hide the refusal itself
         return f"the alert failed ({type(e).__name__}: {e})"
