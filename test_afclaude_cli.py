@@ -4,7 +4,9 @@ import subprocess
 import sys
 import unittest
 
-import afclaude
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv  # noqa: E402,F401  (hermetic: a temp DB and the live-store guard; before the AFClaude imports)
+import afclaude  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, "afclaude.py")

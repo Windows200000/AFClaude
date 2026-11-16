@@ -18,6 +18,93 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 DIR = tempfile.mkdtemp(prefix="afclaude-test-")
 atexit.register(shutil.rmtree, DIR, True)
+
+
+# ---------------------------------------------------------------- the live store is never touched (D-345, D-154)
+# A test that wrote the owner's real alerts doc / notices put junk in front of the owner (D-345). The temp DB and
+# data dirs below keep a test away from the live ones only while every path resolves through them; this audit hook
+# refuses the rest, in the process (a subprocess inherits the env, not the hook; see _refuse_popen).
+
+class LiveStoreTouched(BaseException):
+    """A test reached the live data dir or DB. A BaseException on purpose: the runners' `except Exception`
+    (a note, an alert, a state save "never raises") would swallow an Exception and the leak would pass unseen;
+    unittest still records this one as the test's error."""
+
+
+def _live_dirs():
+    """The directories that hold live data: this checkout's data/ (in a worktree also the main checkout's),
+    and wherever the invoking environment pointed the DB / data dirs / keep-alive state before the temp ones
+    replace them (a container's mounted volume). Both the spelled and the resolved form."""
+    dirs = [os.path.join(HERE, "data")]
+    git = os.path.join(HERE, ".git")
+    if os.path.isfile(git):   # a worktree: ".git" is a file "gitdir: <main>/.git/worktrees/<name>"
+        with open(git) as fh:
+            line = fh.readline().strip()
+        if line.startswith("gitdir:"):
+            dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(line[7:].strip()))), "data"))
+    for var in ("AFCLAUDE_DB", "AFCLAUDE_DATA_DIR", "DISPATCHER_DATA_DIR", "KEEPALIVE_STATE_DIR", "AFCLAUDE_DATA"):
+        v = os.environ.get(var)
+        if v:
+            dirs.append(os.path.dirname(v) if var == "AFCLAUDE_DB" else v)
+    return sorted({os.path.abspath(d) for d in dirs} | {os.path.realpath(d) for d in dirs})
+
+
+LIVE_DIRS = _live_dirs()
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+
+def live_path(path):
+    """True when `path` (str/bytes/PathLike, a sqlite URI too) names something inside a live data dir."""
+    if isinstance(path, int) or path is None:
+        return False
+    try:
+        p = os.fsdecode(path)
+    except TypeError:
+        return False
+    if p.startswith("file:"):   # sqlite URI: file:/path?mode=ro
+        p = p[5:].split("?", 1)[0]
+        if p.startswith("//"):
+            p = p[2:]
+    p = os.path.abspath(p)
+    return any(p == d or p.startswith(d + os.sep) for d in LIVE_DIRS) and not p.startswith(DIR + os.sep)
+
+
+def _refuse_popen(args):
+    """A child process (it inherits the env, not this hook) whose environment aims the DB or the data dir at a
+    live one. One that names no DB at all is not refused: a test may start a script that never reads it (the host
+    kit's wrapper); the before/after counts of a full run show such a leak instead."""
+    cmd, env = args[1], args[3]
+    if env is None:
+        return
+    for var in ("AFCLAUDE_DB", "AFCLAUDE_DATA_DIR", "DISPATCHER_DATA_DIR", "KEEPALIVE_STATE_DIR"):
+        if live_path(dict(env).get(var)):
+            raise LiveStoreTouched(f"a test started {list(cmd)[:3]} with ${var} aimed at the live data")
+
+
+def _audit(event, args):
+    path = None
+    if event == "sqlite3.connect":
+        path = args[0]
+    elif event == "open":
+        mode, flags = args[1], args[2]
+        if (any(c in mode for c in "wax+") if isinstance(mode, str) else (flags or 0) & _WRITE_FLAGS):
+            path = args[0]
+    elif event in ("os.rename", "shutil.copyfile", "shutil.move"):
+        path = args[1] if live_path(args[1]) else args[0]
+    elif event in ("os.remove", "os.rmdir"):
+        path = args[0] if args[1] in (None, -1) else None   # shutil.rmtree's fd-relative names are not paths of the cwd
+    elif event in ("os.truncate", "shutil.rmtree"):
+        path = args[0]
+    elif event == "os.mkdir":
+        # notify.notify makes sure data/ exists: the directory itself, not what it holds
+        path = None if args[2] not in (None, -1) or os.path.abspath(os.fsdecode(args[0])) in LIVE_DIRS else args[0]
+    elif event == "subprocess.Popen":
+        _refuse_popen(args)
+    if path is not None and live_path(path):
+        raise LiveStoreTouched(f"a test used the live data ({event} {os.fsdecode(path)}): isolate it in testenv.DIR")
+
+
+sys.addaudithook(_audit)
 os.environ.update(AFCLAUDE_DB=os.path.join(DIR, "afclaude.db"), AFCLAUDE_CONFIG=os.path.join(DIR, "afclaude.json"),
                   AFCLAUDE_DATA_DIR=DIR, DISPATCHER_DATA_DIR=DIR,
                   KEEPALIVE_LOCK_DIR=DIR)   # the keep-alive's session locks (compaction vs start, D-238)
