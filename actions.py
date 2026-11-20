@@ -2732,17 +2732,16 @@ def inbox_dismiss(conn: sqlite3.Connection, ctx: Ctx, message_id: Any) -> Result
 # A notice is a title and a short text on the dashboard's "Needs your input" section until the owner
 # dismisses it: anything meant for the owner that is not an immediate chat answer. notice.post is the
 # task-manager's (`tasks.py notice post`, MCP afclaude_notice), notice.dismiss the owner's (the inbox
-# API, the CLI). Every review report doc (review:*) writes its own notice (review_notice below, from
-# doc.set and doc.sync), audited as notice.post / notice.update in the doc action's transaction.
+# API, the CLI). A review report doc (review:*) with a "For the owner" section writes its own notice
+# (review_notice below, from doc.set and doc.sync; only that section reaches the page, D-347),
+# audited as notice.post / notice.update in the doc action's transaction.
 
-REVIEW_SUMMARY_MAX = 1200          # characters of a review's summary in its notice
-REVIEW_SUMMARY_HEADS = re.compile(r"^#{2,6}\s+(tl;?dr|summary|short summary|result|results|conclusions?|findings|"
-                                  r"verdict|outcome)\b", re.I)
+REVIEW_SUMMARY_MAX = 1200          # characters of a review's owner part in its notice
 
 
 # D-345/D-347: a notice the task-manager writes for the owner is plain words. Each rule is (regex,
 # what the owner can't read); the first match of every rule is named in the refusal. Review notices
-# (review_notice) are generated, not posted by hand: they are not linted here.
+# (review_notice) are generated: they get the same check in readable_notice, with a fixed sentence instead of a refusal.
 NOTICE_JARGON = (
     (re.compile(r"\b[DPQ]-\d+\b|(?<![\w&])#\d+\b"), "an internal id (decision, proposal, question or message number)"),
     (re.compile(r"\btasks\.py\b|\bgit\s+(?:merge|rebase|cherry-pick|checkout|push|log|diff)\b"), "a command"),
@@ -2794,54 +2793,95 @@ def notice_dismiss(conn: sqlite3.Connection, ctx: Ctx, notice_id: Any) -> Result
     return Result(after, after["id"], before, after)
 
 
-def review_summary(text: str, fallback_title: str) -> tuple[str, str]:
-    """A review report's (title, short summary) for its notice: the first '# ' heading (else
-    `fallback_title`); the first block (paragraph or list) under a TL;DR / Summary / Results-like
-    heading, else the first block after the title. Cut at a line to REVIEW_SUMMARY_MAX."""
+REVIEW_OWNER_HEAD = re.compile(r"^(#{2,6})\s+for the owner\b[\s:\u2013\u2014-]*(.*)$", re.I)
+REVIEW_OWNER_NONE = re.compile(r"^\W*(?:nothing|none|n/?a|no)\b[^\n]{0,60}$", re.I)   # "Nothing for you." = no notice
+REVIEW_NOTICE_TITLE = "A review is finished"
+REVIEW_NOTICE_TEXT = ("A review has finished and has something for you, but what it wrote was not in plain words. "
+                      "The task-manager will follow up.")
+
+
+def review_owner_part(text: str, fallback_title: str) -> tuple[str, str] | None:
+    """The owner's part of a review report (D-347: only clear text for the owner reaches the page):
+    the section under a '## For the owner' heading (any level 2-6; text after the heading's colon is
+    its title), up to the next heading of the same or a higher level, cut at a line to
+    REVIEW_SUMMARY_MAX. The title: that one, else the report's first '# ' heading, else
+    `fallback_title`. None when there is no such section, or it is empty or says "Nothing for you"
+    (a review with nothing for the owner posts no notice; the task-manager has the report)."""
     lines = text.splitlines()
-    title, start = fallback_title, 0
+    head = None
     for i, line in enumerate(lines):
-        if line.startswith("# "):
-            title, start = line[2:].strip() or fallback_title, i + 1
+        m = REVIEW_OWNER_HEAD.match(line.strip())
+        if m:
+            head = (i, len(m.group(1)), m.group(2).strip().strip("*_ ").strip())
             break
-        if line.strip():
-            break
-    hit = next((i + 1 for i, line in enumerate(lines) if REVIEW_SUMMARY_HEADS.match(line.strip())), None)
+    if head is None:
+        return None
+    i, level, own_title = head
     block: list[str] = []
-    for line in lines[hit if hit is not None else start:]:
-        if not line.strip():
-            if block:
-                break
-            continue
-        if line.lstrip().startswith("#"):
-            if block:
-                break
-            continue
+    for line in lines[i + 1:]:
+        m2 = re.match(r"^(#{1,6})\s", line)
+        if m2 and len(m2.group(1)) <= level:
+            break
         block.append(line.rstrip())
-    summary = "\n".join(block).strip() or "(the report has no summary paragraph)"
-    if len(summary) > REVIEW_SUMMARY_MAX:
-        cut = summary.rfind("\n", 0, REVIEW_SUMMARY_MAX - 2)
-        summary = summary[:cut if cut > 0 else REVIEW_SUMMARY_MAX - 2].rstrip() + " …"
-    return title[:store.NOTICE_TITLE_MAX].replace("\n", " "), summary
+    body = "\n".join(block).strip()
+    if not body or REVIEW_OWNER_NONE.match(body):
+        return None
+    if len(body) > REVIEW_SUMMARY_MAX:
+        cut = body.rfind("\n", 0, REVIEW_SUMMARY_MAX - 2)
+        body = body[:cut if cut > 0 else REVIEW_SUMMARY_MAX - 2].rstrip() + " \u2026"
+    title = own_title
+    if not title:
+        title = next((ln[2:].strip() for ln in lines if ln.startswith("# ")), "") or fallback_title
+    return title[:store.NOTICE_TITLE_MAX].replace("\n", " "), body
+
+
+def _doc_note(conn: sqlite3.Connection, ctx: Ctx, project: store.Row, name: str, line: str) -> None:
+    """A line for the task-manager in the project's progress doc, inside the running action's
+    transaction, audited as doc.append (the page doesn't show it, D-347)."""
+    doc = store.ensure_doc(conn, project["id"], name, ctx.actor)
+    body = f"- {store._utcnow().astimezone(ZoneInfo('Europe/Berlin')).strftime('%H:%M')} [notices] {line}\n"
+    eid = store.add_doc_entry(conn, doc["id"], "append", body, ctx.actor, ctx.via)
+    store.add_audit(conn, ctx.actor, ctx.via, "doc.append", "doc", f"{project['name']}/{name}", None,
+                    {"entry": eid, "op": "append", "chars": len(body), "sha256": store.sha256_text(body)}, None,
+                    session=ctx.actor_session)
+
+
+def readable_notice(title: str, text: str) -> tuple[str, str, list[str]]:
+    """A generated notice (title, text) the owner can read (D-345/D-347): `notice_unreadable` finds nothing
+    in it, or the part it finds something in becomes a fixed plain sentence (no refusal: a runner must
+    not die on wording). -> (title, text, what was unreadable, empty when nothing was replaced)."""
+    bad_title, bad_text = notice_unreadable(title, ""), notice_unreadable("", text)
+    return (REVIEW_NOTICE_TITLE if bad_title else title), (REVIEW_NOTICE_TEXT if bad_text else text), bad_title + bad_text
 
 
 def review_notice(conn: sqlite3.Connection, ctx: Ctx, project: store.Row, name: str) -> None:
-    """D-306: a review report doc (review:*) was written: post its notice (title and short summary,
-    review_summary), or refresh the one still shown; a dismissed one stays dismissed (a rewrite of
-    the report doesn't bring it back). Its own audit row, in the doc action's transaction."""
+    """D-306/D-347: a review report doc (review:*) was written: when it has a '## For the owner' part
+    (review_owner_part) post a notice with that part only, or refresh the one still shown; a
+    dismissed one stays dismissed (a rewrite of the report doesn't bring it back). No such part: no
+    notice (the task-manager reads the report). The text passes notice_unreadable or becomes a fixed
+    sentence (readable_notice). Its own audit row, in the doc action's transaction."""
     if not name.startswith("review:"):
         return
     doc = store.get_doc(conn, project["id"], name)
     if doc is None:
         return
-    title, summary = review_summary(store.doc_render(conn, doc["id"]), name)
+    part = review_owner_part(store.doc_render(conn, doc["id"]), REVIEW_NOTICE_TITLE)
+    if part is None:
+        return
     source = f"{project['name']}/{name}"
     before = store.notice_by_source(conn, source)
+    if before is not None and before["dismissed_at"] is not None:
+        return
+    title, summary, bad = readable_notice(*part)
+    if before is not None and (before["title"], before["text"]) == (title, summary):
+        return
+    if bad:       # the original goes to the task-manager, never to the page
+        _doc_note(conn, ctx, project, "progress",
+                  f"owner notice of the report {source} replaced by a fixed sentence, it was not plain words "
+                  f"({'; '.join(bad)[:300]}); title was {part[0][:120]!r}, text was {part[1][:600]!r}")
     if before is None:
         n = store.add_notice(conn, title, summary, project["id"], ctx.actor, source=source)
         store.add_audit(conn, ctx.actor, ctx.via, "notice.post", "notice", n["id"], None, n, None, session=ctx.actor_session)
-        return
-    if before["dismissed_at"] is not None or (before["title"], before["text"]) == (title, summary):
         return
     after = store.update_notice(conn, before["id"], title=title, text=summary, updated_at=store.now_iso())
     b, a = Result(None, None, before, after).audit_pair()

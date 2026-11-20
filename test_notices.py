@@ -21,8 +21,11 @@ REVIEW = """# Usage review 2026-11-01: the prediction model
 Analyst run 2026-11-01. Data: the DB only.
 
 ## Summary
-- The predictor under-predicts by 6 weekly-% on average.
-- A 4-week tail fixes most of it.
+- H1: predictor_v2 under-predicts by 6 weekly-% (pacing.py:120, commit 986ed7d).
+
+## For the owner: The usage forecast is a bit low
+The forecast guessed your weekly use about 6 points too low on average.
+A longer look-back of four weeks fixes most of it.
 
 ## 1. Baseline
 numbers
@@ -108,25 +111,31 @@ class Notices(Env):
         self.assertTrue(v["notices"][0]["posted_berlin"])
 
 
-class ReviewSummary(unittest.TestCase):
-    def test_summary_section(self):
-        title, s = actions.review_summary(REVIEW, "review:x")
-        self.assertEqual(title, "Usage review 2026-11-01: the prediction model")
-        self.assertEqual(s, "- The predictor under-predicts by 6 weekly-% on average.\n- A 4-week tail fixes most of it.")
+class ReviewOwnerPart(unittest.TestCase):
+    def test_the_owner_section_only(self):
+        title, s = actions.review_owner_part(REVIEW, "x")
+        self.assertEqual(title, "The usage forecast is a bit low")
+        self.assertEqual(s, "The forecast guessed your weekly use about 6 points too low on average.\n"
+                            "A longer look-back of four weeks fixes most of it.")
+        self.assertNotIn("H1", s)
 
-    def test_tldr_and_fallbacks(self):
-        self.assertEqual(actions.review_summary("# T\n\nintro\n\n## TL;DR\n- a\n  b\n\nrest\n", "n"), ("T", "- a\n  b"))
-        self.assertEqual(actions.review_summary("# T\n\nfirst para\nline 2\n\nsecond\n", "n"), ("T", "first para\nline 2"))
-        self.assertEqual(actions.review_summary("no heading here\n", "review:x"), ("review:x", "no heading here"))
-        self.assertEqual(actions.review_summary("# Only a title\n", "n"), ("Only a title", "(the report has no summary paragraph)"))
+    def test_none_without_a_plain_part(self):
+        self.assertIsNone(actions.review_owner_part("# T\n\n## Summary\nH1 in store.py\n", "x"))
+        self.assertIsNone(actions.review_owner_part("# T\n\n## For the owner\n\n## Next\nz\n", "x"))
+        for nothing in ("Nothing for you.", "None.", "Nothing to report, all fine."):
+            self.assertIsNone(actions.review_owner_part(f"# T\n\n## For the owner\n{nothing}\n\n## Next\nz\n", "x"), nothing)
 
-    def test_long_summary_is_cut_at_a_line(self):
+    def test_section_ends_at_a_same_level_heading_not_a_deeper_one(self):
+        t, s = actions.review_owner_part("# R\n\n### For the owner\nA\n#### Detail\nB\n### Next\nC\n", "x")
+        self.assertEqual((t, s), ("R", "A\n#### Detail\nB"))          # no title after the heading: the report's
+
+    def test_title_fallbacks_and_cut(self):
+        self.assertEqual(actions.review_owner_part("## For the owner\nA\n", "fb")[0], "fb")
         body = "\n".join(f"- item {i} " + "x" * 80 for i in range(40))
-        _, s = actions.review_summary("# T\n\n## Summary\n" + body + "\n", "n")
+        _, s = actions.review_owner_part("# T\n\n## For the owner\n" + body + "\n", "n")
         self.assertLessEqual(len(s), actions.REVIEW_SUMMARY_MAX)
-        self.assertTrue(s.endswith(" …"))
-        self.assertTrue(s.splitlines()[-1].startswith("- item"))
-        _, s = actions.review_summary("# T\n\n" + "y" * 5000 + "\n", "n")             # one long line: cut hard
+        self.assertTrue(s.endswith(" \u2026"))
+        _, s = actions.review_owner_part("# T\n\n## For the owner\n" + "y" * 5000 + "\n", "n")     # one long line: cut hard
         self.assertEqual(len(s), actions.REVIEW_SUMMARY_MAX)
 
 
@@ -134,22 +143,56 @@ class ReviewNotices(Env):
     def notices(self):
         return store.list_notices(self.conn, include_dismissed=True)
 
-    def test_review_notices_are_not_linted(self):
+    def progress(self):
+        doc = store.get_doc(self.conn, self.p["id"], "progress")
+        return store.doc_render(self.conn, doc["id"]) if doc else ""
+
+    def test_a_report_without_an_owner_part_posts_nothing(self):
+        """D-347: the technical summary never reaches the page; the task-manager has the report."""
         self.do("doc.set", project="Proj", name="review:x", text="# R\n\n## Summary\n\nH1 in store.py:12, commit 986ed7d\n")
+        self.assertEqual(self.notices(), [])
+        self.do("doc.set", project="Proj", name="review:y", text="# R\n\n## For the owner\nNothing for you.\n")
+        self.assertEqual(self.notices(), [])
+        self.assertEqual(self.progress(), "")
+
+    def test_unreadable_owner_part_becomes_a_fixed_sentence(self):
+        """The generated text gets notice_unreadable's check: no refusal (a runner must not crash), the
+        original goes to the progress doc, never to the page."""
+        self.do("doc.set", project="Proj", name="review:z",
+                text="# R (branch k4a @ 986ed7d)\n\n## For the owner\nH1 in store.py:12 needs a fix, see D-300.\n")
+        [n] = self.notices()
+        self.assertEqual((n["title"], n["text"]), (actions.REVIEW_NOTICE_TITLE, actions.REVIEW_NOTICE_TEXT))
+        self.assertEqual(actions.notice_unreadable(n["title"], n["text"]), [])
+        prog = self.progress()
+        self.assertIn("review:z", prog)
+        self.assertIn("store.py:12", prog)
+        self.assertIn("986ed7d", prog)
+        self.assertEqual(len(store.audit_log(self.conn, 20, "doc", "Proj/progress")), 1)
+        before = self.progress()
+        self.do("doc.set", project="Proj", name="review:z",
+                text="# R (branch k4a @ 986ed7d)\n\n## For the owner\nH1 in store.py:12 needs a fix, see D-300.\n\n## More\nx\n")
+        self.assertEqual(self.progress(), before)                       # the same notice again: no new progress line
         self.assertEqual(len(self.notices()), 1)
+        self.assertEqual([r["action"] for r in self.audit(n["id"])], ["notice.post"])
+
+    def test_a_readable_title_and_unreadable_text_keep_the_title(self):
+        self.do("doc.set", project="Proj", name="review:t", text="# R\n\n## For the owner: All good here\nSee file.py:3.\n")
+        [n] = self.notices()
+        self.assertEqual((n["title"], n["text"]), ("All good here", actions.REVIEW_NOTICE_TEXT))
 
     def test_doc_set_posts_then_refreshes(self):
         self.do("doc.set", project="Proj", name="review:2026-11-01", text=REVIEW)
         [n] = self.notices()
         self.assertEqual((n["title"], n["source"], n["project_name"], n["created_by"]),
-                         ("Usage review 2026-11-01: the prediction model", "Proj/review:2026-11-01", "Proj", "cli"))
-        self.assertIn("4-week tail", n["text"])
+                         ("The usage forecast is a bit low", "Proj/review:2026-11-01", "Proj", "cli"))
+        self.assertIn("four weeks", n["text"])
+        self.assertNotIn("H1", n["text"])
         self.assertEqual([r["action"] for r in self.audit(n["id"])], ["notice.post"])
         self.do("doc.set", project="Proj", name="review:2026-11-01", text=REVIEW)    # unchanged: no-op
-        self.do("doc.set", project="Proj", name="review:2026-11-01", text=REVIEW.replace("4-week", "5-week"))
+        self.do("doc.set", project="Proj", name="review:2026-11-01", text=REVIEW.replace("four weeks", "five weeks"))
         [n2] = self.notices()
         self.assertEqual(n2["id"], n["id"])                                     # one notice per report
-        self.assertIn("5-week tail", n2["text"])
+        self.assertIn("five weeks", n2["text"])
         self.assertIsNotNone(n2["updated_at"])
         rows = self.audit(n["id"])
         self.assertEqual([r["action"] for r in rows], ["notice.update", "notice.post"])
