@@ -407,7 +407,7 @@ class QuickviewBlock(StateBase):
     def test_the_block_follows_the_state(self):
         b = qv.auth_block()
         self.assertEqual((b["expired"], b["since_berlin"], b["error"]), (False, None, None))
-        self.assertEqual(b["fix"], claude_auth.FIX)
+        self.assertEqual(b["fix"], claude_auth.FIX)             # the technical fix stays in the data
         claude_auth.record_expired("usage read", EXPIRED_RESULT, ka.USAGE_STATE_FILE,
                                    datetime(2026, 11, 2, 13, 15, tzinfo=UTC))
         b = qv.auth_block()
@@ -416,6 +416,21 @@ class QuickviewBlock(StateBase):
         self.assertIn("14:15", b["since_berlin"])                     # shown in Berlin time
         claude_auth.record_ok("usage read", ka.USAGE_STATE_FILE)
         self.assertFalse(qv.auth_block()["expired"])
+
+    def test_the_card_text_is_plain_words_without_a_command(self):
+        """D-345/D-347: what the owner reads on the card has no command, no CLI message, no file name."""
+        import actions
+        claude_auth.record_expired("usage read", EXPIRED_RESULT, ka.USAGE_STATE_FILE)
+        o = qv.auth_block()["owner"]
+        self.assertIn("sign in to Claude again", o["text"])
+        self.assertIn("automatic runs", o["text"])
+        texts = [(o["title"], o["text"])]
+        import owner_text
+        texts.append((owner_text.LOGIN_UNKNOWN_TITLE, owner_text.LOGIN_UNKNOWN))
+        for title, text in texts:
+            self.assertEqual(actions.notice_unreadable(title, text), [])
+            for bad in ("`", "/login", "claude -p", "~/", "keepalive"):
+                self.assertNotIn(bad, title + text)
 
     def test_unknown_only_for_the_auth_state_own_failed_load(self):
         import runner_state
@@ -436,7 +451,10 @@ class QuickviewBlock(StateBase):
             page = fh.read()
         self.assertIn("function authItem(", page)
         self.assertIn("s.auth", page)
-        self.assertIn("Claude login EXPIRED", page)
+        self.assertIn("o.title", page)                                # the card shows the plain-words text
+        self.assertNotIn("Claude login EXPIRED", page)
+        self.assertNotIn("a.fix", page)                               # never the shell command (D-347)
+        self.assertNotIn("a.found", page)                             # nor the CLI's raw message
         self.assertIn("var html = authHtml + inputHtml", page)        # before every other needs-input item
 
 

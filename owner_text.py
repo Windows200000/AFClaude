@@ -27,6 +27,14 @@ HAND = "AFClaude was paused by hand."
 
 LOGIN = ("Your Claude login on the server has expired, so AFClaude can't use Claude. Sign in to Claude again in a "
          "terminal on the server (Remote Control can't do it).")
+# The quickview's login card (export_quickview.auth_block, D-320/D-347): same facts as LOGIN, more room.
+LOGIN_CARD_TITLE = "Your Claude login has expired"
+LOGIN_CARD = ("AFClaude can't use Claude until you sign in again, so no automatic runs can work meanwhile. To fix it, "
+              "open Claude Code in a terminal on the server and sign in to Claude again (this can't be done over "
+              "Remote Control). This notice goes away by itself once Claude works again.")
+LOGIN_UNKNOWN_TITLE = "AFClaude can't tell if your Claude login still works"
+LOGIN_UNKNOWN = ("Its saved login status could not be read. If automatic runs stop working, check that you are still "
+                 "signed in to Claude on the server. The task-manager has the technical details.")
 USAGE = ("AFClaude couldn't read how much of your Claude usage is left, so it holds new work rather than risk running "
          "into your limit.")
 BUDGET = "AFClaude couldn't work out how much of your weekly Claude usage it may use, so it holds new work."

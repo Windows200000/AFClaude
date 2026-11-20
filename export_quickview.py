@@ -494,16 +494,20 @@ def automation_block():
 def auth_block():
     """D-320: the Claude login state for the page: `expired` while a `claude -p` call of AFClaude failed to
     authenticate and no later call has succeeded (claude_auth; the usage sampler's next successful read
-    clears it by itself). The page shows it at the top, with the needs-input items, with the fix. A state
-    that can't be read (the DB) is `error`, never "fine" (D-235)."""
+    clears it by itself). The page shows it at the top, with the needs-input items, in plain words (`owner`:
+    title and text from owner_text, D-345/D-347: no command, no raw CLI message; `fix`, `found` and `source`
+    stay in the data for the task-manager). A state that can't be read (the DB) is `error`, never "fine" (D-235)."""
     import claude_auth
+    import owner_text
     import runner_state
     st = claude_auth.state(ka.USAGE_STATE_FILE)
     err = runner_state.load_failed(claude_auth.COMPONENT)   # this state's own failed load, not another component's
     return {"expired": bool(st.get("expired")), "since_berlin": bstr(ka.parse_ts(st["since"])) if st.get("since") else None,
             "last_berlin": bstr(ka.parse_ts(st["last"])) if st.get("last") else None,
             "source": st.get("source"), "found": st.get("found"), "fix": claude_auth.FIX,
-            "subject": claude_auth.SHORT, "error": err}
+            "subject": claude_auth.SHORT, "error": err,
+            "owner": ({"title": owner_text.LOGIN_UNKNOWN_TITLE, "text": owner_text.LOGIN_UNKNOWN} if err else
+                      {"title": owner_text.LOGIN_CARD_TITLE, "text": owner_text.LOGIN_CARD})}
 
 
 def host_checks_block():
