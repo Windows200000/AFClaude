@@ -127,6 +127,9 @@ RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple((re.compile(p, re.I), t) 
     (r"roles_enforce setting|^a refusal (?:could not be audited|alert could not be sent)|"
      r"shadow log could not be written|^the read filter failed",
      "AFClaude's permission check for its agents failed, so it holds work to stay on the safe side."),
+    # scheduled backups (backup.py, phase 5c B3)
+    (r"^the daily database backup failed",
+     "The daily backup of AFClaude's database failed, so no new backup was made. The older backups are kept."),
     # proposals, deploys
     (r"agent proposal\(s\) waiting for review",
      "Suggestions from AFClaude's agents have been waiting a long time for the task-manager's review."),
@@ -148,6 +151,7 @@ JOBS = {
     "status_snapshot": "the regular status snapshot",
     "proposal_alert": "the reminder about agents' suggestions waiting for review",
     "host_check": "the hourly health check of the server",
+    "backup": "the daily backup of AFClaude's database",
     "usage_review": "the regular review of how much Claude usage AFClaude may use",
     "window_start": "the planned start of a work session",
     "at": "a scheduled one-off job",

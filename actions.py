@@ -1215,6 +1215,17 @@ def _hhmm(v: Any) -> str:
     return f"{int(m[1]):02d}:{m[2]}"
 
 
+BACKUP_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _clock(v: Any, conn: sqlite3.Connection | None = None) -> str:
+    """HH:MM, 24 hours, any minute (backup_time, UTC)."""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", v.strip()) if isinstance(v, str) else None
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError(f"must be HH:MM (00:00-23:59), got {v!r}")
+    return f"{int(m[1]):02d}:{m[2]}"
+
+
 def _hours_or_auto(lo: float, hi: float) -> Callable[[Any, Optional[sqlite3.Connection]], str | float]:
     """"auto" or a number in lo..hi (last_mile_hours: hours; reserve_threshold: weekly %)."""
     num = _number(lo, hi)
@@ -1526,6 +1537,9 @@ SETTINGS: dict[str, Setting] = {
                                       "take before it is killed and fails (D-234)", "automation"),
     "runner_timeout_proposal_alert": _num(2, 0.5, 720, "Runner: minutes a proposal-alert run may take before it "
                                           "is killed and fails (D-234)", "automation"),
+    # phase 5c B3: snapshot + vacuum + gzip + verify of the whole database, then the prune
+    "runner_timeout_backup": _num(30, 0.5, 720, "Runner: minutes the daily database backup may take before it "
+                                  "is killed and fails (D-234)", "automation"),
     "runner_timeout_status_snapshot": _num(2, 0.5, 720, "Runner: minutes a status-snapshot run may take before it "
                                            "is killed and fails (D-234)", "automation"),
     # phase 5b K6: the lower bound is the sum of the scheduled checks' own timeouts + 1 min
@@ -1595,6 +1609,18 @@ SETTINGS: dict[str, Setting] = {
     "restore_starts_paused": _flag(True, "A restored install starts with automation paused (D-173) and the "
                                    "reason \"restored from a backup of <time>: check and resume\"",
                                    "storage"),
+    # --- scheduled backups (phase 5c B3, D-287; backup.py, the runner's `backup` job): when the daily job runs
+    # (UTC), how many of the newest bundles are kept beyond the protected floor (the latest daily and the 2
+    # latest weekly ones are always kept and never overwritten, whatever this says), and which weekday's first
+    # run is the weekly one.
+    "backup_time": Setting("03:40", _clock, "UTC time (HH:MM) the runner makes the daily database backup "
+                           "(takes effect from the next plan, within a minute)", section="storage", kind="text"),
+    "backup_keep": _int(14, 0, 3650, "How many of the newest scheduled backups are kept; older ones are deleted "
+                        "after each new, verified one. The latest daily and the 2 latest weekly backups are "
+                        "always kept, whatever this says (D-287)", "storage"),
+    "backup_weekly_day": Setting("sun", _choice(BACKUP_WEEKDAYS), "Weekday whose first backup of the week is also "
+                                 "a weekly one (the 2 latest weekly backups are never deleted)",
+                                 section="storage", kind="enum", choices=BACKUP_WEEKDAYS),
     # --- auth (design §9.5, D-162: secure defaults that stay out of the way; dashboard/sessions.py and the
     # login of phase 6a W6 read them). Owner-only like every setting; changing one is a high-impact write
     # (step-up from 6b).
@@ -1907,6 +1933,87 @@ def install_restored(conn: sqlite3.Connection, ctx: Ctx, source: Any) -> Result:
     out = {"install_id": iid, "install_epoch": epoch, "restored_from": src, "paused": paused, "reason": reason}
     return Result(out, iid, {"install_epoch": old_epoch, "restored_from": old_from},
                   {"install_epoch": epoch, "restored_from": src, "paused": paused})
+
+
+# ---- scheduled backups (phase 5c B3, docs/phase5c_plan.md §3.1a, D-287): two actions with two grants. The
+# daily job's path may only INSERT a verified bundle's row (backup.record: it holds no update or delete: the
+# table's triggers refuse those for every connection) and read; deleting past retention is backup.prune, which
+# the job's separate, more-privileged actor runs after the new bundle verified. Each refuses the other's actor
+# here, whatever roles_enforce says; the host owner's hand run (cli | owner) may do both.
+BACKUP_RECORD_ACTOR = "runner:backup"
+BACKUP_PRUNE_ACTOR = "runner:backup_prune"
+BACKUP_FILE_RE = re.compile(r"^afclaude-backup-[0-9a-f]{8}-[0-9]{8}T[0-9]{9}Z\.tar\.gz$")
+BACKUP_MANIFEST_KEYS = ("install_id", "install_epoch", "schema_version", "created_at")
+
+
+def backup_grant(ctx: Ctx, name: str, runner_actor: str) -> None:
+    """The write-once grant: `runner_actor` (this action's own runner actor) or the host owner; any other
+    actor, the other backup actor included, is refused (Forbidden)."""
+    if ctx.actor != runner_actor and roles.parse_actor(ctx.actor).kind != "host":
+        raise Forbidden(f"{name} is the grant of {runner_actor} (or the host owner's hand run), not of "
+                        f"{ctx.actor}: scheduled backups are write-once (D-287)")
+
+
+@action("backup.record", "backup")
+def backup_record(conn: sqlite3.Connection, ctx: Ctx, file: Any, tier: Any, manifest: Any, sha256: Any,
+                  size: Any, directory: Any) -> Result:
+    """Record a finished, verified bundle (the daily job after backup.verify; `backup.py run`): one new row, never an
+    update. The file must be there, in `directory`, of the stated size, and its name new (the table's UNIQUE file
+    refuses a name that exists, a protected bundle's included). -> {id, file, tier}."""
+    backup_grant(ctx, "backup.record", BACKUP_RECORD_ACTOR)
+    if not isinstance(file, str) or not BACKUP_FILE_RE.match(file):
+        raise ValueError(f"file must be a bundle name (afclaude-backup-<id>-<utc>.tar.gz), got {file!r}")
+    if tier not in store.BACKUP_TIERS:
+        raise ValueError(f"tier must be one of {'|'.join(store.BACKUP_TIERS)}, got {tier!r}")
+    if not isinstance(manifest, dict) or not all(k in manifest for k in BACKUP_MANIFEST_KEYS):
+        raise ValueError(f"manifest must be the bundle's manifest (with {', '.join(BACKUP_MANIFEST_KEYS)})")
+    if not isinstance(sha256, str) or not re.match(r"^[0-9a-f]{64}$", sha256):
+        raise ValueError("sha256 must be 64 hex digits")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError(f"size must be a positive integer, got {size!r}")
+    path = os.path.join(str(directory), file)
+    if not os.path.isfile(path) or os.path.getsize(path) != size:
+        raise ValueError(f"{path} is not a file of {size} bytes")
+    try:
+        bid = store.add_backup(conn, file=file, created_at=str(manifest["created_at"]), tier=tier, size=size,
+                               sha256=sha256, verified_at=store.now_iso(), install_id=str(manifest["install_id"]),
+                               install_epoch=int(manifest["install_epoch"]),
+                               schema_version=int(manifest["schema_version"]),
+                               manifest=json.dumps(manifest, sort_keys=True))
+    except sqlite3.IntegrityError as e:
+        raise Conflict(f"backup {file} is already recorded (write-once: a bundle is never replaced): {e}") from e
+    after = {"id": bid, "file": file, "tier": tier, "size": size}
+    return Result(after, file, None, after, changed=True)
+
+
+def backup_keep(conn: sqlite3.Connection) -> int:
+    return int(get_setting(conn, "backup_keep"))
+
+
+@action("backup.prune", "backup")
+def backup_prune(conn: sqlite3.Connection, ctx: Ctx, directory: Any, keep: Any = None) -> Result:
+    """Delete the scheduled backups past retention: every bundle that is neither among the newest `keep` (the
+    setting backup_keep when not given; 0 is allowed) nor protected (the latest daily-or-weekly and the 2 latest
+    weekly bundles: refused by the table's triggers even with `keep` 0). The rows go first (audited, in this
+    transaction), then the files from `directory`; a file already gone is fine, any other failure raises and
+    leaves an orphan file the error names. -> {deleted: [file, ...], kept, keep}."""
+    backup_grant(ctx, "backup.prune", BACKUP_PRUNE_ACTOR)
+    n = backup_keep(conn) if keep is None else keep
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError(f"keep must be a non-negative integer, got {keep!r}")
+    rows = store.prune_backups(conn, n)
+    for r in rows:
+        try:
+            os.remove(os.path.join(str(directory), r["file"]))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise RuntimeError(f"backup {r['file']} was deleted from the table but its file could not be "
+                               f"removed ({e}): delete it by hand") from e
+    kept = int(conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0])
+    before = {"deleted": [{"file": r["file"], "tier": r["tier"], "created_at": r["created_at"]} for r in rows]}
+    after = {"deleted": [r["file"] for r in rows], "kept": kept, "keep": n}
+    return Result(after, "backups", before, after, changed=bool(rows))
 
 
 def _fresh_group(days: Mapping[str, Any]) -> str:

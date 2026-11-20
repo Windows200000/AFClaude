@@ -1047,8 +1047,9 @@ def cron_entries():
     return []
 
 
-def runner_schedule(job):
-    """A runner job's cadence as (UTC, Berlin) text."""
+def runner_schedule(job, clock=None):
+    """A runner job's cadence as (UTC, Berlin) text. clock: "HH:MM" UTC, the current value of the setting that
+    sets a daily job's time (Job.daily_setting); None: the job's own default."""
     if job.every is not None:
         mins = job.every.total_seconds() / 60
         txt = f"every {mins:g} min" if mins < 60 else f"every {mins / 60:g} h"
@@ -1056,7 +1057,8 @@ def runner_schedule(job):
             txt += f" (+{job.offset.total_seconds():g} s)"
         return txt, txt
     if job.daily is not None:
-        t = datetime.now(UTC).replace(hour=job.daily[0], minute=job.daily[1], second=0, microsecond=0)
+        hour, minute = (int(x) for x in clock.split(":")) if clock else job.daily
+        t = datetime.now(UTC).replace(hour=hour, minute=minute, second=0, microsecond=0)
         return f"daily {t:%H:%M} UTC", f"daily {t.astimezone(ka.BERLIN):%H:%M %Z}"
     if job.at_jobs:
         return "each at-job's minute", "each at-job's minute"
@@ -1078,6 +1080,7 @@ def runner_entries(conn=None, now=None):
         conn = conn or store.connect()
         try:
             rows = store.runner_job_rows(conn)
+            clocks = {n: actions.get_setting(conn, j.daily_setting) for n, j in runner.JOBS.items() if j.daily_setting}
         finally:
             if own:
                 conn.close()
@@ -1092,7 +1095,7 @@ def runner_entries(conn=None, now=None):
             "heartbeat_berlin": bstr(beat), "heartbeat_age_s": round((now - beat).total_seconds()) if beat else None}]
     for name in sorted(runner.RUNNER_OWNS):
         job, r = runner.JOBS[name], rows.get(name) or {}
-        utc, berlin = runner_schedule(job)
+        utc, berlin = runner_schedule(job, clocks.get(name))
         out.append({"owner": "runner", "job": name, "schedule_utc": utc, "schedule_berlin": berlin,
                     "what": job.what or name, "next_due_berlin": when(r.get("next_due")),
                     "last_status": r.get("last_status"), "last_ok_berlin": when(r.get("last_ok_at")),

@@ -72,6 +72,8 @@ an older database gains them on its next connect(); bump SCHEMA_VERSION.
                latest usage / next-run / pause / running-runs sections the runner writes each minute.
                host_checks (phase 5b K6, additive the same way, HOST_CHECKS_SCHEMA): the latest result
                of each host check (hostcheck.py; actions.py writes).
+               backups (phase 5c B3, additive the same way, BACKUPS_SCHEMA): the scheduled DB bundles,
+               write-once, with the protected floor (backup.py; actions.py's backup.* write).
                Phase 3b (COLUMNS, no version bump): driven_sessions.project_id (a task-manager
                row's project) and action_requests.run_id / updated_at (run-now, D-153); S1's
                driven_sessions backfill (`import-driven`) is retired since 3b S6.
@@ -646,6 +648,49 @@ CREATE TRIGGER IF NOT EXISTS host_checks_version AFTER UPDATE ON host_checks FOR
 WHEN NEW.version IS OLD.version
 BEGIN UPDATE host_checks SET version = OLD.version + 1 WHERE name = NEW.name; END;
 """
+
+# ---- the scheduled DB backups (phase 5c B3, docs/phase5c_plan.md §3.1a, D-287; backup.py). Additive, no
+# version bump. One row per bundle the daily job made and verified, WRITE-ONCE at the table: insert only, an
+# UPDATE is always refused, a DELETE only through backups_prune_gate (opened and closed inside
+# prune_backups' own transaction, as the app_log prune does) and never for a protected row. The protected
+# floor is derived, not a flag a writer could move: backups_protected = the newest daily-or-weekly bundle (a
+# weekly is also a daily) and the 2 newest weekly ones, by id (insertion order). The bundle files sit under
+# the data dir (backup.backup_dir()); a bundle's own database does not hold its own row (it is made before).
+BACKUPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS backups (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    file          TEXT NOT NULL UNIQUE,   -- the bundle's file name inside the backup directory
+    created_at    TEXT NOT NULL,          -- UTC, the manifest's created_at
+    tier          TEXT NOT NULL CHECK (tier IN ('daily', 'weekly', 'manual')),
+    size          INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,
+    verified_at   TEXT NOT NULL,          -- UTC, when the finished bundle passed backup.verify
+    install_id    TEXT NOT NULL,
+    install_epoch INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    manifest      TEXT NOT NULL           -- the bundle's manifest.json
+);
+CREATE TABLE IF NOT EXISTS backups_prune_gate (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    allowed INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO backups_prune_gate(id, allowed) VALUES (1, 0);
+CREATE VIEW IF NOT EXISTS backups_protected AS
+    SELECT id FROM backups WHERE id = (SELECT id FROM backups WHERE tier IN ('daily', 'weekly')
+                                       ORDER BY id DESC LIMIT 1)
+    UNION
+    SELECT id FROM (SELECT id FROM backups WHERE tier = 'weekly' ORDER BY id DESC LIMIT 2);
+CREATE TRIGGER IF NOT EXISTS backups_no_update BEFORE UPDATE ON backups
+BEGIN SELECT RAISE(ABORT, 'backups are write-once: a row is never updated'); END;
+CREATE TRIGGER IF NOT EXISTS backups_guarded_delete BEFORE DELETE ON backups
+WHEN (SELECT allowed FROM backups_prune_gate WHERE id = 1) = 0
+BEGIN SELECT RAISE(ABORT, 'backups are deleted only through store.prune_backups (backup.prune)'); END;
+CREATE TRIGGER IF NOT EXISTS backups_protected_delete BEFORE DELETE ON backups
+WHEN OLD.id IN (SELECT id FROM backups_protected)
+BEGIN SELECT RAISE(ABORT, 'the latest daily and the 2 latest weekly backups are protected'); END;
+"""
+BACKUP_TIERS = ("daily", "weekly", "manual")
+
 
 # ---- the status snapshot (phase 3a S9(b), design 04_architecture.md: the web container reads usage and
 # the next run from a row the runner writes, it imports no model code). Additive, no version bump. One
@@ -1448,6 +1493,7 @@ def init(conn: sqlite3.Connection, backed_up: bool = False) -> None:
     conn.executescript(RUNNER_RUNS_SCHEMA)
     conn.executescript(STATUS_SNAPSHOT_SCHEMA)
     conn.executescript(HOST_CHECKS_SCHEMA)
+    conn.executescript(BACKUPS_SCHEMA)
     conn.executescript(DOCS_SCHEMA)
     conn.executescript(PROMPT_DEFAULTS_SCHEMA)
     conn.executescript(PROMPT_VARS_SCHEMA)
@@ -4221,6 +4267,47 @@ def mark_host_checks_alerted(conn: sqlite3.Connection, names: Sequence[str], at:
 def host_check_rows(conn: sqlite3.Connection) -> list[Row]:
     """The latest result of every check, by name (hostcheck.CHECKS' order is the caller's)."""
     return [dict(r) for r in conn.execute("SELECT * FROM host_checks ORDER BY name")]
+
+
+def backup_rows(conn: sqlite3.Connection) -> list[Row]:
+    """Every backup row, newest first, each with `protected` (in the floor: latest daily-or-weekly and the 2
+    latest weekly bundles) as a bool."""
+    prot = {int(r[0]) for r in conn.execute("SELECT id FROM backups_protected")}
+    out = [dict(r) for r in conn.execute("SELECT * FROM backups ORDER BY id DESC")]
+    for r in out:
+        r["protected"] = int(r["id"]) in prot
+    return out
+
+
+def add_backup(conn: sqlite3.Connection, *, file: str, created_at: str, tier: str, size: int, sha256: str,
+               verified_at: str, install_id: str, install_epoch: int, schema_version: int,
+               manifest: str) -> int:
+    """Insert one backup row (the only write the daily job's path has). -> its id."""
+    return int(conn.execute(
+        "INSERT INTO backups(file, created_at, tier, size, sha256, verified_at, install_id, install_epoch, "
+        "schema_version, manifest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (file, created_at, tier, size, sha256, verified_at, install_id, install_epoch, schema_version,
+         manifest)).lastrowid or 0)
+
+
+def prune_backups(conn: sqlite3.Connection, keep: int) -> list[Row]:
+    """Delete the backup rows past retention: every row that is neither among the newest `keep` rows (any
+    tier) nor protected (backups_protected). The delete runs through backups_prune_gate, opened and closed in
+    THIS transaction only (no other connection sees it open); the triggers refuse a protected row even then.
+    -> the deleted rows (oldest first). The files are the caller's (actions.backup_prune)."""
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 0:
+        raise ValueError(f"keep must be a non-negative integer, got {keep!r}")
+    with transaction(conn):
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM backups WHERE id NOT IN (SELECT id FROM backups_protected) AND id NOT IN "
+            "(SELECT id FROM backups ORDER BY id DESC LIMIT ?) ORDER BY id", (keep,))]
+        conn.execute("UPDATE backups_prune_gate SET allowed=1 WHERE id=1")
+        try:
+            for r in rows:
+                conn.execute("DELETE FROM backups WHERE id=?", (r["id"],))
+        finally:
+            conn.execute("UPDATE backups_prune_gate SET allowed=0 WHERE id=1")
+    return rows
 
 
 def snapshot_rows(conn: sqlite3.Connection, account_id: str = DEFAULT_ACCOUNT) -> dict[str, Row]:

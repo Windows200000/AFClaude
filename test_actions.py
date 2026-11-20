@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -668,6 +669,8 @@ class SettingActions(Base):
                           "runner_timeout_compaction": 65.0, "runner_timeout_inbox": 5.0,
                           "runner_timeout_inbox_verify": 0.5, "runner_timeout_request": 90.0, "runner_start_catchup": 30.0,
                           "runner_runs_retention_days": 30.0, "restore_starts_paused": True,
+                          "backup_time": "03:40", "backup_keep": 14, "backup_weekly_day": "sun",
+                          "runner_timeout_backup": 30.0,
                           "auth_idle_timeout_min": 30, "auth_absolute_lifetime_h": 12,
                           "auth_remember_device_days": 7, "auth_reauth_window_min": 10,
                           "auth_max_sessions_per_user": 10,
@@ -1159,6 +1162,14 @@ class EveryAction(Base):
         self.addCleanup(os.remove, src.name)
         with src:
             src.write("### D-001 A decision\n- **Keywords:** k\n- **Status:** active\n")
+        bdir = tempfile.mkdtemp(prefix="afclaude-bk-")                         # a recorded bundle (phase 5c B3)
+        self.addCleanup(shutil.rmtree, bdir, True)
+        bfile, bfile2 = ("afclaude-backup-0123abcd-2026102%dT031200123Z.tar.gz" % d for d in (1, 2))
+        for f in (bfile, bfile2):
+            with open(os.path.join(bdir, f), "wb") as fh:
+                fh.write(b"x" * 10)
+        manifest = {"install_id": "0123abcd" * 4, "install_epoch": 0, "schema_version": store.SCHEMA_VERSION,
+                    "created_at": "2026-10-22T03:12:00.123Z"}
         script = [
             ("task.add", {"title": "t", "project": "P"}), ("task.ask", {"question": "q?"}),
             ("task.edit", {"task_id": 1, "description": "d"}), ("task.priority", {"task_id": 1, "priority": "low"}),
@@ -1235,6 +1246,11 @@ class EveryAction(Base):
             ("install.stamp", {}),
             ("writers.set", {"value": "host"}),     # a marked database (set below): the rollback changes it
             ("masterkey.check", {"value": "ab" * 32, "key_id": "abcdef012345"}),
+            ("backup.record", {"file": bfile, "tier": "daily", "manifest": manifest, "sha256": "e" * 64, "size": 10,
+                               "directory": bdir}),
+            ("backup.record", {"file": bfile2, "tier": "daily", "manifest": manifest, "sha256": "f" * 64, "size": 10,
+                               "directory": bdir}),
+            ("backup.prune", {"directory": bdir, "keep": 0}),       # deletes the first; the latest daily stays
             ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
             ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
             ("typed.record", {"session_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "driver": "auto",

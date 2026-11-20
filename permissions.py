@@ -429,6 +429,8 @@ MATRIX: dict[str, Perm] = {
                         note="K5 part 2b (D-344): the owner and AFClaude's own task-manager set who writes the "
                              "database; no runner sets it, an agent is refused"),
     "masterkey.check": INTERNAL,
+    "backup.record": INTERNAL,            # 5c B3: the grants are the actions' own (actions.backup_grant, D-287)
+    "backup.prune": INTERNAL,
     "prompt.set": OWNER,
     "prompt.reset": OWNER,
     "prompt.defaults_sync": DEPLOY,

@@ -180,6 +180,15 @@ def host_check_tick() -> str:
 
 FUNCTIONS["host_check"] = ("host_check.log", host_check_tick)
 
+def backup_tick() -> str:
+    """Phase 5c B3 (D-287): the daily database backup (backup.daily_job): a bundle in <data>/backups, verified and
+    recorded write-once, then pruned to backup_keep. A failure is reported there (failstop: alert + pause)."""
+    import backup
+    return backup.daily_job()
+
+
+FUNCTIONS["backup"] = ("backup.log", backup_tick)
+
 # phase 3a S7 (docs/phase3a_plan.md §5 S7): the inbox's own passes (inbox_worker.py), replacing the
 # legacy mode's worker thread (gone since S9).
 INBOX_LOG = "inbox_worker.log"
@@ -280,7 +289,7 @@ def window_start_job_min_timeout() -> timedelta:
 # call, calls), plus the module constants it waits for. test_runner checks each (module, function,
 # seconds) against a literal `timeout=` in that function's source, and each tick's default timeout
 # (runner.JOBS, actions.SETTINGS) against the sum. The jobs not listed (docs_import, prune_logs,
-# prune_runs, stall_scan) only read and write the DB.
+# prune_runs, stall_scan) only read and write the DB; nor does `backup` (its own checks: backup.py).
 TICK_HOST_CALLS: dict[str, tuple[tuple[str, str, int, int], ...]] = {
     # the usage refresh with its one token-refresh retry (keepalive.refresh_usage_checked), the usage
     # cache, `claude agents`, the hourly Haiku judgements (budgeted for two active sessions)

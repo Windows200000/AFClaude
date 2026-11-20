@@ -18,13 +18,24 @@ Fail fast (D-235): every check that fails raises BackupError and leaves nothing 
 complete: `create` writes <name>.partial, verifies it like a restore would and only then renames it;
 `restore` never overwrites a database and moves the restored file into place only after every check
 and the audited install.restored action (install_epoch + 1, restored_from, and a paused install when
-restore_starts_paused is on, D-173). Nothing schedules this yet (B3: the runner's daily job), and
-the bundle is not encrypted yet (B2): it holds the whole database, so it is written mode 0600.
+restore_starts_paused is on, D-173). The bundle is not encrypted (D-287): it holds the whole database,
+so it is written mode 0600.
+
+Scheduled backups (phase 5c B3, D-287; the runner's daily `backup` job, setting backup_time): `run_scheduled`
+makes a bundle in backup_dir() (<data dir>/backups), verifies the finished file again, makes it read-only,
+records it (action backup.record: create-only, actor runner:backup) and, for a scheduled run, prunes to the
+setting backup_keep (action backup.prune: a separate actor, runner:backup_prune, after the new bundle
+verified). The latest daily and the 2 latest weekly bundles are never deleted, whatever backup_keep says
+(store.BACKUPS_SCHEMA: the table is write-once). A failure (no install_id, a failed verify, a full disk)
+raises; the job's `daily_job` reports it (failstop: alert + pause) and every older bundle stays.
 
     python3 backup.py create --out DIR [--db PATH]     # -> the bundle path and its manifest (JSON)
     python3 backup.py verify BUNDLE                    # every check of a restore, nothing written
     python3 backup.py restore BUNDLE --into DIR        # DIR/afclaude.db; DIR must not hold a database
     python3 backup.py stamp [--db PATH]                # one-off: give an old database its install_id
+    python3 backup.py run [--manual]                   # one scheduled-style backup now (--manual: tier manual, no prune)
+    python3 backup.py prune [--keep N]                 # delete the recorded bundles past retention (never the floor)
+    python3 backup.py list                             # the recorded bundles, newest first, with `protected`
 """
 from __future__ import annotations
 
@@ -39,6 +50,7 @@ import sqlite3
 import sys
 import tarfile
 import tempfile
+from datetime import datetime, timedelta, timezone
 from typing import IO, Any, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +59,7 @@ sys.path.insert(0, HERE)
 import actions  # noqa: E402
 import identity  # noqa: E402  (the default actor: who runs this)
 import store  # noqa: E402
+import failstop  # noqa: E402  (stdlib only at import: the alert + pause of a failed scheduled backup)
 
 FORMAT = "afclaude-backup"
 FORMAT_VERSION = 1
@@ -334,6 +347,118 @@ def stamp(db: str | None = None, actor: Optional[str] = None, via: str = "cli") 
         conn.close()
 
 
+# ---------------------------------------------------------------- scheduled backups (phase 5c B3, D-287)
+
+BACKUP_SUBDIR = "backups"
+FREE_FACTOR = 2             # the free space a run needs, in database sizes: the snapshot copy + the bundle
+FAIL_SUBJECT = "the daily database backup failed"       # stable: failstop alerts once per pause
+
+
+def backup_dir() -> str:
+    """Where the scheduled bundles live: <data dir>/backups, next to the database (data dir permissions;
+    the directory itself and every bundle are private to the owner)."""
+    return os.path.join(os.path.dirname(os.path.abspath(store.DB_PATH)), BACKUP_SUBDIR)
+
+
+def tier_for(conn: sqlite3.Connection, now: datetime) -> str:
+    """The tier of a scheduled run at `now`: "weekly" when no weekly bundle exists since the latest
+    occurrence (UTC midnight, not after `now`) of the setting backup_weekly_day, else "daily" (so the first
+    run on or after that weekday is the weekly one, and a missed day moves it to the next run)."""
+    want = actions.BACKUP_WEEKDAYS.index(str(actions.get_setting(conn, "backup_weekly_day")))
+    day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    day -= timedelta(days=(day.weekday() - want) % 7)
+    last = conn.execute("SELECT MAX(created_at) FROM backups WHERE tier='weekly'").fetchone()[0]
+    parsed = store.parse_iso(last)
+    return "daily" if parsed is not None and parsed >= day else "weekly"
+
+
+def _check_space(directory: str, db: str) -> None:
+    free, need = shutil.disk_usage(directory).free, os.path.getsize(db) * FREE_FACTOR
+    if free < need:
+        raise BackupError(f"not enough free space in {directory} for a backup: {free} bytes free, "
+                          f"{need} needed ({FREE_FACTOR} x the database)")
+
+
+def run_scheduled(manual: bool = False, now: Optional[datetime] = None) -> dict[str, Any]:
+    """One backup of the live database into backup_dir(): create (written as .partial, verified, renamed),
+    verify the finished file again, make it read-only, record it (backup.record as runner:backup) and, unless
+    `manual` (tier "manual", recorded as the caller), prune to backup_keep (backup.prune as
+    runner:backup_prune). Any failure raises and keeps every older bundle: an unrecorded bundle this run
+    made is removed, the prune never runs. -> {file, tier, size, sha256, deleted: [file, ...]}."""
+    now = now or store._utcnow()
+    out_dir = backup_dir()
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    os.chmod(out_dir, 0o700)
+    db = os.path.abspath(store.DB_PATH)
+    if not os.path.isfile(db):
+        raise BackupError(f"no database at {db}")
+    _check_space(out_dir, db)
+    conn = store.connect()
+    try:
+        tier = "manual" if manual else tier_for(conn, now)
+    finally:
+        conn.close()
+    made = create(out_dir, db)
+    path = made["path"]
+    try:
+        verify(path)                              # the finished file, not only the .partial it came from
+        os.chmod(path, 0o400)                     # write-once on disk too
+        record = actions.BACKUP_RECORD_ACTOR if not manual else identity.cli_actor()
+        conn = store.connect()
+        try:
+            actions.perform(conn, "backup.record", {"file": os.path.basename(path), "tier": tier,
+                                                    "manifest": made["manifest"], "sha256": made["sha256"],
+                                                    "size": made["size"], "directory": out_dir},
+                            actor=record, via="runner" if not manual else "cli")
+        finally:
+            conn.close()
+    except BaseException:
+        if os.path.exists(path):
+            os.remove(path)                       # unrecorded: this run's own, never a recorded bundle
+        raise
+    deleted: list[str] = []
+    if not manual:
+        deleted = prune(actor=actions.BACKUP_PRUNE_ACTOR, via="runner")["deleted"]
+    return {"file": os.path.basename(path), "tier": tier, "size": made["size"], "sha256": made["sha256"],
+            "deleted": deleted}
+
+
+def prune(keep: Optional[int] = None, actor: Optional[str] = None, via: str = "cli") -> dict[str, Any]:
+    """backup.prune on the live database: the recorded bundles past backup_keep (or `keep`), their files
+    included; the protected floor stays. -> {deleted: [file, ...], kept, keep}."""
+    conn = store.connect()
+    try:
+        out: dict[str, Any] = actions.perform(conn, "backup.prune", {"directory": backup_dir(), "keep": keep},
+                                              actor=actor or identity.cli_actor(), via=via)
+        return out
+    finally:
+        conn.close()
+
+
+def listing() -> list[dict[str, Any]]:
+    """The recorded bundles, newest first: file, tier, created_at, size, verified_at, protected."""
+    conn = store.connect()
+    try:
+        return [{k: r[k] for k in ("file", "tier", "created_at", "size", "verified_at", "protected")}
+                for r in store.backup_rows(conn)]
+    finally:
+        conn.close()
+
+
+def daily_job() -> str:
+    """The runner's `backup` job (runner_jobs.backup_tick): run_scheduled, its line for the log. A failure is
+    reported here, failstop.fail (alert + pause, D-235), and raised: the runner records it as reported."""
+    try:
+        res = run_scheduled()
+    except Exception as e:      # noqa: BLE001 - every failure of the job is reported the same way
+        failstop.fail("backup", FAIL_SUBJECT, f"{type(e).__name__}: {e}")
+        raise
+    line = f"backup {res['file']} ({res['tier']}, {res['size']} bytes)"
+    line += f", pruned {', '.join(res['deleted'])}" if res["deleted"] else ", nothing to prune"
+    print(line)
+    return line
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="The DB backup bundle and its restore (design §11; phase 5c B1).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -347,6 +472,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--into", required=True, metavar="DIR")
     s = sub.add_parser("stamp", help="give a database that predates the install marker its install_id")
     s.add_argument("--db", default=None, help="database path (default: $AFCLAUDE_DB or data/afclaude.db)")
+    n = sub.add_parser("run", help="make, verify and record one backup in the backup directory now")
+    n.add_argument("--manual", action="store_true", help="tier manual, recorded as you, no prune")
+    q = sub.add_parser("prune", help="delete the recorded bundles past retention (never the protected floor)")
+    q.add_argument("--keep", type=int, default=None, help="newest bundles to keep (default: setting backup_keep)")
+    sub.add_parser("list", help="the recorded bundles, newest first")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "create":
@@ -355,6 +485,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             out = verify(a.bundle)
         elif a.cmd == "restore":
             out = restore(a.bundle, a.into)
+        elif a.cmd == "run":
+            out = run_scheduled(manual=a.manual)
+        elif a.cmd == "prune":
+            out = prune(a.keep)
+        elif a.cmd == "list":
+            out = listing()
         else:
             out = stamp(a.db)
     except (BackupError, ValueError, LookupError, store.DBError, sqlite3.Error, OSError) as e:
