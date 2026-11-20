@@ -1,7 +1,7 @@
 # AFClaude: ROLLBACK file of the K7 cut-over (phase 5b, docs/phase5b_plan.md K7; review:k4a M2): the one container
 # `afclaude` of the old layout, started from the image the cut-over kept, never built from this checkout (a build of
-# HEAD would be today's code in the old shape: review:k4a M2). tools/cutover_5b.py tags the running
-# `afclaude-manager:latest` as `afclaude-manager:pre-k7` before it stops anything and keeps the tag for a week; this file
+# HEAD would be today's code in the old shape: review:k4a M2). tools/cutover_5b.py tags the image
+# the running `afclaude` container uses (docker inspect) as `afclaude-manager:pre-k7` before it stops anything and keeps the tag for a week; this file
 # runs exactly that tag (pull_policy never: a missing tag is an error, not a pull or a build).
 #   docker compose -f docker/compose.single.yml up -d         (after the three services are down and docker/.env is back
 #                                                              to its pre-cut-over state: tools/cutover_5b.py prints the steps)

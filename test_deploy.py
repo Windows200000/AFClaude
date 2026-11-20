@@ -947,7 +947,9 @@ class InjectedRunTest(unittest.TestCase):
             with mock.patch.object(deploy, "container_writes", return_value=True), \
                  mock.patch.object(deploy.runner, "drain_span", return_value=timedelta(minutes=1)):
                 self.assertTrue(deploy.drain(mock.Mock(), "c", None, run=run))
-                deploy.undrain(mock.Mock(), "c", run=run)
+                self.assertTrue(deploy.undrain(mock.Mock(), "c", run=run))
+                with mock.patch.object(deploy, "alert"):
+                    self.assertFalse(deploy.undrain(mock.Mock(), "c", run=lambda cmd, **kw: FakeCompleted("", 1)))
         self.assertEqual([c[-1] for c in calls], ["drain", "drain", "undrain"])
 
 

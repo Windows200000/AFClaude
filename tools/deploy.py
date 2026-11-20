@@ -212,15 +212,17 @@ def drain(conn: Any, container: str, max_wait_minutes: Optional[float],
 
 
 def undrain(conn: Any, container: str,
-            run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> None:
+            run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> bool:
+    """Lift the drain. -> False when the container's `afclaude runner undrain` failed (alerted here), else True."""
     if container_writes(conn):
         rc = container_runner(container, "undrain", limit=UNDRAIN_EXEC_LIMIT, run=run)
         if rc != 0:     # a drain that stays holds the next session runs until it expires (D-257): loud, not silent
             alert("deploy: the drain could not be lifted", f"`afclaude runner undrain` in {container} exited {rc}: "
                   "run it by hand (docker exec ... afclaude runner undrain), else new session runs wait until the "
                   "drain expires")
-        return
+        return rc == 0
     runner.undrain(conn)
+    return True
 
 
 def lift_drain(conn: Any, container: str = CONTAINER) -> int:

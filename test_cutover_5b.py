@@ -461,7 +461,7 @@ class ApplyTest(Base):
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("could not be drained", self.alerts[0][1])
         self.assertIn("docker exec afclaude afclaude runner undrain", self.docker.commands())     # the mark was set: lifted
-        self.assertIn("the drain is lifted again", self.alerts[0][1])
+        self.assertIn("lifting the drain again now", self.alerts[0][1])
 
     def test_a_drain_exec_that_times_out_is_lifted_too(self):
         self.docker.timeouts = {"docker exec afclaude afclaude runner drain": 1}
@@ -538,6 +538,27 @@ class ApplyTest(Base):
         self.assertFalse([c for c in self.docker.commands() if "compose.single.yml" in c])
         self.assertIn("non-blocking host check(s) failed", self.text())
         self.assertEqual(self.alerts, [])
+
+    def test_a_hanging_non_blocking_check_is_reported_loudly_not_rolled_back(self):
+        self.docker.timeouts = {"docker exec afclaude-runner afclaude host check": 1}
+        self.assertEqual(self.apply(), 0, self.text())
+        self.assertFalse([c for c in self.docker.commands() if "compose.single.yml" in c])
+        self.assertEqual(self.alerts, [])
+        self.assertEqual(self.text().count("the full host check did not finish"), 2)       # where it happened and again in the summary
+        self.assertIn("BLOCKING host checks passed, but", self.text())
+        self.assertNotIn("host checks passed.", self.text())
+
+    def test_the_guard_covers_the_worst_case_of_the_limits(self):
+        forward = cutover_5b.STOP_LIMIT + cutover_5b.UP_LIMIT + cutover_5b.HEALTH_WAIT.seconds + cutover_5b.CHECK_LIMIT
+        back = 3 * (30 + deploy.REMOVE_LIMIT + 60) + cutover_5b.UP_LIMIT + cutover_5b.HEALTH_WAIT.seconds
+        self.assertEqual((forward + back) / 60, 56.5)
+        self.assertLess(forward + back, cutover_5b.GUARD.total_seconds())
+
+    def test_an_undrain_that_fails_is_not_reported_as_lifted(self):
+        self.docker.fail = lambda cmd: 1 if "runner undrain" in cmd or "runner drain" in cmd else 0
+        self.assertEqual(self.apply(), 1)
+        self.assertIn("DRAIN NOT LIFTED", self.text())
+        self.assertNotIn("drain lifted (", self.text())
 
     def test_an_exception_out_of_a_parser_still_rolls_back_and_alerts(self):
         self.docker.health_by = {"afclaude-runner": "[]"}        # deploy.health_state: IndexError
