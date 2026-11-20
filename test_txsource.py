@@ -564,6 +564,12 @@ class Docs(DocsEnv):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def tearDown(self):
+        # the kit's patch.dict(os.environ) saved the env after Env.setUp (HOME in the temp dir); undone after Env.tearDown
+        # (cleanups run last) it would put that dead HOME back for every later test, so undo it first
+        self.kit.doCleanups()
+        super().tearDown()
+
     def test_import_through_the_kit_matches_the_file_import(self):
         self.write("PROGRESS.md", "# Progress\n\n- first\n")
         self.write("GOALS.md", "# Goals\n\n- [ ] one\n")
