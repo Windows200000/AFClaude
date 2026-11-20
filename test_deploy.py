@@ -3,6 +3,7 @@
 container-quiet wait logic, the three-service flow and the health wait, with fake `docker` output, stub
 subprocess calls and a fake clock/sleep (no docker, no real waiting)."""
 import os
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -426,6 +427,7 @@ class MainFlowTest(unittest.TestCase):
     def _main(self, argv=(), compose_rc=0, healthy=True, profiles="", roles="on"):
         events = []
         runs = []
+        self.stale = []
 
         def run(cmd, **kw):
             runs.append((cmd, kw.get("env", {}).get("AFCLAUDE_CODE_VERSION")))
@@ -439,6 +441,7 @@ class MainFlowTest(unittest.TestCase):
              mock.patch.object(deploy, "env_value", side_effect=lambda name, *a, **k: profiles if name == "COMPOSE_PROFILES" else ""), \
              mock.patch("actions.roles_mode", return_value=roles), \
              mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
+             mock.patch.object(deploy, "drop_stale_mcp", side_effect=lambda lay, **k: self.stale.append(lay) or False), \
              mock.patch.object(deploy, "code_version", return_value="abc1234"), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
              mock.patch.object(deploy.store, "writers_mark", return_value=None), \
@@ -556,6 +559,7 @@ class DrainViaContainerTest(unittest.TestCase):
              mock.patch.object(deploy, "check_old_container", return_value=True), \
              mock.patch.object(deploy, "check_start_guard", side_effect=list(guards)), \
              mock.patch.object(deploy, "env_value", return_value=""), \
+             mock.patch.object(deploy, "drop_stale_mcp", return_value=False), \
              mock.patch.object(deploy, "code_version", return_value="abc1234"), \
              mock.patch.object(deploy, "alert", side_effect=lambda s, b: events.append(("alert", s))), \
              mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
@@ -847,6 +851,104 @@ class KitGuardTest(unittest.TestCase):
                     deploy.installed_kit_answer(run=run)
                 self.assertEqual(run.call_args.kwargs["env"]["SSH_ORIGINAL_COMMAND"], "kit-version")
                 self.assertEqual(run.call_args.kwargs["timeout"], deploy.KIT_TIMEOUT)
+
+
+class StaleMcpTest(unittest.TestCase):
+    """review:k5-part2a LOW 5: dropping the mcp profile leaves an old afclaude-mcp container running; the deploy stops and
+    removes it, that one name of this compose project only."""
+
+    @staticmethod
+    def docker(existing=("afclaude-mcp",), fail=None):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            if fail and fail(cmd):
+                return FakeCompleted("", 1, "boom")
+            if cmd[:3] == ["docker", "ps", "-a"]:
+                name = [a for a in cmd if a.startswith("name=^")][0][6:-1]
+                return FakeCompleted(name + "\n" if name in existing else "")
+            return FakeCompleted("")
+        return run, calls
+
+    def test_the_named_container_of_this_project_is_stopped_and_removed(self):
+        run, calls = self.docker()
+        self.assertTrue(deploy.remove_container("afclaude-mcp", run=run, project="afclaude"))
+        self.assertEqual(calls[0], ["docker", "ps", "-a", "--filter", "name=^afclaude-mcp$", "--filter",
+                                    "label=com.docker.compose.project=afclaude", "--format", "{{.Names}}"])
+        self.assertEqual(calls[1:], [["docker", "stop", "afclaude-mcp"], ["docker", "rm", "afclaude-mcp"]])
+
+    def test_no_such_container_removes_nothing(self):
+        run, calls = self.docker(existing=())
+        self.assertFalse(deploy.remove_container("afclaude-mcp", run=run, project="afclaude"))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failure_or_timeout_is_an_error_not_a_pass(self):
+        run, _ = self.docker(fail=lambda c: c[:2] == ["docker", "stop"])
+        with self.assertRaises(RuntimeError):
+            deploy.remove_container("afclaude-mcp", run=run, project="afclaude")
+
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 1)
+        with self.assertRaises(RuntimeError):
+            deploy.remove_container("afclaude-mcp", run=hang, project="afclaude")
+
+    def test_only_the_services_layout_without_the_profile_drops_it(self):
+        with mock.patch.object(deploy, "name_prefix", return_value="afclaude"), \
+             mock.patch.object(deploy, "compose_project", return_value="afclaude"):
+            for lay, profile, expected in (("services", False, True), ("services", True, False), ("single", False, False)):
+                run, calls = self.docker()
+                with mock.patch.object(deploy, "mcp_enabled", return_value=profile):
+                    self.assertEqual(deploy.drop_stale_mcp(lay, run=run), expected, (lay, profile))
+                self.assertEqual(bool(calls), expected)
+
+    def test_the_prefix_names_the_container(self):
+        run, calls = self.docker(existing=("two-mcp",))
+        with mock.patch.object(deploy, "name_prefix", return_value="two"), \
+             mock.patch.object(deploy, "compose_project", return_value="afclaude"), \
+             mock.patch.object(deploy, "mcp_enabled", return_value=False):
+            self.assertTrue(deploy.drop_stale_mcp("services", run=run))
+        self.assertIn(["docker", "rm", "two-mcp"], calls)
+
+    def test_main_removes_it_after_the_recreate_and_alerts_a_failure(self):
+        base = MainFlowTest("test_order_drain_quiet_recreate_health")
+        base.layout = "services"
+        rc, events, runs = base._main()
+        self.assertEqual((rc, base.stale), (0, ["services"]))
+        base.stale = []
+        with mock.patch.object(deploy, "drop_stale_mcp", side_effect=RuntimeError("docker rm failed")), \
+             mock.patch.object(deploy, "scheduler_mode", return_value="runner"), \
+             mock.patch.object(deploy, "layout", return_value="services"), \
+             mock.patch.object(deploy, "check_data", return_value="/d/afclaude.db"), \
+             mock.patch.object(deploy, "check_old_container", return_value=True), \
+             mock.patch.object(deploy, "check_start_guard", return_value=True), \
+             mock.patch.object(deploy, "mcp_enabled", return_value=False), \
+             mock.patch.object(deploy, "code_version", return_value="abc"), \
+             mock.patch.object(deploy.store, "connect", return_value=mock.Mock()), \
+             mock.patch.object(deploy.store, "writers_mark", return_value=None), \
+             mock.patch.object(deploy.runner, "drain", return_value=0), \
+             mock.patch.object(deploy, "container_processes", return_value=[]), \
+             mock.patch.object(deploy, "wait_healthy", return_value=True) as health, \
+             mock.patch.object(deploy, "alert") as alert, \
+             mock.patch.object(deploy.subprocess, "run", return_value=FakeCompleted("", 0)), \
+             mock.patch("builtins.print"):
+            self.assertEqual(deploy.main([]), 1)
+        alert.assert_called_once()
+        self.assertIn("docker rm failed", alert.call_args.args[1])
+        health.assert_not_called()
+
+
+class InjectedRunTest(unittest.TestCase):
+    def test_the_container_drain_goes_through_the_given_runner(self):
+        calls = []
+        run = lambda cmd, **kw: calls.append(cmd) or FakeCompleted("", 0)
+        with mock.patch.object(deploy.subprocess, "run", side_effect=AssertionError("real subprocess")):
+            self.assertEqual(deploy.container_runner("c", "drain", run=run), 0)
+            with mock.patch.object(deploy, "container_writes", return_value=True), \
+                 mock.patch.object(deploy.runner, "drain_span", return_value=timedelta(minutes=1)):
+                self.assertTrue(deploy.drain(mock.Mock(), "c", None, run=run))
+                deploy.undrain(mock.Mock(), "c", run=run)
+        self.assertEqual([c[-1] for c in calls], ["drain", "drain", "undrain"])
 
 
 if __name__ == "__main__":

@@ -110,8 +110,13 @@ class ComposeShape(unittest.TestCase):
         self.assertNotIn("AFCLAUDE_LAYOUT", text)            # unset = single, in the entrypoint and the runner
         self.assertNotIn("afclaude-runner", text)
         self.assertEqual(read("docker/compose.dev.yml").count("afclaude:"), 1)      # main's dev override, unchanged
-        self.assertFalse(os.path.exists(os.path.join(HERE, "docker", "compose.single.yml")),
-                         "no second copy of the single layout: a rollback is the old commit/image (review k4a M2)")
+        # review k4a M2: a second copy of the single layout must never build from the checkout; the K7 rollback file
+        # (tools/cutover_5b.py) runs the kept old image by tag instead
+        single = os.path.join(HERE, "docker", "compose.single.yml")
+        if os.path.exists(single):
+            rollback = read("docker/compose.single.yml")
+            self.assertNotRegex(rollback, r"(?m)^\s*build:")
+            self.assertRegex(rollback, r"(?m)^\s*image: afclaude-manager:pre-k7(\s|$)")
 
     def test_the_services_say_so_and_web_and_mcp_do_not_see_the_bridge_key(self):
         text = read("docker/compose.services.yml")

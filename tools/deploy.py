@@ -36,7 +36,7 @@ Steps: 0) refuse within START_GUARD (30 min) before or after a scheduled session
 start missed by the restart gap is one too; the refusal prints the next safe time.
 1) `runner.py drain()` (existing). 2) poll `docker top` for a sampler / usage-review /
 unittest / claude process (any bridge call, including a plain usage read) still running in
-the runner container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` (services: compose.services.yml and its overrides) with
+the runner container, bounded wait. 3) `docker compose -f docker/compose.yml up -d --build` (services: compose.services.yml and its overrides; without the mcp profile an old afclaude-mcp container is then stopped and removed, `drop_stale_mcp`) with
 AFCLAUDE_CODE_VERSION=$(git rev-parse --short HEAD) (as README and the AFClaude project's deploy_rule
 say to run it; the image has no .git, so without this the build commit is unknown).
 Exit 1 (no rebuild, nothing drained, even with --force) when the layout's compose file uses the host kit's bridge
@@ -183,13 +183,15 @@ EXEC_MARGIN = timedelta(minutes=2)      # docker exec's own start-up and the run
 UNDRAIN_EXEC_LIMIT = timedelta(minutes=2)
 
 
-def container_runner(container: str, *args: str, limit: Optional[timedelta] = None) -> int:
+def container_runner(container: str, *args: str, limit: Optional[timedelta] = None,
+                     run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> int:
     """`docker exec <container> afclaude runner <args>`, its output passed through. -> its exit code. limit: a hung
     exec must not hang the deploy past the start guard (D-234): after it the docker client is killed, an alert is
-    raised and 124 is returned (what a timeout is, by convention) so the caller aborts."""
+    raised and 124 is returned (what a timeout is, by convention) so the caller aborts. run: the one place the docker
+    call goes through (default subprocess.run; tools/cutover_5b.py and the tests pass their own)."""
     try:
-        return int(subprocess.run(["docker", "exec", container, "afclaude", "runner", *args],
-                                  timeout=None if limit is None else limit.total_seconds()).returncode)
+        return int((run or subprocess.run)(["docker", "exec", container, "afclaude", "runner", *args],
+                                           timeout=None if limit is None else limit.total_seconds()).returncode)
     except subprocess.TimeoutExpired:
         alert("deploy: a container runner command timed out",
               f"`afclaude runner {' '.join(args)}` in {container} did not finish within "
@@ -198,19 +200,21 @@ def container_runner(container: str, *args: str, limit: Optional[timedelta] = No
         return 124
 
 
-def drain(conn: Any, container: str, max_wait_minutes: Optional[float]) -> bool:
+def drain(conn: Any, container: str, max_wait_minutes: Optional[float],
+          run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> bool:
     """Hold new session runs and wait until none runs (runner.drain). -> drained. Through the container once the
     database is marked writers=container (the host cannot write it), else as before on the host's connection."""
     if container_writes(conn):
         extra = [] if max_wait_minutes is None else ["--max-wait", str(max_wait_minutes)]
         wait = timedelta(minutes=max_wait_minutes) if max_wait_minutes is not None else runner.drain_span(conn)
-        return container_runner(container, "drain", *extra, limit=wait + EXEC_MARGIN) == 0
+        return container_runner(container, "drain", *extra, limit=wait + EXEC_MARGIN, run=run) == 0
     return runner.drain(conn, timedelta(minutes=max_wait_minutes) if max_wait_minutes is not None else None) == 0
 
 
-def undrain(conn: Any, container: str) -> None:
+def undrain(conn: Any, container: str,
+            run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> None:
     if container_writes(conn):
-        rc = container_runner(container, "undrain", limit=UNDRAIN_EXEC_LIMIT)
+        rc = container_runner(container, "undrain", limit=UNDRAIN_EXEC_LIMIT, run=run)
         if rc != 0:     # a drain that stays holds the next session runs until it expires (D-257): loud, not silent
             alert("deploy: the drain could not be lifted", f"`afclaude runner undrain` in {container} exited {rc}: "
                   "run it by hand (docker exec ... afclaude runner undrain), else new session runs wait until the "
@@ -292,6 +296,48 @@ def container_names(prefix: Optional[str] = None, with_mcp: Optional[bool] = Non
     p = prefix or name_prefix()
     with_mcp = mcp_enabled() if with_mcp is None else with_mcp
     return [f"{p}-{svc}" for svc in SERVICES if svc != "mcp" or with_mcp]
+
+
+COMPOSE_PROJECT = "afclaude"                  # `name:` of every compose file here (COMPOSE_PROJECT_NAME overrides it, as for compose)
+REMOVE_LIMIT = 150                            # seconds for one `docker stop`/`rm` of a container (the runner's stop grace is 90)
+
+
+def compose_project() -> str:
+    return env_value("COMPOSE_PROJECT_NAME") or COMPOSE_PROJECT
+
+
+def remove_container(name: str, run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+                     project: Optional[str] = None) -> bool:
+    """Stop and remove the one container called `name` of this compose project (its name exactly and its compose
+    project label: never another container, never a pattern). -> False when there is none. RuntimeError when docker
+    fails or times out (the caller alerts, D-235)."""
+    run = run or subprocess.run
+    proj = project or compose_project()
+
+    def docker(*argv: str, timeout: int) -> "subprocess.CompletedProcess[str]":
+        try:
+            r = run(["docker", *argv], capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"docker {' '.join(argv)}: {e}")
+        if r.returncode != 0:
+            raise RuntimeError(f"docker {' '.join(argv)} failed (rc {r.returncode}): {(r.stderr or r.stdout).strip()[:300]}")
+        return r
+    found = docker("ps", "-a", "--filter", f"name=^{name}$", "--filter", f"label=com.docker.compose.project={proj}",
+                   "--format", "{{.Names}}", timeout=30)
+    if name not in found.stdout.split():
+        return False
+    docker("stop", name, timeout=REMOVE_LIMIT)
+    docker("rm", name, timeout=60)
+    return True
+
+
+def drop_stale_mcp(lay: str, run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None) -> bool:
+    """The services layout without the `mcp` profile: compose ignores a service whose profile is off, so an
+    afclaude-mcp container left by an earlier deploy (review:k5-part2a LOW 5) would keep running the old image and
+    listening. Stop and remove it (only that name of this project). -> True when one was removed."""
+    if lay != "services" or mcp_enabled():
+        return False
+    return remove_container(f"{name_prefix()}-mcp", run=run)
 
 
 def check_mcp_profile(lay: str, mode: Optional[Callable[[], str]] = None) -> bool:
@@ -582,6 +628,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return r.returncode
     if lay == "single":
         return 0
+    try:
+        if drop_stale_mcp(lay):
+            print(f"removed the stale {name_prefix()}-mcp container (the mcp profile is not enabled)")
+    except RuntimeError as e:
+        alert("deploy: the stale afclaude-mcp container could not be removed",
+              f"{e}: it still runs the old image although COMPOSE_PROFILES no longer names mcp; remove it by hand "
+              f"(docker stop {name_prefix()}-mcp; docker rm {name_prefix()}-mcp)")
+        return 1
     healthy: List[str] = []
     ok = wait_healthy(container_names(), timedelta(minutes=args.max_wait_healthy), out=lambda m: (healthy.append(m), print(m)))
     if not ok:

@@ -1,0 +1,64 @@
+# AFClaude: ROLLBACK file of the K7 cut-over (phase 5b, docs/phase5b_plan.md K7; review:k4a M2): the one container
+# `afclaude` of the old layout, started from the image the cut-over kept, never built from this checkout (a build of
+# HEAD would be today's code in the old shape: review:k4a M2). tools/cutover_5b.py tags the running
+# `afclaude-manager:latest` as `afclaude-manager:pre-k7` before it stops anything and keeps the tag for a week; this file
+# runs exactly that tag (pull_policy never: a missing tag is an error, not a pull or a build).
+#   docker compose -f docker/compose.single.yml up -d         (after the three services are down and docker/.env is back
+#                                                              to its pre-cut-over state: tools/cutover_5b.py prints the steps)
+# Otherwise as docker/compose.yml (machine-specific values: docker/.env; no docker socket, no privileges, no published
+# ports). Delete this file, the image tag and docker/compose.yml when the cut-over is accepted (plan K7 "Done when").
+name: afclaude
+services:
+  afclaude:
+    image: afclaude-manager:pre-k7      # the old image the cut-over kept; no `build:` on purpose
+    pull_policy: never
+    container_name: afclaude
+    restart: unless-stopped
+    # a `docker stop` reaches the runner directly (the entrypoint `exec`s it): its running runs get
+    # up to 80 s (runner.STOP_GRACE) to end before it records its clean exit (phase 3a S2/S8)
+    stop_grace_period: 90s
+    # phase 3a S8 (AFCLAUDE_SCHEDULER=runner): a live runner with a loop heartbeat under 3 min; the
+    # off mode is always healthy. It only reports (docker ps); a stuck loop is ended by the
+    # runner's own watchdog thread (exit 70) and `restart: unless-stopped` starts the container again.
+    healthcheck:
+      test: ["CMD", "python3", "runner.py", "health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+    environment:
+      # the host path of the repo: what the host must understand (projects' directories, launch cwds,
+      # paths named in messages to sessions). The code itself runs from /app. K4/K2 take it from host.json.
+      AFCLAUDE_HOST_REPO: ${AFCLAUDE_HOST_REPO:?set in docker/.env}
+      # the host user's home, the same path as on the host: the transcript mounts below sit under it
+      HOME: ${HOST_HOME:?set in docker/.env}
+      AFCLAUDE_SCHEDULER: ${AFCLAUDE_SCHEDULER:-off}
+      AFCLAUDE_BRIDGE_HOST: ${AFCLAUDE_BRIDGE_HOST:-host.docker.internal}
+      AFCLAUDE_BRIDGE_USER: ${AFCLAUDE_BRIDGE_USER:?set in docker/.env}
+      # the host kit's bridge key (K2, the owner's install puts it into <data>/bridge/; its authorized_keys line
+      # runs the installed kit). Rollback to the pre-kit bridge while its authorized_keys line still exists:
+      # this file from the commit before the kit switch (it mounts docker/secrets/ at the image's default
+      # AFCLAUDE_BRIDGE_KEY), then tools/deploy.py.
+      AFCLAUDE_BRIDGE_KEY: /app/data/bridge/host_bridge_ed25519
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${AFCLAUDE_HOST_REPO:?}:/host/repo:ro                       # local-only files, read fresh
+      - ${AFCLAUDE_HOST_REPO}/data:/app/data                        # DB, samples, state, logs (rw)
+      - ${HOST_HOME:?}/.claude/projects:${HOST_HOME}/.claude/projects:ro
+      - ${HOST_HOME}/.claude/sessions:${HOST_HOME}/.claude/sessions:ro
+      - /etc/ssh/ssh_host_ed25519_key.pub:/run/host_ssh/ssh_host_ed25519_key.pub:ro
+      # the quickview key: inbox_api.py checks it on every request too (D-150/D-241)
+      - ${HOST_HOME}/.config/afclaude/quickview.key:/run/secrets/afclaude_quickview.key:ro
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777          # exec: the unit tests put stub binaries in temp dirs
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [afclaude]
+networks:
+  afclaude:
+    # the host kit's authorized_keys line accepts from= this subnet only (install --from, default 172.28.0.0/24)
+    ipam:
+      config:
+        - subnet: ${AFCLAUDE_SUBNET:-172.28.0.0/24}
