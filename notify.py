@@ -11,6 +11,10 @@ DB itself is broken the alert goes to data/ALERTS.fallback.md (§7.8, D-171). Cl
 suppresses the push when it thinks the user is at a terminal ("Not sent — this terminal
 is active"), so the push is best-effort; the tool's answer is recorded next to the alert.
 
+The push carries the owner text (owner_text.push_line: plain words found from the subject, D-345/D-347),
+never the technical subject or body; the alerts doc keeps both for the task-manager, with the line the
+owner was sent.
+
 CLI: notify.py "subject" "body"
 """
 import json
@@ -24,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import claude_auth  # noqa: E402  (D-320: an expired Claude login is told apart)
 import host  # noqa: E402  (host calls: local on the host, the SSH bridge inside the container)
+import owner_text  # noqa: E402  (D-345/D-347: the push says plain words, not the technical subject)
 import project_docs  # noqa: E402  (the alert into the DB: doc.append)
 ACTOR = "runner:notify"
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -61,9 +66,10 @@ def push(text):
 def notify(subject: str, body: str = "", do_push: bool = True) -> str:
     now = datetime.now(BERLIN).strftime("%Y-%m-%d %H:%M")
     os.makedirs(os.path.join(HERE, "data"), exist_ok=True)
-    result = push(f"AFClaude: {subject}"[:180]) if do_push else "push skipped"
-    project_docs.append_note("alerts", f"- **{now}** {subject}\n  {body.strip()[:1500]}\n  _(push: {result})_\n",
-                             ACTOR)
+    told = owner_text.push_line(subject)
+    result = push(told) if do_push else "push skipped"
+    project_docs.append_note("alerts", f"- **{now}** {subject}\n  {body.strip()[:1500]}\n"
+                             f"  _(for the owner: {told}; push: {result})_\n", ACTOR)
     project_docs.append_note("progress", f"- {now[11:]} [ALERT] {subject} (details in the alerts doc)\n", ACTOR)
     return result
 

@@ -473,15 +473,20 @@ def automation_block():
     no run starts until the owner clears it. Strict read (a DB that can't be read = paused).
     paused: anything is paused; install: the install-wide pause (reason, by, since_berlin, resume
     are its own); projects: each paused project (D-244: an inbox error pauses only its project)
-    with its name, reason, by, since_berlin and resume command."""
+    with its name, reason, by, since_berlin and resume command. owner: what the banner shows, the
+    reason in plain words (owner_text.for_pause, D-345/D-347); reason, by and resume are the
+    task-manager's and stay off the page."""
     import failstop
+    import owner_text
     ps = failstop.pauses()
     i = ps["install"]
     projects = [{"name": p["name"], "reason": p.get("reason"), "by": p.get("by"),
+                 "owner": owner_text.for_pause(p.get("reason"), p.get("by")),
                  "since_berlin": bstr(ka.parse_ts(p["since"])) if p.get("since") else None,
                  "resume": failstop.resume_cmd(p["name"])} for p in ps["projects"]]
     return {"paused": bool(i["paused"]) or bool(projects), "install": bool(i["paused"]),
             "reason": i.get("reason"), "by": i.get("by"),
+            "owner": owner_text.for_pause(i.get("reason"), i.get("by")) if i["paused"] else [],
             "since_berlin": bstr(ka.parse_ts(i["since"])) if i.get("since") else None,
             "resume": failstop.RESUME_CMD, "projects": projects}
 
