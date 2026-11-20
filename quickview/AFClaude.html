@@ -639,12 +639,11 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
 
   // D-320: an expired Claude login leads the needs-input items, with the fix, until a later call authenticates
   function authItem(a) {
-    if (a.error) return '<div class="item login"><div class="src">Claude login</div><strong>Login state unknown</strong><br>' + esc(a.error) + "</div>";
+    var o = a.owner || {};   // plain words from owner_text (D-345/D-347): no command, no raw message
+    if (a.error) return '<div class="item login"><div class="src">Claude login</div><strong>' + esc(o.title || "") + "</strong><br>" + esc(o.text || "") + "</div>";
     if (!a.expired) return "";
     return '<div class="item login"><div class="src">Claude login' + (a.since_berlin ? " · since " + esc(a.since_berlin) : "") +
-      '</div><strong>Claude login EXPIRED: AFClaude cannot reach Claude</strong><br>Fix: ' + esc(a.fix || "") +
-      (a.found ? '<div class="mut">Claude said: ' + esc(a.found) + (a.source ? " (" + esc(a.source) + ")" : "") + "</div>" : "") +
-      '<div class="mut">This notice goes away by itself with the next successful Claude call; then clear the pause.</div></div>';
+      '</div><strong>' + esc(o.title || "") + "</strong><br>" + esc(o.text || "") + "</div>";
   }
   function renderInput(s) {
     var n = s.needs_input || {}, out = [];
