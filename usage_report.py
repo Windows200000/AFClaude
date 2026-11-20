@@ -49,6 +49,7 @@ sys.path.insert(0, HERE)
 import keepalive as ka  # noqa: E402  (usage cache, PROJECTS_DIR, berlin/parse_ts helpers)
 import telemetry  # noqa: E402  (phase 2c: --record also writes the DB table usage_reports)
 import identity  # noqa: E402  (the actor of its records: who runs it)
+import txsource  # noqa: E402  (AFCLAUDE_READERS=bridge: the transcripts through the host kit)
 
 UTC = timezone.utc
 BERLIN = ka.BERLIN
@@ -85,17 +86,27 @@ def session_ids(session_id):
 
 
 def main_transcripts(session_id):
-    return sorted(f for sid in session_ids(session_id)
+    """The main transcript files of the session's chain, sorted. AFCLAUDE_READERS=bridge (txsource.py): the
+    host's files by way of the mirror (brought up to date here); a bridge failure raises (D-235)."""
+    ids = session_ids(session_id)
+    if txsource.bridge_on():
+        return [txsource.mirror(r) for r in sorted(r for sid in ids for r in txsource.session_mains(sid))]
+    return sorted(f for sid in ids
                   for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", f"{sid}.jsonl")))
 
 
 def subagent_files(session_id):
     """agentId -> list of agent-<id>.jsonl paths (usually one, but a session's
     cwd can change mid-session, same as the main transcript), over every id of the
-    session's "cleared" chain (session_ids)."""
+    session's "cleared" chain (session_ids). Bridge mode: full mirror copies."""
     by_agent = {}
     for sid in session_ids(session_id):
-        for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents", "agent-*.jsonl")):
+        if txsource.bridge_on():
+            found = [txsource.mirror(r) for r in txsource.session_subagent_rels(sid)
+                     if os.path.basename(r).startswith("agent-")]
+        else:
+            found = glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents", "agent-*.jsonl"))
+        for f in found:
             base = os.path.basename(f)
             agent_id = base[len("agent-"):-len(".jsonl")]
             by_agent.setdefault(agent_id, []).append(f)
@@ -103,6 +114,12 @@ def subagent_files(session_id):
 
 
 def load_meta(session_id, agent_id):
+    if txsource.bridge_on():
+        # the host kit serves *.jsonl only (transcript-read's path pattern), not agent-<id>.meta.json: a missing
+        # label must not look like "no description" (D-235), so this raises until the kit can serve it
+        raise txsource.TxError(f"agent-{agent_id}.meta.json of session {session_id[:8]} cannot be read with "
+                               "AFCLAUDE_READERS=bridge: the host kit serves no .meta.json (needs a kit change); "
+                               "run usage_report on the host (mount mode)")
     for f in (f for sid in session_ids(session_id)
               for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents",
                                               f"agent-{agent_id}.meta.json"))):
@@ -406,4 +423,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except txsource.TxError as e:       # a bridge read failed: stop with the reason (D-235)
+        sys.exit(f"usage_report: {e}")

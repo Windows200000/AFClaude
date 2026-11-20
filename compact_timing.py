@@ -70,6 +70,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import owner_words  # noqa: E402  (the prefix list and the owner-prompt rule)
 import store  # noqa: E402
+import txsource  # noqa: E402  (AFCLAUDE_READERS=bridge: the transcripts through the host kit)
 
 UTC = timezone.utc
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -615,25 +616,49 @@ def context_block(path: Optional[str], now: datetime, m: Optional[Mapping[str, A
 
 # ---------------------------------------------------------------- the fit (the monthly usage review)
 
+def _transcripts(projects_dir: str, main_session: Optional[str] = None) -> list[tuple[str, Optional[float]]]:
+    """[(local path, mtime or None)] of the transcripts to read: every one under `projects_dir` (main sessions and
+    subagents), or the `main_session`'s main transcripts. Mount mode: `glob`, no mtime (the caller takes
+    getmtime). AFCLAUDE_READERS=bridge (txsource.py): the host's files, sorted, with the mtime of one listing and
+    the mirror path (the reader's _iter_entries brings it up to date); a bridge failure raises TxError, never
+    fewer files (D-235), and an explicit other projects dir raises (it would answer an empty scan once the
+    mounts are gone)."""
+    if txsource.use_bridge(projects_dir, txsource.host_projects_dir()):
+        lst = txsource.listing()
+        rels = txsource.session_mains(main_session) if main_session else sorted(lst)
+        return [(txsource.mirror_path(r), lst[r][1]) for r in rels]
+    if main_session:
+        return [(p, None) for p in glob.glob(os.path.join(projects_dir, "*", f"{main_session}.jsonl"))]
+    return [(p, None) for p in glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)]
+
+
 def all_requests(projects_dir: str, since: datetime) -> list[Request]:
     """Every request in every transcript under projects_dir (main sessions and subagents) at or
     after `since` (files not modified since then are skipped)."""
     out: list[Request] = []
     cutoff = since.timestamp()
-    for path in glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True):
-        try:
-            if os.path.getmtime(path) < cutoff:
+    bridge = txsource.bridge_on()
+    for path, mtime in _transcripts(projects_dir):
+        if mtime is None:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
                 continue
-        except OSError:
+        if mtime < cutoff:
             continue
         reqs: dict[str, Request] = {}
-        for e in _iter_entries(path):
-            got = request_of(e)
-            if got and got[1].ts >= since:
-                key, r = got
-                old = reqs.get(key)
-                if old is None or r.output >= old.output:
-                    reqs[key] = r
+        try:
+            for e in _iter_entries(path):
+                got = request_of(e)
+                if got and got[1].ts >= since:
+                    key, r = got
+                    old = reqs.get(key)
+                    if old is None or r.output >= old.output:
+                        reqs[key] = r
+        except FileNotFoundError:
+            if not bridge:
+                raise
+            continue                  # deleted on the host since the listing (Claude Code's cleanup): as in mount mode
         out.extend(reqs.values())
     out.sort(key=lambda r: r.ts)
     return out
@@ -785,8 +810,7 @@ def run_fit(days: int, projects_dir: str, main_session: Optional[str], now: date
     reqs = all_requests(projects_dir, since)
     scans = []
     if main_session:
-        hits = glob.glob(os.path.join(projects_dir, "*", f"{main_session}.jsonl"))
-        scans = [scan(p) for p in hits]
+        scans = [scan(p) for p, _m in _transcripts(projects_dir, main_session)]
     return fit(read_samples(since), reqs, prev, now, scans)
 
 
@@ -858,7 +882,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except store.DBError as e:
         print(store.handback_text(e) if e.not_saved else f"error: {e}", file=sys.stderr)
         return 1
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, txsource.TxError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0
