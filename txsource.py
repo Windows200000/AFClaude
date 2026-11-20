@@ -282,12 +282,16 @@ def rel_of(path: str) -> Optional[str]:
     return p[len(root):].replace(os.sep, "/") if p.startswith(root) else None
 
 
+def host_projects_dir() -> str:
+    """The host's projects dir as the readers' default names it: KEEPALIVE_PROJECTS_DIR, else ~/.claude/projects
+    (keepalive.PROJECTS_DIR)."""
+    return os.environ.get("KEEPALIVE_PROJECTS_DIR", "") or os.path.expanduser("~/.claude/projects")
+
+
 def rel_of_host(path: str, host_projects: Optional[str] = None) -> Optional[str]:
-    """The transcript path relative to the host's projects dir (`host_projects`, default KEEPALIVE_PROJECTS_DIR
-    or ~/.claude/projects, keepalive.PROJECTS_DIR), or None when `path` is not below it: the host form a
-    stored path (sessions.path, an inbox verify entry) has."""
-    root = os.path.abspath(host_projects or os.environ.get("KEEPALIVE_PROJECTS_DIR", "")
-                           or os.path.expanduser("~/.claude/projects")) + os.sep
+    """The transcript path relative to the host's projects dir (`host_projects`, default host_projects_dir()),
+    or None when `path` is not below it: the host form a stored path (sessions.path, an inbox verify entry) has."""
+    root = os.path.abspath(host_projects or host_projects_dir()) + os.sep
     p = os.path.abspath(path)
     return p[len(root):].replace(os.sep, "/") if p.startswith(root) else None
 
@@ -359,6 +363,16 @@ def session_transcript(session_id: str) -> Optional[str]:
     """keepalive.transcript_path in bridge mode: the mirrored (current) main transcript, or None."""
     rel = session_main(session_id)
     return mirror(rel) if rel else None
+
+
+def session_subagent_rels(session_id: str) -> list[str]:
+    """Relative paths of every subagent transcript <project dir>/<session id>/subagents/<name>.jsonl of a session id
+    (any project dir; the mount mode's glob `*/<id>/subagents/*.jsonl`, whose `*` skips a dot name), sorted."""
+    def hit(r: str) -> bool:
+        p = r.split("/")
+        return len(p) == 4 and p[1] == session_id and p[2] == "subagents" and not p[0].startswith(".") \
+            and not p[3].startswith(".")
+    return sorted(r for r in listing() if hit(r))
 
 
 def subagent_rels(main_path: str) -> list[str]:

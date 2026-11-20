@@ -103,7 +103,6 @@ UTC = timezone.utc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECTS_DIR = os.environ.get("KEEPALIVE_PROJECTS_DIR", os.path.expanduser("~/.claude/projects"))
-JOBS_DIR = os.path.expanduser("~/.claude/jobs")
 # Per-process registry every live claude writes (<pid>.json: pid, sessionId, procStart,
 # kind, entrypoint, ...). Both paths are injectable so tests can use a fake /proc.
 SESSIONS_DIR = os.environ.get("KEEPALIVE_SESSIONS_DIR", os.path.expanduser("~/.claude/sessions"))
@@ -845,14 +844,6 @@ def agent_entries(session_id):
     if r.returncode != 0:
         raise OSError(f"`claude agents` failed rc={r.returncode}: {(r.stderr or '').strip()[:200]}")
     return [a for a in json.loads(r.stdout or "[]") if a.get("sessionId") == session_id]
-
-
-def job_state(session_id):
-    try:
-        with open(os.path.join(JOBS_DIR, session_id[:8], "state.json")) as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 class NoTmuxName(LookupError):
