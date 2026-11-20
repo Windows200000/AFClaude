@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -159,6 +160,50 @@ class RunRows(Runs):
         self.assertIn("not the live install", out.getvalue())
         with mock.patch.object(os.path, "isdir", return_value=True), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(tasks.main(["--db", missing, "run-hook", "start"]), 1)   # live + missing: error
+
+    def test_a_linked_worktree_without_a_db_fails_locally_and_never_alerts(self):
+        # 16.11.: tasks.py run in a worktree (no data/, no DB) pushed a "database missing" alert to the owner
+        with tempfile.TemporaryDirectory() as d:
+            wt, live, missing = (os.path.join(d, n) for n in ("wt", "live", "none/afclaude.db"))
+            os.makedirs(live)
+            os.mkdir(wt)
+            os.mkdir(os.path.join(live, ".git"))
+            with open(os.path.join(wt, ".git"), "w") as f:
+                f.write(f"gitdir: {live}/.git/worktrees/wt\n")
+            alert = mock.Mock(side_effect=AssertionError("alerted"))
+            def main(here, *argv):
+                err = io.StringIO()
+                with mock.patch.object(tasks, "HERE", here), mock.patch.object(store, "report_db_error", alert), \
+                        mock.patch.object(actions, "deliver_alerts", alert), \
+                        mock.patch.object(store, "connect", side_effect=AssertionError("connected")), \
+                        contextlib.redirect_stderr(err):
+                    return tasks.main(["--db", missing, *argv]), err.getvalue()
+            rc, err = main(wt, "list")
+            self.assertEqual(rc, 1)
+            self.assertIn(f"run tasks.py from the main checkout {live}", err)
+            self.assertFalse(os.path.exists(os.path.dirname(missing)))           # nothing written anywhere
+            alert.assert_not_called()
+            args = tasks.parser().parse_args(["--db", self.db, "list"])      # an existing DB: not this case
+            with mock.patch.object(tasks, "HERE", wt):
+                self.assertIsNone(tasks.linked_worktree_without_db(args))
+            with open(os.path.join(wt, ".git"), "w") as f:                       # an unreadable pointer: an error
+                f.write("garbage\n")
+            args.db = missing
+            with mock.patch.object(tasks, "HERE", wt), self.assertRaisesRegex(ValueError, "no linked-worktree"):
+                tasks.linked_worktree_without_db(args)
+
+    def test_the_live_checkout_and_a_plain_copy_with_a_missing_db_still_alert(self):
+        with tempfile.TemporaryDirectory() as d:
+            live, copy = os.path.join(d, "live"), os.path.join(d, "copy")
+            os.makedirs(os.path.join(live, ".git"))
+            os.mkdir(copy)                                                       # no .git at all (image, copy)
+            missing = os.path.join(d, "none", "afclaude.db")
+            for here in (live, copy):
+                alert = mock.Mock(return_value=None)
+                with mock.patch.object(tasks, "HERE", here), mock.patch.object(store, "report_db_error", alert), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(tasks.main(["--db", missing, "list"]), 1)
+                alert.assert_called_once()
 
     def test_the_audit_log_has_an_actor_ts_index(self):
         rows = self.conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='audit_log'")

@@ -470,6 +470,28 @@ def hook_is_inert(args) -> bool:
     return not live and not os.path.isfile(args.db or store.DB_PATH)
 
 
+def linked_worktree_without_db(args) -> str | None:
+    """The main checkout's path when this tasks.py runs from a linked git worktree (its .git is a file naming the
+    main repo's git dir) and the DB it would open doesn't exist; else None. A worktree has no data/ and no DB by
+    design, so a "database missing" there is the wrong place, not a lost volume: the command fails locally and
+    pushes no alert (the false alarm of 16.11.). The marker is the .git FILE only: the live checkout (.git is a
+    directory) and a plain copy or image without .git keep the D-171/D-235 alert for a missing DB, as does a
+    worktree pointed at an existing DB (--db / AFCLAUDE_DB)."""
+    git = os.path.join(HERE, ".git")
+    if not os.path.isfile(git) or os.path.isfile(args.db or store.DB_PATH):
+        return None
+    try:
+        with open(git, encoding="utf-8") as f:
+            line = f.readline().strip()
+    except OSError as e:
+        raise ValueError(f"can't read {git}: {e}") from e
+    gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+    marker = os.sep + ".git" + os.sep + "worktrees" + os.sep
+    if marker not in gitdir:
+        raise ValueError(f"{git} is no linked-worktree pointer ({line[:80]!r}): can't tell the main checkout")
+    return gitdir.split(marker)[0]
+
+
 def run_hook(conn, args):
     """Phase 5a A4 (§3.3, §3.8): the SubagentStart / SubagentStop hook. The payload (stdin JSON) names the parent
     session, the subagent and its type. A subagent with no type (a helper agent of an interactive session) and a
@@ -1858,6 +1880,11 @@ def main(argv=None):
         return worker_hold.cli(args, args.db or store.DB_PATH)
     if args.cmd == "run-hook" and hook_is_inert(args):
         return print("no run: this checkout is not the live install (no database): nothing recorded") or 0
+    main_checkout = linked_worktree_without_db(args)
+    if main_checkout is not None:       # no connect, no alert, nothing written: a local error only
+        print(f"error: no AFClaude database here: run tasks.py from the main checkout {main_checkout} "
+              "(this is a git worktree: it has no data/)", file=sys.stderr)
+        return 1
     if args.cmd == "run-hook" and args.hook == "deliver":
         # the PostToolUse hook has 30 s: every DB wait is short and tried once (a lock is an error it shows)
         with store.quick_waits(HOOK_BUSY):
