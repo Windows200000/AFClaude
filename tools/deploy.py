@@ -88,7 +88,8 @@ DB_NAME = "afclaude.db"
 # usage read: it still goes out as `claude -p ... /usage`) that a rebuild must not cut off
 # (D-257, the 21.10. incident). Word-boundary \bclaude\b: "afclaude"/"AFCLAUDE_*" never match
 # (no boundary before "claude" inside that word).
-WATCH_RE = re.compile(r"usage_sampler\.py|usage_review\.py|\bunittest\b|\bclaude\b")
+# (phase 5c B3: the daily backup's child too: a rebuild would kill it half-way and leave its work files behind)
+WATCH_RE = re.compile(r"usage_sampler\.py|usage_review\.py|runner_jobs\.py backup\b|\bunittest\b|\bclaude\b")
 
 
 def container_processes(container: str = CONTAINER,

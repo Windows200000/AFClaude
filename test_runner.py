@@ -909,6 +909,50 @@ class Misc(Base):
 
 
 
+class DailySetting(Base):
+    """Phase 5c B3: the backup job's daily time is the setting backup_time (D-146), UTC."""
+
+    def test_the_default_equals_the_setting_default_and_the_job_runs_while_paused(self):
+        job = runner.JOBS["backup"]
+        h, m = actions.SETTINGS["backup_time"].default().split(":")
+        self.assertEqual((job.daily, job.daily_setting, job.paused), ((int(h), int(m)), "backup_time", "runs"))
+        self.assertEqual(job.timeout_min, actions.SETTINGS["runner_timeout_backup"].default())
+        with self.assertRaises(ValueError):
+            runner.Job("x", 1, daily=(1, 1), daily_setting="no_such_setting")
+        with self.assertRaises(ValueError):
+            runner.Job("x", 1, every=MIN, daily_setting="backup_time")
+
+    def test_next_tick_uses_the_current_time_and_a_change_moves_the_stored_one(self):
+        r = self.runner(owns={"backup"})
+        job = runner.JOBS["backup"]
+        t = datetime(2026, 10, 19, 23, 59, 30, tzinfo=UTC)
+        self.assertEqual(runner.next_tick(job, t), datetime(2026, 10, 20, 3, 40, tzinfo=UTC))
+        self.now = t
+        r.boot()
+        self.assertEqual(self.next_due("backup"), datetime(2026, 10, 20, 3, 40, tzinfo=UTC))
+        actions.perform(self.conn, "setting.set", {"key": "backup_time", "value": "05:15"}, actor="owner", via="cli")
+        self.assertEqual(r.plan(self.now), [])                      # not due, but the stored tick follows
+        self.assertEqual(self.next_due("backup"), datetime(2026, 10, 20, 5, 15, tzinfo=UTC))
+        self.now = datetime(2026, 10, 20, 5, 15, 1, tzinfo=UTC)
+        self.assertEqual([d.job.name for d in r.plan(self.now)], ["backup"])
+        self.assertEqual(r._advance(job, self.now), datetime(2026, 10, 21, 5, 15, tzinfo=UTC))
+
+    def test_a_boot_catch_up_does_not_depend_on_the_job_names_order(self):
+        jobs = dict(runner.JOBS, aaa=runner.Job("aaa", 1, every=MIN))       # sorts before "backup": it takes n = 0
+        r = self.runner(owns={"aaa", "backup"}, jobs=jobs)
+        for name in ("aaa", "backup"):
+            actions.runner_job_set(self.conn, name, actor="runner", via="runner",
+                                   next_due=runner._iso(START - 2 * MIN))      # both overdue at the boot
+        self.now = START
+        r.boot()
+        caught = self.next_due("backup")
+        self.assertEqual(caught, START + runner.STAGGER)
+        r.plan(self.now)
+        self.assertEqual(self.next_due("backup"), caught)                   # the re-plan leaves the catch-up alone
+        self.now = START + runner.STAGGER
+        self.assertIn("backup", [d.job.name for d in r.plan(self.now)])
+
+
 # ---------------------------------------------------------------- S2: offset, ownership, shadow, ensure, stop
 
 SEC = timedelta(seconds=1)
@@ -974,7 +1018,7 @@ class SimpleTicks(Base):
     def test_s3_owns_the_simple_ticks(self):
         self.assertEqual(runner.RUNNER_OWNS, frozenset({"stall_scan", "prune_runs", "at", "window_start",
                                                          "inbox", "inbox_verify", "status_snapshot", "request",
-                                                         "proposal_alert", "host_check"}
+                                                         "proposal_alert", "host_check", "backup"}
                                                        | set(S3_TICKS) | runner.WATCHER_PASSES))   # + S4-S7, S9b, 3b S5
         self.assertEqual(set(runner.JOBS) - runner.RUNNER_OWNS, set())             # every job is the runner's
 

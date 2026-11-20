@@ -2,9 +2,13 @@
 """Offline tests for the DB backup bundle and its restore (backup.py, phase 5c step B1 of
 docs/phase5c_plan.md; temp DBs only): the round trip, the restored install's identity and pause
 (D-173), create never writing its source, and every refusal (no install_id, a database at the
-target, a damaged or tampered bundle, a newer schema), with nothing partial left behind."""
+target, a damaged or tampered bundle, a newer schema), with nothing partial left behind.
+Step B3 (D-287): the scheduled, write-once backups: the protected floor under every backup_keep, the
+two grants (record creates, prune deletes, each refusing the other and every other actor), the table's
+own triggers, a failed run pausing automation and keeping every older bundle, a full disk."""
 import testenv  # noqa: F401  (first: a temp DB, no live settings)
 
+import errno
 import hashlib
 import io
 import json
@@ -14,10 +18,12 @@ import sqlite3
 import tarfile
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import actions
 import backup
+import failstop
 import store
 
 
@@ -327,6 +333,385 @@ class Actions(Base):
                     actions.perform(conn, name, params, actor="mcp:x", via="mcp", autonomous=True)
         finally:
             conn.close()
+
+
+class Scheduled(Base):
+    """Phase 5c B3: the daily job's write-once bundles. The live database is a temp one (store.DB_PATH)."""
+    OWNER = "owner"
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(store, "DB_PATH", self.src)
+        p.start()
+        self.addCleanup(p.stop)
+        self.notes = []
+        n = mock.patch.object(failstop, "_notify", lambda subject, body: self.notes.append(subject))
+        n.start()
+        self.addCleanup(n.stop)
+        self.dir = backup.backup_dir()
+        self.t0 = datetime(2026, 11, 18, 3, 40, tzinfo=timezone.utc)      # a Wednesday
+
+    def conn(self):
+        return store.connect(self.src)
+
+    def rows(self):
+        c = self.conn()
+        try:
+            return store.backup_rows(c)
+        finally:
+            c.close()
+
+    def files(self):
+        return sorted(n for n in os.listdir(self.dir) if n != backup.LOCK_NAME) if os.path.isdir(self.dir) else []
+
+    def perform(self, name, actor, **params):
+        c = self.conn()
+        try:
+            return actions.perform(c, name, params, actor=actor, via="runner")
+        finally:
+            c.close()
+
+    def fake(self, tier, n):
+        """A recorded bundle that is only a small file (the table and the prune don't read it). n: its
+        number, i.e. its time."""
+        os.makedirs(self.dir, exist_ok=True)
+        name = f"afclaude-backup-0123abcd-20261022T{n:09d}Z.tar.gz"
+        with open(os.path.join(self.dir, name), "wb") as fh:
+            fh.write(b"x" * 10)
+        m = {"install_id": "0123abcd" * 4, "install_epoch": 0, "schema_version": store.SCHEMA_VERSION,
+             "created_at": "2026-10-22T03:12:00.123Z"}
+        self.perform("backup.record", actions.BACKUP_RECORD_ACTOR, file=name, tier=tier, manifest=m,
+                     sha256="a" * 64, size=10, directory=self.dir)
+        return name
+
+    def test_a_run_makes_a_verified_read_only_recorded_bundle(self):
+        res = backup.run_scheduled(now=self.t0)
+        self.assertEqual((res["tier"], res["deleted"]), ("weekly", []))     # the first run of a week is the weekly
+        path = os.path.join(self.dir, res["file"])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o400)
+        self.assertEqual(os.stat(self.dir).st_mode & 0o777, 0o700)
+        self.assertEqual(set(self.files()), {res["file"]})   # no .partial, no work directory
+        self.assertEqual(backup.verify(path)["install_id"], self.meta(self.src, "install_id"))
+        (row,) = self.rows()
+        self.assertEqual((row["file"], row["tier"], row["size"], row["sha256"], row["protected"]),
+                         (res["file"], "weekly", os.path.getsize(path), sha(path), True))
+        self.assertTrue(row["verified_at"])
+        audit = [a for a in store.audit_log(self.conn(), target_type="backup")]
+        self.assertEqual([(a["action"], a["actor"]) for a in audit], [("backup.record", "runner:backup")])
+
+    def test_tier_is_the_first_run_since_the_weekly_day(self):
+        def tier(day, hour=3):
+            c = self.conn()
+            try:
+                return backup.tier_for(c, datetime(2026, 11, day, hour, 40, tzinfo=timezone.utc))
+            finally:
+                c.close()
+        self.assertEqual(tier(18), "weekly")                                  # nothing recorded yet
+        self.fake("weekly", 1)                                               # created_at 22.10.: an old one
+        self.assertEqual(tier(18), "weekly")                                 # none since this week's Sunday
+        res = backup.run_scheduled(now=self.t0)                              # Wednesday 18.11.: the weekly
+        self.assertEqual(res["tier"], "weekly")
+        self.assertEqual((tier(18, 23), tier(21)), ("daily", "daily"))       # the rest of that week
+        self.assertEqual(tier(22), "weekly")                                 # Sunday 22.11.: a new week
+        testenv.set_setting("backup_weekly_day", "wed", db=self.src)
+        self.assertEqual(tier(18, 23), "daily")                              # this Wednesday already has one
+        self.assertEqual(tier(25), "weekly")
+
+    def new_install(self):
+        """A fresh live database and an empty backup directory for one subtest."""
+        d = tempfile.mkdtemp(prefix="afclaude-backup-live-")
+        self.addCleanup(shutil.rmtree, d, True)
+        self.src = os.path.join(d, "afclaude.db")
+        store.connect(self.src, create=True).close()
+        p = mock.patch.object(store, "DB_PATH", self.src)
+        p.start()
+        self.addCleanup(p.stop)
+        self.dir = backup.backup_dir()
+
+    def test_the_floor_survives_every_backup_keep(self):
+        """The latest daily-or-weekly and the 2 latest weekly bundles are never pruned, whatever backup_keep
+        says, 0 included; the rest goes by count; rows and files agree afterwards."""
+        tiers = ["weekly", "daily", "daily", "weekly", "daily", "manual", "weekly", "daily", "daily", "manual"]
+        for keep in (0, 1, 2, 3, 5, 14, 100):
+            with self.subTest(keep=keep):
+                self.new_install()
+                names = [self.fake(t, i + 1) for i, t in enumerate(tiers)]
+                floor = {names[8], names[6], names[3]}          # the newest daily; the 2 newest weeklies
+                res = backup.prune(keep=keep, actor=actions.BACKUP_PRUNE_ACTOR, via="runner")
+                want = floor | set(names[max(0, len(names) - keep):] if keep else [])
+                self.assertEqual({r["file"] for r in self.rows()}, want)
+                self.assertEqual(set(self.files()), want)
+                self.assertEqual(set(res["deleted"]), set(names) - want)
+                self.assertEqual({r["file"] for r in self.rows() if r["protected"]}, floor)
+
+    def test_the_grants_are_split_and_the_table_is_write_once(self):
+        a = self.fake("daily", 1)
+        b = self.fake("daily", 2)
+        for actor in ("task-manager:abc", "agent:abc", "mcp:x", "runner:other", "runner", "user:7"):
+            with self.subTest(actor=actor):
+                for name, params in (("backup.prune", {"keep": 0}),
+                                     ("backup.record", {"file": a, "tier": "daily", "manifest": {},
+                                                        "sha256": "a" * 64, "size": 10, "directory": self.dir})):
+                    with self.assertRaises(actions.Forbidden):
+                        self.perform(name, actor, **params)
+        with self.assertRaisesRegex(actions.Forbidden, "write-once"):        # the record actor can't prune
+            self.perform("backup.prune", actions.BACKUP_RECORD_ACTOR, keep=0)
+        with self.assertRaisesRegex(actions.Forbidden, "write-once"):        # nor can the prune actor record
+            self.perform("backup.record", actions.BACKUP_PRUNE_ACTOR, file=a, tier="daily", manifest={},
+                         sha256="a" * 64, size=10, directory=self.dir)
+        self.assertEqual(set(self.files()), {a, b})
+        # at the table: no connection updates a row, none deletes one outside the prune; the floor even with
+        # the prune gate open
+        c = self.conn()
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "write-once"):
+                c.execute("UPDATE backups SET tier='manual'")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "only through"):
+                c.execute("DELETE FROM backups WHERE file=?", (a,))
+            c.rollback()
+            c.execute("UPDATE backups_prune_gate SET allowed=1")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "protected"):
+                c.execute("DELETE FROM backups WHERE file=?", (b,))         # the latest daily
+            c.rollback()
+        finally:
+            c.close()
+        with self.assertRaises(actions.Conflict):                            # a name is never recorded twice
+            self.perform("backup.record", actions.BACKUP_RECORD_ACTOR, file=b, tier="daily",
+                         manifest={"install_id": "x", "install_epoch": 0, "schema_version": 1, "created_at": "t"},
+                         sha256="a" * 64, size=10, directory=self.dir)
+
+    def test_record_checks_what_it_records(self):
+        ok = dict(file="afclaude-backup-0123abcd-20261022T031200123Z.tar.gz", tier="daily",
+                  manifest={"install_id": "x", "install_epoch": 0, "schema_version": 1, "created_at": "t"},
+                  sha256="a" * 64, size=10, directory=self.dir)
+        os.makedirs(self.dir)
+        for bad, msg in ((dict(ok, file="../x.tar.gz"), "bundle name"), (dict(ok, tier="hourly"), "tier"),
+                         (dict(ok, manifest={}), "manifest"), (dict(ok, sha256="z"), "sha256"),
+                         (dict(ok, size=0), "size"), (dict(ok), "is not a file")):
+            with self.subTest(msg=msg), self.assertRaisesRegex(ValueError, msg):
+                self.perform("backup.record", actions.BACKUP_RECORD_ACTOR, **bad)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_scheduled_run_prunes_after_the_new_bundle_is_recorded(self):
+        testenv.set_setting("backup_keep", 1, db=self.src)
+        old = [self.fake("daily", i) for i in (1, 2, 3)]
+        res = backup.run_scheduled(now=self.t0)
+        self.assertEqual(set(res["deleted"]), set(old))                     # keep 1 = the new one; old ones go
+        self.assertEqual({r["file"] for r in self.rows()}, {res["file"]})
+        prunes = [a for a in store.audit_log(self.conn(), target_type="backup") if a["action"] == "backup.prune"]
+        self.assertEqual([a["actor"] for a in prunes], ["runner:backup_prune"])
+
+    def test_a_manual_run_is_tier_manual_recorded_as_the_caller_and_prunes_nothing(self):
+        testenv.set_setting("backup_keep", 0, db=self.src)
+        old = [self.fake("daily", 1), self.fake("daily", 2)]
+        res = backup.run_scheduled(manual=True)
+        self.assertEqual((res["tier"], res["deleted"]), ("manual", []))
+        self.assertEqual(len(self.rows()), 3)
+        self.assertEqual(set(self.files()) - {res["file"]}, set(old))
+
+    def paused(self):
+        c = self.conn()
+        try:
+            return actions.get_setting(c, "automation_paused"), actions.get_setting(c, "automation_paused_reason")
+        finally:
+            c.close()
+
+    def test_a_failed_verify_pauses_and_keeps_every_older_bundle(self):
+        testenv.set_setting("backup_keep", 0, db=self.src)                  # retention would take all but the floor
+        first = [self.fake("weekly", 1), self.fake("daily", 2), self.fake("daily", 3), self.fake("daily", 4)]
+        before = (self.files(), [r["id"] for r in self.rows()])
+        real = backup.verify
+        for stage, patched in (("the partial", lambda b: real(b) if not b.endswith(".partial") else self.boom()),
+                               ("the finished file", lambda b: self.boom() if b.endswith(".tar.gz") else real(b))):
+            with self.subTest(stage=stage):
+                with mock.patch.object(backup, "verify", patched):
+                    with self.assertRaisesRegex(backup.BackupError, "boom"):
+                        backup.daily_job()
+                self.assertEqual((self.files(), [r["id"] for r in self.rows()]), before)   # nothing pruned, no new
+                paused, why = self.paused()
+                self.assertTrue(paused)
+                self.assertIn(backup.FAIL_SUBJECT, why)
+        self.assertEqual(set(self.files()), set(first))
+        self.assertEqual(len([n for n in self.notes if backup.FAIL_SUBJECT in n]), 1)           # alerted once per pause
+
+    def boom(self):
+        raise backup.BackupError("boom")
+
+    def test_no_install_id_fails_loud(self):
+        """The deploy order: a database without install_id makes the job fail, alert and pause; the fix is
+        `backup.py stamp` (the plan's deploy step), after which the next run works."""
+        c = sqlite3.connect(self.src)
+        c.execute("DELETE FROM meta WHERE key='install_id'")
+        c.commit()
+        c.close()
+        with self.assertRaisesRegex(backup.BackupError, "backup.py stamp"):
+            backup.daily_job()
+        self.assertEqual((self.files(), self.rows()), ([], []))
+        self.assertTrue(self.paused()[0])
+        backup.stamp(self.src)
+        self.assertEqual(backup.run_scheduled(now=self.t0)["tier"], "weekly")
+
+    def test_a_full_disk_leaves_no_partial_and_no_row(self):
+        real = tarfile.TarFile.addfile
+
+        def full(tar, ti, fileobj=None):
+            real(tar, ti, fileobj)
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(tarfile.TarFile, "addfile", full):
+            with self.assertRaisesRegex(OSError, "No space"):
+                backup.daily_job()
+        self.assertEqual((self.files(), self.rows()), ([], []))
+        self.assertTrue(self.paused()[0])
+
+    def test_too_little_free_space_is_refused_before_anything_is_written(self):
+        gone = shutil._ntuple_diskusage(100, 99, 1)
+        with mock.patch.object(shutil, "disk_usage", return_value=gone):
+            with self.assertRaisesRegex(backup.BackupError, "not enough free space"):
+                backup.run_scheduled()
+        self.assertEqual((self.files(), self.rows()), ([], []))
+
+    def test_cli_list_and_prune(self):
+        names = [self.fake("daily", i) for i in (1, 2, 3)]
+        self.assertEqual([r["file"] for r in backup.listing()], names[::-1])
+        self.assertEqual([r["protected"] for r in backup.listing()], [True, False, False])
+        res = backup.prune(keep=1, actor=self.OWNER)
+        self.assertEqual(res["deleted"], names[:2])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            backup.prune(keep=-1, actor=self.OWNER)
+        self.assertEqual(backup.main(["list"]), 0)
+
+    def test_insert_or_replace_cannot_replace_a_row(self):
+        """INSERT OR REPLACE removes the replaced row without firing the delete triggers (recursive_triggers is
+        off): refused before the conflict is resolved, by file name and by id; so is an upsert."""
+        names = [self.fake("weekly", 1), self.fake("weekly", 2), self.fake("daily", 3)]      # all protected
+        cols = ("file, created_at, tier, size, sha256, verified_at, install_id, install_epoch, schema_version, "
+                "manifest")
+        vals = "'{}', 't', 'manual', 1, 'x', 't', 'i', 0, 1, '{{}}'"
+        before = [(r["id"], r["file"], r["tier"]) for r in self.rows()]
+        c = self.conn()
+        try:
+            for sql in (f"INSERT OR REPLACE INTO backups({cols}) VALUES ({vals.format(names[2])})",
+                        f"INSERT OR REPLACE INTO backups(id, {cols}) VALUES (1, {vals.format('zz')})",
+                        f"INSERT INTO backups({cols}) VALUES ({vals.format(names[0])}) "
+                        "ON CONFLICT(file) DO UPDATE SET tier='manual'",
+                        f"REPLACE INTO backups({cols}) VALUES ({vals.format(names[1])})"):
+                with self.subTest(sql=sql[:40]), self.assertRaisesRegex(sqlite3.IntegrityError, "write-once"):
+                    c.execute(sql)
+                c.rollback()
+        finally:
+            c.close()
+        self.assertEqual([(r["id"], r["file"], r["tier"]) for r in self.rows()], before)
+
+    def test_a_missing_gate_row_refuses_deletes(self):
+        self.fake("daily", 1)
+        self.fake("daily", 2)
+        c = self.conn()
+        try:
+            c.execute("UPDATE backups_prune_gate SET allowed=1")
+            c.execute("DELETE FROM backups_prune_gate")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "only through"):
+                c.execute("DELETE FROM backups WHERE id=1")
+            c.rollback()
+        finally:
+            c.close()
+
+    def test_prune_removes_files_only_after_the_rows_committed(self):
+        names = [self.fake("daily", i) for i in (1, 2, 3, 4)]
+        real = os.remove
+
+        def flaky(path, *a, **k):
+            if path.endswith(names[1]):
+                raise PermissionError(13, "denied")
+            return real(path, *a, **k)
+        with mock.patch.object(os, "remove", flaky):
+            with self.assertRaisesRegex(backup.BackupError, f"committed.*{names[1]}"):
+                backup.prune(keep=0, actor=actions.BACKUP_PRUNE_ACTOR, via="runner")
+        self.assertEqual([r["file"] for r in self.rows()], [names[3]])           # rows gone (committed), floor stays
+        self.assertEqual(set(self.files()), {names[1], names[3]})                # the one orphan is named, kept
+        self.assertEqual([r["file"] for r in backup.listing()], [names[3], names[1]])
+        self.assertEqual(backup.listing()[1], {"file": names[1], "unrecorded": True})
+
+    def test_a_killed_run_leaves_work_files_the_next_run_removes_and_keeps_bundles(self):
+        os.makedirs(self.dir, exist_ok=True)
+        done = self.fake("weekly", 1)
+        os.makedirs(os.path.join(self.dir, ".backup-abc123"))
+        with open(os.path.join(self.dir, ".backup-abc123", "afclaude.db"), "wb") as fh:
+            fh.write(b"x" * 100)
+        part = "afclaude-backup-0123abcd-20261022T000000009Z.tar.gz.partial"
+        with open(os.path.join(self.dir, part), "wb") as fh:
+            fh.write(b"x")
+        lone = "afclaude-backup-0123abcd-20261022T000000008Z.tar.gz"       # finished, never recorded
+        with open(os.path.join(self.dir, lone), "wb") as fh:
+            fh.write(b"x")
+        self.assertEqual(backup.listing()[-1], {"file": lone, "unrecorded": True})
+        res = backup.run_scheduled(now=self.t0)
+        self.assertEqual(set(res["cleaned"]), {".backup-abc123", part})
+        self.assertEqual(res["unrecorded"], [lone])                          # reported, not deleted
+        self.assertEqual(set(self.files()), {done, lone, res["file"]})
+
+    def test_the_job_line_names_an_unrecorded_bundle(self):
+        os.makedirs(self.dir, exist_ok=True)
+        lone = "afclaude-backup-0123abcd-20261022T000000008Z.tar.gz"
+        with open(os.path.join(self.dir, lone), "wb") as fh:
+            fh.write(b"x")
+        with mock.patch("sys.stdout", io.StringIO()):
+            line = backup.daily_job()
+        self.assertIn("UNRECORDED", line)
+        self.assertIn(lone, line)
+
+    def test_two_runs_at_once_are_refused(self):
+        import fcntl
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, backup.LOCK_NAME), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(backup.BackupError, "another backup is running"):
+                backup.run_scheduled(now=self.t0)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_recorded_bundle_is_never_removed_by_the_failure_path(self):
+        """A failure after the record committed (here: closing the connection) must not delete the bundle, which
+        is by now the protected latest."""
+        real = store.connect
+        state = {"n": 0}
+
+        class Closing:
+            def __init__(self, conn):
+                self._c = conn
+
+            def __getattr__(self, k):
+                return getattr(self._c, k)
+
+            def close(self):
+                self._c.close()
+                if state["n"] == 2:
+                    raise RuntimeError("late failure")
+
+        def wrapped(*a, **k):
+            state["n"] += 1
+            c = real(*a, **k)
+            return Closing(c) if state["n"] == 2 else c       # the 2nd connect is the record's
+        with mock.patch.object(store, "connect", wrapped):
+            with self.assertRaisesRegex(RuntimeError, "late failure"):
+                backup.run_scheduled(now=self.t0)
+        (row,) = self.rows()
+        self.assertEqual(self.files(), [row["file"]])
+
+    def test_the_owner_hears_it_in_plain_words(self):
+        import owner_text
+        self.assertNotEqual(owner_text.for_subject(backup.FAIL_SUBJECT), owner_text.GENERIC)
+        self.assertIn("backup", owner_text.for_subject("backup failed"))
+
+    def test_the_setting_validation(self):
+        for key, bad in (("backup_time", "25:00"), ("backup_time", "3pm"), ("backup_keep", -1),
+                         ("backup_weekly_day", "someday")):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                self.perform("setting.set", self.OWNER, key=key, value=bad)
+        self.perform("setting.set", self.OWNER, key="backup_time", value="4:05")
+        c = self.conn()
+        try:
+            self.assertEqual(actions.get_setting(c, "backup_time"), "04:05")
+        finally:
+            c.close()
 
 
 if __name__ == "__main__":

@@ -204,6 +204,7 @@ class Job:
     argv: Optional[tuple[str, ...]] = None
     offset: timedelta = timedelta(0)
     what: str = ""
+    daily_setting: str = ""             # a `daily` job whose time (UTC HH:MM) is this setting; `daily` is its default
 
     def __post_init__(self) -> None:
         if not actions.JOB_NAME_RE.match(self.name) or self.name == actions.RUNNER_ROW:
@@ -214,6 +215,8 @@ class Job:
                              "/ requests")
         if self.paused not in ("runs", "handler", "skip") or self.on_interrupt not in ("rerun", "fail"):
             raise ValueError(f"{self.name}: bad paused / on_interrupt")
+        if self.daily_setting and (self.daily is None or self.daily_setting not in actions.SETTINGS):
+            raise ValueError(f"{self.name}: daily_setting needs `daily` and a known setting")
         if self.offset and (self.every is None or not timedelta(0) < self.offset < self.every):
             raise ValueError(f"{self.name}: an offset needs an interval longer than it")
 
@@ -243,6 +246,11 @@ JOBS: dict[str, Job] = {j.name: j for j in (
     Job("docs_import", 5, every=10 * MIN, what="docs import"),
     Job("prune_logs", 10, daily=(3, 17), what="log retention"),
     Job("prune_runs", 10, daily=(3, 27), what="runner run-record retention (runner_runs)"),
+    # phase 5c B3 (D-287): the daily database backup, write-once with retention (backup.py, backup_keep); its time
+    # is the setting backup_time (the daily time here is only the default, a test keeps both equal). It runs
+    # while paused: a pause is when the newest state is worth keeping most.
+    Job("backup", 30, daily=(3, 40), daily_setting="backup_time",
+        what="daily database backup (backup.py run): verified, recorded, then pruned to backup_keep"),
     # S9(b): the status snapshot rows (usage, next run, pause, running runs), once a minute and also while
     # paused (the pause is part of it); 30 s off the minute, between the other ticks' offsets
     Job("status_snapshot", 2, every=MIN, offset=30 * SEC, what="status snapshot (status_snapshot.py): the DB rows "
@@ -316,7 +324,7 @@ SUPERVISED: dict[str, tuple[str, ...]] = (
 # their cron lines in the same commit; S9 removed the crontabs).
 RUNNER_OWNS: frozenset[str] = frozenset({"stall_scan", "prune_runs", "status_snapshot", "sampler", "dispatcher",
                                          "quickview", "docs_import", "prune_logs", "usage_review", "at", "window_start",
-                                         "proposal_alert", "host_check",
+                                         "proposal_alert", "host_check", "backup",
                                          "inbox", "inbox_verify", "request"}
                                         | WATCHER_PASSES)
 
@@ -378,15 +386,17 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def next_tick(job: Job, now: datetime) -> datetime:
-    """The job's first tick strictly after `now` (UTC grid / daily time)."""
+def next_tick(job: Job, now: datetime, daily: Optional[tuple[int, int]] = None) -> datetime:
+    """The job's first tick strictly after `now` (UTC grid / daily time). `daily`: the current time of a job
+    with a daily_setting (Runner._next_tick reads it), else the job's own."""
     if job.every is not None:
         day = now.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + job.offset
         step = job.every.total_seconds()
         k = math.floor((now - day).total_seconds() / step) + 1
         return day + timedelta(seconds=k * step)
     if job.daily is not None:
-        t = now.astimezone(UTC).replace(hour=job.daily[0], minute=job.daily[1], second=0, microsecond=0)
+        h, m = daily or job.daily
+        t = now.astimezone(UTC).replace(hour=h, minute=m, second=0, microsecond=0)
         return t if t > now else t + timedelta(days=1)
     raise ValueError(f"{job.name} has no tick")
 
@@ -571,6 +581,14 @@ class Runner:
             self.job_set(actions.RUNNER_ROW, heartbeat_at=_iso(now))
             self.last_beat = now
 
+    def _next_tick(self, job: Job, now: datetime) -> datetime:
+        """next_tick with the current time of a job whose daily time is a setting (D-146)."""
+        daily: Optional[tuple[int, int]] = None
+        if job.daily_setting:
+            h, _, m = str(actions.get_setting(self.conn, job.daily_setting)).partition(":")
+            daily = (int(h), int(m))
+        return next_tick(job, now, daily)
+
     def _next_due(self, name: str) -> Optional[datetime]:
         row = store.get_runner_job(self.conn, name)
         return _parse(row["next_due"]) if row else None
@@ -607,7 +625,7 @@ class Runner:
                 continue
             nd = self._next_due(name)
             if nd is None:
-                self.job_set(name, next_due=_iso(next_tick(job, now)))
+                self.job_set(name, next_due=_iso(self._next_tick(job, now)))
             elif nd <= now:
                 self.job_set(name, next_due=_iso(now + n * STAGGER))
                 n += 1
@@ -690,13 +708,20 @@ class Runner:
                 continue
             nd = self._next_due(name)
             if nd is None:
-                self.job_set(name, next_due=_iso(next_tick(job, now)))
+                self.job_set(name, next_due=_iso(self._next_tick(job, now)))
                 continue
             if nd > now:
+                if job.daily_setting and name not in self.tasks:
+                    want = self._next_tick(job, now)
+                    # the owner changed the time: a stored GRID tick (whole minute) of the old time follows it; a
+                    # boot's catch-up (now + n * STAGGER, not a grid tick) is left alone, whatever the job's name
+                    on_grid = nd.second == 0 and nd.microsecond == 0
+                    if on_grid and (nd.hour, nd.minute) != (want.hour, want.minute):
+                        self.job_set(name, next_due=_iso(want))
                 continue
             if name in self.tasks:
                 self.once(f"overrun:{name}:{_iso(nd)}", f"{name} is still running at its next tick; that tick is skipped")
-                self.job_set(name, next_due=_iso(next_tick(job, now)))
+                self.job_set(name, next_due=_iso(self._next_tick(job, now)))
                 continue
             out.append(Due(job))
         keep: list[tuple[str, str]] = []
@@ -872,7 +897,7 @@ class Runner:
         """The next due time stored right when a non-keyed job starts: the grid tick (`every` /
         `daily`), or, for a poll job (S7), a `poll`-long cooldown from now (_plan_poll re-admits it
         once that passes and POLL_PENDING still says there is work; none: it falls dormant again)."""
-        return now + job.poll if job.poll is not None else next_tick(job, now)
+        return now + job.poll if job.poll is not None else self._next_tick(job, now)
 
     def start(self, due: Due, now: datetime) -> Optional[int]:
         """Record and spawn one run (or record it skipped). -> the run id, or None."""
