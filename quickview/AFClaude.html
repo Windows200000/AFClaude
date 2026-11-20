@@ -194,7 +194,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       <p class="mut" id="paused-meta"></p>
     </div>
     <div id="paused-projects"></div>
-    <p class="mut"><span id="paused-what">No run starts or continues until you clear it.</span> Look at the error (the alerts doc), fix it, then: <code id="paused-cmd"></code></p>
+    <p class="mut"><span id="paused-what">No new work starts until this is cleared.</span> Open a chat with the task-manager: it finds the cause, fixes it and lifts the pause.</p>
   </section>
 
   <section id="s-input">
@@ -562,26 +562,29 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   function renderPaused(s) {
     var be = (s.keepalive || {}).budget_error;
     $("budget-error").hidden = !be;
-    $("budget-error").textContent = be ? "Budget model error: " + be + " (no run starts on it; the runners pause)" : "";
+    // D-345/D-347: plain words on the page; the model's own error is in the logs for the task-manager
+    $("budget-error").textContent = be ? "AFClaude couldn't work out how much of your weekly Claude usage it may use, " +
+      "so no new work starts until this is fixed." : "";
     var a = s.automation || {};
     $("paused").hidden = !a.paused;
     if (!a.paused) return;
     // D-244: the install-wide pause and/or the paused projects (an inbox error pauses only its project)
     var install = a.install !== false, projects = a.projects || [];
-    var meta = function (x) { return (x.since_berlin ? "since " + x.since_berlin : "") + (x.by ? " · by " + x.by : ""); };
+    // D-345/D-347: the reason in plain words (owner_text.for_pause); the technical reason, who set it and the
+    // command stay with the task-manager
+    var meta = function (x) { return x.since_berlin ? "since " + x.since_berlin : ""; };
+    var said = function (x) { return (x.owner && x.owner.length ? x.owner : ["(no reason given)"]).join(" "); };
     $("paused-title").textContent = install ? "Automation is PAUSED" :
       "Automation PAUSED for " + projects.map(function (p) { return p.name; }).join(", ");
     $("paused-install").hidden = !install;
-    $("paused-reason").textContent = a.reason || "(no reason given)";
+    $("paused-reason").textContent = said(a);
     $("paused-meta").textContent = meta(a);
     $("paused-projects").innerHTML = projects.map(function (p) {
-      return '<p class="paused-project"><b>Project ' + esc(p.name) + ":</b> " + esc(p.reason || "(no reason given)") +
+      return '<p class="paused-project"><b>Project ' + esc(p.name) + ":</b> " + esc(said(p)) +
         '</p><p class="mut">' + esc(meta(p)) + "</p>";
     }).join("");
-    $("paused-what").textContent = install ? "No run starts or continues until you clear it." :
-      "No run of " + (projects.length > 1 ? "these projects" : "this project") + " starts or continues until you clear it; other projects go on.";
-    $("paused-cmd").textContent = (install ? [a.resume || "python3 tasks.py automation resume"] : [])
-      .concat(projects.map(function (p) { return p.resume; })).join("  ;  ");
+    $("paused-what").textContent = install ? "No new work starts until this is cleared." :
+      "No new work on " + (projects.length > 1 ? "these projects" : "this project") + " starts until this is cleared; other projects go on.";
   }
 
   // D-237: the task-manager's context, the prompt cache and what each of your messages re-read;

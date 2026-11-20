@@ -286,6 +286,26 @@ class AutomationPaused(unittest.TestCase):
         self.assertEqual((b["paused"], b["reason"], b["by"], b["resume"]),
                          (True, "keepalive: start aborted", "runner:keepalive", "python3 tasks.py automation resume"))
         self.assertTrue(b["since_berlin"])
+        # D-345/D-347: the banner's words; a reason without a rule gets the generic sentence, never itself
+        import owner_text
+        self.assertEqual(b["owner"], [owner_text.GENERIC])
+
+    def test_block_says_a_failstop_reason_in_plain_words(self):
+        """D-345/D-347: a reason failstop.fail stored (two causes) is shown as one plain sentence per cause."""
+        import owner_text
+        self.addCleanup(testenv.unpause)
+        testenv.unpause()
+        reason = ("21.10. 23:45 keepalive: usage reading failed: /usage did not refresh the usage cache"
+                  " | also: 22.10. 05:39 keepalive: compaction of f2897285 failed: no fresh hand-off")
+        conn = store.connect()
+        try:
+            actions.perform(conn, "automation.set", {"paused": True, "reason": reason},
+                            actor="runner:keepalive", via="runner")
+        finally:
+            conn.close()
+        b = qv.automation_block()
+        self.assertEqual(b["owner"], [owner_text.USAGE, owner_text.matched("compaction of f2897285 failed: x")])
+        self.assertEqual(b["reason"], reason)          # the technical reason stays in the data for the task-manager
 
     def test_block_names_the_paused_project(self):
         """D-244: a project's pause (an inbox error) is shown by the project's name, with its reason
@@ -306,6 +326,8 @@ class AutomationPaused(unittest.TestCase):
         self.assertEqual((p["name"], p["reason"], p["by"], p["resume"]),
                          ("PQ", "inbox: triage failed", "runner:inbox", "python3 tasks.py automation resume --project PQ"))
         self.assertTrue(p["since_berlin"])
+        import owner_text
+        self.assertEqual(p["owner"], [owner_text.GENERIC])
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()
         self.assertIn('id="paused-projects"', page)
@@ -336,13 +358,17 @@ class AutomationPaused(unittest.TestCase):
             page = fh.read()
         self.assertIn('id="budget-error"', page)
         self.assertIn("budget_error", page)
+        self.assertNotIn("Budget model error: \" + be", page)      # D-345: the raw model error is not shown
 
     def test_page_renders_the_banner_first(self):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "quickview", "AFClaude.html")) as fh:
             page = fh.read()
         for part in ('id="paused"', "Automation is PAUSED", "s.automation", "renderPaused(s); renderUsage(s)",
-                     'id="paused-reason"', 'id="paused-cmd"'):
+                     'id="paused-reason"', "Open a chat with the task-manager"):
             self.assertIn(part, page)
+        # D-345/D-347: the banner shows the plain words, not the stored reason, its setter or the resume command
+        for gone in ('id="paused-cmd"', "a.reason ||", "p.reason ||", "x.by", "tasks.py automation resume"):
+            self.assertNotIn(gone, page)
         self.assertLess(page.index('id="paused"'), page.index('id="s-input"'))
 
 

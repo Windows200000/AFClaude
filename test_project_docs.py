@@ -399,7 +399,10 @@ class Notes(Env):
             ka.progress_note("window-start: not resumed")
         finally:
             notify.push, pd.HERE, store.DB_PATH, ka.PROGRESS_FILE, pd.host.repo_dir = saved
-        self.assertRegex(self.render("alerts"), r"^- \*\*\d{4}-\d\d-\d\d \d\d:\d\d\*\* disk full\n  details\n  _\(push: test push\)_\n$")
+        # D-345/D-347: the entry keeps the technical subject and body and names what the owner was sent
+        self.assertRegex(self.render("alerts"), r"^- \*\*\d{4}-\d\d-\d\d \d\d:\d\d\*\* disk full\n  details\n"
+                                                r"  _\(for the owner: AFClaude: Something inside AFClaude went wrong\. "
+                                                r"The task-manager has the technical details\.; push: test push\)_\n$")
         prog = self.render("progress")
         self.assertIn("[ALERT] disk full (details in the alerts doc)\n", prog)
         self.assertIn("[keepalive.py] window-start: not resumed\n", prog)
