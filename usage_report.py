@@ -123,11 +123,18 @@ def load_meta(session_id, agent_id):
     for f in (f for sid in session_ids(session_id)
               for f in glob.glob(os.path.join(ka.PROJECTS_DIR, "*", sid, "subagents",
                                               f"agent-{agent_id}.meta.json"))):
+        # a file that is there but unreadable or not a JSON object raises (D-235), as bridge mode does; only a
+        # missing file (older agents have none) is "no description"
         try:
             with open(f) as fh:
-                return json.load(fh)
-        except (OSError, json.JSONDecodeError):
+                meta = json.load(fh)
+        except FileNotFoundError:
             continue
+        except (OSError, ValueError) as e:      # ValueError: invalid JSON, undecodable bytes
+            raise txsource.TxError(f"{f} cannot be read: {e}") from None
+        if not isinstance(meta, dict):
+            raise txsource.TxError(f"{f} is not a JSON object")
+        return meta
     return {}
 
 

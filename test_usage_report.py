@@ -54,6 +54,59 @@ class SessionChain(unittest.TestCase):
             self.assertEqual(ur.last_recorded_ts(NEWER).isoformat(), "2026-11-01T00:00:00+00:00")
 
 
+class LoadMetaMount(unittest.TestCase):
+    """Mount mode: a missing agent-<id>.meta.json is {} (older agents have none); one that is there but
+    unreadable, invalid or not a JSON object raises (D-235), the same TxError as bridge mode."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sub = os.path.join(self.tmp.name, "-p", NEW, "subagents")
+        os.makedirs(self.sub)
+        for p in (mock.patch.object(ur.ka, "PROJECTS_DIR", self.tmp.name),
+                  mock.patch.object(ur.ka, "load_state", lambda: {}),
+                  mock.patch.object(ur.txsource, "bridge_on", lambda: False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def put(self, name, data):
+        with open(os.path.join(self.sub, name), "wb") as f:
+            f.write(data)
+
+    def test_valid_object(self):
+        self.put("agent-a1.meta.json", b'{"description": "job", "agentType": "x"}')
+        self.assertEqual(ur.load_meta(NEW, "a1"), {"description": "job", "agentType": "x"})
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(ur.load_meta(NEW, "nope"), {})
+
+    def test_invalid_json_raises(self):
+        self.put("agent-a1.meta.json", b'{"description": ')
+        with self.assertRaisesRegex(ur.txsource.TxError, "agent-a1.meta.json cannot be read"):
+            ur.load_meta(NEW, "a1")
+
+    def test_undecodable_bytes_raise(self):
+        self.put("agent-a1.meta.json", b"\xff\xfe\x00")
+        with self.assertRaises(ur.txsource.TxError):
+            ur.load_meta(NEW, "a1")
+
+    def test_non_object_raises(self):
+        for i, data in enumerate((b"[]", b'"x"', b"null", b"3")):
+            self.put(f"agent-n{i}.meta.json", data)
+            with self.assertRaisesRegex(ur.txsource.TxError, "not a JSON object"):
+                ur.load_meta(NEW, f"n{i}")
+
+    def test_unreadable_raises(self):
+        os.mkdir(os.path.join(self.sub, "agent-d1.meta.json"))      # open() fails with IsADirectoryError (also as root)
+        with self.assertRaisesRegex(ur.txsource.TxError, "cannot be read"):
+            ur.load_meta(NEW, "d1")
+
+    def test_a_bad_meta_fails_the_whole_report(self):
+        self.put("agent-a1.jsonl", json.dumps(turn("2026-11-01T00:00:00+00:00", "m1", 1)).encode() + b"\n")
+        self.put("agent-a1.meta.json", b"{")
+        with self.assertRaises(ur.txsource.TxError):
+            ur.build_rows(NEW, None)
+
+
 class ParseSince(unittest.TestCase):
     def test_z_suffix_offset_and_naive(self):
         want = ur.parse_since("2026-11-07T23:00:00+00:00")
