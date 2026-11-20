@@ -72,6 +72,25 @@ class Notices(Env):
             self.do("notice.post", title="t", text="x", project="nope")
         self.assertEqual(store.list_notices(self.conn, include_dismissed=True), [])
 
+    def test_unreadable_notices_are_refused(self):
+        """D-345/D-347: ids, commands, file names, hashes, branch names, code names and a
+        'Nothing to do' line are refused with what to rephrase; plain words pass."""
+        bad = ("Answer D-345 first", "see #91", "run tasks.py resume", "fails in store.py:4797", "merged 986ed7d",
+               "branch work/AFClaude-wt-notices-n1 is ready", "Merge branch x", "notice_post failed", "finding H1",
+               "The run finished.\nNothing to do.\n", "uses git merge main")
+        for text in bad:
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "owner can't read it"):
+                self.do("notice.post", title="Run done", text=text)
+        with self.assertRaisesRegex(ValueError, "title: 'P-12'"):
+            self.do("notice.post", title="About P-12", text="plain")
+        self.assertEqual(store.list_notices(self.conn, include_dismissed=True), [])
+        ok = ("The night run finished all four stages. You can open the preview and tell me what to change.",
+              "Costs rose 12% (3 of 25 runs). Nothing here needs a hash or path, plan A/B.",
+              "Version 2.0.1 of the page is live at 10:30; the end-to-end check passed.")
+        for text in ok:
+            with self.subTest(text=text):
+                self.do("notice.post", title="Plain news", text=text)
+
     def test_dismiss_is_the_owners(self):
         n = self.do("notice.post", title="t", text="x")
         with self.assertRaises(actions.Forbidden):
@@ -114,6 +133,10 @@ class ReviewSummary(unittest.TestCase):
 class ReviewNotices(Env):
     def notices(self):
         return store.list_notices(self.conn, include_dismissed=True)
+
+    def test_review_notices_are_not_linted(self):
+        self.do("doc.set", project="Proj", name="review:x", text="# R\n\n## Summary\n\nH1 in store.py:12, commit 986ed7d\n")
+        self.assertEqual(len(self.notices()), 1)
 
     def test_doc_set_posts_then_refreshes(self):
         self.do("doc.set", project="Proj", name="review:2026-11-01", text=REVIEW)
