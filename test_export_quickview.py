@@ -175,64 +175,15 @@ class DocsFromTheDb(unittest.TestCase):
                 qv.HERE = old_here
 
 
-class ProgressLog(unittest.TestCase):
-    """The page shows the newest progress entries (the doc's appends in the DB, where `tasks.py doc
-    append progress` and the runners write), newest first, short; not an old Status line."""
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        old = qv.HERE
-        self.addCleanup(lambda: setattr(qv, "HERE", old))
-        qv.HERE = self.tmp.name
-        patcher = mock.patch.object(qv.host, "repo_dir", lambda: self.tmp.name)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        testenv.notes_project(self.tmp.name)
-        self.project = "notes-" + os.path.basename(self.tmp.name)
-
-    def _do(self, name, text, actor="cli"):
-        conn = store.connect()
-        try:
-            actions.perform(conn, name, {"project": self.project, "name": "progress", "text": text},
-                            actor=actor, via="cli")
-        finally:
-            conn.close()
-
-    def test_no_doc_yet(self):
-        self.assertEqual(qv.progress_log(), {"entries": [], "error": None})
-
-    def test_newest_first_short_and_only_appends(self):
-        self._do("doc.set", "# log\n\n## Status 01.10. old resume point\n")
-        for i in range(qv.PROGRESS_ENTRIES + 2):
-            self._do("doc.append", f"- 10:{i:02d} step {i}\n")
-        self._do("doc.append", "- 11:00 " + "x" * 400 + "\n")
-        self._do("doc.append", "- 11:05 [keepalive.py] a note\n  with a second line\n", actor="runner:keepalive")
-        out = qv.progress_log()
-        self.assertIsNone(out["error"])
-        es = out["entries"]
-        self.assertEqual(len(es), qv.PROGRESS_ENTRIES)
-        self.assertEqual(es[0]["text"], "11:05 [keepalive.py] a note …")
-        self.assertEqual(es[0]["by"], "runner:keepalive")
-        self.assertTrue(es[1]["text"].startswith("11:00 xxx") and es[1]["text"].endswith(" …"))
-        self.assertLessEqual(len(es[1]["text"]), qv.PROGRESS_ENTRY_CHARS + 2)
-        self.assertEqual(es[2]["text"], f"10:{qv.PROGRESS_ENTRIES + 1:02d} step {qv.PROGRESS_ENTRIES + 1}")
-        self.assertEqual(es[2]["by"], "cli")
-        self.assertIsNotNone(es[2]["at_berlin"])
-        self.assertFalse(any("Status" in e["text"] for e in es))
-
-    def test_db_error_is_shown_not_raised(self):
-        from unittest import mock
-        with mock.patch.object(qv.store, "connect", side_effect=RuntimeError("db locked")):
-            out = qv.progress_log()
-        self.assertEqual(out["entries"], [])
-        self.assertIn("db locked", out["error"])
-
-    def test_page_renders_the_log_in_the_progress_section(self):
+class NoProgressLogOnThePage(unittest.TestCase):
+    """D-347: the task-manager's own log stays off the website: no progress_log in status.json, no
+    log list on the page."""
+    def test_export_and_page_have_no_progress_log(self):
+        self.assertFalse(hasattr(qv, "progress_log"))
         with open(PAGE_FILE, encoding="utf-8") as fh:
             page = fh.read()
-        sec = page[page.index("<h2>Progress</h2>"):]
-        self.assertLess(sec.index('id="plog"'), sec.index('id="goals"'))
-        self.assertIn("renderProgressLog(s);", page[page.index("function load()"):])
+        for part in ('id="plog"', "renderProgressLog", "progress_log", "Latest log entries"):
+            self.assertNotIn(part, page)
 
 
 class PreviewMarker(unittest.TestCase):
@@ -1065,8 +1016,7 @@ class PublishPage(unittest.TestCase):
         written = []
         real = qv.write_atomic
         blocks = {n: mock.DEFAULT for n in ("automation_block", "keepalive_and_usage", "context_block", "parse_goals",
-                                             "stages", "latest_decision", "needs_input", "inbox_block", "cron_entries",
-                                             "progress_log")}
+                                             "stages", "latest_decision", "needs_input", "inbox_block", "cron_entries")}
         with mock.patch.multiple(qv, all_docs=lambda: [], doc_source=lambda n, s: ("", None), **blocks), \
                 mock.patch.object(qv.ka, "read_usage_cache", return_value=None), \
                 mock.patch.object(qv.glob, "glob", return_value=[]), \

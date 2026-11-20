@@ -2740,10 +2740,45 @@ REVIEW_SUMMARY_HEADS = re.compile(r"^#{2,6}\s+(tl;?dr|summary|short summary|resu
                                   r"verdict|outcome)\b", re.I)
 
 
+# D-345/D-347: a notice the task-manager writes for the owner is plain words. Each rule is (regex,
+# what the owner can't read); the first match of every rule is named in the refusal. Review notices
+# (review_notice) are generated, not posted by hand: they are not linted here.
+NOTICE_JARGON = (
+    (re.compile(r"\b[DPQ]-\d+\b|(?<![\w&])#\d+\b"), "an internal id (decision, proposal, question or message number)"),
+    (re.compile(r"\btasks\.py\b|\bgit\s+(?:merge|rebase|cherry-pick|checkout|push|log|diff)\b"), "a command"),
+    (re.compile(r"\b[\w./-]+\.(?:py|sh|js|json|md|html|sql|db|ya?ml|toml)(?::\d+)?\b"), "a file name or file:line reference"),
+    (re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"), "a commit hash"),
+    (re.compile(r"\b(?:feature|fix|hotfix|wt|work)/[\w.-]+|\bAFClaude-wt-[\w.-]+|\bMerge branch\b", re.I), "a branch or worktree name"),
+    (re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b"), "a code identifier (with underscores)"),
+    (re.compile(r"\b[HML]\d{1,2}\b"), "a review finding label"),
+    (re.compile(r"^\W*nothing (?:for you )?to do\W*$", re.I | re.M), "a 'Nothing to do' line (the owner sees there is no answer field)"),
+)
+
+
+def notice_unreadable(title: object, text: object) -> list[str]:
+    """What in an owner notice the owner can't read or act on (D-345/D-347): one line per finding,
+    empty when it is plain words."""
+    out = []
+    for where, value in (("title", title), ("text", text)):
+        s = str(value)
+        for rx, what in NOTICE_JARGON:
+            m = rx.search(s)
+            if m:
+                out.append(f"{where}: {m.group(0).strip()!r} is {what}")
+    return out
+
+
 @action("notice.post", "notice")
 def notice_post(conn: sqlite3.Connection, ctx: Ctx, title: Any, text: Any, project: Any = None) -> Result:
     """A notice for the owner (D-306): `title`, `text` (the full content, D-279), optionally about
-    one project. It stays on the dashboard until the owner dismisses it."""
+    one project. It stays on the dashboard until the owner dismisses it. Refused when it holds
+    something the owner can't read (D-345/D-347, notice_unreadable): write what happened, what it
+    means for them and what they can do, in plain words."""
+    problems = notice_unreadable(title, text)
+    if problems:
+        raise ValueError("notice refused, the owner can't read it (D-345): " + "; ".join(problems) +
+                         ". Rephrase in plain words: what happened, what it means for the owner, what they can do "
+                         "(no ids, commands, file names, hashes, branch names or code names; no 'Nothing to do' line).")
     pid = store._project_row(conn, project)["id"] if project is not None else None
     n = store.add_notice(conn, title, text, pid, ctx.actor)
     return Result(n, n["id"], None, n)

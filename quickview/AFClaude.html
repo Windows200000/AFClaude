@@ -66,10 +66,6 @@ details.card > summary .mut { flex: none; margin-left: 0; font-size: 12px; }
 .goals .done .t { color: #9ca3af; text-decoration: line-through; }
 .goals .cur .t { color: #fff; font-weight: 600; }
 .goals .blocked .t { color: #f59e0b; }
-.plog { list-style: none; margin-bottom: 10px; }
-.plog li { padding: 5px 0; border-bottom: 1px solid rgba(255,255,255,.06); overflow-wrap: anywhere; }
-.plog li:last-child { border-bottom: none; }
-.plog .when { color: #9ca3af; font-size: 12px; margin-right: 6px; }
 .tick { width: 1.2em; }
 .tag { font-size: 11px; background: #7e22ce; color: #fff; border-radius: 4px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
@@ -233,8 +229,6 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
   <section>
     <h2>Progress</h2>
     <div id="phases" class="phases"></div>
-    <h3 class="sub">Latest log entries</h3>
-    <ul id="plog" class="plog"></ul>
     <h3 class="sub">Goals</h3>
     <ol id="goals" class="goals"></ol>
   </section>
@@ -488,16 +482,6 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
         '<span class="t">' + esc(g.text) + '<span class="tag" title="' + esc(markText[g.marker] || "") + '">' +
         (g.side ? "side" : "") + '</span></span></li>';
     }).join("") || '<li class="mut">No goals found in GOALS.md.</li>';
-  }
-
-  // the newest appends to the progress doc (tasks.py doc append progress, the runners' notes), newest first
-  function renderProgressLog(s) {
-    var p = s.progress_log || {};
-    $("plog").innerHTML = (p.error ? '<li class="bad">Progress log: ' + esc(p.error) + "</li>" : "") +
-      ((p.entries || []).map(function (e) {
-        return '<li><span class="when">' + esc(e.at_berlin || "?") + (e.by ? " · " + esc(e.by) : "") + "</span>" +
-          esc(e.text) + "</li>";
-      }).join("") || (p.error ? "" : '<li class="mut">No progress entries yet.</li>'));
   }
 
   // a page whose stamp isn't the export's current one is an old copy (served from somewhere other
@@ -1064,7 +1048,7 @@ table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
       var ageMin = (Date.now() - new Date(s.generated_at).getTime()) / 60000;
       $("updated").textContent = "exported " + berlin(s.generated_at) + (ageMin > 10 ? " (" + Math.round(ageMin) + " min ago, export stale?)" : "");
       $("updated").className = "meta" + (ageMin > 10 ? " stale" : "");
-      renderPageVersion(s); renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderProgressLog(s); renderGoals(s); renderDecision(s); renderInput(s); renderRequests(s); renderCron(s);
+      renderPageVersion(s); renderPaused(s); renderUsage(s); renderContext(s); renderPhases(s); renderGoals(s); renderDecision(s); renderInput(s); renderRequests(s); renderCron(s);
       docList($("docs"), s.docs, "title");
       docList($("prompts"), s.prompts, "name");
     }).catch(function (e) {
