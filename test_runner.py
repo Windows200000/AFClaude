@@ -937,6 +937,21 @@ class DailySetting(Base):
         self.assertEqual([d.job.name for d in r.plan(self.now)], ["backup"])
         self.assertEqual(r._advance(job, self.now), datetime(2026, 10, 21, 5, 15, tzinfo=UTC))
 
+    def test_a_boot_catch_up_does_not_depend_on_the_job_names_order(self):
+        jobs = dict(runner.JOBS, aaa=runner.Job("aaa", 1, every=MIN))       # sorts before "backup": it takes n = 0
+        r = self.runner(owns={"aaa", "backup"}, jobs=jobs)
+        for name in ("aaa", "backup"):
+            actions.runner_job_set(self.conn, name, actor="runner", via="runner",
+                                   next_due=runner._iso(START - 2 * MIN))      # both overdue at the boot
+        self.now = START
+        r.boot()
+        caught = self.next_due("backup")
+        self.assertEqual(caught, START + runner.STAGGER)
+        r.plan(self.now)
+        self.assertEqual(self.next_due("backup"), caught)                   # the re-plan leaves the catch-up alone
+        self.now = START + runner.STAGGER
+        self.assertIn("backup", [d.job.name for d in r.plan(self.now)])
+
 
 # ---------------------------------------------------------------- S2: offset, ownership, shadow, ensure, stop
 

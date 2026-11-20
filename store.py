@@ -682,8 +682,13 @@ CREATE VIEW IF NOT EXISTS backups_protected AS
     SELECT id FROM (SELECT id FROM backups WHERE tier = 'weekly' ORDER BY id DESC LIMIT 2);
 CREATE TRIGGER IF NOT EXISTS backups_no_update BEFORE UPDATE ON backups
 BEGIN SELECT RAISE(ABORT, 'backups are write-once: a row is never updated'); END;
+-- INSERT OR REPLACE removes the row it replaces without firing a delete trigger (recursive_triggers is off), so
+-- an insert of an id or a file name that exists is refused before the conflict is resolved.
+CREATE TRIGGER IF NOT EXISTS backups_no_replace BEFORE INSERT ON backups
+WHEN EXISTS (SELECT 1 FROM backups WHERE id = NEW.id OR file = NEW.file)
+BEGIN SELECT RAISE(ABORT, 'backups are write-once: a row is never replaced'); END;
 CREATE TRIGGER IF NOT EXISTS backups_guarded_delete BEFORE DELETE ON backups
-WHEN (SELECT allowed FROM backups_prune_gate WHERE id = 1) = 0
+WHEN (SELECT allowed FROM backups_prune_gate WHERE id = 1) IS NOT 1
 BEGIN SELECT RAISE(ABORT, 'backups are deleted only through store.prune_backups (backup.prune)'); END;
 CREATE TRIGGER IF NOT EXISTS backups_protected_delete BEFORE DELETE ON backups
 WHEN OLD.id IN (SELECT id FROM backups_protected)
@@ -4294,7 +4299,7 @@ def prune_backups(conn: sqlite3.Connection, keep: int) -> list[Row]:
     """Delete the backup rows past retention: every row that is neither among the newest `keep` rows (any
     tier) nor protected (backups_protected). The delete runs through backups_prune_gate, opened and closed in
     THIS transaction only (no other connection sees it open); the triggers refuse a protected row even then.
-    -> the deleted rows (oldest first). The files are the caller's (actions.backup_prune)."""
+    -> the deleted rows (oldest first). The files are the caller's (backup.prune, after this commits)."""
     if isinstance(keep, bool) or not isinstance(keep, int) or keep < 0:
         raise ValueError(f"keep must be a non-negative integer, got {keep!r}")
     with transaction(conn):

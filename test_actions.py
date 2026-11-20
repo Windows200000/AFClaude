@@ -1250,7 +1250,7 @@ class EveryAction(Base):
                                "directory": bdir}),
             ("backup.record", {"file": bfile2, "tier": "daily", "manifest": manifest, "sha256": "f" * 64, "size": 10,
                                "directory": bdir}),
-            ("backup.prune", {"directory": bdir, "keep": 0}),       # deletes the first; the latest daily stays
+            ("backup.prune", {"keep": 0}),       # deletes the first; the latest daily stays
             ("setup.mint_code", {"kind": "first_owner", "code_hash": "f" * 64, "ttl_hours": 24}),
             ("setup.claim_code", {"id": 1, "kind": "first_owner"}),
             ("typed.record", {"session_id": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "driver": "auto",

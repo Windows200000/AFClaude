@@ -1614,7 +1614,8 @@ SETTINGS: dict[str, Setting] = {
     # latest weekly ones are always kept and never overwritten, whatever this says), and which weekday's first
     # run is the weekly one.
     "backup_time": Setting("03:40", _clock, "UTC time (HH:MM) the runner makes the daily database backup "
-                           "(takes effect from the next plan, within a minute)", section="storage", kind="text"),
+                           "(takes effect within a minute; a time already past today means the next backup is tomorrow, "
+                           "at the new time)", section="storage", kind="text"),
     "backup_keep": _int(14, 0, 3650, "How many of the newest scheduled backups are kept; older ones are deleted "
                         "after each new, verified one. The latest daily and the 2 latest weekly backups are "
                         "always kept, whatever this says (D-287)", "storage"),
@@ -1991,25 +1992,17 @@ def backup_keep(conn: sqlite3.Connection) -> int:
 
 
 @action("backup.prune", "backup")
-def backup_prune(conn: sqlite3.Connection, ctx: Ctx, directory: Any, keep: Any = None) -> Result:
-    """Delete the scheduled backups past retention: every bundle that is neither among the newest `keep` (the
-    setting backup_keep when not given; 0 is allowed) nor protected (the latest daily-or-weekly and the 2 latest
-    weekly bundles: refused by the table's triggers even with `keep` 0). The rows go first (audited, in this
-    transaction), then the files from `directory`; a file already gone is fine, any other failure raises and
-    leaves an orphan file the error names. -> {deleted: [file, ...], kept, keep}."""
+def backup_prune(conn: sqlite3.Connection, ctx: Ctx, keep: Any = None) -> Result:
+    """Delete the scheduled backups' rows past retention: every bundle that is neither among the newest `keep`
+    (the setting backup_keep when not given; 0 is allowed) nor protected (the latest daily-or-weekly and the 2
+    latest weekly bundles: refused by the table's triggers even with `keep` 0). Audited. The FILES are the
+    caller's to remove once this has committed (backup.prune: a file left behind by a failed removal is then an
+    orphan, never a row without its file). -> {deleted: [file, ...], kept, keep}."""
     backup_grant(ctx, "backup.prune", BACKUP_PRUNE_ACTOR)
     n = backup_keep(conn) if keep is None else keep
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise ValueError(f"keep must be a non-negative integer, got {keep!r}")
     rows = store.prune_backups(conn, n)
-    for r in rows:
-        try:
-            os.remove(os.path.join(str(directory), r["file"]))
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            raise RuntimeError(f"backup {r['file']} was deleted from the table but its file could not be "
-                               f"removed ({e}): delete it by hand") from e
     kept = int(conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0])
     before = {"deleted": [{"file": r["file"], "tier": r["tier"], "created_at": r["created_at"]} for r in rows]}
     after = {"deleted": [r["file"] for r in rows], "kept": kept, "keep": n}

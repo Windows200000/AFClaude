@@ -40,6 +40,7 @@ raises; the job's `daily_job` reports it (failstop: alert + pause) and every old
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -151,7 +152,7 @@ def create(out_dir: str, db: str | None = None) -> dict[str, Any]:
     db = os.path.abspath(db or store.DB_PATH)
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
-    work = tempfile.mkdtemp(prefix=".backup-", dir=out_dir)
+    work = tempfile.mkdtemp(prefix=WORK_PREFIX, dir=out_dir)
     partial: str | None = None
     try:
         copy = os.path.join(work, DB_NAME)
@@ -350,7 +351,10 @@ def stamp(db: str | None = None, actor: Optional[str] = None, via: str = "cli") 
 # ---------------------------------------------------------------- scheduled backups (phase 5c B3, D-287)
 
 BACKUP_SUBDIR = "backups"
-FREE_FACTOR = 2             # the free space a run needs, in database sizes: the snapshot copy + the bundle
+FREE_FACTOR = 3             # the free space a run needs, in database (+ WAL) sizes: the snapshot copy, VACUUM's
+                            # journal on it and the bundle (about 2.2 x measured)
+LOCK_NAME = ".lock"         # flock for the whole of a run: one at a time, and leftovers are only cleaned under it
+WORK_PREFIX = ".backup-"    # create()'s work directory (a full copy of the database)
 FAIL_SUBJECT = "the daily database backup failed"       # stable: failstop alerts once per pause
 
 
@@ -373,18 +377,56 @@ def tier_for(conn: sqlite3.Connection, now: datetime) -> str:
 
 
 def _check_space(directory: str, db: str) -> None:
-    free, need = shutil.disk_usage(directory).free, os.path.getsize(db) * FREE_FACTOR
+    size = os.path.getsize(db) + (os.path.getsize(db + "-wal") if os.path.exists(db + "-wal") else 0)
+    free, need = shutil.disk_usage(directory).free, size * FREE_FACTOR
     if free < need:
         raise BackupError(f"not enough free space in {directory} for a backup: {free} bytes free, "
                           f"{need} needed ({FREE_FACTOR} x the database)")
 
 
+def _recorded_files(conn: sqlite3.Connection) -> set[str]:
+    return {str(r[0]) for r in conn.execute("SELECT file FROM backups")}
+
+
+def unrecorded(directory: str) -> list[str]:
+    """The finished bundles in `directory` that have no `backups` row (a run killed between its rename and its
+    record; or one made by hand into this directory). Never deleted by the code: the owner decides."""
+    if not os.path.isdir(directory):
+        return []
+    conn = store.connect()
+    try:
+        have = _recorded_files(conn)
+    finally:
+        conn.close()
+    return sorted(n for n in os.listdir(directory)
+                  if n.startswith("afclaude-backup-") and n.endswith(SUFFIX) and n not in have)
+
+
+def clean_leftovers(directory: str) -> list[str]:
+    """A killed run (the runner's timeout, a deploy restart) leaves its work directory (a copy of the whole
+    database) or its `.partial`: remove those, only under the run's flock. Recorded bundles are never touched
+    (they are finished files, not work files). -> what was removed."""
+    gone: list[str] = []
+    for n in sorted(os.listdir(directory)):
+        path = os.path.join(directory, n)
+        if n.startswith(WORK_PREFIX) and os.path.isdir(path):
+            shutil.rmtree(path)
+        elif n.startswith("afclaude-backup-") and n.endswith(SUFFIX + ".partial") and os.path.isfile(path):
+            os.remove(path)
+        else:
+            continue
+        gone.append(n)
+    return gone
+
+
 def run_scheduled(manual: bool = False, now: Optional[datetime] = None) -> dict[str, Any]:
-    """One backup of the live database into backup_dir(): create (written as .partial, verified, renamed),
-    verify the finished file again, make it read-only, record it (backup.record as runner:backup) and, unless
-    `manual` (tier "manual", recorded as the caller), prune to backup_keep (backup.prune as
-    runner:backup_prune). Any failure raises and keeps every older bundle: an unrecorded bundle this run
-    made is removed, the prune never runs. -> {file, tier, size, sha256, deleted: [file, ...]}."""
+    """One backup of the live database into backup_dir(), under an exclusive flock (a second run at the same
+    time fails): first the leftovers of a killed run are removed, then create (written as .partial, verified,
+    renamed), verify the finished file again, make it read-only, record it (backup.record as runner:backup) and,
+    unless `manual` (tier "manual", recorded as the caller), prune to backup_keep (backup.prune as
+    runner:backup_prune). Any failure raises and keeps every older bundle: an unrecorded bundle this run made is
+    removed (a recorded one never), the prune never runs.
+    -> {file, tier, size, sha256, deleted: [file, ...], cleaned: [name, ...], unrecorded: [file, ...]}."""
     now = now or store._utcnow()
     out_dir = backup_dir()
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
@@ -392,6 +434,18 @@ def run_scheduled(manual: bool = False, now: Optional[datetime] = None) -> dict[
     db = os.path.abspath(store.DB_PATH)
     if not os.path.isfile(db):
         raise BackupError(f"no database at {db}")
+    with open(os.path.join(out_dir, LOCK_NAME), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise BackupError(f"another backup is running (it holds {os.path.join(out_dir, LOCK_NAME)})") from e
+        return _run_locked(out_dir, db, manual, now)
+
+
+def _run_locked(out_dir: str, db: str, manual: bool, now: datetime) -> dict[str, Any]:
+    cleaned = clean_leftovers(out_dir)
+    if cleaned:
+        print(f"backup: removed the leftovers of an interrupted run: {', '.join(cleaned)}")
     _check_space(out_dir, db)
     conn = store.connect()
     try:
@@ -400,6 +454,7 @@ def run_scheduled(manual: bool = False, now: Optional[datetime] = None) -> dict[
         conn.close()
     made = create(out_dir, db)
     path = made["path"]
+    recorded = False
     try:
         verify(path)                              # the finished file, not only the .partial it came from
         os.chmod(path, 0o400)                     # write-once on disk too
@@ -410,39 +465,68 @@ def run_scheduled(manual: bool = False, now: Optional[datetime] = None) -> dict[
                                                     "manifest": made["manifest"], "sha256": made["sha256"],
                                                     "size": made["size"], "directory": out_dir},
                             actor=record, via="runner" if not manual else "cli")
+            recorded = True
         finally:
             conn.close()
     except BaseException:
-        if os.path.exists(path):
-            os.remove(path)                       # unrecorded: this run's own, never a recorded bundle
+        if not recorded and os.path.exists(path) and not _is_recorded(os.path.basename(path)):
+            os.remove(path)                       # unrecorded: this run's own; a recorded bundle never
         raise
     deleted: list[str] = []
     if not manual:
         deleted = prune(actor=actions.BACKUP_PRUNE_ACTOR, via="runner")["deleted"]
     return {"file": os.path.basename(path), "tier": tier, "size": made["size"], "sha256": made["sha256"],
-            "deleted": deleted}
+            "deleted": deleted, "cleaned": cleaned, "unrecorded": unrecorded(out_dir)}
+
+
+def _is_recorded(name: str) -> bool:
+    """Is the bundle in the table? A lookup that fails counts as recorded: the file is then kept (and shows
+    in `list` as unrecorded if it isn't), never deleted on a guess."""
+    try:
+        conn = store.connect()
+        try:
+            return name in _recorded_files(conn)
+        finally:
+            conn.close()
+    except Exception:       # noqa: BLE001 - see the doc: keep the file
+        return True
 
 
 def prune(keep: Optional[int] = None, actor: Optional[str] = None, via: str = "cli") -> dict[str, Any]:
-    """backup.prune on the live database: the recorded bundles past backup_keep (or `keep`), their files
-    included; the protected floor stays. -> {deleted: [file, ...], kept, keep}."""
+    """backup.prune on the live database: the rows past backup_keep (or `keep`) go first (committed, audited),
+    then their files; a file already gone is fine, any other failure to remove one raises BackupError naming
+    every file left behind (its row is gone: delete it by hand). The protected floor stays.
+    -> {deleted: [file, ...], kept, keep}."""
     conn = store.connect()
     try:
-        out: dict[str, Any] = actions.perform(conn, "backup.prune", {"directory": backup_dir(), "keep": keep},
+        out: dict[str, Any] = actions.perform(conn, "backup.prune", {"keep": keep},
                                               actor=actor or identity.cli_actor(), via=via)
-        return out
     finally:
         conn.close()
+    left: list[str] = []
+    for name in out["deleted"]:
+        try:
+            os.remove(os.path.join(backup_dir(), name))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            left.append(f"{name} ({e})")
+    if left:
+        raise BackupError("the rows of these backups were deleted (committed) but their files could not be "
+                          f"removed, delete them by hand: {'; '.join(left)}")
+    return out
 
 
 def listing() -> list[dict[str, Any]]:
-    """The recorded bundles, newest first: file, tier, created_at, size, verified_at, protected."""
+    """The recorded bundles, newest first: file, tier, created_at, size, verified_at, protected; then every
+    unrecorded finished bundle in the directory as {file, unrecorded: True}."""
     conn = store.connect()
     try:
-        return [{k: r[k] for k in ("file", "tier", "created_at", "size", "verified_at", "protected")}
+        rows = [{k: r[k] for k in ("file", "tier", "created_at", "size", "verified_at", "protected")}
                 for r in store.backup_rows(conn)]
     finally:
         conn.close()
+    return rows + [{"file": n, "unrecorded": True} for n in unrecorded(backup_dir())]
 
 
 def daily_job() -> str:
@@ -455,6 +539,9 @@ def daily_job() -> str:
         raise
     line = f"backup {res['file']} ({res['tier']}, {res['size']} bytes)"
     line += f", pruned {', '.join(res['deleted'])}" if res["deleted"] else ", nothing to prune"
+    if res["unrecorded"]:
+        line += (f"; UNRECORDED bundle(s) in {backup_dir()} (not deleted: a run was killed before it recorded "
+                 f"them; delete by hand or keep): {', '.join(res['unrecorded'])}")
     print(line)
     return line
 

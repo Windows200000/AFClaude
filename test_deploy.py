@@ -61,6 +61,11 @@ class BusyTest(unittest.TestCase):
     def test_unittest_is_busy(self):
         self.assertEqual(len(deploy.busy(UNITTEST[1:])), 1)
 
+    def test_the_daily_backup_is_busy(self):
+        line = "  7731 /usr/local/bin/python3 -u /app/runner_jobs.py backup"
+        self.assertEqual(deploy.busy([line]), [line])
+        self.assertEqual(deploy.busy(["  7732 python3 -u /app/runner_jobs.py backups_other"]), [])
+
     def test_usage_review_is_busy(self):
         self.assertEqual(len(deploy.busy(REVIEW[1:])), 1)
 

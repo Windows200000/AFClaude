@@ -362,7 +362,7 @@ class Scheduled(Base):
             c.close()
 
     def files(self):
-        return sorted(os.listdir(self.dir)) if os.path.isdir(self.dir) else []
+        return sorted(n for n in os.listdir(self.dir) if n != backup.LOCK_NAME) if os.path.isdir(self.dir) else []
 
     def perform(self, name, actor, **params):
         c = self.conn()
@@ -390,7 +390,7 @@ class Scheduled(Base):
         path = os.path.join(self.dir, res["file"])
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o400)
         self.assertEqual(os.stat(self.dir).st_mode & 0o777, 0o700)
-        self.assertEqual(self.files(), [res["file"]])                        # no .partial, no work directory
+        self.assertEqual(set(self.files()), {res["file"]})   # no .partial, no work directory
         self.assertEqual(backup.verify(path)["install_id"], self.meta(self.src, "install_id"))
         (row,) = self.rows()
         self.assertEqual((row["file"], row["tier"], row["size"], row["sha256"], row["protected"]),
@@ -437,7 +437,7 @@ class Scheduled(Base):
                 self.new_install()
                 names = [self.fake(t, i + 1) for i, t in enumerate(tiers)]
                 floor = {names[8], names[6], names[3]}          # the newest daily; the 2 newest weeklies
-                res = self.perform("backup.prune", actions.BACKUP_PRUNE_ACTOR, directory=self.dir, keep=keep)
+                res = backup.prune(keep=keep, actor=actions.BACKUP_PRUNE_ACTOR, via="runner")
                 want = floor | set(names[max(0, len(names) - keep):] if keep else [])
                 self.assertEqual({r["file"] for r in self.rows()}, want)
                 self.assertEqual(set(self.files()), want)
@@ -449,13 +449,13 @@ class Scheduled(Base):
         b = self.fake("daily", 2)
         for actor in ("task-manager:abc", "agent:abc", "mcp:x", "runner:other", "runner", "user:7"):
             with self.subTest(actor=actor):
-                for name, params in (("backup.prune", {"directory": self.dir, "keep": 0}),
+                for name, params in (("backup.prune", {"keep": 0}),
                                      ("backup.record", {"file": a, "tier": "daily", "manifest": {},
                                                         "sha256": "a" * 64, "size": 10, "directory": self.dir})):
                     with self.assertRaises(actions.Forbidden):
                         self.perform(name, actor, **params)
         with self.assertRaisesRegex(actions.Forbidden, "write-once"):        # the record actor can't prune
-            self.perform("backup.prune", actions.BACKUP_RECORD_ACTOR, directory=self.dir, keep=0)
+            self.perform("backup.prune", actions.BACKUP_RECORD_ACTOR, keep=0)
         with self.assertRaisesRegex(actions.Forbidden, "write-once"):        # nor can the prune actor record
             self.perform("backup.record", actions.BACKUP_PRUNE_ACTOR, file=a, tier="daily", manifest={},
                          sha256="a" * 64, size=10, directory=self.dir)
@@ -579,6 +579,122 @@ class Scheduled(Base):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             backup.prune(keep=-1, actor=self.OWNER)
         self.assertEqual(backup.main(["list"]), 0)
+
+    def test_insert_or_replace_cannot_replace_a_row(self):
+        """INSERT OR REPLACE removes the replaced row without firing the delete triggers (recursive_triggers is
+        off): refused before the conflict is resolved, by file name and by id; so is an upsert."""
+        names = [self.fake("weekly", 1), self.fake("weekly", 2), self.fake("daily", 3)]      # all protected
+        cols = ("file, created_at, tier, size, sha256, verified_at, install_id, install_epoch, schema_version, "
+                "manifest")
+        vals = "'{}', 't', 'manual', 1, 'x', 't', 'i', 0, 1, '{{}}'"
+        before = [(r["id"], r["file"], r["tier"]) for r in self.rows()]
+        c = self.conn()
+        try:
+            for sql in (f"INSERT OR REPLACE INTO backups({cols}) VALUES ({vals.format(names[2])})",
+                        f"INSERT OR REPLACE INTO backups(id, {cols}) VALUES (1, {vals.format('zz')})",
+                        f"INSERT INTO backups({cols}) VALUES ({vals.format(names[0])}) "
+                        "ON CONFLICT(file) DO UPDATE SET tier='manual'",
+                        f"REPLACE INTO backups({cols}) VALUES ({vals.format(names[1])})"):
+                with self.subTest(sql=sql[:40]), self.assertRaisesRegex(sqlite3.IntegrityError, "write-once"):
+                    c.execute(sql)
+                c.rollback()
+        finally:
+            c.close()
+        self.assertEqual([(r["id"], r["file"], r["tier"]) for r in self.rows()], before)
+
+    def test_a_missing_gate_row_refuses_deletes(self):
+        self.fake("daily", 1)
+        self.fake("daily", 2)
+        c = self.conn()
+        try:
+            c.execute("UPDATE backups_prune_gate SET allowed=1")
+            c.execute("DELETE FROM backups_prune_gate")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "only through"):
+                c.execute("DELETE FROM backups WHERE id=1")
+            c.rollback()
+        finally:
+            c.close()
+
+    def test_prune_removes_files_only_after_the_rows_committed(self):
+        names = [self.fake("daily", i) for i in (1, 2, 3, 4)]
+        real = os.remove
+
+        def flaky(path, *a, **k):
+            if path.endswith(names[1]):
+                raise PermissionError(13, "denied")
+            return real(path, *a, **k)
+        with mock.patch.object(os, "remove", flaky):
+            with self.assertRaisesRegex(backup.BackupError, f"committed.*{names[1]}"):
+                backup.prune(keep=0, actor=actions.BACKUP_PRUNE_ACTOR, via="runner")
+        self.assertEqual([r["file"] for r in self.rows()], [names[3]])           # rows gone (committed), floor stays
+        self.assertEqual(set(self.files()), {names[1], names[3]})                # the one orphan is named, kept
+        self.assertEqual([r["file"] for r in backup.listing()], [names[3], names[1]])
+        self.assertEqual(backup.listing()[1], {"file": names[1], "unrecorded": True})
+
+    def test_a_killed_run_leaves_work_files_the_next_run_removes_and_keeps_bundles(self):
+        os.makedirs(self.dir, exist_ok=True)
+        done = self.fake("weekly", 1)
+        os.makedirs(os.path.join(self.dir, ".backup-abc123"))
+        with open(os.path.join(self.dir, ".backup-abc123", "afclaude.db"), "wb") as fh:
+            fh.write(b"x" * 100)
+        part = "afclaude-backup-0123abcd-20261022T000000009Z.tar.gz.partial"
+        with open(os.path.join(self.dir, part), "wb") as fh:
+            fh.write(b"x")
+        lone = "afclaude-backup-0123abcd-20261022T000000008Z.tar.gz"       # finished, never recorded
+        with open(os.path.join(self.dir, lone), "wb") as fh:
+            fh.write(b"x")
+        self.assertEqual(backup.listing()[-1], {"file": lone, "unrecorded": True})
+        res = backup.run_scheduled(now=self.t0)
+        self.assertEqual(set(res["cleaned"]), {".backup-abc123", part})
+        self.assertEqual(res["unrecorded"], [lone])                          # reported, not deleted
+        self.assertEqual(set(self.files()), {done, lone, res["file"]})
+
+    def test_the_job_line_names_an_unrecorded_bundle(self):
+        os.makedirs(self.dir, exist_ok=True)
+        lone = "afclaude-backup-0123abcd-20261022T000000008Z.tar.gz"
+        with open(os.path.join(self.dir, lone), "wb") as fh:
+            fh.write(b"x")
+        with mock.patch("sys.stdout", io.StringIO()):
+            line = backup.daily_job()
+        self.assertIn("UNRECORDED", line)
+        self.assertIn(lone, line)
+
+    def test_two_runs_at_once_are_refused(self):
+        import fcntl
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, backup.LOCK_NAME), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(backup.BackupError, "another backup is running"):
+                backup.run_scheduled(now=self.t0)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_recorded_bundle_is_never_removed_by_the_failure_path(self):
+        """A failure after the record committed (here: closing the connection) must not delete the bundle, which
+        is by now the protected latest."""
+        real = store.connect
+        state = {"n": 0}
+
+        class Closing:
+            def __init__(self, conn):
+                self._c = conn
+
+            def __getattr__(self, k):
+                return getattr(self._c, k)
+
+            def close(self):
+                self._c.close()
+                if state["n"] == 2:
+                    raise RuntimeError("late failure")
+
+        def wrapped(*a, **k):
+            state["n"] += 1
+            c = real(*a, **k)
+            return Closing(c) if state["n"] == 2 else c       # the 2nd connect is the record's
+        with mock.patch.object(store, "connect", wrapped):
+            with self.assertRaisesRegex(RuntimeError, "late failure"):
+                backup.run_scheduled(now=self.t0)
+        (row,) = self.rows()
+        self.assertEqual(self.files(), [row["file"]])
 
     def test_the_owner_hears_it_in_plain_words(self):
         import owner_text

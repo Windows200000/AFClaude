@@ -712,8 +712,11 @@ class Runner:
                 continue
             if nd > now:
                 if job.daily_setting and name not in self.tasks:
-                    want = self._next_tick(job, now)    # the owner changed the time: the stored tick follows it
-                    if want != nd:
+                    want = self._next_tick(job, now)
+                    # the owner changed the time: a stored GRID tick (whole minute) of the old time follows it; a
+                    # boot's catch-up (now + n * STAGGER, not a grid tick) is left alone, whatever the job's name
+                    on_grid = nd.second == 0 and nd.microsecond == 0
+                    if on_grid and (nd.hour, nd.minute) != (want.hour, want.minute):
                         self.job_set(name, next_due=_iso(want))
                 continue
             if name in self.tasks:
