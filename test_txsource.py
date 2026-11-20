@@ -443,6 +443,22 @@ class Hardening(StubKit):
             ka.refresh(os.path.join(self.tmp, "elsewhere", PROJ, f"{SID}.jsonl"))
         conn.close()
 
+    def test_inbox_seen_reads_a_stored_host_form_path_through_the_bridge(self):
+        """An inbox verify entry stored before the switch names the host's path (K7: the mounts are gone, nothing
+        may open it): seen() maps it to the mirror; a path that is neither raises and is not "not seen"."""
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z")])
+        host_form = os.path.join(self.projects, PROJ, f"{SID}.jsonl")
+        off = ka.file_size(host_form)
+        self.tx(f"{SID}.jsonl", [entry("user", "one", "2026-11-01T10:00:00Z"),
+                                 entry("user", "MARK-7 text", "2026-11-01T10:01:00Z")])
+        self.calls.clear()
+        with mock.patch("builtins.open", side_effect=self.no_host_open):
+            self.assertTrue(inbox.seen(host_form, off, "MARK-7"))
+            self.assertFalse(inbox.seen(host_form, off, "MARK-8"))
+            with self.assertRaises(txsource.TxError):
+                inbox.seen(os.path.join(self.tmp, "elsewhere", PROJ, f"{SID}.jsonl"), 0, "MARK-7")
+        self.assertTrue(self.reads())
+
     def no_host_open(self, file, *a, **kw):
         if str(file).startswith(self.projects + os.sep):
             raise AssertionError(f"read the mount: {file}")
