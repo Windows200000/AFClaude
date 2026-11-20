@@ -9,11 +9,11 @@ on the SAME data directory. A checked script, DRY-RUN by default:
                                                 services up for a look instead of rolling back (the command is printed)
 
 Dry-run changes nothing: it runs only read-only docker/git commands (ps, inspect, images, top, `compose config`,
-`git rev-parse`: `Cutover.read` refuses anything else, tested) and prints each changing step as `$ <command>`.
+`git rev-parse`, `docker exec <c> cat /app/CODE_VERSION`: `Cutover.read` refuses anything else, tested) and prints each changing step as `$ <command>`.
 
 Preflight (both modes; a failed one is exit 1 and in --apply nothing is touched):
   - no session-window start within 60 min before or after now (deploy.start_guard with a 60 min guard, a superset of
-    deploy.py's 30 min and its 22:30-23:30 / 03:30-04:30 windows: the downtime and a rollback run to ~55 min; no --force, D-257);
+    deploy.py's 30 min and its 22:30-23:30 / 03:30-04:30 windows: the downtime and a rollback run to 56.5 min at the very worst; no --force, D-257);
   - docker/.env has what the services layout needs: AFCLAUDE_HOST_REPO, HOST_HOME, AFCLAUDE_BRIDGE_USER; the flips it
     still lacks are listed (AFCLAUDE_LAYOUT=services, AFCLAUDE_SCHEDULER=runner, AFCLAUDE_DATA = the repo's data/,
     AFCLAUDE_COMPOSE_OVERRIDES=compose.host-mounts.yml,compose.subnet.yml) and written only by --apply (the old file is
@@ -29,7 +29,8 @@ Steps (--apply): tag the image the RUNNING old container uses as `afclaude-manag
 pre-k7 is re-tagged) -> build the services image (the old
 container still runs) -> drain the runner (through the container, deploy.drain) -> wait until it is quiet -> start guard
 again -> stop the old container -> write the .env flips -> `compose up -d` -> wait for the health checks -> `afclaude
-host check` in the new runner (a failed BLOCKING check rolls back, non-blocking ones are reported) -> print the owner steps
+host check` in the new runner (a failed BLOCKING check rolls back; non-blocking ones, and a hang of that last call, are
+reported at once and in the closing summary, never a rollback) -> print the owner steps
 (keep master.key, the MCP line only with the mcp profile on, the acceptance clean-up, the rollback commands).
 Every failure (any exception; a Ctrl-C is re-raised after the clean-up) is an alert (notify) and exit 1, no silent
 fallback. Before the old container is stopped it only lifts the drain (a failed or timed-out drain attempt too: the mark
@@ -78,7 +79,10 @@ EXEC_LIMIT = 60
 HEALTH_WAIT = timedelta(minutes=6)
 CLEAR_WAIT = timedelta(minutes=10)
 GUARD = timedelta(minutes=60)    # no session-window start within this of now (and again before the stop): the worst case
-                                 # after the stop is ~30 min (stop + up + health + host check), a rollback ~25 more
+                                 # after the stop is 150 s stop + 600 s up + 360 s health + 600 s blocking host check =
+                                 # 28.5 min, then a rollback (3 x (30 + 150 + 60 s) + 600 s up + 360 s health) 28 min:
+                                 # 56.5 min. The report-only full host check comes last and never rolls back (nothing
+                                 # follows it), so its time is not part of that
 CODE_VERSION_READ = ("cat", "/app/CODE_VERSION")      # the one `docker exec` that only reads: the old image's baked version
 
 READ_ONLY_DOCKER = ("ps", "inspect", "images", "top")
@@ -189,6 +193,7 @@ class Cutover:
         self.running_image = ""
         self.drained = False
         self.old_stopped = False
+        self.report_notes: List[str] = []      # non-blocking host check problems: shown again at the end
         self.env_backup: Optional[str] = None
         self.prefix = deploy.NAME
 
@@ -507,7 +512,7 @@ class Cutover:
         self.out("  6. start the three services on the same data directory")
         self.act(self.compose("up", "-d"), timeout=UP_LIMIT, env=self.compose_env())
         self.out(f"  7. wait for health: {', '.join(self.service_names())} (up to {HEALTH_WAIT.seconds // 60} min; the new runner's boot lifts the drain)")
-        self.out("  8. the host checks in the new runner: a failed BLOCKING check rolls back, the others are reported")
+        self.out("  8. the host checks in the new runner: a failed BLOCKING check rolls back, the others are reported (a hang or fail of the full check never rolls back)")
         self.act(self.host_check_command(True), timeout=CHECK_LIMIT)
         self.act(self.host_check_command(False), timeout=CHECK_LIMIT)
         self.out("  9. then (owner, once; with the mcp profile on and roles enforced): switch the MCP registration to the container"
@@ -551,9 +556,21 @@ class Cutover:
         self.wait_healthy(self.service_names(), "the services")
         self.out("  8. host checks")
         self.step(self.host_check_command(True), "a blocking host check in the new runner", timeout=CHECK_LIMIT)
-        r = self.act(self.host_check_command(False), timeout=CHECK_LIMIT)
-        if r is not None and r.returncode != 0:      # a non-blocking fail pauses nothing and alerts once per episode by itself
-            self.out("     non-blocking host check(s) failed (above): reported, the cut-over stays (review them)")
+        self.report_host_check()
+
+    def report_host_check(self) -> None:
+        """The full host check only REPORTS: a fail, a timeout or an OSError in a non-blocking check is shown to the
+        operator here and again at the end, never a rollback (the CLI path records and prints, it neither alerts nor pauses)."""
+        try:
+            r = self.act(self.host_check_command(False), timeout=CHECK_LIMIT)
+        except CutoverError as e:
+            note = f"the full host check did not finish ({e})"
+        else:
+            if r is None or r.returncode == 0:
+                return
+            note = f"non-blocking host check(s) failed (rc {r.returncode}, output above)"
+        self.report_notes.append(note)
+        self.out(f"     !! {note}: reported, the cut-over stays (review it; rerun `docker exec {self.runner_container()} afclaude host check`)")
 
     def drain_old(self) -> None:
         conn = store.connect()
@@ -616,15 +633,18 @@ class Cutover:
         self.out(f"CUT-OVER FAILED: {reason}")
         if not self.old_stopped:
             self.alert("cut-over: failed before the old container was stopped",
-                       f"{reason}. Nothing was cut over" + ("; the drain is lifted again." if self.drained else "."))
+                       f"{reason}. Nothing was cut over" + ("; lifting the drain again now (a second alert follows if that fails)." if self.drained else "."))
             if self.drained:
                 try:
                     conn = store.connect()
                     try:
-                        deploy.undrain(conn, OLD_CONTAINER, run=self.run)
+                        lifted = deploy.undrain(conn, OLD_CONTAINER, run=self.run)
                     finally:
                         conn.close()
-                    self.out("drain lifted (the old container keeps running)")
+                    if lifted:
+                        self.out("drain lifted (the old container keeps running)")
+                    else:       # deploy.undrain alerted already
+                        self.out(f"DRAIN NOT LIFTED: `docker exec {OLD_CONTAINER} afclaude runner undrain` failed: run it by hand")
                 except BaseException as e:
                     self.alert("cut-over: the drain could not be lifted", f"{type(e).__name__}: {e}: run "
                                f"`docker exec {OLD_CONTAINER} afclaude runner undrain` by hand")
@@ -671,7 +691,12 @@ class Cutover:
     def finish(self) -> None:
         until = (self.now() + ROLLBACK_KEEP).strftime("%Y-%m-%d")
         self.out("")
-        self.out("Cut-over done: three services on the same data directory, host checks passed.")
+        if self.report_notes:
+            self.out("Cut-over done: three services on the same data directory, the BLOCKING host checks passed, but:")
+            for note in self.report_notes:
+                self.out(f"  !! {note}")
+        else:
+            self.out("Cut-over done: three services on the same data directory, host checks passed.")
         self.out("Owner steps:")
         self.out(f"  - KEEP and BACK UP {self.data_dir()}/master.key together with the database: the first services start created it "
                  "(0600) and recorded its check in the database; a database with that check and no key refuses the services' start")
